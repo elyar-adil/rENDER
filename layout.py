@@ -13,11 +13,11 @@ class Box:
 
 
 def get_layout_width(n):
-    if n.type is "ROOT":
+    if n.type == "ROOT":
         return viewport_width
-    elif n.type is "ELEM":
+    elif n.type == "ELEM":
         if "width" in n.style:
-            if n.style["width"] is "inherit":
+            if n.style["width"] == "inherit":
                 width = get_layout_width(n.parent)
             else:
                 if n.style["width"][-1] == '%':
@@ -25,23 +25,23 @@ def get_layout_width(n):
                     width = int(parent_width * (int(n.style["width"][0:-1]) / 100))
                 else:
                     width = px2pixel(n.style["width"])
-    elif n.type is "WORD":
+    elif n.type == "WORD":
         return graphics.get_text_size(n)[0]
     return int(width)
 
 
 def get_layout_height(n):
-    if n.type is "ELEM" and "height" in n.style:
+    if n.type == "ELEM" and "height" in n.style:
         return int(n.style["height"][:-2])
-    elif n.type is "WORD":
+    elif n.type == "WORD":
         return graphics.get_text_size(n)[1]
     else:
         height = 0
         last_word = None
         for c in n.children:
-            if get_layout_float(c) is "none":
+            if get_layout_float(c) == "none":
                 height += get_layout_height(c)
-            elif c.type is "WORD":
+            elif c.type == "WORD":
                 last_word = c
         if last_word:
             height = n.parent.box.y - last_word.box.y + last_word.box.height
@@ -72,11 +72,11 @@ def get_margin(n):
     n.margin = Margin(0, 0, 0, 0)
     if "margin" in n.style:
         l = n.style["margin"].split(" ")
-        if len(l) is 1:
+        if len(l) == 1:
             n.margin = Margin(px2pixel(l[0]), px2pixel(l[0]), px2pixel(l[0]), px2pixel(l[0]))
-        elif len(l) is 2:
+        elif len(l) == 2:
             n.margin = Margin(px2pixel(l[0]), px2pixel(l[1]), px2pixel(l[0]), px2pixel(l[1]))
-        elif len(l) is 4:
+        elif len(l) == 4:
             n.margin = Margin(px2pixel(l[0]), px2pixel(l[1]), px2pixel(l[2]), px2pixel(l[3]))
     if "margin-left" in n.style:
         n.margin.l = px2pixel(n.style["margin-left"])
@@ -90,10 +90,10 @@ def get_margin(n):
 
 def get_layout_float(n):
     f = "none"
-    if n.type is "ELEM":
+    if n.type == "ELEM":
         if "float" in n.style:
             f = n.style["float"]
-    elif n.type is "WORD":
+    elif n.type == "WORD":
         f = "left"
     return f
 
@@ -118,10 +118,10 @@ def layout(t):
             _layout(n)
 
     def _layout(d):
-        if d.type is "TEXT":
+        if d.type == "TEXT":
             if d.parent.style["display"] != "none":
                 words = d.content.split(" ")
-                words = [x for x in words if x is not '']
+                words = [x for x in words if x != '']
                 d.children = []
                 for w in words:
                     r = WordRender(w, int(d.parent.style["word-spacing"][:-2]))
@@ -134,7 +134,7 @@ def layout(t):
             return
         else:
             d.float_children = []
-        if d.type is "ROOT":
+        if d.type == "ROOT":
             x = 0
             y = 0
             w = viewport_width
@@ -147,7 +147,7 @@ def layout(t):
             w = get_layout_width(d)
             get_margin(d)
             y = d.parent.box.y + d.parent.cy + d.margin.t
-            if d.type is "WORD" and hasattr(d.parent, "wy"):
+            if d.type == "WORD" and hasattr(d.parent, "wy"):
                 y = d.parent.wy
             h = get_layout_height(d)
             if hasattr(d, "tag") and d.tag == "img" and hasattr(d, "img"):
@@ -161,7 +161,7 @@ def layout(t):
                         w = int(h / d.img.size[1] * d.img.size[0])
                 d.img = graphics.img_resize(d.img, (w, h))
             if f != "none":
-                if d.type is "WORD" and not hasattr(d.parent, "wy"):
+                if d.type == "WORD" and not hasattr(d.parent, "wy"):
                     d.parent.wy = 0
                 # float left
                 if f == "left":
@@ -170,7 +170,7 @@ def layout(t):
                     while i < len(boxes):
                         b = boxes[i]
                         i += 1
-                        if hasattr(b, "isword") and d.type is not "WORD":
+                        if hasattr(b, "isword") and d.type != "WORD":
                             continue
                         if b.y - b.margin.t <= y < b.y + b.height + b.margin.b and x + w > b.x - d.margin.l and x <= b.x + b.width + d.margin.r:
                             x = b.x + b.width + b.margin.r + d.margin.r
@@ -179,11 +179,11 @@ def layout(t):
                                 y = b.y + b.height + d.margin.t
                                 x = d.parent.box.x + d.margin.l
                                 i = 0
-                    if d.type is "WORD":
+                    if d.type == "WORD":
                         d.parent.wy = y
                     d.box = Box(x, y, w, h)
                     d.box.margin = d.margin
-                    if d.type is "WORD":
+                    if d.type == "WORD":
                         d.box.isword = True
                 # float right
                 elif f == "right":
@@ -192,7 +192,7 @@ def layout(t):
                     while i < len(boxes):
                         b = boxes[i]
                         i += 1
-                        if hasattr(b, "isword") and d.type is not "WORD":
+                        if hasattr(b, "isword") and d.type != "WORD":
                             continue
                         if b.y - b.margin.t <= y < b.y + b.height + b.margin.b and x + w > b.x - d.margin.l and x <= b.x + b.width + d.margin.r:
                             x = b.x - w - d.margin.l - b.margin.r
@@ -201,7 +201,7 @@ def layout(t):
                                 y = b.y + b.height + d.margin.t
                                 x = d.parent.box.x + d.parent.box.width - d.margin.r - w
                                 i = 0
-                    if d.type is "WORD":
+                    if d.type == "WORD":
                         d.parent.wy = y
                     d.box = Box(x, y, w, h)
                     d.box.margin = d.margin

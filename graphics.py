@@ -26,7 +26,7 @@ def img_resize(img, size):
 def paint(d):
 
     def _paint_background(d):
-        if d.type is "ELEM":
+        if d.type == "ELEM":
             if hasattr(d, "box"):
                 canvas.create_rectangle(d.box.x, d.box.y, d.box.x + d.box.width, d.box.y + d.box.height,
                                         width=0, fill=d.style["background-color"])
@@ -35,7 +35,7 @@ def paint(d):
             _paint_background(c)
 
     def _paint_words(d):
-        if d.type is "WORD":
+        if d.type == "WORD":
             canvas.create_text(d.box.x, d.box.y, text=d.word, fill=d.color, font=d.font, anchor=NW)
             if d.decoration != "none":
                 if d.decoration == "underline":
