@@ -3,99 +3,100 @@ import re
 
 class DOMNode:
     """DOM Node Class"""
+
     def __init__(self):
         self.children = []
         self.type = ""
 
 
-def __escape_scape(s, p):
-    while p < len(s):
-        if s[p].isspace():
-            p += 1
-        else:
-            break
+_VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
+
+
+def __skip_whitespace(s, p):
+    while p < len(s) and s[p].isspace():
+        p += 1
     return p
 
 
-def __format_attr(s):
-    t = ""
-    s = s.replace("'",'"')
-    for p in range(0, len(s)):
-        if not s[p].isspace():
-            t += s[p]
-    return t
-
-
-# dose not support attr like "with=100" yet
 def __parse_attr(attr_str):
-    attr_str = __format_attr(attr_str).replace("=", '')
-    arr = attr_str.split('"')
-    del(arr[-1])
-    attr = {arr[x]: arr[x + 1] for x in range(0, len(arr), 2)}
+    # supports: key="v", key='v', key=v, boolean-key
+    attr = {}
+    for key, v1, v2, v3 in re.findall(r'([:\w-]+)(?:\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>/]+)))?', attr_str):
+        value = v1 or v2 or v3 or ""
+        attr[key] = value
     return attr
 
 
-def __parse_children(node, html_lines, pos):
+def __parse_children(node, html_lines, pos, stop_tag=None):
     while pos < len(html_lines):
-        pos = __escape_scape(html_lines, pos)
-        if html_lines[pos] is '<':
-            pos += 1  # pass '<'
-            if html_lines[pos] is '/':
-                # close tag parse over
-                while html_lines[pos] is not '>':
-                    pos += 1
-                return pos + 1  # pass '>'
-            # start of a tag
-            else:
-                tag_strt = pos
-                child = DOMNode()
-                child.attr = {}
-                attr_end = pos
-                while html_lines[pos] is not '>':
-                    if html_lines[pos].isspace():
-                        # attr
-                        while html_lines[attr_end] is not '>':
-                            attr_end += 1
-                        child.attr = __parse_attr(html_lines[pos:attr_end])
-                        break
-                    pos += 1
+        pos = __skip_whitespace(html_lines, pos)
+        if pos >= len(html_lines):
+            return pos
 
-                child.type = "ELEM"
-                child.tag = html_lines[tag_strt:pos]
-                child.parent = node
-                node.children.append(child)
+        if html_lines[pos] == '<':
+            close_pos = html_lines.find('>', pos)
+            if close_pos == -1:
+                return len(html_lines)
 
-                while html_lines[pos] != '>':
-                    pos += 1
+            token = html_lines[pos + 1:close_pos].strip()
+            pos = close_pos + 1
 
-                pos += 1  # pass '>'
+            if not token:
+                continue
 
-                pos = __parse_children(child, html_lines, pos)
-        else:
-            # text node
+            if token.startswith('!'):
+                # doctype/comment-like declarations already stripped in parse()
+                continue
 
-            start = pos
+            if token.startswith('/'):
+                tag_name = token[1:].strip().split()[0] if token[1:].strip() else ""
+                if stop_tag is None or tag_name.lower() == stop_tag.lower():
+                    return pos
+                continue
 
-            while pos < len(html_lines) and html_lines[pos] is not '<':
-                pos += 1
+            self_closing = token.endswith('/')
+            if self_closing:
+                token = token[:-1].strip()
+
+            parts = token.split(None, 1)
+            tag = parts[0]
+            attr_text = parts[1] if len(parts) > 1 else ""
 
             child = DOMNode()
-            child.type = "TEXT"
-            child.content = html_lines[start:pos]
+            child.type = "ELEM"
+            child.tag = tag
+            child.attr = __parse_attr(attr_text)
             child.parent = node
             node.children.append(child)
 
+            if self_closing or tag.lower() in _VOID_TAGS:
+                continue
+
+            pos = __parse_children(child, html_lines, pos, stop_tag=tag)
+        else:
+            start = pos
+            while pos < len(html_lines) and html_lines[pos] != '<':
+                pos += 1
+
+            text = html_lines[start:pos]
+            if text:
+                child = DOMNode()
+                child.type = "TEXT"
+                child.content = text
+                child.parent = node
+                node.children.append(child)
+
+    return pos
+
 
 def parse(html):
-    # replace self-closing tag like <img /> to <img></ >
-    html = html.replace("/>", "></ >")
-    # remove comments
-    html = re.sub("<!--.*-->", "", html, flags=re.MULTILINE)
+    # remove comments first
+    html = re.sub(r"<!--.*?-->", "", html, flags=re.DOTALL)
     root = DOMNode()
     root.type = "ROOT"
     __parse_children(root, html, 0)
     root.parent = None
     return root
-
-
-

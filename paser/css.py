@@ -21,7 +21,7 @@ def parse(css_lines):
     styles = []
     while pos < len(css_lines):
         sel_end = css_lines.find("{", pos)
-        if sel_end is -1:
+        if sel_end == -1:
             break
         sel_str = css_lines[pos:sel_end]
         pos = sel_end + 1

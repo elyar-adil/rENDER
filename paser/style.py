@@ -15,18 +15,18 @@ def get_styles(dn: html.DOMNode) -> list:
 
 def get_type(s):
     t = "tag"
-    if s[0] is '.':
+    if s[0] == '.':
         t = "class"
-    elif s[0] is '#':
+    elif s[0] == '#':
         t = "id"
     return t
 
 
 def satisfy_selector(n, s):
-    if s is "*":
+    if s == "*":
         return True
     t = get_type(s)
-    if t is "tag":
+    if t == "tag":
         if n.type == "ELEM" and n.tag == s:
             return True
     else:
@@ -78,7 +78,7 @@ def get_satisfy_props(n, prop_list):
         fit = True
         count = 0
         for p in reversed(ps[0]):
-            if count is 0:
+            if count == 0:
                 if not satisfy_selector(_n, p):
                     fit = False
                     break
@@ -146,7 +146,7 @@ def bind(dt, ua_filename):
     prop_list = get_prop_list(parse_css_file(ua_filename) + get_styles(dt))
 
     def _assign_style(n):
-        if n.type is "ELEM":
+        if n.type == "ELEM":
             n.style = get_best_prop(n, get_satisfy_props(n, prop_list))
             if "style" in n.attr:
                 sty = css.parse_sty(n.attr["style"])
