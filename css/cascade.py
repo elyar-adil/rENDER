@@ -452,16 +452,15 @@ def _apply_to_element(node: Element, index: dict) -> None:
             unique.append(entry)
     unique.sort(key=lambda x: (x[0], x[1], x[2]))  # (origin, specificity, order)
 
-    computed = {}
+    ua_computed = {}
+    author_computed = {}
     important = {}
     css_vars = {}
-
-    # HTML presentational attributes (UA-level, overridden by any CSS)
-    _apply_html_presentation_hints(node, computed)
 
     for _origin, spec, _order, sel_text, decls in unique:
         try:
             if selector_mod.matches(node, sel_text):
+                target = ua_computed if _origin == 0 else author_computed
                 for decl in decls:
                     # Collect CSS custom properties separately
                     if decl.property.startswith('--'):
@@ -471,10 +470,14 @@ def _apply_to_element(node: Element, index: dict) -> None:
                         if decl.important:
                             important.update(expanded)
                         else:
-                            computed.update(expanded)
+                            target.update(expanded)
         except Exception as exc:
             _logger.debug('Selector match error for %r on <%s>: %s', sel_text, node.tag, exc)
 
+    # Priority: UA < hints < author < !important
+    computed = {**ua_computed}
+    _apply_html_presentation_hints(node, computed)  # hints override UA defaults
+    computed.update(author_computed)                 # author CSS overrides hints
     computed.update(important)
 
     # Inline styles

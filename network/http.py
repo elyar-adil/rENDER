@@ -3,6 +3,43 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import re
+import threading
+from collections import OrderedDict
+
+
+class _HTTPCache:
+    """Thread-safe LRU cache for HTTP responses."""
+    def __init__(self, maxsize: int = 256):
+        self._cache: OrderedDict = OrderedDict()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+
+    def get(self, url: str):
+        with self._lock:
+            if url in self._cache:
+                self._cache.move_to_end(url)
+                return self._cache[url]
+        return None
+
+    def put(self, url: str, value) -> None:
+        with self._lock:
+            if url in self._cache:
+                self._cache.move_to_end(url)
+            self._cache[url] = value
+            if len(self._cache) > self._maxsize:
+                self._cache.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
+_cache = _HTTPCache()
+
+
+def clear_cache() -> None:
+    """Clear the HTTP session cache."""
+    _cache.clear()
 
 
 def fetch(url: str) -> tuple[str, str]:
@@ -14,6 +51,10 @@ def fetch(url: str) -> tuple[str, str]:
     - Charset detection: Content-Type header > BOM > meta charset > UTF-8 fallback
     - Returns (html_text, final_url)
     """
+    cached = _cache.get(url)
+    if cached is not None:
+        return cached
+
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -47,7 +88,9 @@ def fetch(url: str) -> tuple[str, str]:
     # Charset detection
     charset = _detect_charset(content_type, raw)
     html = raw.decode(charset, errors='replace')
-    return html, final_url
+    result = html, final_url
+    _cache.put(url, result)
+    return result
 
 
 def _detect_charset(content_type: str, raw: bytes) -> str:
@@ -83,6 +126,11 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
     """Fetch a resource and return raw bytes. Used for images etc."""
     if base_url:
         url = resolve_url(base_url, url)
+
+    cached = _cache.get(url)
+    if cached is not None:
+        return cached
+
     req = urllib.request.Request(url, headers={
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
@@ -97,4 +145,5 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
             raw = gzip.decompress(raw)
         except Exception:
             pass
+    _cache.put(url, raw)
     return raw
