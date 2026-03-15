@@ -1,13 +1,12 @@
 """Text measurement using QFontMetrics (PyQt6)."""
 import sys
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QFont, QFontMetrics
 
 # Need a QApplication to use Qt font metrics
 _app = None
 
 def _ensure_app():
     global _app
+    from PyQt6.QtWidgets import QApplication
     if _app is None and not QApplication.instance():
         _app = QApplication.instance() or QApplication(sys.argv)
 
@@ -18,8 +17,9 @@ _metrics_cache = {}
 _text_cache = {}
 
 
-def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool = False) -> QFont:
+def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool = False):
     """Create a QFont from CSS-style parameters."""
+    from PyQt6.QtGui import QFont
     _ensure_app()
     font = QFont()
 
@@ -31,6 +31,7 @@ def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool =
     font.setPixelSize(max(1, int(size_px)))
 
     # Weight
+    from PyQt6.QtGui import QFont
     weight_map = {
         'bold': QFont.Weight.Bold,
         '700': QFont.Weight.Bold,
@@ -52,6 +53,7 @@ def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool =
 def measure_text(text: str, family: str = 'Times', size_px: float = 16,
                  weight: str = 'normal', italic: bool = False) -> tuple[float, float]:
     """Measure text dimensions. Returns (width, height) in pixels."""
+    from PyQt6.QtGui import QFontMetrics
     cache_key = (family, size_px, weight, italic, text)
     if cache_key in _text_cache:
         return _text_cache[cache_key]
