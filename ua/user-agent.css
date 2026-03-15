@@ -1,9 +1,79 @@
-*{clear:none;text-decoration:none;display:block;color:inherit;float:none;width:100%;background-color:inherit;font-family:Times;font-size:10px;word-spacing:5px;padding:0;}
-html{background-color:white;color:black;}
-head, style, script{display:none;}
-h1{font-size:30px;width:100%;}
-h2{font-size:20px;width:100%;}
-h3{font-size:10px;width:100%;}
-h4{font-size:5px;width:100%;}
-div{display:block;width:100%;}
-a{color:blue;text-decoration:underline;}
+/* rENDER User-Agent Stylesheet */
+
+/* Base */
+html {
+  display: block;
+  background-color: white;
+  color: black;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 16px;
+}
+
+body {
+  display: block;
+  margin-top: 8px;
+  margin-right: 8px;
+  margin-bottom: 8px;
+  margin-left: 8px;
+}
+
+/* Block-level elements */
+address, article, aside, blockquote, details, dialog,
+div, dl, dt, dd, fieldset, figcaption, figure, footer, form,
+h1, h2, h3, h4, h5, h6, header, hgroup, hr, legend, li,
+main, menu, nav, noscript, ol, p, pre, section, summary, ul { display: block; }
+
+center { display: block; }
+
+/* Table model */
+table         { display: table;              border-collapse: separate; border-spacing: 2px; }
+caption       { display: table-caption;      text-align: center; }
+colgroup      { display: table-column-group; }
+col           { display: table-column;       }
+thead         { display: table-header-group; }
+tbody         { display: table-row-group;    }
+tfoot         { display: table-footer-group; }
+tr            { display: table-row;          }
+td, th        { display: table-cell;         }
+
+/* Hidden elements */
+head, style, script, link, meta, title, template { display: none; }
+
+/* Headings */
+h1 { font-size: 32px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h2 { font-size: 24px; font-weight: bold; margin-top: 19px; margin-bottom: 19px; }
+h3 { font-size: 18px; font-weight: bold; margin-top: 18px; margin-bottom: 18px; }
+h4 { font-size: 16px; font-weight: bold; margin-top: 21px; margin-bottom: 21px; }
+h5 { font-size: 13px; font-weight: bold; margin-top: 22px; margin-bottom: 22px; }
+h6 { font-size: 10px; font-weight: bold; margin-top: 24px; margin-bottom: 24px; }
+
+/* Paragraphs */
+p { margin-top: 16px; margin-bottom: 16px; }
+
+/* Lists */
+ul, ol { margin-top: 16px; margin-bottom: 16px; padding-left: 40px; }
+li { display: list-item; }
+
+/* Inline elements — display:inline is the default initial value */
+a { color: blue; text-decoration: underline; }
+abbr, acronym, b, bdo, big, br, button, cite, code, dfn,
+em, i, img, input, kbd, label, map, object, output, q,
+samp, select, small, span, strong, sub, sup, textarea,
+time, tt, u, var { display: inline; }
+b, strong { font-weight: bold; }
+i, em { font-style: italic; }
+u { text-decoration: underline; }
+small { font-size: 0.8em; }
+sub { font-size: 0.8em; }
+sup { font-size: 0.8em; }
+code, kbd, samp, tt { font-family: monospace; }
+pre { font-family: monospace; white-space: pre; }
+
+/* Tables */
+th { font-weight: bold; }
+
+/* Form elements */
+input, select, textarea, button { display: inline; }
+
+/* Horizontal rule */
+hr { border-style: solid; border-color: gray; margin-top: 8px; margin-bottom: 8px; }

@@ -1,0 +1,413 @@
+"""Inline formatting context and line boxes."""
+from dataclasses import dataclass, field
+from layout.box import BoxModel
+from layout.text import measure_word, measure_text, get_font, _parse_px
+
+
+@dataclass
+class InlineItem:
+    """Represents a single inline unit (word, or replaced element like img)."""
+    text: str
+    x: float = 0.0
+    y: float = 0.0
+    width: float = 0.0
+    height: float = 0.0
+    color: str = 'black'
+    font_family: str = 'Arial'
+    font_size: float = 16.0
+    font_weight: str = 'normal'
+    font_italic: bool = False
+    decoration: str = 'none'
+    word_spacing: float = 0.0
+    # for legacy compat with old layout code
+    type: str = 'WORD'
+    # image support: holds a QImage (or None for text items)
+    qimage: object = None
+    # <a> ancestor element, if any (for link click detection)
+    origin_node: object = None
+
+    @property
+    def word(self):
+        return self.text
+
+    @property
+    def font(self):
+        weight = 'bold' if self.font_weight in ('bold', '700') else ''
+        return (self.font_family, int(self.font_size))
+
+    @property
+    def box(self):
+        b = BoxModel()
+        b.x = self.x
+        b.y = self.y
+        b.content_width = self.width
+        b.content_height = self.height
+        b.width = self.width
+        b.height = self.height
+        return b
+
+
+class LineBox:
+    """A single line of inline content."""
+
+    def __init__(self, x: float, y: float, available_width: float, min_height: float = 0.0):
+        self.x = x
+        self.y = y
+        self.available_width = available_width
+        self.min_height = min_height
+        self.items: list[InlineItem] = []
+        self.width: float = 0.0
+        self.height: float = 0.0
+
+    def add_item(self, item: InlineItem) -> bool:
+        """Try to add item. Returns False if it doesn't fit."""
+        if self.items and self.width + item.width > self.available_width:
+            return False
+        item.x = self.x + self.width
+        self.items.append(item)
+        self.width += item.width
+        self.height = max(self.height, item.height)
+        return True
+
+    def finalize(self, text_align: str = 'left') -> None:
+        """Adjust item positions for text alignment."""
+        if not self.items:
+            return
+        # Apply minimum line height
+        if self.min_height > self.height:
+            self.height = self.min_height
+        slack = self.available_width - self.width
+        if text_align == 'center':
+            offset = slack / 2
+            for item in self.items:
+                item.x += offset
+        elif text_align == 'right':
+            for item in self.items:
+                item.x += slack
+        # Vertically align all items to baseline (bottom of line)
+        for item in self.items:
+            item.y = self.y + (self.height - item.height)
+
+
+def _compute_line_height(node, max_font_size: float) -> float:
+    """Compute the CSS line-height for a node as an absolute pixel value."""
+    lh_val = 'normal'
+    if hasattr(node, 'style') and node.style:
+        lh_val = node.style.get('line-height', 'normal')
+
+    if lh_val == 'normal' or not lh_val:
+        return 1.2 * max_font_size
+    if lh_val.endswith('px'):
+        try:
+            return float(lh_val[:-2])
+        except ValueError:
+            pass
+    # Unitless multiplier (e.g. '1.5')
+    try:
+        return float(lh_val) * max_font_size
+    except ValueError:
+        pass
+    # percentage (e.g. '150%')
+    if lh_val.endswith('%'):
+        try:
+            return float(lh_val[:-1]) / 100 * max_font_size
+        except ValueError:
+            pass
+    return 1.2 * max_font_size
+
+
+def layout_inline(node, container_x: float, container_y: float,
+                  container_width: float, float_mgr=None) -> tuple[list[LineBox], float]:
+    """Layout all inline children of node into line boxes.
+
+    Returns (line_boxes, total_height).
+    """
+    items = _collect_inline_items(node)
+    if not items:
+        return [], 0.0
+
+    text_align = 'left'
+    white_space = 'normal'
+    text_overflow = 'clip'
+    text_indent = 0.0
+    if hasattr(node, 'style') and node.style:
+        text_align = node.style.get('text-align', 'left')
+        white_space = node.style.get('white-space', 'normal')
+        text_overflow = node.style.get('text-overflow', 'clip')
+        indent_str = node.style.get('text-indent', '')
+        if indent_str and indent_str not in ('0', '0px', ''):
+            try:
+                text_indent = _parse_px(indent_str)
+            except Exception:
+                text_indent = 0.0
+
+    nowrap = white_space in ('nowrap', 'pre', 'pre-line', 'pre-wrap')
+
+    # Compute dominant font size for line-height calculation
+    font_sizes = [item.font_size for item in items if item.font_size > 0]
+    max_font_size = max(font_sizes, default=16.0)
+    min_line_height = _compute_line_height(node, max_font_size)
+
+    lines = []
+    current_y = container_y
+    first_line = True
+
+    if nowrap:
+        # Put everything in a single line regardless of width
+        if float_mgr:
+            line_x, line_w = float_mgr.available_rect(current_y, 20, container_x, container_width)
+        else:
+            line_x, line_w = container_x, container_width
+
+        if text_indent != 0.0:
+            line_x += text_indent
+            line_w -= text_indent
+
+        line = LineBox(line_x, current_y, line_w, min_height=min_line_height)
+        for item in items:
+            item.x = line_x + line.width
+            line.items.append(item)
+            line.width += item.width
+            line.height = max(line.height, item.height)
+
+        # text-overflow: ellipsis — truncate if needed
+        if text_overflow == 'ellipsis' and line.width > line_w and line.items:
+            _apply_ellipsis(line, line_w)
+
+        if line.height == 0:
+            line.height = min_line_height or 16
+        line.finalize(text_align)
+        lines.append(line)
+        current_y += line.height
+    else:
+        i = 0
+        while i < len(items):
+            # Get available width at current_y (considering floats)
+            if float_mgr:
+                line_x, line_w = float_mgr.available_rect(current_y, 20, container_x, container_width)
+            else:
+                line_x, line_w = container_x, container_width
+
+            # Apply text-indent on the first line only
+            if first_line and text_indent != 0.0:
+                line_x += text_indent
+                line_w -= text_indent
+                first_line = False
+
+            line = LineBox(line_x, current_y, line_w, min_height=min_line_height)
+
+            placed_any = False
+            while i < len(items):
+                item = items[i]
+                if line.add_item(item):
+                    i += 1
+                    placed_any = True
+                else:
+                    if not placed_any:
+                        # Force place item (single word wider than line)
+                        item.x = line_x
+                        line.items.append(item)
+                        line.width += item.width
+                        line.height = max(line.height, item.height)
+                        i += 1
+                    break
+
+            if line.height == 0:
+                line.height = min_line_height or 16
+
+            line.finalize(text_align)
+            lines.append(line)
+            current_y += line.height
+
+    total_height = current_y - container_y
+    return lines, total_height
+
+
+def _apply_ellipsis(line: LineBox, available_width: float) -> None:
+    """Truncate line items so total width fits within available_width with '...' appended."""
+    ellipsis_width = 0.0
+    # Estimate ellipsis width using the first item's font metrics
+    if line.items:
+        first = line.items[0]
+        try:
+            from layout.text import measure_text
+            ew, _ = measure_text('...', first.font_family, first.font_size, first.font_weight, first.font_italic)
+            ellipsis_width = ew
+        except Exception:
+            ellipsis_width = first.font_size * 1.2  # rough estimate
+
+    budget = available_width - ellipsis_width
+    kept = []
+    total_w = 0.0
+    for item in line.items:
+        if total_w + item.width <= budget:
+            kept.append(item)
+            total_w += item.width
+        else:
+            break
+
+    # Add ellipsis item
+    if line.items:
+        ref = line.items[0]
+        from dataclasses import replace
+        ellipsis_item = InlineItem(
+            text='...',
+            x=line.x + total_w,
+            width=ellipsis_width,
+            height=ref.height,
+            color=ref.color,
+            font_family=ref.font_family,
+            font_size=ref.font_size,
+            font_weight=ref.font_weight,
+            font_italic=ref.font_italic,
+        )
+        kept.append(ellipsis_item)
+
+    line.items = kept
+    line.width = sum(item.width for item in kept)
+
+
+def _collect_inline_items(node) -> list[InlineItem]:
+    """Walk DOM tree collecting inline items (words) from text nodes."""
+    items = []
+    style = node.style if hasattr(node, 'style') and node.style else {}
+    _collect(node, items, style, is_root=True, current_link=None)
+    return items
+
+
+def _resolve_img_dim(css_val: str, attr_val: str, natural: int) -> int:
+    """Return pixel dimension for an img width/height. Returns 0 if unknown."""
+    for val in (css_val, attr_val):
+        if not val or val in ('auto', ''):
+            continue
+        try:
+            if val.endswith('px'):
+                return int(float(val[:-2]))
+            if val.lstrip('-').isdigit():
+                return int(val)
+            return int(_parse_px(val))
+        except Exception:
+            pass
+    return natural or 0
+
+
+_BLOCK_DISPLAYS = frozenset({
+    'block', 'flex', 'grid', 'table', 'list-item',
+    'table-row', 'table-cell', 'table-header-group',
+    'table-footer-group', 'table-row-group',
+    'table-caption', 'table-column-group',
+})
+
+
+def _collect(node, items: list, inherited_style: dict = None, is_root: bool = False,
+             current_link=None) -> None:
+    """Collect inline items from node.
+
+    For the root block container (is_root=True) we recurse into all children
+    but skip block-level element children (they are laid out separately by BFC).
+    For inline element children we recurse, inheriting their style.
+    current_link: the nearest <a> ancestor element (or None).
+    """
+    from html.dom import Element, Text
+
+    if inherited_style is None:
+        inherited_style = {}
+
+    if isinstance(node, Text):
+        style = inherited_style
+        text = node.data
+        if not text.strip():
+            return
+
+        family = style.get('font-family', 'Arial').split(',')[0].strip().strip('"\'')
+        size_px = _parse_px(style.get('font-size', '16px'))
+        weight = style.get('font-weight', 'normal')
+        italic = style.get('font-style', 'normal') in ('italic', 'oblique')
+        color = style.get('color', 'black')
+        decoration = style.get('text-decoration', 'none')
+        word_spacing = _parse_px(style.get('word-spacing', '0px'))
+
+        # letter-spacing support
+        letter_spacing_val = style.get('letter-spacing', 'normal')
+        if letter_spacing_val == 'normal' or not letter_spacing_val:
+            letter_spacing = 0.0
+        else:
+            try:
+                letter_spacing = _parse_px(letter_spacing_val)
+            except Exception:
+                letter_spacing = 0.0
+
+        words = text.split()
+        space_w, _ = measure_text(' ', family, size_px, weight, italic)
+        for word in words:
+            w, h = measure_text(word, family, size_px, weight, italic)
+            # Add letter-spacing contribution
+            if letter_spacing != 0.0:
+                w += letter_spacing * len(word)
+            item = InlineItem(
+                text=word,
+                width=w + space_w + word_spacing,
+                height=h,
+                color=color,
+                font_family=family,
+                font_size=size_px,
+                font_weight=weight,
+                font_italic=italic,
+                decoration=decoration,
+                word_spacing=word_spacing,
+                origin_node=current_link,
+            )
+            items.append(item)
+
+    elif isinstance(node, Element):
+        display = node.style.get('display', 'inline') if node.style else 'inline'
+        if display == 'none':
+            return
+        # Skip block-level children of the root container — they have their own boxes
+        if not is_root and display in _BLOCK_DISPLAYS:
+            return
+        # Skip floated elements — they are handled by BFC, not inline flow
+        float_val = node.style.get('float', 'none') if node.style else 'none'
+        if float_val != 'none':
+            return
+
+        # Replaced inline element: <img>
+        if node.tag == 'img':
+            qimage = getattr(node, 'qimage', None)
+            nat_w = getattr(node, 'natural_width', 0)
+            nat_h = getattr(node, 'natural_height', 0)
+            style = node.style or inherited_style
+            # Resolve display dimensions
+            w = _resolve_img_dim(style.get('width', ''), node.attributes.get('width', ''), nat_w)
+            h = _resolve_img_dim(style.get('height', ''), node.attributes.get('height', ''), nat_h)
+            # If only one dimension given, scale proportionally
+            if w and not h and nat_h and nat_w:
+                h = int(w * nat_h / nat_w)
+            elif h and not w and nat_w and nat_h:
+                w = int(h * nat_w / nat_h)
+            if w == 0:
+                w = nat_w or 0
+            if h == 0:
+                h = nat_h or 0
+            if w > 0 and h > 0:
+                item = InlineItem(
+                    text='',
+                    width=float(w),
+                    height=float(h),
+                    qimage=qimage,
+                    type='IMG',
+                    origin_node=current_link,
+                )
+                items.append(item)
+            return
+
+        # Determine link context for children
+        link = node if node.tag == 'a' else current_link
+
+        child_style = node.style or inherited_style
+        for child in node.children:
+            _collect(child, items, child_style, is_root=False, current_link=link)
+
+    else:
+        for child in node.children:
+            _collect(child, items, inherited_style, is_root=False, current_link=current_link)

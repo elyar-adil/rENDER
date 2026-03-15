@@ -1,0 +1,615 @@
+"""Layout engine entry point."""
+from layout.box import BoxModel, EdgeSizes, Rect
+from layout.block import layout_block, layout_absolute
+from layout.flex import layout_flex
+from layout.inline import layout_inline
+from layout.grid import layout_grid
+from rendering.display_list import (
+    DisplayList, PushOpacity, PopOpacity, PushTransform, PopTransform,
+)
+
+
+VIEWPORT_WIDTH = 980
+VIEWPORT_HEIGHT = 600
+
+
+def _parse_shadow_rect(shadow_str: str, base_rect):
+    """Parse a simple box-shadow value, return (Rect, color_str) or None."""
+    from layout.text import _parse_px
+    try:
+        # e.g. "0 2px 4px rgba(0,0,0,0.2)" or "0 1px 3px #ccc"
+        # Find color at end — simplified: take last token that looks like a color
+        parts = shadow_str.split()
+        if len(parts) < 2:
+            return None
+        # Collect numeric offsets: offset-x offset-y [blur] [spread] [color] [inset]
+        offsets = []
+        color = 'rgba(0,0,0,0.2)'
+        for p in parts:
+            p = p.strip(',')
+            if p == 'inset':
+                continue
+            try:
+                offsets.append(_parse_px(p))
+            except Exception:
+                color = p
+        if len(offsets) < 2:
+            return None
+        ox, oy = offsets[0], offsets[1]
+        spread = offsets[3] if len(offsets) >= 4 else 0.0
+        from layout.box import Rect as _Rect
+        r = _Rect(
+            base_rect.x + ox - spread,
+            base_rect.y + oy - spread,
+            base_rect.width + spread * 2,
+            base_rect.height + spread * 2,
+        )
+        return r, color
+    except Exception:
+        return None
+
+
+def layout(document, viewport_width: int = VIEWPORT_WIDTH, viewport_height: int = VIEWPORT_HEIGHT) -> 'DisplayList':
+    """Layout the document and return a DisplayList of draw commands.
+
+    Also sets document.box and element.box on each node.
+    """
+    from html.dom import Element, Text, Document
+
+    # Create root box
+    root_box = BoxModel()
+    root_box.x = 0.0
+    root_box.y = 0.0
+    root_box.content_width = float(viewport_width)
+    root_box.content_height = 0.0
+
+    document.box = root_box
+
+    # Layout all children
+    _layout_children(document, root_box, viewport_width)
+
+    # After initial layout, process any absolutely/fixed positioned elements
+    # that were deferred during the main layout pass
+    _layout_deferred_abs(document, root_box, viewport_width, viewport_height)
+
+    # Build display list — normal elements first, then stacking-context elements on top
+    display_list = DisplayList()
+    stacking_top: list = []  # commands for fixed/absolute elements painted last
+
+    _build_display_list(document, display_list, stacking_top)
+
+    # Append stacking-context (fixed/absolute) commands at the end so they paint on top
+    for cmd in stacking_top:
+        display_list.add(cmd)
+
+    return display_list
+
+
+def _layout_children(node, container_box: BoxModel, viewport_width: int) -> None:
+    from html.dom import Element, Text
+    from layout.float_manager import FloatManager
+
+    float_mgr = FloatManager()
+
+    for child in node.children:
+        if not isinstance(child, Element):
+            continue
+
+        display = child.style.get('display', 'block') if hasattr(child, 'style') and child.style else 'block'
+        position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
+
+        if display == 'none':
+            continue
+
+        # Absolutely/fixed positioned top-level children — defer until after layout
+        if position in ('absolute', 'fixed'):
+            continue
+
+        if display == 'flex':
+            child.box = layout_flex(child, container_box)
+        elif display == 'grid':
+            child.box = layout_grid(child, container_box)
+        elif display == 'table':
+            from layout.table import layout_table
+            child.box = layout_table(child, container_box, viewport_width)
+        else:
+            child.box = layout_block(child, container_box, float_mgr, viewport_width)
+
+        child.box.update_legacy()
+
+        # Update container height
+        container_box.content_height = max(
+            container_box.content_height,
+            child.box.y - container_box.y + child.box.content_height + child.box.margin.bottom
+        )
+
+
+def _layout_deferred_abs(node, root_box: BoxModel, viewport_width: int, viewport_height: int) -> None:
+    """Walk the DOM and lay out any absolute/fixed elements that weren't laid out yet."""
+    from html.dom import Element
+
+    for child in _walk_elements(node):
+        position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
+        if position in ('absolute', 'fixed') and not hasattr(child, 'box'):
+            containing = _find_containing_block(child, node, root_box)
+            child.box = layout_absolute(
+                child, containing, position,
+                viewport_width=viewport_width,
+                viewport_height=viewport_height,
+            )
+            child.box.update_legacy()
+
+
+def _walk_elements(node):
+    """Generator that yields all Element descendants."""
+    from html.dom import Element
+    for child in node.children:
+        if isinstance(child, Element):
+            yield child
+            yield from _walk_elements(child)
+
+
+def _find_containing_block(node, root, root_box: BoxModel) -> BoxModel:
+    """Find the nearest positioned ancestor's box, or root box for fixed/fallback."""
+    from html.dom import Element
+    position = node.style.get('position', 'static') if hasattr(node, 'style') and node.style else 'static'
+    if position == 'fixed':
+        return root_box
+    # Walk parent pointers to find nearest positioned ancestor
+    parent = getattr(node, 'parent', None)
+    while parent is not None and isinstance(parent, Element):
+        parent_pos = parent.style.get('position', 'static') if hasattr(parent, 'style') and parent.style else 'static'
+        if parent_pos in ('relative', 'absolute', 'fixed', 'sticky'):
+            if hasattr(parent, 'box') and parent.box is not None:
+                return parent.box
+        parent = getattr(parent, 'parent', None)
+    return root_box
+
+
+def _parse_linear_gradient(value: str, rect):
+    """Parse a CSS linear-gradient() value.
+
+    Returns (angle_degrees, color_stops) or None on failure.
+    color_stops is [(position: float 0..1, color_str), ...].
+    """
+    import re
+    m = re.match(r'linear-gradient\s*\((.+)\)\s*$', value, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+
+    inner = m.group(1).strip()
+
+    # Split by top-level commas (respecting nested parens)
+    parts = []
+    depth = 0
+    current = []
+    for ch in inner:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current).strip())
+
+    if not parts:
+        return None
+
+    # First token may be an angle or direction keyword
+    angle = 180.0  # default: top → bottom
+    start_idx = 0
+    first = parts[0].strip().lower()
+    if first.endswith('deg'):
+        try:
+            angle = float(first[:-3])
+            start_idx = 1
+        except ValueError:
+            pass
+    elif first.startswith('to '):
+        direction = first[3:].strip()
+        angle_map = {
+            'bottom': 180.0, 'top': 0.0, 'right': 90.0, 'left': 270.0,
+            'bottom right': 135.0, 'bottom left': 225.0,
+            'top right': 45.0, 'top left': 315.0,
+        }
+        angle = angle_map.get(direction, 180.0)
+        start_idx = 1
+    elif first.endswith('turn'):
+        try:
+            angle = float(first[:-4]) * 360
+            start_idx = 1
+        except ValueError:
+            pass
+    elif first.endswith('rad'):
+        try:
+            import math as _math
+            angle = _math.degrees(float(first[:-3]))
+            start_idx = 1
+        except ValueError:
+            pass
+
+    color_parts = parts[start_idx:]
+    if not color_parts:
+        return None
+
+    stops = []
+    n = len(color_parts)
+    for i, part in enumerate(color_parts):
+        part = part.strip()
+        # Check for trailing position hint like "red 50%" or "blue 100%"
+        pos_match = re.search(r'\s+([\d.]+%|[\d.]+px)\s*$', part)
+        if pos_match:
+            color_str = part[:pos_match.start()].strip()
+            pos_str = pos_match.group(1)
+            if pos_str.endswith('%'):
+                pos = float(pos_str[:-1]) / 100.0
+            else:
+                try:
+                    from layout.text import _parse_px as _ppx
+                    pos = _ppx(pos_str) / max(1.0, rect.width)
+                except Exception:
+                    pos = i / max(1, n - 1)
+        else:
+            color_str = part
+            pos = i / max(1, n - 1)
+        stops.append((pos, color_str))
+
+    return angle, stops
+
+
+def _get_list_marker(node, list_type: str) -> str:
+    """Return the marker string for a list item."""
+    from html.dom import Element
+
+    if list_type == 'none':
+        return ''
+    if list_type == 'circle':
+        return '\u25cb'   # ○
+    if list_type == 'square':
+        return '\u25a0'   # ■
+    if list_type in ('decimal', 'decimal-leading-zero'):
+        parent = getattr(node, 'parent', None)
+        idx = 1
+        if parent:
+            try:
+                idx = int(getattr(parent, 'attributes', {}).get('start', '1'))
+            except Exception:
+                idx = 1
+            for sib in parent.children:
+                if sib is node:
+                    break
+                if isinstance(sib, Element) and sib.tag == 'li':
+                    idx += 1
+        return f'{idx}.'
+    if list_type in ('lower-alpha', 'lower-latin'):
+        parent = getattr(node, 'parent', None)
+        idx = 0
+        if parent:
+            for sib in parent.children:
+                if sib is node:
+                    break
+                if isinstance(sib, Element) and sib.tag == 'li':
+                    idx += 1
+        return f'{chr(97 + idx % 26)}.'
+    if list_type in ('upper-alpha', 'upper-latin'):
+        parent = getattr(node, 'parent', None)
+        idx = 0
+        if parent:
+            for sib in parent.children:
+                if sib is node:
+                    break
+                if isinstance(sib, Element) and sib.tag == 'li':
+                    idx += 1
+        return f'{chr(65 + idx % 26)}.'
+    if list_type in ('lower-roman',):
+        parent = getattr(node, 'parent', None)
+        idx = 1
+        if parent:
+            for sib in parent.children:
+                if sib is node:
+                    break
+                if isinstance(sib, Element) and sib.tag == 'li':
+                    idx += 1
+        return _to_roman(idx).lower() + '.'
+    if list_type in ('upper-roman',):
+        parent = getattr(node, 'parent', None)
+        idx = 1
+        if parent:
+            for sib in parent.children:
+                if sib is node:
+                    break
+                if isinstance(sib, Element) and sib.tag == 'li':
+                    idx += 1
+        return _to_roman(idx) + '.'
+    # disc (default)
+    return '\u2022'   # •
+
+
+def _to_roman(n: int) -> str:
+    """Convert integer to uppercase Roman numeral string."""
+    result = ''
+    for value, numeral in (
+        (1000, 'M'), (900, 'CM'), (500, 'D'), (400, 'CD'),
+        (100, 'C'), (90, 'XC'), (50, 'L'), (40, 'XL'),
+        (10, 'X'), (9, 'IX'), (5, 'V'), (4, 'IV'), (1, 'I'),
+    ):
+        while n >= value:
+            result += numeral
+            n -= value
+    return result or 'I'
+
+
+def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -> None:
+    """Recursively build display list from laid-out DOM."""
+    from html.dom import Element, Text
+    from rendering.display_list import (
+        DrawRect, DrawText, DrawBorder, DrawImage,
+        PushClip, PopClip, DrawLinearGradient,
+    )
+
+    if isinstance(node, Element):
+        style = node.style if hasattr(node, 'style') else {}
+        display = style.get('display', 'block')
+        position = style.get('position', 'static')
+
+        # Skip hidden elements entirely (don't recurse into children either)
+        if display == 'none':
+            return
+
+        if not hasattr(node, 'box') or node.box is None:
+            # Element has no layout box but is visible — recurse into children
+            for child in node.children:
+                _build_display_list(child, display_list, stacking_top)
+            return
+
+        box = node.box
+
+        # Elements with position: fixed or absolute go on top (stacking context)
+        is_stacking = position in ('fixed', 'absolute')
+
+        if is_stacking:
+            target: list = []
+        else:
+            target = None  # use display_list directly
+
+        def _emit(cmd):
+            if target is not None:
+                target.append(cmd)
+            else:
+                display_list.add(cmd)
+
+        # Opacity
+        opacity_str = style.get('opacity', '1')
+        try:
+            opacity = float(opacity_str)
+        except (ValueError, TypeError):
+            opacity = 1.0
+        if opacity < 1.0:
+            _emit(PushOpacity(opacity))
+
+        # position: relative — apply visual offset via transform
+        needs_pop_transform = False
+        if position == 'relative':
+            from layout.text import _parse_px as _ppx
+            top_str = style.get('top', 'auto')
+            left_str = style.get('left', 'auto')
+            right_str = style.get('right', 'auto')
+            bottom_str = style.get('bottom', 'auto')
+            dx, dy = 0.0, 0.0
+            if top_str not in ('auto', '', 'none'):
+                try:
+                    dy = _ppx(top_str)
+                except Exception:
+                    pass
+            elif bottom_str not in ('auto', '', 'none'):
+                try:
+                    dy = -_ppx(bottom_str)
+                except Exception:
+                    pass
+            if left_str not in ('auto', '', 'none'):
+                try:
+                    dx = _ppx(left_str)
+                except Exception:
+                    pass
+            elif right_str not in ('auto', '', 'none'):
+                try:
+                    dx = -_ppx(right_str)
+                except Exception:
+                    pass
+            if dx != 0.0 or dy != 0.0:
+                _emit(PushTransform(dx, dy))
+                needs_pop_transform = True
+
+        from layout.text import _parse_px
+        border_radius_str = style.get('border-radius', '0')
+        radius = _parse_px(border_radius_str) if border_radius_str not in ('0', '') else 0
+
+        # box-shadow — drawn first (behind background)
+        shadow = style.get('box-shadow', 'none')
+        if shadow and shadow not in ('none', ''):
+            _shadow = _parse_shadow_rect(shadow, box.border_rect)
+            if _shadow is not None:
+                _emit(DrawRect(_shadow[0], _shadow[1], border_radius=radius))
+
+        # Background color
+        bg = style.get('background-color', 'transparent')
+        if bg and bg != 'transparent':
+            _emit(DrawRect(box.border_rect, bg, border_radius=radius))
+
+        # <img> element: draw the image directly using the layout box
+        if node.tag == 'img':
+            qimage = getattr(node, 'qimage', None)
+            if qimage is not None:
+                from rendering.display_list import DrawImage
+                _emit(DrawImage(box.x, box.y, qimage, box.content_width, box.content_height))
+
+        # Background image (linear-gradient)
+        bg_image = style.get('background-image', 'none')
+        if bg_image and bg_image not in ('none', ''):
+            grad = _parse_linear_gradient(bg_image, box.border_rect)
+            if grad is not None:
+                angle, stops = grad
+                _emit(DrawLinearGradient(box.border_rect, angle, stops))
+
+        # Border
+        _SIDES = ('top', 'right', 'bottom', 'left')
+        side_styles = tuple(
+            style.get(f'border-{s}-style', style.get('border-style', 'none'))
+            for s in _SIDES
+        )
+        side_colors = tuple(
+            style.get(f'border-{s}-color', style.get('border-color', style.get('color', 'black')))
+            for s in _SIDES
+        )
+        if any(s not in ('none', '', 'hidden') for s in side_styles):
+            _emit(DrawBorder(box.border_rect, box.border, side_colors, side_styles))
+
+        # overflow: hidden/scroll/auto → clip children to padding box
+        overflow = style.get('overflow', style.get('overflow-x', 'visible'))
+        needs_clip = overflow in ('hidden', 'scroll', 'auto')
+        if needs_clip:
+            _emit(PushClip(box.padding_rect))
+
+        # List item marker (drawn before content)
+        if display == 'list-item':
+            list_type = style.get('list-style-type', '')
+            if not list_type:
+                parent = getattr(node, 'parent', None)
+                if parent and hasattr(parent, 'tag'):
+                    list_type = 'decimal' if parent.tag == 'ol' else 'disc'
+                else:
+                    list_type = 'disc'
+            if list_type != 'none':
+                marker = _get_list_marker(node, list_type)
+                if marker:
+                    font_family = style.get('font-family', 'Arial').split(',')[0].strip().strip('"\'')
+                    try:
+                        font_size = int(_parse_px(style.get('font-size', '16px')))
+                    except Exception:
+                        font_size = 16
+                    marker_x = box.x - font_size * 1.4
+                    marker_y = box.y
+                    _emit(DrawText(
+                        marker_x, marker_y, marker,
+                        (font_family, font_size, 'normal', ''),
+                        style.get('color', 'black'),
+                    ))
+
+        # Children
+        if is_stacking:
+            child_dl = DisplayList()
+            child_stacking: list = []
+            for child in node.children:
+                _build_display_list(child, child_dl, child_stacking)
+            for cmd in child_dl:
+                target.append(cmd)
+            target.extend(child_stacking)
+        else:
+            for child in node.children:
+                _build_display_list(child, display_list, stacking_top)
+
+        # Inline text/images (from line boxes if set)
+        if hasattr(node, 'line_boxes'):
+            for line in node.line_boxes:
+                for item in line.items:
+                    if getattr(item, 'qimage', None) is not None:
+                        cmd = DrawImage(
+                            item.x, item.y, item.qimage,
+                            item.width, item.height,
+                        )
+                    elif item.text:
+                        cmd = DrawText(
+                            item.x, item.y, item.text,
+                            (item.font_family, int(item.font_size),
+                             item.font_weight, 'italic' if item.font_italic else ''),
+                            item.color,
+                            decoration=item.decoration,
+                            weight=item.font_weight,
+                            italic=item.font_italic,
+                        )
+                    else:
+                        continue
+                    _emit(cmd)
+
+        if needs_clip:
+            _emit(PopClip())
+
+        if opacity < 1.0:
+            _emit(PopOpacity())
+
+        if needs_pop_transform:
+            _emit(PopTransform())
+
+        if is_stacking:
+            stacking_top.extend(target)
+
+    elif isinstance(node, Text):
+        pass  # Text is handled via line_boxes on parent elements
+
+    else:
+        for child in node.children:
+            _build_display_list(child, display_list, stacking_top)
+
+
+# ---------------------------------------------------------------------------
+# Link extraction
+# ---------------------------------------------------------------------------
+
+def _extract_links(document, base_url: str = '') -> list:
+    """Walk the DOM and collect (Rect, url) for all clickable <a href> elements."""
+    from html.dom import Element
+    links = []
+    _collect_links(document, base_url, links)
+    return links
+
+
+def _collect_links(node, base_url: str, links: list) -> None:
+    from html.dom import Element
+    from network.http import resolve_url
+    if not isinstance(node, Element):
+        for child in node.children:
+            _collect_links(child, base_url, links)
+        return
+
+    # Collect from inline line_boxes
+    if hasattr(node, 'line_boxes') and node.line_boxes:
+        link_map = {}   # origin_node -> [items]
+        for line in node.line_boxes:
+            for item in line.items:
+                ln = getattr(item, 'origin_node', None)
+                if ln is not None:
+                    link_map.setdefault(ln, []).append(item)
+        for a_node, items in link_map.items():
+            href = a_node.attributes.get('href', '').strip()
+            if not href or href.startswith('#'):
+                continue
+            try:
+                url = resolve_url(base_url, href) if base_url else href
+            except Exception:
+                url = href
+            if items:
+                x1 = min(it.x for it in items)
+                y1 = min(it.y for it in items)
+                x2 = max(it.x + it.width for it in items)
+                y2 = max(it.y + it.height for it in items)
+                from layout.box import Rect
+                links.append((Rect(x1, y1, x2 - x1, y2 - y1), url))
+
+    # Block-level <a> with its own box
+    if node.tag == 'a' and hasattr(node, 'box') and node.box is not None:
+        href = node.attributes.get('href', '').strip()
+        if href and not href.startswith('#'):
+            try:
+                url = resolve_url(base_url, href) if base_url else href
+            except Exception:
+                url = href
+            links.append((node.box.border_rect, url))
+
+    for child in node.children:
+        _collect_links(child, base_url, links)
