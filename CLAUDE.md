@@ -1,6 +1,8 @@
-# rENDER — Browser Engine
+# rENDER — Minimal Browser
 
-A browser engine built from scratch in Python, using PyQt6 for rendering.
+**Goal**: A lean, correct, usable browser built from scratch in Python with PyQt6.
+Implement the minimum code necessary to render real web pages correctly.
+Every line must earn its place — no gold-plating, no speculative features.
 
 ## Architecture
 
@@ -52,7 +54,9 @@ python -m pytest tests/
 
 ## Design Principles
 
-- No third-party libraries except PyQt6
-- Each layer has a clear interface contract
-- DOM → CSS → Layout → Rendering pipeline
+- **Minimal**: solve the problem with the least code that works correctly
+- **No third-party libraries** except PyQt6
+- **Correctness over completeness**: implement features fully or not at all
+- **Delete before adding**: prefer removing dead code to working around it
+- Each layer has a clear interface: DOM → CSS → Layout → Rendering
 - Tests must always pass: `python -m pytest tests/`
