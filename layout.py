@@ -60,10 +60,23 @@ class Margin:
 
 
 def px2pixel(s):
-    if s == "0":
+    s = s.strip()
+    if s == "0" or s == "auto" or s == "":
         return 0
-    else:
-        return int(s[:-2])
+    if s.endswith("px"):
+        try:
+            return int(float(s[:-2]))
+        except ValueError:
+            return 0
+    if s.endswith("em") or s.endswith("rem") or s.endswith("vw") or s.endswith("vh"):
+        try:
+            return int(float(s[:-2]) * 16)
+        except ValueError:
+            return 0
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
 
 
 def get_margin(n):

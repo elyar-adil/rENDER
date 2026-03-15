@@ -6,7 +6,8 @@ def get_styles(dn: html.DOMNode) -> list:
         for node in n.children:
             if hasattr(node, "tag"):
                 if node.tag == "style":
-                    s += css.parse(node.children[0].content)
+                    if node.children:
+                        s += css.parse(node.children[0].content)
             _get_styles(node, s)
         assert isinstance(s, list)
         return s

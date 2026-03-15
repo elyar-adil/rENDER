@@ -10,7 +10,7 @@ def parse_sty(sty_str):
     for line in sty_str.splitlines():
         if line:
             t = [x.strip(' \t\n\r') for x in line.split(":")]
-            if t[0] and t[1]:
+            if len(t) >= 2 and t[0] and t[1]:
                 properties[t[0]] = t[1]
     return properties
 
