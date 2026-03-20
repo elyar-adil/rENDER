@@ -1,0 +1,26 @@
+[
+  {
+    "name": "header",
+    "path": "tests/fixtures/hao123_modules/header.html",
+    "viewport_w": 1280,
+    "viewport_h": 140
+  },
+  {
+    "name": "search",
+    "path": "tests/fixtures/hao123_modules/search.html",
+    "viewport_w": 1280,
+    "viewport_h": 260
+  },
+  {
+    "name": "sites",
+    "path": "tests/fixtures/hao123_modules/sites.html",
+    "viewport_w": 1280,
+    "viewport_h": 360
+  },
+  {
+    "name": "feed_columns",
+    "path": "tests/fixtures/hao123_modules/feed_columns.html",
+    "viewport_w": 1280,
+    "viewport_h": 420
+  }
+]
