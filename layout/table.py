@@ -1,7 +1,7 @@
 """Table layout — CSS display:table."""
 from __future__ import annotations
 from layout.box import BoxModel, EdgeSizes
-from layout.text import _parse_px
+from layout.text import _parse_px, measure_text
 from layout.context import LayoutEngine, LayoutContext
 
 _TABLE_ROW_GROUPS = frozenset({
@@ -152,12 +152,17 @@ class TableLayout(LayoutEngine):
                 child_ctx = ctx.fork()  # cells form new BFC
                 cell_box = BlockLayout().layout(td_node, cell_cont, child_ctx)
                 td_node.box = cell_box
+                valign = td_style.get('vertical-align', 'middle')
+                align = td_style.get('text-align', 'left')
                 cell_box.x = table_x + x_offset + pad
                 cell_box.y = row_y + pad
                 cell_box.content_width = inner_w
                 cell_box.update_legacy()
 
                 max_cell_h = max(max_cell_h, cell_box.content_height + 2 * pad)
+                td_node._table_align = align
+                td_node._table_valign = valign
+                td_node._table_pad = pad
                 x_offset += cell_w + cell_spacing
                 col_idx += colspan
 
@@ -165,6 +170,38 @@ class TableLayout(LayoutEngine):
             tr_box.x = table_x; tr_box.y = row_y
             tr_box.content_width = table_w; tr_box.content_height = max_cell_h
             tr_node.box = tr_box; tr_box.update_legacy()
+
+            x_offset = cell_spacing
+            col_idx = 0
+            for td_node, colspan in cells:
+                cell_w = sum(col_widths[col_idx:col_idx + colspan]) + cell_spacing * (colspan - 1)
+                pad = getattr(td_node, '_table_pad', 0.0)
+                cell_box = getattr(td_node, 'box', None)
+                if cell_box is not None:
+                    extra_h = max(0.0, max_cell_h - (cell_box.content_height + 2 * pad))
+                    valign = getattr(td_node, '_table_valign', 'middle')
+                    if valign == 'bottom':
+                        dy = extra_h
+                    elif valign in ('middle', 'center'):
+                        dy = extra_h / 2.0
+                    else:
+                        dy = 0.0
+
+                    dx = 0.0
+                    align = getattr(td_node, '_table_align', 'left')
+                    content_w = _measure_cell_content_width(td_node)
+                    if content_w <= 0:
+                        content_w = cell_box.content_width
+                    if align == 'right':
+                        dx = max(0.0, cell_w - 2 * pad - content_w)
+                    elif align == 'center':
+                        dx = max(0.0, (cell_w - 2 * pad - content_w) / 2.0)
+
+                    if dx or dy:
+                        _shift_cell_contents(td_node, dx, dy)
+
+                x_offset += cell_w + cell_spacing
+                col_idx += colspan
             y_offset += max_cell_h + cell_spacing
 
         box.content_height = y_offset
@@ -195,11 +232,12 @@ def _extract_cells(tr_node) -> list:
 def _compute_col_widths(all_rows, n_cols: int, table_w: float, cell_spacing: float) -> list:
     available = table_w - cell_spacing * (n_cols + 1)
     col_widths = [None] * n_cols
+    auto_min = [0.0] * n_cols
     for _tr, cells in all_rows:
         col_idx = 0
         for td_node, colspan in cells:
+            td_style = td_node.style or {}
             if colspan == 1:
-                td_style = td_node.style or {}
                 w_str = td_style.get('width', '') or getattr(td_node, 'attributes', {}).get('width', '')
                 if w_str and w_str not in ('auto', ''):
                     try:
@@ -209,12 +247,119 @@ def _compute_col_widths(all_rows, n_cols: int, table_w: float, cell_spacing: flo
                             col_widths[col_idx] = w
                     except Exception:
                         pass
+                else:
+                    auto_min[col_idx] = max(auto_min[col_idx], _measure_cell_min_width(td_node))
             col_idx += colspan
 
     fixed = sum(w for w in col_widths if w is not None)
     n_auto = sum(1 for w in col_widths if w is None)
-    auto_w = max(0.0, (available - fixed) / n_auto) if n_auto > 0 else 0.0
-    return [w if w is not None else auto_w for w in col_widths]
+    remaining = max(0.0, available - fixed)
+    min_total = sum(auto_min[i] for i, w in enumerate(col_widths) if w is None)
+
+    if n_auto == 0:
+        return [max(0.0, w) for w in col_widths]
+
+    if min_total <= 0:
+        auto_w = remaining / n_auto
+        return [w if w is not None else auto_w for w in col_widths]
+
+    widths = []
+    for i, w in enumerate(col_widths):
+        if w is not None:
+            widths.append(max(0.0, w))
+            continue
+        share = remaining * (auto_min[i] / min_total) if min_total > 0 else 0.0
+        widths.append(max(auto_min[i], share))
+
+    used = sum(widths)
+    if used > available and used > 0:
+        scale = available / used
+        widths = [w * scale for w in widths]
+    return widths
+
+
+def _measure_cell_min_width(node) -> float:
+    """Estimate a table cell's minimum intrinsic width from its contents."""
+    from html.dom import Element, Text
+
+    style = getattr(node, 'style', {}) or {}
+    width_str = style.get('width', '') or getattr(node, 'attributes', {}).get('width', '')
+    if width_str and width_str not in ('auto', ''):
+        try:
+            return float(_parse_px(width_str))
+        except Exception:
+            pass
+    if getattr(node, 'tag', '') == 'img':
+        natural = getattr(node, 'natural_width', 0) or 0
+        if natural > 0:
+            return float(natural)
+
+    width = 0.0
+    for child in getattr(node, 'children', []):
+        if isinstance(child, Text):
+            for word in child.data.split():
+                if not word:
+                    continue
+                try:
+                    w, _ = measure_text(
+                        word,
+                        style.get('font-family', 'Arial'),
+                        _parse_px(style.get('font-size', '16px')),
+                        style.get('font-weight', 'normal'),
+                        style.get('font-style', 'normal') in ('italic', 'oblique'),
+                    )
+                    width = max(width, w)
+                except Exception:
+                    width = max(width, len(word) * max(1.0, _parse_px(style.get('font-size', '16px')) * 0.6))
+        elif isinstance(child, Element):
+            width = max(width, _measure_cell_min_width(child))
+    return width
+
+
+def _shift_subtree(node, dx: float, dy: float) -> None:
+    from html.dom import Element
+
+    for child in getattr(node, 'children', []):
+        if not isinstance(child, Element):
+            continue
+        if hasattr(child, 'box') and child.box is not None:
+            child.box.x += dx
+            child.box.y += dy
+            child.box.update_legacy()
+        if hasattr(child, 'line_boxes'):
+            for lb in child.line_boxes:
+                lb.x += dx
+                lb.y += dy
+                for item in lb.items:
+                    item.x += dx
+                    item.y += dy
+        _shift_subtree(child, dx, dy)
+
+
+def _shift_cell_contents(node, dx: float, dy: float) -> None:
+    if hasattr(node, 'line_boxes'):
+        for lb in node.line_boxes:
+            lb.x += dx
+            lb.y += dy
+            for item in lb.items:
+                item.x += dx
+                item.y += dy
+    _shift_subtree(node, dx, dy)
+
+
+def _measure_cell_content_width(node) -> float:
+    max_width = 0.0
+
+    if hasattr(node, 'line_boxes'):
+        for lb in node.line_boxes:
+            max_width = max(max_width, sum(item.width for item in lb.items))
+
+    for child in getattr(node, 'children', []):
+        child_box = getattr(child, 'box', None)
+        if child_box is not None:
+            max_width = max(max_width, child_box.content_width)
+        max_width = max(max_width, _measure_cell_content_width(child))
+    return max_width
 
 
 # Backward-compat shim

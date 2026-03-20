@@ -12,6 +12,7 @@ from PyQt6.QtGui import (
     QPixmap, QImage, QLinearGradient,
 )
 from PyQt6.QtCore import Qt, QRect, QSize, QPoint, pyqtSignal
+from PyQt6.QtCore import QTimer
 
 from rendering.display_list import (
     DisplayList, DrawRect, DrawText, DrawBorder, DrawImage,
@@ -260,6 +261,7 @@ class RenderCanvas(QWidget):
 
 class BrowserWidget(QMainWindow):
     """Main browser window with address bar and render area."""
+    viewport_changed = pyqtSignal(int, int)
 
     def __init__(self, title: str = 'rENDER Browser'):
         super().__init__()
@@ -317,12 +319,20 @@ class BrowserWidget(QMainWindow):
 
         # Navigation callback (set by engine)
         self.navigate_callback = None
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(120)
+        self._resize_timer.timeout.connect(self._emit_viewport_changed)
 
     def set_display_list(self, dl: DisplayList, page_height: int = 600, title: str = '') -> None:
         self.canvas.set_display_list(dl)
         self.canvas.setFixedHeight(max(600, page_height))
         if title:
             self.setWindowTitle(f'{title} — rENDER')
+
+    def viewport_size(self) -> tuple[int, int]:
+        viewport = self.scroll_area.viewport().size()
+        return max(1, viewport.width()), max(1, viewport.height())
 
     def set_url(self, url: str) -> None:
         self.address_bar.setText(url)
@@ -341,6 +351,14 @@ class BrowserWidget(QMainWindow):
     def _on_link_click(self, href: str) -> None:
         if self.navigate_callback:
             self.navigate_callback(href)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._resize_timer.start()
+
+    def _emit_viewport_changed(self) -> None:
+        width, height = self.viewport_size()
+        self.viewport_changed.emit(width, height)
 
 
 def paint(display_list: DisplayList, painter: QPainter) -> None:
