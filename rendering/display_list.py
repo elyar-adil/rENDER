@@ -69,15 +69,32 @@ class PopClip:
 
 @dataclass
 class PushTransform:
-    """Push a translation transform (dx, dy offset in pixels)."""
-    dx: float
-    dy: float
+    """Push a transform (translation, rotation, scale)."""
+    dx: float = 0.0
+    dy: float = 0.0
+    rotate_deg: float = 0.0
+    scale_x: float = 1.0
+    scale_y: float = 1.0
+    origin_x: float = 0.0
+    origin_y: float = 0.0
 
 
 @dataclass
 class PopTransform:
-    """Pop the current translation transform."""
+    """Pop the current transform."""
     pass
+
+
+@dataclass
+class DrawBoxShadow:
+    """Draw a box shadow with blur."""
+    rect: Any           # layout.box.Rect (border box of element)
+    offset_x: float
+    offset_y: float
+    blur_radius: float
+    spread: float
+    color: str
+    border_radius: float = 0.0
 
 
 @dataclass

@@ -6,6 +6,7 @@ from layout.inline import layout_inline
 from layout.grid import layout_grid
 from rendering.display_list import (
     DisplayList, PushOpacity, PopOpacity, PushTransform, PopTransform,
+    DrawBoxShadow,
 )
 
 
@@ -13,40 +14,131 @@ VIEWPORT_WIDTH = 980
 VIEWPORT_HEIGHT = 600
 
 
-def _parse_shadow_rect(shadow_str: str, base_rect):
-    """Parse a simple box-shadow value, return (Rect, color_str) or None."""
+def _parse_shadow(shadow_str: str):
+    """Parse a box-shadow value, return (ox, oy, blur, spread, color) or None.
+
+    Handles colour functions with spaces like ``rgba(0, 0, 0, 0.2)``."""
+    import re
     from layout.text import _parse_px
     try:
-        # e.g. "0 2px 4px rgba(0,0,0,0.2)" or "0 1px 3px #ccc"
-        # Find color at end — simplified: take last token that looks like a color
-        parts = shadow_str.split()
-        if len(parts) < 2:
-            return None
-        # Collect numeric offsets: offset-x offset-y [blur] [spread] [color] [inset]
-        offsets = []
+        # Strip multiple shadows (take only the first)
+        # Remove any 'inset' keyword
+        s = shadow_str.split(',')[0].strip()
+        if s.startswith('inset'):
+            s = s[5:].strip()
+        elif s.endswith('inset'):
+            s = s[:-5].strip()
+
+        # Extract colour functions first so spaces inside parens don't break split
         color = 'rgba(0,0,0,0.2)'
+        def _extract_color(m):
+            nonlocal color
+            color = m.group(0)
+            return ''
+        s = re.sub(r'(rgba?\s*\([^)]+\)|hsla?\s*\([^)]+\))', _extract_color, s)
+
+        parts = s.split()
+        offsets = []
         for p in parts:
             p = p.strip(',')
-            if p == 'inset':
+            if not p:
                 continue
             try:
                 offsets.append(_parse_px(p))
             except Exception:
-                color = p
+                color = p  # named / hex colour
         if len(offsets) < 2:
             return None
-        ox, oy = offsets[0], offsets[1]
+        ox = offsets[0]
+        oy = offsets[1]
+        blur = offsets[2] if len(offsets) >= 3 else 0.0
         spread = offsets[3] if len(offsets) >= 4 else 0.0
-        from layout.box import Rect as _Rect
-        r = _Rect(
-            base_rect.x + ox - spread,
-            base_rect.y + oy - spread,
-            base_rect.width + spread * 2,
-            base_rect.height + spread * 2,
-        )
-        return r, color
+        return ox, oy, blur, spread, color
     except Exception:
         return None
+
+
+def _parse_css_transform(transform_str: str):
+    """Parse CSS transform value. Return (dx, dy, rotate_deg, scale_x, scale_y) or None."""
+    import re
+    dx, dy, rot, sx, sy = 0.0, 0.0, 0.0, 1.0, 1.0
+    from layout.text import _parse_px
+    found = False
+
+    for m in re.finditer(r'(\w+)\s*\(([^)]*)\)', transform_str):
+        fn = m.group(1).lower()
+        args = [a.strip() for a in m.group(2).split(',')]
+        try:
+            if fn == 'translate':
+                dx += _parse_px(args[0])
+                if len(args) > 1:
+                    dy += _parse_px(args[1])
+                found = True
+            elif fn == 'translatex':
+                dx += _parse_px(args[0])
+                found = True
+            elif fn == 'translatey':
+                dy += _parse_px(args[0])
+                found = True
+            elif fn == 'rotate':
+                val = args[0].strip()
+                if val.endswith('deg'):
+                    rot += float(val[:-3])
+                elif val.endswith('rad'):
+                    rot += float(val[:-3]) * 180 / 3.14159265
+                else:
+                    rot += float(val)
+                found = True
+            elif fn == 'scale':
+                sx *= float(args[0])
+                sy *= float(args[1]) if len(args) > 1 else float(args[0])
+                found = True
+            elif fn == 'scalex':
+                sx *= float(args[0])
+                found = True
+            elif fn == 'scaley':
+                sy *= float(args[0])
+                found = True
+        except Exception:
+            pass
+    return (dx, dy, rot, sx, sy) if found else None
+
+
+def _parse_transform_origin(origin_str: str, box):
+    """Parse transform-origin and return (ox, oy) in absolute coordinates."""
+    from layout.text import _parse_px
+    parts = origin_str.split()
+    ox = box.x + box.content_width / 2
+    oy = box.y + box.content_height / 2
+    try:
+        p0 = parts[0] if parts else '50%'
+        if p0.endswith('%'):
+            ox = box.x + box.content_width * float(p0[:-1]) / 100
+        elif p0 == 'left':
+            ox = box.x
+        elif p0 == 'right':
+            ox = box.x + box.content_width
+        elif p0 == 'center':
+            pass
+        else:
+            ox = box.x + _parse_px(p0)
+    except Exception:
+        pass
+    try:
+        p1 = parts[1] if len(parts) > 1 else '50%'
+        if p1.endswith('%'):
+            oy = box.y + box.content_height * float(p1[:-1]) / 100
+        elif p1 == 'top':
+            oy = box.y
+        elif p1 == 'bottom':
+            oy = box.y + box.content_height
+        elif p1 == 'center':
+            pass
+        else:
+            oy = box.y + _parse_px(p1)
+    except Exception:
+        pass
+    return ox, oy
 
 
 def layout(document, viewport_width: int = VIEWPORT_WIDTH, viewport_height: int = VIEWPORT_HEIGHT) -> 'DisplayList':
@@ -423,7 +515,20 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                 except Exception:
                     pass
             if dx != 0.0 or dy != 0.0:
-                _emit(PushTransform(dx, dy))
+                _emit(PushTransform(dx=dx, dy=dy))
+                needs_pop_transform = True
+
+        # CSS transform property
+        transform_str = style.get('transform', 'none')
+        if transform_str and transform_str not in ('none', ''):
+            t = _parse_css_transform(transform_str)
+            if t:
+                tdx, tdy, rot, sx, sy = t
+                origin = style.get('transform-origin', '50% 50%')
+                ox, oy = _parse_transform_origin(origin, box)
+                _emit(PushTransform(dx=tdx, dy=tdy, rotate_deg=rot,
+                                    scale_x=sx, scale_y=sy,
+                                    origin_x=ox, origin_y=oy))
                 needs_pop_transform = True
 
         from layout.text import _parse_px
@@ -433,9 +538,11 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         # box-shadow — drawn first (behind background)
         shadow = style.get('box-shadow', 'none')
         if shadow and shadow not in ('none', ''):
-            _shadow = _parse_shadow_rect(shadow, box.border_rect)
+            _shadow = _parse_shadow(shadow)
             if _shadow is not None:
-                _emit(DrawRect(_shadow[0], _shadow[1], border_radius=radius))
+                ox, oy, blur, spread, scolor = _shadow
+                _emit(DrawBoxShadow(box.border_rect, ox, oy, blur, spread,
+                                    scolor, border_radius=radius))
 
         # Background color
         bg = style.get('background-color', 'transparent')

@@ -17,6 +17,7 @@ from rendering.display_list import (
     DisplayList, DrawRect, DrawText, DrawBorder, DrawImage,
     PushClip, PopClip, PushOpacity, PopOpacity,
     PushTransform, PopTransform, DrawLinearGradient,
+    DrawBoxShadow,
 )
 
 
@@ -462,9 +463,67 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
                 clip_stack.pop()
                 painter.restore()
 
+        elif isinstance(cmd, DrawBoxShadow):
+            r = cmd.rect
+            sc = _parse_color(cmd.color)
+            if sc.alpha() == 0:
+                continue
+            blur = max(0.0, cmd.blur_radius)
+            spread = cmd.spread
+            # Draw blurred shadow using multiple expanding semi-transparent layers
+            sr_x = r.x + cmd.offset_x - spread
+            sr_y = r.y + cmd.offset_y - spread
+            sr_w = r.width + spread * 2
+            sr_h = r.height + spread * 2
+            if blur > 0:
+                steps = max(3, min(int(blur), 10))
+                base_alpha = sc.alpha()
+                for i in range(steps):
+                    t = (i + 1) / steps
+                    expand = blur * t
+                    layer_color = QColor(sc.red(), sc.green(), sc.blue(),
+                                         int(base_alpha * (1.0 - t) / steps))
+                    painter.setBrush(QBrush(layer_color))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    if cmd.border_radius > 0:
+                        painter.drawRoundedRect(
+                            int(sr_x - expand), int(sr_y - expand),
+                            int(sr_w + expand * 2), int(sr_h + expand * 2),
+                            cmd.border_radius, cmd.border_radius)
+                    else:
+                        painter.drawRect(
+                            int(sr_x - expand), int(sr_y - expand),
+                            int(sr_w + expand * 2), int(sr_h + expand * 2))
+            else:
+                painter.setBrush(QBrush(sc))
+                painter.setPen(Qt.PenStyle.NoPen)
+                if cmd.border_radius > 0:
+                    painter.drawRoundedRect(
+                        int(sr_x), int(sr_y), int(sr_w), int(sr_h),
+                        cmd.border_radius, cmd.border_radius)
+                else:
+                    painter.drawRect(int(sr_x), int(sr_y), int(sr_w), int(sr_h))
+
         elif isinstance(cmd, PushTransform):
             painter.save()
-            painter.translate(cmd.dx, cmd.dy)
+            has_transform = (getattr(cmd, 'rotate_deg', 0) != 0 or
+                             getattr(cmd, 'scale_x', 1.0) != 1.0 or
+                             getattr(cmd, 'scale_y', 1.0) != 1.0)
+            if has_transform:
+                ox = getattr(cmd, 'origin_x', 0.0)
+                oy = getattr(cmd, 'origin_y', 0.0)
+                if ox or oy:
+                    painter.translate(ox, oy)
+                if getattr(cmd, 'rotate_deg', 0):
+                    painter.rotate(cmd.rotate_deg)
+                sx = getattr(cmd, 'scale_x', 1.0)
+                sy = getattr(cmd, 'scale_y', 1.0)
+                if sx != 1.0 or sy != 1.0:
+                    painter.scale(sx, sy)
+                if ox or oy:
+                    painter.translate(-ox, -oy)
+            if cmd.dx or cmd.dy:
+                painter.translate(cmd.dx, cmd.dy)
 
         elif isinstance(cmd, PopTransform):
             painter.restore()

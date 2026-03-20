@@ -129,6 +129,24 @@ def matches(element, selector_text: str) -> bool:
     return False
 
 
+def get_pseudo_element(selector_text: str) -> str | None:
+    """Return the pseudo-element name ('before', 'after') if the selector
+    targets one, otherwise None."""
+    try:
+        group = parse_selector(selector_text)
+    except Exception:
+        return None
+    for complex_sel in group.selectors:
+        parts = complex_sel.parts
+        if parts:
+            last_compound = parts[-1]
+            if isinstance(last_compound, CompoundSelector):
+                for ss in last_compound.simple_selectors:
+                    if ss.pseudo_element:
+                        return ss.pseudo_element
+    return None
+
+
 @functools.lru_cache(maxsize=4096)
 def specificity(selector_text: str) -> tuple:
     """Return (a, b, c) specificity tuple for the most specific selector. Cached."""
@@ -367,11 +385,23 @@ def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> boo
             pass
         return False
 
-    # Dynamic (always return True — layout/script handles actual state)
-    if pseudo_lower in ('hover', 'focus', 'active', 'visited', 'link',
-                        'checked', 'disabled', 'enabled', 'placeholder',
-                        'focus-within', 'focus-visible', 'target'):
-        return True
+    # Dynamic pseudo-classes — match based on element state
+    if pseudo_lower == 'link':
+        return (element.tag == 'a' and bool(element.attributes.get('href')))
+    if pseudo_lower == 'visited':
+        return False  # no browsing history
+    if pseudo_lower in ('hover', 'focus', 'active', 'focus-within',
+                        'focus-visible', 'target'):
+        return False  # static rendering, no interaction state
+    if pseudo_lower == 'checked':
+        return 'checked' in element.attributes
+    if pseudo_lower == 'disabled':
+        return 'disabled' in element.attributes
+    if pseudo_lower == 'enabled':
+        return (element.tag in ('input', 'select', 'textarea', 'button')
+                and 'disabled' not in element.attributes)
+    if pseudo_lower == 'placeholder':
+        return False
 
     return False
 
