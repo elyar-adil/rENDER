@@ -17,7 +17,9 @@ VIEWPORT_H = 600
 # Pipeline helpers
 # ---------------------------------------------------------------------------
 
-def _pipeline(html_content: str, base_url: str = '') -> tuple:
+def _pipeline(html_content: str, base_url: str = '',
+              viewport_width: int = VIEWPORT_W,
+              viewport_height: int = VIEWPORT_H) -> tuple:
     """Parse → JS → CSS (+ external sheets) → Images → Layout.
 
     External stylesheets and images are fetched concurrently.
@@ -42,15 +44,15 @@ def _pipeline(html_content: str, base_url: str = '') -> tuple:
     css_texts.extend(css_texts2)
     img_data.extend(img_data2)
 
-    css_bind(doc, UA_CSS, viewport_width=VIEWPORT_W, viewport_height=VIEWPORT_H,
+    css_bind(doc, UA_CSS, viewport_width=viewport_width, viewport_height=viewport_height,
              extra_css_texts=css_texts, base_url=base_url)
-    css_compute(doc, viewport_width=VIEWPORT_W, viewport_height=VIEWPORT_H)
+    css_compute(doc, viewport_width=viewport_width, viewport_height=viewport_height)
 
     # Attach fetched image data to DOM nodes
     _attach_images(img_data)
 
-    dl = layout_mod.layout(doc, viewport_width=VIEWPORT_W, viewport_height=VIEWPORT_H)
-    height = _page_height(doc)
+    dl = layout_mod.layout(doc, viewport_width=viewport_width, viewport_height=viewport_height)
+    height = _page_height(doc, viewport_height=viewport_height)
     return dl, height, doc
 
 
@@ -278,8 +280,8 @@ def _collect_scripts(node, scripts):
                 _collect_scripts(child, scripts)
 
 
-def _page_height(document) -> int:
-    ref = [VIEWPORT_H]
+def _page_height(document, viewport_height: int = VIEWPORT_H) -> int:
+    ref = [viewport_height]
     def walk(n):
         if hasattr(n, 'box') and n.box is not None:
             ref[0] = max(ref[0], n.box.y + n.box.content_height)
@@ -309,31 +311,46 @@ def _extract_title(document) -> str:
 
 class _Loader(QObject):
     """Fetches + pipelines a page in a worker thread."""
-    done    = pyqtSignal(object, int, str, str, object)   # display_list, height, title, final_url, links
+    done    = pyqtSignal(object, int, str, str, object, str)   # display_list, height, title, final_url, links, html
     error   = pyqtSignal(str)
 
-    def __init__(self, target: str):
+    def __init__(self, target: str | None = None, *,
+                 html_content: str | None = None, base_url: str = '',
+                 viewport_width: int = VIEWPORT_W, viewport_height: int = VIEWPORT_H):
         super().__init__()
         self.target = target
+        self.html_content = html_content
+        self.base_url = base_url
+        self.viewport_width = viewport_width
+        self.viewport_height = viewport_height
 
     def run(self):
         try:
-            target = self.target
-            if target.startswith('http://') or target.startswith('https://'):
-                from network.http import fetch
-                html, final_url = fetch(target)
+            if self.html_content is not None:
+                html = self.html_content
+                final_url = self.base_url
             else:
-                if not os.path.isabs(target):
-                    target = os.path.join(os.path.dirname(os.path.abspath(__file__)), target)
-                with open(target, encoding='utf-8', errors='replace') as f:
-                    html = f.read()
-                final_url = 'file:///' + target.replace('\\', '/')
+                target = self.target or ''
+                if target.startswith('http://') or target.startswith('https://'):
+                    from network.http import fetch
+                    html, final_url = fetch(target)
+                else:
+                    if not os.path.isabs(target):
+                        target = os.path.join(os.path.dirname(os.path.abspath(__file__)), target)
+                    with open(target, encoding='utf-8', errors='replace') as f:
+                        html = f.read()
+                    final_url = 'file:///' + target.replace('\\', '/')
 
-            dl, height, doc = _pipeline(html, base_url=final_url)
+            dl, height, doc = _pipeline(
+                html,
+                base_url=final_url,
+                viewport_width=self.viewport_width,
+                viewport_height=self.viewport_height,
+            )
             title = _extract_title(doc)
             import layout as layout_mod
             links = layout_mod._extract_links(doc, final_url)
-            self.done.emit(dl, height, title, final_url, links)
+            self.done.emit(dl, height, title, final_url, links, html)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -348,13 +365,18 @@ class Browser:
         from rendering.qt_painter import BrowserWidget
         self._win = BrowserWidget('rENDER')
         self._win.navigate_callback = self.navigate
+        self._win.viewport_changed.connect(self._on_viewport_changed)
         self._thread = None
         self._loader = None
+        self._current_html = None
+        self._current_url = ''
+        self._current_target = ''
 
     def navigate(self, target: str) -> None:
         """Start async load of target (URL or file path). Non-blocking."""
         self._win.set_status('Loading…')
         self._win.address_bar.setText(target)
+        self._current_target = target
 
         # Clean up previous thread
         if self._thread and self._thread.isRunning():
@@ -362,7 +384,8 @@ class Browser:
             self._thread.wait(500)
 
         self._thread = QThread()
-        self._loader = _Loader(target)
+        vw, vh = self._win.viewport_size()
+        self._loader = _Loader(target, viewport_width=vw, viewport_height=vh)
         self._loader.moveToThread(self._thread)
 
         self._thread.started.connect(self._loader.run)
@@ -373,15 +396,40 @@ class Browser:
 
         self._thread.start()
 
-    def _on_done(self, display_list, height: int, title: str, final_url: str, links: list):
+    def _on_done(self, display_list, height: int, title: str, final_url: str, links: list, html: str):
         self._win.set_display_list(display_list, page_height=height, title=title)
         self._win.canvas.set_links(links)
         self._win.address_bar.setText(final_url)
         self._win.set_status('')
+        self._current_html = html
+        self._current_url = final_url
 
     def _on_error(self, msg: str):
         self._win.set_status(f'Error: {msg}')
         print(f'[rENDER] Error: {msg}', file=sys.stderr)
+
+    def _on_viewport_changed(self, viewport_width: int, viewport_height: int) -> None:
+        if not self._current_html or not self._current_url:
+            return
+        if self._thread and self._thread.isRunning():
+            return
+
+        self._thread = QThread()
+        self._loader = _Loader(
+            html_content=self._current_html,
+            base_url=self._current_url,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
+        )
+        self._loader.moveToThread(self._thread)
+
+        self._thread.started.connect(self._loader.run)
+        self._loader.done.connect(self._on_done)
+        self._loader.error.connect(self._on_error)
+        self._loader.done.connect(self._thread.quit)
+        self._loader.error.connect(self._thread.quit)
+
+        self._thread.start()
 
     def load(self, target: str) -> None:
         self._win.show()
