@@ -12,7 +12,7 @@ _logger = logging.getLogger(__name__)
 
 def bind(document: Document, ua_css_path: str,
          viewport_width: int = 980, viewport_height: int = 600,
-         extra_css_texts: list = None) -> None:
+         extra_css_texts: list = None, base_url: str = '') -> None:
     """Apply computed styles to every Element in the DOM tree.
 
     extra_css_texts: optional list of raw CSS strings (e.g. fetched external
@@ -30,6 +30,10 @@ def bind(document: Document, ua_css_path: str,
                 except Exception as exc:
                     _logger.debug('External stylesheet parse error: %s', exc)
 
+    # Load @font-face fonts from all rule sources
+    all_rules = ua_rules + doc_rules + extra_rules
+    _load_font_faces(all_rules, base_url)
+
     # Tag each rule with its cascade origin:
     #   0 = user-agent (lowest priority for normal declarations)
     #   1 = author     (highest priority for normal declarations)
@@ -45,6 +49,9 @@ def bind(document: Document, ua_css_path: str,
     # Walk DOM iteratively
     _apply_iterative(document, index)
 
+    # Generate ::before / ::after pseudo-element nodes
+    _generate_pseudo_elements(document)
+
     # Inheritance pass
     _inherit_iterative(document)
 
@@ -55,6 +62,37 @@ def bind(document: Document, ua_css_path: str,
 # ---------------------------------------------------------------------------
 # Rule loading
 # ---------------------------------------------------------------------------
+
+def _load_font_faces(rules: list, base_url: str) -> None:
+    """Parse @font-face rules and register fonts via QFontDatabase."""
+    try:
+        from PyQt6.QtGui import QFontDatabase
+        from PyQt6.QtCore import QByteArray
+    except ImportError:
+        return
+    for rule in rules:
+        if hasattr(rule, 'name') and rule.name == 'font-face':
+            family = None
+            src_url = None
+            for decl in getattr(rule, 'declarations', []):
+                if decl.property == 'font-family':
+                    family = decl.value.strip().strip('"\'')
+                elif decl.property == 'src':
+                    m = re.search(r"url\(['\"]?([^'\")\s]+)['\"]?\)", decl.value)
+                    if m:
+                        src_url = m.group(1)
+            if family and src_url:
+                try:
+                    from network.http import fetch_bytes, resolve_url
+                    url = resolve_url(base_url, src_url) if base_url else src_url
+                    font_data = fetch_bytes(url)
+                    QFontDatabase.addApplicationFontFromData(QByteArray(font_data))
+                except Exception:
+                    pass
+        # Recurse into @media blocks
+        if hasattr(rule, 'rules') and rule.rules:
+            _load_font_faces(rule.rules, base_url)
+
 
 def _load_ua(path: str) -> list:
     try:
@@ -457,8 +495,18 @@ def _apply_to_element(node: Element, index: dict) -> None:
     important = {}
     css_vars = {}
 
+    pseudo_rules = {}  # 'before' / 'after' → list of (origin, decls)
+
     for _origin, spec, _order, sel_text, decls in unique:
         try:
+            # Check if this rule targets a pseudo-element
+            pe = selector_mod.get_pseudo_element(sel_text)
+            if pe in ('before', 'after'):
+                # Match the element part (ignoring pseudo-element)
+                if selector_mod.matches(node, sel_text):
+                    pseudo_rules.setdefault(pe, []).append((_origin, decls))
+                continue
+
             if selector_mod.matches(node, sel_text):
                 target = ua_computed if _origin == 0 else author_computed
                 for decl in decls:
@@ -504,6 +552,77 @@ def _apply_to_element(node: Element, index: dict) -> None:
 
     node.style = computed
     node.css_vars = css_vars
+    if pseudo_rules:
+        node._pseudo_rules = pseudo_rules
+
+
+# ---------------------------------------------------------------------------
+# Pseudo-element generation (::before / ::after)
+# ---------------------------------------------------------------------------
+
+def _resolve_content(content_val: str, element=None) -> str:
+    """Resolve CSS content property value to plain text."""
+    if not content_val or content_val in ('none', 'normal'):
+        return ''
+    # Strip surrounding quotes: "text" or 'text'
+    val = content_val.strip()
+    if (val.startswith('"') and val.endswith('"')) or \
+       (val.startswith("'") and val.endswith("'")):
+        return val[1:-1]
+    # attr(name)
+    if val.startswith('attr(') and val.endswith(')') and element is not None:
+        attr_name = val[5:-1].strip()
+        return element.attributes.get(attr_name, '')
+    # Bare identifier or empty — treat as text
+    if val == '""' or val == "''":
+        return ''
+    return val
+
+
+def _generate_pseudo_elements(document) -> None:
+    """Walk the DOM and create virtual ::before/::after child Elements."""
+    stack = [document]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Element) and hasattr(node, '_pseudo_rules'):
+            for pos in ('before', 'after'):
+                rule_list = node._pseudo_rules.get(pos)
+                if not rule_list:
+                    continue
+                # Merge all declarations for this pseudo-element
+                merged = {}
+                for _origin, decls in rule_list:
+                    for decl in decls:
+                        expanded = expand_shorthand(decl.property, decl.value)
+                        merged.update(expanded)
+                content = merged.get('content', 'none')
+                text = _resolve_content(content, node)
+                # Even empty-string content generates the element (for bg/border)
+                if content in ('none', 'normal'):
+                    continue
+                # Ensure display defaults to inline if not specified
+                if 'display' not in merged:
+                    merged['display'] = 'inline'
+                # Fill initial values for non-inherited properties
+                for prop, propdef in PROPERTIES.items():
+                    if prop not in merged and not propdef.inherited:
+                        merged[prop] = propdef.initial
+                pseudo = Element(f'__{pos}__')
+                pseudo.style = merged
+                pseudo.css_vars = {}
+                pseudo.parent = node
+                if text:
+                    t = Text(text)
+                    t.parent = pseudo
+                    pseudo.children = [t]
+                else:
+                    pseudo.children = []
+                if pos == 'before':
+                    node.children.insert(0, pseudo)
+                else:
+                    node.children.append(pseudo)
+        for child in reversed(getattr(node, 'children', [])):
+            stack.append(child)
 
 
 # ---------------------------------------------------------------------------

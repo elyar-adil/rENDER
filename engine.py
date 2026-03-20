@@ -18,7 +18,7 @@ VIEWPORT_H = 600
 # ---------------------------------------------------------------------------
 
 def _pipeline(html_content: str, base_url: str = '') -> tuple:
-    """Parse → CSS (+ external sheets) → Images → Layout.
+    """Parse → JS → CSS (+ external sheets) → Images → Layout.
 
     External stylesheets and images are fetched concurrently.
     Returns (display_list, page_height, document).
@@ -34,8 +34,16 @@ def _pipeline(html_content: str, base_url: str = '') -> tuple:
     # concurrently so network round-trips overlap.
     css_texts, img_data = _fetch_subresources(doc, base_url)
 
+    # Execute JavaScript (modifies DOM before layout)
+    _execute_scripts(doc, base_url)
+
+    # Re-fetch subresources that JS may have injected
+    css_texts2, img_data2 = _fetch_subresources(doc, base_url)
+    css_texts.extend(css_texts2)
+    img_data.extend(img_data2)
+
     css_bind(doc, UA_CSS, viewport_width=VIEWPORT_W, viewport_height=VIEWPORT_H,
-             extra_css_texts=css_texts)
+             extra_css_texts=css_texts, base_url=base_url)
     css_compute(doc, viewport_width=VIEWPORT_W, viewport_height=VIEWPORT_H)
 
     # Attach fetched image data to DOM nodes
@@ -73,6 +81,9 @@ def _fetch_subresources(document, base_url: str) -> tuple[list, list]:
                     css_jobs.append(url)
             elif tag == 'img':
                 src = node.attributes.get('src', '').strip()
+                if not src:
+                    # Fallback for lazy-loaded images (JS would swap data-src → src)
+                    src = node.attributes.get('data-src', '').strip()
                 if src.startswith('data:'):
                     img_jobs.append((node, None, src))
                 elif src:
@@ -133,13 +144,22 @@ def _fetch_subresources(document, base_url: str) -> tuple[list, list]:
 
 def _attach_images(img_data: list) -> None:
     """Decode raw bytes and attach QImage to each node."""
-    from PyQt6.QtGui import QImage
+    from PyQt6.QtGui import QImage, QPainter
     from PyQt6.QtCore import QByteArray
 
     for node, raw in img_data:
         if raw is None:
             continue
         try:
+            # Detect SVG content
+            if _is_svg(raw):
+                qimg = _render_svg(raw)
+                if qimg and not qimg.isNull():
+                    node.qimage = qimg
+                    node.natural_width = qimg.width()
+                    node.natural_height = qimg.height()
+                continue
+
             ba = QByteArray(raw)
             qimg = QImage()
             qimg.loadFromData(ba)
@@ -149,6 +169,113 @@ def _attach_images(img_data: list) -> None:
                 node.natural_height = qimg.height()
         except Exception:
             pass
+
+
+def _is_svg(raw: bytes) -> bool:
+    """Check if raw bytes look like SVG content."""
+    head = raw[:200].lstrip()
+    return (head.startswith(b'<?xml') and b'<svg' in raw[:500]) or \
+           head.startswith(b'<svg') or \
+           (head.startswith(b'<!') and b'<svg' in raw[:500])
+
+
+def _render_svg(raw: bytes):
+    """Render SVG bytes to a QImage. Returns QImage or None."""
+    try:
+        from PyQt6.QtSvg import QSvgRenderer
+        from PyQt6.QtGui import QImage, QPainter
+        from PyQt6.QtCore import QByteArray
+        renderer = QSvgRenderer(QByteArray(raw))
+        if not renderer.isValid():
+            return None
+        size = renderer.defaultSize()
+        if size.width() <= 0 or size.height() <= 0:
+            size = renderer.viewBox().size()
+        if size.width() <= 0 or size.height() <= 0:
+            return None
+        img = QImage(size, QImage.Format.Format_ARGB32)
+        img.fill(0)
+        painter = QPainter(img)
+        renderer.render(painter)
+        painter.end()
+        return img
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def _execute_scripts(document, base_url: str) -> None:
+    """Find and execute <script> elements in DOM order."""
+    from html.dom import Element, Text
+    from js.lexer import Lexer
+    from js.parser import Parser
+    from js.interpreter import Interpreter
+    from js.dom_api import DOMBinding
+    from js.xhr import XMLHttpRequest
+
+    # Collect all <script> elements in document order
+    scripts = []
+    _collect_scripts(document, scripts)
+
+    if not scripts:
+        return
+
+    # Create a single interpreter instance shared across all scripts
+    interp = Interpreter()
+    binding = DOMBinding(document, interp)
+    binding.setup()
+
+    # Register XMLHttpRequest constructor
+    interp.global_env.define('XMLHttpRequest', XMLHttpRequest)
+
+    for script_node in scripts:
+        src = script_node.attributes.get('src', '').strip() if hasattr(script_node, 'attributes') else ''
+        script_type = script_node.attributes.get('type', '').strip().lower() if hasattr(script_node, 'attributes') else ''
+
+        # Skip non-JS scripts (e.g. type="application/json", type="text/template")
+        if script_type and script_type not in ('text/javascript', 'application/javascript',
+                                                 'module', ''):
+            continue
+
+        js_code = ''
+        if src:
+            # External script
+            try:
+                from network.http import fetch as fetch_text, resolve_url
+                url = resolve_url(base_url, src) if base_url else src
+                js_code, _ = fetch_text(url)
+            except Exception:
+                continue
+        else:
+            # Inline script
+            js_code = ''.join(
+                c.data for c in script_node.children
+                if isinstance(c, Text)
+            )
+
+        if not js_code or not js_code.strip():
+            continue
+
+        try:
+            lexer = Lexer(js_code)
+            tokens = lexer.tokenize()
+            parser = Parser(tokens)
+            ast = parser.parse()
+            interp.execute(ast)
+        except Exception as e:
+            print(f'[JS] Script error: {e}', file=sys.stderr)
+
+
+def _collect_scripts(node, scripts):
+    """Collect <script> elements in document order."""
+    from html.dom import Element
+    for child in getattr(node, 'children', []):
+        if isinstance(child, Element):
+            if child.tag == 'script':
+                scripts.append(child)
+            else:
+                _collect_scripts(child, scripts)
 
 
 def _page_height(document) -> int:
