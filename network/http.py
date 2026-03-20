@@ -1,4 +1,5 @@
 """HTTP/HTTPS client using Python stdlib urllib."""
+import codecs
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -97,7 +98,7 @@ def _detect_charset(content_type: str, raw: bytes) -> str:
     # 1. Content-Type header: text/html; charset=utf-8
     m = re.search(r'charset=([\w-]+)', content_type, re.I)
     if m:
-        return m.group(1)
+        return _normalize_charset(m.group(1))
 
     # 2. BOM detection
     if raw.startswith(b'\xef\xbb\xbf'):
@@ -107,14 +108,53 @@ def _detect_charset(content_type: str, raw: bytes) -> str:
     if raw.startswith(b'\xfe\xff'):
         return 'utf-16-be'
 
-    # 3. meta charset in first 1024 bytes
-    head = raw[:1024].decode('ascii', errors='replace')
-    m = re.search(r'<meta[^>]+charset=["\']?([\w-]+)', head, re.I)
-    if m:
-        return m.group(1)
+    # 3. meta charset/http-equiv in first 16 KB
+    # Wayback toolbar/script injection can push the original charset declaration
+    # well past the first 1024 bytes on archived pages.
+    meta_charset = _extract_meta_charset(raw[:16384])
+    if meta_charset:
+        return meta_charset
 
     # 4. Default
     return 'utf-8'
+
+
+def _extract_meta_charset(raw_head: bytes) -> str | None:
+    head = raw_head.decode('ascii', errors='replace')
+
+    # HTML5 form: <meta charset="utf-8">
+    m = re.search(r'<meta[^>]+charset\s*=\s*["\']?([^\s"\'>/;]+)', head, re.I)
+    if m:
+        return _normalize_charset(m.group(1))
+
+    # Legacy form: <meta http-equiv="Content-Type" content="text/html; charset=gb2312">
+    for meta_tag in re.findall(r'<meta\b[^>]*>', head, re.I):
+        if not re.search(r'http-equiv\s*=\s*["\']?content-type["\']?', meta_tag, re.I):
+            continue
+        m = re.search(r'content\s*=\s*(?:["\']([^"\']*)["\']|([^\s>]+))', meta_tag, re.I)
+        if not m:
+            continue
+        content_value = m.group(1) or m.group(2) or ''
+        m2 = re.search(r'charset\s*=\s*([\w-]+)', content_value, re.I)
+        if m2:
+            return _normalize_charset(m2.group(1))
+
+    return None
+
+
+def _normalize_charset(charset: str) -> str:
+    charset = charset.strip().strip(';').strip('"\'').lower()
+
+    # Treat legacy Chinese encodings as gb18030 so archived GB2312/GBK pages
+    # round-trip without mojibake. Python's codec aliases often handle this
+    # already, but normalizing here avoids environment-specific differences.
+    if charset in {'gb2312', 'gbk', 'gb_2312', 'x-gbk'}:
+        return 'gb18030'
+
+    try:
+        return codecs.lookup(charset).name
+    except LookupError:
+        return charset
 
 
 def resolve_url(base_url: str, url: str) -> str:

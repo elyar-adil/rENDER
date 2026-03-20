@@ -25,6 +25,8 @@ class InlineItem:
     qimage: object = None
     # <a> ancestor element, if any (for link click detection)
     origin_node: object = None
+    # Atomic inline formatting context node (e.g. display:inline-block)
+    layout_node: object = None
 
     @property
     def word(self):
@@ -87,6 +89,34 @@ class LineBox:
         # Vertically align all items to baseline (bottom of line)
         for item in self.items:
             item.y = self.y + (self.height - item.height)
+            if item.layout_node is not None:
+                _shift_layout_subtree(item.layout_node, item.x, item.y)
+
+
+def _shift_layout_subtree(node, dx: float, dy: float) -> None:
+    if dx == 0.0 and dy == 0.0:
+        return
+
+    from html.dom import Element
+
+    if hasattr(node, 'box') and node.box is not None:
+        node.box.x += dx
+        node.box.y += dy
+        node.box.update_legacy()
+
+    if hasattr(node, 'line_boxes'):
+        for lb in node.line_boxes:
+            lb.x += dx
+            lb.y += dy
+            for item in lb.items:
+                item.x += dx
+                item.y += dy
+                if item.layout_node is not None and item.layout_node is not node:
+                    _shift_layout_subtree(item.layout_node, dx, dy)
+
+    for child in getattr(node, 'children', []):
+        if isinstance(child, Element):
+            _shift_layout_subtree(child, dx, dy)
 
 
 def _compute_line_height(node, max_font_size: float) -> float:
@@ -122,7 +152,7 @@ def layout_inline(node, container_x: float, container_y: float,
 
     Returns (line_boxes, total_height).
     """
-    items = _collect_inline_items(node)
+    items = _collect_inline_items(node, container_width)
     if not items:
         return [], 0.0
 
@@ -267,11 +297,11 @@ def _apply_ellipsis(line: LineBox, available_width: float) -> None:
     line.width = sum(item.width for item in kept)
 
 
-def _collect_inline_items(node) -> list[InlineItem]:
-    """Walk DOM tree collecting inline items (words) from text nodes."""
+def _collect_inline_items(node, container_width: float) -> list[InlineItem]:
+    """Walk DOM tree collecting inline items from text and atomic inline boxes."""
     items = []
     style = node.style if hasattr(node, 'style') and node.style else {}
-    _collect(node, items, style, is_root=True, current_link=None)
+    _collect(node, items, style, container_width, is_root=True, current_link=None)
     return items
 
 
@@ -291,6 +321,92 @@ def _resolve_img_dim(css_val: str, attr_val: str, natural: int) -> int:
     return natural or 0
 
 
+def _resolve_inline_block_width(style: dict, container_width: float) -> float | None:
+    width = (style or {}).get('width', 'auto')
+    if not width or width == 'auto':
+        return None
+    try:
+        if width.endswith('%'):
+            return max(0.0, container_width * float(width[:-1]) / 100.0)
+        return max(0.0, _parse_px(width))
+    except Exception:
+        return None
+
+
+def _measure_text_span(text: str, style: dict) -> float:
+    family = style.get('font-family', 'Arial').split(',')[0].strip().strip('"\'')
+    size_px = _parse_px(style.get('font-size', '16px'))
+    weight = style.get('font-weight', 'normal')
+    italic = style.get('font-style', 'normal') in ('italic', 'oblique')
+    try:
+        width, _ = measure_text(text, family, size_px, weight, italic)
+        return width
+    except Exception:
+        return max(0.0, len(text) * size_px * 0.6)
+
+
+def _measure_inline_block_intrinsic_width(node, inherited_style: dict) -> float:
+    from html.dom import Element, Text
+
+    width = 0.0
+
+    if isinstance(node, Text):
+        text = ' '.join(node.data.split())
+        if text:
+            width += _measure_text_span(text, inherited_style)
+        return width
+
+    if isinstance(node, Element):
+        style = node.style or inherited_style
+        if node.tag == 'img':
+            nat_w = getattr(node, 'natural_width', 0) or 0
+            return float(_resolve_img_dim(style.get('width', ''), node.attributes.get('width', ''), nat_w))
+        for child in node.children:
+            width += _measure_inline_block_intrinsic_width(child, style)
+        margin_left = _parse_px(style.get('margin-left', '0px'))
+        margin_right = _parse_px(style.get('margin-right', '0px'))
+        padding_left = _parse_px(style.get('padding-left', '0px'))
+        padding_right = _parse_px(style.get('padding-right', '0px'))
+        border_left = _parse_px(style.get('border-left-width', '0px'))
+        border_right = _parse_px(style.get('border-right-width', '0px'))
+        return width + margin_left + margin_right + padding_left + padding_right + border_left + border_right
+
+    return width
+
+
+def _layout_inline_block(node, inherited_style: dict, container_width: float):
+    from layout.block import BlockLayout
+    from layout.context import LayoutContext
+
+    style = node.style or inherited_style
+    resolved_width = _resolve_inline_block_width(style, container_width)
+    if resolved_width is None:
+        resolved_width = _measure_inline_block_intrinsic_width(node, style)
+
+    resolved_width = max(0.0, min(resolved_width, container_width)) if container_width > 0 else max(0.0, resolved_width)
+
+    tmp = BoxModel()
+    tmp.x = 0.0
+    tmp.y = 0.0
+    tmp.content_width = resolved_width if resolved_width > 0 else max(container_width, 0.0)
+    tmp.content_height = 0.0
+
+    original_width = style.get('width') if isinstance(style, dict) else None
+    width_was_auto = original_width in (None, '', 'auto')
+    if width_was_auto and resolved_width > 0:
+        style['width'] = f'{resolved_width}px'
+
+    try:
+        box = BlockLayout().layout(node, tmp, LayoutContext(max(int(container_width), 1)))
+    finally:
+        if width_was_auto:
+            style.pop('width', None)
+        elif original_width is not None:
+            style['width'] = original_width
+
+    return box
+
+
 _BLOCK_DISPLAYS = frozenset({
     'block', 'flex', 'grid', 'table', 'list-item',
     'table-row', 'table-cell', 'table-header-group',
@@ -299,7 +415,7 @@ _BLOCK_DISPLAYS = frozenset({
 })
 
 
-def _collect(node, items: list, inherited_style: dict = None, is_root: bool = False,
+def _collect(node, items: list, inherited_style: dict = None, container_width: float = 0.0, is_root: bool = False,
              current_link=None) -> None:
     """Collect inline items from node.
 
@@ -371,6 +487,26 @@ def _collect(node, items: list, inherited_style: dict = None, is_root: bool = Fa
         if float_val != 'none':
             return
 
+        # Atomic inline formatting contexts
+        if display == 'inline-block':
+            box = _layout_inline_block(node, inherited_style, container_width)
+            node.box = box
+            node.box.update_legacy()
+            item = InlineItem(
+                text='',
+                x=box.x,
+                y=box.y,
+                width=box.margin.left + box.border.left + box.padding.left + box.content_width
+                      + box.padding.right + box.border.right + box.margin.right,
+                height=box.margin.top + box.border.top + box.padding.top + box.content_height
+                       + box.padding.bottom + box.border.bottom + box.margin.bottom,
+                origin_node=current_link,
+                layout_node=node,
+                type='INLINE-BLOCK',
+            )
+            items.append(item)
+            return
+
         # Replaced inline element: <img>
         if node.tag == 'img':
             qimage = getattr(node, 'qimage', None)
@@ -406,8 +542,8 @@ def _collect(node, items: list, inherited_style: dict = None, is_root: bool = Fa
 
         child_style = node.style or inherited_style
         for child in node.children:
-            _collect(child, items, child_style, is_root=False, current_link=link)
+            _collect(child, items, child_style, container_width, is_root=False, current_link=link)
 
     else:
         for child in node.children:
-            _collect(child, items, inherited_style, is_root=False, current_link=current_link)
+            _collect(child, items, inherited_style, container_width, is_root=False, current_link=current_link)
