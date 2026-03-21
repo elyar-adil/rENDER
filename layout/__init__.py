@@ -6,7 +6,7 @@ from layout.inline import layout_inline
 from layout.grid import layout_grid
 from rendering.display_list import (
     DisplayList, PushOpacity, PopOpacity, PushTransform, PopTransform,
-    DrawBoxShadow, DrawInput,
+    DrawBoxShadow, DrawInput, DrawOutline, DrawRadialGradient,
 )
 
 
@@ -14,22 +14,42 @@ VIEWPORT_WIDTH = 980
 VIEWPORT_HEIGHT = 600
 
 
-def _parse_shadow(shadow_str: str):
-    """Parse a box-shadow value, return (ox, oy, blur, spread, color) or None.
+def _split_top_level(s: str, sep: str = ',') -> list:
+    """Split string by separator, respecting parentheses."""
+    parts = []
+    depth = 0
+    current = []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == sep and depth == 0:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current))
+    return parts
 
-    Handles colour functions with spaces like ``rgba(0, 0, 0, 0.2)``."""
+
+def _parse_single_shadow(s: str):
+    """Parse a single box-shadow value, return (ox, oy, blur, spread, color, inset) or None."""
     import re
     from layout.text import _parse_px
     try:
-        # Strip multiple shadows (take only the first)
-        # Remove any 'inset' keyword
-        s = shadow_str.split(',')[0].strip()
+        s = s.strip()
+        inset = False
         if s.startswith('inset'):
+            inset = True
             s = s[5:].strip()
         elif s.endswith('inset'):
+            inset = True
             s = s[:-5].strip()
 
-        # Extract colour functions first so spaces inside parens don't break split
         color = 'rgba(0,0,0,0.2)'
         def _extract_color(m):
             nonlocal color
@@ -46,16 +66,41 @@ def _parse_shadow(shadow_str: str):
             try:
                 offsets.append(_parse_px(p))
             except Exception:
-                color = p  # named / hex colour
+                color = p
         if len(offsets) < 2:
             return None
         ox = offsets[0]
         oy = offsets[1]
         blur = offsets[2] if len(offsets) >= 3 else 0.0
         spread = offsets[3] if len(offsets) >= 4 else 0.0
-        return ox, oy, blur, spread, color
+        return ox, oy, blur, spread, color, inset
     except Exception:
         return None
+
+
+def _parse_shadow(shadow_str: str):
+    """Parse a box-shadow value, return (ox, oy, blur, spread, color) or None.
+
+    Handles colour functions with spaces like ``rgba(0, 0, 0, 0.2)``.
+    For backward compatibility, returns the first non-inset shadow."""
+    parts = _split_top_level(shadow_str)
+    for part in parts:
+        result = _parse_single_shadow(part)
+        if result is not None:
+            ox, oy, blur, spread, color, inset = result
+            if not inset:
+                return ox, oy, blur, spread, color
+    return None
+
+
+def _parse_all_shadows(shadow_str: str) -> list:
+    """Parse all box-shadow values, return list of (ox, oy, blur, spread, color, inset)."""
+    results = []
+    for part in _split_top_level(shadow_str):
+        result = _parse_single_shadow(part)
+        if result is not None:
+            results.append(result)
+    return results
 
 
 def _parse_css_transform(transform_str: str):
@@ -166,13 +211,18 @@ def layout(document, viewport_width: int = VIEWPORT_WIDTH, viewport_height: int 
 
     # Build display list — normal elements first, then stacking-context elements on top
     display_list = DisplayList()
-    stacking_top: list = []  # commands for fixed/absolute elements painted last
+    stacking_top: list = []  # (z_index, order, commands) for positioned elements
 
     _build_display_list(document, display_list, stacking_top)
 
-    # Append stacking-context (fixed/absolute) commands at the end so they paint on top
-    for cmd in stacking_top:
-        display_list.add(cmd)
+    # Sort stacking context items by z-index (lower z-index painted first)
+    stacking_top.sort(key=lambda item: (item[0], item[1]) if isinstance(item, tuple) and len(item) == 3 else (0, 0))
+    for item in stacking_top:
+        if isinstance(item, tuple) and len(item) == 3:
+            for cmd in item[2]:
+                display_list.add(cmd)
+        else:
+            display_list.add(item)
 
     return display_list
 
@@ -355,6 +405,116 @@ def _parse_linear_gradient(value: str, rect):
     return angle, stops
 
 
+def _parse_radial_gradient(value: str, rect):
+    """Parse a CSS radial-gradient() value.
+
+    Returns (cx, cy, rx, ry, color_stops) or None.
+    """
+    import re
+    m = re.match(r'radial-gradient\s*\((.+)\)\s*$', value, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+
+    inner = m.group(1).strip()
+
+    # Split by top-level commas
+    parts = []
+    depth = 0
+    current = []
+    for ch in inner:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current).strip())
+
+    if not parts:
+        return None
+
+    # Default: ellipse at center
+    cx = rect.x + rect.width / 2
+    cy = rect.y + rect.height / 2
+    rx = rect.width / 2
+    ry = rect.height / 2
+    start_idx = 0
+
+    # Check if first part is a shape/size/position directive
+    first = parts[0].strip().lower()
+    if 'at ' in first or first.startswith('circle') or first.startswith('ellipse'):
+        start_idx = 1
+        # Parse "at X Y" position
+        at_match = re.search(r'at\s+(.+)', first)
+        if at_match:
+            pos_str = at_match.group(1).strip()
+            pos_parts = pos_str.split()
+            from layout.text import _parse_px as _ppx
+            try:
+                p0 = pos_parts[0] if pos_parts else '50%'
+                if p0.endswith('%'):
+                    cx = rect.x + rect.width * float(p0[:-1]) / 100
+                elif p0 in ('left',):
+                    cx = rect.x
+                elif p0 in ('right',):
+                    cx = rect.x + rect.width
+                elif p0 in ('center',):
+                    pass
+                else:
+                    cx = rect.x + _ppx(p0)
+            except Exception:
+                pass
+            try:
+                p1 = pos_parts[1] if len(pos_parts) > 1 else '50%'
+                if p1.endswith('%'):
+                    cy = rect.y + rect.height * float(p1[:-1]) / 100
+                elif p1 in ('top',):
+                    cy = rect.y
+                elif p1 in ('bottom',):
+                    cy = rect.y + rect.height
+                elif p1 in ('center',):
+                    pass
+                else:
+                    cy = rect.y + _ppx(p1)
+            except Exception:
+                pass
+        if 'circle' in first:
+            rx = ry = min(rect.width, rect.height) / 2
+
+    color_parts = parts[start_idx:]
+    if not color_parts:
+        return None
+
+    stops = []
+    n = len(color_parts)
+    for i, part in enumerate(color_parts):
+        part = part.strip()
+        pos_match = re.search(r'\s+([\d.]+%|[\d.]+px)\s*$', part)
+        if pos_match:
+            color_str = part[:pos_match.start()].strip()
+            pos_str = pos_match.group(1)
+            if pos_str.endswith('%'):
+                pos = float(pos_str[:-1]) / 100.0
+            else:
+                try:
+                    from layout.text import _parse_px as _ppx
+                    pos = _ppx(pos_str) / max(1.0, max(rx, ry))
+                except Exception:
+                    pos = i / max(1, n - 1)
+        else:
+            color_str = part
+            pos = i / max(1, n - 1)
+        stops.append((pos, color_str))
+
+    return cx, cy, rx, ry, stops
+
+
 def _get_list_marker(node, list_type: str) -> str:
     """Return the marker string for a list item."""
     from html.dom import Element
@@ -535,14 +695,15 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         border_radius_str = style.get('border-radius', '0')
         radius = _parse_px(border_radius_str) if border_radius_str not in ('0', '') else 0
 
-        # box-shadow — drawn first (behind background)
+        # box-shadow — drawn first (behind background); supports multiple shadows
         shadow = style.get('box-shadow', 'none')
         if shadow and shadow not in ('none', ''):
-            _shadow = _parse_shadow(shadow)
-            if _shadow is not None:
-                ox, oy, blur, spread, scolor = _shadow
-                _emit(DrawBoxShadow(box.border_rect, ox, oy, blur, spread,
-                                    scolor, border_radius=radius))
+            shadows = _parse_all_shadows(shadow)
+            # CSS spec: first shadow is topmost, so draw in reverse order
+            for ox, oy, blur, spread, scolor, inset in reversed(shadows):
+                if not inset:  # inset shadows drawn after background
+                    _emit(DrawBoxShadow(box.border_rect, ox, oy, blur, spread,
+                                        scolor, border_radius=radius))
 
         # Background color
         bg = style.get('background-color', 'transparent')
@@ -563,13 +724,18 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                 from rendering.display_list import DrawImage
                 _emit(DrawImage(box.x, box.y, qimage, box.content_width, box.content_height))
 
-        # Background image (linear-gradient)
+        # Background image (linear-gradient / radial-gradient)
         bg_image = style.get('background-image', 'none')
         if bg_image and bg_image not in ('none', ''):
             grad = _parse_linear_gradient(bg_image, box.border_rect)
             if grad is not None:
                 angle, stops = grad
                 _emit(DrawLinearGradient(box.border_rect, angle, stops))
+            else:
+                rgrad = _parse_radial_gradient(bg_image, box.border_rect)
+                if rgrad is not None:
+                    rcx, rcy, rrx, rry, rstops = rgrad
+                    _emit(DrawRadialGradient(box.border_rect, rcx, rcy, rrx, rry, rstops))
 
         # Border
         _SIDES = ('top', 'right', 'bottom', 'left')
@@ -583,6 +749,16 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         )
         if any(s not in ('none', '', 'hidden') for s in side_styles):
             _emit(DrawBorder(box.border_rect, box.border, side_colors, side_styles))
+
+        # Outline (drawn outside border box, does not affect layout)
+        outline_style = style.get('outline-style', 'none')
+        if outline_style and outline_style not in ('none', '', 'hidden'):
+            outline_width = _parse_px(style.get('outline-width', '0'))
+            if outline_width > 0:
+                outline_color = style.get('outline-color', style.get('color', 'black'))
+                outline_offset = _parse_px(style.get('outline-offset', '0'))
+                _emit(DrawOutline(box.border_rect, outline_width, outline_style,
+                                  outline_color, outline_offset))
 
         # overflow: hidden/scroll/auto → clip children to padding box
         overflow = style.get('overflow', style.get('overflow-x', 'visible'))
@@ -623,12 +799,18 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                 _build_display_list(child, child_dl, child_stacking)
             for cmd in child_dl:
                 target.append(cmd)
-            target.extend(child_stacking)
+            # Flatten child stacking contexts into our target
+            for item in child_stacking:
+                if isinstance(item, tuple) and len(item) == 3:
+                    target.extend(item[2])
+                else:
+                    target.append(item)
         else:
             for child in node.children:
                 _build_display_list(child, display_list, stacking_top)
 
         # Inline text/images (from line boxes if set)
+        text_shadow = style.get('text-shadow', '')
         if hasattr(node, 'line_boxes'):
             for line in node.line_boxes:
                 for item in line.items:
@@ -658,6 +840,7 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                             weight=item.font_weight,
                             italic=item.font_italic,
                             advance_width=item.width,
+                            text_shadow=text_shadow if text_shadow and text_shadow != 'none' else '',
                         )
                     else:
                         continue
@@ -673,7 +856,13 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
             _emit(PopTransform())
 
         if is_stacking:
-            stacking_top.extend(target)
+            # Pack z-index for proper stacking order
+            z_str = style.get('z-index', 'auto')
+            try:
+                z_index = int(z_str) if z_str not in ('auto', '') else 0
+            except (ValueError, TypeError):
+                z_index = 0
+            stacking_top.append((z_index, len(stacking_top), target))
 
     elif isinstance(node, Text):
         pass  # Text is handled via line_boxes on parent elements

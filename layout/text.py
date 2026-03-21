@@ -82,6 +82,31 @@ def measure_word(word: str, style: dict) -> tuple[float, float]:
     return w + word_spacing, h
 
 
+def resolve_font_family(family: str) -> str:
+    """Resolve a CSS font-family list to a single family name.
+
+    Returns the first available family or the first in the list as fallback.
+    """
+    families = [f.strip().strip('"\'') for f in family.split(',')]
+    _GENERIC = {
+        'serif': 'Times New Roman',
+        'sans-serif': 'Arial',
+        'monospace': 'Courier New',
+        'cursive': 'Comic Sans MS',
+        'fantasy': 'Impact',
+        'system-ui': 'Arial',
+        'ui-sans-serif': 'Arial',
+        'ui-serif': 'Times New Roman',
+        'ui-monospace': 'Courier New',
+    }
+    for f in families:
+        if f.lower() in _GENERIC:
+            return _GENERIC[f.lower()]
+        if f:
+            return f
+    return 'Arial'
+
+
 def _parse_px(value: str) -> float:
     """Extract numeric px value from a CSS length string."""
     if not value:

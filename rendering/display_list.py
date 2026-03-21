@@ -32,6 +32,7 @@ class DrawText:
     weight: str = 'normal'
     italic: bool = False
     advance_width: float = 0.0
+    text_shadow: str = ''      # CSS text-shadow value
 
 
 @dataclass
@@ -119,6 +120,27 @@ class DrawLinearGradient:
     rect: Any           # layout.box.Rect
     angle: float        # degrees — 0=top→bottom, 90=left→right, 180=bottom→top
     color_stops: list   # [(position: float 0..1, color_str), ...]
+
+
+@dataclass
+class DrawRadialGradient:
+    """Draw a radial gradient background fill."""
+    rect: Any           # layout.box.Rect
+    cx: float           # center x (absolute)
+    cy: float           # center y (absolute)
+    radius_x: float     # horizontal radius
+    radius_y: float     # vertical radius
+    color_stops: list   # [(position: float 0..1, color_str), ...]
+
+
+@dataclass
+class DrawOutline:
+    """Draw an outline (outside the border box)."""
+    rect: Any           # layout.box.Rect (border box)
+    width: float
+    style: str          # solid, dashed, dotted, etc.
+    color: str
+    offset: float = 0.0
 
 
 class DisplayList:

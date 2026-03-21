@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QFontMetrics, QPen, QBrush,
-    QPixmap, QImage, QLinearGradient,
+    QPixmap, QImage, QLinearGradient, QRadialGradient,
 )
 from PyQt6.QtCore import Qt, QRect, QSize, QPoint, pyqtSignal
 from PyQt6.QtCore import QTimer
@@ -18,7 +18,7 @@ from rendering.display_list import (
     DisplayList, DrawRect, DrawText, DrawBorder, DrawImage, DrawInput,
     PushClip, PopClip, PushOpacity, PopOpacity,
     PushTransform, PopTransform, DrawLinearGradient,
-    DrawBoxShadow,
+    DrawBoxShadow, DrawRadialGradient, DrawOutline,
 )
 
 
@@ -363,6 +363,81 @@ class BrowserWidget(QMainWindow):
         self.viewport_changed.emit(width, height)
 
 
+def _draw_text_shadow(painter: QPainter, text: str, x: int, y: int, font: QFont, shadow_str: str) -> None:
+    """Draw text shadows parsed from a CSS text-shadow value."""
+    import re
+    # Parse shadow: offset-x offset-y [blur-radius] color
+    # May have multiple comma-separated shadows
+    for part in _split_top_level_commas(shadow_str):
+        part = part.strip()
+        if not part or part == 'none':
+            continue
+        color_str = 'rgba(0,0,0,0.5)'
+        # Extract color function or named/hex color
+        def _extract(m):
+            nonlocal color_str
+            color_str = m.group(0)
+            return ''
+        cleaned = re.sub(r'(rgba?\s*\([^)]+\)|hsla?\s*\([^)]+\))', _extract, part)
+        nums = []
+        for tok in cleaned.split():
+            tok = tok.strip(',')
+            if not tok:
+                continue
+            try:
+                if tok.endswith('px'):
+                    nums.append(float(tok[:-2]))
+                else:
+                    nums.append(float(tok))
+            except ValueError:
+                color_str = tok
+        if len(nums) < 2:
+            continue
+        ox, oy = nums[0], nums[1]
+        blur = nums[2] if len(nums) >= 3 else 0
+        sc = _parse_color(color_str)
+        if blur > 0:
+            # Approximate blur with multiple offset draws
+            steps = max(2, min(int(blur), 6))
+            base_alpha = sc.alpha()
+            for i in range(steps):
+                t = (i + 1) / steps
+                a = int(base_alpha * (1.0 - t) / steps * 2)
+                if a < 1:
+                    continue
+                bc = QColor(sc.red(), sc.green(), sc.blue(), a)
+                painter.setPen(bc)
+                spread = blur * t
+                for dx in (-spread, 0, spread):
+                    for dy in (-spread, 0, spread):
+                        painter.drawText(int(x + ox + dx), int(y + oy + dy), text)
+        else:
+            painter.setPen(sc)
+            painter.drawText(int(x + ox), int(y + oy), text)
+
+
+def _split_top_level_commas(s: str) -> list:
+    """Split string by commas that are not inside parentheses."""
+    parts = []
+    depth = 0
+    current = []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current))
+    return parts
+
+
 def paint(display_list: DisplayList, painter: QPainter) -> None:
     """Execute display list draw commands using QPainter."""
     clip_stack = []
@@ -398,9 +473,13 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
             color = _parse_color(cmd.color)
             font = _make_qfont(cmd.font)
             painter.setFont(font)
-            painter.setPen(color)
             fm = QFontMetrics(font)
             text_y = int(cmd.y + fm.ascent())
+            # Text shadow (rendered before main text)
+            text_shadow = getattr(cmd, 'text_shadow', '')
+            if text_shadow and text_shadow not in ('none', ''):
+                _draw_text_shadow(painter, cmd.text, int(cmd.x), text_y, font, text_shadow)
+            painter.setPen(color)
             painter.drawText(int(cmd.x), text_y, cmd.text)
             # Text decoration
             dec = getattr(cmd, 'decoration', 'none')
@@ -412,6 +491,9 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
                 if 'line-through' in dec:
                     lt_y = int(cmd.y + fm.ascent() - fm.ascent() // 3)
                     painter.drawLine(int(cmd.x), lt_y, int(cmd.x) + tw, lt_y)
+                if 'overline' in dec:
+                    ol_y = int(cmd.y)
+                    painter.drawLine(int(cmd.x), ol_y, int(cmd.x) + tw, ol_y)
 
         elif isinstance(cmd, DrawBorder):
             r = cmd.rect
@@ -508,37 +590,38 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
                 continue
             blur = max(0.0, cmd.blur_radius)
             spread = cmd.spread
-            # Draw blurred shadow using multiple expanding semi-transparent layers
             sr_x = r.x + cmd.offset_x - spread
             sr_y = r.y + cmd.offset_y - spread
             sr_w = r.width + spread * 2
             sr_h = r.height + spread * 2
+            br = cmd.border_radius
             if blur > 0:
-                steps = max(3, min(int(blur), 10))
+                # Gaussian-like approximation: more steps for smoother result
+                steps = max(4, min(int(blur * 1.5), 20))
                 base_alpha = sc.alpha()
+                painter.setPen(Qt.PenStyle.NoPen)
                 for i in range(steps):
                     t = (i + 1) / steps
                     expand = blur * t
-                    layer_color = QColor(sc.red(), sc.green(), sc.blue(),
-                                         int(base_alpha * (1.0 - t) / steps))
+                    # Gaussian-inspired alpha falloff
+                    alpha = base_alpha * (1.0 - t * t) / steps * 1.5
+                    if alpha < 1:
+                        continue
+                    layer_color = QColor(sc.red(), sc.green(), sc.blue(), int(alpha))
                     painter.setBrush(QBrush(layer_color))
-                    painter.setPen(Qt.PenStyle.NoPen)
-                    if cmd.border_radius > 0:
-                        painter.drawRoundedRect(
-                            int(sr_x - expand), int(sr_y - expand),
-                            int(sr_w + expand * 2), int(sr_h + expand * 2),
-                            cmd.border_radius, cmd.border_radius)
+                    lx = int(sr_x - expand)
+                    ly = int(sr_y - expand)
+                    lw = int(sr_w + expand * 2)
+                    lh = int(sr_h + expand * 2)
+                    if br > 0:
+                        painter.drawRoundedRect(lx, ly, lw, lh, br + expand * 0.5, br + expand * 0.5)
                     else:
-                        painter.drawRect(
-                            int(sr_x - expand), int(sr_y - expand),
-                            int(sr_w + expand * 2), int(sr_h + expand * 2))
+                        painter.drawRect(lx, ly, lw, lh)
             else:
                 painter.setBrush(QBrush(sc))
                 painter.setPen(Qt.PenStyle.NoPen)
-                if cmd.border_radius > 0:
-                    painter.drawRoundedRect(
-                        int(sr_x), int(sr_y), int(sr_w), int(sr_h),
-                        cmd.border_radius, cmd.border_radius)
+                if br > 0:
+                    painter.drawRoundedRect(int(sr_x), int(sr_y), int(sr_w), int(sr_h), br, br)
                 else:
                     painter.drawRect(int(sr_x), int(sr_y), int(sr_w), int(sr_h))
 
@@ -585,6 +668,43 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
             painter.setBrush(QBrush(gradient))
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawRect(int(r.x), int(r.y), int(r.width), int(r.height))
+
+        elif isinstance(cmd, DrawRadialGradient):
+            r = cmd.rect
+            gradient = QRadialGradient(cmd.cx, cmd.cy, max(cmd.radius_x, cmd.radius_y))
+            gradient.setFocalPoint(cmd.cx, cmd.cy)
+            for pos, color_str in cmd.color_stops:
+                gradient.setColorAt(max(0.0, min(1.0, pos)), _parse_color(color_str))
+            painter.setBrush(QBrush(gradient))
+            painter.setPen(Qt.PenStyle.NoPen)
+            if cmd.radius_x != cmd.radius_y and cmd.radius_x > 0:
+                # Elliptical: scale Y to simulate non-circular gradient
+                painter.save()
+                painter.translate(cmd.cx, cmd.cy)
+                painter.scale(1.0, cmd.radius_y / cmd.radius_x)
+                painter.translate(-cmd.cx, -cmd.cy)
+                painter.drawRect(int(r.x), int(r.y), int(r.width), int(r.height))
+                painter.restore()
+            else:
+                painter.drawRect(int(r.x), int(r.y), int(r.width), int(r.height))
+
+        elif isinstance(cmd, DrawOutline):
+            r = cmd.rect
+            offset = cmd.offset
+            pen = QPen(_parse_color(cmd.color))
+            pen.setWidth(max(1, int(cmd.width)))
+            if cmd.style == 'dashed':
+                pen.setStyle(Qt.PenStyle.DashLine)
+            elif cmd.style == 'dotted':
+                pen.setStyle(Qt.PenStyle.DotLine)
+            else:
+                pen.setStyle(Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            hw = cmd.width / 2 + offset
+            painter.drawRect(
+                int(r.x - hw), int(r.y - hw),
+                int(r.width + hw * 2), int(r.height + hw * 2))
 
 
 def run_browser(display_list: DisplayList, page_height: int = 600,
