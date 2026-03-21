@@ -259,6 +259,48 @@ class TestBlockHeight(unittest.TestCase):
         self.assertGreaterEqual(box.content_height, 100)
 
 
+class TestBlockImages(unittest.TestCase):
+
+    def test_block_img_uses_width_attribute(self):
+        img = make_element('img', style={'display': 'block'})
+        img.attributes['width'] = '240px'
+        img.natural_width = 2000
+        img.natural_height = 1000
+
+        box = do_layout(img, make_container(width=800))
+
+        self.assertEqual(box.content_width, 240)
+        self.assertEqual(box.content_height, 120)
+
+    def test_block_img_margin_auto_centers_intrinsic_width(self):
+        img = make_element('img', style={
+            'display': 'block',
+            'margin-left': 'auto',
+            'margin-right': 'auto',
+            'margin-top': '0px',
+            'margin-bottom': '0px',
+        })
+        img.natural_width = 250
+        img.natural_height = 125
+
+        box = do_layout(img, make_container(width=600))
+
+        self.assertEqual(box.x, 175)
+        self.assertEqual(box.content_width, 250)
+        self.assertEqual(box.content_height, 125)
+
+    def test_block_img_height_attribute_backfills_width_from_aspect_ratio(self):
+        img = make_element('img', style={'display': 'block'})
+        img.attributes['height'] = '150'
+        img.natural_width = 400
+        img.natural_height = 200
+
+        box = do_layout(img, make_container(width=800))
+
+        self.assertEqual(box.content_width, 300)
+        self.assertEqual(box.content_height, 150)
+
+
 class TestBlockMarginCollapsing(unittest.TestCase):
 
     def test_adjacent_margins_collapse(self):
@@ -310,6 +352,33 @@ class TestBlockMarginCollapsing(unittest.TestCase):
         box = do_layout(parent)
         # collapsed = 10, total = 20 + 10 + 20 = 50
         self.assertEqual(box.content_height, 50)
+
+    def test_negative_top_margin_pulls_following_block_up(self):
+        child = make_element(style={
+            'display': 'block', 'height': '20px',
+            'margin-top': '-15px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        parent = make_element(style={'display': 'block'}, children=[child])
+        box = do_layout(parent)
+        self.assertEqual(child.box.y, -15)
+        self.assertEqual(box.content_height, 5)
+
+    def test_positive_and_negative_margins_sum_when_collapsing(self):
+        child1 = make_element(style={
+            'display': 'block', 'height': '20px',
+            'margin-top': '0px', 'margin-bottom': '30px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        child2 = make_element(style={
+            'display': 'block', 'height': '20px',
+            'margin-top': '-10px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        parent = make_element(style={'display': 'block'}, children=[child1, child2])
+        box = do_layout(parent)
+        self.assertEqual(child2.box.y, 40)
+        self.assertEqual(box.content_height, 60)
 
 
 class TestBlockDisplayNone(unittest.TestCase):

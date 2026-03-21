@@ -15,7 +15,7 @@ from PyQt6.QtCore import Qt, QRect, QSize, QPoint, pyqtSignal
 from PyQt6.QtCore import QTimer
 
 from rendering.display_list import (
-    DisplayList, DrawRect, DrawText, DrawBorder, DrawImage,
+    DisplayList, DrawRect, DrawText, DrawBorder, DrawImage, DrawInput,
     PushClip, PopClip, PushOpacity, PopOpacity,
     PushTransform, PopTransform, DrawLinearGradient,
     DrawBoxShadow,
@@ -177,6 +177,8 @@ def _parse_color(color_str: str) -> QColor:
 
 def _make_qfont(font_tuple: tuple) -> QFont:
     """Create QFont from (family, size_px[, weight_str[, style_str]]) tuple."""
+    from layout.text import resolve_font_family
+
     family = 'Arial'
     size_px = 16
     weight_str = 'normal'
@@ -184,7 +186,7 @@ def _make_qfont(font_tuple: tuple) -> QFont:
 
     if isinstance(font_tuple, (list, tuple)):
         if len(font_tuple) >= 1:
-            family = str(font_tuple[0]).split(',')[0].strip().strip('"\'') or 'Arial'
+            family = resolve_font_family(str(font_tuple[0]) or 'Arial')
         if len(font_tuple) >= 2:
             try:
                 size_px = max(1, int(font_tuple[1]))
@@ -403,7 +405,7 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
             # Text decoration
             dec = getattr(cmd, 'decoration', 'none')
             if dec and dec not in ('none', ''):
-                tw = fm.horizontalAdvance(cmd.text)
+                tw = int(round(cmd.advance_width)) if getattr(cmd, 'advance_width', 0) > 0 else fm.horizontalAdvance(cmd.text)
                 if 'underline' in dec:
                     ul_y = text_y + 2
                     painter.drawLine(int(cmd.x), ul_y, int(cmd.x) + tw, ul_y)
@@ -469,6 +471,24 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
                         painter.drawPixmap(int(cmd.x), int(cmd.y), pixmap)
                 except Exception:
                     pass
+
+        elif isinstance(cmd, DrawInput):
+            bg = _parse_color(cmd.background_color)
+            border = _parse_color(cmd.border_color)
+            painter.setBrush(QBrush(bg))
+            pen = QPen(border)
+            pen.setWidth(max(1, int(cmd.border_width)))
+            painter.setPen(pen)
+            painter.drawRect(int(cmd.x), int(cmd.y), int(cmd.width), int(cmd.height))
+
+            if cmd.text:
+                font = _make_qfont(cmd.font)
+                painter.setFont(font)
+                painter.setPen(_parse_color(cmd.color))
+                fm = QFontMetrics(font)
+                text_x = int(cmd.x + 4)
+                text_y = int(cmd.y + max(0, (cmd.height - fm.height()) / 2) + fm.ascent())
+                painter.drawText(text_x, text_y, cmd.text)
 
         elif isinstance(cmd, PushClip):
             r = cmd.rect

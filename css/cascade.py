@@ -1,6 +1,8 @@
 """CSS cascade: applies styles from all sources to every Element in the DOM."""
 import re
 import logging
+import sys
+from urllib.parse import urlparse
 from html.dom import Document, Element, Text, Node
 import css.parser as css_parser
 import css.selector as selector_mod
@@ -8,6 +10,10 @@ from css.properties import PROPERTIES, expand_shorthand
 from collections import defaultdict
 
 _logger = logging.getLogger(__name__)
+_FONT_FACE_CACHE: dict[str, bool] = {}
+_SFNT_MAGIC = {b'\x00\x01\x00\x00', b'OTTO', b'true', b'ttcf'}
+_SAFE_FONT_EXTS = {'.ttf', '.otf', '.ttc', '.otc'}
+_VAR_SHORTHANDS = {'border', 'border-top', 'border-right', 'border-bottom', 'border-left'}
 
 
 def bind(document: Document, ua_css_path: str,
@@ -65,6 +71,8 @@ def bind(document: Document, ua_css_path: str,
 
 def _load_font_faces(rules: list, base_url: str) -> None:
     """Parse @font-face rules and register fonts via QFontDatabase."""
+    if sys.platform.startswith('win'):
+        return
     try:
         from PyQt6.QtGui import QFontDatabase
         from PyQt6.QtCore import QByteArray
@@ -73,25 +81,68 @@ def _load_font_faces(rules: list, base_url: str) -> None:
     for rule in rules:
         if hasattr(rule, 'name') and rule.name == 'font-face':
             family = None
-            src_url = None
+            src_value = None
             for decl in getattr(rule, 'declarations', []):
                 if decl.property == 'font-family':
                     family = decl.value.strip().strip('"\'')
                 elif decl.property == 'src':
-                    m = re.search(r"url\(['\"]?([^'\")\s]+)['\"]?\)", decl.value)
-                    if m:
-                        src_url = m.group(1)
+                    src_value = decl.value
+            src_url = _pick_font_face_src(src_value) if src_value else None
             if family and src_url:
                 try:
                     from network.http import fetch_bytes, resolve_url
                     url = resolve_url(base_url, src_url) if base_url else src_url
+                    cached = _FONT_FACE_CACHE.get(url)
+                    if cached is False:
+                        continue
+                    if cached is True:
+                        continue
                     font_data = fetch_bytes(url)
-                    QFontDatabase.addApplicationFontFromData(QByteArray(font_data))
-                except Exception:
-                    pass
+                    if not _looks_like_sfnt_font(font_data):
+                        _FONT_FACE_CACHE[url] = False
+                        continue
+                    font_id = QFontDatabase.addApplicationFontFromData(QByteArray(font_data))
+                    _FONT_FACE_CACHE[url] = font_id >= 0
+                except Exception as exc:
+                    _FONT_FACE_CACHE[url] = False
+                    _logger.debug('Ignoring @font-face load failure for %s: %s', src_url, exc)
         # Recurse into @media blocks
         if hasattr(rule, 'rules') and rule.rules:
             _load_font_faces(rule.rules, base_url)
+
+
+def _pick_font_face_src(src_value: str | None) -> str | None:
+    """Prefer TrueType/OpenType sources and skip formats that are unsafe in Qt."""
+    if not src_value:
+        return None
+    matches = re.findall(
+        r"url\(['\"]?([^'\")\s]+)['\"]?\)\s*(?:format\(['\"]?([^'\")]+)['\"]?\))?",
+        src_value,
+        re.I,
+    )
+    if not matches:
+        return None
+
+    fallback = None
+    for raw_url, fmt in matches:
+        parsed = urlparse(raw_url)
+        ext = ''
+        if parsed.path:
+            _, _, ext = parsed.path.rpartition('.')
+            ext = f'.{ext.lower()}' if ext else ''
+        fmt = (fmt or '').strip().lower()
+        if ext in _SAFE_FONT_EXTS or fmt in ('truetype', 'opentype', 'collection'):
+            return raw_url
+        if fallback is None:
+            fallback = raw_url
+    return fallback
+
+
+def _looks_like_sfnt_font(raw: bytes) -> bool:
+    """Accept only SFNT-based fonts to avoid Qt/DirectWrite crashes on Windows."""
+    if not raw or len(raw) < 4:
+        return False
+    return raw[:4] in _SFNT_MAGIC
 
 
 def _load_ua(path: str) -> list:
@@ -235,10 +286,15 @@ def _media_condition_matches(cond: str, viewport_width: int, viewport_height: in
     cond = cond.strip().lower()
     if not cond:
         return True
+    if cond.startswith('only '):
+        cond = cond[5:].strip()
     if cond in ('all', 'screen'):
         return True
-    if cond == 'print':
+    if cond in ('print', 'handheld', 'speech', 'tv', 'projection', 'tty', 'braille', 'embossed'):
         return False
+    if cond.startswith('(') and cond.endswith(')'):
+        return _media_feature_matches(cond[1:-1].strip(), viewport_width, viewport_height)
+    return False
 
     # Parenthesised feature
     if cond.startswith('(') and cond.endswith(')'):
@@ -268,6 +324,36 @@ def _media_condition_matches(cond: str, viewport_width: int, viewport_height: in
 
     # Unknown media type
     return True
+
+
+def _media_feature_matches(feature: str, viewport_width: int, viewport_height: int) -> bool:
+    """Evaluate a media feature expression inside parentheses."""
+    m = re.match(r'([\w-]+)\s*:\s*(-?\d+(?:\.\d+)?)(px|em|rem)?', feature)
+    if not m:
+        return False
+
+    name = m.group(1)
+    value = _media_length_to_px(float(m.group(2)), m.group(3) or 'px')
+
+    if name in ('min-width', 'min-device-width'):
+        return viewport_width >= value
+    if name in ('max-width', 'max-device-width'):
+        return viewport_width <= value
+    if name in ('min-height', 'min-device-height'):
+        return viewport_height >= value
+    if name in ('max-height', 'max-device-height'):
+        return viewport_height <= value
+    return False
+
+
+def _media_length_to_px(value: float, unit: str) -> float:
+    """Convert CSS media-query lengths to px."""
+    unit = unit.lower()
+    if unit == 'px':
+        return value
+    if unit in ('em', 'rem'):
+        return value * 16.0
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +601,8 @@ def _apply_to_element(node: Element, index: dict) -> None:
                         css_vars[decl.property] = decl.value
                     else:
                         expanded = expand_shorthand(decl.property, decl.value)
+                        if decl.property in _VAR_SHORTHANDS and 'var(' in decl.value:
+                            expanded[decl.property] = decl.value
                         if decl.important:
                             important.update(expanded)
                         else:
@@ -536,7 +624,10 @@ def _apply_to_element(node: Element, index: dict) -> None:
                 if k.startswith('--'):
                     css_vars[k] = v
                 else:
-                    computed.update(expand_shorthand(k, v))
+                    expanded = expand_shorthand(k, v)
+                    if k in _VAR_SHORTHANDS and 'var(' in v:
+                        expanded[k] = v
+                    computed.update(expanded)
         except Exception as exc:
             _logger.debug('Inline style parse error on <%s>: %s', node.tag, exc)
 
@@ -684,6 +775,7 @@ def _resolve_vars_iterative(document) -> None:
             for prop, val in list(style.items()):
                 if val and 'var(' in val:
                     style[prop] = _replace_vars(val, vars_dict)
+            _expand_resolved_var_shorthands(style)
 
             child_vars = vars_dict
         else:
@@ -720,6 +812,35 @@ def _replace_vars(value: str, vars_dict: dict) -> str:
         if result == prev:
             break
     return result
+
+
+def _expand_resolved_var_shorthands(style: dict) -> None:
+    border_value = style.get('border')
+    if border_value and border_value not in ('none', '') and 'var(' not in border_value:
+        if _border_longhands_look_unresolved(style):
+            style.update(expand_shorthand('border', border_value))
+
+    for side in ('top', 'right', 'bottom', 'left'):
+        prop = f'border-{side}'
+        value = style.get(prop)
+        if value and value not in ('none', '') and 'var(' not in value:
+            if _border_side_longhands_look_unresolved(style, side):
+                style.update(expand_shorthand(prop, value))
+
+
+def _border_longhands_look_unresolved(style: dict) -> bool:
+    return all(_border_side_longhands_look_unresolved(style, side) for side in ('top', 'right', 'bottom', 'left'))
+
+
+def _border_side_longhands_look_unresolved(style: dict, side: str) -> bool:
+    width = style.get(f'border-{side}-width', '')
+    border_style = style.get(f'border-{side}-style', '')
+    color = style.get(f'border-{side}-color', '')
+    return (
+        width in ('', 'medium')
+        and color in ('', 'currentcolor')
+        and border_style in ('', 'none', 'solid')
+    )
 
 
 # ---------------------------------------------------------------------------

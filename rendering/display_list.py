@@ -31,6 +31,7 @@ class DrawText:
     decoration: str = 'none'   # 'underline', 'line-through', 'none'
     weight: str = 'normal'
     italic: bool = False
+    advance_width: float = 0.0
 
 
 @dataclass
@@ -53,6 +54,21 @@ class DrawImage:
     image_data: Any    # QImage, QPixmap, or PIL Image
     width: float = 0.0
     height: float = 0.0
+
+
+@dataclass
+class DrawInput:
+    """Draw a simple text input control."""
+    x: float
+    y: float
+    width: float
+    height: float
+    text: str
+    font: tuple
+    color: str
+    background_color: str = 'white'
+    border_color: str = '#767676'
+    border_width: float = 1.0
 
 
 @dataclass

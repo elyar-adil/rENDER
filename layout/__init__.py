@@ -6,7 +6,7 @@ from layout.inline import layout_inline
 from layout.grid import layout_grid
 from rendering.display_list import (
     DisplayList, PushOpacity, PopOpacity, PushTransform, PopTransform,
-    DrawBoxShadow,
+    DrawBoxShadow, DrawInput,
 )
 
 
@@ -549,6 +549,13 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         if bg and bg != 'transparent':
             _emit(DrawRect(box.border_rect, bg, border_radius=radius))
 
+        bg_qimage = getattr(node, 'background_qimage', None)
+        if bg_qimage is not None:
+            _emit(DrawImage(
+                box.border_rect.x, box.border_rect.y,
+                bg_qimage, box.border_rect.width, box.border_rect.height,
+            ))
+
         # <img> element: draw the image directly using the layout box
         if node.tag == 'img':
             qimage = getattr(node, 'qimage', None)
@@ -595,7 +602,7 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
             if list_type != 'none':
                 marker = _get_list_marker(node, list_type)
                 if marker:
-                    font_family = style.get('font-family', 'Arial').split(',')[0].strip().strip('"\'')
+                    font_family = style.get('font-family', 'Arial')
                     try:
                         font_size = int(_parse_px(style.get('font-size', '16px')))
                     except Exception:
@@ -630,6 +637,17 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                             item.x, item.y, item.qimage,
                             item.width, item.height,
                         )
+                    elif getattr(item, 'control_type', '') == 'text-input':
+                        cmd = DrawInput(
+                            item.x, item.y, item.width, item.height,
+                            item.control_value,
+                            (item.font_family, int(item.font_size),
+                             item.font_weight, 'italic' if item.font_italic else ''),
+                            item.color,
+                            background_color=item.background_color,
+                            border_color=item.border_color,
+                            border_width=item.border_width,
+                        )
                     elif item.text:
                         cmd = DrawText(
                             item.x, item.y, item.text,
@@ -639,6 +657,7 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                             decoration=item.decoration,
                             weight=item.font_weight,
                             italic=item.font_italic,
+                            advance_width=item.width,
                         )
                     else:
                         continue
