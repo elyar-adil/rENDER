@@ -87,6 +87,18 @@ class TestMediaQueries(unittest.TestCase):
     def test_and_one_false(self):
         self.assertFalse(_media_matches('screen and (min-width: 1200px)', 980, 600))
 
+    def test_only_screen_prefix_is_ignored(self):
+        self.assertTrue(_media_matches('only screen and (min-width: 60em)', 980, 600))
+
+    def test_em_units_are_converted_to_px(self):
+        self.assertFalse(_media_matches('screen and (max-width: 40em)', 980, 600))
+
+    def test_max_device_width_is_not_treated_as_always_true(self):
+        self.assertFalse(_media_matches('only screen and (max-device-width: 40em)', 980, 600))
+
+    def test_handheld_media_type_does_not_match_desktop_viewport(self):
+        self.assertFalse(_media_matches('handheld, only screen and (max-device-width: 40em)', 980, 600))
+
     def test_not_negates(self):
         self.assertTrue(_media_matches('not print', 980, 600))
         self.assertFalse(_media_matches('not screen', 980, 600))
@@ -368,6 +380,26 @@ class TestCascadeIntegration(unittest.TestCase):
 
         doc, body = self._make_doc_inline('#hero { display: flex; }', add_div)
         self.assertEqual(body._div.style.get('display'), 'flex')
+
+    def test_border_shorthand_with_var_expands_after_var_resolution(self):
+        def add_img(body):
+            img = Element('img')
+            img.style = {}
+            img.parent = body
+            body.children.append(img)
+            body._img = img
+
+        doc, body = self._make_doc_inline(
+            ':root { --bw: 1px; --bc: #999999; } img { border: var(--bw) solid var(--bc); }',
+            add_img,
+        )
+        img = body._img
+        self.assertEqual(img.style.get('border-top-width'), '1px')
+        self.assertEqual(img.style.get('border-right-width'), '1px')
+        self.assertEqual(img.style.get('border-bottom-width'), '1px')
+        self.assertEqual(img.style.get('border-left-width'), '1px')
+        self.assertEqual(img.style.get('border-top-style'), 'solid')
+        self.assertEqual(img.style.get('border-top-color'), '#999999')
 
     def test_specificity_id_beats_class(self):
         def add_div(body):
