@@ -37,12 +37,24 @@ def _process_element(node: Element, parent_font_size: float, root_font_size: flo
         'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
         'top', 'right', 'bottom', 'left',
         'word-spacing', 'letter-spacing',
+        'border-radius', 'text-indent',
+        'outline-width', 'outline-offset',
+        'column-gap', 'row-gap',
+        'border-top-left-radius', 'border-top-right-radius',
+        'border-bottom-left-radius', 'border-bottom-right-radius',
     ]
     for prop in _length_props:
         if prop in node.style:
             resolved = _resolve_length(node.style[prop], font_size, root_font_size, vw, vh)
             if resolved is not None:
                 node.style[prop] = f'{resolved}px'
+
+    # line-height: resolve em/rem but keep unitless/normal as-is
+    lh = node.style.get('line-height', '')
+    if lh and lh not in ('normal', 'inherit', 'initial', ''):
+        resolved = _resolve_length(lh, font_size, root_font_size, vw, vh)
+        if resolved is not None:
+            node.style['line-height'] = f'{resolved}px'
 
     return font_size
 

@@ -449,7 +449,7 @@ class BlockLayout(LayoutEngine):
 
         if is_replaced_img:
             content_width = _resolve_replaced_img_width(
-                node, getattr(node, 'style', {}) or {}, c_width,
+                child, getattr(child, 'style', {}) or {}, c_width,
                 margin, padding, border_w, box_sizing,
             )
         elif width_str in ('auto', ''):

@@ -367,6 +367,33 @@ def _parse_font_value(value: str) -> dict:
 
 
 # -----------------------------------------------------------------------
+# Outline shorthand parsing
+# -----------------------------------------------------------------------
+
+_OUTLINE_STYLES = frozenset({
+    'none', 'hidden', 'dotted', 'dashed', 'solid', 'double',
+    'groove', 'ridge', 'inset', 'outset', 'auto',
+})
+
+
+def _parse_outline_value(value: str) -> dict:
+    """Parse CSS outline shorthand: [width] [style] [color]."""
+    result = {}
+    parts = value.split()
+    for part in parts:
+        pl = part.lower()
+        if pl in _OUTLINE_STYLES:
+            result['outline-style'] = part
+        elif re.match(r'^-?\d+(\.\d+)?(px|em|rem|pt)?$', pl) or pl in ('thin', 'medium', 'thick'):
+            result['outline-width'] = part
+        elif _is_color_token(pl):
+            result['outline-color'] = part
+    if not result:
+        result['outline-style'] = value
+    return result
+
+
+# -----------------------------------------------------------------------
 # Background shorthand parsing
 # -----------------------------------------------------------------------
 
@@ -409,7 +436,7 @@ def _parse_background_value(value: str) -> dict:
 
     for tok in tokens:
         tl = tok.lower()
-        if tl.startswith('url('):
+        if tl.startswith('url(') or tl.startswith('linear-gradient(') or tl.startswith('radial-gradient(') or tl.startswith('repeating-linear-gradient(') or tl.startswith('repeating-radial-gradient('):
             result['background-image'] = tok
         elif tl in _BG_REPEATS:
             result['background-repeat'] = tok
@@ -534,6 +561,10 @@ def expand_shorthand(prop: str, value: str) -> dict:
             return parsed
         # fallback: at least set background-color
         return {'background-color': value}
+
+    # ---- outline ----
+    if prop == 'outline':
+        return _parse_outline_value(value)
 
     # ---- gap ----
     if prop == 'gap':
