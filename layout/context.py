@@ -23,7 +23,7 @@ class LayoutContext:
 
     def layout(self, node, container: BoxModel) -> BoxModel | None:
         """Dispatch to the appropriate layout engine and return the node's BoxModel.
-        Sets node.box and calls box.update_legacy() before returning.
+        Sets node.box before returning.
         Returns None if node has display:none.
         """
         from layout._dispatch import layout_node
@@ -47,6 +47,6 @@ class LayoutEngine(ABC):
         - Return a fully-positioned BoxModel for *node*.
         - Set box.x, box.y, box.content_width, box.content_height, box.margin,
           box.padding, box.border.
-        - NOT call node.box = ... or box.update_legacy() — the caller does that.
+        - NOT call node.box = ... — the caller does that.
         - NOT modify ctx.float_mgr for floated descendants; call ctx.fork() first.
         """

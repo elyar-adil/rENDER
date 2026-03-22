@@ -257,7 +257,6 @@ def _layout_children(node, container_box: BoxModel, viewport_width: int) -> None
         else:
             child.box = layout_block(child, container_box, float_mgr, viewport_width)
 
-        child.box.update_legacy()
 
         # Update container height
         container_box.content_height = max(
@@ -279,7 +278,6 @@ def _layout_deferred_abs(node, root_box: BoxModel, viewport_width: int, viewport
                 viewport_width=viewport_width,
                 viewport_height=viewport_height,
             )
-            child.box.update_legacy()
 
 
 def _walk_elements(node):

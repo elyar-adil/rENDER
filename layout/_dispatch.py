@@ -30,7 +30,6 @@ def layout_node(node, container: BoxModel, ctx: LayoutContext) -> BoxModel | Non
     box = engine.layout(node, container, ctx)
     if box is not None:
         node.box = box
-        box.update_legacy()
     return box
 
 

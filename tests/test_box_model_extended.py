@@ -141,20 +141,24 @@ class TestBoxModelRects(unittest.TestCase):
 
 class TestBoxModelLegacy(unittest.TestCase):
 
-    def test_update_legacy_syncs_width(self):
+    def test_width_height_alias_content_dims(self):
         box = BoxModel()
         box.content_width = 150.0
         box.content_height = 75.0
-        box.update_legacy()
         self.assertEqual(box.width, 150.0)
         self.assertEqual(box.height, 75.0)
-        self.assertEqual(box.h, 75.0)
 
-    def test_initial_legacy_fields_zero(self):
+    def test_width_setter_updates_content_width(self):
+        box = BoxModel()
+        box.width = 200.0
+        self.assertEqual(box.content_width, 200.0)
+        box.height = 100.0
+        self.assertEqual(box.content_height, 100.0)
+
+    def test_initial_dims_zero(self):
         box = BoxModel()
         self.assertEqual(box.width, 0.0)
         self.assertEqual(box.height, 0.0)
-        self.assertEqual(box.h, 0.0)
 
     def test_repr(self):
         box = BoxModel()

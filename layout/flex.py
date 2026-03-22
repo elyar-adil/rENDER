@@ -66,7 +66,6 @@ class FlexLayout(LayoutEngine):
 
         if not flex_children:
             box.content_height = 0.0
-            box.update_legacy()
             return box
 
         # Measure children — use a child context derived from flex ctx
@@ -179,7 +178,6 @@ class FlexLayout(LayoutEngine):
                         cb.y = y_cursor + cb.margin.top
                     else:  # flex-start
                         cb.y = y_cursor + cb.margin.top
-                    cb.update_legacy()
                     child.box = cb
 
                 y_cursor += line_height
@@ -200,11 +198,9 @@ class FlexLayout(LayoutEngine):
                 if idx < len(flex_children) - 1:
                     y += row_gap
                 max_width = max(max_width, cb.content_width)
-                cb.update_legacy()
                 child.box = cb
             box.content_height = y - box.y
 
-        box.update_legacy()
         return box
 
 

@@ -96,7 +96,6 @@ def _shift_subtree(node, dx: float, dy: float) -> None:
     if hasattr(node, 'box') and node.box is not None:
         node.box.x += dx
         node.box.y += dy
-        node.box.update_legacy()
 
     if hasattr(node, 'line_boxes'):
         for lb in node.line_boxes:
@@ -322,7 +321,6 @@ class BlockLayout(LayoutEngine):
                 child_ctx = ctx.fork()
                 child_box = BlockLayout().layout(child, tmp, child_ctx)
                 child.box = child_box
-                child_box.update_legacy()
 
                 float_x, float_w = ctx.float_mgr.available_rect(
                     box.y + child_y, child_box.content_height, box.x, box.content_width)
@@ -363,12 +361,10 @@ class BlockLayout(LayoutEngine):
                 else:
                     child_box = BlockLayout().layout(child, child_cont, ctx)
                 child.box = child_box
-                child_box.update_legacy()
 
                 top_margin = child_box.margin.top
                 collapsed = _collapse_adjacent_margins(prev_margin_bottom, top_margin)
                 child_box.y += collapsed - top_margin
-                child_box.update_legacy()
 
                 child_h = (child_box.content_height + child_box.padding.top + child_box.padding.bottom
                            + child_box.border.top + child_box.border.bottom + collapsed)
@@ -410,14 +406,12 @@ class BlockLayout(LayoutEngine):
                 content_height = resolved_h
 
         box.content_height = max(content_height, 0.0)
-        box.update_legacy()
 
         # Absolutely positioned children
         for child, child_pos in abs_children:
             child_box = BlockLayout.layout_absolute(child, box, child_pos,
                                                     ctx.viewport_width, ctx.viewport_height)
             child.box = child_box
-            child_box.update_legacy()
 
         return box
 
@@ -534,7 +528,6 @@ class BlockLayout(LayoutEngine):
         dy = y - old_y
         if dx or dy:
             _shift_subtree(child, dx, dy)
-        cb.update_legacy()
         return cb
 
 
