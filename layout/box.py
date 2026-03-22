@@ -41,16 +41,21 @@ class BoxModel:
         self.border: EdgeSizes = EdgeSizes()
         self.margin: EdgeSizes = EdgeSizes()
 
-        # legacy compat attributes used by old graphics code
-        self.width: float = 0.0    # = content_width (kept in sync)
-        self.height: float = 0.0   # = content_height
-        self.h: float = 0.0        # another legacy alias
+    @property
+    def width(self) -> float:
+        return self.content_width
 
-    def update_legacy(self):
-        """Sync legacy attributes from canonical ones."""
-        self.width = self.content_width
-        self.height = self.content_height
-        self.h = self.content_height
+    @width.setter
+    def width(self, value: float):
+        self.content_width = value
+
+    @property
+    def height(self) -> float:
+        return self.content_height
+
+    @height.setter
+    def height(self, value: float):
+        self.content_height = value
 
     @property
     def content_rect(self) -> Rect:

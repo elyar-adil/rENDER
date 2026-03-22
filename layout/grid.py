@@ -168,7 +168,6 @@ class GridLayout(LayoutEngine):
 
         if not children:
             box.content_height = 0.0
-            box.update_legacy()
             return box
 
         # If no explicit column template, use a single column (block-like layout)
@@ -257,7 +256,6 @@ class GridLayout(LayoutEngine):
 
             cb.x = target_x + cb.margin.left + cb.border.left + cb.padding.left
             cb.y = target_y + cb.margin.top + cb.border.top + cb.padding.top
-            cb.update_legacy()
             child.box = cb
 
         # Total height
@@ -274,7 +272,6 @@ class GridLayout(LayoutEngine):
                 pass
 
         box.content_height = max(total_h, 0.0)
-        box.update_legacy()
         return box
 
 

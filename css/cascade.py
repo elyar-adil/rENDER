@@ -296,35 +296,6 @@ def _media_condition_matches(cond: str, viewport_width: int, viewport_height: in
         return _media_feature_matches(cond[1:-1].strip(), viewport_width, viewport_height)
     return False
 
-    # Parenthesised feature
-    if cond.startswith('(') and cond.endswith(')'):
-        inner = cond[1:-1].strip()
-        # min-width
-        m = re.match(r'min-width\s*:\s*(-?\d+(?:\.\d+)?)(px|em|rem)?', inner)
-        if m:
-            val = float(m.group(1))
-            return viewport_width >= val
-        # max-width
-        m = re.match(r'max-width\s*:\s*(-?\d+(?:\.\d+)?)(px|em|rem)?', inner)
-        if m:
-            val = float(m.group(1))
-            return viewport_width <= val
-        # min-height
-        m = re.match(r'min-height\s*:\s*(-?\d+(?:\.\d+)?)(px|em|rem)?', inner)
-        if m:
-            val = float(m.group(1))
-            return viewport_height >= val
-        # max-height
-        m = re.match(r'max-height\s*:\s*(-?\d+(?:\.\d+)?)(px|em|rem)?', inner)
-        if m:
-            val = float(m.group(1))
-            return viewport_height <= val
-        # Unrecognised feature — assume True (permissive)
-        return True
-
-    # Unknown media type
-    return True
-
 
 def _media_feature_matches(feature: str, viewport_width: int, viewport_height: int) -> bool:
     """Evaluate a media feature expression inside parentheses."""

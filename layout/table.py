@@ -107,7 +107,6 @@ class TableLayout(LayoutEngine):
                 h_str = _gs(tr_node, 'height', getattr(tr_node, 'attributes', {}).get('height', '0'))
                 total_h += max(0.0, _parse_px(h_str)) + cell_spacing
             box.content_height = total_h
-            box.update_legacy()
             return box
 
         col_widths = _compute_col_widths(all_rows, n_cols, table_w, cell_spacing)
@@ -127,8 +126,7 @@ class TableLayout(LayoutEngine):
                 tr_box.x = table_x; tr_box.y = row_y
                 tr_box.content_width = table_w
                 tr_box.content_height = tr_min_h
-                tr_node.box = tr_box; tr_box.update_legacy()
-                y_offset += tr_min_h + cell_spacing
+                tr_node.box = tr_box;                y_offset += tr_min_h + cell_spacing
                 continue
 
             x_offset = cell_spacing
@@ -157,7 +155,6 @@ class TableLayout(LayoutEngine):
                 cell_box.x = table_x + x_offset + pad
                 cell_box.y = row_y + pad
                 cell_box.content_width = inner_w
-                cell_box.update_legacy()
 
                 max_cell_h = max(max_cell_h, cell_box.content_height + 2 * pad)
                 td_node._table_align = align
@@ -169,8 +166,7 @@ class TableLayout(LayoutEngine):
             tr_box = BoxModel()
             tr_box.x = table_x; tr_box.y = row_y
             tr_box.content_width = table_w; tr_box.content_height = max_cell_h
-            tr_node.box = tr_box; tr_box.update_legacy()
-
+            tr_node.box = tr_box;
             x_offset = cell_spacing
             col_idx = 0
             for td_node, colspan in cells:
@@ -205,7 +201,6 @@ class TableLayout(LayoutEngine):
             y_offset += max_cell_h + cell_spacing
 
         box.content_height = y_offset
-        box.update_legacy()
         return box
 
 
@@ -325,7 +320,6 @@ def _shift_subtree(node, dx: float, dy: float) -> None:
         if hasattr(child, 'box') and child.box is not None:
             child.box.x += dx
             child.box.y += dy
-            child.box.update_legacy()
         if hasattr(child, 'line_boxes'):
             for lb in child.line_boxes:
                 lb.x += dx
@@ -368,5 +362,4 @@ def layout_table(node, container_box: BoxModel, viewport_width: int = 980) -> Bo
     box = TableLayout().layout(node, container_box, ctx)
     if box is not None:
         node.box = box
-        box.update_legacy()
     return box

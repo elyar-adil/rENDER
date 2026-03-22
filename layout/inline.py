@@ -53,8 +53,6 @@ class InlineItem:
         b.y = self.y
         b.content_width = self.width
         b.content_height = self.height
-        b.width = self.width
-        b.height = self.height
         return b
 
 
@@ -111,7 +109,6 @@ def _shift_layout_subtree(node, dx: float, dy: float) -> None:
     if hasattr(node, 'box') and node.box is not None:
         node.box.x += dx
         node.box.y += dy
-        node.box.update_legacy()
 
     if hasattr(node, 'line_boxes'):
         for lb in node.line_boxes:
@@ -704,7 +701,6 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
         if promote_atomic:
             box = _layout_inline_block(node, inherited_style, container_width)
             node.box = box
-            node.box.update_legacy()
             item = InlineItem(
                 text='',
                 x=box.x,

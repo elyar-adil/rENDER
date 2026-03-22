@@ -81,7 +81,7 @@ class TestBasicParsing(unittest.TestCase):
     def test_document_type(self):
         doc = parse('<!doctype html><html></html>')
         self.assertIsInstance(doc, Document)
-        self.assertEqual(doc.type, 'ROOT')
+        self.assertEqual(doc.node_type, 'document')
 
 
 class TestDocumentStructure(unittest.TestCase):
@@ -246,7 +246,7 @@ class TestComplexDocument(unittest.TestCase):
 </html>"""
         doc = parse(html)
         self.assertIsInstance(doc, Document)
-        self.assertEqual(doc.type, 'ROOT')
+        self.assertEqual(doc.node_type, 'document')
         self.assertTrue(any(isinstance(c, Element) and c.tag == 'html' for c in doc.children))
         main = _find_tag(doc, 'main')
         self.assertIsNotNone(main)

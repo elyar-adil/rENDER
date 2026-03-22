@@ -108,7 +108,6 @@ class SelectorGroup:
 # ---------------------------------------------------------------------------
 
 @functools.lru_cache(maxsize=4096)
-@functools.lru_cache(maxsize=2048)
 def parse_selector(text: str) -> SelectorGroup:
     """Parse a CSS selector string (may contain commas). LRU-cached."""
     parser = _SelectorParser(text.strip())
