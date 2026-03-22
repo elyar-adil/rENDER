@@ -1,0 +1,14 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    ".cache",
+    "tests/fixtures/webkit/upstream_raw",
+]
+
+[tool.ruff.lint]
+select = ["F"]

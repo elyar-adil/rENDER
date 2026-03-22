@@ -8,6 +8,10 @@ import threading
 from collections import OrderedDict
 
 
+_TEXT_CACHE_KIND = 'text'
+_BYTES_CACHE_KIND = 'bytes'
+
+
 class _HTTPCache:
     """Thread-safe LRU cache for HTTP responses."""
     def __init__(self, maxsize: int = 256):
@@ -15,18 +19,20 @@ class _HTTPCache:
         self._lock = threading.Lock()
         self._maxsize = maxsize
 
-    def get(self, url: str):
+    def get(self, kind: str, url: str):
+        key = (kind, url)
         with self._lock:
-            if url in self._cache:
-                self._cache.move_to_end(url)
-                return self._cache[url]
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
         return None
 
-    def put(self, url: str, value) -> None:
+    def put(self, kind: str, url: str, value) -> None:
+        key = (kind, url)
         with self._lock:
-            if url in self._cache:
-                self._cache.move_to_end(url)
-            self._cache[url] = value
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
@@ -52,7 +58,7 @@ def fetch(url: str) -> tuple[str, str]:
     - Charset detection: Content-Type header > BOM > meta charset > UTF-8 fallback
     - Returns (html_text, final_url)
     """
-    cached = _cache.get(url)
+    cached = _cache.get(_TEXT_CACHE_KIND, url)
     if cached is not None:
         return cached
 
@@ -69,28 +75,13 @@ def fetch(url: str) -> tuple[str, str]:
         encoding_header = response.headers.get('Content-Encoding', '')
         raw = response.read()
 
-    # Decompress if needed
-    if 'gzip' in encoding_header:
-        import gzip
-        try:
-            raw = gzip.decompress(raw)
-        except Exception:
-            pass
-    elif 'deflate' in encoding_header:
-        import zlib
-        try:
-            raw = zlib.decompress(raw)
-        except Exception:
-            try:
-                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-            except Exception:
-                pass
+    raw = _decode_content_encoding(raw, encoding_header)
 
     # Charset detection
     charset = _detect_charset(content_type, raw)
     html = raw.decode(charset, errors='replace')
     result = html, final_url
-    _cache.put(url, result)
+    _cache.put(_TEXT_CACHE_KIND, url, result)
     return result
 
 
@@ -167,7 +158,7 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
     if base_url:
         url = resolve_url(base_url, url)
 
-    cached = _cache.get(url)
+    cached = _cache.get(_BYTES_CACHE_KIND, url)
     if cached is not None:
         return cached
 
@@ -179,11 +170,26 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
     with urllib.request.urlopen(req, timeout=10) as resp:
         raw = resp.read()
         encoding = resp.headers.get('Content-Encoding', '')
+    raw = _decode_content_encoding(raw, encoding)
+    _cache.put(_BYTES_CACHE_KIND, url, raw)
+    return raw
+
+
+def _decode_content_encoding(raw: bytes, encoding_header: str) -> bytes:
+    encoding = (encoding_header or '').lower()
     if 'gzip' in encoding:
         import gzip
         try:
-            raw = gzip.decompress(raw)
+            return gzip.decompress(raw)
         except Exception:
-            pass
-    _cache.put(url, raw)
+            return raw
+    if 'deflate' in encoding:
+        import zlib
+        try:
+            return zlib.decompress(raw)
+        except Exception:
+            try:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+            except Exception:
+                return raw
     return raw
