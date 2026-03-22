@@ -1,7 +1,9 @@
-"""rENDER Browser Engine — main entry point."""
+"""rENDER browser engine main entry point."""
+import argparse
 import sys
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import unquote_to_bytes
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -20,7 +22,7 @@ VIEWPORT_H = 600
 def _pipeline(html_content: str, base_url: str = '',
               viewport_width: int = VIEWPORT_W,
               viewport_height: int = VIEWPORT_H) -> tuple:
-    """Parse → JS → CSS (+ external sheets) → Images → Layout.
+    """Parse -> JS -> CSS (+ external sheets) -> images -> layout.
 
     External stylesheets and images are fetched concurrently.
     Returns (display_list, page_height, document).
@@ -59,16 +61,13 @@ def _pipeline(html_content: str, base_url: str = '',
 def _fetch_subresources(document, base_url: str) -> tuple[list, list]:
     """Concurrently fetch external CSS stylesheets and images.
 
-    Returns:
-        css_texts  — list of raw CSS strings from <link rel="stylesheet">
-        img_data   — list of (node, raw_bytes_or_None) for <img> nodes
+    CSS is returned in DOM order even though requests run concurrently.
     """
     from html.dom import Element
     from network.http import fetch_bytes, resolve_url, fetch as fetch_text
 
-    # Walk DOM once to collect all tasks
-    css_jobs: list[tuple] = []   # (href_url,)
-    img_jobs: list[tuple] = []   # (node, url_or_None, data_uri_or_None)
+    css_jobs: list[str] = []
+    img_jobs: list[tuple] = []
 
     stack = [document]
     while stack:
@@ -84,64 +83,109 @@ def _fetch_subresources(document, base_url: str) -> tuple[list, list]:
             elif tag == 'img':
                 src = node.attributes.get('src', '').strip()
                 if not src:
-                    # Fallback for lazy-loaded images (JS would swap data-src → src)
+                    # Fallback for lazy-loaded images (JS would swap data-src -> src)
                     src = node.attributes.get('data-src', '').strip()
                 if src.startswith('data:'):
                     img_jobs.append((node, None, src))
                 elif src:
                     url = resolve_url(base_url, src) if base_url else src
                     img_jobs.append((node, url, None))
-        stack.extend(node.children)
+        stack.extend(reversed(node.children))
 
     css_texts: list[str] = []
-    img_data: list[tuple] = []   # (node, raw_bytes_or_None)
+    img_data: list[tuple] = []
 
     if not css_jobs and not img_jobs:
         return css_texts, img_data
 
-    # Each fetch is I/O-bound — use threads.
-    # Limit workers to avoid hammering the server with too many simultaneous
-    # connections (browsers typically allow 6 per origin).
     max_workers = min(16, len(css_jobs) + len(img_jobs))
 
     def _fetch_css(url):
         try:
             text, _ = fetch_text(url)
-            return ('css', url, text)
+            return text
         except Exception:
-            return ('css', url, None)
+            return None
 
-    def _fetch_img(node, url, data_uri):
-        if data_uri:
-            try:
-                import base64
-                comma = data_uri.index(',')
-                raw = base64.b64decode(data_uri[comma + 1:])
-                return ('img', node, raw)
-            except Exception:
-                return ('img', node, None)
-        try:
-            raw = fetch_bytes(url)
-            return ('img', node, raw)
-        except Exception:
-            return ('img', node, None)
-
-    futures = []
+    css_results: list[str | None] = [None] * len(css_jobs)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for url in css_jobs:
-            futures.append(pool.submit(_fetch_css, url))
-        for node, url, data_uri in img_jobs:
-            futures.append(pool.submit(_fetch_img, node, url, data_uri))
+        css_futures_by_url = {}
+        css_future_map = {}
+        for idx, url in enumerate(css_jobs):
+            future = css_futures_by_url.get(url)
+            if future is None:
+                future = pool.submit(_fetch_css, url)
+                css_futures_by_url[url] = future
+            css_future_map.setdefault(future, []).append(idx)
 
-        for future in as_completed(futures):
-            result = future.result()
-            if result[0] == 'css':
-                if result[2]:
-                    css_texts.append(result[2])
-            else:
-                img_data.append((result[1], result[2]))
+        for future in as_completed(css_future_map):
+            text = future.result()
+            for idx in css_future_map[future]:
+                css_results[idx] = text
+
+    css_texts = [text for text in css_results if text]
+    img_data = _fetch_binary_jobs(
+        img_jobs,
+        fetcher=fetch_bytes,
+        max_workers=max_workers,
+    )
 
     return css_texts, img_data
+
+
+def _fetch_binary_jobs(jobs: list[tuple], *, fetcher, max_workers: int) -> list[tuple]:
+    """Fetch binary resources concurrently while preserving DOM order."""
+    if not jobs:
+        return []
+
+    results: list[tuple | None] = [None] * len(jobs)
+
+    def _fetch_single(url, data_uri):
+        if data_uri:
+            return _decode_data_uri(data_uri)
+        try:
+            return fetcher(url)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures_by_url = {}
+        future_map = {}
+        for idx, (_, url, data_uri) in enumerate(jobs):
+            if data_uri:
+                future = pool.submit(_fetch_single, None, data_uri)
+            else:
+                future = futures_by_url.get(url)
+                if future is None:
+                    future = pool.submit(_fetch_single, url, None)
+                    futures_by_url[url] = future
+            future_map.setdefault(future, []).append(idx)
+
+        for future in as_completed(future_map):
+            raw = future.result()
+            for idx in future_map[future]:
+                results[idx] = (jobs[idx][0], raw)
+
+    return [item for item in results if item is not None]
+
+
+def _decode_data_uri(data_uri: str) -> bytes | None:
+    try:
+        header, payload = data_uri.split(',', 1)
+    except ValueError:
+        return None
+
+    if ';base64' in header.lower():
+        try:
+            import base64
+            return base64.b64decode(payload)
+        except Exception:
+            return None
+
+    try:
+        return unquote_to_bytes(payload)
+    except Exception:
+        return None
 
 
 def _attach_images(img_data: list) -> None:
@@ -374,7 +418,7 @@ class Browser:
 
     def navigate(self, target: str) -> None:
         """Start async load of target (URL or file path). Non-blocking."""
-        self._win.set_status('Loading…')
+        self._win.set_status('Loading...')
         self._win.address_bar.setText(target)
         self._current_target = target
 
@@ -443,16 +487,36 @@ class Browser:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main():
-    if len(sys.argv) < 2:
-        target = os.path.join(os.path.dirname(__file__), 'example', 'index.html')
-    else:
-        target = sys.argv[1]
+def _default_target() -> str:
+    return os.path.join(os.path.dirname(__file__), 'example', 'index.html')
 
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description='Render a local HTML file or URL with the rENDER browser engine.'
+    )
+    parser.add_argument(
+        'target',
+        nargs='?',
+        default=_default_target(),
+        help='HTML file path or URL to render',
+    )
+    parser.add_argument('--width', type=int, default=VIEWPORT_W, help='Initial viewport width in pixels')
+    parser.add_argument('--height', type=int, default=VIEWPORT_H, help='Initial viewport height in pixels')
+    return parser
+
+
+def _parse_args(argv: list[str]):
+    return _build_arg_parser().parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
     browser = Browser()
-    browser.load(target)
-    sys.exit(browser.exec())
+    browser._win.resize(args.width, args.height)
+    browser.load(args.target)
+    return browser.exec()
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

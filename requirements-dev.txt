@@ -1,0 +1,4 @@
+PyQt6>=6.8
+pytest>=8.0
+pytest-subtests>=0.14
+ruff>=0.15
