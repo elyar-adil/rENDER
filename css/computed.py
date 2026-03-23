@@ -69,6 +69,33 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
 
     value = value.strip()
 
+    # CSS math functions: min(), max(), clamp()
+    vl = value.lower()
+    if vl.startswith('min(') and vl.endswith(')'):
+        args = _split_css_args(value[4:-1])
+        resolved = [_resolve_length(a.strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
+                    for a in args]
+        resolved = [r for r in resolved if r is not None]
+        return min(resolved) if resolved else None
+    if vl.startswith('max(') and vl.endswith(')'):
+        args = _split_css_args(value[4:-1])
+        resolved = [_resolve_length(a.strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
+                    for a in args]
+        resolved = [r for r in resolved if r is not None]
+        return max(resolved) if resolved else None
+    if vl.startswith('clamp(') and vl.endswith(')'):
+        args = _split_css_args(value[6:-1])
+        if len(args) == 3:
+            lo = _resolve_length(args[0].strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
+            val = _resolve_length(args[1].strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
+            hi = _resolve_length(args[2].strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
+            if lo is not None and val is not None and hi is not None:
+                return max(lo, min(val, hi))
+        return None
+    # env() — return None (unknown environment variable)
+    if vl.startswith('env('):
+        return None
+
     # Named font sizes
     if is_font_size:
         named = {'xx-small': 9, 'x-small': 10, 'small': 13, 'medium': 16,
@@ -80,7 +107,7 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
             return (parent_font_size or 16) * relative[value]
 
     # Numeric with unit
-    m = re.fullmatch(r'([+-]?[\d.]+)\s*(px|em|rem|vw|vh|%|pt|pc|cm|mm|in|ex|ch|)', value)
+    m = re.fullmatch(r'([+-]?[\d.]+)\s*(px|em|rem|vw|vh|dvh|svh|lvh|dvw|svw|lvw|vmin|vmax|%|pt|pc|cm|mm|in|ex|ch|)', value)
     if m:
         num = float(m.group(1))
         unit = m.group(2)
@@ -92,8 +119,14 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
             return num * root_font_size
         elif unit == 'vw':
             return num * vw / 100
-        elif unit == 'vh':
+        elif unit in ('vh', 'dvh', 'svh', 'lvh'):
             return num * vh / 100
+        elif unit in ('dvw', 'svw', 'lvw'):
+            return num * vw / 100
+        elif unit == 'vmin':
+            return num * min(vw, vh) / 100
+        elif unit == 'vmax':
+            return num * max(vw, vh) / 100
         elif unit == '%' and is_font_size:
             return num * (parent_font_size or 16) / 100
         elif unit == 'pt':
@@ -110,3 +143,25 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
             return None  # % without context
 
     return None
+
+
+def _split_css_args(text: str) -> list:
+    """Split comma-separated CSS function arguments, respecting nested parens."""
+    result = []
+    current = []
+    depth = 0
+    for ch in text:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            result.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        result.append(''.join(current))
+    return result

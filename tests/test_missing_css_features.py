@@ -61,123 +61,93 @@ def bind_css(css_text, body_builder=None, vw=980, vh=600):
 class TestMissingPropertyDefinitions:
     """Properties missing from PROPERTIES (no initial value or inheritance info)."""
 
-    @pytest.mark.xfail(reason="object-fit not in PROPERTIES")
     def test_object_fit_in_properties(self):
         assert 'object-fit' in PROPERTIES
 
-    @pytest.mark.xfail(reason="object-position not in PROPERTIES")
     def test_object_position_in_properties(self):
         assert 'object-position' in PROPERTIES
 
-    @pytest.mark.xfail(reason="aspect-ratio not in PROPERTIES")
     def test_aspect_ratio_in_properties(self):
         assert 'aspect-ratio' in PROPERTIES
 
-    @pytest.mark.xfail(reason="filter not in PROPERTIES")
     def test_filter_in_properties(self):
         assert 'filter' in PROPERTIES
 
-    @pytest.mark.xfail(reason="backdrop-filter not in PROPERTIES")
     def test_backdrop_filter_in_properties(self):
         assert 'backdrop-filter' in PROPERTIES
 
-    @pytest.mark.xfail(reason="clip-path not in PROPERTIES")
     def test_clip_path_in_properties(self):
         assert 'clip-path' in PROPERTIES
 
-    @pytest.mark.xfail(reason="mask not in PROPERTIES")
     def test_mask_in_properties(self):
         assert 'mask' in PROPERTIES
 
-    @pytest.mark.xfail(reason="writing-mode not in PROPERTIES")
     def test_writing_mode_in_properties(self):
         assert 'writing-mode' in PROPERTIES
 
-    @pytest.mark.xfail(reason="direction not in PROPERTIES")
     def test_direction_in_properties(self):
         assert 'direction' in PROPERTIES
 
-    @pytest.mark.xfail(reason="unicode-bidi not in PROPERTIES")
     def test_unicode_bidi_in_properties(self):
         assert 'unicode-bidi' in PROPERTIES
 
-    @pytest.mark.xfail(reason="contain not in PROPERTIES")
     def test_contain_in_properties(self):
         assert 'contain' in PROPERTIES
 
-    @pytest.mark.xfail(reason="isolation not in PROPERTIES")
     def test_isolation_in_properties(self):
         assert 'isolation' in PROPERTIES
 
-    @pytest.mark.xfail(reason="counter-reset not in PROPERTIES")
     def test_counter_reset_in_properties(self):
         assert 'counter-reset' in PROPERTIES
 
-    @pytest.mark.xfail(reason="counter-increment not in PROPERTIES")
     def test_counter_increment_in_properties(self):
         assert 'counter-increment' in PROPERTIES
 
-    @pytest.mark.xfail(reason="quotes not in PROPERTIES")
     def test_quotes_in_properties(self):
         assert 'quotes' in PROPERTIES
 
-    @pytest.mark.xfail(reason="list-style-position not in PROPERTIES")
     def test_list_style_position_in_properties(self):
         assert 'list-style-position' in PROPERTIES
 
-    @pytest.mark.xfail(reason="list-style-image not in PROPERTIES")
     def test_list_style_image_in_properties(self):
         assert 'list-style-image' in PROPERTIES
 
-    @pytest.mark.xfail(reason="column-count not in PROPERTIES (multi-column layout)")
     def test_column_count_in_properties(self):
         assert 'column-count' in PROPERTIES
 
-    @pytest.mark.xfail(reason="column-width not in PROPERTIES")
     def test_column_width_in_properties(self):
         assert 'column-width' in PROPERTIES
 
-    @pytest.mark.xfail(reason="font-variant not in PROPERTIES")
     def test_font_variant_in_properties(self):
         assert 'font-variant' in PROPERTIES
 
-    @pytest.mark.xfail(reason="font-feature-settings not in PROPERTIES")
     def test_font_feature_settings_in_properties(self):
         assert 'font-feature-settings' in PROPERTIES
 
-    @pytest.mark.xfail(reason="shape-outside not in PROPERTIES")
     def test_shape_outside_in_properties(self):
         assert 'shape-outside' in PROPERTIES
 
-    @pytest.mark.xfail(reason="user-select not in PROPERTIES")
     def test_user_select_in_properties(self):
         assert 'user-select' in PROPERTIES
 
-    @pytest.mark.xfail(reason="appearance not in PROPERTIES")
     def test_appearance_in_properties(self):
         assert 'appearance' in PROPERTIES
 
-    @pytest.mark.xfail(reason="resize not in PROPERTIES")
     def test_resize_in_properties(self):
         assert 'resize' in PROPERTIES
 
-    @pytest.mark.xfail(reason="scroll-behavior not in PROPERTIES")
     def test_scroll_behavior_in_properties(self):
         assert 'scroll-behavior' in PROPERTIES
 
-    @pytest.mark.xfail(reason="overscroll-behavior not in PROPERTIES")
     def test_overscroll_behavior_in_properties(self):
         assert 'overscroll-behavior' in PROPERTIES
 
-    @pytest.mark.xfail(reason="scroll-snap-type not in PROPERTIES")
     def test_scroll_snap_type_in_properties(self):
         assert 'scroll-snap-type' in PROPERTIES
 
-    @pytest.mark.xfail(reason="touch-action not in PROPERTIES")
     def test_touch_action_in_properties(self):
         assert 'touch-action' in PROPERTIES
 
-    @pytest.mark.xfail(reason="image-rendering not in PROPERTIES")
     def test_image_rendering_in_properties(self):
         assert 'image-rendering' in PROPERTIES
 
@@ -194,7 +164,6 @@ class TestShorthandGaps:
         assert 'grid-template-rows' in result
         assert 'grid-template-columns' in result
 
-    @pytest.mark.xfail(reason="list-style shorthand not expanded to all longhands")
     def test_list_style_shorthand_expanded_to_position(self):
         result = expand_shorthand('list-style', 'disc inside')
         assert 'list-style-type' in result
@@ -385,19 +354,16 @@ class TestSelectorGaps:
         el = make_element('button', attrs={'class': 'btn'})
         assert selector_mod.matches(el, ':where(button, a)')
 
-    @pytest.mark.xfail(reason=":has() pseudo-class not implemented")
     def test_has_pseudo(self):
         parent = make_element('div')
         child = make_element('img', parent=parent)
         assert selector_mod.matches(parent, 'div:has(img)')
 
-    @pytest.mark.xfail(reason=":has() with descendant not implemented")
     def test_has_pseudo_descendant(self):
         parent = make_element('article')
         make_element('h2', parent=parent)
         assert selector_mod.matches(parent, 'article:has(h2)')
 
-    @pytest.mark.xfail(reason=":not() with multiple arguments only parses first arg; element with .bar but not .foo should not match")
     def test_not_multiple_args_second_arg_checked(self):
         """An element with .bar (but not .foo) should NOT match :not(.foo, .bar)
         because it has one of the excluded classes.  Currently only the first
@@ -514,19 +480,16 @@ class TestComputedValueGaps:
         from css.computed import _resolve_length
         assert _resolve_length('50%', 16, 16, 980, 600) is None
 
-    @pytest.mark.xfail(reason="min() CSS function not supported in computed.py")
     def test_min_function(self):
         from css.computed import _resolve_length
         result = _resolve_length('min(50px, 100px)', 16, 16, 980, 600)
         assert result == 50.0
 
-    @pytest.mark.xfail(reason="max() CSS function not supported in computed.py")
     def test_max_function(self):
         from css.computed import _resolve_length
         result = _resolve_length('max(20px, 10px)', 16, 16, 980, 600)
         assert result == 20.0
 
-    @pytest.mark.xfail(reason="clamp() CSS function not supported in computed.py")
     def test_clamp_function(self):
         from css.computed import _resolve_length
         result = _resolve_length('clamp(10px, 5vw, 100px)', 16, 16, 1000, 600)
@@ -538,7 +501,6 @@ class TestComputedValueGaps:
         result = _resolve_length('env(safe-area-inset-top, 20px)', 16, 16, 980, 600)
         assert result == 20.0  # should use fallback
 
-    @pytest.mark.xfail(reason="dvh/svh/lvh viewport units not supported")
     def test_dvh_unit(self):
         from css.computed import _resolve_length
         result = _resolve_length('100dvh', 16, 16, 980, 600)
@@ -571,7 +533,6 @@ class TestAtRuleGaps:
         div = body.children[0]
         assert div.style.get('color', '') != 'red'
 
-    @pytest.mark.xfail(reason="@supports rule not implemented in CSS parser")
     def test_at_supports_property(self):
         """@supports (display: grid) should be honoured."""
         _, body = bind_css(
@@ -581,7 +542,6 @@ class TestAtRuleGaps:
         div = body.children[0]
         assert div.style.get('color') == 'green'
 
-    @pytest.mark.xfail(reason="@layer rule not implemented")
     def test_at_layer_base(self):
         """@layer should establish a cascade layer."""
         _, body = bind_css(
@@ -607,7 +567,6 @@ class TestAtRuleGaps:
         # container queries should apply color:purple at this viewport width
         assert box_el.style.get('color') == 'purple'
 
-    @pytest.mark.xfail(reason="@keyframes rule not implemented")
     def test_at_keyframes_parsed(self):
         """@keyframes blocks should be parsed without error and accessible."""
         sheet = css_parser.parse_stylesheet(
@@ -803,7 +762,6 @@ class TestBackgroundGaps:
 
 class TestFlexOrder:
 
-    @pytest.mark.xfail(reason="flex order property not applied during layout")
     def test_flex_order_reorders_children(self):
         """Children with order: -1 should appear before order: 0."""
         from html.dom import Element

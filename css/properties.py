@@ -170,8 +170,96 @@ PROPERTIES: dict = {
     'cursor':           PropertyDef('auto', True),
     'pointer-events':   PropertyDef('auto', True),
     'content':          PropertyDef('normal', False),
-    'list-style':       PropertyDef('disc outside none', True),
-    'list-style-type':  PropertyDef('disc', True),
+    'list-style':           PropertyDef('disc outside none', True),
+    'list-style-type':      PropertyDef('disc', True),
+    'list-style-position':  PropertyDef('outside', True),
+    'list-style-image':     PropertyDef('none', True),
+
+    # Image / replaced content
+    'object-fit':       PropertyDef('fill', False),
+    'object-position':  PropertyDef('50% 50%', False),
+    'aspect-ratio':     PropertyDef('auto', False),
+    'image-rendering':  PropertyDef('auto', False),
+
+    # Filters / effects
+    'filter':           PropertyDef('none', False),
+    'backdrop-filter':  PropertyDef('none', False),
+    'clip-path':        PropertyDef('none', False),
+    'mask':             PropertyDef('none', False),
+
+    # Writing / text direction
+    'writing-mode':     PropertyDef('horizontal-tb', True),
+    'direction':        PropertyDef('ltr', True),
+    'unicode-bidi':     PropertyDef('normal', False),
+
+    # Containment
+    'contain':          PropertyDef('none', False),
+    'isolation':        PropertyDef('auto', False),
+
+    # Counters / lists
+    'counter-reset':        PropertyDef('none', False),
+    'counter-increment':    PropertyDef('none', False),
+    'counter-set':          PropertyDef('none', False),
+    'quotes':               PropertyDef('auto', True),
+
+    # Columns
+    'column-count':     PropertyDef('auto', False),
+    'column-width':     PropertyDef('auto', False),
+    'column-gap':       PropertyDef('normal', False),
+    'columns':          PropertyDef('auto auto', False),
+    'column-rule':      PropertyDef('medium none currentcolor', False),
+    'column-fill':      PropertyDef('balance', False),
+    'column-span':      PropertyDef('none', False),
+
+    # Font advanced
+    'font-variant':             PropertyDef('normal', True),
+    'font-feature-settings':    PropertyDef('normal', True),
+    'font-kerning':             PropertyDef('auto', True),
+    'font-stretch':             PropertyDef('normal', True),
+
+    # Shape
+    'shape-outside':    PropertyDef('none', False),
+    'shape-margin':     PropertyDef('0', False),
+
+    # Interaction
+    'user-select':          PropertyDef('auto', False),
+    'appearance':           PropertyDef('none', False),
+    'resize':               PropertyDef('none', False),
+    'touch-action':         PropertyDef('auto', False),
+
+    # Scroll
+    'scroll-behavior':      PropertyDef('auto', False),
+    'overscroll-behavior':  PropertyDef('auto', False),
+    'scroll-snap-type':     PropertyDef('none', False),
+    'scroll-snap-align':    PropertyDef('none', False),
+    'scroll-margin':        PropertyDef('0', False),
+    'scroll-padding':       PropertyDef('auto', False),
+
+    # Transitions / animations (longhands)
+    'transition-property':          PropertyDef('all', False),
+    'transition-duration':          PropertyDef('0s', False),
+    'transition-timing-function':   PropertyDef('ease', False),
+    'transition-delay':             PropertyDef('0s', False),
+    'animation-name':               PropertyDef('none', False),
+    'animation-duration':           PropertyDef('0s', False),
+    'animation-timing-function':    PropertyDef('ease', False),
+    'animation-delay':              PropertyDef('0s', False),
+    'animation-iteration-count':    PropertyDef('1', False),
+    'animation-direction':          PropertyDef('normal', False),
+    'animation-fill-mode':          PropertyDef('none', False),
+    'animation-play-state':         PropertyDef('running', False),
+
+    # Grid (additional)
+    'grid-template':        PropertyDef('none', False),
+    'grid':                 PropertyDef('none', False),
+
+    # Misc
+    'speak':                PropertyDef('normal', True),
+    'print-color-adjust':   PropertyDef('economy', False),
+    'forced-color-adjust':  PropertyDef('auto', True),
+    'accent-color':         PropertyDef('auto', False),
+    'caret-color':          PropertyDef('auto', True),
+    'color-scheme':         PropertyDef('normal', False),
 }
 
 
@@ -621,6 +709,51 @@ def expand_shorthand(prop: str, value: str) -> dict:
                 'flex-basis':  parts[2],
             }
         return {prop: value}
+
+    # ---- list-style ----
+    if prop == 'list-style':
+        _LST = {'disc', 'circle', 'square', 'decimal', 'decimal-leading-zero',
+                'lower-roman', 'upper-roman', 'lower-alpha', 'upper-alpha',
+                'lower-latin', 'upper-latin', 'none'}
+        _LSP = {'inside', 'outside'}
+        result = {}
+        for tok in value.split():
+            tl = tok.lower()
+            if tl in _LST:
+                result['list-style-type'] = tok
+            elif tl in _LSP:
+                result['list-style-position'] = tok
+            elif tl.startswith('url(') or tl == 'none':
+                result.setdefault('list-style-image', tok)
+        if not result:
+            result['list-style-type'] = value
+        return result
+
+    # ---- transition ----
+    if prop == 'transition':
+        # Store as-is; individual longhands are tracked separately
+        return {prop: value}
+
+    # ---- animation ----
+    if prop == 'animation':
+        # Store as-is
+        return {prop: value}
+
+    # ---- columns ----
+    if prop == 'columns':
+        parts = value.split()
+        result = {}
+        for part in parts:
+            tl = part.lower()
+            if tl == 'auto':
+                # ambiguous, set both
+                result.setdefault('column-count', 'auto')
+                result.setdefault('column-width', 'auto')
+            elif re.match(r'^\d+$', tl):
+                result['column-count'] = part
+            else:
+                result['column-width'] = part
+        return result or {prop: value}
 
     # Not a shorthand
     return {prop: value}

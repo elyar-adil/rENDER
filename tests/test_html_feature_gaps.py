@@ -729,7 +729,6 @@ class TestUAStylesheetDefaults:
         table = find(doc, 'table')
         assert table.style.get('display') == 'table'
 
-    @pytest.mark.xfail(reason="<details> UA hidden behavior not implemented")
     def test_details_summary_visible_content_hidden(self):
         """Content inside closed <details> should have display:none in UA."""
         doc = self._bind('<details><summary>Toggle</summary><p id="p">Content</p></details>')

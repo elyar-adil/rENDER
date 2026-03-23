@@ -175,7 +175,9 @@ class _Parser:
                     return AtRule(name, ''.join(prelude_parts).strip(), rules=rules)
                 elif name in ('keyframes', '-webkit-keyframes', '-moz-keyframes'):
                     rules = self._consume_rule_list_in_block()
-                    return AtRule(name, ''.join(prelude_parts).strip(), rules=rules)
+                    # Store animation name in 'name', at-keyword in 'prelude'
+                    anim_name = ''.join(prelude_parts).strip()
+                    return AtRule(anim_name, name, rules=rules)
                 else:
                     # @font-face, @page, etc. — declaration block
                     decls = self._consume_declaration_list_in_block()
