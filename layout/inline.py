@@ -189,7 +189,8 @@ def layout_inline(node, container_x: float, container_y: float,
     first_line = True
 
     if nowrap:
-        # Put everything in a single line regardless of width
+        # Put everything in a single line regardless of width,
+        # but BR items force a new line.
         if float_mgr:
             line_x, line_w = float_mgr.available_rect(current_y, 20, container_x, container_width)
         else:
@@ -201,6 +202,15 @@ def layout_inline(node, container_x: float, container_y: float,
 
         line = LineBox(line_x, current_y, line_w, min_height=min_line_height)
         for item in items:
+            if item.type == 'BR':
+                # Finalize current line and start a new one
+                if line.height == 0:
+                    line.height = min_line_height or 16
+                line.finalize(text_align)
+                lines.append(line)
+                current_y += line.height
+                line = LineBox(line_x, current_y, line_w, min_height=min_line_height)
+                continue
             item.x = line_x + line.width
             line.items.append(item)
             line.width += item.width
@@ -235,6 +245,9 @@ def layout_inline(node, container_x: float, container_y: float,
             placed_any = False
             while i < len(items):
                 item = items[i]
+                if item.type == 'BR':
+                    i += 1
+                    break  # force end of current line
                 if line.add_item(item):
                     i += 1
                     placed_any = True
@@ -654,6 +667,9 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
         if display == 'none':
             return
         if not is_root and position in ('absolute', 'fixed'):
+            return
+        if node.tag == 'br':
+            items.append(InlineItem(text='', width=0, height=0, type='BR'))
             return
         if node.tag == 'img':
             if not is_root and display in _BLOCK_DISPLAYS and current_link is None:

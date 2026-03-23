@@ -502,6 +502,10 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
     align = attrs.get('align', '').lower().strip()
     if align in ('left', 'right', 'center', 'justify'):
         computed['text-align'] = align
+    elif tag == 'td' and 'text-align' not in computed:
+        computed['text-align'] = 'left'
+    elif tag == 'th' and 'text-align' not in computed:
+        computed['text-align'] = 'center'
 
     # valign → vertical-align
     valign = attrs.get('valign', '').lower().strip()

@@ -741,8 +741,11 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
             style.get(f'border-{s}-style', style.get('border-style', 'none'))
             for s in _SIDES
         )
+        _element_color = style.get('color', 'black')
         side_colors = tuple(
-            style.get(f'border-{s}-color', style.get('border-color', style.get('color', 'black')))
+            (lambda c: _element_color if c == 'currentcolor' else c)(
+                style.get(f'border-{s}-color', style.get('border-color', _element_color))
+            )
             for s in _SIDES
         )
         if any(s not in ('none', '', 'hidden') for s in side_styles):
