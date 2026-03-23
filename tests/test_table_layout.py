@@ -7,6 +7,7 @@ import unittest
 
 from html.dom import Element
 from layout.box import BoxModel
+from layout.block import BlockLayout
 from layout.context import LayoutContext
 from layout.table import TableLayout, _compute_col_widths
 
@@ -66,6 +67,40 @@ class TestTableCellAlignment(unittest.TestCase):
 
         self.assertAlmostEqual(inner.box.x, 50.0)
         self.assertAlmostEqual(inner.box.y, 40.0)
+
+
+class TestBlockBrAroundBlockChildren(unittest.TestCase):
+    def test_br_between_block_children_is_not_double_counted(self):
+        container = Element('div')
+        container.style = {
+            'display': 'block',
+            'font-size': '10px',
+        }
+
+        top = _append(container, Element('div'))
+        top.style = {
+            'display': 'block',
+            'height': '20px',
+        }
+
+        _append(container, Element('br'))
+
+        bottom = _append(container, Element('div'))
+        bottom.style = {
+            'display': 'block',
+            'height': '30px',
+        }
+
+        outer = BoxModel()
+        outer.x = 0.0
+        outer.y = 0.0
+        outer.content_width = 200.0
+        outer.content_height = 0.0
+
+        ctx = LayoutContext(viewport_width=200, viewport_height=200)
+        box = BlockLayout().layout(container, outer, ctx)
+
+        self.assertAlmostEqual(box.content_height, 62.0)
 
 
 if __name__ == '__main__':

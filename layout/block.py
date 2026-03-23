@@ -281,8 +281,12 @@ class BlockLayout(LayoutEngine):
             for c in node.children
         )
         has_inline = any(
-            isinstance(c, TextNode) or
+            (isinstance(c, TextNode) and bool(c.data.strip())) or
             (isinstance(c, Element)
+             and (
+                 not has_block
+                 or getattr(c, 'tag', '') != 'br'
+             )
              and _get_style(c, 'display', 'inline') not in _BLOCK_DISPLAYS
              and _get_style(c, 'display', 'inline') != 'none'
              and _get_style(c, 'float', 'none') == 'none'
