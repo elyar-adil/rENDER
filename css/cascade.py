@@ -440,6 +440,13 @@ def _apply_iterative(document, index: dict) -> None:
         stack.extend(reversed(node.children))
 
 
+# HTML <font size="N"> → CSS font-size mapping (per HTML spec)
+_FONT_SIZE_MAP = {
+    '1': '10px', '2': '13px', '3': '16px', '4': '18px',
+    '5': '24px', '6': '32px', '7': '48px',
+}
+
+
 def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
     """Convert HTML presentational attributes to CSS at lowest priority.
 
@@ -482,6 +489,46 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
     if 'nowrap' in attrs:
         computed['white-space'] = 'nowrap'
 
+    # ----- <font> element: size, face, color -----
+    if tag == 'font':
+        size = attrs.get('size', '').strip()
+        if size and size in _FONT_SIZE_MAP:
+            computed['font-size'] = _FONT_SIZE_MAP[size]
+        face = attrs.get('face', '').strip()
+        if face:
+            computed['font-family'] = face
+
+    # ----- <body> text/link/vlink attributes -----
+    if tag == 'body':
+        text_color = attrs.get('text', '').strip()
+        if text_color:
+            computed['color'] = text_color
+
+    # <a> inherits link color from ancestor <body link="...">
+    if tag == 'a':
+        p = getattr(node, 'parent', None)
+        while p is not None:
+            if isinstance(p, Element) and p.tag == 'body':
+                link_color = p.attributes.get('link', '').strip()
+                if link_color:
+                    computed['color'] = link_color
+                break
+            p = getattr(p, 'parent', None)
+
+    # ----- <hr> size, color, noshade -----
+    if tag == 'hr':
+        size = attrs.get('size', '').strip()
+        if size:
+            computed['height'] = size if size.endswith('px') else size + 'px'
+        hr_color = attrs.get('color', '').strip()
+        if hr_color:
+            computed['background-color'] = hr_color
+            computed['border-style'] = 'solid'
+            computed['border-color'] = hr_color
+        if 'noshade' in attrs:
+            if 'border-style' not in computed or computed.get('border-style') in ('', 'none'):
+                computed['border-style'] = 'solid'
+
     # table-specific
     if tag == 'table':
         cs = attrs.get('cellspacing', '').strip()
@@ -495,6 +542,23 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
             computed['border-style'] = 'solid'
             computed['border-width'] = border if border.endswith('px') else border + 'px'
 
+    # <td>/<th> in a <table border="N"> → cells get 1px inset border
+    if tag in ('td', 'th'):
+        parent = getattr(node, 'parent', None)
+        # Walk up to find the table ancestor
+        table_node = None
+        p = parent
+        while p is not None:
+            if isinstance(p, Element) and p.tag == 'table':
+                table_node = p
+                break
+            p = getattr(p, 'parent', None)
+        if table_node is not None:
+            tb = table_node.attributes.get('border', '').strip()
+            if tb and tb != '0':
+                computed.setdefault('border-style', 'inset')
+                computed.setdefault('border-width', '1px')
+
     # img border → border
     if tag == 'img':
         border = attrs.get('border', '').strip()
@@ -504,7 +568,9 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
             computed['border-style'] = 'solid'
             computed['border-width'] = border if border.endswith('px') else border + 'px'
 
-    # <center> children get auto margins so block children center
+    # <center> → text-align:center + auto margins on children
+    if tag == 'center':
+        computed.setdefault('text-align', 'center')
     parent = getattr(node, 'parent', None)
     if parent is not None and getattr(parent, 'tag', '') == 'center':
         if 'margin-left' not in computed:
