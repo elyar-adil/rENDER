@@ -446,6 +446,22 @@ _FONT_SIZE_MAP = {
     '5': '24px', '6': '32px', '7': '48px',
 }
 
+_BORDER_SIDES = ('top', 'right', 'bottom', 'left')
+
+
+def _set_border_shorthand(computed, prop, value):
+    """Set a border shorthand (border-style, border-width, border-color) with longhand expansion."""
+    if prop == 'border-style':
+        for side in _BORDER_SIDES:
+            computed[f'border-{side}-style'] = value
+    elif prop == 'border-width':
+        for side in _BORDER_SIDES:
+            computed[f'border-{side}-width'] = value
+    elif prop == 'border-color':
+        for side in _BORDER_SIDES:
+            computed[f'border-{side}-color'] = value
+    computed[prop] = value
+
 
 def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
     """Convert HTML presentational attributes to CSS at lowest priority.
@@ -523,11 +539,11 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
         hr_color = attrs.get('color', '').strip()
         if hr_color:
             computed['background-color'] = hr_color
-            computed['border-style'] = 'solid'
-            computed['border-color'] = hr_color
+            _set_border_shorthand(computed, 'border-style', 'solid')
+            _set_border_shorthand(computed, 'border-color', hr_color)
         if 'noshade' in attrs:
-            if 'border-style' not in computed or computed.get('border-style') in ('', 'none'):
-                computed['border-style'] = 'solid'
+            if computed.get('border-top-style', 'none') == 'none':
+                _set_border_shorthand(computed, 'border-style', 'solid')
 
     # table-specific
     if tag == 'table':
@@ -537,10 +553,11 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
             computed['border-spacing'] = val
         border = attrs.get('border', '').strip()
         if border == '0':
-            computed['border-style'] = 'none'
+            _set_border_shorthand(computed, 'border-style', 'none')
         elif border:
-            computed['border-style'] = 'solid'
-            computed['border-width'] = border if border.endswith('px') else border + 'px'
+            _set_border_shorthand(computed, 'border-style', 'solid')
+            _set_border_shorthand(computed, 'border-width',
+                                  border if border.endswith('px') else border + 'px')
 
     # <td>/<th> in a <table border="N"> → cells get 1px inset border
     if tag in ('td', 'th'):
@@ -556,17 +573,19 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
         if table_node is not None:
             tb = table_node.attributes.get('border', '').strip()
             if tb and tb != '0':
-                computed.setdefault('border-style', 'inset')
-                computed.setdefault('border-width', '1px')
+                if computed.get('border-top-style', 'none') == 'none':
+                    _set_border_shorthand(computed, 'border-style', 'inset')
+                    _set_border_shorthand(computed, 'border-width', '1px')
 
     # img border → border
     if tag == 'img':
         border = attrs.get('border', '').strip()
         if border == '0':
-            computed['border-style'] = 'none'
+            _set_border_shorthand(computed, 'border-style', 'none')
         elif border:
-            computed['border-style'] = 'solid'
-            computed['border-width'] = border if border.endswith('px') else border + 'px'
+            _set_border_shorthand(computed, 'border-style', 'solid')
+            _set_border_shorthand(computed, 'border-width',
+                                  border if border.endswith('px') else border + 'px')
 
     # <center> → text-align:center + auto margins on children
     if tag == 'center':

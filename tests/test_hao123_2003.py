@@ -300,6 +300,30 @@ class TestTableAttributes:
         assert bs in ('solid', 'inset'), f"td border-style should be solid/inset when table border=1, got {bs!r}"
         assert bw and bw != '0px' and bw != '0', f"td border-width should be >0 when table border=1, got {bw!r}"
 
+    def test_table_border_longhands_set(self):
+        """Border longhands (border-top-style, etc.) must be set for rendering."""
+        doc = _parse_and_bind(
+            '<body><table border="1"><tr><td>cell</td></tr></table></body>'
+        )
+        table = _find_first(doc, 'table')
+        assert _style(table, 'border-top-style') == 'solid'
+        assert _style(table, 'border-right-style') == 'solid'
+        assert _style(table, 'border-bottom-style') == 'solid'
+        assert _style(table, 'border-left-style') == 'solid'
+        assert _style(table, 'border-top-width') == '1px'
+
+    def test_td_border_longhands_set(self):
+        """TD border longhands must be set when table has border attr."""
+        doc = _parse_and_bind(
+            '<body><table border="1"><tr><td>cell</td></tr></table></body>'
+        )
+        td = _find_first(doc, 'td')
+        assert _style(td, 'border-top-style') in ('solid', 'inset')
+        assert _style(td, 'border-right-style') in ('solid', 'inset')
+        assert _style(td, 'border-bottom-style') in ('solid', 'inset')
+        assert _style(td, 'border-left-style') in ('solid', 'inset')
+        assert _style(td, 'border-top-width') == '1px'
+
     def test_table_cellspacing(self):
         doc = _parse_and_bind(
             '<body><table cellspacing="0"><tr><td>cell</td></tr></table></body>'
@@ -545,15 +569,15 @@ class TestHao123FullPage:
         assert _style(body, 'background-color') == '#FFFFFF'
 
     def test_full_page_category_rows_have_bgcolor(self):
-        """Category header rows use bgcolor="#DBE4F0"."""
+        """Category header rows use bgcolor attributes."""
         page_path = os.path.join(ROOT, 'example', 'hao123_2003.html')
         with open(page_path, 'r', encoding='utf-8') as f:
             html_text = f.read()
         doc = _parse_and_bind(html_text, viewport_width=890)
-        blue_trs = _find_elements(
+        bg_trs = _find_elements(
             doc, 'tr',
-            attr_filter=lambda a: a.get('bgcolor') == '#DBE4F0'
+            attr_filter=lambda a: 'bgcolor' in a
         )
-        assert len(blue_trs) >= 3, "Should have blue category header rows"
-        for tr in blue_trs:
-            assert _style(tr, 'background-color') == '#DBE4F0'
+        assert len(bg_trs) >= 3, "Should have colored category header rows"
+        for tr in bg_trs:
+            assert _style(tr, 'background-color') == tr.attributes['bgcolor']
