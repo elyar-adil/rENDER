@@ -64,6 +64,9 @@ class FlexLayout(LayoutEngine):
 
         flex_children = [c for c in node.children if isinstance(c, Element) and _get_style(c, 'display') != 'none']
 
+        # Sort by CSS order property (default 0); stable sort preserves DOM order for equal values
+        flex_children.sort(key=lambda c: int(_get_style(c, 'order', '0') or '0'))
+
         if not flex_children:
             box.content_height = 0.0
             return box
@@ -168,11 +171,14 @@ class FlexLayout(LayoutEngine):
 
                 for i, (child, cb) in enumerate(zip(line_children, line_boxes)):
                     cb.x = x_positions[i]
-                    if align == 'center':
+                    # align-self overrides align-items for this child
+                    child_align = _get_style(child, 'align-self', 'auto')
+                    effective_align = align if child_align in ('auto', '') else child_align
+                    if effective_align == 'center':
                         cb.y = y_cursor + (line_height - cb.content_height) / 2
-                    elif align == 'flex-end':
+                    elif effective_align == 'flex-end':
                         cb.y = y_cursor + line_height - cb.content_height - cb.margin.bottom
-                    elif align == 'stretch':
+                    elif effective_align == 'stretch':
                         cb.content_height = line_height
                         cb.height = line_height
                         cb.y = y_cursor + cb.margin.top

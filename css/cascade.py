@@ -357,6 +357,13 @@ def _build_index(tagged_rules: list, viewport_width: int = 980,
                     _process_rule(sub, origin)
             return
 
+        if hasattr(rule, 'name') and rule.name in ('supports', 'layer', 'document'):
+            # @supports / @layer — treat as always-true for now
+            # (we assume all features are "supported" so @supports passes)
+            for sub in getattr(rule, 'rules', []):
+                _process_rule(sub, origin)
+            return
+
         if not hasattr(rule, 'declarations'):
             return
 

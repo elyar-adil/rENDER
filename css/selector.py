@@ -163,7 +163,7 @@ def specificity(selector_text: str) -> tuple:
 def _simple_specificity(s: SimpleSelector) -> tuple:
     a = 1 if s.id else 0
     b = len(s.classes) + len(s.attributes)
-    if s.pseudo_class and s.pseudo_class not in ('not',):
+    if s.pseudo_class and not s.pseudo_class.lower().startswith('not'):
         b += 1
     # :not() contributes the specificity of its argument, not itself
     if s.negation is not None:
@@ -318,11 +318,49 @@ def _match_attribute(element: Element, name: str, op: str, value: str) -> bool:
 def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> bool:
     pseudo_lower = pseudo.lower()
 
-    # :not(selector)
+    # :not(selector) — supports comma-separated list of selectors
     if pseudo_lower == 'not' or pseudo_lower.startswith('not('):
-        if negation_sel is not None:
+        # negation_sel holds only the first arg (legacy); re-parse the full arg list
+        # by extracting from pseudo_lower if it embeds the args
+        if pseudo_lower.startswith('not(') and pseudo_lower.endswith(')'):
+            arg_str = pseudo_lower[4:-1]
+        elif negation_sel is not None:
+            # Use the negation_sel directly (single-arg path)
             return not _matches_simple(element, negation_sel)
-        return True
+        else:
+            return True
+        # Check all comma-separated arguments — if element matches ANY, return False
+        try:
+            for frag in _split_by_comma_outside_parens(arg_str):
+                frag = frag.strip()
+                if frag and matches(element, frag):
+                    return False
+            return True
+        except Exception:
+            if negation_sel is not None:
+                return not _matches_simple(element, negation_sel)
+            return True
+
+    # :has(selector) — matches if element has a descendant matching selector
+    if pseudo_lower.startswith('has(') and pseudo_lower.endswith(')'):
+        arg = pseudo_lower[4:-1]
+        from html.dom import Element as _Element
+        def _has_descendant(el, sel_text):
+            for child in el.children:
+                if isinstance(child, _Element):
+                    if matches(child, sel_text):
+                        return True
+                    if _has_descendant(child, sel_text):
+                        return True
+            return False
+        try:
+            for frag in _split_by_comma_outside_parens(arg):
+                frag = frag.strip()
+                if frag and _has_descendant(element, frag):
+                    return True
+        except Exception:
+            pass
+        return False
 
     # Structural pseudo-classes
     if pseudo_lower == 'root':
@@ -681,7 +719,8 @@ class _SelectorParser:
             else:
                 pname = name.lower()
                 if pname == 'not' and arg is not None:
-                    ss.pseudo_class = 'not'
+                    # Store full arg so multi-arg :not() works in matching
+                    ss.pseudo_class = f'not({arg})'
                     try:
                         neg_group = parse_selector(arg.strip())
                         if neg_group.selectors:

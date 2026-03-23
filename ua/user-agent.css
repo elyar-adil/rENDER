@@ -77,3 +77,10 @@ input, select, textarea, button { display: inline; }
 
 /* Horizontal rule */
 hr { border-style: solid; border-color: gray; margin-top: 8px; margin-bottom: 8px; }
+
+/* Details / Dialog */
+details { display: block; }
+summary { display: block; cursor: pointer; }
+details:not([open]) > :not(summary) { display: none; }
+dialog { display: block; position: absolute; }
+dialog:not([open]) { display: none; }
