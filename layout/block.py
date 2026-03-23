@@ -303,6 +303,10 @@ class BlockLayout(LayoutEngine):
                 abs_children.append((child, child_pos))
                 continue
             if child_display not in _BLOCK_DISPLAYS and child_float == 'none':
+                # <br> between block siblings creates vertical spacing
+                if has_block and getattr(child, 'tag', '') == 'br':
+                    font_size = _parse_px(_get_style(node, 'font-size', '16px'))
+                    child_y += font_size * 1.2
                 continue
 
             # clear

@@ -135,9 +135,9 @@ class TableLayout(LayoutEngine):
                 cell_w = sum(col_widths[col_idx:col_idx + colspan]) + cell_spacing * (colspan - 1)
                 td_style = td_node.style or {}
                 has_css_pad = any(
-                    td_style.get(f'padding-{s}', '') not in ('', '0px', '0')
+                    _parse_px(td_style.get(f'padding-{s}', '0')) > 0
                     for s in ('top', 'right', 'bottom', 'left')
-                ) or td_style.get('padding', '') not in ('', '0px', '0')
+                )
                 pad = 0.0 if has_css_pad else cell_padding
                 inner_w = max(0.0, cell_w - 2 * pad)
 
@@ -147,8 +147,20 @@ class TableLayout(LayoutEngine):
                 cell_cont.content_width = inner_w
                 cell_cont.content_height = 0.0
 
+                # Override td width to 'auto' so BlockLayout uses the
+                # resolved column width instead of re-interpreting the
+                # percentage against the (already-resolved) container.
+                saved_width = td_style.get('width')
+                td_style['width'] = 'auto'
+
                 child_ctx = ctx.fork()  # cells form new BFC
                 cell_box = BlockLayout().layout(td_node, cell_cont, child_ctx)
+
+                # Restore original width style
+                if saved_width is not None:
+                    td_style['width'] = saved_width
+                else:
+                    td_style.pop('width', None)
                 td_node.box = cell_box
                 valign = td_style.get('vertical-align', 'middle')
                 align = td_style.get('text-align', 'left')
@@ -174,6 +186,8 @@ class TableLayout(LayoutEngine):
                 cell_box = getattr(td_node, 'box', None)
                 if cell_box is not None:
                     extra_h = max(0.0, max_cell_h - (cell_box.content_height + 2 * pad))
+                    # Stretch cell to fill row height
+                    cell_box.content_height = max_cell_h - 2 * pad
                     valign = getattr(td_node, '_table_valign', 'middle')
                     if valign == 'bottom':
                         dy = extra_h
@@ -232,11 +246,17 @@ def _compute_col_widths(all_rows, n_cols: int, table_w: float, cell_spacing: flo
     available = table_w - cell_spacing * (n_cols + 1)
     col_widths = [None] * n_cols
     auto_min = [0.0] * n_cols
+    nowrap_min = [0.0] * n_cols  # minimum width for nowrap cells
     for _tr, cells in all_rows:
         col_idx = 0
         for td_node, colspan in cells:
             td_style = td_node.style or {}
             if colspan == 1:
+                # Track nowrap minimum width regardless of explicit width
+                ws = td_style.get('white-space', '')
+                if ws == 'nowrap' or 'nowrap' in getattr(td_node, 'attributes', {}):
+                    nowrap_min[col_idx] = max(nowrap_min[col_idx],
+                                              _measure_cell_nowrap_width(td_node))
                 w_str = td_style.get('width', '') or getattr(td_node, 'attributes', {}).get('width', '')
                 if w_str and w_str not in ('auto', ''):
                     try:
@@ -249,6 +269,11 @@ def _compute_col_widths(all_rows, n_cols: int, table_w: float, cell_spacing: flo
                 else:
                     auto_min[col_idx] = max(auto_min[col_idx], _measure_cell_min_width(td_node))
             col_idx += colspan
+
+    # Ensure nowrap columns are at least as wide as their content
+    for i in range(n_cols):
+        if col_widths[i] is not None and nowrap_min[i] > col_widths[i]:
+            col_widths[i] = nowrap_min[i]
 
     fixed = sum(w for w in col_widths if w is not None)
     n_auto = sum(1 for w in col_widths if w is None)
@@ -313,6 +338,48 @@ def _measure_cell_min_width(node) -> float:
         elif isinstance(child, Element):
             width = max(width, _measure_cell_min_width(child))
     return width
+
+
+def _measure_cell_nowrap_width(node) -> float:
+    """Measure the total inline content width of a nowrap cell (all words on one line)."""
+    from html.dom import Element, Text
+
+    style = getattr(node, 'style', {}) or {}
+    family = style.get('font-family', 'Arial')
+    size_px = _parse_px(style.get('font-size', '16px'))
+    weight = style.get('font-weight', 'normal')
+    italic = style.get('font-style', 'normal') in ('italic', 'oblique')
+
+    total = 0.0
+    try:
+        space_w, _ = measure_text(' ', family, size_px, weight, italic)
+    except Exception:
+        space_w = size_px * 0.3
+
+    def _walk(n, inherited_style):
+        nonlocal total
+        if isinstance(n, Text):
+            words = n.data.split()
+            s = inherited_style
+            fam = s.get('font-family', family)
+            sz = _parse_px(s.get('font-size', f'{size_px}px'))
+            wt = s.get('font-weight', weight)
+            it = s.get('font-style', 'normal') in ('italic', 'oblique')
+            for word in words:
+                try:
+                    w, _ = measure_text(word, fam, sz, wt, it)
+                    sw, _ = measure_text(' ', fam, sz, wt, it)
+                    total += w + sw
+                except Exception:
+                    total += len(word) * sz * 0.6 + space_w
+        elif isinstance(n, Element):
+            s = n.style or inherited_style
+            for c in n.children:
+                _walk(c, s)
+
+    for child in node.children:
+        _walk(child, style)
+    return total
 
 
 def _measure_block_children_width(node) -> float:
