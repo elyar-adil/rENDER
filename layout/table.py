@@ -157,7 +157,6 @@ class TableLayout(LayoutEngine):
                 cell_box.content_width = inner_w
 
                 max_cell_h = max(max_cell_h, cell_box.content_height + 2 * pad)
-                td_node._table_align = align
                 td_node._table_valign = valign
                 td_node._table_pad = pad
                 x_offset += cell_w + cell_spacing
@@ -183,18 +182,23 @@ class TableLayout(LayoutEngine):
                     else:
                         dy = 0.0
 
+                    # Horizontal alignment for block-level children only.
+                    # Inline text is already positioned by LineBox.finalize()
+                    # via text-align, so we must NOT shift line boxes here.
                     dx = 0.0
-                    align = getattr(td_node, '_table_align', 'left')
-                    content_w = _measure_cell_content_width(td_node)
-                    if content_w <= 0:
-                        content_w = cell_box.content_width
-                    if align == 'right':
-                        dx = max(0.0, cell_w - 2 * pad - content_w)
-                    elif align == 'center':
-                        dx = max(0.0, (cell_w - 2 * pad - content_w) / 2.0)
+                    td_style = td_node.style or {}
+                    align = td_style.get('text-align', 'left')
+                    if align in ('center', 'right'):
+                        block_w = _measure_block_children_width(td_node)
+                        if block_w > 0:
+                            inner_w = cell_w - 2 * pad
+                            if align == 'right':
+                                dx = max(0.0, inner_w - block_w)
+                            else:
+                                dx = max(0.0, (inner_w - block_w) / 2.0)
 
                     if dx or dy:
-                        _shift_cell_contents(td_node, dx, dy)
+                        _shift_block_children(td_node, dx, dy)
 
                 x_offset += cell_w + cell_spacing
                 col_idx += colspan
@@ -309,6 +313,49 @@ def _measure_cell_min_width(node) -> float:
         elif isinstance(child, Element):
             width = max(width, _measure_cell_min_width(child))
     return width
+
+
+def _measure_block_children_width(node) -> float:
+    """Measure the max width of block-level children (not line boxes)."""
+    from html.dom import Element
+    max_w = 0.0
+    for child in getattr(node, 'children', []):
+        if not isinstance(child, Element):
+            continue
+        child_box = getattr(child, 'box', None)
+        if child_box is not None:
+            max_w = max(max_w, child_box.content_width)
+    return max_w
+
+
+def _shift_block_children(node, dx: float, dy: float) -> None:
+    """Shift block-level children and line boxes vertically only.
+
+    dx is applied only to block children (with box), not to line boxes
+    which already handle text-align. dy applies to everything.
+    """
+    from html.dom import Element
+    # Shift line boxes vertically only
+    if hasattr(node, 'line_boxes') and dy:
+        for lb in node.line_boxes:
+            lb.y += dy
+            for item in lb.items:
+                item.y += dy
+    # Shift block children both horizontally and vertically
+    for child in getattr(node, 'children', []):
+        if not isinstance(child, Element):
+            continue
+        if hasattr(child, 'box') and child.box is not None:
+            child.box.x += dx
+            child.box.y += dy
+        if hasattr(child, 'line_boxes'):
+            for lb in child.line_boxes:
+                lb.x += dx
+                lb.y += dy
+                for item in lb.items:
+                    item.x += dx
+                    item.y += dy
+        _shift_subtree(child, dx, dy)
 
 
 def _shift_subtree(node, dx: float, dy: float) -> None:
