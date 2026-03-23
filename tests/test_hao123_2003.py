@@ -581,3 +581,95 @@ class TestHao123FullPage:
         assert len(bg_trs) >= 3, "Should have colored category header rows"
         for tr in bg_trs:
             assert _style(tr, 'background-color') == tr.attributes['bgcolor']
+
+
+# =========================================================================
+# 11. Table cell text alignment (layout-level)
+# =========================================================================
+
+class TestTableCellAlignment:
+    """Ensure center-aligned text in table cells is not double-shifted."""
+
+    def _do_layout(self, html_text, viewport_width=890):
+        import layout as layout_mod
+        doc = _parse_and_bind(html_text, viewport_width=viewport_width)
+        dl = layout_mod.layout(doc, viewport_width=viewport_width)
+        return doc, dl
+
+    def test_center_aligned_colspan_text_within_bounds(self):
+        """Centered text in a colspan cell must stay within the table width."""
+        html = '''<body><table width="800" border="1" cellspacing="0" cellpadding="3">
+        <tr><td colspan="4" align="center"><font size="2" color="#FF0000"><b>Header</b></font></td></tr>
+        <tr><td width="25%">A</td><td width="25%">B</td><td width="25%">C</td><td width="25%">D</td></tr>
+        </table></body>'''
+        doc, dl = self._do_layout(html, viewport_width=890)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        header = [t for t in texts if t.text == 'Header']
+        assert header, "Should have 'Header' text"
+        h = header[0]
+        # Header should be roughly centered: x should be near 400 (half of 800)
+        # Definitely not beyond the table right edge
+        assert h.x < 800, f"Header x={h.x:.1f} should be within table (800px)"
+        assert h.x > 100, f"Header x={h.x:.1f} should be roughly centered"
+
+    def test_center_aligned_text_not_double_shifted(self):
+        """Text in align=center cells should only be centered once."""
+        html = '''<body><table width="600" border="0" cellspacing="0" cellpadding="0">
+        <tr><td align="center">Centered</td></tr>
+        </table></body>'''
+        doc, dl = self._do_layout(html, viewport_width=600)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        centered = [t for t in texts if t.text == 'Centered']
+        assert centered, "Should have 'Centered' text"
+        c = centered[0]
+        # With 600px cell, text ~63px wide, centered x should be ~268
+        # NOT at ~536 (double-shifted)
+        assert c.x < 400, f"Centered text x={c.x:.1f} looks double-shifted"
+
+    def test_right_aligned_cell_text(self):
+        """Text in align=right cells should be positioned near right edge."""
+        html = '''<body><table width="600" border="0" cellspacing="0" cellpadding="0">
+        <tr><td align="right">Right</td></tr>
+        </table></body>'''
+        doc, dl = self._do_layout(html, viewport_width=600)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        right = [t for t in texts if t.text == 'Right']
+        assert right, "Should have 'Right' text"
+        r = right[0]
+        # Should be near right edge of 600px cell, but not beyond
+        assert r.x > 500, f"Right-aligned text x={r.x:.1f} should be near right edge"
+        assert r.x < 600, f"Right-aligned text x={r.x:.1f} should be within cell"
+
+    def test_full_page_no_text_beyond_viewport(self):
+        """No text in the full page should be positioned beyond the viewport."""
+        page_path = os.path.join(ROOT, 'example', 'hao123_2003.html')
+        with open(page_path, 'r', encoding='utf-8') as f:
+            html_text = f.read()
+        doc, dl = self._do_layout(html_text, viewport_width=890)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        off_screen = [t for t in texts if t.x + t.advance_width > 900]
+        assert len(off_screen) == 0, \
+            f"{len(off_screen)} text items extend beyond viewport: {[(t.text, t.x) for t in off_screen[:5]]}"
+
+    def test_sidebar_two_column_layout(self):
+        """Sidebar navigation items should appear in two columns."""
+        page_path = os.path.join(ROOT, 'example', 'hao123_2003.html')
+        with open(page_path, 'r', encoding='utf-8') as f:
+            html_text = f.read()
+        doc, dl = self._do_layout(html_text, viewport_width=890)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        # Find sidebar text pairs that should be on the same y-line
+        music = [t for t in texts if t.text == '音乐mp3']
+        software = [t for t in texts if t.text == '软件下载']
+        assert music and software, "Should have sidebar items"
+        # They should be on the same line (same y within tolerance)
+        assert abs(music[0].y - software[0].y) < 2.0, \
+            f"'音乐mp3' and '软件下载' should be on same line: y={music[0].y:.1f} vs {software[0].y:.1f}"
+        # And in two different x positions (columns)
+        assert software[0].x > music[0].x + 30, \
+            f"'软件下载' should be in second column: x={software[0].x:.1f} vs {music[0].x:.1f}"
