@@ -1,5 +1,6 @@
 """Table layout — CSS display:table."""
 from __future__ import annotations
+import re
 from layout.box import BoxModel, EdgeSizes
 from layout.text import _parse_px, measure_text
 from layout.context import LayoutEngine, LayoutContext
@@ -143,13 +144,11 @@ class TableLayout(LayoutEngine):
                     _parse_px(td_style.get(f'padding-{s}', '0')) > 0
                     for s in ('top', 'right', 'bottom', 'left')
                 )
-                pad = 0.0 if has_css_pad else cell_padding
-                inner_w = max(0.0, cell_w - 2 * pad)
 
                 cell_cont = BoxModel()
-                cell_cont.x = table_x + x_offset + pad
-                cell_cont.y = row_y + pad
-                cell_cont.content_width = inner_w
+                cell_cont.x = table_x + x_offset
+                cell_cont.y = row_y
+                cell_cont.content_width = cell_w
                 cell_cont.content_height = 0.0
 
                 # Override td width to 'auto' so BlockLayout uses the
@@ -157,6 +156,12 @@ class TableLayout(LayoutEngine):
                 # percentage against the (already-resolved) container.
                 saved_width = td_style.get('width')
                 td_style['width'] = 'auto'
+                saved_padding = {}
+                if not has_css_pad and cell_padding > 0.0:
+                    for side in ('top', 'right', 'bottom', 'left'):
+                        key = f'padding-{side}'
+                        saved_padding[key] = td_style.get(key)
+                        td_style[key] = f'{cell_padding}px'
 
                 child_ctx = ctx.fork()  # cells form new BFC
                 cell_box = BlockLayout().layout(td_node, cell_cont, child_ctx)
@@ -166,20 +171,21 @@ class TableLayout(LayoutEngine):
                     td_style['width'] = saved_width
                 else:
                     td_style.pop('width', None)
+                if saved_padding:
+                    for key, value in saved_padding.items():
+                        if value is None:
+                            td_style.pop(key, None)
+                        else:
+                            td_style[key] = value
                 td_node.box = cell_box
                 valign = td_style.get('vertical-align', 'middle')
-                align = td_style.get('text-align', 'left')
-                # Account for cell border widths when positioning content
-                bl = cell_box.border.left
-                bt = cell_box.border.top
-                cell_box.x = table_x + x_offset + pad + bl
-                cell_box.y = row_y + pad + bt
-                cell_box.content_width = max(0.0, inner_w - bl - cell_box.border.right)
-
-                cell_total_pad = pad + bt + cell_box.border.bottom
-                max_cell_h = max(max_cell_h, cell_box.content_height + 2 * cell_total_pad)
+                total_cell_h = (
+                    cell_box.content_height
+                    + cell_box.padding.top + cell_box.padding.bottom
+                    + cell_box.border.top + cell_box.border.bottom
+                )
+                max_cell_h = max(max_cell_h, total_cell_h)
                 td_node._table_valign = valign
-                td_node._table_pad = pad
                 x_offset += cell_w + cell_spacing
                 col_idx += colspan
 
@@ -191,15 +197,18 @@ class TableLayout(LayoutEngine):
             col_idx = 0
             for td_node, colspan in cells:
                 cell_w = sum(col_widths[col_idx:col_idx + colspan]) + cell_spacing * (colspan - 1)
-                pad = getattr(td_node, '_table_pad', 0.0)
                 cell_box = getattr(td_node, 'box', None)
                 if cell_box is not None:
+                    pl = cell_box.padding.left
+                    pr = cell_box.padding.right
+                    pt = cell_box.padding.top
+                    pb = cell_box.padding.bottom
                     bt = cell_box.border.top
                     bb = cell_box.border.bottom
-                    total_vert = pad + bt + bb
-                    extra_h = max(0.0, max_cell_h - (cell_box.content_height + 2 * total_vert))
+                    total_vert = pt + pb + bt + bb
+                    extra_h = max(0.0, max_cell_h - (cell_box.content_height + total_vert))
                     # Stretch cell to fill row height
-                    cell_box.content_height = max(0.0, max_cell_h - 2 * total_vert)
+                    cell_box.content_height = max(0.0, max_cell_h - total_vert)
                     valign = getattr(td_node, '_table_valign', 'middle')
                     if valign == 'bottom':
                         dy = extra_h
@@ -217,7 +226,7 @@ class TableLayout(LayoutEngine):
                     if align in ('center', 'right'):
                         block_w = _measure_block_children_width(td_node)
                         if block_w > 0:
-                            inner_w = cell_w - 2 * pad
+                            inner_w = max(0.0, cell_box.content_width)
                             if align == 'right':
                                 dx = max(0.0, inner_w - block_w)
                             else:
@@ -371,19 +380,20 @@ def _measure_cell_nowrap_width(node) -> float:
     def _walk(n, inherited_style):
         nonlocal total
         if isinstance(n, Text):
-            words = n.data.split()
             s = inherited_style
             fam = s.get('font-family', family)
             sz = _parse_px(s.get('font-size', f'{size_px}px'))
             wt = s.get('font-weight', weight)
             it = s.get('font-style', 'normal') in ('italic', 'oblique')
-            for word in words:
+            for token in re.findall(r'\S+|\s+', n.data):
+                if token.isspace():
+                    total += space_w
+                    continue
                 try:
-                    w, _ = measure_text(word, fam, sz, wt, it)
-                    sw, _ = measure_text(' ', fam, sz, wt, it)
-                    total += w + sw
+                    w, _ = measure_text(token, fam, sz, wt, it)
+                    total += w
                 except Exception:
-                    total += len(word) * sz * 0.6 + space_w
+                    total += len(token) * sz * 0.6
         elif isinstance(n, Element):
             s = n.style or inherited_style
             for c in n.children:

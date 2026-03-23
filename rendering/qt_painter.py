@@ -200,10 +200,14 @@ def _make_qfont(font_tuple: tuple) -> QFont:
     font = QFont()
     font.setFamily(family)
     font.setPixelSize(size_px)
+    is_bold = False
     if weight_str in ('bold', '700', '800', '900') or 'bold' in weight_str:
         font.setWeight(QFont.Weight.Bold)
+        is_bold = True
     elif weight_str in ('600',):
         font.setWeight(QFont.Weight.DemiBold)
+        is_bold = True
+    font.setBold(is_bold)
     if 'italic' in weight_str or 'italic' in style_str or 'oblique' in style_str:
         font.setItalic(True)
     return font

@@ -569,6 +569,8 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
             _set_border_shorthand(computed, 'border-style', 'solid')
             _set_border_shorthand(computed, 'border-width',
                                   border if border.endswith('px') else border + 'px')
+            if computed.get('border-top-color', 'currentcolor') == 'currentcolor':
+                _set_border_shorthand(computed, 'border-color', 'gray')
 
     # <td>/<th> in a <table border="N"> → cells get 1px inset border
     if tag in ('td', 'th'):
@@ -585,8 +587,9 @@ def _apply_html_presentation_hints(node: Element, computed: dict) -> None:
             tb = table_node.attributes.get('border', '').strip()
             if tb and tb != '0':
                 if computed.get('border-top-style', 'none') == 'none':
-                    _set_border_shorthand(computed, 'border-style', 'inset')
+                    _set_border_shorthand(computed, 'border-style', 'solid')
                     _set_border_shorthand(computed, 'border-width', '1px')
+                    _set_border_shorthand(computed, 'border-color', 'gray')
 
     # img border → border
     if tag == 'img':

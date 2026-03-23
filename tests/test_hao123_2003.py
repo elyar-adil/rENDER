@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import html.parser as hp
 from html.dom import Document, Element, Text
 from css.cascade import bind
+from layout.text import measure_text
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -311,6 +312,7 @@ class TestTableAttributes:
         assert _style(table, 'border-bottom-style') == 'solid'
         assert _style(table, 'border-left-style') == 'solid'
         assert _style(table, 'border-top-width') == '1px'
+        assert _style(table, 'border-top-color') == 'gray'
 
     def test_td_border_longhands_set(self):
         """TD border longhands must be set when table has border attr."""
@@ -323,6 +325,7 @@ class TestTableAttributes:
         assert _style(td, 'border-bottom-style') in ('solid', 'inset')
         assert _style(td, 'border-left-style') in ('solid', 'inset')
         assert _style(td, 'border-top-width') == '1px'
+        assert _style(td, 'border-top-color') == 'gray'
 
     def test_table_cellspacing(self):
         doc = _parse_and_bind(
@@ -446,6 +449,17 @@ class TestInlineElements:
         )
         a = _find_first(doc, 'a')
         assert _style(a, 'color') == '#261cdc'
+
+    def test_anchor_underline_uses_text_width(self):
+        import layout as layout_mod
+        from rendering.display_list import DrawText
+
+        doc = _parse_and_bind('<body><a href="#">link</a></body>', viewport_width=200)
+        dl = layout_mod.layout(doc, viewport_width=200)
+        texts = [c for c in dl.commands if isinstance(c, DrawText) and c.text == 'link']
+        assert texts, "Should emit a DrawText command for the anchor text"
+        expected_width, _ = measure_text('link', 'Arial, Helvetica, sans-serif', 16, 'normal', False)
+        assert texts[0].advance_width == expected_width
 
 
 # =========================================================================
@@ -673,3 +687,17 @@ class TestTableCellAlignment:
         # And in two different x positions (columns)
         assert software[0].x > music[0].x + 30, \
             f"'软件下载' should be in second column: x={software[0].x:.1f} vs {music[0].x:.1f}"
+
+    def test_sidebar_first_row_does_not_overlap(self):
+        """The first-row sidebar links should not overlap each other."""
+        page_path = os.path.join(ROOT, 'example', 'hao123_2003.html')
+        with open(page_path, 'r', encoding='utf-8') as f:
+            html_text = f.read()
+        doc, dl = self._do_layout(html_text, viewport_width=890)
+        from rendering.display_list import DrawText
+        texts = [c for c in dl.commands if isinstance(c, DrawText)]
+        music = [t for t in texts if t.text == '音乐mp3']
+        software = [t for t in texts if t.text == '软件下载']
+        assert music and software, "Should have sidebar items"
+        assert music[0].x + music[0].advance_width <= software[0].x, \
+            f"Sidebar first-row links overlap: music ends at {music[0].x + music[0].advance_width:.1f}, software starts at {software[0].x:.1f}"

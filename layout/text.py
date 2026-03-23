@@ -25,7 +25,7 @@ def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool =
 
     # Handle font family (may be comma-separated)
     families = [f.strip().strip('"\'') for f in family.split(',')]
-    font.setFamily(families[0])
+    font.setFamily(resolve_font_family(families[0]))
 
     # Size
     font.setPixelSize(max(1, int(size_px)))
@@ -44,7 +44,9 @@ def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool =
         '800': QFont.Weight.ExtraBold,
         '900': QFont.Weight.Black,
     }
-    font.setWeight(weight_map.get(str(weight).lower(), QFont.Weight.Normal))
+    resolved_weight = weight_map.get(str(weight).lower(), QFont.Weight.Normal)
+    font.setWeight(resolved_weight)
+    font.setBold(resolved_weight >= QFont.Weight.Bold)
     font.setItalic(italic)
 
     return font

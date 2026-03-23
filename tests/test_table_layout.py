@@ -68,6 +68,49 @@ class TestTableCellAlignment(unittest.TestCase):
         self.assertAlmostEqual(inner.box.x, 50.0)
         self.assertAlmostEqual(inner.box.y, 40.0)
 
+    def test_cellpadding_keeps_cell_border_on_grid_edge(self):
+        table = Element('table', {'cellspacing': '0', 'cellpadding': '3', 'width': '120'})
+        table.style = {
+            'display': 'table',
+            'width': '120px',
+            'border-top-style': 'solid',
+            'border-right-style': 'solid',
+            'border-bottom-style': 'solid',
+            'border-left-style': 'solid',
+            'border-top-width': '1px',
+            'border-right-width': '1px',
+            'border-bottom-width': '1px',
+            'border-left-width': '1px',
+        }
+        tr = _append(table, Element('tr'))
+        td = _append(tr, Element('td'))
+        td.style = {
+            'display': 'table-cell',
+            'border-top-style': 'solid',
+            'border-right-style': 'solid',
+            'border-bottom-style': 'solid',
+            'border-left-style': 'solid',
+            'border-top-width': '1px',
+            'border-right-width': '1px',
+            'border-bottom-width': '1px',
+            'border-left-width': '1px',
+        }
+
+        inner = _append(td, Element('div'))
+        inner.style = {'display': 'block', 'height': '10px'}
+
+        container = BoxModel()
+        container.x = 0.0
+        container.y = 0.0
+        container.content_width = 120.0
+        container.content_height = 0.0
+
+        ctx = LayoutContext(viewport_width=120, viewport_height=120)
+        table_box = TableLayout().layout(table, container, ctx)
+
+        self.assertAlmostEqual(td.box.border_rect.x, table_box.x)
+        self.assertAlmostEqual(inner.box.x, table_box.x + 1.0 + 3.0)
+
 
 class TestBlockBrAroundBlockChildren(unittest.TestCase):
     def test_br_between_block_children_is_not_double_counted(self):

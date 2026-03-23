@@ -1,4 +1,5 @@
 """Inline formatting context and line boxes."""
+import re
 from dataclasses import dataclass, field
 from layout.box import BoxModel
 from layout.text import measure_word, measure_text, get_font, _parse_px
@@ -70,6 +71,11 @@ class LineBox:
 
     def add_item(self, item: InlineItem) -> bool:
         """Try to add item. Returns False if it doesn't fit."""
+        if item.type == 'SPACE':
+            if not self.items:
+                return True
+            if self.items[-1].type == 'SPACE':
+                return True
         if self.items and self.width + item.width > self.available_width:
             return False
         item.x = self.x + self.width
@@ -80,6 +86,9 @@ class LineBox:
 
     def finalize(self, text_align: str = 'left') -> None:
         """Adjust item positions for text alignment."""
+        while self.items and self.items[-1].type == 'SPACE':
+            self.width -= self.items[-1].width
+            self.items.pop()
         if not self.items:
             return
         # Apply minimum line height
@@ -637,16 +646,32 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
             except Exception:
                 letter_spacing = 0.0
 
-        words = text.split()
-        space_w, _ = measure_text(' ', family, size_px, weight, italic)
-        for word in words:
-            w, h = measure_text(word, family, size_px, weight, italic)
-            # Add letter-spacing contribution
+        tokens = re.findall(r'\S+|\s+', text)
+        space_w, space_h = measure_text(' ', family, size_px, weight, italic)
+        for token in tokens:
+            if token.isspace():
+                items.append(InlineItem(
+                    text='',
+                    width=space_w + word_spacing,
+                    height=space_h,
+                    color=color,
+                    font_family=family,
+                    font_size=size_px,
+                    font_weight=weight,
+                    font_italic=italic,
+                    decoration=decoration,
+                    word_spacing=word_spacing,
+                    origin_node=current_link,
+                    type='SPACE',
+                ))
+                continue
+
+            w, h = measure_text(token, family, size_px, weight, italic)
             if letter_spacing != 0.0:
-                w += letter_spacing * len(word)
+                w += letter_spacing * len(token)
             item = InlineItem(
-                text=word,
-                width=w + space_w + word_spacing,
+                text=token,
+                width=w,
                 height=h,
                 color=color,
                 font_family=family,
