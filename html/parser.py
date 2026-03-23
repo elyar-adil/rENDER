@@ -104,7 +104,7 @@ RAW_TEXT_ELEMENTS = frozenset({'script', 'style'})
 
 # Tags that have optional closing tags (simplified set)
 OPTIONAL_CLOSE = {
-    'li': frozenset({'li', 'ul', 'ol'}),
+    'li': frozenset({'li'}),
     'dt': frozenset({'dd', 'dt', 'dl'}),
     'dd': frozenset({'dd', 'dt', 'dl'}),
     'p': frozenset({

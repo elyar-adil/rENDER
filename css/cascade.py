@@ -581,13 +581,12 @@ def _apply_to_element(node: Element, index: dict) -> None:
         except Exception as exc:
             _logger.debug('Selector match error for %r on <%s>: %s', sel_text, node.tag, exc)
 
-    # Priority: UA < hints < author < !important
+    # Priority: UA < hints < author < inline < !important
     computed = {**ua_computed}
     _apply_html_presentation_hints(node, computed)  # hints override UA defaults
     computed.update(author_computed)                 # author CSS overrides hints
-    computed.update(important)
 
-    # Inline styles
+    # Inline styles (higher priority than author, lower than !important)
     if 'style' in node.attributes and node.attributes['style']:
         try:
             inline = css_parser.parse_inline_style(node.attributes['style'])
@@ -601,6 +600,8 @@ def _apply_to_element(node: Element, index: dict) -> None:
                     computed.update(expanded)
         except Exception as exc:
             _logger.debug('Inline style parse error on <%s>: %s', node.tag, exc)
+
+    computed.update(important)                       # !important overrides everything
 
     # Initial values for missing properties.
     # Inherited properties are intentionally left absent here so that
