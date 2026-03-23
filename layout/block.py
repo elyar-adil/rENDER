@@ -121,7 +121,14 @@ def _get_style(node, prop: str, default: str = '') -> str:
 def _parse_edge(node, prop_prefix: str, container_width: float = 0.0) -> EdgeSizes:
     edges = EdgeSizes()
     for side in ('top', 'right', 'bottom', 'left'):
-        val = _get_style(node, f'{prop_prefix}-{side}', '0px')
+        # CSS border properties use border-{side}-width, not border-width-{side}
+        # Try the correct CSS form first, then fall back to the legacy form
+        if prop_prefix == 'border-width':
+            val = _get_style(node, f'border-{side}-width', '')
+            if not val:
+                val = _get_style(node, f'border-width-{side}', '0px')
+        else:
+            val = _get_style(node, f'{prop_prefix}-{side}', '0px')
         if val == 'auto':
             edges.__dict__[side] = 0.0
         elif val and val.endswith('%') and container_width > 0:

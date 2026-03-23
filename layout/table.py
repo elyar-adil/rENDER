@@ -18,7 +18,12 @@ def _gs(node, prop: str, default: str = '') -> str:
 def _parse_edge(node, prop_prefix: str, cw: float = 0.0) -> EdgeSizes:
     e = EdgeSizes()
     for side in ('top', 'right', 'bottom', 'left'):
-        val = _gs(node, f'{prop_prefix}-{side}', '0px')
+        if prop_prefix == 'border-width':
+            val = _gs(node, f'border-{side}-width', '')
+            if not val:
+                val = _gs(node, f'border-width-{side}', '0px')
+        else:
+            val = _gs(node, f'{prop_prefix}-{side}', '0px')
         if val == 'auto':
             e.__dict__[side] = 0.0
         elif val and val.endswith('%') and cw > 0:
@@ -164,11 +169,15 @@ class TableLayout(LayoutEngine):
                 td_node.box = cell_box
                 valign = td_style.get('vertical-align', 'middle')
                 align = td_style.get('text-align', 'left')
-                cell_box.x = table_x + x_offset + pad
-                cell_box.y = row_y + pad
-                cell_box.content_width = inner_w
+                # Account for cell border widths when positioning content
+                bl = cell_box.border.left
+                bt = cell_box.border.top
+                cell_box.x = table_x + x_offset + pad + bl
+                cell_box.y = row_y + pad + bt
+                cell_box.content_width = max(0.0, inner_w - bl - cell_box.border.right)
 
-                max_cell_h = max(max_cell_h, cell_box.content_height + 2 * pad)
+                cell_total_pad = pad + bt + cell_box.border.bottom
+                max_cell_h = max(max_cell_h, cell_box.content_height + 2 * cell_total_pad)
                 td_node._table_valign = valign
                 td_node._table_pad = pad
                 x_offset += cell_w + cell_spacing
@@ -185,9 +194,12 @@ class TableLayout(LayoutEngine):
                 pad = getattr(td_node, '_table_pad', 0.0)
                 cell_box = getattr(td_node, 'box', None)
                 if cell_box is not None:
-                    extra_h = max(0.0, max_cell_h - (cell_box.content_height + 2 * pad))
+                    bt = cell_box.border.top
+                    bb = cell_box.border.bottom
+                    total_vert = pad + bt + bb
+                    extra_h = max(0.0, max_cell_h - (cell_box.content_height + 2 * total_vert))
                     # Stretch cell to fill row height
-                    cell_box.content_height = max_cell_h - 2 * pad
+                    cell_box.content_height = max(0.0, max_cell_h - 2 * total_vert)
                     valign = getattr(td_node, '_table_valign', 'middle')
                     if valign == 'bottom':
                         dy = extra_h
