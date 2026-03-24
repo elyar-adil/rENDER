@@ -62,6 +62,8 @@ Run the test suite:
 python -m pytest
 ```
 
+Testing strategy details: [`docs/testing_strategy.md`](docs/testing_strategy.md).
+
 Run syntax and lint checks:
 
 ```bash
@@ -101,8 +103,9 @@ The central orchestration lives in [`engine.py`](engine.py). Layout engines are 
 The project is not trying to mimic every browser subsystem at once. Instead, it improves compatibility through narrow, test-backed slices:
 
 - page-specific regressions captured as unit tests
+- page-level rendering contracts for real-world fixture modules
 - adapted WebKit layout fixtures
-- visual regression helpers for local fixtures
+- visual regression helpers for local fixtures and browser diffing
 - compatibility notes under `docs/`
 
 This keeps behavior improvements concrete and reviewable.

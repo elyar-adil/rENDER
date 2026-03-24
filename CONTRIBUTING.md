@@ -16,6 +16,13 @@ python -m venv .venv
 pip install -r requirements-dev.txt
 ```
 
+## Testing Philosophy
+
+- A test passing should imply the page still renders correctly, not just that parsing succeeded.
+- Prefer adding assertions in `tests/test_modern_rendering_contracts.py` for real-page fixtures when fixing compatibility bugs.
+- Use browser-vs-engine visual diffs as a secondary guardrail for parity with Chromium/Chrome.
+- See `docs/testing_strategy.md` for the layered test model and rollout expectations.
+
 ## Required Checks
 
 Before sending a change, run:
