@@ -76,7 +76,7 @@ th { font-weight: bold; }
 input, select, textarea, button { display: inline; }
 
 /* Horizontal rule */
-hr { border-style: solid; border-color: gray; margin-top: 8px; margin-bottom: 8px; }
+hr { border-top-style: solid; border-top-color: gray; border-top-width: 1px; margin-top: 8px; margin-bottom: 8px; }
 
 /* Details / Dialog */
 details { display: block; }
