@@ -9,6 +9,17 @@ DEFAULT_FONT_SIZE = 16  # browser default px
 def compute(document: Document, viewport_width: int = 980, viewport_height: int = 600) -> None:
     """Convert all element style values to computed values in-place (iterative)."""
     root_font_size = DEFAULT_FONT_SIZE
+    # Determine root font-size from <html> element before full walk
+    for child in document.children:
+        if isinstance(child, Element) and child.tag == 'html':
+            fs_str = (child.style or {}).get('font-size', '')
+            if fs_str:
+                resolved = _resolve_length(fs_str, DEFAULT_FONT_SIZE,
+                                           DEFAULT_FONT_SIZE, viewport_width,
+                                           viewport_height, is_font_size=True)
+                if resolved is not None:
+                    root_font_size = resolved
+            break
     # Iterative top-down walk so we can propagate font-size parent→child
     stack = [(document, DEFAULT_FONT_SIZE)]
     while stack:
@@ -49,12 +60,17 @@ def _process_element(node: Element, parent_font_size: float, root_font_size: flo
             if resolved is not None:
                 node.style[prop] = f'{resolved}px'
 
-    # line-height: resolve em/rem but keep unitless/normal as-is
+    # line-height: resolve em/rem/px but keep unitless multipliers as-is
     lh = node.style.get('line-height', '')
     if lh and lh not in ('normal', 'inherit', 'initial', ''):
-        resolved = _resolve_length(lh, font_size, root_font_size, vw, vh)
-        if resolved is not None:
-            node.style['line-height'] = f'{resolved}px'
+        import re as _re
+        # Unitless numbers (e.g. '1.5', '3') are multipliers — keep as-is
+        if _re.fullmatch(r'[+-]?[\d.]+', lh):
+            pass  # keep unitless value for inline layout to multiply by font-size
+        else:
+            resolved = _resolve_length(lh, font_size, root_font_size, vw, vh)
+            if resolved is not None:
+                node.style['line-height'] = f'{resolved}px'
 
     return font_size
 
