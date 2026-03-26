@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import unittest
 from html.dom import Element
 from layout.box import BoxModel
-from layout.flex import FlexLayout, _compute_x_positions, _wrap_into_lines
+from layout.flex import FlexLayout, _compute_x_positions
 from layout.context import LayoutContext
 
 
@@ -361,53 +361,6 @@ class TestComputeXPositions(unittest.TestCase):
         # around_gap = 200/2 = 100; first at 50, second at 250
         self.assertAlmostEqual(xs[0], 50, delta=0.5)
         self.assertAlmostEqual(xs[1], 250, delta=0.5)
-
-
-class TestWrapIntoLines(unittest.TestCase):
-    """Unit tests for _wrap_into_lines helper."""
-
-    def _make_boxes(self, widths):
-        boxes = []
-        for w in widths:
-            b = BoxModel()
-            b.content_width = w
-            b.margin = __import__('layout.box', fromlist=['EdgeSizes']).EdgeSizes()
-            boxes.append(b)
-        return boxes
-
-    def test_all_fit_single_line(self):
-        children = [object(), object()]
-        boxes = self._make_boxes([100, 100])
-        lines = _wrap_into_lines(children, boxes, content_width=300, gap=0)
-        self.assertEqual(len(lines), 1)
-
-    def test_wrap_when_overflow(self):
-        # 3 items of 200px in 350px: item1 fits(200), item2 400>350 wraps,
-        # item3 then 200+200=400>350 wraps again → 3 lines
-        children = [object(), object(), object()]
-        boxes = self._make_boxes([200, 200, 200])
-        lines = _wrap_into_lines(children, boxes, content_width=350, gap=0)
-        self.assertEqual(len(lines), 3)
-
-    def test_wrap_two_items_two_lines(self):
-        # 2 items that don't fit together
-        children = [object(), object()]
-        boxes = self._make_boxes([200, 200])
-        lines = _wrap_into_lines(children, boxes, content_width=300, gap=0)
-        self.assertEqual(len(lines), 2)
-
-    def test_single_item_always_one_line(self):
-        children = [object()]
-        boxes = self._make_boxes([999])
-        lines = _wrap_into_lines(children, boxes, content_width=100, gap=0)
-        self.assertEqual(len(lines), 1)
-
-    def test_gap_affects_wrapping(self):
-        children = [object(), object()]
-        boxes = self._make_boxes([100, 100])
-        # With gap=50: needed=100+50+100=250 > 200
-        lines = _wrap_into_lines(children, boxes, content_width=200, gap=50)
-        self.assertEqual(len(lines), 2)
 
 
 if __name__ == '__main__':

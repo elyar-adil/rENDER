@@ -130,36 +130,6 @@ class TestBoxModelRects(unittest.TestCase):
         self.assertEqual(mr.width, 140)
         self.assertEqual(mr.height, 80)
 
-    def test_border_box_rect_alias(self):
-        self.assertEqual(self.box.border_box_rect.x, self.box.border_rect.x)
-        self.assertEqual(self.box.border_box_rect.width, self.box.border_rect.width)
-
-    def test_margin_box_rect_alias(self):
-        self.assertEqual(self.box.margin_box_rect.x, self.box.margin_rect.x)
-        self.assertEqual(self.box.margin_box_rect.width, self.box.margin_rect.width)
-
-
-class TestBoxModelLegacy(unittest.TestCase):
-
-    def test_width_height_alias_content_dims(self):
-        box = BoxModel()
-        box.content_width = 150.0
-        box.content_height = 75.0
-        self.assertEqual(box.width, 150.0)
-        self.assertEqual(box.height, 75.0)
-
-    def test_width_setter_updates_content_width(self):
-        box = BoxModel()
-        box.width = 200.0
-        self.assertEqual(box.content_width, 200.0)
-        box.height = 100.0
-        self.assertEqual(box.content_height, 100.0)
-
-    def test_initial_dims_zero(self):
-        box = BoxModel()
-        self.assertEqual(box.width, 0.0)
-        self.assertEqual(box.height, 0.0)
-
     def test_repr(self):
         box = BoxModel()
         box.x = 1.0

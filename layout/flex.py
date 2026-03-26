@@ -464,39 +464,7 @@ def _compute_x_positions(justify: str, child_boxes: list, slack: float, gap: flo
     return x_positions
 
 
-# Backward-compat shims
-
-def _wrap_into_lines(flex_children, child_boxes, content_width: float, gap: float) -> list:
-    """Backward-compatible module-level wrapper for wrap logic."""
-    lines = []
-    current_children = []
-    current_boxes = []
-    current_width = 0.0
-
-    for child, cb in zip(flex_children, child_boxes):
-        item_w = cb.content_width + cb.margin.left + cb.margin.right
-        if current_children:
-            needed = current_width + gap + item_w
-        else:
-            needed = item_w
-
-        if current_children and needed > content_width:
-            lines.append((current_children, current_boxes))
-            current_children = [child]
-            current_boxes = [cb]
-            current_width = item_w
-        else:
-            current_children.append(child)
-            current_boxes.append(cb)
-            current_width = needed
-
-    if current_children:
-        lines.append((current_children, current_boxes))
-    return lines
-
-
 def layout_flex(node, container_box: BoxModel) -> BoxModel:
-    """Backward-compatible wrapper around FlexLayout."""
     from layout.context import LayoutContext
     ctx = LayoutContext()
     return FlexLayout().layout(node, container_box, ctx)

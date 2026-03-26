@@ -1,6 +1,6 @@
+"""rENDER browser engine main entry point."""
 import logging
 _logger = logging.getLogger(__name__)
-"""rENDER browser engine main entry point."""
 import argparse
 import sys
 import os
