@@ -1,6 +1,8 @@
 """Resolve CSS computed values: convert relative units to absolute px values."""
 import re
 from html.dom import Document, Element
+from css.lengths import resolve_length_expr as _resolve_calc_expr
+from css.utils import split_paren_aware as _split_css_args_impl
 
 
 DEFAULT_FONT_SIZE = 16  # browser default px
@@ -85,8 +87,17 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
 
     value = value.strip()
 
-    # CSS math functions: min(), max(), clamp()
+    # CSS math functions: calc(), min(), max(), clamp()
     vl = value.lower()
+    if vl.startswith('calc(') and vl.endswith(')'):
+        return _resolve_calc_expr(
+            value,
+            percentage_base=None,
+            em_base=parent_font_size,
+            rem_base=root_font_size,
+            vw=vw,
+            vh=vh,
+        )
     if vl.startswith('min(') and vl.endswith(')'):
         args = _split_css_args(value[4:-1])
         resolved = [_resolve_length(a.strip(), parent_font_size, root_font_size, vw, vh, is_font_size)
@@ -163,21 +174,4 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
 
 def _split_css_args(text: str) -> list:
     """Split comma-separated CSS function arguments, respecting nested parens."""
-    result = []
-    current = []
-    depth = 0
-    for ch in text:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            result.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        result.append(''.join(current))
-    return result
+    return _split_css_args_impl(text)

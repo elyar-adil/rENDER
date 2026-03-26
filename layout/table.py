@@ -1,5 +1,7 @@
 """Table layout — CSS display:table."""
 from __future__ import annotations
+import logging
+_logger = logging.getLogger(__name__)
 import re
 from layout.box import BoxModel, EdgeSizes
 from layout.text import _parse_px, measure_text
@@ -285,8 +287,8 @@ def _compute_col_widths(all_rows, n_cols: int, table_w: float, cell_spacing: flo
                              else _parse_px(w_str))
                         if col_widths[col_idx] is None:
                             col_widths[col_idx] = w
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _logger.debug("Ignored: %s", _exc)
                 else:
                     auto_min[col_idx] = max(auto_min[col_idx], _measure_cell_min_width(td_node))
             col_idx += colspan
@@ -332,8 +334,8 @@ def _measure_cell_min_width(node) -> float:
     if width_str and width_str not in ('auto', ''):
         try:
             return float(_parse_px(width_str))
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
     if getattr(node, 'tag', '') == 'img':
         natural = getattr(node, 'natural_width', 0) or 0
         if natural > 0:

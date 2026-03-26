@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """DOM/BOM API bindings for the JavaScript interpreter."""
 from js.interpreter import (
     Interpreter, Environment, JSObject, JSArray, JSFunction,
@@ -166,8 +168,8 @@ class DOMElement(JSObject):
             self._node.children = list(body.children)
             for child in self._node.children:
                 child.parent = self._node
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
 
     def _set_text_content(self, text):
         t = Text(_to_str(text))
@@ -270,8 +272,8 @@ class DOMElement(JSObject):
                 import css.selector as selector_mod
                 if selector_mod.matches(node, sel):
                     return self._binding.wrap(node)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
             node = getattr(node, 'parent', None)
         return None
 

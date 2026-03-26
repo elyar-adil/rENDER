@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """JavaScript tree-walking interpreter for rENDER browser engine."""
 import math
 import json
@@ -174,13 +176,13 @@ class Interpreter:
             if callable(fn):
                 try:
                     fn(*args)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
             elif isinstance(fn, JSFunction):
                 try:
                     self._call_function(fn, list(args))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
 
     def execute(self, ast) -> None:
         """Execute a Program AST node."""
@@ -923,8 +925,8 @@ def _safe_call(fn, args):
             interp._exec_stmt(fn.body, call_env)
         except _Return as ret:
             return ret.value
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
         return _UNDEF
     return _UNDEF
 

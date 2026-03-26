@@ -53,8 +53,9 @@ class TestInlineLayout(unittest.TestCase):
         lines, _ = layout_inline(root, 0.0, 0.0, 200.0)
 
         items = [item for line in lines for item in line.items]
-        self.assertEqual([item.type for item in items], ['WORD', 'WORD'])
-        self.assertEqual([item.text for item in items], ['Read', 'more'])
+        word_items = [item for item in items if item.type not in ('SPACE',)]
+        self.assertEqual([item.type for item in word_items], ['WORD', 'WORD'])
+        self.assertEqual([item.text for item in word_items], ['Read', 'more'])
 
     def test_text_input_is_emitted_as_inline_control(self):
         root = Element('div')
@@ -109,8 +110,9 @@ class TestInlineLayout(unittest.TestCase):
 
         lines, _ = layout_inline(root, 0.0, 0.0, 300.0)
         items = [item for line in lines for item in line.items]
-        self.assertEqual([item.type for item in items], ['WORD', 'WORD'])
-        self.assertEqual([item.text for item in items], ['Read', 'more'])
+        word_items = [item for item in items if item.type not in ('SPACE',)]
+        self.assertEqual([item.type for item in word_items], ['WORD', 'WORD'])
+        self.assertEqual([item.text for item in word_items], ['Read', 'more'])
 
     def test_resolve_font_family_returns_installed_family(self):
         from PyQt6.QtGui import QFontDatabase

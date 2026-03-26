@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """rENDER browser engine main entry point."""
 import argparse
 import sys
@@ -213,8 +215,8 @@ def _attach_images(img_data: list) -> None:
                 node.qimage = qimg
                 node.natural_width = qimg.width()
                 node.natural_height = qimg.height()
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
 
 
 def _is_svg(raw: bytes) -> bool:
@@ -328,7 +330,9 @@ def _page_height(document, viewport_height: int = VIEWPORT_H) -> int:
     ref = [viewport_height]
     def walk(n):
         if hasattr(n, 'box') and n.box is not None:
-            ref[0] = max(ref[0], n.box.y + n.box.content_height)
+            box = n.box
+            bottom = box.y + box.content_height + box.padding.bottom + box.border.bottom
+            ref[0] = max(ref[0], bottom)
         for c in n.children:
             walk(c)
     walk(document)

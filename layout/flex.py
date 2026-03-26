@@ -1,5 +1,7 @@
 """Flexbox layout (simplified)."""
 from __future__ import annotations
+import logging
+_logger = logging.getLogger(__name__)
 from layout.box import BoxModel, EdgeSizes
 from layout.text import _parse_px
 from layout.context import LayoutEngine, LayoutContext
@@ -66,8 +68,8 @@ def _initial_main_size(child, child_box: BoxModel, container_width: float,
                 return container_width * float(width_str[:-1]) / 100.0
             try:
                 return _parse_px(width_str)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
         # Auto width flex item: use intrinsic (min-content) width, not container
         from layout.inline import _measure_inline_block_intrinsic_width
         try:
@@ -81,8 +83,8 @@ def _initial_main_size(child, child_box: BoxModel, container_width: float,
         if height_str not in ('auto', ''):
             try:
                 return _parse_px(height_str)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
         return child_box.content_height
 
 

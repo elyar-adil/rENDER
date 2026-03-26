@@ -1,5 +1,7 @@
 """Block Formatting Context layout."""
 from __future__ import annotations
+import logging
+_logger = logging.getLogger(__name__)
 from layout.box import BoxModel, EdgeSizes, Rect
 from layout.text import _parse_px
 from layout.float_manager import FloatManager
@@ -26,8 +28,8 @@ def _resolve_replaced_img_dim(css_val: str, attr_val: str, natural: int) -> floa
                 if raw.lstrip('-').isdigit():
                     return max(0.0, float(raw))
             return max(0.0, float(_parse_px(val)))
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
     return float(natural or 0)
 
 
@@ -183,8 +185,8 @@ def _measure_auto_width(node, container_width: float) -> float:
                     measured += _measure_text_span(text, style)
         if measured > 0:
             return measured
-    except Exception:
-        pass
+    except Exception as _exc:
+        _logger.debug("Ignored: %s", _exc)
     return max(0.0, container_width)
 
 
@@ -243,8 +245,8 @@ class BlockLayout(LayoutEngine):
                 try:
                     v = c_width * float(s[:-1]) / 100 if s.endswith('%') else _parse_px(s)
                     content_width = op(content_width, v)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
 
         # --- margin:auto centering ---
         ml_str = _get_style(node, 'margin-left', '0px')
@@ -409,8 +411,8 @@ class BlockLayout(LayoutEngine):
             if s and s not in ('none', ''):
                 try:
                     content_height = op(content_height, _parse_px(s))
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
 
         # <img> auto height from natural dimensions
         if is_replaced_img and child_y == 0.0:
@@ -483,8 +485,8 @@ class BlockLayout(LayoutEngine):
                 try:
                     v = c_width * float(s[:-1]) / 100 if s.endswith('%') else _parse_px(s)
                     content_width = op(content_width, v)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
 
         tmp = BoxModel()
         tmp.x = c_x + margin.left + border_w.left + padding.left
