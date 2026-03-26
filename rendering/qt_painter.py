@@ -4,6 +4,8 @@ _logger = logging.getLogger(__name__)
 import sys
 import os
 import math
+import re
+from functools import lru_cache
 from css.utils import split_paren_aware as _split_top_level_commas
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
@@ -23,6 +25,80 @@ from rendering.display_list import (
     PushTransform, PopTransform, DrawLinearGradient,
     DrawBoxShadow, DrawRadialGradient, DrawOutline,
 )
+
+
+# --- Module-level constants for _parse_color (avoid rebuild per call) ---
+
+_NAMED_COLORS: dict[str, str] = {
+    'black': '#000000', 'white': '#ffffff', 'red': '#ff0000',
+    'green': '#008000', 'blue': '#0000ff', 'yellow': '#ffff00',
+    'orange': '#ffa500', 'purple': '#800080', 'pink': '#ffc0cb',
+    'gray': '#808080', 'grey': '#808080', 'silver': '#c0c0c0',
+    'aqua': '#00ffff', 'cyan': '#00ffff', 'magenta': '#ff00ff',
+    'fuchsia': '#ff00ff', 'lime': '#00ff00', 'maroon': '#800000',
+    'navy': '#000080', 'olive': '#808000', 'teal': '#008080',
+    'brown': '#a52a2a', 'gold': '#ffd700', 'coral': '#ff7f50',
+    'salmon': '#fa8072', 'khaki': '#f0e68c', 'indigo': '#4b0082',
+    'violet': '#ee82ee', 'beige': '#f5f5dc', 'ivory': '#fffff0',
+    'lavender': '#e6e6fa', 'turquoise': '#40e0d0', 'tan': '#d2b48c',
+    'sienna': '#a0522d', 'crimson': '#dc143c', 'darkblue': '#00008b',
+    'darkgreen': '#006400', 'darkred': '#8b0000', 'darkorange': '#ff8c00',
+    'lightblue': '#add8e6', 'lightgreen': '#90ee90', 'lightgray': '#d3d3d3',
+    'lightgrey': '#d3d3d3', 'currentcolor': '#000000', 'inherit': '#000000',
+    'aliceblue': '#f0f8ff', 'antiquewhite': '#faebd7', 'aquamarine': '#7fffd4',
+    'azure': '#f0ffff', 'bisque': '#ffe4c4', 'blanchedalmond': '#ffebcd',
+    'blueviolet': '#8a2be2', 'burlywood': '#deb887', 'cadetblue': '#5f9ea0',
+    'chartreuse': '#7fff00', 'chocolate': '#d2691e', 'cornflowerblue': '#6495ed',
+    'cornsilk': '#fff8dc', 'darkcyan': '#008b8b', 'darkgoldenrod': '#b8860b',
+    'darkgray': '#a9a9a9', 'darkgrey': '#a9a9a9', 'darkkhaki': '#bdb76b',
+    'darkmagenta': '#8b008b', 'darkolivegreen': '#556b2f', 'darkorchid': '#9932cc',
+    'darksalmon': '#e9967a', 'darkseagreen': '#8fbc8f', 'darkslateblue': '#483d8b',
+    'darkslategray': '#2f4f4f', 'darkslategrey': '#2f4f4f',
+    'darkturquoise': '#00ced1', 'darkviolet': '#9400d3', 'deeppink': '#ff1493',
+    'deepskyblue': '#00bfff', 'dimgray': '#696969', 'dimgrey': '#696969',
+    'dodgerblue': '#1e90ff', 'firebrick': '#b22222', 'floralwhite': '#fffaf0',
+    'forestgreen': '#228b22', 'gainsboro': '#dcdcdc', 'ghostwhite': '#f8f8ff',
+    'goldenrod': '#daa520', 'greenyellow': '#adff2f', 'honeydew': '#f0fff0',
+    'hotpink': '#ff69b4', 'indianred': '#cd5c5c', 'lawngreen': '#7cfc00',
+    'lemonchiffon': '#fffacd', 'lightcoral': '#f08080', 'lightcyan': '#e0ffff',
+    'lightgoldenrodyellow': '#fafad2', 'lightpink': '#ffb6c1',
+    'lightsalmon': '#ffa07a', 'lightseagreen': '#20b2aa', 'lightskyblue': '#87cefa',
+    'lightslategray': '#778899', 'lightslategrey': '#778899',
+    'lightsteelblue': '#b0c4de', 'lightyellow': '#ffffe0', 'limegreen': '#32cd32',
+    'linen': '#faf0e6', 'mediumaquamarine': '#66cdaa', 'mediumblue': '#0000cd',
+    'mediumorchid': '#ba55d3', 'mediumpurple': '#9370db',
+    'mediumseagreen': '#3cb371', 'mediumslateblue': '#7b68ee',
+    'mediumspringgreen': '#00fa9a', 'mediumturquoise': '#48d1cc',
+    'mediumvioletred': '#c71585', 'midnightblue': '#191970',
+    'mintcream': '#f5fffa', 'mistyrose': '#ffe4e1', 'moccasin': '#ffe4b5',
+    'navajowhite': '#ffdead', 'oldlace': '#fdf5e6', 'olivedrab': '#6b8e23',
+    'orangered': '#ff4500', 'orchid': '#da70d6', 'palegoldenrod': '#eee8aa',
+    'palegreen': '#98fb98', 'paleturquoise': '#afeeee', 'palevioletred': '#db7093',
+    'papayawhip': '#ffefd5', 'peachpuff': '#ffdab9', 'peru': '#cd853f',
+    'plum': '#dda0dd', 'powderblue': '#b0e0e6', 'rosybrown': '#bc8f8f',
+    'royalblue': '#4169e1', 'saddlebrown': '#8b4513', 'sandybrown': '#f4a460',
+    'seagreen': '#2e8b57', 'seashell': '#fff5ee', 'skyblue': '#87ceeb',
+    'slateblue': '#6a5acd', 'slategray': '#708090', 'slategrey': '#708090',
+    'snow': '#fffafa', 'springgreen': '#00ff7f', 'steelblue': '#4682b4',
+    'thistle': '#d8bfd8', 'tomato': '#ff6347', 'wheat': '#f5deb3',
+    'whitesmoke': '#f5f5f5', 'yellowgreen': '#9acd32',
+}
+
+# Pre-compiled color-parsing patterns (avoid recompilation on every call)
+_RE_RGB = re.compile(
+    r'rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)', re.I)
+_RE_HSL_COMMA = re.compile(
+    r'hsla?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%'
+    r'(?:\s*,\s*([\d.]+))?\s*\)', re.I)
+_RE_HSL_SPACE = re.compile(
+    r'hsla?\s*\(\s*([\d.]+)\s+([\d.]+)%\s+([\d.]+)%'
+    r'(?:\s*/\s*([\d.]+))?\s*\)', re.I)
+
+# Cache: color string -> QColor  (avoids re-parsing identical color values)
+_COLOR_CACHE: dict[str, 'QColor'] = {}
+
+# Cache: font tuple -> QFontMetrics  (avoids QFontMetrics() construction per DrawText)
+_FM_CACHE: dict[tuple, 'QFontMetrics'] = {}
 
 
 def _hsl_to_rgb(h: float, s: float, l: float) -> tuple:
@@ -54,79 +130,39 @@ def _hsl_to_rgb(h: float, s: float, l: float) -> tuple:
 
 
 def _parse_color(color_str: str) -> QColor:
-    """Parse a CSS color string into QColor."""
+    """Parse a CSS color string into QColor (result is cached by string value)."""
+    if not color_str:
+        return QColor(0, 0, 0, 0)
+
+    cached = _COLOR_CACHE.get(color_str)
+    if cached is not None:
+        return cached
+
+    result = _parse_color_impl(color_str)
+    # Limit cache size to avoid unbounded growth on dynamic pages
+    if len(_COLOR_CACHE) < 2048:
+        _COLOR_CACHE[color_str] = result
+    return result
+
+
+def _parse_color_impl(color_str: str) -> QColor:
+    """Actual color parsing logic (called by _parse_color cache wrapper)."""
+    color_str = color_str.strip()
     if not color_str or color_str in ('transparent', 'none'):
         return QColor(0, 0, 0, 0)
 
-    color_str = color_str.strip()
-
-    # Named colors (CSS3 full list)
-    named = {
-        'black': '#000000', 'white': '#ffffff', 'red': '#ff0000',
-        'green': '#008000', 'blue': '#0000ff', 'yellow': '#ffff00',
-        'orange': '#ffa500', 'purple': '#800080', 'pink': '#ffc0cb',
-        'gray': '#808080', 'grey': '#808080', 'silver': '#c0c0c0',
-        'aqua': '#00ffff', 'cyan': '#00ffff', 'magenta': '#ff00ff',
-        'fuchsia': '#ff00ff', 'lime': '#00ff00', 'maroon': '#800000',
-        'navy': '#000080', 'olive': '#808000', 'teal': '#008080',
-        'brown': '#a52a2a', 'gold': '#ffd700', 'coral': '#ff7f50',
-        'salmon': '#fa8072', 'khaki': '#f0e68c', 'indigo': '#4b0082',
-        'violet': '#ee82ee', 'beige': '#f5f5dc', 'ivory': '#fffff0',
-        'lavender': '#e6e6fa', 'turquoise': '#40e0d0', 'tan': '#d2b48c',
-        'sienna': '#a0522d', 'crimson': '#dc143c', 'darkblue': '#00008b',
-        'darkgreen': '#006400', 'darkred': '#8b0000', 'darkorange': '#ff8c00',
-        'lightblue': '#add8e6', 'lightgreen': '#90ee90', 'lightgray': '#d3d3d3',
-        'lightgrey': '#d3d3d3', 'currentcolor': '#000000', 'inherit': '#000000',
-        # Extended CSS3 named colors
-        'aliceblue': '#f0f8ff', 'antiquewhite': '#faebd7', 'aquamarine': '#7fffd4',
-        'azure': '#f0ffff', 'bisque': '#ffe4c4', 'blanchedalmond': '#ffebcd',
-        'blueviolet': '#8a2be2', 'burlywood': '#deb887', 'cadetblue': '#5f9ea0',
-        'chartreuse': '#7fff00', 'chocolate': '#d2691e', 'cornflowerblue': '#6495ed',
-        'cornsilk': '#fff8dc', 'darkcyan': '#008b8b', 'darkgoldenrod': '#b8860b',
-        'darkgray': '#a9a9a9', 'darkgrey': '#a9a9a9', 'darkkhaki': '#bdb76b',
-        'darkmagenta': '#8b008b', 'darkolivegreen': '#556b2f', 'darkorchid': '#9932cc',
-        'darksalmon': '#e9967a', 'darkseagreen': '#8fbc8f', 'darkslateblue': '#483d8b',
-        'darkslategray': '#2f4f4f', 'darkslategrey': '#2f4f4f',
-        'darkturquoise': '#00ced1', 'darkviolet': '#9400d3', 'deeppink': '#ff1493',
-        'deepskyblue': '#00bfff', 'dimgray': '#696969', 'dimgrey': '#696969',
-        'dodgerblue': '#1e90ff', 'firebrick': '#b22222', 'floralwhite': '#fffaf0',
-        'forestgreen': '#228b22', 'gainsboro': '#dcdcdc', 'ghostwhite': '#f8f8ff',
-        'goldenrod': '#daa520', 'greenyellow': '#adff2f', 'honeydew': '#f0fff0',
-        'hotpink': '#ff69b4', 'indianred': '#cd5c5c', 'lawngreen': '#7cfc00',
-        'lemonchiffon': '#fffacd', 'lightcoral': '#f08080', 'lightcyan': '#e0ffff',
-        'lightgoldenrodyellow': '#fafad2', 'lightpink': '#ffb6c1',
-        'lightsalmon': '#ffa07a', 'lightseagreen': '#20b2aa', 'lightskyblue': '#87cefa',
-        'lightslategray': '#778899', 'lightslategrey': '#778899',
-        'lightsteelblue': '#b0c4de', 'lightyellow': '#ffffe0', 'limegreen': '#32cd32',
-        'linen': '#faf0e6', 'mediumaquamarine': '#66cdaa', 'mediumblue': '#0000cd',
-        'mediumorchid': '#ba55d3', 'mediumpurple': '#9370db',
-        'mediumseagreen': '#3cb371', 'mediumslateblue': '#7b68ee',
-        'mediumspringgreen': '#00fa9a', 'mediumturquoise': '#48d1cc',
-        'mediumvioletred': '#c71585', 'midnightblue': '#191970',
-        'mintcream': '#f5fffa', 'mistyrose': '#ffe4e1', 'moccasin': '#ffe4b5',
-        'navajowhite': '#ffdead', 'oldlace': '#fdf5e6', 'olivedrab': '#6b8e23',
-        'orangered': '#ff4500', 'orchid': '#da70d6', 'palegoldenrod': '#eee8aa',
-        'palegreen': '#98fb98', 'paleturquoise': '#afeeee', 'palevioletred': '#db7093',
-        'papayawhip': '#ffefd5', 'peachpuff': '#ffdab9', 'peru': '#cd853f',
-        'plum': '#dda0dd', 'powderblue': '#b0e0e6', 'rosybrown': '#bc8f8f',
-        'royalblue': '#4169e1', 'saddlebrown': '#8b4513', 'sandybrown': '#f4a460',
-        'seagreen': '#2e8b57', 'seashell': '#fff5ee', 'skyblue': '#87ceeb',
-        'slateblue': '#6a5acd', 'slategray': '#708090', 'slategrey': '#708090',
-        'snow': '#fffafa', 'springgreen': '#00ff7f', 'steelblue': '#4682b4',
-        'thistle': '#d8bfd8', 'tomato': '#ff6347', 'wheat': '#f5deb3',
-        'whitesmoke': '#f5f5f5', 'yellowgreen': '#9acd32',
-    }
     lower = color_str.lower()
-    if lower in named:
-        color_str = named[lower]
+    hex_val = _NAMED_COLORS.get(lower)
+    if hex_val is not None:
+        color_str = hex_val
 
     # #rgb / #rrggbb / #rgba / #rrggbbaa
     if color_str.startswith('#'):
         hex_str = color_str[1:]
         if len(hex_str) == 3:
-            hex_str = ''.join(c * 2 for c in hex_str)
-        if len(hex_str) == 4:
-            hex_str = ''.join(c * 2 for c in hex_str)
+            hex_str = hex_str[0]*2 + hex_str[1]*2 + hex_str[2]*2
+        elif len(hex_str) == 4:
+            hex_str = hex_str[0]*2 + hex_str[1]*2 + hex_str[2]*2 + hex_str[3]*2
         if len(hex_str) == 6:
             r = int(hex_str[0:2], 16)
             g = int(hex_str[2:4], 16)
@@ -140,18 +176,14 @@ def _parse_color(color_str: str) -> QColor:
             return QColor(r, g, b, a)
 
     # rgb(r, g, b) / rgba(r, g, b, a)
-    import re
-    m = re.match(r'rgba?\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)(?:\s*,\s*([\d.]+))?\s*\)', color_str, re.I)
+    m = _RE_RGB.match(color_str)
     if m:
         r, g, b = int(m.group(1)), int(m.group(2)), int(m.group(3))
         a = int(float(m.group(4)) * 255) if m.group(4) else 255
         return QColor(r, g, b, a)
 
-    # hsl(h, s%, l%) / hsla(h, s%, l%, a)  — comma-separated
-    m = re.match(
-        r'hsla?\s*\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%'
-        r'(?:\s*,\s*([\d.]+))?\s*\)',
-        color_str, re.I)
+    # hsl(h, s%, l%) / hsla — comma-separated
+    m = _RE_HSL_COMMA.match(color_str)
     if m:
         h = float(m.group(1))
         s = float(m.group(2)) / 100
@@ -160,11 +192,8 @@ def _parse_color(color_str: str) -> QColor:
         r, g, b = _hsl_to_rgb(h, s, l)
         return QColor(r, g, b, a)
 
-    # hsl(h s% l%) / hsl(h s% l% / a)  — modern space-separated
-    m = re.match(
-        r'hsla?\s*\(\s*([\d.]+)\s+([\d.]+)%\s+([\d.]+)%'
-        r'(?:\s*/\s*([\d.]+))?\s*\)',
-        color_str, re.I)
+    # hsl(h s% l%) — modern space-separated
+    m = _RE_HSL_SPACE.match(color_str)
     if m:
         h = float(m.group(1))
         s = float(m.group(2)) / 100
@@ -178,8 +207,9 @@ def _parse_color(color_str: str) -> QColor:
     return c if c.isValid() else QColor(0, 0, 0)
 
 
+@lru_cache(maxsize=256)
 def _make_qfont(font_tuple: tuple) -> QFont:
-    """Create QFont from (family, size_px[, weight_str[, style_str]]) tuple."""
+    """Create QFont from (family, size_px[, weight_str[, style_str]]) tuple (cached)."""
     from layout.text import resolve_font_family
 
     family = 'Arial'
@@ -225,6 +255,7 @@ class RenderCanvas(QWidget):
         super().__init__(parent)
         self._display_list: DisplayList = DisplayList()
         self._links: list = []  # [(rect, href), ...]
+        self._pixmap_cache: QPixmap | None = None  # full-page offscreen buffer
         self.setMinimumSize(980, 600)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -233,6 +264,7 @@ class RenderCanvas(QWidget):
     def set_display_list(self, dl: DisplayList) -> None:
         self._display_list = dl
         self._links = []
+        self._pixmap_cache = None  # invalidate offscreen buffer
         self.update()
 
     def set_links(self, links: list) -> None:
@@ -240,10 +272,20 @@ class RenderCanvas(QWidget):
         self._links = links
 
     def paintEvent(self, event):
+        # Render the full page to an offscreen QPixmap once; subsequent
+        # paint events (scroll, expose) just blit from that cache — O(1).
+        if self._pixmap_cache is None:
+            w = max(1, self.width())
+            h = max(1, self.height())
+            self._pixmap_cache = QPixmap(w, h)
+            self._pixmap_cache.fill(QColor(255, 255, 255))
+            off_painter = QPainter(self._pixmap_cache)
+            off_painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            paint(self._display_list, off_painter)
+            off_painter.end()
+
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(255, 255, 255))
-        paint(self._display_list, painter)
+        painter.drawPixmap(0, 0, self._pixmap_cache)
         painter.end()
 
     def mouseMoveEvent(self, event):
@@ -459,7 +501,10 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
             color = _parse_color(cmd.color)
             font = _make_qfont(cmd.font)
             painter.setFont(font)
-            fm = QFontMetrics(font)
+            fm = _FM_CACHE.get(cmd.font)
+            if fm is None:
+                fm = QFontMetrics(font)
+                _FM_CACHE[cmd.font] = fm
             text_y = int(cmd.y + fm.ascent())
             # Text shadow (rendered before main text)
             text_shadow = getattr(cmd, 'text_shadow', '')

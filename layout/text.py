@@ -1,5 +1,6 @@
 """Text measurement using QFontMetrics (PyQt6)."""
 import sys
+from functools import lru_cache
 
 # Need a QApplication to use Qt font metrics
 _app = None
@@ -17,6 +18,7 @@ _metrics_cache = {}
 _text_cache = {}
 
 
+@lru_cache(maxsize=512)
 def get_font(family: str, size_px: float, weight: str = 'normal', italic: bool = False):
     """Create a QFont from CSS-style parameters."""
     from PyQt6.QtGui import QFont
@@ -113,6 +115,7 @@ def _get_installed_fonts() -> set:
     return _installed_fonts
 
 
+@lru_cache(maxsize=256)
 def resolve_font_family(family: str) -> str:
     """Resolve a CSS font-family list to a single installed family name.
 
@@ -140,6 +143,7 @@ def resolve_font_family(family: str) -> str:
     return families[0] if families else 'Arial'
 
 
+@lru_cache(maxsize=1024)
 def _parse_px(value: str) -> float:
     """Extract numeric px value from a CSS length string."""
     if not value:

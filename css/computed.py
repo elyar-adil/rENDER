@@ -7,6 +7,35 @@ from css.utils import split_paren_aware as _split_css_args_impl
 
 DEFAULT_FONT_SIZE = 16  # browser default px
 
+# Properties that need length resolution (module-level to avoid per-element list creation)
+_LENGTH_PROPS = (
+    'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+    'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+    'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+    'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+    'top', 'right', 'bottom', 'left',
+    'word-spacing', 'letter-spacing',
+    'border-radius', 'text-indent',
+    'outline-width', 'outline-offset',
+    'column-gap', 'row-gap',
+    'border-top-left-radius', 'border-top-right-radius',
+    'border-bottom-left-radius', 'border-bottom-right-radius',
+)
+
+# Named font sizes and relative keywords (module-level, not per-call)
+_NAMED_FONT_SIZES: dict[str, float] = {
+    'xx-small': 9.0, 'x-small': 10.0, 'small': 13.0, 'medium': 16.0,
+    'large': 18.0, 'x-large': 24.0, 'xx-large': 32.0,
+}
+_RELATIVE_FONT_SIZES: dict[str, float] = {'smaller': 0.8, 'larger': 1.25}
+
+# Pre-compiled numeric+unit pattern for _resolve_length
+_RE_LENGTH = re.compile(
+    r'([+-]?[\d.]+)\s*(px|em|rem|vw|vh|dvh|svh|lvh|dvw|svw|lvw|vmin|vmax|%|pt|pc|cm|mm|in|ex|ch|)')
+# Pre-compiled unitless number pattern for line-height
+_RE_UNITLESS = re.compile(r'[+-]?[\d.]+')
+_RE_UNITLESS_FULL = re.compile(r'^[+-]?[\d.]+$')
+
 
 def compute(document: Document, viewport_width: int = 980, viewport_height: int = 600) -> None:
     """Convert all element style values to computed values in-place (iterative)."""
@@ -43,20 +72,7 @@ def _process_element(node: Element, parent_font_size: float, root_font_size: flo
         font_size = parent_font_size
     node.style['font-size'] = f'{int(font_size)}px'
 
-    _length_props = [
-        'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
-        'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
-        'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
-        'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
-        'top', 'right', 'bottom', 'left',
-        'word-spacing', 'letter-spacing',
-        'border-radius', 'text-indent',
-        'outline-width', 'outline-offset',
-        'column-gap', 'row-gap',
-        'border-top-left-radius', 'border-top-right-radius',
-        'border-bottom-left-radius', 'border-bottom-right-radius',
-    ]
-    for prop in _length_props:
+    for prop in _LENGTH_PROPS:
         if prop in node.style:
             resolved = _resolve_length(node.style[prop], font_size, root_font_size, vw, vh)
             if resolved is not None:
@@ -65,9 +81,8 @@ def _process_element(node: Element, parent_font_size: float, root_font_size: flo
     # line-height: resolve em/rem/px but keep unitless multipliers as-is
     lh = node.style.get('line-height', '')
     if lh and lh not in ('normal', 'inherit', 'initial', ''):
-        import re as _re
         # Unitless numbers (e.g. '1.5', '3') are multipliers — keep as-is
-        if _re.fullmatch(r'[+-]?[\d.]+', lh):
+        if _RE_UNITLESS_FULL.fullmatch(lh):
             pass  # keep unitless value for inline layout to multiply by font-size
         else:
             resolved = _resolve_length(lh, font_size, root_font_size, vw, vh)
@@ -125,16 +140,15 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
 
     # Named font sizes
     if is_font_size:
-        named = {'xx-small': 9, 'x-small': 10, 'small': 13, 'medium': 16,
-                 'large': 18, 'x-large': 24, 'xx-large': 32}
-        if value in named:
-            return float(named[value])
-        relative = {'smaller': 0.8, 'larger': 1.25}
-        if value in relative:
-            return (parent_font_size or 16) * relative[value]
+        named_sz = _NAMED_FONT_SIZES.get(value)
+        if named_sz is not None:
+            return named_sz
+        rel = _RELATIVE_FONT_SIZES.get(value)
+        if rel is not None:
+            return (parent_font_size or 16) * rel
 
     # Numeric with unit
-    m = re.fullmatch(r'([+-]?[\d.]+)\s*(px|em|rem|vw|vh|dvh|svh|lvh|dvw|svw|lvw|vmin|vmax|%|pt|pc|cm|mm|in|ex|ch|)', value)
+    m = _RE_LENGTH.fullmatch(value)
     if m:
         num = float(m.group(1))
         unit = m.group(2)
