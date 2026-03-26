@@ -1,6 +1,6 @@
+"""Inline formatting context and line boxes."""
 import logging
 _logger = logging.getLogger(__name__)
-"""Inline formatting context and line boxes."""
 import re
 from dataclasses import dataclass, field
 from layout.box import BoxModel
@@ -41,10 +41,6 @@ class InlineItem:
     border_color: str = '#767676'
     border_width: float = 1.0
     control_value: str = ''
-
-    @property
-    def word(self):
-        return self.text
 
     @property
     def font(self):
@@ -110,12 +106,7 @@ class LineBox:
         for item in self.items:
             item.y = self.y + (self.height - item.height)
             if item.layout_node is not None:
-                _shift_layout_subtree(item.layout_node, item.x, item.y)
-
-
-def _shift_layout_subtree(node, dx: float, dy: float) -> None:
-    """Shift a subtree by (dx, dy); delegates to shared _shift_subtree."""
-    _shift_subtree(node, dx, dy)
+                _shift_subtree(item.layout_node, item.x, item.y)
 
 
 def _compute_line_height(node, max_font_size: float) -> float:

@@ -6,37 +6,17 @@ import re
 from layout.box import BoxModel, EdgeSizes
 from layout.text import _parse_px, measure_text
 from layout.context import LayoutEngine, LayoutContext
+from layout.block import _parse_edge
 
 _TABLE_ROW_GROUPS = frozenset({
     'table-row-group', 'table-header-group', 'table-footer-group',
 })
 
 
-def _gs(node, prop: str, default: str = '') -> str:
+def _get_style(node, prop: str, default: str = '') -> str:
     if hasattr(node, 'style') and node.style:
         return node.style.get(prop, default)
     return default
-
-
-def _parse_edge(node, prop_prefix: str, cw: float = 0.0) -> EdgeSizes:
-    e = EdgeSizes()
-    for side in ('top', 'right', 'bottom', 'left'):
-        if prop_prefix == 'border-width':
-            val = _gs(node, f'border-{side}-width', '')
-            if not val:
-                val = _gs(node, f'border-width-{side}', '0px')
-        else:
-            val = _gs(node, f'{prop_prefix}-{side}', '0px')
-        if val == 'auto':
-            e.__dict__[side] = 0.0
-        elif val and val.endswith('%') and cw > 0:
-            try:
-                e.__dict__[side] = float(val[:-1]) / 100.0 * cw
-            except ValueError:
-                e.__dict__[side] = 0.0
-        else:
-            e.__dict__[side] = _parse_px(val)
-    return e
 
 
 class TableLayout(LayoutEngine):
@@ -90,13 +70,13 @@ class TableLayout(LayoutEngine):
         for child in node.children:
             if not isinstance(child, Element):
                 continue
-            disp = _gs(child, 'display', '')
+            disp = _get_style(child, 'display', '')
             tag = child.tag
             if tag == 'tr' or disp == 'table-row':
                 all_rows.append((child, _extract_cells(child)))
             elif tag in ('thead', 'tbody', 'tfoot') or disp in _TABLE_ROW_GROUPS:
                 for sub in child.children:
-                    if isinstance(sub, Element) and (sub.tag == 'tr' or _gs(sub, 'display', '') == 'table-row'):
+                    if isinstance(sub, Element) and (sub.tag == 'tr' or _get_style(sub, 'display', '') == 'table-row'):
                         all_rows.append((sub, _extract_cells(sub)))
 
         # Column count
@@ -112,7 +92,7 @@ class TableLayout(LayoutEngine):
             # Empty table: still give it a height from any explicit TR heights
             total_h = cell_spacing
             for tr_node, _ in all_rows:
-                h_str = _gs(tr_node, 'height', getattr(tr_node, 'attributes', {}).get('height', '0'))
+                h_str = _get_style(tr_node, 'height', getattr(tr_node, 'attributes', {}).get('height', '0'))
                 total_h += max(0.0, _parse_px(h_str)) + cell_spacing
             box.content_height = total_h
             return box
@@ -122,7 +102,7 @@ class TableLayout(LayoutEngine):
         y_offset = cell_spacing
         for tr_node, cells in all_rows:
             tr_attrs = getattr(tr_node, 'attributes', {})
-            tr_h_str = _gs(tr_node, 'height', tr_attrs.get('height', '0'))
+            tr_h_str = _get_style(tr_node, 'height', tr_attrs.get('height', '0'))
             tr_min_h = _parse_px(tr_h_str) if tr_h_str and tr_h_str != '0' else 0.0
 
             row_y = table_y + y_offset
@@ -252,10 +232,10 @@ def _extract_cells(tr_node) -> list:
     for child in tr_node.children:
         if not isinstance(child, Element):
             continue
-        disp = _gs(child, 'display', '')
+        disp = _get_style(child, 'display', '')
         if child.tag not in ('td', 'th') and disp != 'table-cell':
             continue
-        if _gs(child, 'display', 'table-cell') == 'none':
+        if _get_style(child, 'display', 'table-cell') == 'none':
             continue
         try:
             colspan = max(1, int(getattr(child, 'attributes', {}).get('colspan', '1')))
@@ -446,10 +426,11 @@ def _shift_block_children(node, dx: float, dy: float) -> None:
                 for item in lb.items:
                     item.x += dx
                     item.y += dy
-        _shift_subtree(child, dx, dy)
+        _shift_descendants(child, dx, dy)
 
 
-def _shift_subtree(node, dx: float, dy: float) -> None:
+def _shift_descendants(node, dx: float, dy: float) -> None:
+    """Recursively shift all descendants of node (not node itself)."""
     from html.dom import Element
 
     for child in getattr(node, 'children', []):
@@ -465,39 +446,9 @@ def _shift_subtree(node, dx: float, dy: float) -> None:
                 for item in lb.items:
                     item.x += dx
                     item.y += dy
-        _shift_subtree(child, dx, dy)
+        _shift_descendants(child, dx, dy)
 
 
-def _shift_cell_contents(node, dx: float, dy: float) -> None:
-    if hasattr(node, 'line_boxes'):
-        for lb in node.line_boxes:
-            lb.x += dx
-            lb.y += dy
-            for item in lb.items:
-                item.x += dx
-                item.y += dy
-    _shift_subtree(node, dx, dy)
-
-
-def _measure_cell_content_width(node) -> float:
-    max_width = 0.0
-
-    if hasattr(node, 'line_boxes'):
-        for lb in node.line_boxes:
-            max_width = max(max_width, sum(item.width for item in lb.items))
-
-    for child in getattr(node, 'children', []):
-        child_box = getattr(child, 'box', None)
-        if child_box is not None:
-            max_width = max(max_width, child_box.content_width)
-        max_width = max(max_width, _measure_cell_content_width(child))
-    return max_width
-
-
-# Backward-compat shim
 def layout_table(node, container_box: BoxModel, viewport_width: int = 980) -> BoxModel:
     ctx = LayoutContext(viewport_width)
-    box = TableLayout().layout(node, container_box, ctx)
-    if box is not None:
-        node.box = box
-    return box
+    return TableLayout().layout(node, container_box, ctx)

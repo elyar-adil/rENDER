@@ -22,10 +22,7 @@ def screenshot(target: str, output: str, width: int = 1200, height: int = 900):
     app = QApplication.instance() or QApplication(sys.argv[:1])
 
     # Import pipeline
-    from engine import _pipeline, VIEWPORT_W, VIEWPORT_H
-    import engine as eng
-    eng.VIEWPORT_W = width
-    eng.VIEWPORT_H = height
+    from engine import _pipeline
 
     # Fetch content
     if target.startswith('http://') or target.startswith('https://'):
@@ -39,7 +36,8 @@ def screenshot(target: str, output: str, width: int = 1200, height: int = 900):
         final_url = 'file:///' + target.replace('\\', '/')
 
     print(f'[screenshot] Rendering {final_url} ...', flush=True)
-    dl, page_height, doc = _pipeline(html, base_url=final_url)
+    dl, page_height, doc = _pipeline(html, base_url=final_url,
+                                     viewport_width=width, viewport_height=height)
 
     render_height = min(page_height, height * 3)  # cap at 3 viewports
     print(f'[screenshot] Page height: {page_height}px, rendering: {render_height}px', flush=True)

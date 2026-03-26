@@ -548,13 +548,8 @@ class BlockLayout(LayoutEngine):
         return cb
 
 
-# ---------------------------------------------------------------------------
-# Compatibility shims (keep old function signatures working for __init__.py)
-# ---------------------------------------------------------------------------
-
 def layout_block(node, container_box: BoxModel, float_mgr: FloatManager = None,
                  viewport_width: int = 980) -> BoxModel:
-    """Backward-compatible wrapper around BlockLayout."""
     ctx = LayoutContext(viewport_width)
     if float_mgr is not None:
         ctx.float_mgr = float_mgr

@@ -42,22 +42,6 @@ class BoxModel:
         self.margin: EdgeSizes = EdgeSizes()
 
     @property
-    def width(self) -> float:
-        return self.content_width
-
-    @width.setter
-    def width(self, value: float):
-        self.content_width = value
-
-    @property
-    def height(self) -> float:
-        return self.content_height
-
-    @height.setter
-    def height(self, value: float):
-        self.content_height = value
-
-    @property
     def content_rect(self) -> Rect:
         return Rect(self.x, self.y, self.content_width, self.content_height)
 
@@ -72,15 +56,6 @@ class BoxModel:
     @property
     def margin_rect(self) -> Rect:
         return self.border_rect.expanded_by(self.margin)
-
-    # legacy
-    @property
-    def border_box_rect(self) -> Rect:
-        return self.border_rect
-
-    @property
-    def margin_box_rect(self) -> Rect:
-        return self.margin_rect
 
     def __repr__(self):
         return (f'BoxModel(x={self.x:.1f}, y={self.y:.1f}, '

@@ -1,6 +1,6 @@
+"""Layout engine entry point."""
 import logging
 _logger = logging.getLogger(__name__)
-"""Layout engine entry point."""
 from layout.box import BoxModel, EdgeSizes, Rect
 from layout.block import layout_block, layout_absolute
 from layout.flex import layout_flex

@@ -118,7 +118,7 @@ class GridLayout(LayoutEngine):
 
     def layout(self, node, container: BoxModel, ctx: LayoutContext) -> BoxModel:
         from html.dom import Element
-        from layout.block import layout_block, _parse_edge, BlockLayout
+        from layout.block import _parse_edge, BlockLayout
         from layout.flex import FlexLayout
 
         box = BoxModel()
@@ -277,8 +277,6 @@ class GridLayout(LayoutEngine):
         return box
 
 
-# Backward-compat shim
 def layout_grid(node, container_box: BoxModel) -> BoxModel:
-    """Backward-compatible wrapper around GridLayout."""
     ctx = LayoutContext()
     return GridLayout().layout(node, container_box, ctx)
