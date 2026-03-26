@@ -12,7 +12,7 @@ _ATOMIC_INLINE_DISPLAYS = frozenset({'inline-block', 'inline-flex', 'inline-grid
 _BORDER_WIDTH_KEYWORDS = frozenset({'thin', 'medium', 'thick'})
 
 
-@dataclass
+@dataclass(slots=True)
 class InlineItem:
     """Represents a single inline unit (word, or replaced element like img)."""
     text: str
