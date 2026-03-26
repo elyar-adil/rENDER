@@ -85,6 +85,7 @@ class Interpreter:
 
     def __init__(self):
         self.global_env = Environment()
+        self.console_prefix = '[JS]'
         self._setup_globals()
         self._iteration_count = 0
 
@@ -168,7 +169,10 @@ class Interpreter:
 
     def _console_log(self, *args):
         parts = [_to_str(a) for a in args]
-        print('[JS]', ' '.join(parts))
+        if self.console_prefix:
+            print(self.console_prefix, ' '.join(parts))
+        else:
+            print(' '.join(parts))
 
     def _set_timeout(self, fn, ms, *args):
         """Execute setTimeout(fn, 0) immediately; ignore delays > 0."""
