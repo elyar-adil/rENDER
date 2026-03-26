@@ -1,12 +1,12 @@
-import logging
-_logger = logging.getLogger(__name__)
 """PyQt6 rendering backend for rENDER browser engine."""
+import logging
 import sys
 import os
 import math
 import re
 from functools import lru_cache
 from css.utils import split_paren_aware as _split_top_level_commas
+_logger = logging.getLogger(__name__)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
     QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
@@ -210,7 +210,7 @@ def _parse_color_impl(color_str: str) -> QColor:
 @lru_cache(maxsize=256)
 def _make_qfont(font_tuple: tuple) -> QFont:
     """Create QFont from (family, size_px[, weight_str[, style_str]]) tuple (cached)."""
-    from layout.text import resolve_font_family
+    from backend.qt.font import _resolve_family as resolve_font_family
 
     family = 'Arial'
     size_px = 16

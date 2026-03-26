@@ -689,19 +689,19 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         if bg and bg != 'transparent':
             _emit(DrawRect(box.border_rect, bg, border_radius=radius))
 
-        bg_qimage = getattr(node, 'background_qimage', None)
-        if bg_qimage is not None:
+        node_bg_image = getattr(node, 'background_image', None)
+        if node_bg_image is not None:
             _emit(DrawImage(
                 box.border_rect.x, box.border_rect.y,
-                bg_qimage, box.border_rect.width, box.border_rect.height,
+                node_bg_image, box.border_rect.width, box.border_rect.height,
             ))
 
         # <img> element: draw the image directly using the layout box
         if node.tag == 'img':
-            qimage = getattr(node, 'qimage', None)
-            if qimage is not None:
+            image = getattr(node, 'image', None)
+            if image is not None:
                 from rendering.display_list import DrawImage
-                _emit(DrawImage(box.x, box.y, qimage, box.content_width, box.content_height))
+                _emit(DrawImage(box.x, box.y, image, box.content_width, box.content_height))
 
         # Background image (linear-gradient / radial-gradient)
         bg_image = style.get('background-image', 'none')
@@ -796,9 +796,9 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
         if hasattr(node, 'line_boxes'):
             for line in node.line_boxes:
                 for item in line.items:
-                    if getattr(item, 'qimage', None) is not None:
+                    if getattr(item, 'image', None) is not None:
                         cmd = DrawImage(
-                            item.x, item.y, item.qimage,
+                            item.x, item.y, item.image,
                             item.width, item.height,
                         )
                     elif getattr(item, 'control_type', '') == 'text-input':

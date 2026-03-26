@@ -4,7 +4,7 @@ _logger = logging.getLogger(__name__)
 import re
 from dataclasses import dataclass, field
 from layout.box import BoxModel
-from layout.text import measure_word, measure_text, get_font, _parse_px
+from layout.text import measure_word, measure_text, _parse_px
 
 from layout.block import _BLOCK_DISPLAYS, _shift_subtree  # shared constants/helpers
 
