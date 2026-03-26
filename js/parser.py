@@ -618,7 +618,11 @@ class Parser:
                 elements.append(_node('Literal', value=_UNDEF))
                 self.pos += 1
                 continue
-            elements.append(self._assign_expr())
+            if self._peek(OP, '...'):
+                self.pos += 1
+                elements.append(_node('Spread', arg=self._assign_expr()))
+            else:
+                elements.append(self._assign_expr())
             if self._peek(PUNCT, ','):
                 self.pos += 1
         self._eat(PUNCT, ']')
@@ -628,6 +632,12 @@ class Parser:
         self._eat(PUNCT, '{')
         props = []
         while not self._peek(PUNCT, '}') and not self._peek(EOF):
+            if self._peek(OP, '...'):
+                self.pos += 1
+                props.append((None, self._assign_expr()))
+                if self._peek(PUNCT, ','):
+                    self.pos += 1
+                continue
             # Key
             t = self._cur()
             if t.type == IDENT:

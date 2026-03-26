@@ -54,13 +54,14 @@ class Environment:
 
 class JSFunction:
     """A JavaScript function (closure)."""
-    __slots__ = ('name', 'params', 'body', 'env')
+    __slots__ = ('name', 'params', 'body', 'env', 'properties')
 
     def __init__(self, name, params, body, env):
         self.name = name or '(anonymous)'
         self.params = params
         self.body = body
         self.env = env
+        self.properties = JSObject()
 
     def __repr__(self):
         return f'function {self.name}()'
@@ -129,11 +130,41 @@ class Interpreter:
         g.define('decodeURIComponent', lambda s: __import__('urllib.parse', fromlist=['unquote']).unquote(str(s)))
         g.define('encodeURI', lambda s: __import__('urllib.parse', fromlist=['quote']).quote(str(s), safe=':/?#[]@!$&\'()*+,;=-._~'))
         g.define('decodeURI', lambda s: __import__('urllib.parse', fromlist=['unquote']).unquote(str(s)))
-        g.define('String', lambda v=_UNDEF: '' if v is _UNDEF else _to_str(v))
+        def _string_ctor(v=_UNDEF):
+            return '' if v is _UNDEF else _to_str(v)
+
+        _string_ctor.fromCharCode = lambda *codes: ''.join(chr(int(_to_num(code))) for code in codes)
+        g.define('String', _string_ctor)
+
         g.define('Number', lambda v=0: _to_num(v))
         g.define('Boolean', lambda v=False: _to_bool(v))
-        g.define('Array', JSArray)
-        g.define('Object', JSObject)
+
+        def _array_ctor(*args):
+            if len(args) == 1 and isinstance(args[0], (int, float)):
+                return JSArray([_UNDEF] * max(0, int(args[0])))
+            return JSArray(args)
+
+        _array_ctor.isArray = lambda value: isinstance(value, list)
+        g.define('Array', _array_ctor)
+
+        def _object_ctor(value=_UNDEF):
+            if value is _UNDEF or value is None:
+                return JSObject()
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list):
+                obj = JSObject()
+                for index, item in enumerate(value):
+                    obj[str(index)] = item
+                obj['length'] = len(value)
+                return obj
+            return JSObject()
+
+        _object_ctor.assign = lambda target, *sources: _object_assign(target, *sources)
+        _object_ctor.keys = lambda obj: JSArray(key for key, _ in _iter_enumerable_entries(obj))
+        _object_ctor.values = lambda obj: JSArray(value for _, value in _iter_enumerable_entries(obj))
+        _object_ctor.create = lambda proto=_UNDEF: _object_create(proto)
+        g.define('Object', _object_ctor)
         g.define('RegExp', lambda p, f='': re.compile(p))
         g.define('setTimeout', lambda fn, ms=0, *a: self._set_timeout(fn, ms, *a))
         g.define('setInterval', lambda fn, ms=0, *a: None)
@@ -444,11 +475,20 @@ class Interpreter:
             return self._member_get(obj, node, env)
 
         if t == 'Array':
-            return JSArray(self._eval(el, env) for el in node.data['elements'])
+            result = JSArray()
+            for el in node.data['elements']:
+                if isinstance(el, ASTNode) and el.type == 'Spread':
+                    result.extend(_expand_spread_values(self._eval(el.data['arg'], env)))
+                else:
+                    result.append(self._eval(el, env))
+            return result
 
         if t == 'Object':
             result = JSObject()
             for key, val_node in node.data['props']:
+                if key is None:
+                    _object_assign(result, self._eval(val_node, env))
+                    continue
                 if isinstance(key, ASTNode):  # computed key
                     key = _to_str(self._eval(key.data['expr'], env))
                 result[key] = self._eval(val_node, env)
@@ -509,7 +549,12 @@ class Interpreter:
 
     def _exec_call(self, node, env):
         callee_node = node.data['callee']
-        args = [self._eval(a, env) for a in node.data['args']]
+        args = []
+        for arg in node.data['args']:
+            if isinstance(arg, ASTNode) and arg.type == 'Spread':
+                args.extend(_expand_spread_values(self._eval(arg.data['arg'], env)))
+            else:
+                args.append(self._eval(arg, env))
 
         this_val = None
         if callee_node.type == 'Member':
@@ -744,6 +789,14 @@ def _get_property(obj, prop):
     if obj is _UNDEF or obj is None:
         return _UNDEF
 
+    if isinstance(obj, JSFunction):
+        return _get_function_property(obj, prop)
+
+    if callable(obj):
+        prop_val = _get_callable_property(obj, prop)
+        if prop_val is not _UNDEF:
+            return prop_val
+
     # String methods
     if isinstance(obj, str):
         if prop == 'length':
@@ -895,6 +948,10 @@ def _get_property(obj, prop):
 def _set_property(obj, prop, value):
     if isinstance(obj, dict):
         obj[prop] = value
+    elif isinstance(obj, JSFunction):
+        obj.properties[prop] = value
+    elif callable(obj) and hasattr(obj, '__dict__'):
+        setattr(obj, prop, value)
     elif isinstance(obj, list):
         try:
             idx = int(prop)
@@ -932,6 +989,124 @@ def _safe_call(fn, args):
         except Exception as _exc:
             _logger.debug("Ignored: %s", _exc)
         return _UNDEF
+    return _UNDEF
+
+
+def _expand_spread_values(value):
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        return list(value)
+    return []
+
+
+def _iter_enumerable_entries(obj):
+    if obj is _UNDEF or obj is None:
+        return []
+    if isinstance(obj, dict):
+        return list(obj.items())
+    if isinstance(obj, list):
+        return [(str(index), value) for index, value in enumerate(obj)]
+    if isinstance(obj, JSFunction):
+        return list(obj.properties.items())
+    if callable(obj) and hasattr(obj, '__dict__'):
+        return [
+            (key, value)
+            for key, value in obj.__dict__.items()
+            if not key.startswith('__')
+        ]
+    return []
+
+
+def _object_assign(target, *sources):
+    if target is _UNDEF or target is None:
+        target = JSObject()
+    for source in sources:
+        for key, value in _iter_enumerable_entries(source):
+            _set_property(target, key, value)
+    return target
+
+
+def _object_create(proto):
+    obj = JSObject()
+    if isinstance(proto, dict):
+        obj._proto = proto
+    return obj
+
+
+def _invoke_callable(fn, args, this_val=None):
+    if fn is _UNDEF or fn is None:
+        return _UNDEF
+    if callable(fn) and not isinstance(fn, JSFunction):
+        try:
+            return fn(*args)
+        except Exception:
+            return _UNDEF
+    if isinstance(fn, JSFunction):
+        call_env = Environment(fn.env)
+        for index, param in enumerate(fn.params):
+            call_env.define(param, args[index] if index < len(args) else _UNDEF)
+        call_env.define('arguments', JSArray(args))
+        if this_val is not None:
+            call_env.define('this', this_val)
+        try:
+            interp = Interpreter.__new__(Interpreter)
+            interp.global_env = fn.env
+            interp._iteration_count = 0
+            interp._exec_stmt(fn.body, call_env)
+        except _Return as ret:
+            return ret.value
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
+        return _UNDEF
+    return _UNDEF
+
+
+def _get_function_property(obj, prop):
+    if prop == 'call':
+        return lambda this_arg=None, *call_args: _invoke_callable(obj, list(call_args), this_arg)
+    if prop == 'apply':
+        return lambda this_arg=None, call_args=None: _invoke_callable(
+            obj,
+            _expand_spread_values(call_args),
+            this_arg,
+        )
+    if prop == 'bind':
+        return lambda this_arg=None, *bound_args: (
+            lambda *call_args: _invoke_callable(
+                obj,
+                list(bound_args) + list(call_args),
+                this_arg,
+            )
+        )
+    if prop == 'length':
+        return len(obj.params)
+    if prop == 'name':
+        return obj.name
+    if prop in obj.properties:
+        return obj.properties[prop]
+    return _UNDEF
+
+
+def _get_callable_property(obj, prop):
+    if prop == 'call':
+        return lambda this_arg=None, *call_args: _invoke_callable(obj, list(call_args), this_arg)
+    if prop == 'apply':
+        return lambda this_arg=None, call_args=None: _invoke_callable(
+            obj,
+            _expand_spread_values(call_args),
+            this_arg,
+        )
+    if prop == 'bind':
+        return lambda this_arg=None, *bound_args: (
+            lambda *call_args: _invoke_callable(
+                obj,
+                list(bound_args) + list(call_args),
+                this_arg,
+            )
+        )
+    if hasattr(obj, '__dict__') and prop in obj.__dict__:
+        return obj.__dict__[prop]
     return _UNDEF
 
 

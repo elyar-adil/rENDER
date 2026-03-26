@@ -178,7 +178,6 @@ def test_vue_style_list_render_script_can_expand_children():
     assert items[0].box.y < items[1].box.y < items[2].box.y
 
 
-@pytest.mark.xfail(strict=True, reason="function objects still drop assigned properties")
 def test_jquery_style_function_objects_can_hold_plugin_properties():
     code = """
         function jQuery(){}
@@ -191,7 +190,6 @@ def test_jquery_style_function_objects_can_hold_plugin_properties():
     assert interp.global_env.get("out") == "render"
 
 
-@pytest.mark.xfail(strict=True, reason="Object.assign helper is still missing")
 def test_vue_react_style_object_assign_merge_helper_exists():
     code = """
         var props = Object.assign({ id: 'a' }, { class: 'hero' });
@@ -200,3 +198,63 @@ def test_vue_react_style_object_assign_merge_helper_exists():
     interp = _exec(code)
 
     assert interp.global_env.get("out") == "hero"
+
+
+def test_react_style_transpiled_helper_can_mount_component_markup():
+    html = """
+        <html>
+          <body>
+            <div id="app"></div>
+            <script>
+              function App(props) {
+                return '<main id="' + props.id + '" class="' + props.className + '">' +
+                  App.displayName +
+                  '</main>';
+              }
+              App.displayName = 'ReactApp';
+              var props = Object.assign({ id: 'root' }, { className: 'shell' });
+              document.getElementById('app').innerHTML = App.call(null, props);
+            </script>
+          </body>
+        </html>
+    """
+    _display_list, _page_height, document = _pipeline_offline(html)
+
+    app = _find_by_attr(document, "id", "app")
+    root = _find_by_attr(document, "id", "root")
+    assert app is not None
+    assert root is not None
+    assert root.parent is app
+    assert root.attributes.get("class") == "shell"
+
+
+def test_vue_style_compiled_list_helper_can_spread_items_and_bind_context():
+    html = """
+        <html>
+          <body>
+            <ul id="list"></ul>
+            <script>
+              function renderList(source, renderItem) {
+                return source.map(function(item, index) {
+                  return renderItem.call({ prefix: 'item' }, item, index);
+                }).join('');
+              }
+              var state = { items: ['a', 'b'] };
+              var extra = ['c'];
+              var merged = [...state.items, ...extra];
+              var attrs = { ...{ class: 'entry' }, 'data-count': merged.length };
+              document.getElementById('list').innerHTML = renderList(merged, function(item, index) {
+                return '<li class="' + attrs.class + '">' + this.prefix + '-' + index + ':' + item + '</li>';
+              });
+            </script>
+          </body>
+        </html>
+    """
+    _display_list, _page_height, document = _pipeline_offline(html)
+
+    items = _find_all_by_class(document, "entry")
+    assert [item.children[0].data for item in items] == [
+        "item-0:a",
+        "item-1:b",
+        "item-2:c",
+    ]

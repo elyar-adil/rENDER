@@ -45,6 +45,8 @@ def _pipeline(html_content: str, base_url: str = '',
              extra_css_texts=css_texts, base_url=base_url)
     css_compute(doc, viewport_width=viewport_width, viewport_height=viewport_height)
 
+    img_data.extend(_fetch_background_images(doc, base_url))
+
     import backend
     backend.get_image_loader().attach_images(img_data)
 
@@ -157,6 +159,64 @@ def _fetch_binary_jobs(jobs: list[tuple], *, fetcher, max_workers: int) -> list[
                 results[idx] = (jobs[idx][0], raw)
 
     return [item for item in results if item is not None]
+
+
+class _BackgroundImageTarget:
+    """Proxy that lets the generic image loader attach CSS background images."""
+
+    __slots__ = ('node', 'natural_width', 'natural_height')
+
+    def __init__(self, node):
+        self.node = node
+        self.natural_width = 0
+        self.natural_height = 0
+
+    @property
+    def image(self):
+        return getattr(self.node, 'background_image', None)
+
+    @image.setter
+    def image(self, value):
+        self.node.background_image = value
+
+
+def _fetch_background_images(document, base_url: str) -> list[tuple]:
+    """Fetch CSS background-image URLs after styles have been computed."""
+    from html.dom import Element
+    from network.http import fetch_bytes, resolve_url
+
+    jobs: list[tuple] = []
+    stack = [document]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, Element):
+            bg_image = (getattr(node, 'style', {}) or {}).get('background-image', '').strip()
+            bg_url = _extract_background_image_url(bg_image)
+            if bg_url:
+                target = _BackgroundImageTarget(node)
+                if bg_url.startswith('data:'):
+                    jobs.append((target, None, bg_url))
+                else:
+                    url = resolve_url(base_url, bg_url) if base_url else bg_url
+                    jobs.append((target, url, None))
+        stack.extend(reversed(getattr(node, 'children', [])))
+
+    if not jobs:
+        return []
+
+    return _fetch_binary_jobs(jobs, fetcher=fetch_bytes, max_workers=min(16, len(jobs)))
+
+
+def _extract_background_image_url(value: str) -> str | None:
+    import re
+
+    if not value or value in ('none', ''):
+        return None
+
+    match = re.search(r'url\(\s*([\'"]?)(.+?)\1\s*\)', value, re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(2).strip()
 
 
 def _decode_data_uri(data_uri: str) -> bytes | None:

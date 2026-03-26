@@ -104,9 +104,16 @@ class LineBox:
                 item.x += slack
         # Vertically align all items to baseline (bottom of line)
         for item in self.items:
-            item.y = self.y + (self.height - item.height)
             if item.layout_node is not None:
-                _shift_subtree(item.layout_node, item.x, item.y)
+                # Atomic inline boxes already bake their own margins/heights into the
+                # measured box, so top-aligning them avoids exaggerated offsets.
+                item.y = self.y
+            else:
+                item.y = self.y + (self.height - item.height)
+            if item.layout_node is not None:
+                box = getattr(item.layout_node, 'box', None)
+                current_y = box.y if box is not None else 0.0
+                _shift_subtree(item.layout_node, item.x, item.y - current_y)
 
 
 def _compute_line_height(node, max_font_size: float) -> float:
