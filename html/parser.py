@@ -581,43 +581,6 @@ class TreeBuilder:
 # Raw-text aware tokenization for script/style
 # ---------------------------------------------------------------------------
 
-def _tokenize_with_rawtext(html: str):
-    """Tokenize HTML, handling raw text elements (script/style) specially."""
-    base_tokenizer = Tokenizer(html)
-    tokens = base_tokenizer.tokenize()
-
-    # Post-process: for script/style, merge character tokens between start/end tags
-    result = []
-    i = 0
-    while i < len(tokens):
-        tok = tokens[i]
-        if isinstance(tok, StartTagToken) and tok.tag_name in RAW_TEXT_ELEMENTS:
-            result.append(tok)
-            i += 1
-            # Collect all characters until matching end tag
-            raw_chars = []
-            close_tag = f'</{tok.tag_name}'
-            # Find the closing tag in tokens
-            while i < len(tokens):
-                t = tokens[i]
-                if isinstance(t, EndTagToken) and t.tag_name == tok.tag_name:
-                    break
-                if isinstance(t, CharacterToken):
-                    raw_chars.append(t.char)
-                elif isinstance(t, EOFToken):
-                    break
-                i += 1
-            raw_text = ''.join(raw_chars)
-            if raw_text:
-                for ch in raw_text:
-                    result.append(CharacterToken(ch))
-            # The EndTagToken at position i will be appended in the next iteration
-        else:
-            result.append(tok)
-            i += 1
-
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Public API

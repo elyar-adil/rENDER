@@ -2,15 +2,18 @@
 import re
 import logging
 import sys
+import threading
 from urllib.parse import urlparse
 from html.dom import Document, Element, Text, Node
 import css.parser as css_parser
 import css.selector as selector_mod
 from css.properties import PROPERTIES, expand_shorthand
+from css.utils import split_paren_aware
 from collections import defaultdict
 
 _logger = logging.getLogger(__name__)
 _FONT_FACE_CACHE: dict[str, bool] = {}
+_FONT_FACE_LOCK = threading.Lock()
 _SFNT_MAGIC = {b'\x00\x01\x00\x00', b'OTTO', b'true', b'ttcf'}
 _SAFE_FONT_EXTS = {'.ttf', '.otf', '.ttc', '.otc'}
 _VAR_SHORTHANDS = {'border', 'border-top', 'border-right', 'border-bottom', 'border-left'}
@@ -92,19 +95,23 @@ def _load_font_faces(rules: list, base_url: str) -> None:
                 try:
                     from network.http import fetch_bytes, resolve_url
                     url = resolve_url(base_url, src_url) if base_url else src_url
-                    cached = _FONT_FACE_CACHE.get(url)
+                    with _FONT_FACE_LOCK:
+                        cached = _FONT_FACE_CACHE.get(url)
                     if cached is False:
                         continue
                     if cached is True:
                         continue
                     font_data = fetch_bytes(url)
                     if not _looks_like_sfnt_font(font_data):
-                        _FONT_FACE_CACHE[url] = False
+                        with _FONT_FACE_LOCK:
+                            _FONT_FACE_CACHE[url] = False
                         continue
                     font_id = QFontDatabase.addApplicationFontFromData(QByteArray(font_data))
-                    _FONT_FACE_CACHE[url] = font_id >= 0
+                    with _FONT_FACE_LOCK:
+                        _FONT_FACE_CACHE[url] = font_id >= 0
                 except Exception as exc:
-                    _FONT_FACE_CACHE[url] = False
+                    with _FONT_FACE_LOCK:
+                        _FONT_FACE_CACHE[url] = False
                     _logger.debug('Ignoring @font-face load failure for %s: %s', src_url, exc)
         # Recurse into @media blocks
         if hasattr(rule, 'rules') and rule.rules:
@@ -191,33 +198,10 @@ def _media_matches(prelude: str, viewport_width: int, viewport_height: int) -> b
         return True
 
     # Comma-separated → OR
-    parts = _split_media_list(raw)
-    for part in parts:
+    for part in split_paren_aware(raw):
         if _media_single_matches(part.strip(), viewport_width, viewport_height):
             return True
     return False
-
-
-def _split_media_list(text: str) -> list:
-    """Split comma-separated media query list (not inside parens)."""
-    result = []
-    depth = 0
-    current = []
-    for ch in text:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            result.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        result.append(''.join(current))
-    return result
 
 
 def _media_single_matches(query: str, viewport_width: int, viewport_height: int) -> bool:
@@ -714,8 +698,7 @@ def _apply_to_element(node: Element, index: dict) -> None:
 
     node.style = computed
     node.css_vars = css_vars
-    if pseudo_rules:
-        node._pseudo_rules = pseudo_rules
+    node._pseudo_rules = pseudo_rules
 
 
 # ---------------------------------------------------------------------------
@@ -919,21 +902,4 @@ def _border_side_longhands_look_unresolved(style: dict, side: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _split_selectors(sel_text: str) -> list:
-    result = []
-    depth = 0
-    current = []
-    for ch in sel_text:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            result.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        result.append(''.join(current))
-    return result
+    return split_paren_aware(sel_text)

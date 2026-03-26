@@ -1,8 +1,12 @@
+import logging
+_logger = logging.getLogger(__name__)
 """Inline formatting context and line boxes."""
 import re
 from dataclasses import dataclass, field
 from layout.box import BoxModel
 from layout.text import measure_word, measure_text, get_font, _parse_px
+
+from layout.block import _BLOCK_DISPLAYS, _shift_subtree  # shared constants/helpers
 
 _ATOMIC_INLINE_DISPLAYS = frozenset({'inline-block', 'inline-flex', 'inline-grid'})
 _BORDER_WIDTH_KEYWORDS = frozenset({'thin', 'medium', 'thick'})
@@ -110,28 +114,8 @@ class LineBox:
 
 
 def _shift_layout_subtree(node, dx: float, dy: float) -> None:
-    if dx == 0.0 and dy == 0.0:
-        return
-
-    from html.dom import Element
-
-    if hasattr(node, 'box') and node.box is not None:
-        node.box.x += dx
-        node.box.y += dy
-
-    if hasattr(node, 'line_boxes'):
-        for lb in node.line_boxes:
-            lb.x += dx
-            lb.y += dy
-            for item in lb.items:
-                item.x += dx
-                item.y += dy
-                if item.layout_node is not None and item.layout_node is not node:
-                    _shift_layout_subtree(item.layout_node, dx, dy)
-
-    for child in getattr(node, 'children', []):
-        if isinstance(child, Element):
-            _shift_layout_subtree(child, dx, dy)
+    """Shift a subtree by (dx, dy); delegates to shared _shift_subtree."""
+    _shift_subtree(node, dx, dy)
 
 
 def _compute_line_height(node, max_font_size: float) -> float:
@@ -344,8 +328,8 @@ def _resolve_img_dim(css_val: str, attr_val: str, natural: int) -> int:
             if val.lstrip('-').isdigit():
                 return int(val)
             return int(_parse_px(val))
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
     return natural or 0
 
 
@@ -545,8 +529,8 @@ def _has_visible_border(style: dict) -> bool:
         try:
             if _parse_px(width) > 0.0:
                 return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
     return False
 
 
@@ -598,14 +582,6 @@ def _layout_inline_block(node, inherited_style: dict, container_width: float):
             style['width'] = original_width
 
     return box
-
-
-_BLOCK_DISPLAYS = frozenset({
-    'block', 'flex', 'grid', 'table', 'list-item',
-    'table-row', 'table-cell', 'table-header-group',
-    'table-footer-group', 'table-row-group',
-    'table-caption', 'table-column-group',
-})
 
 
 def _collect(node, items: list, inherited_style: dict = None, container_width: float = 0.0, is_root: bool = False,

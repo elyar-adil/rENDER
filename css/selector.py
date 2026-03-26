@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """CSS Selector parsing and matching.
 
 Implements:
@@ -17,6 +19,7 @@ Implements:
 import re
 import functools
 from html.dom import Element
+from css.utils import split_paren_aware as _split_by_comma_outside_parens
 
 
 # ---------------------------------------------------------------------------
@@ -358,8 +361,8 @@ def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> boo
                 frag = frag.strip()
                 if frag and _has_descendant(element, frag):
                     return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
         return False
 
     # Structural pseudo-classes
@@ -406,8 +409,8 @@ def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> boo
                 sel_fragment = sel_fragment.strip()
                 if sel_fragment and matches(element, sel_fragment):
                     return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
         return False
 
     # :where(A, B, C) — same matching as :is() but zero specificity
@@ -418,8 +421,8 @@ def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> boo
                 sel_fragment = sel_fragment.strip()
                 if sel_fragment and matches(element, sel_fragment):
                     return True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
         return False
 
     # Dynamic pseudo-classes — match based on element state
@@ -441,28 +444,6 @@ def _match_pseudo_class(element: Element, pseudo: str, negation_sel=None) -> boo
         return False
 
     return False
-
-
-def _split_by_comma_outside_parens(text: str) -> list:
-    """Split text by commas that are not inside parentheses."""
-    result = []
-    depth = 0
-    current = []
-    for ch in text:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            result.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        result.append(''.join(current))
-    return result
 
 
 # ---- structural helpers ---------------------------------------------------
@@ -529,20 +510,21 @@ def _eval_nth(arg: str, index: int) -> bool:
     m = re.fullmatch(r'([+-]?\d*n)\s*([+-]\s*\d+)?', arg)
     if m:
         a_str = m.group(1)
-        b_str = m.group(2) or '0'
-        b_str = b_str.replace(' ', '')
-        a = int(a_str.replace('n', '') or '1') if 'n' in a_str else 0
-        if a_str == 'n':
+        b_str = (m.group(2) or '+0').replace(' ', '')
+        if a_str in ('n', '+n'):
             a = 1
         elif a_str == '-n':
             a = -1
-        b = int(b_str) if b_str else 0
+        else:
+            a = int(a_str.replace('n', '') or '1')
+        b = int(b_str)
         if a == 0:
             return index == b
-        n = (index - b)
-        if n < 0 or a == 0:
+        remainder = index - b
+        if remainder % a != 0:
             return False
-        return n % a == 0
+        k = remainder // a
+        return k >= 0
     return False
 
 
@@ -729,8 +711,8 @@ class _SelectorParser:
                                 neg_compound = neg_complex.parts[0]
                                 if isinstance(neg_compound, CompoundSelector) and neg_compound.simple_selectors:
                                     ss.negation = neg_compound.simple_selectors[0]
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        _logger.debug("Ignored: %s", _exc)
                 elif arg is not None:
                     ss.pseudo_class = f'{pname}({arg})'
                 else:

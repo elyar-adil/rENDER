@@ -25,8 +25,18 @@ class Element(Node):
         self.node_type = 'element'
         self.tag = tag.lower()
         self.attributes = attributes if attributes is not None else {}
-        self.style = {}              # computed style dict (set by css/cascade.py)
-        self.box = None              # set by layout engine
+        self.style: dict = {}        # computed style dict (set by css/cascade.py)
+        self.css_vars: dict = {}     # CSS custom property values (set by cascade)
+        self.box = None              # BoxModel, set by layout engine
+        self.line_boxes: list = []   # inline line boxes (set by inline layout)
+        self.qimage = None           # QImage for <img> (set by engine._attach_images)
+        self.natural_width: int = 0  # intrinsic image width in px
+        self.natural_height: int = 0 # intrinsic image height in px
+        self.background_qimage = None  # QImage for CSS background-image
+        # Internal: pseudo-element rules collected during cascade
+        self._pseudo_rules: dict = {}
+        # Internal: absolute-positioned children deferred by block layout
+        self._abs_children: list = []
 
     def get(self, attr: str, default=None):
         return self.attributes.get(attr, default)

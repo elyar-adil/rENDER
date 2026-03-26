@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """XMLHttpRequest bridge for rENDER JavaScript engine.
 
 Provides a synchronous XHR implementation for JS scripts.
@@ -62,14 +64,14 @@ class XMLHttpRequest(JSObject):
         if cb and callable(cb):
             try:
                 cb()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
         cb = self.get('onload')
         if cb and callable(cb):
             try:
                 cb()
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
 
 
 def create_xhr():

@@ -1,7 +1,10 @@
+import logging
+_logger = logging.getLogger(__name__)
 """PyQt6 rendering backend for rENDER browser engine."""
 import sys
 import os
 import math
+from css.utils import split_paren_aware as _split_top_level_commas
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QScrollArea,
     QVBoxLayout, QHBoxLayout, QLineEdit, QPushButton,
@@ -420,27 +423,6 @@ def _draw_text_shadow(painter: QPainter, text: str, x: int, y: int, font: QFont,
             painter.drawText(int(x + ox), int(y + oy), text)
 
 
-def _split_top_level_commas(s: str) -> list:
-    """Split string by commas that are not inside parentheses."""
-    parts = []
-    depth = 0
-    current = []
-    for ch in s:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == ',' and depth == 0:
-            parts.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append(''.join(current))
-    return parts
-
 
 def paint(display_list: DisplayList, painter: QPainter) -> None:
     """Execute display list draw commands using QPainter."""
@@ -555,8 +537,8 @@ def paint(display_list: DisplayList, painter: QPainter) -> None:
                                 Qt.TransformationMode.SmoothTransformation,
                             )
                         painter.drawPixmap(int(cmd.x), int(cmd.y), pixmap)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
 
         elif isinstance(cmd, DrawInput):
             bg = _parse_color(cmd.background_color)

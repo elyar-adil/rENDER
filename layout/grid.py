@@ -1,5 +1,7 @@
 """CSS Grid layout (simplified — supports fixed/fr/auto column tracks)."""
 from __future__ import annotations
+import logging
+_logger = logging.getLogger(__name__)
 from layout.box import BoxModel, EdgeSizes
 from layout.text import _parse_px
 from layout.context import LayoutEngine, LayoutContext
@@ -268,8 +270,8 @@ class GridLayout(LayoutEngine):
         if height_str and height_str not in ('auto', ''):
             try:
                 total_h = _parse_px(height_str)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
 
         box.content_height = max(total_h, 0.0)
         return box

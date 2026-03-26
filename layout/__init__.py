@@ -1,3 +1,5 @@
+import logging
+_logger = logging.getLogger(__name__)
 """Layout engine entry point."""
 from layout.box import BoxModel, EdgeSizes, Rect
 from layout.block import layout_block, layout_absolute
@@ -8,32 +10,11 @@ from rendering.display_list import (
     DisplayList, PushOpacity, PopOpacity, PushTransform, PopTransform,
     DrawBoxShadow, DrawInput, DrawOutline, DrawRadialGradient,
 )
+from css.utils import split_paren_aware as _split_top_level
 
 
 VIEWPORT_WIDTH = 980
 VIEWPORT_HEIGHT = 600
-
-
-def _split_top_level(s: str, sep: str = ',') -> list:
-    """Split string by separator, respecting parentheses."""
-    parts = []
-    depth = 0
-    current = []
-    for ch in s:
-        if ch == '(':
-            depth += 1
-            current.append(ch)
-        elif ch == ')':
-            depth -= 1
-            current.append(ch)
-        elif ch == sep and depth == 0:
-            parts.append(''.join(current))
-            current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append(''.join(current))
-    return parts
 
 
 def _parse_single_shadow(s: str):
@@ -144,8 +125,8 @@ def _parse_css_transform(transform_str: str):
             elif fn == 'scaley':
                 sy *= float(args[0])
                 found = True
-        except Exception:
-            pass
+        except Exception as _exc:
+            _logger.debug("Ignored: %s", _exc)
     return (dx, dy, rot, sx, sy) if found else None
 
 
@@ -167,8 +148,8 @@ def _parse_transform_origin(origin_str: str, box):
             pass
         else:
             ox = box.x + _parse_px(p0)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _logger.debug("Ignored: %s", _exc)
     try:
         p1 = parts[1] if len(parts) > 1 else '50%'
         if p1.endswith('%'):
@@ -181,8 +162,8 @@ def _parse_transform_origin(origin_str: str, box):
             pass
         else:
             oy = box.y + _parse_px(p1)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _logger.debug("Ignored: %s", _exc)
     return ox, oy
 
 
@@ -466,8 +447,8 @@ def _parse_radial_gradient(value: str, rect):
                     pass
                 else:
                     cx = rect.x + _ppx(p0)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
             try:
                 p1 = pos_parts[1] if len(pos_parts) > 1 else '50%'
                 if p1.endswith('%'):
@@ -480,8 +461,8 @@ def _parse_radial_gradient(value: str, rect):
                     pass
                 else:
                     cy = rect.y + _ppx(p1)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _logger.debug("Ignored: %s", _exc)
         if 'circle' in first:
             rx = ry = min(rect.width, rect.height) / 2
 
@@ -655,23 +636,23 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
             if top_str not in ('auto', '', 'none'):
                 try:
                     dy = _ppx(top_str)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
             elif bottom_str not in ('auto', '', 'none'):
                 try:
                     dy = -_ppx(bottom_str)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
             if left_str not in ('auto', '', 'none'):
                 try:
                     dx = _ppx(left_str)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
             elif right_str not in ('auto', '', 'none'):
                 try:
                     dx = -_ppx(right_str)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    _logger.debug("Ignored: %s", _exc)
             if dx != 0.0 or dy != 0.0:
                 _emit(PushTransform(dx=dx, dy=dy))
                 needs_pop_transform = True

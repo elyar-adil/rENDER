@@ -84,29 +84,60 @@ def measure_word(word: str, style: dict) -> tuple[float, float]:
     return w + word_spacing, h
 
 
-def resolve_font_family(family: str) -> str:
-    """Resolve a CSS font-family list to a single family name.
+# Primary and fallback candidates for each CSS generic family keyword.
+# Ordered from most-preferred to least-preferred.
+_GENERIC_CANDIDATES: dict[str, list[str]] = {
+    'serif':       ['Times New Roman', 'DejaVu Serif', 'Liberation Serif', 'FreeSerif',
+                    'Bitstream Charter', 'Georgia', 'Serif'],
+    'sans-serif':  ['Arial', 'Helvetica', 'DejaVu Sans', 'Liberation Sans', 'FreeSans',
+                    'Nimbus Sans', 'Sans Serif'],
+    'monospace':   ['Courier New', 'Courier', 'DejaVu Sans Mono', 'Liberation Mono',
+                    'FreeMono', 'Courier 10 Pitch', 'Monospace'],
+    'cursive':     ['Comic Sans MS', 'URW Chancery L', 'Loma'],
+    'fantasy':     ['Impact', 'Copperplate', 'DejaVu Sans'],
+    'system-ui':   ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Sans Serif'],
+    'ui-sans-serif': ['Arial', 'DejaVu Sans', 'Liberation Sans', 'Sans Serif'],
+    'ui-serif':    ['Times New Roman', 'DejaVu Serif', 'Serif'],
+    'ui-monospace': ['Courier New', 'DejaVu Sans Mono', 'Monospace'],
+}
 
-    Returns the first available family or the first in the list as fallback.
+_installed_fonts: set | None = None
+
+
+def _get_installed_fonts() -> set:
+    global _installed_fonts
+    if _installed_fonts is None:
+        _ensure_app()
+        from PyQt6.QtGui import QFontDatabase
+        _installed_fonts = set(QFontDatabase.families())
+    return _installed_fonts
+
+
+def resolve_font_family(family: str) -> str:
+    """Resolve a CSS font-family list to a single installed family name.
+
+    Checks each candidate against the system's installed fonts and returns
+    the first match. Falls back through generic keyword alternatives.
     """
     families = [f.strip().strip('"\'') for f in family.split(',')]
-    _GENERIC = {
-        'serif': 'Times New Roman',
-        'sans-serif': 'Arial',
-        'monospace': 'Courier New',
-        'cursive': 'Comic Sans MS',
-        'fantasy': 'Impact',
-        'system-ui': 'Arial',
-        'ui-sans-serif': 'Arial',
-        'ui-serif': 'Times New Roman',
-        'ui-monospace': 'Courier New',
-    }
+    installed = _get_installed_fonts()
     for f in families:
-        if f.lower() in _GENERIC:
-            return _GENERIC[f.lower()]
-        if f:
+        fl = f.lower()
+        candidates = _GENERIC_CANDIDATES.get(fl)
+        if candidates is not None:
+            for c in candidates:
+                if c in installed:
+                    return c
+            continue
+        if f and f in installed:
             return f
-    return 'Arial'
+    # Last resort: find any installed font from the generic candidate lists.
+    for f in families:
+        fl = f.lower()
+        candidates = _GENERIC_CANDIDATES.get(fl)
+        if candidates:
+            return candidates[0]  # return preferred even if not installed
+    return families[0] if families else 'Arial'
 
 
 def _parse_px(value: str) -> float:
