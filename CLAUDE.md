@@ -7,11 +7,13 @@ Every line must earn its place — no gold-plating, no speculative features.
 ## Architecture
 
 ```
-html/parser.py     → Document (DOM tree)
-css/cascade.py     → computed styles on each Element
-css/computed.py    → resolve units (em→px, etc.)
-layout/__init__.py → DisplayList of draw commands
-rendering/qt_painter.py → QPainter execution
+html/parser.py          → Document (DOM tree)
+css/cascade.py          → computed styles on each Element
+css/computed.py         → resolve units (em→px, etc.)
+layout/__init__.py      → DisplayList of draw commands
+rendering/display_list.py → platform-agnostic draw commands
+backend/base.py         → FontMetrics + ImageLoader ABCs
+backend/qt/painter.py   → QPainter execution (Qt implementation)
 ```
 
 ## Running
@@ -46,10 +48,14 @@ python -m pytest tests/
 | `layout/block.py` | Block Formatting Context |
 | `layout/inline.py` | Inline Formatting Context + LineBox |
 | `layout/flex.py` | Flexbox layout |
-| `layout/text.py` | Text measurement via QFontMetrics |
+| `layout/text.py` | Text measurement facade (delegates to backend) |
 | `layout/float_manager.py` | Float tracking within BFC |
 | `rendering/display_list.py` | DrawRect/DrawText/DrawBorder/DrawImage commands |
-| `rendering/qt_painter.py` | PyQt6 QPainter rendering backend |
+| `backend/base.py` | FontMetrics + ImageLoader abstract base classes |
+| `backend/qt/font.py` | Qt font metrics implementation |
+| `backend/qt/image.py` | Qt image loading/decoding implementation |
+| `backend/qt/painter.py` | PyQt6 QPainter rendering backend |
+| `backend/qt/app.py` | Qt application controller (Browser + loader thread) |
 | `js/` | JavaScript engine (Phase 5, stubs for now) |
 
 ## Design Principles

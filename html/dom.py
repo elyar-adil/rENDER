@@ -29,10 +29,10 @@ class Element(Node):
         self.css_vars: dict = {}     # CSS custom property values (set by cascade)
         self.box = None              # BoxModel, set by layout engine
         self.line_boxes: list = []   # inline line boxes (set by inline layout)
-        self.qimage = None           # QImage for <img> (set by engine._attach_images)
+        self.image = None            # platform image object for <img> (set by ImageLoader)
         self.natural_width: int = 0  # intrinsic image width in px
         self.natural_height: int = 0 # intrinsic image height in px
-        self.background_qimage = None  # QImage for CSS background-image
+        self.background_image = None # platform image for CSS background-image
         # Internal: pseudo-element rules collected during cascade
         self._pseudo_rules: dict = {}
         # Internal: absolute-positioned children deferred by block layout

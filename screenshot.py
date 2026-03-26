@@ -45,7 +45,7 @@ def screenshot(target: str, output: str, width: int = 1200, height: int = 900):
     img = QImage(width, render_height, QImage.Format.Format_RGB32)
     img.fill(0xFFFFFF)
 
-    from rendering.qt_painter import paint
+    from backend.qt.painter import paint
     painter = QPainter(img)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     paint(dl, painter)

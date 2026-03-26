@@ -21,7 +21,7 @@ from PyQt6.QtGui import QPainter, QPixmap, QImage, QColor
 from PyQt6.QtCore import Qt
 
 from engine import _pipeline
-from rendering.qt_painter import paint
+from backend.qt.painter import paint
 
 
 # ---------------------------------------------------------------------------
