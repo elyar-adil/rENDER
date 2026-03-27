@@ -21,7 +21,7 @@ KEYWORD = 'KEYWORD'
 PUNCT = 'PUNCT'
 OP = 'OP'
 EOF = 'EOF'
-TEMPLATE = 'TEMPLATE'
+TEMPLATE = 'TEMPLATE'  # value: list of ('str', text) | ('expr', code)
 
 KEYWORDS = frozenset({
     'var', 'let', 'const', 'function', 'return', 'if', 'else', 'for',
@@ -29,13 +29,15 @@ KEYWORDS = frozenset({
     'instanceof', 'in', 'of', 'null', 'undefined', 'true', 'false',
     'try', 'catch', 'finally', 'throw', 'switch', 'case', 'default',
     'delete', 'void',
+    # ES6 class syntax — always reserved
+    'class', 'extends', 'super',
 })
 
 # Multi-character operators (longest-first for greedy matching)
 _MULTI_OPS = (
     '>>>=', '===', '!==', '>>>', '<<=', '>>=',
     '**=', '&&=', '||=', '??=',
-    '==', '!=', '<=', '>=', '&&', '||', '??',
+    '==', '!=', '<=', '>=', '&&', '||', '?.', '??',
     '++', '--', '+=', '-=', '*=', '/=', '%=',
     '**', '=>', '<<', '>>',
 )
@@ -178,16 +180,27 @@ class Lexer:
                     elif esc == quote:
                         parts.append(quote)
                     elif esc == 'u':
-                        # Unicode escape \uXXXX
-                        hex_str = src[self.pos + 1:self.pos + 5]
-                        if len(hex_str) == 4:
-                            try:
-                                parts.append(chr(int(hex_str, 16)))
-                                self.pos += 4
-                            except ValueError:
+                        # Unicode escape \uXXXX or \u{XXXX}
+                        if self.pos + 1 < len(src) and src[self.pos + 1] == '{':
+                            end = src.find('}', self.pos + 2)
+                            if end != -1:
+                                try:
+                                    parts.append(chr(int(src[self.pos + 2:end], 16)))
+                                    self.pos = end
+                                except ValueError:
+                                    parts.append(esc)
+                            else:
                                 parts.append(esc)
                         else:
-                            parts.append(esc)
+                            hex_str = src[self.pos + 1:self.pos + 5]
+                            if len(hex_str) == 4:
+                                try:
+                                    parts.append(chr(int(hex_str, 16)))
+                                    self.pos += 4
+                                except ValueError:
+                                    parts.append(esc)
+                            else:
+                                parts.append(esc)
                     elif esc == '0':
                         parts.append('\0')
                     else:
@@ -204,26 +217,78 @@ class Lexer:
         return Token(STRING, ''.join(parts), self.line)
 
     def _read_template(self) -> Token:
-        """Read backtick template literal as a plain string (no interpolation)."""
+        """Read backtick template literal, extracting ${expr} interpolations.
+
+        Returns a TEMPLATE token whose value is a list of ('str', text) or
+        ('expr', source_code) pairs.  When there are no expressions the value
+        is a plain str (backward-compatible with STRING handling).
+        """
         src = self.source
-        self.pos += 1  # skip `
-        parts = []
+        self.pos += 1  # skip opening `
+        parts: list[tuple[str, str]] = []
+        text: list[str] = []
+
         while self.pos < len(src):
             ch = src[self.pos]
+
             if ch == '\\':
                 self.pos += 1
                 if self.pos < len(src):
-                    parts.append(src[self.pos])
-                self.pos += 1
+                    esc = src[self.pos]
+                    if esc == 'n':
+                        text.append('\n')
+                    elif esc == 't':
+                        text.append('\t')
+                    elif esc == 'r':
+                        text.append('\r')
+                    elif esc == '`':
+                        text.append('`')
+                    elif esc == '$':
+                        text.append('$')
+                    elif esc == '\\':
+                        text.append('\\')
+                    else:
+                        text.append(esc)
+                    self.pos += 1
                 continue
+
             if ch == '`':
                 self.pos += 1
                 break
+
+            if ch == '$' and self.pos + 1 < len(src) and src[self.pos + 1] == '{':
+                parts.append(('str', ''.join(text)))
+                text = []
+                self.pos += 2  # skip ${
+                depth = 1
+                expr_start = self.pos
+                while self.pos < len(src) and depth > 0:
+                    c = src[self.pos]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    if c == '\n':
+                        self.line += 1
+                    if depth > 0:
+                        self.pos += 1
+                # self.pos now points at the closing }
+                parts.append(('expr', src[expr_start:self.pos]))
+                self.pos += 1  # skip }
+                continue
+
             if ch == '\n':
                 self.line += 1
-            parts.append(ch)
+            text.append(ch)
             self.pos += 1
-        return Token(STRING, ''.join(parts), self.line)
+
+        parts.append(('str', ''.join(text)))
+
+        # Optimisation: no interpolations → plain STRING token
+        if len(parts) == 1 and parts[0][0] == 'str':
+            return Token(STRING, parts[0][1], self.line)
+
+        return Token(TEMPLATE, parts, self.line)
 
     def _read_number(self) -> Token:
         src = self.source
@@ -234,6 +299,15 @@ class Lexer:
             while self.pos < len(src) and src[self.pos] in '0123456789abcdefABCDEF_':
                 self.pos += 1
             return Token(NUMBER, int(src[start:self.pos].replace('_', ''), 16), self.line)
+        # Binary / octal
+        if src[self.pos] == '0' and self.pos + 1 < len(src) and src[self.pos + 1] in 'bBoO':
+            base_char = src[self.pos + 1].lower()
+            self.pos += 2
+            base = 2 if base_char == 'b' else 8
+            while self.pos < len(src) and src[self.pos] in '01234567_':
+                self.pos += 1
+            text = src[start + 2:self.pos].replace('_', '')
+            return Token(NUMBER, int(text, base) if text else 0, self.line)
         # Decimal / float
         has_dot = False
         while self.pos < len(src):
@@ -250,9 +324,12 @@ class Lexer:
                 while self.pos < len(src) and src[self.pos].isdigit():
                     self.pos += 1
                 break
+            elif ch == 'n':  # BigInt suffix — treat as integer
+                self.pos += 1
+                break
             else:
                 break
-        text = src[start:self.pos].replace('_', '')
+        text = src[start:self.pos].replace('_', '').rstrip('n')
         val = float(text) if '.' in text or 'e' in text.lower() else int(text)
         return Token(NUMBER, val, self.line)
 
@@ -271,6 +348,7 @@ class Lexer:
         src = self.source
         self.pos += 1  # skip /
         parts = ['/']
+        in_class = False
         while self.pos < len(src):
             ch = src[self.pos]
             parts.append(ch)
@@ -278,7 +356,11 @@ class Lexer:
             if ch == '\\' and self.pos < len(src):
                 parts.append(src[self.pos])
                 self.pos += 1
-            elif ch == '/':
+            elif ch == '[':
+                in_class = True
+            elif ch == ']':
+                in_class = False
+            elif ch == '/' and not in_class:
                 break
         # Flags
         while self.pos < len(src) and src[self.pos].isalpha():
