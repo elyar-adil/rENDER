@@ -13,9 +13,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
-from PyQt6.QtWidgets import QApplication
-
-_app = QApplication.instance() or QApplication([])
+try:
+    from PyQt6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication([])
+except ImportError:
+    _app = None
 
 from html.parser import parse as parse_html
 from html.dom import Element, Text, Document

@@ -1,11 +1,42 @@
-import logging
-_logger = logging.getLogger(__name__)
 """JavaScript tree-walking interpreter for rENDER browser engine."""
+import logging
 import math
 import json
 import re
-from js.parser import _UNDEF, ASTNode
 
+_logger = logging.getLogger(__name__)
+
+# --- sub-module imports -------------------------------------------------------
+from js.types import _UNDEF, JSObject, JSArray, JSFunction, Environment
+from js.ast import ASTNode
+from js.coerce import (
+    _to_str, _to_num, _to_bool, _typeof,
+    _binop, _loose_eq, _strict_eq,
+    _parse_int, _parse_float,
+    _expand_spread_values, _js_to_python,
+)
+from js.builtins import (
+    _get_property, _set_property,
+    _get_function_property, _get_callable_property,
+    _safe_call, _invoke_callable,
+    _object_assign, _object_create, _iter_enumerable_entries,
+    _JSDate,
+)
+
+# Re-export everything that external modules import from js.interpreter
+__all__ = [
+    'Interpreter', 'Environment',
+    'JSObject', 'JSArray', 'JSFunction',
+    '_UNDEF', '_to_str', '_to_num', '_to_bool',
+    '_get_property', '_set_property',
+    '_object_assign', '_iter_enumerable_entries',
+    '_safe_call', '_invoke_callable',
+]
+
+
+# ---------------------------------------------------------------------------
+# Control-flow signals
+# ---------------------------------------------------------------------------
 
 class _Break(Exception):
     pass
@@ -22,67 +53,14 @@ class _Throw(Exception):
         self.value = value
 
 
-class Environment:
-    """Scope chain for variable lookup."""
-    __slots__ = ('bindings', 'parent')
-
-    def __init__(self, parent=None):
-        self.bindings = {}
-        self.parent = parent
-
-    def get(self, name):
-        if name in self.bindings:
-            return self.bindings[name]
-        if self.parent:
-            return self.parent.get(name)
-        return _UNDEF
-
-    def set(self, name, value):
-        """Set in existing scope (walk up chain), or create in current."""
-        env = self
-        while env is not None:
-            if name in env.bindings:
-                env.bindings[name] = value
-                return
-            env = env.parent
-        self.bindings[name] = value
-
-    def define(self, name, value):
-        """Define in current scope."""
-        self.bindings[name] = value
-
-
-class JSFunction:
-    """A JavaScript function (closure)."""
-    __slots__ = ('name', 'params', 'body', 'env', 'properties')
-
-    def __init__(self, name, params, body, env):
-        self.name = name or '(anonymous)'
-        self.params = params
-        self.body = body
-        self.env = env
-        self.properties = JSObject()
-
-    def __repr__(self):
-        return f'function {self.name}()'
-
-
-class JSObject(dict):
-    """A JavaScript object (plain dict with prototype stub)."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._proto = None
-
-
-class JSArray(list):
-    """A JavaScript array."""
-    pass
-
+# ---------------------------------------------------------------------------
+# Interpreter
+# ---------------------------------------------------------------------------
 
 class Interpreter:
     """JavaScript tree-walking interpreter."""
 
-    MAX_ITERATIONS = 100000  # safety limit for loops
+    MAX_ITERATIONS = 100_000
 
     def __init__(self):
         self.global_env = Environment()
@@ -90,99 +68,132 @@ class Interpreter:
         self._setup_globals()
         self._iteration_count = 0
 
+    # ------------------------------------------------------------------
+    # Global environment setup
+    # ------------------------------------------------------------------
+
     def _setup_globals(self):
         g = self.global_env
 
         # console
-        console = JSObject()
-        console['log'] = lambda *args: self._console_log(*args)
-        console['warn'] = lambda *args: self._console_log(*args)
-        console['error'] = lambda *args: self._console_log(*args)
-        console['info'] = lambda *args: self._console_log(*args)
-        g.define('console', console)
+        con = JSObject()
+        for method in ('log', 'warn', 'error', 'info', 'debug'):
+            con[method] = lambda *a: self._console_log(*a)
+        g.define('console', con)
 
         # JSON
         json_obj = JSObject()
         json_obj['parse'] = lambda s: json.loads(_to_str(s)) if isinstance(s, str) else None
-        json_obj['stringify'] = lambda v, *a: json.dumps(_js_to_python(v))
+        json_obj['stringify'] = lambda v, *_: json.dumps(_js_to_python(v))
         g.define('JSON', json_obj)
 
         # Math
         math_obj = JSObject()
-        math_obj['abs'] = abs
-        math_obj['round'] = round
-        for fn_name in ('ceil', 'floor', 'sqrt', 'pow',
-                         'sin', 'cos', 'tan', 'atan2', 'log', 'exp'):
-            math_obj[fn_name] = getattr(math, fn_name)
+        for name in ('ceil', 'floor', 'round', 'abs', 'sqrt', 'pow',
+                      'sin', 'cos', 'tan', 'atan', 'atan2', 'log', 'log2',
+                      'log10', 'exp', 'sign', 'cbrt', 'hypot', 'trunc'):
+            if hasattr(math, name):
+                math_obj[name] = getattr(math, name)
         math_obj['max'] = lambda *a: max(a) if a else float('-inf')
         math_obj['min'] = lambda *a: min(a) if a else float('inf')
         math_obj['random'] = lambda: __import__('random').random()
         math_obj['PI'] = math.pi
         math_obj['E'] = math.e
+        math_obj['LN2'] = math.log(2)
+        math_obj['LN10'] = math.log(10)
+        math_obj['SQRT2'] = math.sqrt(2)
         g.define('Math', math_obj)
 
         # Global functions
-        g.define('parseInt', lambda s, r=10: _parse_int(s, r))
-        g.define('parseFloat', lambda s: _parse_float(s))
-        g.define('isNaN', lambda v: v != v if isinstance(v, float) else False)
+        g.define('parseInt', _parse_int)
+        g.define('parseFloat', _parse_float)
+        g.define('isNaN', lambda v: isinstance(v, float) and v != v)
         g.define('isFinite', lambda v: isinstance(v, (int, float)) and math.isfinite(v))
-        g.define('encodeURIComponent', lambda s: __import__('urllib.parse', fromlist=['quote']).quote(str(s), safe=''))
-        g.define('decodeURIComponent', lambda s: __import__('urllib.parse', fromlist=['unquote']).unquote(str(s)))
-        g.define('encodeURI', lambda s: __import__('urllib.parse', fromlist=['quote']).quote(str(s), safe=':/?#[]@!$&\'()*+,;=-._~'))
-        g.define('decodeURI', lambda s: __import__('urllib.parse', fromlist=['unquote']).unquote(str(s)))
+        _up = __import__('urllib.parse', fromlist=['quote', 'unquote'])
+        g.define('encodeURIComponent', lambda s: _up.quote(_to_str(s), safe=''))
+        g.define('decodeURIComponent', lambda s: _up.unquote(_to_str(s)))
+        g.define('encodeURI', lambda s: _up.quote(_to_str(s), safe=":/?#[]@!$&'()*+,;=-._~"))
+        g.define('decodeURI', lambda s: _up.unquote(_to_str(s)))
+
+        # String constructor
         def _string_ctor(v=_UNDEF):
             return '' if v is _UNDEF else _to_str(v)
-
-        _string_ctor.fromCharCode = lambda *codes: ''.join(chr(int(_to_num(code))) for code in codes)
+        _string_ctor.fromCharCode = lambda *codes: ''.join(chr(int(_to_num(c))) for c in codes)
+        _string_ctor.fromCodePoint = lambda *codes: ''.join(chr(int(_to_num(c))) for c in codes)
         g.define('String', _string_ctor)
 
-        g.define('Number', lambda v=0: _to_num(v))
+        # Number constructor
+        def _number_ctor(v=0):
+            return _to_num(v)
+        _number_ctor.isNaN = lambda v: isinstance(v, float) and v != v
+        _number_ctor.isFinite = lambda v: isinstance(v, (int, float)) and math.isfinite(v)
+        _number_ctor.isInteger = lambda v: isinstance(v, (int, float)) and float(v) == int(v)
+        _number_ctor.parseInt = _parse_int
+        _number_ctor.parseFloat = _parse_float
+        _number_ctor.MAX_SAFE_INTEGER = 2 ** 53 - 1
+        _number_ctor.MIN_SAFE_INTEGER = -(2 ** 53 - 1)
+        _number_ctor.POSITIVE_INFINITY = float('inf')
+        _number_ctor.NEGATIVE_INFINITY = float('-inf')
+        _number_ctor.NaN = float('nan')
+        _number_ctor.EPSILON = 2.220446049250313e-16
+        g.define('Number', _number_ctor)
+
         g.define('Boolean', lambda v=False: _to_bool(v))
 
-        def _array_ctor(*args):
-            if len(args) == 1 and isinstance(args[0], (int, float)):
-                return JSArray([_UNDEF] * max(0, int(args[0])))
-            return JSArray(args)
+        # Array constructor (needs 'from' as an attribute)
+        class _ArrayCtor:
+            def __call__(self_, *args):
+                if len(args) == 1 and isinstance(args[0], (int, float)):
+                    return JSArray([_UNDEF] * max(0, int(args[0])))
+                return JSArray(args)
+        _ac = _ArrayCtor()
+        _ac.isArray = lambda v: isinstance(v, list)
+        _ac.of = lambda *a: JSArray(a)
+        _ac.__dict__['from'] = lambda v, fn=None: _array_from(v, fn)
+        g.define('Array', _ac)
 
-        _array_ctor.isArray = lambda value: isinstance(value, list)
-        g.define('Array', _array_ctor)
-
-        def _object_ctor(value=_UNDEF):
-            if value is _UNDEF or value is None:
+        # Object constructor
+        def _object_ctor(v=_UNDEF):
+            if v is _UNDEF or v is None:
                 return JSObject()
-            if isinstance(value, dict):
-                return value
-            if isinstance(value, list):
-                obj = JSObject()
-                for index, item in enumerate(value):
-                    obj[str(index)] = item
-                obj['length'] = len(value)
-                return obj
-            return JSObject()
-
-        _object_ctor.assign = lambda target, *sources: _object_assign(target, *sources)
-        _object_ctor.keys = lambda obj: JSArray(key for key, _ in _iter_enumerable_entries(obj))
-        _object_ctor.values = lambda obj: JSArray(value for _, value in _iter_enumerable_entries(obj))
-        _object_ctor.create = lambda proto=_UNDEF: _object_create(proto)
+            return v if isinstance(v, dict) else JSObject()
+        _object_ctor.assign = _object_assign
+        _object_ctor.keys = lambda obj: JSArray(k for k, _ in _iter_enumerable_entries(obj))
+        _object_ctor.values = lambda obj: JSArray(v for _, v in _iter_enumerable_entries(obj))
+        _object_ctor.entries = lambda obj: JSArray(JSArray([k, v]) for k, v in _iter_enumerable_entries(obj))
+        _object_ctor.create = _object_create
+        _object_ctor.freeze = lambda obj: obj
+        _object_ctor.fromEntries = lambda pairs: JSObject(
+            {_to_str(p[0]): p[1] for p in (pairs or []) if isinstance(p, (list, tuple)) and len(p) >= 2})
+        _object_ctor.is_ = lambda a, b: _strict_eq(a, b)
+        _object_ctor.hasOwn = lambda obj, k: isinstance(obj, dict) and _to_str(k) in obj
+        _object_ctor.getPrototypeOf = lambda obj: getattr(obj, '_proto', None)
+        _object_ctor.getOwnPropertyNames = lambda obj: JSArray(list(obj.keys()) if isinstance(obj, dict) else [])
+        _object_ctor.defineProperty = lambda obj, k, d: obj.__setitem__(k, d.get('value', _UNDEF)) or obj if isinstance(obj, dict) else obj
         g.define('Object', _object_ctor)
-        g.define('RegExp', lambda p, f='': re.compile(p))
+
+        g.define('RegExp', lambda p, f='': re.compile(_to_str(p)))
         g.define('setTimeout', lambda fn, ms=0, *a: self._set_timeout(fn, ms, *a))
         g.define('setInterval', lambda fn, ms=0, *a: None)
         g.define('clearTimeout', lambda tid: None)
         g.define('clearInterval', lambda tid: None)
+        g.define('queueMicrotask', lambda fn: None)
         g.define('alert', lambda msg='': None)
         g.define('confirm', lambda msg='': False)
         g.define('prompt', lambda msg='', d='': d)
         g.define('undefined', _UNDEF)
         g.define('NaN', float('nan'))
         g.define('Infinity', float('inf'))
-        g.define('Error', lambda msg='': JSObject({'message': str(msg)}))
-        g.define('TypeError', lambda msg='': JSObject({'message': str(msg)}))
+        g.define('Symbol', lambda desc=_UNDEF: f'Symbol({_to_str(desc)})' if desc is not _UNDEF else 'Symbol()')
+
+        for ename in ('Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError'):
+            g.define(ename, lambda msg='', _n=ename: JSObject({'message': _to_str(msg), 'name': _n}))
+
         g.define('Date', _JSDate)
 
-        # window = global
+        # window / globalThis
         window = JSObject()
-        window['document'] = _UNDEF  # will be set by DOMBinding
+        window['document'] = _UNDEF
         window['location'] = JSObject({'href': '', 'hostname': '', 'pathname': '/'})
         window['navigator'] = JSObject({'userAgent': 'rENDER/1.0'})
         window['innerWidth'] = 980
@@ -194,33 +205,27 @@ class Interpreter:
         window['addEventListener'] = lambda *a: None
         window['removeEventListener'] = lambda *a: None
         window['getComputedStyle'] = lambda el, *a: JSObject()
+        window['requestAnimationFrame'] = lambda fn: None
         g.define('window', window)
         g.define('self', window)
         g.define('globalThis', window)
 
     def _console_log(self, *args):
-        parts = [_to_str(a) for a in args]
-        if self.console_prefix:
-            print(self.console_prefix, ' '.join(parts))
-        else:
-            print(' '.join(parts))
+        msg = ' '.join(_to_str(a) for a in args)
+        print(self.console_prefix, msg) if self.console_prefix else print(msg)
 
     def _set_timeout(self, fn, ms, *args):
-        """Execute setTimeout(fn, 0) immediately; ignore delays > 0."""
         if isinstance(ms, (int, float)) and ms <= 0:
-            if callable(fn):
-                try:
-                    fn(*args)
-                except Exception as _exc:
-                    _logger.debug("Ignored: %s", _exc)
-            elif isinstance(fn, JSFunction):
-                try:
-                    self._call_function(fn, list(args))
-                except Exception as _exc:
-                    _logger.debug("Ignored: %s", _exc)
+            try:
+                self._call_value(fn, list(args))
+            except Exception as exc:
+                _logger.debug('setTimeout ignored: %s', exc)
+
+    # ------------------------------------------------------------------
+    # Entry points
+    # ------------------------------------------------------------------
 
     def execute(self, ast) -> None:
-        """Execute a Program AST node."""
         if ast is None:
             return
         if ast.type == 'Program':
@@ -228,8 +233,11 @@ class Interpreter:
                 self._exec_stmt(stmt, self.global_env)
 
     def evaluate(self, node):
-        """Evaluate an expression node and return its value."""
         return self._eval(node, self.global_env)
+
+    # ------------------------------------------------------------------
+    # Statement execution
+    # ------------------------------------------------------------------
 
     def _exec_stmt(self, node, env):
         if node is None:
@@ -242,13 +250,21 @@ class Interpreter:
         elif t == 'VarDecl':
             for name, init in node.data['decls']:
                 val = self._eval(init, env) if init else _UNDEF
-                env.define(name, val)
+                if isinstance(name, str):
+                    env.define(name, val)
+                elif isinstance(name, ASTNode):
+                    self._destructure(name, val, env)
 
         elif t == 'FuncDecl':
+            fn = self._make_function(node, env)
+            if fn.name and fn.name != '(anonymous)':
+                env.define(fn.name, fn)
+
+        elif t == 'ClassDecl':
+            cls_fn = self._make_class(node, env)
             name = node.data.get('name')
-            fn = JSFunction(name, node.data['params'], node.data['body'], env)
             if name:
-                env.define(name, fn)
+                env.define(name, cls_fn)
 
         elif t == 'Block':
             block_env = Environment(env)
@@ -316,13 +332,12 @@ class Interpreter:
                     break
                 except _Continue:
                     pass
-                update = node.data.get('update')
-                if update:
-                    self._eval(update, loop_env)
+                upd = node.data.get('update')
+                if upd:
+                    self._eval(upd, loop_env)
 
         elif t == 'ForIn':
             iterable = self._eval(node.data['iterable'], env)
-            name = node.data['name']
             loop_type = node.data.get('loop_type', 'in')
             loop_env = Environment(env)
             if isinstance(iterable, dict):
@@ -333,8 +348,13 @@ class Interpreter:
                 items = list(range(len(iterable))) if loop_type == 'in' else list(iterable)
             else:
                 items = []
+            name = node.data.get('name')
+            pattern = node.data.get('pattern')
             for item in items:
-                loop_env.define(name, item)
+                if name:
+                    loop_env.define(name, item)
+                elif isinstance(pattern, ASTNode):
+                    self._destructure(pattern, item, loop_env)
                 try:
                     self._exec_stmt(node.data['body'], loop_env)
                 except _Break:
@@ -369,10 +389,8 @@ class Interpreter:
             matched = False
             for case in node.data['cases']:
                 if case.type == 'Case':
-                    if not matched:
-                        test = self._eval(case.data['test'], env)
-                        if disc == test:
-                            matched = True
+                    if not matched and disc == self._eval(case.data['test'], env):
+                        matched = True
                 elif case.type == 'Default':
                     matched = True
                 if matched:
@@ -386,6 +404,15 @@ class Interpreter:
             raise _Break()
         elif t == 'Continue':
             raise _Continue()
+        elif t == 'Labeled':
+            try:
+                self._exec_stmt(node.data['body'], env)
+            except _Break:
+                pass
+
+    # ------------------------------------------------------------------
+    # Expression evaluation
+    # ------------------------------------------------------------------
 
     def _eval(self, node, env):
         if node is None:
@@ -399,11 +426,17 @@ class Interpreter:
             return env.get(node.data['name'])
 
         if t == 'This':
-            return env.get('this') or self.global_env.get('window')
+            v = env.get('this')
+            return v if v is not _UNDEF else self.global_env.get('window')
+
+        if t == 'Super':
+            return env.get('__super__')
+
+        if t == 'TemplateLiteral':
+            return ''.join(_to_str(self._eval(p, env)) for p in node.data['parts'])
 
         if t == 'BinOp':
             op = node.data['op']
-            # Short-circuit operators
             if op == '&&':
                 left = self._eval(node.data['left'], env)
                 return left if not _to_bool(left) else self._eval(node.data['right'], env)
@@ -413,41 +446,14 @@ class Interpreter:
             if op == '??':
                 left = self._eval(node.data['left'], env)
                 return left if left is not None and left is not _UNDEF else self._eval(node.data['right'], env)
-
             left = self._eval(node.data['left'], env)
             right = self._eval(node.data['right'], env)
+            if op == 'instanceof':
+                return self._instanceof(left, right)
             return _binop(op, left, right)
 
         if t == 'UnaryOp':
-            op = node.data['op']
-            if op == 'typeof':
-                operand = node.data['operand']
-                if operand.type == 'Ident':
-                    val = env.get(operand.data['name'])
-                else:
-                    val = self._eval(operand, env)
-                return _typeof(val)
-            if op == 'void':
-                self._eval(node.data['operand'], env)
-                return _UNDEF
-            if op == 'delete':
-                operand = node.data['operand']
-                if operand.type == 'Member':
-                    obj = self._eval(operand.data['obj'], env)
-                    prop = self._resolve_prop(operand, env)
-                    if isinstance(obj, dict) and prop in obj:
-                        del obj[prop]
-                return True
-            val = self._eval(node.data['operand'], env)
-            if op == '!':
-                return not _to_bool(val)
-            if op == '-':
-                return -_to_num(val)
-            if op == '+':
-                return _to_num(val)
-            if op == '~':
-                return ~int(_to_num(val))
-            return _UNDEF
+            return self._eval_unary(node, env)
 
         if t == 'UpdatePre':
             return self._update(node.data['operand'], node.data['op'], True, env)
@@ -460,9 +466,7 @@ class Interpreter:
 
         if t == 'Ternary':
             cond = self._eval(node.data['cond'], env)
-            if _to_bool(cond):
-                return self._eval(node.data['then'], env)
-            return self._eval(node.data['else_'], env)
+            return self._eval(node.data['then'], env) if _to_bool(cond) else self._eval(node.data['else_'], env)
 
         if t == 'Call':
             return self._exec_call(node, env)
@@ -471,7 +475,10 @@ class Interpreter:
             return self._exec_new(node, env)
 
         if t == 'Member':
+            optional = node.data.get('optional', False)
             obj = self._eval(node.data['obj'], env)
+            if optional and (obj is _UNDEF or obj is None):
+                return _UNDEF
             return self._member_get(obj, node, env)
 
         if t == 'Array':
@@ -486,29 +493,74 @@ class Interpreter:
         if t == 'Object':
             result = JSObject()
             for key, val_node in node.data['props']:
+                if isinstance(key, ASTNode) and key.type in ('SpreadProp',):
+                    _object_assign(result, self._eval(val_node, env))
+                    continue
                 if key is None:
                     _object_assign(result, self._eval(val_node, env))
                     continue
-                if isinstance(key, ASTNode):  # computed key
+                if isinstance(key, ASTNode) and key.type == 'Computed':
                     key = _to_str(self._eval(key.data['expr'], env))
+                elif isinstance(key, ASTNode):
+                    key = _to_str(self._eval(key, env))
                 result[key] = self._eval(val_node, env)
             return result
 
         if t == 'FuncDecl':
-            fn = JSFunction(node.data.get('name'), node.data['params'],
-                            node.data['body'], env)
-            if node.data.get('name'):
-                env.define(node.data['name'], fn)
+            fn = self._make_function(node, env)
+            if fn.name and fn.name != '(anonymous)':
+                env.define(fn.name, fn)
             return fn
+
+        if t == 'ClassDecl':
+            return self._make_class(node, env)
+
+        if t == 'Await':
+            return self._eval(node.data['value'], env)
+
+        if t == 'Yield':
+            return self._eval(node.data.get('value'), env) if node.data.get('value') else _UNDEF
+
+        if t == 'Spread':
+            return self._eval(node.data['arg'], env)
 
         if t == 'Comma':
             self._eval(node.data['left'], env)
             return self._eval(node.data['right'], env)
 
-        if t == 'Spread':
-            return self._eval(node.data['arg'], env)
-
         return _UNDEF
+
+    def _eval_unary(self, node, env):
+        op = node.data['op']
+        if op == 'typeof':
+            operand = node.data['operand']
+            val = env.get(operand.data['name']) if operand.type == 'Ident' else self._eval(operand, env)
+            return _typeof(val)
+        if op == 'void':
+            self._eval(node.data['operand'], env)
+            return _UNDEF
+        if op == 'delete':
+            operand = node.data['operand']
+            if operand.type == 'Member':
+                obj = self._eval(operand.data['obj'], env)
+                prop = self._resolve_prop(operand, env)
+                if isinstance(obj, dict) and prop in obj:
+                    del obj[prop]
+            return True
+        val = self._eval(node.data['operand'], env)
+        if op == '!':
+            return not _to_bool(val)
+        if op == '-':
+            return -_to_num(val)
+        if op == '+':
+            return _to_num(val)
+        if op == '~':
+            return ~int(_to_num(val))
+        return _UNDEF
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _resolve_prop(self, member_node, env):
         if member_node.data.get('computed'):
@@ -516,714 +568,308 @@ class Interpreter:
         return member_node.data['prop']
 
     def _member_get(self, obj, member_node, env):
-        prop = self._resolve_prop(member_node, env)
-        return _get_property(obj, prop)
+        return _get_property(obj, self._resolve_prop(member_node, env))
 
     def _assign(self, node, env):
         op = node.data['op']
         target = node.data['left']
-        right_val = self._eval(node.data['right'], env)
+        rval = self._eval(node.data['right'], env)
 
         if op != '=':
-            old_val = self._eval(target, env)
-            right_val = _binop(op[:-1], old_val, right_val)
+            old = self._eval(target, env)
+            if op == '&&=':
+                rval = rval if _to_bool(old) else old; op = '='
+            elif op == '||=':
+                rval = old if _to_bool(old) else rval; op = '='
+            elif op == '??=':
+                rval = old if old is not None and old is not _UNDEF else rval; op = '='
+            else:
+                rval = _binop(op[:-1], old, rval)
 
         if target.type == 'Ident':
-            env.set(target.data['name'], right_val)
+            env.set(target.data['name'], rval)
         elif target.type == 'Member':
             obj = self._eval(target.data['obj'], env)
-            prop = self._resolve_prop(target, env)
-            _set_property(obj, prop, right_val)
-        return right_val
+            _set_property(obj, self._resolve_prop(target, env), rval)
+        elif target.type in ('ObjectPattern', 'ArrayPattern'):
+            self._destructure(target, rval, env)
+        return rval
 
     def _update(self, target, op, prefix, env):
-        old_val = _to_num(self._eval(target, env))
-        new_val = old_val + 1 if op == '++' else old_val - 1
+        old = _to_num(self._eval(target, env))
+        new = old + 1 if op == '++' else old - 1
         if target.type == 'Ident':
-            env.set(target.data['name'], new_val)
+            env.set(target.data['name'], new)
         elif target.type == 'Member':
-            obj = self._eval(target.data['obj'], env)
-            prop = self._resolve_prop(target, env)
-            _set_property(obj, prop, new_val)
-        return new_val if prefix else old_val
+            _set_property(self._eval(target.data['obj'], env),
+                          self._resolve_prop(target, env), new)
+        return new if prefix else old
+
+    def _instanceof(self, obj, cls):
+        proto = (cls.properties.get('prototype') if isinstance(cls, JSFunction)
+                 else getattr(cls, 'prototype', None))
+        if proto is None:
+            return False
+        p = getattr(obj, '_proto', None)
+        while p is not None:
+            if p is proto:
+                return True
+            p = getattr(p, '_proto', None)
+        return False
+
+    # ------------------------------------------------------------------
+    # Function / class building
+    # ------------------------------------------------------------------
+
+    def _make_function(self, node, env) -> JSFunction:
+        fn = JSFunction(node.data.get('name'), node.data.get('params', []),
+                        node.data.get('body'), env)
+        fn.param_defaults = node.data.get('param_defaults', {})
+        fn.param_rest = node.data.get('param_rest')
+        fn.param_patterns = node.data.get('param_patterns', {})
+        fn.is_class = False
+        proto = JSObject({'constructor': fn})
+        fn.properties['prototype'] = proto
+        return fn
+
+    def _make_class(self, node, env) -> JSFunction:
+        methods = node.data.get('methods', [])
+        super_node = node.data.get('superclass')
+        super_cls = self._eval(super_node, env) if super_node else None
+
+        ctor_node = next((m for m in methods
+                         if m.data.get('name') == 'constructor'
+                         and not m.data.get('is_static')), None)
+
+        if ctor_node:
+            ctor_fn = JSFunction(node.data.get('name'), ctor_node.data.get('params', []),
+                                 ctor_node.data.get('body'), env)
+            ctor_fn.param_defaults = ctor_node.data.get('param_defaults', {})
+            ctor_fn.param_rest = ctor_node.data.get('param_rest')
+            ctor_fn.param_patterns = ctor_node.data.get('param_patterns', {})
+        else:
+            from js.ast import _node as _n
+            ctor_fn = JSFunction(node.data.get('name'), [], _n('Block', body=[]), env)
+            ctor_fn.param_defaults = {}
+            ctor_fn.param_rest = None
+            ctor_fn.param_patterns = {}
+
+        ctor_fn.is_class = True
+        ctor_fn.super_cls = super_cls
+
+        proto = JSObject({'constructor': ctor_fn})
+        if super_cls is not None:
+            sp = (super_cls.properties.get('prototype') if isinstance(super_cls, JSFunction) else None)
+            if isinstance(sp, dict):
+                proto._proto = sp
+
+        for m in methods:
+            mname = m.data.get('name')
+            if isinstance(mname, ASTNode):
+                mname = _to_str(self._eval(mname, env))
+            if mname == 'constructor' and not m.data.get('is_static'):
+                continue
+            fn = JSFunction(mname, m.data.get('params', []), m.data.get('body'), env)
+            fn.param_defaults = m.data.get('param_defaults', {})
+            fn.param_rest = m.data.get('param_rest')
+            fn.param_patterns = m.data.get('param_patterns', {})
+            fn.is_class = False
+            target = ctor_fn.properties if m.data.get('is_static') else proto
+            kind = m.data.get('kind', 'method')
+            if kind == 'get':
+                target[f'__get__{mname}'] = fn
+            elif kind == 'set':
+                target[f'__set__{mname}'] = fn
+            else:
+                target[mname] = fn
+
+        ctor_fn.properties['prototype'] = proto
+        return ctor_fn
+
+    # ------------------------------------------------------------------
+    # Function calls
+    # ------------------------------------------------------------------
 
     def _exec_call(self, node, env):
         callee_node = node.data['callee']
+        optional = node.data.get('optional', False)
+        args = self._eval_args(node.data['args'], env)
+
+        if callee_node.type == 'Member':
+            this_val = self._eval(callee_node.data['obj'], env)
+            if optional and (this_val is _UNDEF or this_val is None):
+                return _UNDEF
+            fn = self._member_get(this_val, callee_node, env)
+            if optional and (fn is _UNDEF or fn is None):
+                return _UNDEF
+            return self._call_value(fn, args, this_val)
+
+        fn = self._eval(callee_node, env)
+        if optional and (fn is _UNDEF or fn is None):
+            return _UNDEF
+        return self._call_value(fn, args, None)
+
+    def _eval_args(self, raw_args, env) -> list:
         args = []
-        for arg in node.data['args']:
+        for arg in raw_args:
             if isinstance(arg, ASTNode) and arg.type == 'Spread':
                 args.extend(_expand_spread_values(self._eval(arg.data['arg'], env)))
             else:
                 args.append(self._eval(arg, env))
-
-        this_val = None
-        if callee_node.type == 'Member':
-            this_val = self._eval(callee_node.data['obj'], env)
-            fn = self._member_get(this_val, callee_node, env)
-        else:
-            fn = self._eval(callee_node, env)
-
-        return self._call_value(fn, args, this_val)
+        return args
 
     def _call_value(self, fn, args, this_val=None):
         if fn is _UNDEF or fn is None:
             return _UNDEF
-        if callable(fn) and not isinstance(fn, JSFunction):
-            try:
-                return fn(*args)
-            except TypeError:
-                return _UNDEF
-            except Exception:
-                return _UNDEF
         if isinstance(fn, JSFunction):
             return self._call_function(fn, args, this_val)
+        if callable(fn):
+            try:
+                return fn(*args)
+            except Exception:
+                return _UNDEF
         return _UNDEF
 
-    def _call_function(self, fn, args, this_val=None):
+    def _call_function(self, fn: JSFunction, args: list, this_val=None):
         call_env = Environment(fn.env)
-        for i, param in enumerate(fn.params):
-            call_env.define(param, args[i] if i < len(args) else _UNDEF)
+        params = fn.params
+        defaults = getattr(fn, 'param_defaults', {})
+        rest = getattr(fn, 'param_rest', None)
+        patterns = getattr(fn, 'param_patterns', {})
+
+        for i, param in enumerate(params):
+            raw = args[i] if i < len(args) else _UNDEF
+            if raw is _UNDEF and i in defaults:
+                raw = self._eval(defaults[i], call_env)
+            if param.startswith('__pattern__') and i in patterns:
+                call_env.define(param, raw)
+                self._destructure(patterns[i], raw, call_env)
+            else:
+                call_env.define(param, raw)
+
+        if rest:
+            call_env.define(rest, JSArray(args[len(params):]))
+
         call_env.define('arguments', JSArray(args))
         if this_val is not None:
             call_env.define('this', this_val)
+
         try:
             self._exec_stmt(fn.body, call_env)
-        except _Return as ret:
-            return ret.value
+        except _Return as r:
+            return r.value
         return _UNDEF
 
     def _exec_new(self, node, env):
         callee = self._eval(node.data['callee'], env)
-        args = [self._eval(a, env) for a in node.data.get('args', [])]
+        args = self._eval_args(node.data.get('args', []), env)
 
         if callee is _UNDEF or callee is None:
             return JSObject()
-        if callable(callee) and not isinstance(callee, JSFunction):
+
+        if isinstance(callee, JSFunction):
+            obj = JSObject()
+            proto = callee.properties.get('prototype')
+            if isinstance(proto, dict):
+                obj._proto = proto
+
+            super_cls = getattr(callee, 'super_cls', None)
+            if super_cls is not None:
+                def _super_call(*sargs, _obj=obj):
+                    if isinstance(super_cls, JSFunction):
+                        self._call_function(super_cls, list(sargs), _obj)
+                    elif callable(super_cls):
+                        super_cls(*sargs)
+                # Inject super into environment via call_function
+                _orig_body = callee.body
+                # Patch env before calling
+                callee_env_patch = Environment(callee.env)
+                callee_env_patch.define('super', _super_call)
+                sp = super_cls.properties.get('prototype') if isinstance(super_cls, JSFunction) else None
+                callee_env_patch.define('__super__', sp or _UNDEF)
+                patched_fn = JSFunction(callee.name, callee.params, callee.body, callee_env_patch)
+                patched_fn.param_defaults = getattr(callee, 'param_defaults', {})
+                patched_fn.param_rest = getattr(callee, 'param_rest', None)
+                patched_fn.param_patterns = getattr(callee, 'param_patterns', {})
+                patched_fn.is_class = False
+                try:
+                    self._call_function(patched_fn, args, obj)
+                except _Return as r:
+                    if isinstance(r.value, dict):
+                        return r.value
+                return obj
+
+            try:
+                self._call_function(callee, args, obj)
+            except _Return as r:
+                if isinstance(r.value, dict):
+                    return r.value
+            return obj
+
+        if callable(callee):
             try:
                 return callee(*args)
             except Exception:
                 return JSObject()
-        if isinstance(callee, JSFunction):
-            obj = JSObject()
-            call_env = Environment(callee.env)
-            for i, param in enumerate(callee.params):
-                call_env.define(param, args[i] if i < len(args) else _UNDEF)
-            call_env.define('this', obj)
-            call_env.define('arguments', JSArray(args))
-            try:
-                self._exec_stmt(callee.body, call_env)
-            except _Return as ret:
-                if isinstance(ret.value, dict):
-                    return ret.value
-            return obj
+
         return JSObject()
 
+    # ------------------------------------------------------------------
+    # Destructuring
+    # ------------------------------------------------------------------
+
+    def _destructure(self, pattern: ASTNode, value, env):
+        t = pattern.type
+
+        if t == 'BindingDefault':
+            name = pattern.data['name']
+            default = pattern.data.get('default')
+            val = value if value is not _UNDEF else (
+                self._eval(default, env) if default is not None else _UNDEF)
+            if isinstance(name, str):
+                env.define(name, val)
+            elif isinstance(name, ASTNode):
+                self._destructure(name, val, env)
+
+        elif t == 'ObjectPattern':
+            obj = value if isinstance(value, dict) else JSObject()
+            seen = set()
+            for key, sub in pattern.data['props']:
+                seen.add(key)
+                raw = _get_property(obj, key)
+                self._destructure(sub, raw, env)
+            rest_name = pattern.data.get('rest')
+            if rest_name:
+                env.define(rest_name, JSObject(
+                    {k: v for k, v in obj.items() if k not in seen}))
+
+        elif t == 'ArrayPattern':
+            lst = list(value) if isinstance(value, (list, tuple, str)) else []
+            elements = pattern.data.get('elements', [])
+            for i, elem in enumerate(elements):
+                if elem is None:
+                    continue
+                self._destructure(elem, lst[i] if i < len(lst) else _UNDEF, env)
+            rest_name = pattern.data.get('rest')
+            if rest_name:
+                env.define(rest_name, JSArray(lst[len(elements):]))
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Array.from helper (used in _setup_globals)
 # ---------------------------------------------------------------------------
 
-def _to_str(v) -> str:
-    if v is _UNDEF:
-        return 'undefined'
-    if v is None:
-        return 'null'
-    if v is True:
-        return 'true'
-    if v is False:
-        return 'false'
-    if isinstance(v, float):
-        if v != v:
-            return 'NaN'
-        if v == float('inf'):
-            return 'Infinity'
-        if v == float('-inf'):
-            return '-Infinity'
-        if v == int(v):
-            return str(int(v))
-    if isinstance(v, (list, JSArray)):
-        return ','.join(_to_str(x) for x in v)
-    if isinstance(v, dict):
-        return '[object Object]'
-    if isinstance(v, JSFunction):
-        return f'function {v.name}() {{ [native code] }}'
-    return str(v)
-
-
-def _to_num(v):
-    if v is _UNDEF:
-        return float('nan')
-    if v is None:
-        return 0
-    if v is True:
-        return 1
-    if v is False:
-        return 0
-    if isinstance(v, (int, float)):
-        return v
-    if isinstance(v, str):
-        v = v.strip()
-        if not v:
-            return 0
-        try:
-            if v.startswith('0x') or v.startswith('0X'):
-                return int(v, 16)
-            return float(v) if '.' in v or 'e' in v.lower() else int(v)
-        except ValueError:
-            return float('nan')
-    return float('nan')
-
-
-def _to_bool(v) -> bool:
-    if v is _UNDEF or v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0 and v == v  # NaN is falsy
-    if isinstance(v, str):
-        return len(v) > 0
-    return True  # objects/arrays/functions are truthy
-
-
-def _typeof(v) -> str:
-    if v is _UNDEF:
-        return 'undefined'
-    if v is None:
-        return 'object'
-    if isinstance(v, bool):
-        return 'boolean'
-    if isinstance(v, (int, float)):
-        return 'number'
-    if isinstance(v, str):
-        return 'string'
-    if isinstance(v, JSFunction) or callable(v):
-        return 'function'
-    return 'object'
-
-
-def _binop(op, left, right):
-    if op == '+':
-        if isinstance(left, str) or isinstance(right, str):
-            return _to_str(left) + _to_str(right)
-        return _to_num(left) + _to_num(right)
-    if op == '-':
-        return _to_num(left) - _to_num(right)
-    if op == '*':
-        return _to_num(left) * _to_num(right)
-    if op == '/':
-        r = _to_num(right)
-        return float('nan') if r == 0 else _to_num(left) / r
-    if op == '%':
-        r = _to_num(right)
-        return float('nan') if r == 0 else _to_num(left) % r
-    if op == '**':
-        return _to_num(left) ** _to_num(right)
-    if op == '==':
-        return _loose_eq(left, right)
-    if op == '!=':
-        return not _loose_eq(left, right)
-    if op == '===':
-        return _strict_eq(left, right)
-    if op == '!==':
-        return not _strict_eq(left, right)
-    if op == '<':
-        return _to_num(left) < _to_num(right) if not (isinstance(left, str) and isinstance(right, str)) else left < right
-    if op == '>':
-        return _to_num(left) > _to_num(right) if not (isinstance(left, str) and isinstance(right, str)) else left > right
-    if op == '<=':
-        return _to_num(left) <= _to_num(right) if not (isinstance(left, str) and isinstance(right, str)) else left <= right
-    if op == '>=':
-        return _to_num(left) >= _to_num(right) if not (isinstance(left, str) and isinstance(right, str)) else left >= right
-    if op == '<<':
-        return int(_to_num(left)) << (int(_to_num(right)) & 31)
-    if op == '>>':
-        return int(_to_num(left)) >> (int(_to_num(right)) & 31)
-    if op == '>>>':
-        return (int(_to_num(left)) & 0xFFFFFFFF) >> (int(_to_num(right)) & 31)
-    if op == '|':
-        return int(_to_num(left)) | int(_to_num(right))
-    if op == '&':
-        return int(_to_num(left)) & int(_to_num(right))
-    if op == '^':
-        return int(_to_num(left)) ^ int(_to_num(right))
-    if op == 'instanceof':
-        return False
-    if op == 'in':
-        if isinstance(right, dict):
-            return _to_str(left) in right
-        return False
-    return _UNDEF
-
-
-def _loose_eq(a, b):
-    if type(a) is type(b):
-        return _strict_eq(a, b)
-    if a is None and b is _UNDEF:
-        return True
-    if a is _UNDEF and b is None:
-        return True
-    if isinstance(a, (int, float)) and isinstance(b, str):
-        return a == _to_num(b)
-    if isinstance(a, str) and isinstance(b, (int, float)):
-        return _to_num(a) == b
-    if isinstance(a, bool):
-        return _loose_eq(_to_num(a), b)
-    if isinstance(b, bool):
-        return _loose_eq(a, _to_num(b))
-    return a is b
-
-
-def _strict_eq(a, b):
-    if a is _UNDEF and b is _UNDEF:
-        return True
-    if a is None and b is None:
-        return True
-    if isinstance(a, float) and a != a:
-        return False  # NaN !== NaN
-    return a is b if isinstance(a, (dict, list)) else a == b
-
-
-def _get_property(obj, prop):
-    """Get a property from a JS value, including built-in methods."""
-    if obj is _UNDEF or obj is None:
-        return _UNDEF
-
-    if isinstance(obj, JSFunction):
-        return _get_function_property(obj, prop)
-
-    if callable(obj):
-        prop_val = _get_callable_property(obj, prop)
-        if prop_val is not _UNDEF:
-            return prop_val
-
-    # String methods
-    if isinstance(obj, str):
-        if prop == 'length':
-            return len(obj)
-        if prop == 'charAt':
-            return lambda i=0: obj[int(i)] if 0 <= int(i) < len(obj) else ''
-        if prop == 'charCodeAt':
-            return lambda i=0: ord(obj[int(i)]) if 0 <= int(i) < len(obj) else float('nan')
-        if prop == 'indexOf':
-            return lambda s, start=0: obj.find(str(s), int(start))
-        if prop == 'lastIndexOf':
-            return lambda s, start=None: obj.rfind(str(s)) if start is None else obj.rfind(str(s), 0, int(start) + 1)
-        if prop == 'slice':
-            return lambda s=0, e=None: obj[int(s):] if e is None else obj[int(s):int(e)]
-        if prop == 'substring':
-            return lambda s=0, e=None: obj[int(s):] if e is None else obj[int(s):int(e)]
-        if prop == 'substr':
-            return lambda s=0, l=None: obj[int(s):] if l is None else obj[int(s):int(s)+int(l)]
-        if prop == 'split':
-            return lambda sep=_UNDEF, limit=None: obj.split(str(sep)) if sep is not _UNDEF else [obj]
-        if prop == 'trim':
-            return lambda: obj.strip()
-        if prop == 'trimStart':
-            return lambda: obj.lstrip()
-        if prop == 'trimEnd':
-            return lambda: obj.rstrip()
-        if prop == 'toLowerCase':
-            return lambda: obj.lower()
-        if prop == 'toUpperCase':
-            return lambda: obj.upper()
-        if prop == 'replace':
-            return lambda pat, rep: obj.replace(str(pat), str(rep), 1)
-        if prop == 'replaceAll':
-            return lambda pat, rep: obj.replace(str(pat), str(rep))
-        if prop == 'includes':
-            return lambda s: str(s) in obj
-        if prop == 'startsWith':
-            return lambda s: obj.startswith(str(s))
-        if prop == 'endsWith':
-            return lambda s: obj.endswith(str(s))
-        if prop == 'match':
-            return lambda pat: None  # stub
-        if prop == 'repeat':
-            return lambda n: obj * int(n)
-        if prop == 'padStart':
-            return lambda l, c=' ': obj.rjust(int(l), str(c)[:1])
-        if prop == 'padEnd':
-            return lambda l, c=' ': obj.ljust(int(l), str(c)[:1])
-        # Numeric index
-        try:
-            idx = int(prop)
-            if 0 <= idx < len(obj):
-                return obj[idx]
-        except (ValueError, TypeError):
-            pass
-        return _UNDEF
-
-    # Array methods
-    if isinstance(obj, list):
-        if prop == 'length':
-            return len(obj)
-        if prop == 'push':
-            return lambda *a: (obj.extend(a), len(obj))[-1]
-        if prop == 'pop':
-            return lambda: obj.pop() if obj else _UNDEF
-        if prop == 'shift':
-            return lambda: obj.pop(0) if obj else _UNDEF
-        if prop == 'unshift':
-            return lambda *a: (obj.__setitem__(slice(0, 0), list(a)), len(obj))[-1]
-        if prop == 'join':
-            return lambda sep=',': str(sep).join(_to_str(x) for x in obj)
-        if prop == 'indexOf':
-            return lambda v, start=0: _list_index_of(obj, v, int(start))
-        if prop == 'lastIndexOf':
-            return lambda v: _list_last_index_of(obj, v)
-        if prop == 'includes':
-            return lambda v: v in obj
-        if prop == 'slice':
-            return lambda s=0, e=None: JSArray(obj[int(s):] if e is None else obj[int(s):int(e)])
-        if prop == 'splice':
-            return lambda *a: _array_splice(obj, *a)
-        if prop == 'concat':
-            return lambda *a: JSArray(obj + sum((list(x) if isinstance(x, list) else [x] for x in a), []))
-        if prop == 'reverse':
-            return lambda: (obj.reverse(), JSArray(obj))[-1]
-        if prop == 'sort':
-            return lambda key=None: (obj.sort(), JSArray(obj))[-1]
-        if prop == 'map':
-            return lambda fn: JSArray(_safe_call(fn, [x, i, obj]) for i, x in enumerate(obj))
-        if prop == 'filter':
-            return lambda fn: JSArray(x for i, x in enumerate(obj) if _to_bool(_safe_call(fn, [x, i, obj])))
-        if prop == 'forEach':
-            def _forEach(fn):
-                for i, x in enumerate(obj):
-                    _safe_call(fn, [x, i, obj])
-            return _forEach
-        if prop == 'find':
-            return lambda fn: next((x for i, x in enumerate(obj) if _to_bool(_safe_call(fn, [x, i, obj]))), _UNDEF)
-        if prop == 'findIndex':
-            return lambda fn: next((i for i, x in enumerate(obj) if _to_bool(_safe_call(fn, [x, i, obj]))), -1)
-        if prop == 'every':
-            return lambda fn: all(_to_bool(_safe_call(fn, [x, i, obj])) for i, x in enumerate(obj))
-        if prop == 'some':
-            return lambda fn: any(_to_bool(_safe_call(fn, [x, i, obj])) for i, x in enumerate(obj))
-        if prop == 'reduce':
-            return lambda fn, *init: _array_reduce(obj, fn, *init)
-        if prop == 'flat':
-            return lambda depth=1: JSArray(_flatten(obj, int(depth)))
-        if prop == 'fill':
-            return lambda val, s=0, e=None: _array_fill(obj, val, int(s), e)
-        # Numeric index
-        try:
-            idx = int(prop)
-            if 0 <= idx < len(obj):
-                return obj[idx]
-        except (ValueError, TypeError):
-            pass
-        return _UNDEF
-
-    # Dict/Object
-    if isinstance(obj, dict):
-        # Use __getitem__ which may be overridden (e.g. DOMElement)
-        try:
-            val = obj[prop]
-            if val is not _UNDEF:
-                return val
-        except (KeyError, IndexError):
-            pass
-        # Object built-ins
-        if prop == 'hasOwnProperty':
-            return lambda k: k in obj
-        if prop == 'keys':
-            return lambda: JSArray(obj.keys())
-        if prop == 'values':
-            return lambda: JSArray(obj.values())
-        return _UNDEF
-
-    # Number methods
-    if isinstance(obj, (int, float)):
-        if prop == 'toString':
-            return lambda base=10: _num_to_string(obj, int(base))
-        if prop == 'toFixed':
-            return lambda d=0: f'{float(obj):.{int(d)}f}'
-        return _UNDEF
-
-    return _UNDEF
-
-
-def _set_property(obj, prop, value):
-    if isinstance(obj, dict):
-        obj[prop] = value
-    elif isinstance(obj, JSFunction):
-        obj.properties[prop] = value
-    elif callable(obj) and hasattr(obj, '__dict__'):
-        setattr(obj, prop, value)
-    elif isinstance(obj, list):
-        try:
-            idx = int(prop)
-            while len(obj) <= idx:
-                obj.append(_UNDEF)
-            obj[idx] = value
-        except (ValueError, TypeError):
-            if prop == 'length':
-                new_len = int(value)
-                while len(obj) > new_len:
-                    obj.pop()
-                while len(obj) < new_len:
-                    obj.append(_UNDEF)
-
-
-def _safe_call(fn, args):
-    if callable(fn) and not isinstance(fn, JSFunction):
-        try:
-            return fn(*args)
-        except Exception:
-            return _UNDEF
-    if isinstance(fn, JSFunction):
-        # Need interpreter — but we're in a helper. Use a simple approach.
-        call_env = Environment(fn.env)
-        for i, p in enumerate(fn.params):
-            call_env.define(p, args[i] if i < len(args) else _UNDEF)
-        call_env.define('arguments', JSArray(args))
-        interp = Interpreter.__new__(Interpreter)
-        interp.global_env = fn.env
-        interp._iteration_count = 0
-        try:
-            interp._exec_stmt(fn.body, call_env)
-        except _Return as ret:
-            return ret.value
-        except Exception as _exc:
-            _logger.debug("Ignored: %s", _exc)
-        return _UNDEF
-    return _UNDEF
-
-
-def _expand_spread_values(value):
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    if isinstance(value, str):
-        return list(value)
-    return []
-
-
-def _iter_enumerable_entries(obj):
-    if obj is _UNDEF or obj is None:
-        return []
-    if isinstance(obj, dict):
-        return list(obj.items())
-    if isinstance(obj, list):
-        return [(str(index), value) for index, value in enumerate(obj)]
-    if isinstance(obj, JSFunction):
-        return list(obj.properties.items())
-    if callable(obj) and hasattr(obj, '__dict__'):
-        return [
-            (key, value)
-            for key, value in obj.__dict__.items()
-            if not key.startswith('__')
-        ]
-    return []
-
-
-def _object_assign(target, *sources):
-    if target is _UNDEF or target is None:
-        target = JSObject()
-    for source in sources:
-        for key, value in _iter_enumerable_entries(source):
-            _set_property(target, key, value)
-    return target
-
-
-def _object_create(proto):
-    obj = JSObject()
-    if isinstance(proto, dict):
-        obj._proto = proto
-    return obj
-
-
-def _invoke_callable(fn, args, this_val=None):
-    if fn is _UNDEF or fn is None:
-        return _UNDEF
-    if callable(fn) and not isinstance(fn, JSFunction):
-        try:
-            return fn(*args)
-        except Exception:
-            return _UNDEF
-    if isinstance(fn, JSFunction):
-        call_env = Environment(fn.env)
-        for index, param in enumerate(fn.params):
-            call_env.define(param, args[index] if index < len(args) else _UNDEF)
-        call_env.define('arguments', JSArray(args))
-        if this_val is not None:
-            call_env.define('this', this_val)
-        try:
-            interp = Interpreter.__new__(Interpreter)
-            interp.global_env = fn.env
-            interp._iteration_count = 0
-            interp._exec_stmt(fn.body, call_env)
-        except _Return as ret:
-            return ret.value
-        except Exception as _exc:
-            _logger.debug("Ignored: %s", _exc)
-        return _UNDEF
-    return _UNDEF
-
-
-def _get_function_property(obj, prop):
-    if prop == 'call':
-        return lambda this_arg=None, *call_args: _invoke_callable(obj, list(call_args), this_arg)
-    if prop == 'apply':
-        return lambda this_arg=None, call_args=None: _invoke_callable(
-            obj,
-            _expand_spread_values(call_args),
-            this_arg,
-        )
-    if prop == 'bind':
-        return lambda this_arg=None, *bound_args: (
-            lambda *call_args: _invoke_callable(
-                obj,
-                list(bound_args) + list(call_args),
-                this_arg,
-            )
-        )
-    if prop == 'length':
-        return len(obj.params)
-    if prop == 'name':
-        return obj.name
-    if prop in obj.properties:
-        return obj.properties[prop]
-    return _UNDEF
-
-
-def _get_callable_property(obj, prop):
-    if prop == 'call':
-        return lambda this_arg=None, *call_args: _invoke_callable(obj, list(call_args), this_arg)
-    if prop == 'apply':
-        return lambda this_arg=None, call_args=None: _invoke_callable(
-            obj,
-            _expand_spread_values(call_args),
-            this_arg,
-        )
-    if prop == 'bind':
-        return lambda this_arg=None, *bound_args: (
-            lambda *call_args: _invoke_callable(
-                obj,
-                list(bound_args) + list(call_args),
-                this_arg,
-            )
-        )
-    if hasattr(obj, '__dict__') and prop in obj.__dict__:
-        return obj.__dict__[prop]
-    return _UNDEF
-
-
-def _parse_int(s, radix=10):
-    try:
-        s = str(s).strip()
-        if not s:
-            return float('nan')
-        if s.startswith('0x') or s.startswith('0X'):
-            return int(s, 16)
-        return int(s, int(radix) if radix else 10)
-    except (ValueError, TypeError):
-        # Try to parse leading digits
-        import re
-        m = re.match(r'[+-]?\d+', str(s).strip())
-        if m:
-            return int(m.group(0))
-        return float('nan')
-
-
-def _parse_float(s):
-    try:
-        return float(str(s).strip())
-    except (ValueError, TypeError):
-        import re
-        m = re.match(r'[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?', str(s).strip())
-        if m:
-            return float(m.group(0))
-        return float('nan')
-
-
-def _list_index_of(arr, val, start=0):
-    for i in range(max(0, start), len(arr)):
-        if _strict_eq(arr[i], val):
-            return i
-    return -1
-
-
-def _list_last_index_of(arr, val):
-    for i in range(len(arr) - 1, -1, -1):
-        if _strict_eq(arr[i], val):
-            return i
-    return -1
-
-
-def _array_splice(arr, start=0, delete_count=None, *items):
-    s = int(start)
-    if s < 0:
-        s = max(0, len(arr) + s)
-    dc = int(delete_count) if delete_count is not None else len(arr) - s
-    removed = JSArray(arr[s:s + dc])
-    arr[s:s + dc] = list(items)
-    return removed
-
-
-def _array_reduce(arr, fn, *init):
-    it = iter(enumerate(arr))
-    if init:
-        acc = init[0]
+def _array_from(iterable, map_fn=None):
+    if iterable is _UNDEF or iterable is None:
+        return JSArray()
+    if isinstance(iterable, (list, tuple)):
+        items = list(iterable)
+    elif isinstance(iterable, str):
+        items = list(iterable)
+    elif isinstance(iterable, dict):
+        items = list(iterable.values())
     else:
-        try:
-            i, acc = next(it)
-        except StopIteration:
-            return _UNDEF
-    for i, val in it:
-        acc = _safe_call(fn, [acc, val, i, arr])
-    return acc
-
-
-def _flatten(arr, depth):
-    result = []
-    for item in arr:
-        if isinstance(item, list) and depth > 0:
-            result.extend(_flatten(item, depth - 1))
-        else:
-            result.append(item)
-    return result
-
-
-def _array_fill(arr, val, start, end):
-    e = len(arr) if end is None else int(end)
-    for i in range(start, min(e, len(arr))):
-        arr[i] = val
-    return JSArray(arr)
-
-
-def _num_to_string(n, base=10):
-    if base == 10:
-        return _to_str(n)
-    if base == 16:
-        return hex(int(n))[2:]
-    if base == 2:
-        return bin(int(n))[2:]
-    if base == 8:
-        return oct(int(n))[2:]
-    return str(int(n))
-
-
-def _js_to_python(v):
-    """Convert JS value to Python-native for JSON.stringify."""
-    if v is _UNDEF:
-        return None
-    if isinstance(v, JSFunction):
-        return None
-    if isinstance(v, JSArray):
-        return [_js_to_python(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _js_to_python(val) for k, val in v.items()}
-    return v
-
-
-class _JSDate:
-    """Minimal Date constructor."""
-    def __init__(self, *args):
-        import time
-        self._ts = time.time() * 1000
-    def getTime(self):
-        return self._ts
-    def toString(self):
-        return str(self._ts)
+        items = []
+    if map_fn is not None:
+        items = [_safe_call(map_fn, [x, i]) for i, x in enumerate(items)]
+    return JSArray(items)

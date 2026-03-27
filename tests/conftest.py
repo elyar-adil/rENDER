@@ -9,7 +9,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+
+try:
+    from PyQt6.QtWidgets import QApplication
+    _QT_AVAILABLE = True
+except ImportError:
+    _QT_AVAILABLE = False
 
 # Singleton QApplication required by Qt
 _app = None
@@ -19,6 +24,8 @@ _app = None
 def qt_app():
     """Ensure a QApplication exists for font metrics."""
     global _app
+    if not _QT_AVAILABLE:
+        return None
     if _app is None:
         _app = QApplication.instance() or QApplication([])
     return _app
