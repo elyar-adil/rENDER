@@ -3,7 +3,6 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import engine
-import pytest
 from js.interpreter import Interpreter
 from js.lexer import Lexer
 from js.parser import Parser
@@ -178,7 +177,6 @@ def test_vue_style_list_render_script_can_expand_children():
     assert items[0].box.y < items[1].box.y < items[2].box.y
 
 
-@pytest.mark.xfail(strict=True, reason="function objects still drop assigned properties")
 def test_jquery_style_function_objects_can_hold_plugin_properties():
     code = """
         function jQuery(){}
@@ -191,7 +189,6 @@ def test_jquery_style_function_objects_can_hold_plugin_properties():
     assert interp.global_env.get("out") == "render"
 
 
-@pytest.mark.xfail(strict=True, reason="Object.assign helper is still missing")
 def test_vue_react_style_object_assign_merge_helper_exists():
     code = """
         var props = Object.assign({ id: 'a' }, { class: 'hero' });
@@ -200,3 +197,13 @@ def test_vue_react_style_object_assign_merge_helper_exists():
     interp = _exec(code)
 
     assert interp.global_env.get("out") == "hero"
+
+
+def test_window_properties_are_visible_as_globals():
+    code = """
+        window.React = { version: '18.2.0' };
+        var out = React.version;
+    """
+    interp = _exec(code)
+
+    assert interp.global_env.get("out") == "18.2.0"

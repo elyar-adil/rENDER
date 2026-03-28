@@ -28,13 +28,14 @@ KEYWORDS = frozenset({
     'while', 'do', 'break', 'continue', 'new', 'this', 'typeof',
     'instanceof', 'in', 'of', 'null', 'undefined', 'true', 'false',
     'try', 'catch', 'finally', 'throw', 'switch', 'case', 'default',
-    'delete', 'void',
+    'delete', 'void', 'await', 'async', 'class', 'extends', 'super',
 })
 
 # Multi-character operators (longest-first for greedy matching)
 _MULTI_OPS = (
     '>>>=', '===', '!==', '>>>', '<<=', '>>=',
-    '**=', '&&=', '||=', '??=',
+    '**=', '&&=', '||=', '??=', '|=', '&=', '^=',
+    '?.',
     '==', '!=', '<=', '>=', '&&', '||', '??',
     '++', '--', '+=', '-=', '*=', '/=', '%=',
     '**', '=>', '<<', '>>',
@@ -126,6 +127,8 @@ class Lexer:
             # Multi-char operators (try longest match first)
             matched = False
             for op in _MULTI_OPS:
+                if op == '?.' and self.pos + 2 < length and src[self.pos + 2].isdigit():
+                    continue
                 if src[self.pos:self.pos + len(op)] == op:
                     tokens.append(Token(OP, op, self.line))
                     self.pos += len(op)
@@ -204,26 +207,158 @@ class Lexer:
         return Token(STRING, ''.join(parts), self.line)
 
     def _read_template(self) -> Token:
-        """Read backtick template literal as a plain string (no interpolation)."""
+        """Read a template literal, preserving ${...} interpolations."""
         src = self.source
         self.pos += 1  # skip `
         parts = []
+        text = []
         while self.pos < len(src):
             ch = src[self.pos]
             if ch == '\\':
                 self.pos += 1
                 if self.pos < len(src):
-                    parts.append(src[self.pos])
+                    esc = src[self.pos]
+                    if esc == 'n':
+                        text.append('\n')
+                    elif esc == 't':
+                        text.append('\t')
+                    elif esc == 'r':
+                        text.append('\r')
+                    else:
+                        text.append(esc)
+                    if esc == '\n':
+                        self.line += 1
                 self.pos += 1
                 continue
             if ch == '`':
                 self.pos += 1
                 break
+            if ch == '$' and self.pos + 1 < len(src) and src[self.pos + 1] == '{':
+                self.pos += 2
+                parts.append(('str', ''.join(text)))
+                text = []
+                parts.append(('expr', self._read_template_expr_source()))
+                if self.pos < len(src) and src[self.pos] == '}':
+                    self.pos += 1
+                continue
             if ch == '\n':
                 self.line += 1
-            parts.append(ch)
+            text.append(ch)
             self.pos += 1
-        return Token(STRING, ''.join(parts), self.line)
+        parts.append(('str', ''.join(text)))
+        if len(parts) == 1 and parts[0][0] == 'str':
+            return Token(STRING, parts[0][1], self.line)
+        return Token(TEMPLATE, parts, self.line)
+
+    def _read_template_expr_source(self) -> str:
+        src = self.source
+        start = self.pos
+        depth = 1
+        while self.pos < len(src) and depth > 0:
+            ch = src[self.pos]
+            if ch in ('"', "'"):
+                self._skip_quoted(ch)
+                continue
+            if ch == '`':
+                self._skip_nested_template()
+                continue
+            if ch == '/' and self.pos + 1 < len(src):
+                nxt = src[self.pos + 1]
+                if nxt == '/':
+                    self.pos += 2
+                    while self.pos < len(src) and src[self.pos] != '\n':
+                        self.pos += 1
+                    continue
+                if nxt == '*':
+                    self.pos += 2
+                    while self.pos + 1 < len(src):
+                        if src[self.pos] == '\n':
+                            self.line += 1
+                        if src[self.pos] == '*' and src[self.pos + 1] == '/':
+                            self.pos += 2
+                            break
+                        self.pos += 1
+                    continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return src[start:self.pos]
+            if ch == '\n':
+                self.line += 1
+            self.pos += 1
+        return src[start:self.pos]
+
+    def _skip_template_expr(self) -> None:
+        src = self.source
+        depth = 1
+        while self.pos < len(src) and depth > 0:
+            ch = src[self.pos]
+            if ch in ('"', "'"):
+                self._skip_quoted(ch)
+                continue
+            if ch == '`':
+                self._skip_nested_template()
+                continue
+            if ch == '/' and self.pos + 1 < len(src):
+                nxt = src[self.pos + 1]
+                if nxt == '/':
+                    self.pos += 2
+                    while self.pos < len(src) and src[self.pos] != '\n':
+                        self.pos += 1
+                    continue
+                if nxt == '*':
+                    self.pos += 2
+                    while self.pos + 1 < len(src):
+                        if src[self.pos] == '\n':
+                            self.line += 1
+                        if src[self.pos] == '*' and src[self.pos + 1] == '/':
+                            self.pos += 2
+                            break
+                        self.pos += 1
+                    continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+            if ch == '\n':
+                self.line += 1
+            self.pos += 1
+
+    def _skip_quoted(self, quote: str) -> None:
+        src = self.source
+        self.pos += 1
+        while self.pos < len(src):
+            ch = src[self.pos]
+            if ch == '\\':
+                self.pos += 2
+                continue
+            if ch == quote:
+                self.pos += 1
+                return
+            if ch == '\n':
+                self.line += 1
+            self.pos += 1
+
+    def _skip_nested_template(self) -> None:
+        src = self.source
+        self.pos += 1
+        while self.pos < len(src):
+            ch = src[self.pos]
+            if ch == '\\':
+                self.pos += 2
+                continue
+            if ch == '`':
+                self.pos += 1
+                return
+            if ch == '$' and self.pos + 1 < len(src) and src[self.pos + 1] == '{':
+                self.pos += 2
+                self._skip_template_expr()
+                continue
+            if ch == '\n':
+                self.line += 1
+            self.pos += 1
 
     def _read_number(self) -> Token:
         src = self.source
@@ -234,6 +369,16 @@ class Lexer:
             while self.pos < len(src) and src[self.pos] in '0123456789abcdefABCDEF_':
                 self.pos += 1
             return Token(NUMBER, int(src[start:self.pos].replace('_', ''), 16), self.line)
+        # Binary / octal
+        if src[self.pos] == '0' and self.pos + 1 < len(src) and src[self.pos + 1] in 'bBoO':
+            base_char = src[self.pos + 1].lower()
+            digits = '01_' if base_char == 'b' else '01234567_'
+            base = 2 if base_char == 'b' else 8
+            self.pos += 2
+            while self.pos < len(src) and src[self.pos] in digits:
+                self.pos += 1
+            text = src[start + 2:self.pos].replace('_', '')
+            return Token(NUMBER, int(text, base) if text else 0, self.line)
         # Decimal / float
         has_dot = False
         while self.pos < len(src):
@@ -244,11 +389,15 @@ class Lexer:
                 has_dot = True
                 self.pos += 1
             elif ch in 'eE':
-                self.pos += 1
-                if self.pos < len(src) and src[self.pos] in '+-':
-                    self.pos += 1
-                while self.pos < len(src) and src[self.pos].isdigit():
-                    self.pos += 1
+                probe = self.pos + 1
+                if probe < len(src) and src[probe] in '+-':
+                    probe += 1
+                digit_start = probe
+                while probe < len(src) and src[probe].isdigit():
+                    probe += 1
+                if probe == digit_start:
+                    break
+                self.pos = probe
                 break
             else:
                 break
@@ -271,6 +420,7 @@ class Lexer:
         src = self.source
         self.pos += 1  # skip /
         parts = ['/']
+        in_class = False
         while self.pos < len(src):
             ch = src[self.pos]
             parts.append(ch)
@@ -278,7 +428,11 @@ class Lexer:
             if ch == '\\' and self.pos < len(src):
                 parts.append(src[self.pos])
                 self.pos += 1
-            elif ch == '/':
+            elif ch == '[':
+                in_class = True
+            elif ch == ']':
+                in_class = False
+            elif ch == '/' and not in_class:
                 break
         # Flags
         while self.pos < len(src) and src[self.pos].isalpha():

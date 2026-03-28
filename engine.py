@@ -266,7 +266,26 @@ def _execute_scripts(document, base_url: str) -> None:
             ast = parser.parse()
             interp.execute(ast)
         except Exception as e:
-            print(f'[JS] Script error: {e}', file=sys.stderr)
+            label = src or '<inline>'
+            print(f'[JS] Script error in {label}: {_summarize_js_error(e)}', file=sys.stderr)
+
+
+def _summarize_js_error(err: Exception) -> str:
+    value = getattr(err, 'value', None)
+    if isinstance(value, dict):
+        name = value.get('name')
+        message = value.get('message')
+        if name and message:
+            msg = f'{name}: {message}'
+        elif message:
+            msg = str(message)
+        else:
+            msg = str(value).strip() or err.__class__.__name__
+    else:
+        msg = str(err).strip() or err.__class__.__name__
+    if len(msg) > 220:
+        msg = msg[:217] + '...'
+    return msg
 
 
 def _collect_scripts(node, scripts):

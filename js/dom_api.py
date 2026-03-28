@@ -22,6 +22,8 @@ class DOMElement(JSObject):
         self['nodeName'] = self['tagName']
         self['id'] = node.attributes.get('id', '') if hasattr(node, 'attributes') else ''
         self['className'] = node.attributes.get('class', '') if hasattr(node, 'attributes') else ''
+        self['__instanceof__'] = 'HTMLInputElement' if getattr(node, 'tag', '') == 'input' else \
+                                 'HTMLImageElement' if getattr(node, 'tag', '') == 'img' else 'HTMLElement'
 
         # Methods
         self['getAttribute'] = lambda name: node.attributes.get(name, None) if hasattr(node, 'attributes') else None
@@ -44,7 +46,7 @@ class DOMElement(JSObject):
         self['removeEventListener'] = lambda ev, fn, *a: self._remove_event_listener(ev, fn)
         self['dispatchEvent'] = lambda ev: None
 
-        self['contains'] = lambda other: False
+        self['contains'] = lambda other: self._contains(other)
         self['matches'] = lambda sel: self._matches(sel)
         self['closest'] = lambda sel: self._closest(sel)
         self['getBoundingClientRect'] = lambda: self._get_bounding_rect()
@@ -203,6 +205,8 @@ class DOMElement(JSObject):
             child_node = child_wrapper._node
         else:
             return child_wrapper
+        if child_node is self._node or _is_descendant(child_node, self._node):
+            return child_wrapper
         # Remove from old parent
         old_parent = getattr(child_node, 'parent', None)
         if old_parent and hasattr(old_parent, 'children'):
@@ -221,6 +225,7 @@ class DOMElement(JSObject):
             return child_wrapper
         try:
             self._node.children.remove(child_node)
+            child_node.parent = None
         except ValueError:
             pass
         return child_wrapper
@@ -236,6 +241,8 @@ class DOMElement(JSObject):
             ref_node = ref_wrapper._node
         else:
             return self._append_child(new_wrapper)
+        if new_node is self._node or _is_descendant(new_node, self._node):
+            return new_wrapper
         # Remove from old parent
         old_parent = getattr(new_node, 'parent', None)
         if old_parent and hasattr(old_parent, 'children'):
@@ -318,6 +325,13 @@ class DOMElement(JSObject):
         except ValueError:
             pass
 
+    def _contains(self, other):
+        if isinstance(other, (DOMElement, DOMText)):
+            node = other._node
+        else:
+            return False
+        return _is_descendant(self._node, node) or node is self._node
+
 
 class DOMText(JSObject):
     """Wraps a Text node for JavaScript."""
@@ -327,6 +341,7 @@ class DOMText(JSObject):
         self._binding = binding
         self['nodeType'] = 3
         self['nodeName'] = '#text'
+        self['__instanceof__'] = 'Node'
 
     def __getitem__(self, key):
         if key == 'textContent' or key == 'data' or key == 'nodeValue':
@@ -378,6 +393,11 @@ class DOMBinding:
         g = self.interpreter.global_env
         doc_obj = self._make_document()
         g.define('document', doc_obj)
+        g.define('Node', JSObject({'__instanceof__': 'Node'}))
+        g.define('Element', JSObject({'__instanceof__': 'Element'}))
+        g.define('HTMLElement', JSObject({'__instanceof__': 'HTMLElement'}))
+        g.define('HTMLInputElement', JSObject({'__instanceof__': 'HTMLInputElement'}))
+        g.define('HTMLImageElement', JSObject({'__instanceof__': 'HTMLImageElement'}))
 
         # Also set on window
         window = g.get('window')
@@ -524,6 +544,15 @@ def _query_all(root, sel, selector_mod):
         except Exception:
             continue
     return results
+
+
+def _is_descendant(root, candidate):
+    for child in getattr(root, 'children', []):
+        if child is candidate:
+            return True
+        if _is_descendant(child, candidate):
+            return True
+    return False
 
 
 def _extract_text(node):
