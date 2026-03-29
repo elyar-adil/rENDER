@@ -1,7 +1,7 @@
-# rENDER — Minimal Browser
+# rENDER — Browser Engine
 
-**Goal**: A lean, correct, usable browser built from scratch in Python with PyQt6.
-Implement the minimum code necessary to render real web pages correctly.
+**Goal**: A correct, usable, actively evolving browser engine built from scratch in Python with PyQt6.
+Implement the functionality required to render real web pages correctly and improve compatibility without reducing the project to a toy or demo.
 Every line must earn its place — no gold-plating, no speculative features.
 
 ## Architecture
