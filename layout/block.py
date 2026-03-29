@@ -15,6 +15,10 @@ _BLOCK_DISPLAYS = frozenset({
 })
 
 
+def _is_replaced_visual(node) -> bool:
+    return getattr(node, 'tag', '') in ('img', 'svg')
+
+
 def _resolve_replaced_img_dim(css_val: str, attr_val: str, natural: int) -> float:
     """Resolve an <img> width/height from CSS, HTML attribute, or intrinsic size."""
     for val in (css_val, attr_val):
@@ -190,6 +194,43 @@ def _measure_auto_width(node, container_width: float) -> float:
     return max(0.0, container_width)
 
 
+def _needs_local_float_ctx(node) -> bool:
+    from html.dom import Element
+
+    for child in getattr(node, 'children', []):
+        if not isinstance(child, Element):
+            continue
+        if _get_style(child, 'display', 'inline') == 'none':
+            continue
+        if _get_style(child, 'float', 'none') != 'none':
+            return True
+        if _get_style(child, 'clear', 'none') != 'none':
+            return True
+    return False
+
+
+def _acts_like_block_container(node) -> bool:
+    """Treat invalid inline wrappers around block descendants like block containers."""
+    from html.dom import Element
+
+    if _get_style(node, 'display', 'inline') != 'inline':
+        return False
+
+    for child in getattr(node, 'children', []):
+        if not isinstance(child, Element):
+            continue
+        child_display = _get_style(child, 'display', 'inline')
+        child_float = _get_style(child, 'float', 'none')
+        child_pos = _get_style(child, 'position', 'static')
+        if (
+            child_display in _BLOCK_DISPLAYS
+            or child_float != 'none'
+            or child_pos in ('absolute', 'fixed')
+        ):
+            return True
+    return False
+
+
 class BlockLayout(LayoutEngine):
     """Layout engine for display:block (and fallback for unknown display values)."""
 
@@ -203,7 +244,7 @@ class BlockLayout(LayoutEngine):
         margin = _parse_edge(node, 'margin', c_width)
         padding = _parse_edge(node, 'padding', c_width)
         border_w = _parse_edge(node, 'border-width', c_width)
-        is_replaced_img = getattr(node, 'tag', '') == 'img'
+        is_replaced_img = _is_replaced_visual(node)
 
         # --- Width ---
         if is_replaced_img:
@@ -214,7 +255,7 @@ class BlockLayout(LayoutEngine):
         elif width_str in ('auto', ''):
             # <img> with auto width → use natural width
             nat_w = getattr(node, 'natural_width', 0) or 0
-            if getattr(node, 'tag', '') == 'img' and nat_w > 0:
+            if _is_replaced_visual(node) and nat_w > 0:
                 content_width = float(nat_w)
             else:
                 content_width = max(0.0, c_width - margin.left - margin.right
@@ -279,7 +320,10 @@ class BlockLayout(LayoutEngine):
         # --- Classify children ---
         has_block = any(
             isinstance(c, Element)
-            and _get_style(c, 'display', 'inline') in _BLOCK_DISPLAYS
+            and (
+                _get_style(c, 'display', 'inline') in _BLOCK_DISPLAYS
+                or _acts_like_block_container(c)
+            )
             for c in node.children
         )
         has_inline = any(
@@ -290,6 +334,7 @@ class BlockLayout(LayoutEngine):
                  or getattr(c, 'tag', '') != 'br'
              )
              and _get_style(c, 'display', 'inline') not in _BLOCK_DISPLAYS
+             and not _acts_like_block_container(c)
              and _get_style(c, 'display', 'inline') != 'none'
              and _get_style(c, 'float', 'none') == 'none'
              and _get_style(c, 'position', 'static') not in ('absolute', 'fixed'))
@@ -306,6 +351,7 @@ class BlockLayout(LayoutEngine):
             child_display = _get_style(child, 'display', 'inline')
             child_float = _get_style(child, 'float', 'none')
             child_pos = _get_style(child, 'position', 'static')
+            child_behaves_as_block = _acts_like_block_container(child)
 
             if child_display == 'none':
                 continue
@@ -315,7 +361,7 @@ class BlockLayout(LayoutEngine):
                 node._abs_children.append((child, child_pos))
                 abs_children.append((child, child_pos))
                 continue
-            if child_display not in _BLOCK_DISPLAYS and child_float == 'none':
+            if child_display not in _BLOCK_DISPLAYS and not child_behaves_as_block and child_float == 'none':
                 # <br> between block siblings creates vertical spacing
                 if has_block and getattr(child, 'tag', '') == 'br':
                     font_size = _parse_px(_get_style(node, 'font-size', '16px'))
@@ -336,6 +382,11 @@ class BlockLayout(LayoutEngine):
                 tmp.content_width = box.content_width
                 tmp.content_height = 0.0
                 child_ctx = ctx.fork()
+                child_width = _get_style(child, 'width', 'auto')
+                if child_width in ('auto', '') and child_display in _BLOCK_DISPLAYS:
+                    shrink_width = _measure_auto_width(child, box.content_width)
+                    if 0.0 < shrink_width < box.content_width:
+                        tmp.content_width = shrink_width
                 child_box = BlockLayout().layout(child, tmp, child_ctx)
                 child.box = child_box
 
@@ -366,17 +417,19 @@ class BlockLayout(LayoutEngine):
                 child_cont.content_width = box.content_width
                 child_cont.content_height = 0.0
 
+                child_ctx = ctx.fork() if _needs_local_float_ctx(child) else ctx
+
                 if child_display == 'table':
                     from layout.table import TableLayout
-                    child_box = TableLayout().layout(child, child_cont, ctx)
+                    child_box = TableLayout().layout(child, child_cont, child_ctx)
                 elif child_display == 'flex':
                     from layout.flex import FlexLayout
-                    child_box = FlexLayout().layout(child, child_cont, ctx)
+                    child_box = FlexLayout().layout(child, child_cont, child_ctx)
                 elif child_display == 'grid':
                     from layout.grid import GridLayout
-                    child_box = GridLayout().layout(child, child_cont, ctx)
+                    child_box = GridLayout().layout(child, child_cont, child_ctx)
                 else:
-                    child_box = BlockLayout().layout(child, child_cont, ctx)
+                    child_box = BlockLayout().layout(child, child_cont, child_ctx)
                 child.box = child_box
 
                 top_margin = child_box.margin.top
@@ -444,7 +497,7 @@ class BlockLayout(LayoutEngine):
 
         width_str = style.get('width', 'auto')
         box_sizing = style.get('box-sizing', 'content-box')
-        is_replaced_img = getattr(child, 'tag', '') == 'img'
+        is_replaced_img = _is_replaced_visual(child)
         c_width = float(viewport_width) if position == 'fixed' else containing_box.content_width
         c_x = 0.0 if position == 'fixed' else containing_box.x
         c_y = 0.0 if position == 'fixed' else containing_box.y

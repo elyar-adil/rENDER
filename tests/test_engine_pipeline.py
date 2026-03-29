@@ -15,6 +15,7 @@ from html.parser import parse as parse_html
 
 
 class TestEnginePipelineHelpers(unittest.TestCase):
+
     def test_fetch_subresources_preserves_stylesheet_dom_order(self):
         doc = parse_html(
             """
@@ -77,6 +78,23 @@ class TestEnginePipelineHelpers(unittest.TestCase):
         self.assertEqual(args.target, 'https://example.com')
         self.assertEqual(args.width, 1280)
         self.assertEqual(args.height, 720)
+
+    def test_detects_browser_hydration_shell_markup(self):
+        html = """
+            <html>
+              <body>
+                <div id="root"></div>
+                <div id="ssr" data-ssr-entry="/bundles/app.js" hidden></div>
+              </body>
+            </html>
+        """
+        self.assertTrue(
+            engine._looks_like_browser_hydration_shell(
+                html,
+                'https://www.msn.cn/zh-cn',
+            )
+        )
+
 
 
 if __name__ == '__main__':

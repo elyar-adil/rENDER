@@ -108,7 +108,7 @@ def _layout_deferred_abs(node, root_box: BoxModel, viewport_width: int, viewport
 
     for child in _walk_elements(node):
         position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
-        if position in ('absolute', 'fixed') and not hasattr(child, 'box'):
+        if position in ('absolute', 'fixed') and getattr(child, 'box', None) is None:
             containing = _find_containing_block(child, node, root_box)
             child.box = layout_absolute(
                 child, containing, position,

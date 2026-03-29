@@ -1,5 +1,6 @@
 """HTTP/HTTPS client using Python stdlib urllib."""
 import codecs
+import ssl
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -49,6 +50,31 @@ def clear_cache() -> None:
     _cache.clear()
 
 
+def _is_cert_verification_failure(exc: Exception) -> bool:
+    """Return True when urllib failed due to TLS certificate verification."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(current, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(current):
+            return True
+        current = getattr(current, 'reason', None) or getattr(current, '__cause__', None)
+    return False
+
+
+def _urlopen_with_cert_fallback(req, *, timeout: int):
+    """Retry once with an unverified TLS context on cert verification failures."""
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not _is_cert_verification_failure(exc):
+            raise
+        insecure_context = ssl._create_unverified_context()
+        return urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
+
+
 def fetch(url: str) -> tuple[str, str]:
     """Fetch URL and return (html_content, final_url).
 
@@ -69,7 +95,7 @@ def fetch(url: str) -> tuple[str, str]:
         'Accept-Encoding': 'gzip, deflate',
     })
 
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with _urlopen_with_cert_fallback(req, timeout=15) as response:
         final_url = response.url
         content_type = response.headers.get('Content-Type', '')
         encoding_header = response.headers.get('Content-Encoding', '')
@@ -167,7 +193,7 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
     })
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with _urlopen_with_cert_fallback(req, timeout=10) as resp:
         raw = resp.read()
         encoding = resp.headers.get('Content-Encoding', '')
     raw = _decode_content_encoding(raw, encoding)

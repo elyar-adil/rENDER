@@ -1,9 +1,10 @@
-"""rENDER browser engine — pipeline and entry point."""
+"""rENDER browser engine pipeline and entry point."""
 import logging
 _logger = logging.getLogger(__name__)
 import argparse
 import sys
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote_to_bytes
 
@@ -21,7 +22,7 @@ VIEWPORT_H = 600
 def _pipeline(html_content: str, base_url: str = '',
               viewport_width: int = VIEWPORT_W,
               viewport_height: int = VIEWPORT_H) -> tuple:
-    """Parse → JS → CSS (+ external sheets) → images → layout.
+    """Parse -> JS -> CSS (+ external sheets) -> images -> layout.
 
     External stylesheets and images are fetched concurrently.
     Returns (display_list, page_height, document).
@@ -53,6 +54,23 @@ def _pipeline(html_content: str, base_url: str = '',
     dl = layout_mod.layout(doc, viewport_width=viewport_width, viewport_height=viewport_height)
     height = _page_height(doc, viewport_height=viewport_height)
     return dl, height, doc
+
+
+def _looks_like_browser_hydration_shell(html_content: str, base_url: str = '') -> bool:
+    """Detect pages whose visible content only appears after client hydration."""
+    if not base_url.startswith('http://') and not base_url.startswith('https://'):
+        return False
+    if 'data-ssr-entry=' not in html_content:
+        return False
+    return bool(
+        re.search(
+            r'<div\s+id=["\']root["\'][^>]*>\s*</div>',
+            html_content,
+            re.IGNORECASE,
+        )
+    )
+
+
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,8 @@
 """Tests for HTTP helpers."""
 import sys
 import os
+import ssl
+import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import unittest
@@ -75,6 +77,30 @@ class TestCharsetDetection(unittest.TestCase):
         self.assertEqual(cached_html, html)
         self.assertEqual(raw, b'\x89PNG\r\n\x1a\n')
         self.assertEqual(cached_raw, raw)
+        self.assertEqual(mocked_urlopen.call_count, 2)
+
+    def test_retries_with_unverified_context_on_cert_verification_failure(self):
+        url = 'https://example.com/style.css'
+        cert_error = None
+        try:
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+        except ssl.SSLCertVerificationError as exc:
+            cert_error = exc
+
+        def fake_urlopen(*args, **kwargs):
+            if 'context' not in kwargs:
+                raise urllib.error.URLError(cert_error)
+            return _FakeResponse(
+                url,
+                b'body { color: red; }',
+                content_type='text/css; charset=utf-8',
+            )
+
+        with patch('network.http.urllib.request.urlopen', side_effect=fake_urlopen) as mocked_urlopen:
+            css_text, final_url = fetch(url)
+
+        self.assertEqual(final_url, url)
+        self.assertIn('color: red', css_text)
         self.assertEqual(mocked_urlopen.call_count, 2)
 
 

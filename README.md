@@ -63,6 +63,7 @@ python -m pytest
 ```
 
 Testing strategy details: [`docs/testing_strategy.md`](docs/testing_strategy.md).
+Generic engine backlog: [`docs/generic-browser-todo.md`](docs/generic-browser-todo.md).
 
 Run syntax and lint checks:
 
@@ -107,6 +108,8 @@ The project is not trying to mimic every browser subsystem at once. Instead, it 
 - adapted WebKit layout fixtures
 - visual regression helpers for local fixtures and browser diffing
 - compatibility notes under `docs/`
+
+Site-specific render adapters and external-browser fallbacks are intentionally out of scope for the runtime engine. Missing capability should be tracked as generic engine work, not patched per site.
 
 This keeps behavior improvements concrete and reviewable.
 

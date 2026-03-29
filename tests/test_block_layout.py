@@ -509,6 +509,25 @@ class TestBlockFloats(unittest.TestCase):
         # Second float should be to the right of first
         self.assertGreater(f2.box.x, f1.box.x)
 
+    def test_auto_width_float_shrinks_to_fit_contents(self):
+        badge = make_element('span', style={
+            'display': 'inline-block',
+            'width': '30px',
+            'height': '20px',
+        })
+        floated = make_element(style={
+            'display': 'block', 'float': 'right',
+            'margin-top': '0px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        }, children=[badge])
+        parent = make_element(style={'display': 'block'}, children=[floated])
+        ctx = LayoutContext()
+        do_layout(parent, make_container(x=0, y=0, width=400), ctx)
+
+        self.assertLess(floated.box.content_width, 400)
+        self.assertAlmostEqual(floated.box.content_width, 30, delta=1)
+        self.assertAlmostEqual(floated.box.x, 370, delta=1)
+
 
 class TestBlockAbsolutePositioning(unittest.TestCase):
 
@@ -602,6 +621,26 @@ class TestBlockNestedChildren(unittest.TestCase):
         }, children=[inner])
         do_layout(outer, make_container(width=500))
         self.assertEqual(inner.box.content_width, 300)
+
+    def test_inline_wrapper_with_block_child_contributes_height(self):
+        inner = make_element(style={
+            'display': 'block', 'height': '40px',
+            'margin-top': '0px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        wrapper = make_element(tag='span', style={'display': 'inline'}, children=[inner])
+        outer = make_element(style={
+            'display': 'block',
+            'margin-top': '0px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        }, children=[wrapper])
+
+        box = do_layout(outer, make_container(width=400))
+
+        self.assertEqual(box.content_height, 40)
+        self.assertIsNotNone(wrapper.box)
+        self.assertIsNotNone(inner.box)
+        self.assertEqual(inner.box.y, wrapper.box.y)
 
 
 class TestBlockEdgeSizes(unittest.TestCase):
