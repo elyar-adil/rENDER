@@ -1,11 +1,16 @@
 """HTTP/HTTPS client using Python stdlib urllib."""
 import codecs
+import ssl
 import urllib.request
 import urllib.parse
 import urllib.error
 import re
 import threading
 from collections import OrderedDict
+
+
+_TEXT_CACHE_KIND = 'text'
+_BYTES_CACHE_KIND = 'bytes'
 
 
 class _HTTPCache:
@@ -15,18 +20,20 @@ class _HTTPCache:
         self._lock = threading.Lock()
         self._maxsize = maxsize
 
-    def get(self, url: str):
+    def get(self, kind: str, url: str):
+        key = (kind, url)
         with self._lock:
-            if url in self._cache:
-                self._cache.move_to_end(url)
-                return self._cache[url]
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
         return None
 
-    def put(self, url: str, value) -> None:
+    def put(self, kind: str, url: str, value) -> None:
+        key = (kind, url)
         with self._lock:
-            if url in self._cache:
-                self._cache.move_to_end(url)
-            self._cache[url] = value
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            self._cache[key] = value
             if len(self._cache) > self._maxsize:
                 self._cache.popitem(last=False)
 
@@ -43,6 +50,36 @@ def clear_cache() -> None:
     _cache.clear()
 
 
+def _is_cert_verification_failure(exc: Exception) -> bool:
+    """Return True when urllib failed due to TLS certificate verification."""
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(current, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(current):
+            return True
+        current = getattr(current, 'reason', None) or getattr(current, '__cause__', None)
+    return False
+
+
+def _urlopen_with_cert_fallback(req, *, timeout: int):
+    """Open a request, retrying once without certificate verification on TLS failures.
+
+    Some CDN endpoints used by real pages fail certificate validation on local
+    Python installs with stale trust stores. Browsers still load them, so retry
+    once with an unverified context to keep page rendering working.
+    """
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if not _is_cert_verification_failure(exc):
+            raise
+        insecure_context = ssl._create_unverified_context()
+        return urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
+
+
 def fetch(url: str) -> tuple[str, str]:
     """Fetch URL and return (html_content, final_url).
 
@@ -52,7 +89,7 @@ def fetch(url: str) -> tuple[str, str]:
     - Charset detection: Content-Type header > BOM > meta charset > UTF-8 fallback
     - Returns (html_text, final_url)
     """
-    cached = _cache.get(url)
+    cached = _cache.get(_TEXT_CACHE_KIND, url)
     if cached is not None:
         return cached
 
@@ -63,34 +100,19 @@ def fetch(url: str) -> tuple[str, str]:
         'Accept-Encoding': 'gzip, deflate',
     })
 
-    with urllib.request.urlopen(req, timeout=15) as response:
+    with _urlopen_with_cert_fallback(req, timeout=15) as response:
         final_url = response.url
         content_type = response.headers.get('Content-Type', '')
         encoding_header = response.headers.get('Content-Encoding', '')
         raw = response.read()
 
-    # Decompress if needed
-    if 'gzip' in encoding_header:
-        import gzip
-        try:
-            raw = gzip.decompress(raw)
-        except Exception:
-            pass
-    elif 'deflate' in encoding_header:
-        import zlib
-        try:
-            raw = zlib.decompress(raw)
-        except Exception:
-            try:
-                raw = zlib.decompress(raw, -zlib.MAX_WBITS)
-            except Exception:
-                pass
+    raw = _decode_content_encoding(raw, encoding_header)
 
     # Charset detection
     charset = _detect_charset(content_type, raw)
     html = raw.decode(charset, errors='replace')
     result = html, final_url
-    _cache.put(url, result)
+    _cache.put(_TEXT_CACHE_KIND, url, result)
     return result
 
 
@@ -167,7 +189,7 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
     if base_url:
         url = resolve_url(base_url, url)
 
-    cached = _cache.get(url)
+    cached = _cache.get(_BYTES_CACHE_KIND, url)
     if cached is not None:
         return cached
 
@@ -176,14 +198,29 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
         'Accept-Encoding': 'gzip, deflate',
     })
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with _urlopen_with_cert_fallback(req, timeout=10) as resp:
         raw = resp.read()
         encoding = resp.headers.get('Content-Encoding', '')
+    raw = _decode_content_encoding(raw, encoding)
+    _cache.put(_BYTES_CACHE_KIND, url, raw)
+    return raw
+
+
+def _decode_content_encoding(raw: bytes, encoding_header: str) -> bytes:
+    encoding = (encoding_header or '').lower()
     if 'gzip' in encoding:
         import gzip
         try:
-            raw = gzip.decompress(raw)
+            return gzip.decompress(raw)
         except Exception:
-            pass
-    _cache.put(url, raw)
+            return raw
+    if 'deflate' in encoding:
+        import zlib
+        try:
+            return zlib.decompress(raw)
+        except Exception:
+            try:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+            except Exception:
+                return raw
     return raw

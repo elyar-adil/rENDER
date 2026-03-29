@@ -222,7 +222,7 @@ def _layout_deferred_abs(node, root_box: BoxModel, viewport_width: int, viewport
 
     for child in _walk_elements(node):
         position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
-        if position in ('absolute', 'fixed') and not hasattr(child, 'box'):
+        if position in ('absolute', 'fixed') and getattr(child, 'box', None) is None:
             containing = _find_containing_block(child, node, root_box)
             child.box = layout_absolute(
                 child, containing, position,
@@ -265,7 +265,7 @@ def _parse_linear_gradient(value: str, rect):
     color_stops is [(position: float 0..1, color_str), ...].
     """
     import re
-    m = re.match(r'linear-gradient\s*\((.+)\)\s*$', value, re.IGNORECASE | re.DOTALL)
+    m = re.match(r'(?:-webkit-)?linear-gradient\s*\((.+)\)\s*$', value, re.IGNORECASE | re.DOTALL)
     if not m:
         return None
 
@@ -546,7 +546,8 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
 
         # Background color
         bg = style.get('background-color', 'transparent')
-        if bg and bg != 'transparent':
+        bg_lower = (bg or '').lower()
+        if bg and bg != 'transparent' and 'gradient(' not in bg_lower:
             _emit(DrawRect(box.border_rect, bg, border_radius=radius))
 
         bg_qimage = getattr(node, 'background_qimage', None)
@@ -556,8 +557,8 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
                 bg_qimage, box.border_rect.width, box.border_rect.height,
             ))
 
-        # <img> element: draw the image directly using the layout box
-        if node.tag == 'img':
+        # Replaced visual elements draw their rasterized content directly
+        if node.tag in ('img', 'svg'):
             qimage = getattr(node, 'qimage', None)
             if qimage is not None:
                 from rendering.display_list import DrawImage
@@ -565,6 +566,8 @@ def _build_display_list(node, display_list: 'DisplayList', stacking_top: list) -
 
         # Background image (linear-gradient)
         bg_image = style.get('background-image', 'none')
+        if (not bg_image or bg_image in ('none', '')) and 'gradient(' in bg_lower:
+            bg_image = bg
         if bg_image and bg_image not in ('none', ''):
             grad = _parse_linear_gradient(bg_image, box.border_rect)
             if grad is not None:

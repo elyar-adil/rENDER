@@ -13,6 +13,7 @@ from tests.layout_test_utils import iter_elements, render_document, require_elem
 
 ROOT = Path(__file__).resolve().parents[1]
 HAO123_FIXTURE_DIR = ROOT / "tests" / "fixtures" / "hao123_modules"
+MICROSOFT_FIXTURE_DIR = ROOT / "tests" / "fixtures" / "microsoft"
 HAO123_VIEWPORTS = {
     "header": (1280, 140),
     "search": (1280, 260),
@@ -39,6 +40,20 @@ def _render_pipeline_offline(html: str, *, viewport_w: int, viewport_h: int):
         return engine._pipeline(
             html,
             base_url="",
+            viewport_width=viewport_w,
+            viewport_height=viewport_h,
+        )
+
+
+def _render_pipeline_with_css_offline(html: str, css_texts: list[str], *, viewport_w: int, viewport_h: int):
+    with (
+        patch("engine._fetch_subresources", return_value=(css_texts, [])),
+        patch("engine._fetch_background_images", return_value=[]),
+        patch("engine._execute_scripts", return_value=None),
+    ):
+        return engine._pipeline(
+            html,
+            base_url="https://www.microsoft.com/zh-cn/",
             viewport_width=viewport_w,
             viewport_height=viewport_h,
         )
@@ -146,6 +161,76 @@ def test_real_fixture_generates_before_pseudo_icon():
     assert icon.box.content_height == pytest.approx(16.0, abs=1.0)
     assert icon.box.x == pytest.approx(refresh_link.box.x, abs=1.0)
     assert icon.box.y == pytest.approx(refresh_link.box.y + 12.0, abs=2.0)
+
+
+def test_top_level_fixed_element_is_laid_out_after_normal_flow_pass():
+    html = """
+        <html>
+          <head>
+            <style>
+              body { margin: 0; min-height: 200px; }
+              #banner {
+                position: fixed;
+                top: 12px;
+                left: 24px;
+                width: 180px;
+                height: 40px;
+              }
+            </style>
+          </head>
+          <body>
+            <div id="banner">Pinned</div>
+          </body>
+        </html>
+    """
+    display_list, _page_height, document = _render_pipeline_offline(
+        html,
+        viewport_w=400,
+        viewport_h=200,
+    )
+
+    banner = require_element(document, "#banner")
+
+    assert banner.box is not None
+    assert banner.box.x == pytest.approx(24.0, abs=1.0)
+    assert banner.box.y == pytest.approx(12.0, abs=1.0)
+    assert any(
+        getattr(cmd, "text", "") == "Pinned"
+        for cmd in display_list
+    )
+
+
+def test_microsoft_fixture_keeps_fixed_header_and_footer_content_visible():
+    html = (MICROSOFT_FIXTURE_DIR / "blocked.html").read_text(encoding="utf-8")
+    css_texts = [
+        (MICROSOFT_FIXTURE_DIR / "css_0.css").read_text(encoding="utf-8"),
+        (MICROSOFT_FIXTURE_DIR / "css_1.css").read_text(encoding="utf-8"),
+    ]
+
+    display_list, _page_height, document = _render_pipeline_with_css_offline(
+        html,
+        css_texts,
+        viewport_w=1280,
+        viewport_h=900,
+    )
+
+    skip_link = require_element(document, "#uhfSkipToMain")
+    header_area = require_element(document, "#headerArea")
+    main = require_element(document, "#mainContent")
+    header_descendants_with_boxes = [
+        node for node in iter_elements(header_area)
+        if getattr(node, "box", None) is not None
+    ]
+
+    assert skip_link.box is not None
+    assert skip_link.box.y <= 20
+    assert len(header_descendants_with_boxes) >= 5
+    assert main.box.content_height > 100
+
+    drawn_text = [getattr(cmd, "text", "") for cmd in display_list if hasattr(cmd, "text")]
+    assert "Skip" in drawn_text
+    assert "Microsoft" in drawn_text
+    assert "Search" in drawn_text
 
 
 @pytest.mark.xfail(strict=True, reason="grid-column span still lays out as a single track")

@@ -5,6 +5,7 @@ Usage:
 
 Renders the page headlessly and saves to a PNG file.
 """
+import argparse
 import sys
 import os
 
@@ -53,15 +54,18 @@ def screenshot(target: str, output: str, width: int = 1200, height: int = 900):
     painter.end()
 
     img.save(output)
-    print(f'[screenshot] Saved → {output}')
+    print(f'[screenshot] Saved -> {output}')
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description='Render a page to a PNG file with the rENDER engine.')
+    parser.add_argument('target', help='URL or local HTML file to render')
+    parser.add_argument('output', help='Output PNG path')
+    parser.add_argument('width', nargs='?', type=int, default=1200, help='Viewport width in pixels')
+    parser.add_argument('height', nargs='?', type=int, default=900, help='Viewport height in pixels')
+    return parser
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 3:
-        print('Usage: python screenshot.py <url_or_file> <output.png> [width] [height]')
-        sys.exit(1)
-    url = sys.argv[1]
-    out = sys.argv[2]
-    w = int(sys.argv[3]) if len(sys.argv) > 3 else 1200
-    h = int(sys.argv[4]) if len(sys.argv) > 4 else 900
-    screenshot(url, out, w, h)
+    args = _build_arg_parser().parse_args()
+    screenshot(args.target, args.output, args.width, args.height)
