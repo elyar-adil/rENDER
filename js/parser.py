@@ -179,7 +179,12 @@ class Parser:
         elif t.type == PUNCT and t.value == '[':
             pattern = self._array_pattern()
         else:
-            name = self._eat(IDENT).value
+            t = self._cur()
+            if t.type in (IDENT, KEYWORD):
+                name = t.value
+                self.pos += 1
+            else:
+                name = self._eat(IDENT).value
             init = None
             if self._peek(OP, '='):
                 self.pos += 1
@@ -326,7 +331,12 @@ class Parser:
                     self.pos += 1
                     defaults[idx] = self._assign_expr()
             else:
-                name = self._eat(IDENT).value
+                t = self._cur()
+                if t.type in (IDENT, KEYWORD):
+                    name = t.value
+                    self.pos += 1
+                else:
+                    name = self._eat(IDENT).value
                 params.append(name)
                 if self._peek(OP, '='):
                     self.pos += 1
@@ -430,6 +440,47 @@ class Parser:
             else_ = self._statement()
         return _node('If', cond=cond, then=then, else_=else_)
 
+    def _scan_arrow_after_paren(self) -> bool:
+        """Check if the ')' closing the current '(' is followed by '=>'."""
+        depth = 0
+        i = self.pos
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.type == PUNCT and t.value == '(':
+                depth += 1
+            elif t.type == PUNCT and t.value == ')':
+                depth -= 1
+                if depth == 0:
+                    ni = i + 1
+                    if ni < len(self.tokens):
+                        nt = self.tokens[ni]
+                        return nt.type == OP and nt.value == '=>'
+                    return False
+            i += 1
+        return False
+
+    def _scan_for_in_of(self):
+        """Scan ahead from current position (inside for-parens) for 'in'/'of' at depth 0.
+
+        Returns (True, keyword) if found before any ';', else (False, None).
+        """
+        depth = 0
+        i = self.pos
+        while i < len(self.tokens):
+            t = self.tokens[i]
+            if t.type == PUNCT and t.value in ('(', '[', '{'):
+                depth += 1
+            elif t.type == PUNCT and t.value in (')', ']', '}'):
+                if depth == 0:
+                    return False, None
+                depth -= 1
+            elif depth == 0 and t.type == PUNCT and t.value == ';':
+                return False, None
+            elif depth == 0 and t.type == KEYWORD and t.value in ('in', 'of'):
+                return True, t.value
+            i += 1
+        return False, None
+
     def _for_stmt(self) -> ASTNode:
         self._eat(KEYWORD, 'for')
         is_await = False
@@ -456,8 +507,11 @@ class Parser:
                     return _node('ForIn', kind=kind, pattern=pattern, name=None,
                                  loop_type=loop_type, iterable=iterable, body=body)
                 self.pos = saved
-            elif self._peek(IDENT):
-                name = self._eat(IDENT).value
+            elif self._peek(IDENT) or (self._peek(KEYWORD) and
+                                        self._cur().value not in ('in', 'of', 'var', 'let', 'const')):
+                t2 = self._cur()
+                name = t2.value
+                self.pos += 1
                 if self._peek(KEYWORD, 'in') or self._peek(KEYWORD, 'of'):
                     loop_type = self._eat(KEYWORD).value
                     iterable = self._expression()
@@ -468,6 +522,22 @@ class Parser:
                 self.pos = saved  # not for-in/of, reparse
             else:
                 self.pos = saved
+
+        # Check for for-in/of without var/let/const declaration: for (lval in/of iterable)
+        if not (self._peek(KEYWORD) and self._cur().value in ('var', 'let', 'const')):
+            is_forin, forin_kw = self._scan_for_in_of()
+            if is_forin:
+                lval = self._left_hand_side()
+                self._eat(KEYWORD, forin_kw)
+                iterable = self._expression()
+                self._eat(PUNCT, ')')
+                body = self._statement()
+                # Use 'name' if simple ident, else 'pattern' for complex lvalue
+                if lval.type == 'Ident':
+                    return _node('ForIn', kind=None, name=lval.data['name'], pattern=None,
+                                 loop_type=forin_kw, iterable=iterable, body=body)
+                return _node('ForIn', kind=None, name=None, pattern=lval,
+                             loop_type=forin_kw, iterable=iterable, body=body)
 
         # Standard for loop
         init = None
@@ -881,16 +951,29 @@ class Parser:
                 self.pos += 1
                 if self._peek(KEYWORD, 'function'):
                     return self._function_decl(is_async=True)
-                # Try async arrow
-                if self._peek(IDENT):
-                    name = self._eat(IDENT).value
+                # async (params) => body
+                if self._peek(PUNCT, '(') and self._scan_arrow_after_paren():
+                    params, defaults, rest, patterns = self._param_list_full()
+                    self._eat(OP, '=>')
+                    if self._peek(PUNCT, '{'):
+                        body = self._block()
+                    else:
+                        body = _node('Return', value=self._assign_expr())
+                    return _node('FuncDecl', name=None, params=params, body=body,
+                                 param_defaults=defaults, param_rest=rest,
+                                 param_patterns=patterns, is_async=True, is_generator=False)
+                # async x => body
+                if self._peek(IDENT) or (self._peek(KEYWORD) and
+                                          self._cur().value not in ('function', 'class')):
+                    t2 = self._cur()
+                    self.pos += 1
                     if self._peek(OP, '=>'):
                         self.pos += 1
                         if self._peek(PUNCT, '{'):
                             body = self._block()
                         else:
                             body = _node('Return', value=self._assign_expr())
-                        return _node('FuncDecl', name=None, params=[name], body=body,
+                        return _node('FuncDecl', name=None, params=[t2.value], body=body,
                                      param_defaults={}, param_rest=None, param_patterns={},
                                      is_async=True, is_generator=False)
                 self.pos = saved
