@@ -16,10 +16,19 @@ class LayoutContext:
         self.viewport_height = viewport_height
         from layout.float_manager import FloatManager
         self.float_mgr = FloatManager()
+        self.absolute_nodes: list = []
+        self.initial_containing_block = None
+        self.absolute_containing_block = None
+        self.absolute_containing_node = None
 
     def fork(self) -> LayoutContext:
         """Return a new context with a fresh FloatManager (new BFC)."""
-        return LayoutContext(self.viewport_width, self.viewport_height)
+        child = LayoutContext(self.viewport_width, self.viewport_height)
+        child.absolute_nodes = self.absolute_nodes
+        child.initial_containing_block = self.initial_containing_block
+        child.absolute_containing_block = self.absolute_containing_block
+        child.absolute_containing_node = self.absolute_containing_node
+        return child
 
     def layout(self, node, container: BoxModel) -> BoxModel | None:
         """Dispatch to the appropriate layout engine and return the node's BoxModel.

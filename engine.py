@@ -271,21 +271,37 @@ def _execute_scripts(document, base_url: str) -> None:
     from js.parser import Parser
     from js.interpreter import Interpreter
     from js.dom_api import DOMBinding
-    from js.xhr import XMLHttpRequest
+    from js.xhr import create_xhr
     from js.event_loop import get_event_loop, reset_event_loop
+    from rendering.invalidation import InvalidationGraph
 
     scripts: list = []
     _collect_scripts(document, scripts)
     if not scripts:
         return
     reset_event_loop()
+    invalidation_graph = InvalidationGraph()
 
     interp = Interpreter()
-    binding = DOMBinding(document, interp)
+    binding = DOMBinding(document, interp, invalidation_graph=invalidation_graph)
     binding.setup()
-    interp.global_env.define('XMLHttpRequest', XMLHttpRequest)
+    xhr_ctor = lambda: create_xhr(interp=interp, base_url=base_url)
+    interp.global_env.define('XMLHttpRequest', xhr_ctor)
+    window = interp.global_env.get('window')
+    if isinstance(window, dict):
+        window['XMLHttpRequest'] = xhr_ctor
+    document._render_opportunities = 0
+    document._last_render_invalidation = invalidation_graph.snapshot()
 
-    # Install a synchronous fetch() that returns a Promise
+    def _on_render_opportunity():
+        snapshot = invalidation_graph.consume()
+        document._last_render_invalidation = snapshot
+        if snapshot.has_pending():
+            document._render_opportunities += 1
+
+    get_event_loop().set_render_callback(_on_render_opportunity)
+
+    # Install fetch() backed by the event loop's network queue.
     _install_fetch(interp, base_url)
 
     blocking: list = []
@@ -332,44 +348,50 @@ def _execute_scripts(document, base_url: str) -> None:
             print(f'[JS] Script error in {script_label}: {e}', file=sys.stderr)
 
     for sn in blocking:
-        _run_script(sn)
-        get_event_loop().run_until_idle()
+        get_event_loop().enqueue_task('script', lambda sn=sn: _run_script(sn))
+    get_event_loop().run_until_idle()
 
     for sn in deferred:
-        _run_script(sn)
-        get_event_loop().run_until_idle()
+        get_event_loop().enqueue_task('script', lambda sn=sn: _run_script(sn))
+    get_event_loop().run_until_idle()
 
 
 def _install_fetch(interp, base_url: str) -> None:
-    """Install a synchronous fetch() that returns a settled Promise."""
+    """Install fetch() backed by the network task queue."""
+    from js.event_loop import get_event_loop
     from js.promise import JSPromise
-    from js.types import JSObject, JSArray, _UNDEF
+    from js.types import JSObject, _UNDEF
     from js.coerce import _to_str
 
     def _fetch_impl(url_val, options=_UNDEF):
         url = _to_str(url_val)
-        try:
-            from network.http import fetch as fetch_text, resolve_url
-            resolved = resolve_url(base_url, url) if base_url else url
-            text, final_url = fetch_text(resolved)
+        promise = JSPromise(_interp=interp)
 
-            response = JSObject()
-            response['ok'] = True
-            response['status'] = 200
-            response['statusText'] = 'OK'
-            response['url'] = final_url
-            response['headers'] = JSObject()
-            response['text'] = lambda: JSPromise.resolve(text, _interp=interp)
-            response['json'] = lambda: JSPromise.resolve(
-                _try_json(text), _interp=interp
-            )
-            response['arrayBuffer'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
-            response['blob'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
-            response['clone'] = lambda: response
+        def _network_task():
+            try:
+                from network.http import fetch as fetch_text, resolve_url
+                resolved = resolve_url(base_url, url) if base_url else url
+                text, final_url = fetch_text(resolved)
 
-            return JSPromise.resolve(response, _interp=interp)
-        except Exception as exc:
-            return JSPromise.reject(str(exc), _interp=interp)
+                response = JSObject()
+                response['ok'] = True
+                response['status'] = 200
+                response['statusText'] = 'OK'
+                response['url'] = final_url
+                response['headers'] = JSObject()
+                response['text'] = lambda: JSPromise.resolve(text, _interp=interp)
+                response['json'] = lambda: JSPromise.resolve(
+                    _try_json(text), _interp=interp
+                )
+                response['arrayBuffer'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
+                response['blob'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
+                response['clone'] = lambda: response
+                promise._resolve(response)
+            except Exception as exc:
+                promise._reject(str(exc))
+
+        get_event_loop().enqueue_task('network', _network_task)
+        return promise
 
     interp.global_env.define('fetch', _fetch_impl)
     window = interp.global_env.get('window')

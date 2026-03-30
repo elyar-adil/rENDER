@@ -165,6 +165,18 @@ def _resolve_length_against(val: str, reference: float, fallback: float = 0.0) -
     return _parse_px(val)
 
 
+def _resolve_containing_content_height(containing_box: BoxModel, containing_node) -> float:
+    if containing_box.content_height > 0.0 or containing_node is None:
+        return containing_box.content_height
+    style = getattr(containing_node, 'style', {}) or {}
+    height_str = style.get('height', 'auto')
+    if height_str in ('', 'auto'):
+        return containing_box.content_height
+    if height_str.endswith('%'):
+        return containing_box.content_height
+    return max(0.0, _parse_px(height_str))
+
+
 def _collapse_adjacent_margins(previous_bottom: float, current_top: float) -> float:
     """Collapse adjoining vertical margins, including negative values."""
     if previous_bottom >= 0 and current_top >= 0:
@@ -236,6 +248,9 @@ class BlockLayout(LayoutEngine):
 
     def layout(self, node, container: BoxModel, ctx: LayoutContext) -> BoxModel:
         from html.dom import Element, Text as TextNode
+
+        if ctx.initial_containing_block is None:
+            ctx.initial_containing_block = container
 
         box = BoxModel()
         c_width = container.content_width
@@ -316,6 +331,19 @@ class BlockLayout(LayoutEngine):
         box.margin = margin
         box.padding = padding
         box.border = border_w
+        node_position = _get_style(node, 'position', 'static')
+        abs_containing_box = (
+            box if node_position in ('relative', 'absolute', 'fixed', 'sticky')
+            else ctx.absolute_containing_block
+        )
+        abs_containing_node = (
+            node if node_position in ('relative', 'absolute', 'fixed', 'sticky')
+            else ctx.absolute_containing_node
+        )
+        if abs_containing_box is None:
+            abs_containing_box = ctx.initial_containing_block or container
+        if abs_containing_node is None and abs_containing_box is box:
+            abs_containing_node = node
 
         # --- Classify children ---
         has_block = any(
@@ -359,7 +387,8 @@ class BlockLayout(LayoutEngine):
                 if not hasattr(node, '_abs_children'):
                     node._abs_children = []
                 node._abs_children.append((child, child_pos))
-                abs_children.append((child, child_pos))
+                abs_children.append((child, child_pos, abs_containing_box, abs_containing_node))
+                ctx.absolute_nodes.append(child)
                 continue
             if child_display not in _BLOCK_DISPLAYS and not child_behaves_as_block and child_float == 'none':
                 # <br> between block siblings creates vertical spacing
@@ -382,6 +411,8 @@ class BlockLayout(LayoutEngine):
                 tmp.content_width = box.content_width
                 tmp.content_height = 0.0
                 child_ctx = ctx.fork()
+                child_ctx.absolute_containing_block = abs_containing_box
+                child_ctx.absolute_containing_node = abs_containing_node
                 child_width = _get_style(child, 'width', 'auto')
                 if child_width in ('auto', '') and child_display in _BLOCK_DISPLAYS:
                     shrink_width = _measure_auto_width(child, box.content_width)
@@ -418,6 +449,8 @@ class BlockLayout(LayoutEngine):
                 child_cont.content_height = 0.0
 
                 child_ctx = ctx.fork() if _needs_local_float_ctx(child) else ctx
+                child_ctx.absolute_containing_block = abs_containing_box
+                child_ctx.absolute_containing_node = abs_containing_node
 
                 if child_display == 'table':
                     from layout.table import TableLayout
@@ -478,15 +511,21 @@ class BlockLayout(LayoutEngine):
         box.content_height = max(content_height, 0.0)
 
         # Absolutely positioned children
-        for child, child_pos in abs_children:
-            child_box = BlockLayout.layout_absolute(child, box, child_pos,
-                                                    ctx.viewport_width, ctx.viewport_height)
+        for child, child_pos, containing_box, containing_node in abs_children:
+            child_box = BlockLayout.layout_absolute(
+                child,
+                containing_box,
+                containing_node,
+                child_pos,
+                ctx.viewport_width,
+                ctx.viewport_height,
+            )
             child.box = child_box
 
         return box
 
     @staticmethod
-    def layout_absolute(child, containing_box: BoxModel, position: str,
+    def layout_absolute(child, containing_box: BoxModel, containing_node, position: str,
                         viewport_width: int = 980, viewport_height: int = 600) -> BoxModel:
         """Layout an absolutely or fixed positioned element."""
         style = child.style or {}
@@ -501,7 +540,11 @@ class BlockLayout(LayoutEngine):
         c_width = float(viewport_width) if position == 'fixed' else containing_box.content_width
         c_x = 0.0 if position == 'fixed' else containing_box.x
         c_y = 0.0 if position == 'fixed' else containing_box.y
-        c_height = float(viewport_height) if position == 'fixed' else containing_box.content_height
+        c_height = (
+            float(viewport_height)
+            if position == 'fixed'
+            else _resolve_containing_content_height(containing_box, containing_node)
+        )
         left_val = style.get('left', 'auto')
         right_val = style.get('right', 'auto')
         top_val = style.get('top', 'auto')
@@ -611,5 +654,5 @@ def layout_block(node, container_box: BoxModel, float_mgr: FloatManager = None,
 
 def layout_absolute(child, containing_box: BoxModel, position: str,
                     viewport_width: int = 980, viewport_height: int = 600) -> BoxModel:
-    return BlockLayout.layout_absolute(child, containing_box, position,
+    return BlockLayout.layout_absolute(child, containing_box, None, position,
                                        viewport_width, viewport_height)

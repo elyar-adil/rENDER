@@ -7,6 +7,7 @@ from js.interpreter import (
     _UNDEF, _to_str, _to_bool, _get_property, _set_property,
 )
 from js.parser import _UNDEF as UNDEF
+from js.event_loop import get_event_loop
 from html.dom import Element, Text, Document
 
 
@@ -111,6 +112,7 @@ class JSMutationObserver(JSObject):
         self._binding = binding
         self._observed: list = []  # (node, options)
         self._records: list = []
+        self._delivery_scheduled = False
 
         self['observe'] = self._observe
         self['disconnect'] = self._disconnect
@@ -133,13 +135,24 @@ class JSMutationObserver(JSObject):
     def notify(self, record: JSObject):
         """Called internally when a mutation occurs on an observed node."""
         self._records.append(record)
+        if self._delivery_scheduled:
+            return
+        self._delivery_scheduled = True
+        get_event_loop().enqueue_microtask(self._deliver)
+
+    def _deliver(self):
+        self._delivery_scheduled = False
+        if not self._records:
+            return
+        records = JSArray(self._records)
+        self._records = []
         try:
             if self._binding.interpreter:
                 self._binding.interpreter._call_value(
-                    self._callback, [JSArray([record]), self]
+                    self._callback, [records, self]
                 )
             elif callable(self._callback):
-                self._callback(JSArray([record]), self)
+                self._callback(records, self)
         except Exception as exc:
             _logger.debug('MutationObserver callback error: %s', exc)
 
@@ -154,16 +167,16 @@ class DOMElement(JSObject):
         self._event_listeners = {}  # event_name -> [{'fn': fn, 'capture': bool}, ...]
 
         # Properties
-        self['nodeType'] = 1
-        self['tagName'] = node.tag.upper() if hasattr(node, 'tag') else ''
-        self['nodeName'] = self['tagName']
-        self['id'] = node.attributes.get('id', '') if hasattr(node, 'attributes') else ''
-        self['className'] = node.attributes.get('class', '') if hasattr(node, 'attributes') else ''
+        super().__setitem__('nodeType', 1)
+        super().__setitem__('tagName', node.tag.upper() if hasattr(node, 'tag') else '')
+        super().__setitem__('nodeName', self['tagName'])
+        super().__setitem__('id', node.attributes.get('id', '') if hasattr(node, 'attributes') else '')
+        super().__setitem__('className', node.attributes.get('class', '') if hasattr(node, 'attributes') else '')
 
         # Methods
         self['getAttribute'] = lambda name: node.attributes.get(name, None) if hasattr(node, 'attributes') else None
         self['setAttribute'] = lambda name, val: self._set_attr(name, val)
-        self['removeAttribute'] = lambda name: node.attributes.pop(name, None) if hasattr(node, 'attributes') else None
+        self['removeAttribute'] = lambda name: self._remove_attr(name)
         self['hasAttribute'] = lambda name: name in node.attributes if hasattr(node, 'attributes') else False
 
         self['querySelector'] = lambda sel: binding.query_selector(node, sel)
@@ -193,7 +206,7 @@ class DOMElement(JSObject):
         self['classList'] = self._make_class_list()
 
         # style proxy
-        self['style'] = StyleProxy(node)
+        self['style'] = StyleProxy(node, binding)
 
     def __getitem__(self, key):
         # Dynamic properties
@@ -259,28 +272,80 @@ class DOMElement(JSObject):
         if key == 'className':
             if hasattr(self._node, 'attributes'):
                 self._node.attributes['class'] = _to_str(value)
+                self._binding.invalidate_style(self._node, 'property:className')
+                self._notify_mutation(
+                    'attributes',
+                    attributeName='class',
+                    oldValue=None,
+                )
             return
         if key == 'id':
             if hasattr(self._node, 'attributes'):
                 self._node.attributes['id'] = _to_str(value)
+                self._binding.invalidate_style(self._node, 'property:id')
+                self._notify_mutation(
+                    'attributes',
+                    attributeName='id',
+                    oldValue=None,
+                )
             return
         if key == 'value':
             if hasattr(self._node, 'attributes'):
                 self._node.attributes['value'] = _to_str(value)
+                self._binding.invalidate_layout(self._node, 'property:value')
+                self._notify_mutation(
+                    'attributes',
+                    attributeName='value',
+                    oldValue=None,
+                )
             return
         if key == 'href':
             if hasattr(self._node, 'attributes'):
                 self._node.attributes['href'] = _to_str(value)
+                self._binding.invalidate_style(self._node, 'property:href')
+                self._notify_mutation(
+                    'attributes',
+                    attributeName='href',
+                    oldValue=None,
+                )
             return
         if key == 'src':
             if hasattr(self._node, 'attributes'):
                 self._node.attributes['src'] = _to_str(value)
+                self._binding.invalidate_layout(self._node, 'property:src')
+                self._notify_mutation(
+                    'attributes',
+                    attributeName='src',
+                    oldValue=None,
+                )
             return
         super().__setitem__(key, value)
 
     def _set_attr(self, name, val):
         if hasattr(self._node, 'attributes'):
-            self._node.attributes[name] = _to_str(val)
+            attr_name = _to_str(name)
+            old_value = self._node.attributes.get(attr_name)
+            self._node.attributes[attr_name] = _to_str(val)
+            self._binding.invalidate_style(self._node, f'attribute:{attr_name}')
+            self._notify_mutation(
+                'attributes',
+                attributeName=attr_name,
+                oldValue=old_value,
+            )
+
+    def _remove_attr(self, name):
+        if not hasattr(self._node, 'attributes'):
+            return None
+        attr_name = _to_str(name)
+        old_value = self._node.attributes.pop(attr_name, None)
+        if old_value is not None:
+            self._binding.invalidate_style(self._node, f'attribute:{attr_name}')
+            self._notify_mutation(
+                'attributes',
+                attributeName=attr_name,
+                oldValue=old_value,
+            )
+        return old_value
 
     def _get_inner_html(self):
         parts = []
@@ -300,16 +365,31 @@ class DOMElement(JSObject):
             doc = parse_html(_to_str(html_str))
             # Replace children
             body = _find_body(doc) or doc
+            old_children = [self._binding.wrap(child) for child in self._node.children]
             self._node.children = list(body.children)
             for child in self._node.children:
                 child.parent = self._node
+            new_children = [self._binding.wrap(child) for child in self._node.children]
+            self._binding.invalidate_layout(self._node, 'innerHTML')
+            self._notify_mutation(
+                'childList',
+                addedNodes=JSArray(new_children),
+                removedNodes=JSArray(old_children),
+            )
         except Exception as _exc:
             _logger.debug("Ignored: %s", _exc)
 
     def _set_text_content(self, text):
+        old_children = [self._binding.wrap(child) for child in self._node.children]
         t = Text(_to_str(text))
         t.parent = self._node
         self._node.children = [t]
+        self._binding.invalidate_layout(self._node, 'textContent')
+        self._notify_mutation(
+            'childList',
+            addedNodes=JSArray([self._binding.wrap(t)]),
+            removedNodes=JSArray(old_children),
+        )
 
     def _get_children(self):
         return JSArray(
@@ -349,6 +429,7 @@ class DOMElement(JSObject):
                 pass
         child_node.parent = self._node
         self._node.children.append(child_node)
+        self._binding.invalidate_layout(self._node, 'appendChild')
         self._notify_mutation('childList',
                               addedNodes=JSArray([child_wrapper]),
                               removedNodes=JSArray())
@@ -363,6 +444,8 @@ class DOMElement(JSObject):
             self._node.children.remove(child_node)
         except ValueError:
             pass
+        child_node.parent = None
+        self._binding.invalidate_layout(self._node, 'removeChild')
         self._notify_mutation('childList',
                               addedNodes=JSArray(),
                               removedNodes=JSArray([child_wrapper]))
@@ -392,6 +475,10 @@ class DOMElement(JSObject):
             self._node.children.insert(idx, new_node)
         except ValueError:
             self._node.children.append(new_node)
+        self._binding.invalidate_layout(self._node, 'insertBefore')
+        self._notify_mutation('childList',
+                              addedNodes=JSArray([new_wrapper]),
+                              removedNodes=JSArray())
         return new_wrapper
 
     def _replace_child(self, new_wrapper, old_wrapper):
@@ -444,11 +531,11 @@ class DOMElement(JSObject):
     def _make_class_list(self):
         node = self._node
         cl = JSObject()
-        cl['add'] = lambda *classes: _classList_add(node, classes)
-        cl['remove'] = lambda *classes: _classList_remove(node, classes)
-        cl['toggle'] = lambda cls: _classList_toggle(node, cls)
+        cl['add'] = lambda *classes: _classList_add(node, classes, self._binding)
+        cl['remove'] = lambda *classes: _classList_remove(node, classes, self._binding)
+        cl['toggle'] = lambda cls: _classList_toggle(node, cls, self._binding)
         cl['contains'] = lambda cls: cls in (node.attributes.get('class', '') if hasattr(node, 'attributes') else '').split()
-        cl['replace'] = lambda old, new: _classList_replace(node, old, new)
+        cl['replace'] = lambda old, new: _classList_replace(node, old, new, self._binding)
         return cl
 
     def _add_event_listener(self, event, fn, opts=_UNDEF):
@@ -509,16 +596,27 @@ class DOMText(JSObject):
 
     def __setitem__(self, key, value):
         if key in ('textContent', 'data', 'nodeValue'):
+            old_value = self._node.data
             self._node.data = _to_str(value)
+            self._binding.invalidate_layout(self._node, 'characterData')
+            parent = getattr(self._node, 'parent', None)
+            if parent is not None:
+                parent_wrapper = self._binding.wrap(parent)
+                if isinstance(parent_wrapper, DOMElement):
+                    parent_wrapper._notify_mutation(
+                        'characterData',
+                        oldValue=old_value,
+                    )
             return
         super().__setitem__(key, value)
 
 
 class StyleProxy(JSObject):
     """Proxy for element.style that reads/writes to node.style dict."""
-    def __init__(self, node):
+    def __init__(self, node, binding):
         super().__init__()
         self._node = node
+        self._binding = binding
 
     def __getitem__(self, key):
         style = getattr(self._node, 'style', {}) or {}
@@ -530,6 +628,7 @@ class StyleProxy(JSObject):
             self._node.style = {}
         css_prop = _camel_to_css(key)
         self._node.style[css_prop] = _to_str(value)
+        self._binding.invalidate_style(self._node, f'inline-style:{css_prop}')
 
     def __contains__(self, key):
         style = getattr(self._node, 'style', {}) or {}
@@ -539,12 +638,13 @@ class StyleProxy(JSObject):
 class DOMBinding:
     """Binds JavaScript interpreter to the DOM tree."""
 
-    def __init__(self, document, interpreter: Interpreter):
+    def __init__(self, document, interpreter: Interpreter, invalidation_graph=None):
         self.document = document
         self.interpreter = interpreter
         self._node_cache = {}  # id(node) -> wrapper
         self._mutation_observers: list = []  # JSMutationObserver instances
         self._custom_elements: dict = {}   # tag -> (constructor_fn, options)
+        self._invalidation_graph = invalidation_graph
 
     def setup(self) -> None:
         """Set up document, window, console objects in JS scope."""
@@ -741,6 +841,21 @@ class DOMBinding:
             if isinstance(n, Element) and cls in n.attributes.get('class', '').split()
         )
 
+    def invalidate_style(self, node, reason: str = '') -> None:
+        if self._invalidation_graph is not None:
+            self._invalidation_graph.mark_style(node, reason)
+        get_event_loop().request_render()
+
+    def invalidate_layout(self, node, reason: str = '') -> None:
+        if self._invalidation_graph is not None:
+            self._invalidation_graph.mark_layout(node, reason)
+        get_event_loop().request_render()
+
+    def invalidate_paint(self, node, reason: str = '') -> None:
+        if self._invalidation_graph is not None:
+            self._invalidation_graph.mark_paint(node, reason)
+        get_event_loop().request_render()
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -857,45 +972,74 @@ def _data_attr_to_camel(name):
     return parts[0] + ''.join(p.capitalize() for p in parts[1:])
 
 
-def _classList_add(node, classes):
+def _classList_add(node, classes, binding=None):
     if not hasattr(node, 'attributes'):
         return
+    old_value = node.attributes.get('class')
     current = set(node.attributes.get('class', '').split())
     for cls in classes:
         current.add(_to_str(cls))
     node.attributes['class'] = ' '.join(current)
+    if binding is not None:
+        binding.invalidate_style(node, 'classList:add')
+        wrapper = binding.wrap(node)
+        if isinstance(wrapper, DOMElement):
+            wrapper._notify_mutation('attributes', attributeName='class', oldValue=old_value)
 
 
-def _classList_remove(node, classes):
+def _classList_remove(node, classes, binding=None):
     if not hasattr(node, 'attributes'):
         return
+    old_value = node.attributes.get('class')
     current = set(node.attributes.get('class', '').split())
     for cls in classes:
         current.discard(_to_str(cls))
     node.attributes['class'] = ' '.join(current)
+    if binding is not None:
+        binding.invalidate_style(node, 'classList:remove')
+        wrapper = binding.wrap(node)
+        if isinstance(wrapper, DOMElement):
+            wrapper._notify_mutation('attributes', attributeName='class', oldValue=old_value)
 
 
-def _classList_toggle(node, cls):
+def _classList_toggle(node, cls, binding=None):
     if not hasattr(node, 'attributes'):
         return False
+    old_value = node.attributes.get('class')
     current = set(node.attributes.get('class', '').split())
     cls = _to_str(cls)
     if cls in current:
         current.discard(cls)
         node.attributes['class'] = ' '.join(current)
+        if binding is not None:
+            binding.invalidate_style(node, 'classList:toggle')
+            wrapper = binding.wrap(node)
+            if isinstance(wrapper, DOMElement):
+                wrapper._notify_mutation('attributes', attributeName='class', oldValue=old_value)
         return False
     current.add(cls)
     node.attributes['class'] = ' '.join(current)
+    if binding is not None:
+        binding.invalidate_style(node, 'classList:toggle')
+        wrapper = binding.wrap(node)
+        if isinstance(wrapper, DOMElement):
+            wrapper._notify_mutation('attributes', attributeName='class', oldValue=old_value)
     return True
 
 
-def _classList_replace(node, old, new):
+def _classList_replace(node, old, new, binding=None):
     if not hasattr(node, 'attributes'):
         return False
+    old_value = node.attributes.get('class')
     current = node.attributes.get('class', '').split()
     old, new = _to_str(old), _to_str(new)
     if old in current:
         current = [new if c == old else c for c in current]
         node.attributes['class'] = ' '.join(current)
+        if binding is not None:
+            binding.invalidate_style(node, 'classList:replace')
+            wrapper = binding.wrap(node)
+            if isinstance(wrapper, DOMElement):
+                wrapper._notify_mutation('attributes', attributeName='class', oldValue=old_value)
         return True
     return False

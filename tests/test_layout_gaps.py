@@ -797,7 +797,6 @@ class TestDisplayNone:
 
 class TestAbsolutePositioningGaps:
 
-    @pytest.mark.xfail(reason="absolute positioning relative to nearest positioned ancestor not implemented")
     def test_absolute_positioned_relative_to_positioned_ancestor(self):
         """position:absolute elements should be placed relative to the nearest
         non-static ancestor, not the document root."""

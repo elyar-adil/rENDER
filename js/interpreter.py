@@ -211,6 +211,8 @@ class Interpreter:
         g.define('setInterval', lambda fn, ms=0, *a: None)
         g.define('clearTimeout', lambda tid: None)
         g.define('clearInterval', lambda tid: None)
+        g.define('requestAnimationFrame', lambda fn: self._request_animation_frame(fn))
+        g.define('cancelAnimationFrame', lambda req_id: self._cancel_animation_frame(req_id))
         g.define('queueMicrotask', lambda fn: _enqueue_microtask(lambda: self._call_value(fn, [])))
         g.define('alert', lambda msg='': None)
         g.define('confirm', lambda msg='': False)
@@ -256,10 +258,11 @@ class Interpreter:
         window['setInterval'] = g.get('setInterval')
         window['clearTimeout'] = g.get('clearTimeout')
         window['clearInterval'] = g.get('clearInterval')
+        window['requestAnimationFrame'] = g.get('requestAnimationFrame')
+        window['cancelAnimationFrame'] = g.get('cancelAnimationFrame')
         window['addEventListener'] = lambda *a: None
         window['removeEventListener'] = lambda *a: None
         window['getComputedStyle'] = lambda el, *a: JSObject()
-        window['requestAnimationFrame'] = lambda fn: None
         g.define('window', window)
         g.define('self', window)
         g.define('globalThis', window)
@@ -274,6 +277,21 @@ class Interpreter:
         except Exception as exc:
             _logger.debug('setTimeout ignored: %s', exc)
             return None
+
+    def _request_animation_frame(self, fn):
+        try:
+            return get_event_loop().request_animation_frame(
+                lambda ts=0.0: self._call_value(fn, [ts])
+            )
+        except Exception as exc:
+            _logger.debug('requestAnimationFrame ignored: %s', exc)
+            return None
+
+    def _cancel_animation_frame(self, request_id):
+        try:
+            get_event_loop().cancel_animation_frame(int(_to_num(request_id)))
+        except Exception as exc:
+            _logger.debug('cancelAnimationFrame ignored: %s', exc)
 
     # ------------------------------------------------------------------
     # Entry points

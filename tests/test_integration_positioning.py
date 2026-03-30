@@ -85,6 +85,25 @@ class TestAbsolutePositioning:
         assert approx(abs_el.box.content_width, 400.0, tolerance=5), \
             f"Should stretch to 400, got {abs_el.box.content_width}"
 
+    def test_absolute_uses_positioned_ancestor_through_static_wrapper(self):
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <div id="rel" style="position:relative; width:400px; height:300px; margin-top:100px; margin-left:50px">
+            <div>
+              <div id="abs" style="position:absolute; right:10px; bottom:20px;
+                                   width:100px; height:50px">Abs</div>
+            </div>
+          </div>
+        </body></html>
+        ''')
+        rel = find_element(doc, id_name='rel')
+        abs_el = find_element(doc, id_name='abs')
+        assert approx(abs_el.box.x, rel.box.x + 400.0 - 10.0 - 100.0, tolerance=5), \
+            f"Abs x should be anchored to positioned ancestor, got {abs_el.box.x}"
+        assert approx(abs_el.box.y, rel.box.y + 300.0 - 20.0 - 50.0, tolerance=5), \
+            f"Abs y should be anchored to positioned ancestor, got {abs_el.box.y}"
+
 
 class TestFixedPositioning:
     """position:fixed positions relative to viewport."""
