@@ -259,13 +259,20 @@ def _decode_data_uri(data_uri: str) -> bytes | None:
 # ---------------------------------------------------------------------------
 
 def _execute_scripts(document, base_url: str) -> None:
-    """Find and execute <script> elements in DOM order."""
+    """Find and execute <script> elements in DOM order.
+
+    Blocking scripts run immediately in order.
+    Scripts with defer or type=module are queued and run after all blocking
+    scripts have executed.
+    async scripts also run deferred (we have no parallel loading).
+    """
     from html.dom import Text
     from js.lexer import Lexer
     from js.parser import Parser
     from js.interpreter import Interpreter
     from js.dom_api import DOMBinding
     from js.xhr import XMLHttpRequest
+    from js.promise import drain_microtasks
 
     scripts: list = []
     _collect_scripts(document, scripts)
@@ -277,13 +284,30 @@ def _execute_scripts(document, base_url: str) -> None:
     binding.setup()
     interp.global_env.define('XMLHttpRequest', XMLHttpRequest)
 
-    for script_node in scripts:
-        src = script_node.attributes.get('src', '').strip() if hasattr(script_node, 'attributes') else ''
-        script_type = script_node.attributes.get('type', '').strip().lower() if hasattr(script_node, 'attributes') else ''
+    # Install a synchronous fetch() that returns a Promise
+    _install_fetch(interp, base_url)
 
+    blocking: list = []
+    deferred: list = []
+
+    for script_node in scripts:
+        if not hasattr(script_node, 'attributes'):
+            continue
+        attrs = script_node.attributes
+        script_type = attrs.get('type', '').strip().lower()
         if script_type and script_type not in ('text/javascript', 'application/javascript', 'module', ''):
             continue
+        is_module = script_type == 'module'
+        is_defer = 'defer' in attrs or is_module
+        is_async_attr = 'async' in attrs
+        if is_defer or is_async_attr:
+            deferred.append(script_node)
+        else:
+            blocking.append(script_node)
 
+    def _run_script(script_node):
+        attrs = getattr(script_node, 'attributes', {})
+        src = attrs.get('src', '').strip()
         js_code = ''
         if src:
             try:
@@ -291,18 +315,71 @@ def _execute_scripts(document, base_url: str) -> None:
                 url = resolve_url(base_url, src) if base_url else src
                 js_code, _ = fetch_text(url)
             except Exception:
-                continue
+                return
         else:
             js_code = ''.join(c.data for c in script_node.children if isinstance(c, Text))
-
         if not js_code or not js_code.strip():
-            continue
+            return
         try:
             tokens = Lexer(js_code).tokenize()
             ast = Parser(tokens).parse()
             interp.execute(ast)
         except Exception as e:
             print(f'[JS] Script error: {e}', file=sys.stderr)
+
+    for sn in blocking:
+        _run_script(sn)
+        drain_microtasks()
+
+    for sn in deferred:
+        _run_script(sn)
+        drain_microtasks()
+
+
+def _install_fetch(interp, base_url: str) -> None:
+    """Install a synchronous fetch() that returns a settled Promise."""
+    from js.promise import JSPromise
+    from js.types import JSObject, JSArray, _UNDEF
+    from js.coerce import _to_str
+
+    def _fetch_impl(url_val, options=_UNDEF):
+        url = _to_str(url_val)
+        try:
+            from network.http import fetch as fetch_text, resolve_url
+            resolved = resolve_url(base_url, url) if base_url else url
+            text, final_url = fetch_text(resolved)
+
+            response = JSObject()
+            response['ok'] = True
+            response['status'] = 200
+            response['statusText'] = 'OK'
+            response['url'] = final_url
+            response['headers'] = JSObject()
+            response['text'] = lambda: JSPromise.resolve(text, _interp=interp)
+            response['json'] = lambda: JSPromise.resolve(
+                _try_json(text), _interp=interp
+            )
+            response['arrayBuffer'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
+            response['blob'] = lambda: JSPromise.resolve(_UNDEF, _interp=interp)
+            response['clone'] = lambda: response
+
+            return JSPromise.resolve(response, _interp=interp)
+        except Exception as exc:
+            return JSPromise.reject(str(exc), _interp=interp)
+
+    interp.global_env.define('fetch', _fetch_impl)
+    window = interp.global_env.get('window')
+    if isinstance(window, dict):
+        window['fetch'] = _fetch_impl
+
+
+def _try_json(text: str):
+    import json
+    from js.types import JSObject, JSArray, _UNDEF
+    try:
+        return json.loads(text)
+    except Exception:
+        return _UNDEF
 
 
 def _collect_scripts(node, scripts: list) -> None:

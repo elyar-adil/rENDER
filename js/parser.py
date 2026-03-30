@@ -746,11 +746,34 @@ class Parser:
 
     def _new_expr(self) -> ASTNode:
         self._eat(KEYWORD, 'new')
-        callee = self._left_hand_side()
+        # Callee is a MemberExpression: parse primary then handle only . and []
+        # We must NOT consume call-argument parens here; those belong to the New args.
+        callee = self._new_member_expr()
         args = []
         if self._peek(PUNCT, '('):
             args = self._arguments()
         return _node('New', callee=callee, args=args)
+
+    def _new_member_expr(self) -> ASTNode:
+        """Parse a MemberExpression for the 'new' callee (no call args)."""
+        # Support nested 'new': new new Foo()() → new (new Foo())()
+        if self._peek(KEYWORD, 'new'):
+            return self._new_expr()
+        expr = self._primary()
+        # Only member access (. and []) — no () calls
+        while True:
+            if self._peek(PUNCT, '.'):
+                self.pos += 1
+                prop = self._eat_ident_or_keyword()
+                expr = _node('Member', obj=expr, prop=prop, computed=False, optional=False)
+            elif self._peek(PUNCT, '['):
+                self.pos += 1
+                prop = self._expression()
+                self._eat(PUNCT, ']')
+                expr = _node('Member', obj=expr, prop=prop, computed=True, optional=False)
+            else:
+                break
+        return expr
 
     def _left_hand_side(self) -> ASTNode:
         """Call/member expressions including optional chaining."""

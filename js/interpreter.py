@@ -22,6 +22,7 @@ from js.builtins import (
     _object_assign, _object_create, _iter_enumerable_entries,
     _JSDate,
 )
+from js.promise import JSPromise, _PromiseCtor, drain_microtasks, _enqueue_microtask
 
 # Re-export everything that external modules import from js.interpreter
 __all__ = [
@@ -51,6 +52,38 @@ class _Return(Exception):
 class _Throw(Exception):
     def __init__(self, value):
         self.value = value
+
+class _Yield(Exception):
+    def __init__(self, value):
+        self.value = value
+
+
+class JSGenerator(JSObject):
+    """JavaScript generator object returned by generator functions."""
+
+    def __init__(self, values: list):
+        super().__init__()
+        self._values = iter(values)
+        self._done = False
+        self['next'] = self._next
+        self['return'] = self._return
+        self['throw'] = lambda v=_UNDEF: self._return(_UNDEF)
+        # Make iterable
+        self['Symbol.iterator'] = lambda: self
+
+    def _next(self, value=_UNDEF):
+        if self._done:
+            return JSObject({'value': _UNDEF, 'done': True})
+        try:
+            v = next(self._values)
+            return JSObject({'value': v, 'done': False})
+        except StopIteration:
+            self._done = True
+            return JSObject({'value': _UNDEF, 'done': True})
+
+    def _return(self, value=_UNDEF):
+        self._done = True
+        return JSObject({'value': value, 'done': True})
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +210,34 @@ class Interpreter:
         g.define('setInterval', lambda fn, ms=0, *a: None)
         g.define('clearTimeout', lambda tid: None)
         g.define('clearInterval', lambda tid: None)
-        g.define('queueMicrotask', lambda fn: None)
+        g.define('queueMicrotask', lambda fn: _enqueue_microtask(lambda: self._call_value(fn, [])))
         g.define('alert', lambda msg='': None)
         g.define('confirm', lambda msg='': False)
         g.define('prompt', lambda msg='', d='': d)
         g.define('undefined', _UNDEF)
         g.define('NaN', float('nan'))
         g.define('Infinity', float('inf'))
-        g.define('Symbol', lambda desc=_UNDEF: f'Symbol({_to_str(desc)})' if desc is not _UNDEF else 'Symbol()')
+
+        _sym_registry = {}
+        def _symbol(desc=_UNDEF):
+            key = _to_str(desc) if desc is not _UNDEF else ''
+            sym = f'Symbol({key})'
+            return sym
+        _sym_ctor = type('SymbolCtor', (), {
+            '__call__': staticmethod(_symbol),
+            'for': staticmethod(lambda key: _sym_registry.setdefault(_to_str(key), f'Symbol({_to_str(key)})')),
+            'iterator': 'Symbol(Symbol.iterator)',
+            'hasInstance': 'Symbol(Symbol.hasInstance)',
+            'toPrimitive': 'Symbol(Symbol.toPrimitive)',
+        })()
+        g.define('Symbol', _sym_ctor)
+
+        # Promise
+        promise_ctor = _PromiseCtor(interp=self)
+        promise_obj = promise_ctor.make_ctor_obj()
+        # Allow 'new Promise(fn)' via _exec_new by making it a callable JSFunction-like
+        promise_obj['__is_promise_ctor__'] = True
+        g.define('Promise', promise_obj)
 
         for ename in ('Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError'):
             g.define(ename, lambda msg='', _n=ename: JSObject({'message': _to_str(msg), 'name': _n}))
@@ -340,7 +393,18 @@ class Interpreter:
             iterable = self._eval(node.data['iterable'], env)
             loop_type = node.data.get('loop_type', 'in')
             loop_env = Environment(env)
-            if isinstance(iterable, dict):
+            if isinstance(iterable, JSGenerator):
+                # for-of generator: exhaust the iterator
+                items = []
+                if loop_type == 'of':
+                    while True:
+                        result = iterable._next()
+                        if result.get('done'):
+                            break
+                        items.append(result.get('value', _UNDEF))
+                else:
+                    items = list(range(len(iterable._values)))
+            elif isinstance(iterable, dict):
                 items = list(iterable.keys()) if loop_type == 'in' else list(iterable.values())
             elif isinstance(iterable, (list, tuple)):
                 items = list(range(len(iterable))) if loop_type == 'in' else list(iterable)
@@ -516,9 +580,11 @@ class Interpreter:
             return self._make_class(node, env)
 
         if t == 'Await':
-            return self._eval(node.data['value'], env)
+            val = self._eval(node.data['value'], env)
+            return _unwrap_promise(val)
 
         if t == 'Yield':
+            # Yield inside _exec_generator_stmt is handled there; here it's a no-op
             return self._eval(node.data.get('value'), env) if node.data.get('value') else _UNDEF
 
         if t == 'Spread':
@@ -628,6 +694,8 @@ class Interpreter:
         fn.param_rest = node.data.get('param_rest')
         fn.param_patterns = node.data.get('param_patterns', {})
         fn.is_class = False
+        fn.is_async = node.data.get('is_async', False)
+        fn.is_generator = node.data.get('is_generator', False)
         proto = JSObject({'constructor': fn})
         fn.properties['prototype'] = proto
         return fn
@@ -674,6 +742,8 @@ class Interpreter:
             fn.param_rest = m.data.get('param_rest')
             fn.param_patterns = m.data.get('param_patterns', {})
             fn.is_class = False
+            fn.is_async = m.data.get('is_async', False)
+            fn.is_generator = m.data.get('is_generator', False)
             target = ctor_fn.properties if m.data.get('is_static') else proto
             kind = m.data.get('kind', 'method')
             if kind == 'get':
@@ -754,11 +824,123 @@ class Interpreter:
         if this_val is not None:
             call_env.define('this', this_val)
 
+        is_gen = getattr(fn, 'is_generator', False)
+        is_async = getattr(fn, 'is_async', False)
+
+        if is_gen:
+            return self._run_generator(fn.body, call_env)
+
+        if is_async:
+            p = JSPromise(_interp=self)
+            try:
+                self._exec_stmt(fn.body, call_env)
+                p._resolve(_UNDEF)
+            except _Return as r:
+                val = r.value
+                # If the returned value is a Promise, chain it
+                if isinstance(val, JSPromise):
+                    val._then(p._resolve, p._reject)
+                else:
+                    p._resolve(val)
+            except _Throw as e:
+                p._reject(e.value)
+            except Exception as e:
+                p._reject(str(e))
+            drain_microtasks()
+            return p
+
         try:
             self._exec_stmt(fn.body, call_env)
         except _Return as r:
             return r.value
         return _UNDEF
+
+    def _run_generator(self, body, env) -> 'JSGenerator':
+        """Execute a generator body, collecting all yielded values eagerly.
+
+        Yield does not truly suspend execution — all yields are collected
+        synchronously and the caller gets an iterator over them.  This covers
+        the common for-of / spread / Array.from usage without requiring
+        Python coroutine machinery.
+        """
+        yielded: list = []
+        env.define('__gen_yields__', yielded)
+        try:
+            self._exec_generator_stmt(body, env, yielded)
+        except _Return:
+            pass
+        return JSGenerator(yielded)
+
+    def _exec_generator_stmt(self, node, env, yields: list):
+        """Like _exec_stmt but intercepts Yield nodes."""
+        if node is None:
+            return
+        t = node.type
+        if t == 'Yield':
+            val = self._eval(node.data.get('value'), env) if node.data.get('value') else _UNDEF
+            yields.append(val)
+            return
+        if t == 'ExprStmt':
+            expr = node.data.get('expr')
+            if expr is not None and expr.type == 'Yield':
+                val = self._eval(expr.data.get('value'), env) if expr.data.get('value') else _UNDEF
+                yields.append(val)
+                return
+            # Normal expression (no yield) — execute as-is
+            self._eval(expr, env)
+            return
+        if t == 'Block':
+            block_env = Environment(env)
+            for stmt in node.data['body']:
+                self._exec_generator_stmt(stmt, block_env, yields)
+            return
+        if t == 'For':
+            loop_env = Environment(env)
+            init = node.data.get('init')
+            if init:
+                if isinstance(init, ASTNode) and init.type == 'VarDecl':
+                    self._exec_stmt(init, loop_env)
+                else:
+                    self._eval(init, loop_env)
+            count = 0
+            while True:
+                count += 1
+                if count > self.MAX_ITERATIONS:
+                    break
+                cond = node.data.get('cond')
+                if cond and not _to_bool(self._eval(cond, loop_env)):
+                    break
+                try:
+                    self._exec_generator_stmt(node.data['body'], loop_env, yields)
+                except _Break:
+                    break
+                except _Continue:
+                    pass
+                upd = node.data.get('update')
+                if upd:
+                    self._eval(upd, loop_env)
+            return
+        if t == 'While':
+            count = 0
+            while _to_bool(self._eval(node.data['cond'], env)):
+                count += 1
+                if count > self.MAX_ITERATIONS:
+                    break
+                try:
+                    self._exec_generator_stmt(node.data['body'], env, yields)
+                except _Break:
+                    break
+                except _Continue:
+                    continue
+            return
+        if t == 'If':
+            if _to_bool(self._eval(node.data['cond'], env)):
+                self._exec_generator_stmt(node.data['then'], env, yields)
+            elif node.data.get('else_'):
+                self._exec_generator_stmt(node.data['else_'], env, yields)
+            return
+        # Fall through to normal statement execution for everything else
+        self._exec_stmt(node, env)
 
     def _exec_new(self, node, env):
         callee = self._eval(node.data['callee'], env)
@@ -766,6 +948,11 @@ class Interpreter:
 
         if callee is _UNDEF or callee is None:
             return JSObject()
+
+        # new Promise(executor)
+        if isinstance(callee, dict) and callee.get('__is_promise_ctor__'):
+            executor = args[0] if args else _UNDEF
+            return JSPromise(executor if executor is not _UNDEF else None, _interp=self)
 
         if isinstance(callee, JSFunction):
             obj = JSObject()
@@ -853,6 +1040,23 @@ class Interpreter:
             rest_name = pattern.data.get('rest')
             if rest_name:
                 env.define(rest_name, JSArray(lst[len(elements):]))
+
+
+# ---------------------------------------------------------------------------
+# Promise unwrap helper (used by await)
+# ---------------------------------------------------------------------------
+
+def _unwrap_promise(val):
+    """Synchronously unwrap a settled Promise; return raw value otherwise."""
+    if not isinstance(val, JSPromise):
+        return val
+    drain_microtasks()
+    if val._state == JSPromise.FULFILLED:
+        return val._value
+    if val._state == JSPromise.REJECTED:
+        raise _Throw(val._value)
+    # Still pending — return undefined (best effort in synchronous model)
+    return _UNDEF
 
 
 # ---------------------------------------------------------------------------
