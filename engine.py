@@ -272,12 +272,13 @@ def _execute_scripts(document, base_url: str) -> None:
     from js.interpreter import Interpreter
     from js.dom_api import DOMBinding
     from js.xhr import XMLHttpRequest
-    from js.promise import drain_microtasks
+    from js.event_loop import get_event_loop, reset_event_loop
 
     scripts: list = []
     _collect_scripts(document, scripts)
     if not scripts:
         return
+    reset_event_loop()
 
     interp = Interpreter()
     binding = DOMBinding(document, interp)
@@ -332,11 +333,11 @@ def _execute_scripts(document, base_url: str) -> None:
 
     for sn in blocking:
         _run_script(sn)
-        drain_microtasks()
+        get_event_loop().run_until_idle()
 
     for sn in deferred:
         _run_script(sn)
-        drain_microtasks()
+        get_event_loop().run_until_idle()
 
 
 def _install_fetch(interp, base_url: str) -> None:
