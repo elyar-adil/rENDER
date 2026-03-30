@@ -1,12 +1,147 @@
+"""DOM/BOM API bindings for the JavaScript interpreter."""
 import logging
 _logger = logging.getLogger(__name__)
-"""DOM/BOM API bindings for the JavaScript interpreter."""
+
 from js.interpreter import (
     Interpreter, Environment, JSObject, JSArray, JSFunction,
     _UNDEF, _to_str, _to_bool, _get_property, _set_property,
 )
 from js.parser import _UNDEF as UNDEF
 from html.dom import Element, Text, Document
+
+
+# ---------------------------------------------------------------------------
+# Event system
+# ---------------------------------------------------------------------------
+
+class JSEvent(JSObject):
+    """Minimal DOM Event object."""
+
+    def __init__(self, type_: str, bubbles: bool = False,
+                 cancelable: bool = False, detail=_UNDEF):
+        super().__init__()
+        self['type'] = type_
+        self['bubbles'] = bubbles
+        self['cancelable'] = cancelable
+        self['detail'] = detail
+        self['target'] = None
+        self['currentTarget'] = None
+        self['defaultPrevented'] = False
+        self['propagationStopped'] = False
+        self['immediatePropagationStopped'] = False
+        self['preventDefault'] = lambda: self.__setitem__('defaultPrevented', True)
+        self['stopPropagation'] = lambda: self.__setitem__('propagationStopped', True)
+        self['stopImmediatePropagation'] = lambda: (
+            self.__setitem__('propagationStopped', True) or
+            self.__setitem__('immediatePropagationStopped', True)
+        )
+
+
+def _dispatch_event(node, event: JSEvent, binding) -> bool:
+    """Dispatch event with capture + bubble phases (simplified).
+
+    Returns False if preventDefault() was called, True otherwise.
+    """
+    # Build ancestor chain for capture phase
+    ancestors: list = []
+    p = getattr(node, 'parent', None)
+    while p is not None:
+        ancestors.append(p)
+        p = getattr(p, 'parent', None)
+
+    event['target'] = binding.wrap(node)
+
+    # Capture phase (root → parent)
+    for ancestor in reversed(ancestors):
+        wrapper = binding.wrap(ancestor)
+        if isinstance(wrapper, DOMElement):
+            _invoke_listeners(wrapper, event, capture=True)
+        if event.get('propagationStopped'):
+            break
+
+    # At-target phase
+    wrapper = binding.wrap(node)
+    if isinstance(wrapper, DOMElement):
+        event['currentTarget'] = wrapper
+        _invoke_listeners(wrapper, event, capture=False)
+        _invoke_listeners(wrapper, event, capture=True)
+
+    # Bubble phase (parent → root)
+    if event.get('bubbles') and not event.get('propagationStopped'):
+        for ancestor in ancestors:
+            wrapper = binding.wrap(ancestor)
+            if isinstance(wrapper, DOMElement):
+                event['currentTarget'] = wrapper
+                _invoke_listeners(wrapper, event, capture=False)
+                if event.get('propagationStopped'):
+                    break
+
+    return not event.get('defaultPrevented', False)
+
+
+def _invoke_listeners(wrapper: 'DOMElement', event: JSEvent, capture: bool):
+    """Call all registered listeners of the given phase."""
+    event_type = event['type']
+    listeners = wrapper._event_listeners.get(event_type, [])
+    for entry in list(listeners):
+        fn = entry['fn']
+        if entry.get('capture', False) != capture:
+            continue
+        try:
+            if wrapper._binding.interpreter:
+                wrapper._binding.interpreter._call_value(fn, [event])
+            elif callable(fn):
+                fn(event)
+        except Exception as exc:
+            _logger.debug('Event listener error: %s', exc)
+        if event.get('immediatePropagationStopped'):
+            break
+
+
+# ---------------------------------------------------------------------------
+# MutationObserver
+# ---------------------------------------------------------------------------
+
+class JSMutationObserver(JSObject):
+    """Minimal MutationObserver implementation."""
+
+    def __init__(self, callback, binding):
+        super().__init__()
+        self._callback = callback
+        self._binding = binding
+        self._observed: list = []  # (node, options)
+        self._records: list = []
+
+        self['observe'] = self._observe
+        self['disconnect'] = self._disconnect
+        self['takeRecords'] = self._take_records
+
+    def _observe(self, target, options=_UNDEF):
+        if isinstance(target, DOMElement):
+            self._observed.append((target, options if isinstance(options, dict) else {}))
+        return _UNDEF
+
+    def _disconnect(self):
+        self._observed = []
+        return _UNDEF
+
+    def _take_records(self):
+        records = JSArray(self._records)
+        self._records = []
+        return records
+
+    def notify(self, record: JSObject):
+        """Called internally when a mutation occurs on an observed node."""
+        self._records.append(record)
+        try:
+            if self._binding.interpreter:
+                self._binding.interpreter._call_value(
+                    self._callback, [JSArray([record]), self]
+                )
+            elif callable(self._callback):
+                self._callback(JSArray([record]), self)
+        except Exception as exc:
+            _logger.debug('MutationObserver callback error: %s', exc)
 
 
 class DOMElement(JSObject):
@@ -16,7 +151,7 @@ class DOMElement(JSObject):
         super().__init__()
         self._node = node
         self._binding = binding
-        self._event_listeners = {}  # event_name -> [fn, ...]
+        self._event_listeners = {}  # event_name -> [{'fn': fn, 'capture': bool}, ...]
 
         # Properties
         self['nodeType'] = 1
@@ -42,9 +177,9 @@ class DOMElement(JSObject):
         self['replaceChild'] = lambda new, old: self._replace_child(new, old)
         self['cloneNode'] = lambda deep=False: self  # stub
 
-        self['addEventListener'] = lambda ev, fn, *a: self._add_event_listener(ev, fn)
-        self['removeEventListener'] = lambda ev, fn, *a: self._remove_event_listener(ev, fn)
-        self['dispatchEvent'] = lambda ev: None
+        self['addEventListener'] = lambda ev, fn, opts=_UNDEF: self._add_event_listener(ev, fn, opts)
+        self['removeEventListener'] = lambda ev, fn, opts=_UNDEF: self._remove_event_listener(ev, fn)
+        self['dispatchEvent'] = lambda ev: self._dispatch(ev)
 
         self['contains'] = lambda other: False
         self['matches'] = lambda sel: self._matches(sel)
@@ -214,6 +349,9 @@ class DOMElement(JSObject):
                 pass
         child_node.parent = self._node
         self._node.children.append(child_node)
+        self._notify_mutation('childList',
+                              addedNodes=JSArray([child_wrapper]),
+                              removedNodes=JSArray())
         return child_wrapper
 
     def _remove_child(self, child_wrapper):
@@ -225,6 +363,9 @@ class DOMElement(JSObject):
             self._node.children.remove(child_node)
         except ValueError:
             pass
+        self._notify_mutation('childList',
+                              addedNodes=JSArray(),
+                              removedNodes=JSArray([child_wrapper]))
         return child_wrapper
 
     def _insert_before(self, new_wrapper, ref_wrapper):
@@ -310,15 +451,43 @@ class DOMElement(JSObject):
         cl['replace'] = lambda old, new: _classList_replace(node, old, new)
         return cl
 
-    def _add_event_listener(self, event, fn):
-        self._event_listeners.setdefault(event, []).append(fn)
+    def _add_event_listener(self, event, fn, opts=_UNDEF):
+        capture = False
+        if isinstance(opts, dict):
+            capture = bool(opts.get('capture', False))
+        elif opts is True:
+            capture = True
+        self._event_listeners.setdefault(_to_str(event), []).append(
+            {'fn': fn, 'capture': capture}
+        )
 
     def _remove_event_listener(self, event, fn):
-        listeners = self._event_listeners.get(event, [])
-        try:
-            listeners.remove(fn)
-        except ValueError:
-            pass
+        listeners = self._event_listeners.get(_to_str(event), [])
+        self._event_listeners[_to_str(event)] = [
+            entry for entry in listeners if entry['fn'] is not fn
+        ]
+
+    def _dispatch(self, event):
+        if not isinstance(event, JSEvent):
+            return True
+        return _dispatch_event(self._node, event, self._binding)
+
+    def _notify_mutation(self, record_type: str, **kwargs):
+        """Notify any MutationObservers watching this node."""
+        record = JSObject({'type': record_type, 'target': self, **kwargs})
+        for obs in self._binding._mutation_observers:
+            for (target, opts) in obs._observed:
+                if target is self:
+                    should_notify = False
+                    if record_type == 'childList' and opts.get('childList'):
+                        should_notify = True
+                    elif record_type == 'attributes' and opts.get('attributes'):
+                        should_notify = True
+                    elif record_type == 'characterData' and opts.get('characterData'):
+                        should_notify = True
+                    if should_notify:
+                        obs.notify(record)
+                    break
 
 
 class DOMText(JSObject):
@@ -374,6 +543,8 @@ class DOMBinding:
         self.document = document
         self.interpreter = interpreter
         self._node_cache = {}  # id(node) -> wrapper
+        self._mutation_observers: list = []  # JSMutationObserver instances
+        self._custom_elements: dict = {}   # tag -> (constructor_fn, options)
 
     def setup(self) -> None:
         """Set up document, window, console objects in JS scope."""
@@ -381,10 +552,86 @@ class DOMBinding:
         doc_obj = self._make_document()
         g.define('document', doc_obj)
 
+        # MutationObserver constructor
+        binding = self
+        def _mo_ctor(callback):
+            obs = JSMutationObserver(callback, binding)
+            binding._mutation_observers.append(obs)
+            return obs
+        g.define('MutationObserver', _mo_ctor)
+
+        # IntersectionObserver stub
+        def _io_ctor(callback, options=_UNDEF):
+            obj = JSObject()
+            obj['observe'] = lambda el: None
+            obj['unobserve'] = lambda el: None
+            obj['disconnect'] = lambda: None
+            return obj
+        g.define('IntersectionObserver', _io_ctor)
+
+        # ResizeObserver stub
+        def _ro_ctor(callback):
+            obj = JSObject()
+            obj['observe'] = lambda el, opts=_UNDEF: None
+            obj['unobserve'] = lambda el: None
+            obj['disconnect'] = lambda: None
+            return obj
+        g.define('ResizeObserver', _ro_ctor)
+
+        # CustomEvent constructor
+        def _custom_event(type_str, init=_UNDEF):
+            bubbles = False
+            cancelable = False
+            detail = _UNDEF
+            if isinstance(init, dict):
+                bubbles = bool(init.get('bubbles', False))
+                cancelable = bool(init.get('cancelable', False))
+                detail = init.get('detail', _UNDEF)
+            return JSEvent(_to_str(type_str), bubbles=bubbles,
+                           cancelable=cancelable, detail=detail)
+        g.define('CustomEvent', _custom_event)
+
+        # Event constructor
+        def _event_ctor(type_str, init=_UNDEF):
+            bubbles = False
+            cancelable = False
+            if isinstance(init, dict):
+                bubbles = bool(init.get('bubbles', False))
+                cancelable = bool(init.get('cancelable', False))
+            return JSEvent(_to_str(type_str), bubbles=bubbles, cancelable=cancelable)
+        g.define('Event', _event_ctor)
+
+        # customElements registry
+        ce_registry = JSObject()
+        ce_registry['define'] = lambda name, ctor, opts=_UNDEF: self._register_custom_element(name, ctor, opts)
+        ce_registry['get'] = lambda name: self._custom_elements.get(_to_str(name), (None,))[0]
+        ce_registry['whenDefined'] = lambda name: _UNDEF
+        g.define('customElements', ce_registry)
+
+        # localStorage / sessionStorage
+        ls = _make_storage()
+        ss = _make_storage()
+        g.define('localStorage', ls)
+        g.define('sessionStorage', ss)
+
         # Also set on window
         window = g.get('window')
         if isinstance(window, dict):
             window['document'] = doc_obj
+            window['MutationObserver'] = g.get('MutationObserver')
+            window['IntersectionObserver'] = g.get('IntersectionObserver')
+            window['ResizeObserver'] = g.get('ResizeObserver')
+            window['CustomEvent'] = _custom_event
+            window['Event'] = _event_ctor
+            window['customElements'] = ce_registry
+            window['localStorage'] = ls
+            window['sessionStorage'] = ss
+
+    def _register_custom_element(self, name, ctor, options=_UNDEF):
+        tag = _to_str(name).lower()
+        self._custom_elements[tag] = (ctor, options if isinstance(options, dict) else {})
+        # Upgrade any existing elements in the DOM
+        self._upgrade_custom_elements(tag, ctor)
 
     def wrap(self, node):
         """Wrap a DOM node into a JS-accessible object."""
@@ -402,6 +649,17 @@ class DOMBinding:
         self._node_cache[nid] = w
         return w
 
+    def _upgrade_custom_elements(self, tag: str, ctor):
+        """Call constructor/connectedCallback on existing matching elements."""
+        for el in _walk(self.document):
+            if el.tag == tag:
+                wrapper = self.wrap(el)
+                try:
+                    if self.interpreter:
+                        self.interpreter._call_value(ctor, [wrapper])
+                except Exception as exc:
+                    _logger.debug('Custom element upgrade error: %s', exc)
+
     def _make_document(self):
         doc = JSObject()
         doc['nodeType'] = 9
@@ -416,8 +674,15 @@ class DOMBinding:
         doc['createTextNode'] = lambda text: self._create_text_node(text)
         doc['createDocumentFragment'] = lambda: self._create_element('__fragment__')
         doc['createComment'] = lambda text: None
-        doc['addEventListener'] = lambda *a: None
-        doc['removeEventListener'] = lambda *a: None
+        _doc_listeners: dict = {}
+        def _doc_add_listener(ev, fn, opts=_UNDEF):
+            _doc_listeners.setdefault(_to_str(ev), []).append(fn)
+        def _doc_remove_listener(ev, fn, opts=_UNDEF):
+            lst = _doc_listeners.get(_to_str(ev), [])
+            _doc_listeners[_to_str(ev)] = [f for f in lst if f is not fn]
+        doc['addEventListener'] = _doc_add_listener
+        doc['removeEventListener'] = _doc_remove_listener
+        doc['dispatchEvent'] = lambda ev: True
 
         # document.body / document.head / document.documentElement
         doc['body'] = self._find_and_wrap('body')
@@ -480,6 +745,35 @@ class DOMBinding:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _make_storage() -> JSObject:
+    """Create a localStorage/sessionStorage object (in-memory, per-session)."""
+    store: dict = {}
+    obj = JSObject()
+    obj['getItem'] = lambda k: store.get(_to_str(k), None)
+    obj['setItem'] = lambda k, v: store.__setitem__(_to_str(k), _to_str(v))
+    obj['removeItem'] = lambda k: store.pop(_to_str(k), None)
+    obj['clear'] = lambda: store.clear()
+    obj['key'] = lambda n: list(store.keys())[int(n)] if 0 <= int(n) < len(store) else None
+    # length as a callable (JS would be a property, we approximate)
+    obj['length'] = 0
+    _orig_set = obj['setItem']
+    _orig_del = obj['removeItem']
+    _orig_clr = obj['clear']
+    def _set(k, v):
+        _orig_set(k, v)
+        obj['length'] = len(store)
+    def _del(k):
+        _orig_del(k)
+        obj['length'] = len(store)
+    def _clr():
+        _orig_clr()
+        obj['length'] = 0
+    obj['setItem'] = _set
+    obj['removeItem'] = _del
+    obj['clear'] = _clr
+    return obj
+
 
 def _walk(node):
     """Yield all descendant elements."""
