@@ -309,15 +309,18 @@ def _execute_scripts(document, base_url: str) -> None:
         attrs = getattr(script_node, 'attributes', {})
         src = attrs.get('src', '').strip()
         js_code = ''
+        script_label = ''
         if src:
             try:
                 from network.http import fetch as fetch_text, resolve_url
                 url = resolve_url(base_url, src) if base_url else src
                 js_code, _ = fetch_text(url)
+                script_label = url
             except Exception:
                 return
         else:
             js_code = ''.join(c.data for c in script_node.children if isinstance(c, Text))
+            script_label = f'{base_url} (inline)'
         if not js_code or not js_code.strip():
             return
         try:
@@ -325,7 +328,7 @@ def _execute_scripts(document, base_url: str) -> None:
             ast = Parser(tokens).parse()
             interp.execute(ast)
         except Exception as e:
-            print(f'[JS] Script error: {e}', file=sys.stderr)
+            print(f'[JS] Script error in {script_label}: {e}', file=sys.stderr)
 
     for sn in blocking:
         _run_script(sn)
