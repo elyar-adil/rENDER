@@ -8,11 +8,13 @@ import engine
 from js.interpreter import Interpreter
 from js.lexer import Lexer
 from js.parser import Parser
+from js.event_loop import get_event_loop, reset_event_loop
 from js.promise import JSPromise, drain_microtasks
 from js.types import _UNDEF
 
 
 def _exec(code: str) -> Interpreter:
+    reset_event_loop()
     interp = Interpreter()
     ast = Parser(Lexer(code).tokenize()).parse()
     interp.execute(ast)
@@ -134,6 +136,28 @@ def test_promise_race():
             .then(function(v) { winner = v; });
     """)
     assert interp.global_env.get('winner') == 'a'
+
+
+def test_event_loop_runs_microtasks_before_timers():
+    interp = _exec("""
+        var log = [];
+        Promise.resolve(1).then(function() { log.push('microtask'); });
+        setTimeout(function() { log.push('timer'); }, 0);
+    """)
+    get_event_loop().run_until_idle()
+    assert list(interp.global_env.get('log')) == ['microtask', 'timer']
+
+
+def test_timer_callback_can_enqueue_followup_microtasks():
+    interp = _exec("""
+        var log = [];
+        setTimeout(function() {
+            log.push('timer');
+            Promise.resolve().then(function() { log.push('after-timer'); });
+        }, 0);
+    """)
+    get_event_loop().run_until_idle()
+    assert list(interp.global_env.get('log')) == ['timer', 'after-timer']
 
 
 # ---------------------------------------------------------------------------

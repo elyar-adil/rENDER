@@ -1,31 +1,16 @@
-"""Promise and microtask queue for rENDER browser engine.
+"""Promise and microtask queue helpers for the rENDER browser engine."""
 
-Implements a synchronous-eager Promise that settles immediately when possible
-and drains microtasks inline. This makes async/await and .then() chains work
-correctly for the single-threaded script execution model used by the browser.
-"""
-
+from js.event_loop import get_event_loop
 from js.types import _UNDEF, JSObject, JSArray, JSFunction
-
-# ---------------------------------------------------------------------------
-# Microtask queue
-# ---------------------------------------------------------------------------
-
-_microtask_queue: list = []
 
 
 def _enqueue_microtask(fn) -> None:
-    _microtask_queue.append(fn)
+    get_event_loop().enqueue_microtask(fn)
 
 
 def drain_microtasks() -> None:
-    """Run all pending microtasks in FIFO order (re-entrant safe)."""
-    while _microtask_queue:
-        task = _microtask_queue.pop(0)
-        try:
-            task()
-        except Exception:
-            pass
+    """Run a microtask checkpoint (re-entrant safe)."""
+    get_event_loop().perform_microtask_checkpoint()
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +89,6 @@ class JSPromise(JSObject):
         self._handlers = []
         for entry in handlers:
             _enqueue_microtask(lambda e=entry: self._run_handler(*e))
-        drain_microtasks()
 
     def _run_handler(self, on_f, on_r, child):
         handler = on_f if self._state == self.FULFILLED else on_r
@@ -127,7 +111,6 @@ class JSPromise(JSObject):
             self._handlers.append((on_fulfill, on_reject, child))
         else:
             _enqueue_microtask(lambda: self._run_handler(on_fulfill, on_reject, child))
-            drain_microtasks()
         return child
 
     def _finally(self, fn):

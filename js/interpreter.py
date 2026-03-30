@@ -22,6 +22,7 @@ from js.builtins import (
     _object_assign, _object_create, _iter_enumerable_entries,
     _JSDate,
 )
+from js.event_loop import get_event_loop
 from js.promise import JSPromise, _PromiseCtor, drain_microtasks, _enqueue_microtask
 
 # Re-export everything that external modules import from js.interpreter
@@ -268,11 +269,11 @@ class Interpreter:
         print(self.console_prefix, msg) if self.console_prefix else print(msg)
 
     def _set_timeout(self, fn, ms, *args):
-        if isinstance(ms, (int, float)) and ms <= 0:
-            try:
-                self._call_value(fn, list(args))
-            except Exception as exc:
-                _logger.debug('setTimeout ignored: %s', exc)
+        try:
+            return get_event_loop().set_timeout(fn, *args, _interp=self)
+        except Exception as exc:
+            _logger.debug('setTimeout ignored: %s', exc)
+            return None
 
     # ------------------------------------------------------------------
     # Entry points
@@ -846,7 +847,6 @@ class Interpreter:
                 p._reject(e.value)
             except Exception as e:
                 p._reject(str(e))
-            drain_microtasks()
             return p
 
         try:
