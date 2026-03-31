@@ -387,7 +387,11 @@ def _parse_font_value(value: str) -> dict:
         tl = tok.lower().split('/')[0]
         if tl in _SIZE_KEYWORDS:
             return True
-        if re.match(r'^-?\d+(\.\d+)?(px|em|rem|vw|vh|pt|cm|mm|in|%)?$', tl):
+        # In font shorthand, a bare number like "300" is a valid font-weight
+        # and must not be mistaken for font-size.
+        if tl == '0':
+            return True
+        if re.match(r'^-?\d+(\.\d+)?(px|em|rem|vw|vh|vmin|vmax|pt|pc|cm|mm|in|ex|ch|%)$', tl):
             return True
         return False
 

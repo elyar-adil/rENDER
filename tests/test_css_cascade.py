@@ -8,6 +8,7 @@ from html.dom import Document, Element, Text
 from css.cascade import _media_matches, _media_single_matches
 import css.parser as css_parser
 import css.selector as selector_mod
+from css.properties import expand_shorthand
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +326,13 @@ class TestCSSParser(unittest.TestCase):
         # Empty string returns empty dict
         result = css_parser.parse_inline_style('')
         self.assertFalse(result)  # Empty dict is falsy
+
+    def test_font_shorthand_distinguishes_weight_from_size(self):
+        expanded = expand_shorthand('font', '300 18px/170% Microsoft YaHei,sans-serif')
+        self.assertEqual(expanded.get('font-weight'), '300')
+        self.assertEqual(expanded.get('font-size'), '18px')
+        self.assertEqual(expanded.get('line-height'), '170%')
+        self.assertEqual(expanded.get('font-family'), 'Microsoft YaHei, sans-serif')
 
     def test_declaration_with_no_value_skipped(self):
         # Malformed CSS should not crash
