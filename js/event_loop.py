@@ -2,13 +2,15 @@
 
 The runtime is still single-threaded/synchronous, but this module centralizes
 queueing semantics so Promise reactions are no longer drained inline from inside
-Promise settlement.
+Promise settlement. Timers are scheduled against a virtual monotonic clock so
+future callbacks do not execute during the same initial bootstrap turn.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+import heapq
 from typing import Callable
 
 Task = Callable[[], None]
@@ -20,7 +22,6 @@ class EventLoop:
 
     task_queues: dict[str, deque[Task]] = field(default_factory=lambda: {
         'script': deque(),
-        'timer': deque(),
         'network': deque(),
         'user-interaction': deque(),
     })
@@ -30,12 +31,26 @@ class EventLoop:
     render_requested: bool = False
     animation_frame_callbacks: deque[tuple[int, Callable[[float], None]]] = field(default_factory=deque)
     _next_animation_frame_id: int = 1
+    current_time_ms: int = 0
+    _timers: list[tuple[int, int, int, Task]] = field(default_factory=list)
+    _cancelled_timer_ids: set[int] = field(default_factory=set)
+    _next_timer_id: int = 1
+    _timer_order: int = 0
 
     def enqueue_task(self, queue: str, fn: Task) -> None:
         self.task_queues.setdefault(queue, deque()).append(fn)
 
     def enqueue_microtask(self, fn: Task) -> None:
         self.microtasks.append(fn)
+
+    def _promote_due_timers(self) -> None:
+        timer_queue = self.task_queues.setdefault('timer', deque())
+        while self._timers and self._timers[0][0] <= self.current_time_ms:
+            _due_ms, _order, timer_id, task = heapq.heappop(self._timers)
+            if timer_id in self._cancelled_timer_ids:
+                self._cancelled_timer_ids.discard(timer_id)
+                continue
+            timer_queue.append(task)
 
     def set_render_callback(self, fn: Task | None) -> None:
         self.render_callback = fn
@@ -87,6 +102,7 @@ class EventLoop:
             pass
 
     def run_next_task(self) -> bool:
+        self._promote_due_timers()
         for queue in ('script', 'timer', 'network', 'user-interaction'):
             q = self.task_queues.get(queue)
             if not q:
@@ -109,15 +125,30 @@ class EventLoop:
         self.perform_microtask_checkpoint()
         self.perform_rendering_opportunity()
 
-    def set_timeout(self, callback: Callable, *args, _interp=None) -> int:
+    def advance_time(self, delta_ms: int) -> None:
+        self.current_time_ms += max(0, int(delta_ms))
+
+    def set_timeout(self, callback: Callable, delay_ms: int = 0, *args, _interp=None) -> int:
         def _task():
             if _interp is not None:
                 _interp._call_value(callback, list(args))
             elif callable(callback):
                 callback(*args)
 
-        self.enqueue_task('timer', _task)
-        return 1
+        delay = max(0, int(delay_ms))
+        timer_id = self._next_timer_id
+        self._next_timer_id += 1
+        self._timer_order += 1
+        heapq.heappush(
+            self._timers,
+            (self.current_time_ms + delay, self._timer_order, timer_id, _task),
+        )
+        return timer_id
+
+    def clear_timeout(self, timer_id: int | None) -> None:
+        if timer_id is None:
+            return
+        self._cancelled_timer_ids.add(int(timer_id))
 
 
 _DEFAULT_EVENT_LOOP = EventLoop()

@@ -209,8 +209,8 @@ class Interpreter:
         g.define('RegExp', lambda p, f='': re.compile(_to_str(p)))
         g.define('setTimeout', lambda fn, ms=0, *a: self._set_timeout(fn, ms, *a))
         g.define('setInterval', lambda fn, ms=0, *a: None)
-        g.define('clearTimeout', lambda tid: None)
-        g.define('clearInterval', lambda tid: None)
+        g.define('clearTimeout', lambda tid: self._clear_timeout(tid))
+        g.define('clearInterval', lambda tid: self._clear_timeout(tid))
         g.define('requestAnimationFrame', lambda fn: self._request_animation_frame(fn))
         g.define('cancelAnimationFrame', lambda req_id: self._cancel_animation_frame(req_id))
         g.define('queueMicrotask', lambda fn: _enqueue_microtask(lambda: self._call_value(fn, [])))
@@ -273,10 +273,16 @@ class Interpreter:
 
     def _set_timeout(self, fn, ms, *args):
         try:
-            return get_event_loop().set_timeout(fn, *args, _interp=self)
+            return get_event_loop().set_timeout(fn, int(_to_num(ms)), *args, _interp=self)
         except Exception as exc:
             _logger.debug('setTimeout ignored: %s', exc)
             return None
+
+    def _clear_timeout(self, timer_id):
+        try:
+            get_event_loop().clear_timeout(int(_to_num(timer_id)))
+        except Exception as exc:
+            _logger.debug('clearTimeout ignored: %s', exc)
 
     def _request_animation_frame(self, fn):
         try:

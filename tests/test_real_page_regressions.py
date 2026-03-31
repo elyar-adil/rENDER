@@ -163,6 +163,46 @@ def test_real_fixture_generates_before_pseudo_icon():
     assert icon.box.y == pytest.approx(refresh_link.box.y + 12.0, abs=2.0)
 
 
+def test_hao123_header_script_bootstrap_stops_before_future_weather_timers():
+    html = (HAO123_FIXTURE_DIR / "header.html").read_text(encoding="utf-8")
+
+    def _fake_fetch(url):
+        if url.endswith("/api/gethitthecity?"):
+            return ('{"isHit": false}', url)
+        if "/api/citymenu" in url:
+            return ('[{"id":"01","firstchar":"B","name":"北京"}]', url)
+        if "/api/newforecast" in url:
+            return (
+                '{"aqi":{"level":"优","levelLong":"优","levelnum":"1"},'
+                '"alarm":{"w":[]},'
+                '"forecast5d":{"f":{"f1":['
+                '{"weathern_zh":"晴","weatherd_zh":"晴","fd":1,"fc":12,"icon_url":"https://example.com/a.png"},'
+                '{"weathern_zh":"多云","weatherd_zh":"多云","fd":2,"fc":13,"icon_url":"https://example.com/b.png"}'
+                ']}}}',
+                url,
+            )
+        return ("", url)
+
+    with (
+        patch("engine._fetch_subresources", return_value=([], [])),
+        patch("engine._fetch_background_images", return_value=[]),
+        patch("network.http.fetch", side_effect=_fake_fetch),
+    ):
+        _display_list, _page_height, document = engine._pipeline(
+            html,
+            base_url="https://www.hao123.com/",
+            viewport_width=1280,
+            viewport_height=140,
+        )
+
+    links_area = _require_first_by_class(document, "head-item-links-area")
+    weather_tag_area = _require_first_by_class(document, "weather-tag-area")
+
+    assert len(links_area.children) >= 6
+    assert len(weather_tag_area.children) >= 1
+    assert getattr(document, "_render_opportunities", 0) < 20
+
+
 def test_top_level_fixed_element_is_laid_out_after_normal_flow_pass():
     html = """
         <html>

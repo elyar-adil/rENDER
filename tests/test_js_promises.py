@@ -160,6 +160,30 @@ def test_timer_callback_can_enqueue_followup_microtasks():
     assert list(interp.global_env.get('log')) == ['timer', 'after-timer']
 
 
+def test_delayed_timer_waits_for_time_advance():
+    interp = _exec("""
+        var log = [];
+        setTimeout(function() { log.push('late'); }, 50);
+    """)
+    get_event_loop().run_until_idle()
+    assert list(interp.global_env.get('log')) == []
+
+    get_event_loop().advance_time(50)
+    get_event_loop().run_until_idle()
+    assert list(interp.global_env.get('log')) == ['late']
+
+
+def test_clear_timeout_cancels_pending_timer():
+    interp = _exec("""
+        var log = [];
+        var token = setTimeout(function() { log.push('timer'); }, 50);
+        clearTimeout(token);
+    """)
+    get_event_loop().advance_time(50)
+    get_event_loop().run_until_idle()
+    assert list(interp.global_env.get('log')) == []
+
+
 # ---------------------------------------------------------------------------
 # async / await
 # ---------------------------------------------------------------------------
