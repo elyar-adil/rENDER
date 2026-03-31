@@ -6,19 +6,8 @@ from layout.block import layout_block, layout_absolute
 from layout.flex import layout_flex
 from layout.inline import layout_inline
 from layout.grid import layout_grid
-from layout.paint import (
-    build_display_list as _build_display_list,
-    _parse_single_shadow,
-    _parse_shadow,
-    _parse_all_shadows,
-    _parse_css_transform,
-    _parse_transform_origin,
-    _parse_linear_gradient,
-    _parse_radial_gradient,
-    _get_list_marker,
-    _to_roman,
-)
-from layout.links import _extract_links, _collect_links
+from layout.paint import build_display_list as _build_display_list
+from layout.links import _extract_links
 from rendering.display_list import DisplayList
 
 
@@ -54,15 +43,17 @@ def layout(document, viewport_width: int = VIEWPORT_WIDTH, viewport_height: int 
     _build_display_list(document, display_list, stacking_top)
 
     # Sort stacking context items by z-index (lower z-index painted first)
-    stacking_top.sort(key=lambda item: (item[0], item[1]) if isinstance(item, tuple) and len(item) == 3 else (0, 0))
-    for item in stacking_top:
-        if isinstance(item, tuple) and len(item) == 3:
-            for cmd in item[2]:
-                display_list.add(cmd)
-        else:
-            display_list.add(item)
+    stacking_top.sort(key=lambda item: (item[0], item[1]))
+    for _z, _order, cmds in stacking_top:
+        for cmd in cmds:
+            display_list.add(cmd)
 
     return display_list
+
+
+def _node_style(node, prop: str, default: str) -> str:
+    style = getattr(node, 'style', None)
+    return style.get(prop, default) if style else default
 
 
 def _layout_children(node, container_box: BoxModel, viewport_width: int) -> None:
@@ -75,8 +66,8 @@ def _layout_children(node, container_box: BoxModel, viewport_width: int) -> None
         if not isinstance(child, Element):
             continue
 
-        display = child.style.get('display', 'block') if hasattr(child, 'style') and child.style else 'block'
-        position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
+        display = _node_style(child, 'display', 'block')
+        position = _node_style(child, 'position', 'static')
 
         if display == 'none':
             continue
@@ -107,7 +98,7 @@ def _layout_deferred_abs(node, root_box: BoxModel, viewport_width: int, viewport
     from html.dom import Element
 
     for child in _walk_elements(node):
-        position = child.style.get('position', 'static') if hasattr(child, 'style') and child.style else 'static'
+        position = _node_style(child, 'position', 'static')
         if position in ('absolute', 'fixed') and getattr(child, 'box', None) is None:
             containing = _find_containing_block(child, node, root_box)
             child.box = layout_absolute(
@@ -129,14 +120,12 @@ def _walk_elements(node):
 def _find_containing_block(node, root, root_box: BoxModel) -> BoxModel:
     """Find the nearest positioned ancestor's box, or root box for fixed/fallback."""
     from html.dom import Element
-    position = node.style.get('position', 'static') if hasattr(node, 'style') and node.style else 'static'
-    if position == 'fixed':
+    if _node_style(node, 'position', 'static') == 'fixed':
         return root_box
     # Walk parent pointers to find nearest positioned ancestor
     parent = getattr(node, 'parent', None)
     while parent is not None and isinstance(parent, Element):
-        parent_pos = parent.style.get('position', 'static') if hasattr(parent, 'style') and parent.style else 'static'
-        if parent_pos in ('relative', 'absolute', 'fixed', 'sticky'):
+        if _node_style(parent, 'position', 'static') in ('relative', 'absolute', 'fixed', 'sticky'):
             if hasattr(parent, 'box') and parent.box is not None:
                 return parent.box
         parent = getattr(parent, 'parent', None)

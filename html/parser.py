@@ -556,10 +556,7 @@ class TreeBuilder:
             return
 
         if isinstance(token, CharacterToken):
-            if self._in_rawtext:
-                self._pending_text.append(token.char)
-            else:
-                self._pending_text.append(token.char)
+            self._pending_text.append(token.char)
             return
 
         if isinstance(token, StartTagToken):
