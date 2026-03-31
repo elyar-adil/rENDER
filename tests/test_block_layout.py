@@ -380,6 +380,55 @@ class TestBlockMarginCollapsing(unittest.TestCase):
         self.assertEqual(child2.box.y, 40)
         self.assertEqual(box.content_height, 60)
 
+    def test_parent_and_first_child_top_margins_collapse(self):
+        parent = make_element(style={
+            'display': 'block',
+            'margin-top': '20px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        child = make_element(style={
+            'display': 'block', 'height': '50px',
+            'margin-top': '30px', 'margin-bottom': '0px',
+            'margin-left': '0px', 'margin-right': '0px',
+        })
+        parent.children = [child]
+        child.parent = parent
+
+        box = do_layout(parent, make_container(x=0, y=0, width=400))
+
+        self.assertEqual(box.y, 30)
+        self.assertEqual(child.box.y, 30)
+
+
+class TestAtomicInlineSizing(unittest.TestCase):
+
+    def test_root_inline_block_auto_width_shrinks_to_contents(self):
+        inline_block = make_element(style={
+            'display': 'inline-block',
+            'width': 'auto',
+            'height': '20px',
+        })
+        inline_block.children = [TextNode('OK')]
+        inline_block.children[0].parent = inline_block
+
+        box = do_layout(inline_block, make_container(x=0, y=0, width=400))
+
+        self.assertLess(box.content_width, 100)
+
+    def test_root_float_auto_width_shrinks_to_contents(self):
+        floated = make_element(style={
+            'display': 'block',
+            'float': 'left',
+            'width': 'auto',
+            'height': '20px',
+        })
+        floated.children = [TextNode('Hi')]
+        floated.children[0].parent = floated
+
+        box = do_layout(floated, make_container(x=0, y=0, width=400))
+
+        self.assertLess(box.content_width, 100)
+
 
 class TestBlockDisplayNone(unittest.TestCase):
 

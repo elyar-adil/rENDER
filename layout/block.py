@@ -13,6 +13,7 @@ _BLOCK_DISPLAYS = frozenset({
     'table-footer-group', 'table-row-group',
     'table-caption', 'table-column-group',
 })
+_ATOMIC_INLINE_DISPLAYS = frozenset({'inline-block', 'inline-flex', 'inline-grid'})
 
 
 def _is_replaced_visual(node) -> bool:
@@ -186,7 +187,7 @@ def _collapse_adjacent_margins(previous_bottom: float, current_top: float) -> fl
     return previous_bottom + current_top
 
 
-def _measure_auto_width(node, container_width: float) -> float:
+def _measure_auto_width(node, container_width: float, fallback_width: float | None = None) -> float:
     try:
         from html.dom import Element, Text
         from layout.inline import _measure_inline_block_intrinsic_width, _measure_text_span
@@ -203,7 +204,9 @@ def _measure_auto_width(node, container_width: float) -> float:
             return measured
     except Exception as _exc:
         _logger.debug("Ignored: %s", _exc)
-    return max(0.0, container_width)
+    if fallback_width is None:
+        fallback_width = container_width
+    return max(0.0, fallback_width)
 
 
 def _needs_local_float_ctx(node) -> bool:
@@ -219,6 +222,30 @@ def _needs_local_float_ctx(node) -> bool:
         if _get_style(child, 'clear', 'none') != 'none':
             return True
     return False
+
+
+def _find_first_collapsible_in_flow_child(node):
+    """Return the first in-flow block child eligible for top-margin collapse."""
+    from html.dom import Element, Text
+
+    for child in getattr(node, 'children', []):
+        if isinstance(child, Text):
+            if child.data.strip():
+                return None
+            continue
+        if not isinstance(child, Element):
+            continue
+        child_display = _get_style(child, 'display', 'inline')
+        child_float = _get_style(child, 'float', 'none')
+        child_pos = _get_style(child, 'position', 'static')
+        if child_display == 'none':
+            continue
+        if child_pos in ('absolute', 'fixed') or child_float != 'none':
+            continue
+        if child_display in _BLOCK_DISPLAYS or _acts_like_block_container(child):
+            return child
+        return None
+    return None
 
 
 def _acts_like_block_container(node) -> bool:
@@ -255,11 +282,28 @@ class BlockLayout(LayoutEngine):
         box = BoxModel()
         c_width = container.content_width
         width_str = _get_style(node, 'width', 'auto')
+        display = _get_style(node, 'display', 'block')
+        float_value = _get_style(node, 'float', 'none')
         box_sizing = _get_style(node, 'box-sizing', 'content-box')
         margin = _parse_edge(node, 'margin', c_width)
         padding = _parse_edge(node, 'padding', c_width)
         border_w = _parse_edge(node, 'border-width', c_width)
         is_replaced_img = _is_replaced_visual(node)
+        collapsed_parent_top_child = None
+        collapsed_parent_top_margin = margin.top
+        if (
+            padding.top == 0.0
+            and border_w.top == 0.0
+        ):
+            first_collapsible_child = _find_first_collapsible_in_flow_child(node)
+            if first_collapsible_child is not None:
+                child_margin_top = _parse_edge(first_collapsible_child, 'margin', c_width).top
+                if margin.top > 0.0 and child_margin_top > 0.0:
+                    collapsed_parent_top_child = first_collapsible_child
+                    collapsed_parent_top_margin = _collapse_adjacent_margins(
+                        margin.top,
+                        child_margin_top,
+                    )
 
         # --- Width ---
         if is_replaced_img:
@@ -272,6 +316,8 @@ class BlockLayout(LayoutEngine):
             nat_w = getattr(node, 'natural_width', 0) or 0
             if _is_replaced_visual(node) and nat_w > 0:
                 content_width = float(nat_w)
+            elif display in _ATOMIC_INLINE_DISPLAYS or float_value != 'none':
+                content_width = _measure_auto_width(node, c_width, fallback_width=0.0)
             else:
                 content_width = max(0.0, c_width - margin.left - margin.right
                                     - padding.left - padding.right
@@ -326,7 +372,13 @@ class BlockLayout(LayoutEngine):
             box_x = container.x + margin.left + border_w.left + padding.left
 
         box.x = box_x
-        box.y = container.y + container.content_height + margin.top + border_w.top + padding.top
+        box.y = (
+            container.y
+            + container.content_height
+            + collapsed_parent_top_margin
+            + border_w.top
+            + padding.top
+        )
         box.content_width = content_width
         box.margin = margin
         box.padding = padding
@@ -466,6 +518,9 @@ class BlockLayout(LayoutEngine):
                 child.box = child_box
 
                 top_margin = child_box.margin.top
+                if child is collapsed_parent_top_child:
+                    _shift_subtree(child, 0.0, -child_box.margin.top)
+                    top_margin = 0.0
                 collapsed = _collapse_adjacent_margins(prev_margin_bottom, top_margin)
                 child_box.y += collapsed - top_margin
 

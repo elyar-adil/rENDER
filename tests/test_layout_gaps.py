@@ -55,7 +55,6 @@ class TestInlineBlockWidth:
     """display:inline-block with width:auto should shrink to its content,
     not fill the container.  Currently BlockLayout fills the container."""
 
-    @pytest.mark.xfail(reason="inline-block shrink-to-fit not implemented; BlockLayout fills container")
     def test_inline_block_auto_width_is_shrink_to_fit(self):
         """An inline-block with auto width should not exceed its content width."""
         el = make_element(style={
@@ -419,7 +418,6 @@ class TestMarginCollapsingEdgeCases:
         assert hasattr(child2, 'box') and child2.box is not None
         assert child2.box.y == 60.0, f"Expected y=60, got {child2.box.y}"
 
-    @pytest.mark.xfail(reason="parent-child margin collapsing not implemented")
     def test_parent_child_margin_collapse(self):
         """Parent with no border/padding: child's top margin collapses with parent's top margin."""
         outer = make_element(style={
@@ -628,7 +626,6 @@ class TestTableGaps:
 
 class TestFloatGaps:
 
-    @pytest.mark.xfail(reason="float elements do not shrink-wrap to their content")
     def test_float_left_shrinks_to_content(self):
         """A floated element with width:auto should shrink to its content width."""
         el = make_element(style={
@@ -843,7 +840,21 @@ class TestAbsolutePositioningGaps:
         assert not (hasattr(el, 'box') and el.box is not None), \
             "Absolute element should not have a box set inline"
 
-    @pytest.mark.xfail(reason="right/bottom absolute offsets resolved in post-pass not implemented")
     def test_absolute_right_bottom_final_position(self):
         """After full pipeline, right:0,bottom:0 element should be at bottom-right corner."""
-        raise NotImplementedError("requires full engine pipeline with absolute post-pass")
+        from tests.render_helper import render, find_element
+
+        document = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <div id="container" style="position:relative; width:400px; height:300px">
+            <div id="abs" style="position:absolute; right:0; bottom:0;
+                                 width:100px; height:50px">Abs</div>
+          </div>
+        </body></html>
+        ''', viewport_width=800, viewport_height=600)
+
+        container = find_element(document, id_name='container')
+        abs_el = find_element(document, id_name='abs')
+        assert abs_el.box.x == pytest.approx(container.box.x + 300.0, abs=2.0)
+        assert abs_el.box.y == pytest.approx(container.box.y + 250.0, abs=2.0)
