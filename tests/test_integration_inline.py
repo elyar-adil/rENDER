@@ -35,6 +35,17 @@ class TestTextRendering:
             assert first_item.x >= 20.0, \
                 f"Text should be offset by padding, x={first_item.x}"
 
+    def test_text_transform_uppercase_affects_draw_text(self):
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body><p style="margin:0; text-transform:uppercase">Hello world</p></body></html>
+        ''')
+        dl = get_display_list(doc)
+        text_cmds = [cmd for cmd in dl if isinstance(cmd, DrawText)]
+        all_text = ' '.join(cmd.text for cmd in text_cmds)
+        assert 'HELLO' in all_text
+        assert 'WORLD' in all_text
+
 
 class TestLineWrapping:
     """Text wraps at container boundary."""

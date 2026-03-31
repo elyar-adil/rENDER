@@ -67,6 +67,9 @@ def bind(document: Document, ua_css_path: str,
     # CSS custom property (var()) resolution
     _resolve_vars_iterative(document)
 
+    # Text-transform post-pass for renderable text nodes
+    _apply_text_transform_iterative(document)
+
 
 # ---------------------------------------------------------------------------
 # Rule loading
@@ -837,6 +840,41 @@ def _resolve_vars_iterative(document) -> None:
 
         for child in reversed(node.children):
             stack.append((child, child_vars))
+
+
+def _apply_text_transform_iterative(document) -> None:
+    stack = [(document, 'none', False)]
+    while stack:
+        node, inherited_transform, suppress_text = stack.pop()
+        if isinstance(node, Element):
+            style = getattr(node, 'style', {}) or {}
+            text_transform = style.get('text-transform', inherited_transform)
+            suppress_children = suppress_text or node.tag in ('style', 'script')
+            for child in reversed(node.children):
+                stack.append((child, text_transform, suppress_children))
+        elif isinstance(node, Text):
+            if suppress_text:
+                continue
+            source_text = getattr(node, '_source_data', node.data)
+            node._source_data = source_text
+            node.data = _transform_text(source_text, inherited_transform)
+        else:
+            for child in reversed(getattr(node, 'children', [])):
+                stack.append((child, inherited_transform, suppress_text))
+
+
+def _transform_text(text: str, text_transform: str) -> str:
+    if not text or not text_transform or text_transform == 'none':
+        return text
+    if text_transform == 'uppercase':
+        return text.upper()
+    if text_transform == 'lowercase':
+        return text.lower()
+    if text_transform == 'capitalize':
+        return re.sub(r'(^|[\s\t\r\n\f\v]+)(\S)',
+                      lambda m: m.group(1) + m.group(2).upper(),
+                      text)
+    return text
 
 
 def _replace_vars(value: str, vars_dict: dict) -> str:

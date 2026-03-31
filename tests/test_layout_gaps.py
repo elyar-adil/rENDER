@@ -285,7 +285,6 @@ class TestDisplayContents:
 
 class TestTextPropertiesNotApplied:
 
-    @pytest.mark.xfail(reason="text-transform not applied during layout/rendering")
     def test_text_transform_uppercase(self):
         """text-transform:uppercase should affect text content before layout."""
         from html.dom import Document
