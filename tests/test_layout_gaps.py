@@ -85,7 +85,6 @@ class TestInlineBlockWidth:
 
 class TestPositionSticky:
 
-    @pytest.mark.xfail(reason="position:sticky treated identically to position:static")
     def test_sticky_element_is_not_deferred(self):
         """Sticky positioned elements must participate in normal flow AND
         be remembered for later offset adjustment. Currently they are just

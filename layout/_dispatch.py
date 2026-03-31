@@ -30,6 +30,15 @@ def layout_node(node, container: BoxModel, ctx: LayoutContext) -> BoxModel | Non
     box = engine.layout(node, container, ctx)
     if box is not None:
         node.box = box
+        if position == 'sticky':
+            ctx.sticky_elements.append({
+                'node': node,
+                'box': box,
+                'top': (node.style or {}).get('top', 'auto'),
+                'right': (node.style or {}).get('right', 'auto'),
+                'bottom': (node.style or {}).get('bottom', 'auto'),
+                'left': (node.style or {}).get('left', 'auto'),
+            })
     return box
 
 

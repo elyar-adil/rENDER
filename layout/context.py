@@ -17,6 +17,7 @@ class LayoutContext:
         from layout.float_manager import FloatManager
         self.float_mgr = FloatManager()
         self.absolute_nodes: list = []
+        self.sticky_elements: list = []
         self.initial_containing_block = None
         self.absolute_containing_block = None
         self.absolute_containing_node = None
@@ -25,6 +26,7 @@ class LayoutContext:
         """Return a new context with a fresh FloatManager (new BFC)."""
         child = LayoutContext(self.viewport_width, self.viewport_height)
         child.absolute_nodes = self.absolute_nodes
+        child.sticky_elements = self.sticky_elements
         child.initial_containing_block = self.initial_containing_block
         child.absolute_containing_block = self.absolute_containing_block
         child.absolute_containing_node = self.absolute_containing_node
