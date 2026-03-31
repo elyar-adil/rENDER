@@ -821,7 +821,8 @@ class Interpreter:
         if callable(fn):
             try:
                 return fn(*args)
-            except Exception:
+            except Exception as exc:
+                _logger.debug('Native callable error: %s', exc)
                 return _UNDEF
         return _UNDEF
 
@@ -1020,7 +1021,8 @@ class Interpreter:
         if callable(callee):
             try:
                 return callee(*args)
-            except Exception:
+            except Exception as exc:
+                _logger.debug('Native constructor error: %s', exc)
                 return JSObject()
 
         return JSObject()

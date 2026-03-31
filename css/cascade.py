@@ -17,6 +17,7 @@ _FONT_FACE_LOCK = threading.Lock()
 _SFNT_MAGIC = {b'\x00\x01\x00\x00', b'OTTO', b'true', b'ttcf'}
 _SAFE_FONT_EXTS = {'.ttf', '.otf', '.ttc', '.otc'}
 _VAR_SHORTHANDS = {'border', 'border-top', 'border-right', 'border-bottom', 'border-left'}
+_RE_MEDIA_AND = re.compile(r'(?i)\band\b\s*')
 
 
 def bind(document: Document, ua_css_path: str,
@@ -160,7 +161,8 @@ def _load_ua(path: str) -> list:
         with open(path, encoding='utf-8') as f:
             stylesheet = css_parser.parse_stylesheet(f.read())
         return list(stylesheet.rules)
-    except Exception:
+    except Exception as exc:
+        _logger.warning('Failed to load UA stylesheet %s: %s', path, exc)
         return []
 
 
@@ -247,9 +249,9 @@ def _split_media_and(text: str) -> list:
                 result.append(part)
             current = []
             i += 4
-        elif depth == 0 and re.match(r'(?i)\band\b', text[i:]):
+        elif depth == 0 and _RE_MEDIA_AND.match(text[i:]):
             # 'and' with word boundary
-            m = re.match(r'(?i)\band\b\s*', text[i:])
+            m = _RE_MEDIA_AND.match(text[i:])
             if m:
                 part = ''.join(current).strip()
                 if part:
@@ -329,7 +331,7 @@ def _build_index(tagged_rules: list, viewport_width: int = 980,
     accordingly.
     """
     # order counter for stable cascade ordering within the same origin+specificity
-    order = [0]
+    order = 0
 
     by_tag     = defaultdict(list)  # tag name → entries
     by_class   = defaultdict(list)  # class name → entries
@@ -337,6 +339,7 @@ def _build_index(tagged_rules: list, viewport_width: int = 980,
     universal  = []                  # rules that match any element
 
     def _process_rule(rule, origin):
+        nonlocal order
         if hasattr(rule, 'name') and rule.name == 'media':
             # @media rule — evaluate prelude
             if _media_matches(rule.prelude, viewport_width, viewport_height):
@@ -362,8 +365,8 @@ def _build_index(tagged_rules: list, viewport_width: int = 980,
             try:
                 spec = selector_mod.specificity(single_sel)
                 # Sort key: (origin, spec, order) — origin ensures author > UA
-                entry = (origin, spec, order[0], single_sel, rule.declarations)
-                order[0] += 1
+                entry = (origin, spec, order, single_sel, rule.declarations)
+                order += 1
 
                 key_tag, key_classes, key_id = _extract_subject_keys(single_sel)
                 if key_id:
