@@ -1,13 +1,15 @@
 """rENDER browser engine pipeline and entry point."""
-import base64
-import logging
-_logger = logging.getLogger(__name__)
 import argparse
-import sys
+import base64
+import json
+import logging
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote_to_bytes
+
+_logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -402,8 +404,7 @@ def _install_fetch(interp, base_url: str) -> None:
 
 
 def _try_json(text: str):
-    import json
-    from js.types import JSObject, JSArray, _UNDEF
+    from js.types import _UNDEF
     try:
         return json.loads(text)
     except Exception:

@@ -802,11 +802,8 @@ def _resolve_inherit(node: Element, parent_style: dict) -> None:
     # Handle explicit 'inherit' on non-registered or already-set properties
     for prop in list(style.keys()):
         if style.get(prop) == 'inherit':
-            style[prop] = parent_style.get(prop, PROPERTIES.get(prop, _Dummy).initial)
-
-
-class _Dummy:
-    initial = ''
+            propdef = PROPERTIES.get(prop)
+            style[prop] = parent_style.get(prop, propdef.initial if propdef else '')
 
 
 # ---------------------------------------------------------------------------

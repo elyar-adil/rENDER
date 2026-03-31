@@ -78,6 +78,7 @@ def _urlopen_with_cert_fallback(req, *, timeout: int):
     except urllib.error.URLError as exc:
         if not _is_cert_verification_failure(exc):
             raise
+        _logger.warning('TLS certificate verification failed for %s; retrying without verification', req.full_url)
         insecure_context = ssl._create_unverified_context()
         return urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
 

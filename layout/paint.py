@@ -256,19 +256,7 @@ def _parse_radial_position(pos_str, rect):
 
 def _split_by_comma(inner: str) -> list:
     """Split CSS value by top-level commas (respecting parentheses)."""
-    parts, current, depth = [], [], 0
-    for ch in inner:
-        if ch == '(':
-            depth += 1; current.append(ch)
-        elif ch == ')':
-            depth -= 1; current.append(ch)
-        elif ch == ',' and depth == 0:
-            parts.append(''.join(current).strip()); current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append(''.join(current).strip())
-    return parts
+    return [p.strip() for p in _split_top_level(inner)]
 
 
 def _parse_color_stops(color_parts, extent) -> list:
