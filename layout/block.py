@@ -2,7 +2,7 @@
 from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
-from layout.box import BoxModel, EdgeSizes, Rect
+from layout.box import BoxModel, EdgeSizes, Rect, get_node_style
 from layout.text import _parse_px
 from layout.float_manager import FloatManager
 from layout.context import LayoutEngine, LayoutContext
@@ -119,10 +119,7 @@ def _shift_subtree(node, dx: float, dy: float) -> None:
             _shift_subtree(child, dx, dy)
 
 
-def _get_style(node, prop: str, default: str = '') -> str:
-    if hasattr(node, 'style') and node.style:
-        return node.style.get(prop, default)
-    return default
+_get_style = get_node_style
 
 
 def _parse_edge(node, prop_prefix: str, container_width: float = 0.0) -> EdgeSizes:

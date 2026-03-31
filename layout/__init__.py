@@ -1,7 +1,7 @@
 """Layout engine entry point."""
 import logging
 _logger = logging.getLogger(__name__)
-from layout.box import BoxModel, EdgeSizes, Rect
+from layout.box import BoxModel, EdgeSizes, Rect, get_node_style as _node_style
 from layout.block import layout_block, layout_absolute
 from layout.flex import layout_flex
 from layout.inline import layout_inline
@@ -49,11 +49,6 @@ def layout(document, viewport_width: int = VIEWPORT_WIDTH, viewport_height: int 
             display_list.add(cmd)
 
     return display_list
-
-
-def _node_style(node, prop: str, default: str) -> str:
-    style = getattr(node, 'style', None)
-    return style.get(prop, default) if style else default
 
 
 def _layout_children(node, container_box: BoxModel, viewport_width: int) -> None:
