@@ -2,6 +2,12 @@
 from dataclasses import dataclass, field
 
 
+def get_node_style(node, prop: str, default: str = '') -> str:
+    """Return the computed style value for *prop* on *node*, or *default*."""
+    style = getattr(node, 'style', None)
+    return style.get(prop, default) if style else default
+
+
 @dataclass
 class EdgeSizes:
     top: float = 0.0

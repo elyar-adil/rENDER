@@ -1,5 +1,6 @@
 """HTTP/HTTPS client using Python stdlib urllib."""
 import codecs
+import logging
 import ssl
 import urllib.request
 import urllib.parse
@@ -11,6 +12,12 @@ from collections import OrderedDict
 
 _TEXT_CACHE_KIND = 'text'
 _BYTES_CACHE_KIND = 'bytes'
+
+_BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept-Encoding': 'gzip, deflate',
+}
 
 
 class _HTTPCache:
@@ -71,6 +78,7 @@ def _urlopen_with_cert_fallback(req, *, timeout: int):
     except urllib.error.URLError as exc:
         if not _is_cert_verification_failure(exc):
             raise
+        _logger.warning('TLS certificate verification failed for %s; retrying without verification', req.full_url)
         insecure_context = ssl._create_unverified_context()
         return urllib.request.urlopen(req, timeout=timeout, context=insecure_context)
 
@@ -89,10 +97,8 @@ def fetch(url: str) -> tuple[str, str]:
         return cached
 
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        **_BROWSER_HEADERS,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7',
-        'Accept-Encoding': 'gzip, deflate',
     })
 
     with _urlopen_with_cert_fallback(req, timeout=15) as response:
@@ -189,9 +195,8 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
         return cached
 
     req = urllib.request.Request(url, headers={
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+        **_BROWSER_HEADERS,
         'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate',
     })
     with _urlopen_with_cert_fallback(req, timeout=10) as resp:
         raw = resp.read()
@@ -201,13 +206,17 @@ def fetch_bytes(url: str, base_url: str = '') -> bytes:
     return raw
 
 
+_logger = logging.getLogger(__name__)
+
+
 def _decode_content_encoding(raw: bytes, encoding_header: str) -> bytes:
     encoding = (encoding_header or '').lower()
     if 'gzip' in encoding:
         import gzip
         try:
             return gzip.decompress(raw)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('gzip decompression failed: %s', exc)
             return raw
     if 'deflate' in encoding:
         import zlib
@@ -216,6 +225,7 @@ def _decode_content_encoding(raw: bytes, encoding_header: str) -> bytes:
         except Exception:
             try:
                 return zlib.decompress(raw, -zlib.MAX_WBITS)
-            except Exception:
+            except Exception as exc:
+                _logger.debug('deflate decompression failed: %s', exc)
                 return raw
     return raw

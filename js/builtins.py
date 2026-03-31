@@ -115,7 +115,8 @@ def _invoke_callable(fn, args, this_val=None):
     if callable(fn) and not isinstance(fn, JSFunction):
         try:
             return fn(*args)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('invoke_callable error: %s', exc)
             return _UNDEF
     if isinstance(fn, JSFunction):
         call_env = Environment(fn.env)
@@ -144,7 +145,8 @@ def _safe_call(fn, args):
     if callable(fn) and not isinstance(fn, JSFunction):
         try:
             return fn(*args)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('safe_call error: %s', exc)
             return _UNDEF
     return _invoke_callable(fn, args)
 

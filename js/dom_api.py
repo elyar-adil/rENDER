@@ -6,9 +6,9 @@ from js.interpreter import (
     Interpreter, Environment, JSObject, JSArray, JSFunction,
     _UNDEF, _to_str, _to_bool, _get_property, _set_property,
 )
-from js.parser import _UNDEF as UNDEF
 from js.event_loop import get_event_loop
 from html.dom import Element, Text, Document
+import css.selector as _selector_mod
 
 
 # ---------------------------------------------------------------------------
@@ -488,17 +488,16 @@ class DOMElement(JSObject):
 
     def _matches(self, sel):
         try:
-            import css.selector as selector_mod
-            return selector_mod.matches(self._node, sel)
-        except Exception:
+            return _selector_mod.matches(self._node, sel)
+        except Exception as exc:
+            _logger.debug('matches(%r) error: %s', sel, exc)
             return False
 
     def _closest(self, sel):
         node = self._node
         while node and isinstance(node, Element):
             try:
-                import css.selector as selector_mod
-                if selector_mod.matches(node, sel):
+                if _selector_mod.matches(node, sel):
                     return self._binding.wrap(node)
             except Exception as _exc:
                 _logger.debug("Ignored: %s", _exc)
@@ -816,18 +815,18 @@ class DOMBinding:
 
     def query_selector(self, root, sel):
         try:
-            import css.selector as selector_mod
-            node = _query_one(root, _to_str(sel), selector_mod)
+            node = _query_one(root, _to_str(sel), _selector_mod)
             return self.wrap(node) if node else None
-        except Exception:
+        except Exception as exc:
+            _logger.debug('querySelector(%r) error: %s', sel, exc)
             return None
 
     def query_selector_all(self, root, sel):
         try:
-            import css.selector as selector_mod
-            nodes = _query_all(root, _to_str(sel), selector_mod)
+            nodes = _query_all(root, _to_str(sel), _selector_mod)
             return JSArray(self.wrap(n) for n in nodes)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('querySelectorAll(%r) error: %s', sel, exc)
             return JSArray()
 
     def get_elements_by_tag(self, root, tag):

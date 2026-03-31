@@ -1,12 +1,15 @@
 """rENDER browser engine pipeline and entry point."""
-import logging
-_logger = logging.getLogger(__name__)
 import argparse
-import sys
+import base64
+import json
+import logging
 import os
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote_to_bytes
+
+_logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -119,7 +122,8 @@ def _fetch_subresources(document, base_url: str) -> tuple[list, list]:
         try:
             text, _ = fetch_text(url)
             return text
-        except Exception:
+        except Exception as exc:
+            _logger.debug('Failed to fetch stylesheet %s: %s', url, exc)
             return None
 
     css_results: list[str | None] = [None] * len(css_jobs)
@@ -155,7 +159,8 @@ def _fetch_binary_jobs(jobs: list[tuple], *, fetcher, max_workers: int) -> list[
             return _decode_data_uri(data_uri)
         try:
             return fetcher(url)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('Failed to fetch resource %s: %s', url, exc)
             return None
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -226,8 +231,6 @@ def _fetch_background_images(document, base_url: str) -> list[tuple]:
 
 
 def _extract_background_image_url(value: str) -> str | None:
-    import re
-
     if not value or value in ('none', ''):
         return None
 
@@ -244,13 +247,14 @@ def _decode_data_uri(data_uri: str) -> bytes | None:
         return None
     if ';base64' in header.lower():
         try:
-            import base64
             return base64.b64decode(payload)
-        except Exception:
+        except Exception as exc:
+            _logger.debug('base64 decode failed: %s', exc)
             return None
     try:
         return unquote_to_bytes(payload)
-    except Exception:
+    except Exception as exc:
+        _logger.debug('data URI decode failed: %s', exc)
         return None
 
 
@@ -400,8 +404,7 @@ def _install_fetch(interp, base_url: str) -> None:
 
 
 def _try_json(text: str):
-    import json
-    from js.types import JSObject, JSArray, _UNDEF
+    from js.types import _UNDEF
     try:
         return json.loads(text)
     except Exception:
@@ -423,18 +426,17 @@ def _collect_scripts(node, scripts: list) -> None:
 # ---------------------------------------------------------------------------
 
 def _page_height(document, viewport_height: int = VIEWPORT_H) -> int:
-    ref = [viewport_height]
-
-    def walk(n):
-        if hasattr(n, 'box') and n.box is not None:
-            box = n.box
+    max_bottom = float(viewport_height)
+    stack = [document]
+    while stack:
+        n = stack.pop()
+        box = getattr(n, 'box', None)
+        if box is not None:
             bottom = box.y + box.content_height + box.padding.bottom + box.border.bottom
-            ref[0] = max(ref[0], bottom)
-        for c in n.children:
-            walk(c)
-
-    walk(document)
-    return int(ref[0]) + 50
+            if bottom > max_bottom:
+                max_bottom = bottom
+        stack.extend(reversed(n.children))
+    return int(max_bottom) + 50
 
 
 def _extract_title(document) -> str:

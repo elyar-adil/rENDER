@@ -208,7 +208,7 @@ class Interpreter:
 
         g.define('RegExp', lambda p, f='': re.compile(_to_str(p)))
         g.define('setTimeout', lambda fn, ms=0, *a: self._set_timeout(fn, ms, *a))
-        g.define('setInterval', lambda fn, ms=0, *a: None)
+        g.define('setInterval', lambda fn, ms=0, *a: self._set_timeout(fn, ms, *a))
         g.define('clearTimeout', lambda tid: self._clear_timeout(tid))
         g.define('clearInterval', lambda tid: self._clear_timeout(tid))
         g.define('requestAnimationFrame', lambda fn: self._request_animation_frame(fn))
@@ -821,7 +821,8 @@ class Interpreter:
         if callable(fn):
             try:
                 return fn(*args)
-            except Exception:
+            except Exception as exc:
+                _logger.debug('Native callable error: %s', exc)
                 return _UNDEF
         return _UNDEF
 
@@ -1020,7 +1021,8 @@ class Interpreter:
         if callable(callee):
             try:
                 return callee(*args)
-            except Exception:
+            except Exception as exc:
+                _logger.debug('Native constructor error: %s', exc)
                 return JSObject()
 
         return JSObject()

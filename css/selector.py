@@ -1,5 +1,3 @@
-import logging
-_logger = logging.getLogger(__name__)
 """CSS Selector parsing and matching.
 
 Implements:
@@ -15,11 +13,13 @@ Implements:
                  general sibling (~)
   - Comma-separated selector groups
 """
-
+import logging
 import re
 import functools
 from html.dom import Element
 from css.utils import split_paren_aware as _split_by_comma_outside_parens
+
+_logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------

@@ -1,10 +1,18 @@
 """CSS visual-effect parsing and display-list painting for rENDER browser engine."""
 import logging
+import math
 import re
 
 _logger = logging.getLogger(__name__)
 
 from css.utils import split_paren_aware as _split_top_level
+from html.dom import Element, Text
+from layout.text import _parse_px
+from rendering.display_list import (
+    DisplayList, DrawRect, DrawText, DrawBorder, DrawImage, DrawInput,
+    PushClip, PopClip, PushTransform, PopTransform, PushOpacity, PopOpacity,
+    DrawBoxShadow, DrawLinearGradient, DrawRadialGradient, DrawOutline,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -13,7 +21,6 @@ from css.utils import split_paren_aware as _split_top_level
 
 def _parse_single_shadow(s: str):
     """Parse one box-shadow value. Returns (ox, oy, blur, spread, color, inset) or None."""
-    from layout.text import _parse_px
     try:
         s = s.strip()
         inset = False
@@ -79,7 +86,6 @@ def _parse_all_shadows(shadow_str: str) -> list:
 
 def _parse_css_transform(transform_str: str):
     """Parse CSS transform. Returns (dx, dy, rotate_deg, scale_x, scale_y) or None."""
-    from layout.text import _parse_px
     dx, dy, rot, sx, sy = 0.0, 0.0, 0.0, 1.0, 1.0
     found = False
     for m in re.finditer(r'(\w+)\s*\(([^)]*)\)', transform_str):
@@ -119,7 +125,6 @@ def _parse_css_transform(transform_str: str):
 
 def _parse_transform_origin(origin_str: str, box):
     """Parse transform-origin, return (ox, oy) in absolute coordinates."""
-    from layout.text import _parse_px
     parts = origin_str.split()
     ox = box.x + box.content_width / 2
     oy = box.y + box.content_height / 2
@@ -183,8 +188,7 @@ def _parse_linear_gradient(value: str, rect):
             pass
     elif first.endswith('rad'):
         try:
-            import math as _m
-            angle = _m.degrees(float(first[:-3])); start_idx = 1
+            angle = math.degrees(float(first[:-3])); start_idx = 1
         except ValueError:
             pass
 
@@ -220,7 +224,6 @@ def _parse_radial_gradient(value: str, rect):
 
 
 def _parse_radial_position(pos_str, rect):
-    from layout.text import _parse_px as _ppx
     parts = pos_str.split()
     cx = rect.x + rect.width / 2
     cy = rect.y + rect.height / 2
@@ -233,7 +236,7 @@ def _parse_radial_position(pos_str, rect):
         elif p0 == 'right':
             cx = rect.x + rect.width
         elif p0 != 'center':
-            cx = rect.x + _ppx(p0)
+            cx = rect.x + _parse_px(p0)
     except Exception as exc:
         _logger.debug('_parse_radial_position x: %s', exc)
     try:
@@ -245,7 +248,7 @@ def _parse_radial_position(pos_str, rect):
         elif p1 == 'bottom':
             cy = rect.y + rect.height
         elif p1 != 'center':
-            cy = rect.y + _ppx(p1)
+            cy = rect.y + _parse_px(p1)
     except Exception as exc:
         _logger.debug('_parse_radial_position y: %s', exc)
     return cx, cy
@@ -253,24 +256,11 @@ def _parse_radial_position(pos_str, rect):
 
 def _split_by_comma(inner: str) -> list:
     """Split CSS value by top-level commas (respecting parentheses)."""
-    parts, current, depth = [], [], 0
-    for ch in inner:
-        if ch == '(':
-            depth += 1; current.append(ch)
-        elif ch == ')':
-            depth -= 1; current.append(ch)
-        elif ch == ',' and depth == 0:
-            parts.append(''.join(current).strip()); current = []
-        else:
-            current.append(ch)
-    if current:
-        parts.append(''.join(current).strip())
-    return parts
+    return [p.strip() for p in _split_top_level(inner)]
 
 
 def _parse_color_stops(color_parts, extent) -> list:
     """Parse color stop strings into [(position 0..1, color_str), ...]."""
-    from layout.text import _parse_px as _ppx
     stops = []
     n = len(color_parts)
     for i, part in enumerate(color_parts):
@@ -283,7 +273,7 @@ def _parse_color_stops(color_parts, extent) -> list:
                 pos = float(ps[:-1]) / 100.0
             else:
                 try:
-                    pos = _ppx(ps) / max(1.0, extent)
+                    pos = _parse_px(ps) / max(1.0, extent)
                 except Exception:
                     pos = i / max(1, n - 1)
         else:
@@ -298,7 +288,6 @@ def _parse_color_stops(color_parts, extent) -> list:
 # ---------------------------------------------------------------------------
 
 def _get_list_marker(node, list_type: str) -> str:
-    from html.dom import Element
     if list_type == 'none':
         return ''
     if list_type == 'circle':
@@ -320,7 +309,6 @@ def _get_list_marker(node, list_type: str) -> str:
 
 
 def _sibling_index(node, start: int) -> int:
-    from html.dom import Element
     parent = getattr(node, 'parent', None)
     idx = start
     if parent:
@@ -351,15 +339,6 @@ def _to_roman(n: int) -> str:
 
 def build_display_list(node, display_list, stacking_top: list) -> None:
     """Recursively paint laid-out DOM nodes into *display_list*."""
-    from html.dom import Element, Text
-    from rendering.display_list import (
-        DisplayList, DrawRect, DrawText, DrawBorder, DrawImage,
-        PushClip, PopClip, DrawLinearGradient,
-        PushOpacity, PopOpacity, PushTransform, PopTransform,
-        DrawBoxShadow, DrawInput, DrawOutline, DrawRadialGradient,
-    )
-    from layout.text import _parse_px
-
     if isinstance(node, Element):
         style = node.style if hasattr(node, 'style') else {}
         display = style.get('display', 'block')

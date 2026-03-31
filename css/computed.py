@@ -2,7 +2,7 @@
 import re
 from html.dom import Document, Element
 from css.lengths import resolve_length_expr as _resolve_calc_expr
-from css.utils import split_paren_aware as _split_css_args_impl
+from css.utils import split_paren_aware as _split_css_args
 
 
 DEFAULT_FONT_SIZE = 16  # browser default px
@@ -185,7 +185,3 @@ def _resolve_length(value: str, parent_font_size: float, root_font_size: float,
 
     return None
 
-
-def _split_css_args(text: str) -> list:
-    """Split comma-separated CSS function arguments, respecting nested parens."""
-    return _split_css_args_impl(text)

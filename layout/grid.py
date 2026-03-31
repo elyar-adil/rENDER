@@ -2,15 +2,9 @@
 from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
-from layout.box import BoxModel, EdgeSizes
+from layout.box import BoxModel, EdgeSizes, get_node_style as _get_style
 from layout.text import _parse_px
 from layout.context import LayoutEngine, LayoutContext
-
-
-def _get_style(node, prop: str, default: str = '') -> str:
-    if hasattr(node, 'style') and node.style:
-        return node.style.get(prop, default)
-    return default
 
 
 def _parse_edge(node, prefix: str) -> EdgeSizes:

@@ -2,7 +2,8 @@
 from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
-from layout.box import BoxModel, EdgeSizes, Rect
+from html.dom import Element, Text
+from layout.box import BoxModel, EdgeSizes, Rect, get_node_style
 from layout.text import _parse_px
 from layout.float_manager import FloatManager
 from layout.context import LayoutEngine, LayoutContext
@@ -96,7 +97,6 @@ def _resolve_replaced_img_height(node, style: dict, content_width: float) -> flo
 
 
 def _shift_subtree(node, dx: float, dy: float) -> None:
-    from html.dom import Element
     if dx == 0.0 and dy == 0.0:
         return
 
@@ -119,10 +119,7 @@ def _shift_subtree(node, dx: float, dy: float) -> None:
             _shift_subtree(child, dx, dy)
 
 
-def _get_style(node, prop: str, default: str = '') -> str:
-    if hasattr(node, 'style') and node.style:
-        return node.style.get(prop, default)
-    return default
+_get_style = get_node_style
 
 
 def _parse_edge(node, prop_prefix: str, container_width: float = 0.0) -> EdgeSizes:
@@ -202,7 +199,6 @@ def _collapse_adjacent_margins(previous_bottom: float, current_top: float) -> fl
 
 def _measure_auto_width(node, container_width: float, fallback_width: float | None = None) -> float:
     try:
-        from html.dom import Element, Text
         from layout.inline import _measure_inline_block_intrinsic_width, _measure_text_span
         style = getattr(node, 'style', {}) or {}
         measured = 0.0
@@ -223,8 +219,6 @@ def _measure_auto_width(node, container_width: float, fallback_width: float | No
 
 
 def _needs_local_float_ctx(node) -> bool:
-    from html.dom import Element
-
     for child in getattr(node, 'children', []):
         if not isinstance(child, Element):
             continue
@@ -239,8 +233,6 @@ def _needs_local_float_ctx(node) -> bool:
 
 def _find_first_collapsible_in_flow_child(node):
     """Return the first in-flow block child eligible for top-margin collapse."""
-    from html.dom import Element, Text
-
     for child in getattr(node, 'children', []):
         if isinstance(child, Text):
             if child.data.strip():
@@ -263,8 +255,6 @@ def _find_first_collapsible_in_flow_child(node):
 
 def _acts_like_block_container(node) -> bool:
     """Treat invalid inline wrappers around block descendants like block containers."""
-    from html.dom import Element
-
     if _get_style(node, 'display', 'inline') != 'inline':
         return False
 
@@ -287,8 +277,6 @@ class BlockLayout(LayoutEngine):
     """Layout engine for display:block (and fallback for unknown display values)."""
 
     def layout(self, node, container: BoxModel, ctx: LayoutContext) -> BoxModel:
-        from html.dom import Element, Text as TextNode
-
         if ctx.initial_containing_block is None:
             ctx.initial_containing_block = container
 
@@ -423,7 +411,7 @@ class BlockLayout(LayoutEngine):
             for c in node.children
         )
         has_inline = any(
-            (isinstance(c, TextNode) and bool(c.data.strip())) or
+            (isinstance(c, Text) and bool(c.data.strip())) or
             (isinstance(c, Element)
              and (
                  not has_block

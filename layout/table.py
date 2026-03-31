@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
 import re
-from layout.box import BoxModel, EdgeSizes
+from layout.box import BoxModel, EdgeSizes, get_node_style as _get_style
 from layout.text import _parse_px, measure_text
 from layout.context import LayoutEngine, LayoutContext
 from layout.block import _parse_edge
@@ -11,12 +11,6 @@ from layout.block import _parse_edge
 _TABLE_ROW_GROUPS = frozenset({
     'table-row-group', 'table-header-group', 'table-footer-group',
 })
-
-
-def _get_style(node, prop: str, default: str = '') -> str:
-    if hasattr(node, 'style') and node.style:
-        return node.style.get(prop, default)
-    return default
 
 
 class TableLayout(LayoutEngine):

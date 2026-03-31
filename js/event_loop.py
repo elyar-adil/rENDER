@@ -11,7 +11,10 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import heapq
+import logging
 from typing import Callable
+
+_logger = logging.getLogger(__name__)
 
 Task = Callable[[], None]
 
@@ -78,8 +81,8 @@ class EventLoop:
             task = self.microtasks.popleft()
             try:
                 task()
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.debug('Microtask error: %s', exc)
 
     def perform_rendering_opportunity(self) -> None:
         if not self.render_requested:
@@ -90,16 +93,16 @@ class EventLoop:
         for _, callback in callbacks:
             try:
                 callback(0.0)
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.debug('Animation frame callback error: %s', exc)
         if callbacks:
             self.perform_microtask_checkpoint()
         if self.render_callback is None:
             return
         try:
             self.render_callback()
-        except Exception:
-            pass
+        except Exception as exc:
+            _logger.debug('Render callback error: %s', exc)
 
     def run_next_task(self) -> bool:
         self._promote_due_timers()
@@ -110,8 +113,8 @@ class EventLoop:
             task = q.popleft()
             try:
                 task()
-            except Exception:
-                pass
+            except Exception as exc:
+                _logger.debug('Task error: %s', exc)
             self.perform_microtask_checkpoint()
             self.perform_rendering_opportunity()
             return True

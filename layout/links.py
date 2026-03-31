@@ -1,4 +1,7 @@
 """Link extraction helpers for the layout engine."""
+from html.dom import Element
+from layout.box import Rect
+from network.http import resolve_url
 
 
 def _extract_links(document, base_url: str = '') -> list:
@@ -9,8 +12,6 @@ def _extract_links(document, base_url: str = '') -> list:
 
 
 def _collect_links(node, base_url: str, links: list) -> None:
-    from html.dom import Element
-    from network.http import resolve_url
     if not isinstance(node, Element):
         for child in node.children:
             _collect_links(child, base_url, links)
@@ -37,7 +38,6 @@ def _collect_links(node, base_url: str, links: list) -> None:
                 y1 = min(it.y for it in items)
                 x2 = max(it.x + it.width for it in items)
                 y2 = max(it.y + it.height for it in items)
-                from layout.box import Rect
                 links.append((Rect(x1, y1, x2 - x1, y2 - y1), url))
 
     # Block-level <a> with its own box
