@@ -480,7 +480,6 @@ class TestZIndex:
 
 class TestPercentageHeight:
 
-    @pytest.mark.xfail(reason="percentage height requires explicit parent height; currently resolves to 0")
     def test_percentage_height_with_known_parent(self):
         """height:50% should compute to 50% of the explicit parent height."""
         parent = make_element(style={'display': 'block', 'height': '200px'})

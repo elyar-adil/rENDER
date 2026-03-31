@@ -178,6 +178,19 @@ def _resolve_containing_content_height(containing_box: BoxModel, containing_node
     return max(0.0, _parse_px(height_str))
 
 
+def _resolve_specified_content_height(height_str: str, containing_content_height: float) -> float | None:
+    if height_str in ('', 'auto'):
+        return None
+    if height_str.endswith('%'):
+        if containing_content_height <= 0.0:
+            return None
+        try:
+            return max(0.0, containing_content_height * float(height_str[:-1]) / 100.0)
+        except ValueError:
+            return None
+    return max(0.0, _parse_px(height_str))
+
+
 def _collapse_adjacent_margins(previous_bottom: float, current_top: float) -> float:
     """Collapse adjoining vertical margins, including negative values."""
     if previous_bottom >= 0 and current_top >= 0:
@@ -282,9 +295,12 @@ class BlockLayout(LayoutEngine):
         box = BoxModel()
         c_width = container.content_width
         width_str = _get_style(node, 'width', 'auto')
+        height_str = _get_style(node, 'height', 'auto')
         display = _get_style(node, 'display', 'block')
         float_value = _get_style(node, 'float', 'none')
         box_sizing = _get_style(node, 'box-sizing', 'content-box')
+        containing_content_height = getattr(container, 'containing_content_height', container.content_height)
+        specified_content_height = _resolve_specified_content_height(height_str, containing_content_height)
         margin = _parse_edge(node, 'margin', c_width)
         padding = _parse_edge(node, 'padding', c_width)
         border_w = _parse_edge(node, 'border-width', c_width)
@@ -462,6 +478,7 @@ class BlockLayout(LayoutEngine):
                 tmp.x = 0.0; tmp.y = 0.0
                 tmp.content_width = box.content_width
                 tmp.content_height = 0.0
+                tmp.containing_content_height = specified_content_height or 0.0
                 child_ctx = ctx.fork()
                 child_ctx.absolute_containing_block = abs_containing_box
                 child_ctx.absolute_containing_node = abs_containing_node
@@ -499,6 +516,7 @@ class BlockLayout(LayoutEngine):
                 child_cont.y = box.y + child_y
                 child_cont.content_width = box.content_width
                 child_cont.content_height = 0.0
+                child_cont.containing_content_height = specified_content_height or 0.0
 
                 child_ctx = ctx.fork() if _needs_local_float_ctx(child) else ctx
                 child_ctx.absolute_containing_block = abs_containing_box
@@ -537,14 +555,17 @@ class BlockLayout(LayoutEngine):
             child_y += inline_h
 
         # --- Height ---
-        height_str = _get_style(node, 'height', 'auto')
         overflow = _get_style(node, 'overflow', 'visible')
-        if height_str in ('auto', '') or height_str.endswith('%'):
+        if height_str in ('auto', ''):
             content_height = child_y
+        elif specified_content_height is not None:
+            content_height = (
+                specified_content_height
+                if overflow not in ('visible', '')
+                else max(specified_content_height, child_y)
+            )
         else:
-            specified_h = _parse_px(height_str)
-            # overflow:visible → content can exceed specified height
-            content_height = specified_h if overflow not in ('visible', '') else max(specified_h, child_y)
+            content_height = child_y
 
         # min/max height
         for prop, op in (('min-height', max), ('max-height', min)):

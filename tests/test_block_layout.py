@@ -400,6 +400,34 @@ class TestBlockMarginCollapsing(unittest.TestCase):
         self.assertEqual(child.box.y, 30)
 
 
+class TestBlockHeight(unittest.TestCase):
+
+    def test_percentage_height_resolves_against_explicit_parent_height(self):
+        parent = make_element(style={'display': 'block', 'height': '200px'})
+        child = make_element(style={'display': 'block', 'height': '50px'})
+        grandchild = make_element(style={'display': 'block', 'height': '50%'}, children=[child])
+        grandchild.parent = parent
+        parent.children = [grandchild]
+
+        box = do_layout(parent, make_container(x=0, y=0, width=400))
+
+        self.assertEqual(box.content_height, 200)
+        self.assertEqual(grandchild.box.content_height, 100)
+
+    def test_percentage_height_does_not_inherit_through_auto_height_parent(self):
+        parent = make_element(style={'display': 'block', 'height': '200px'})
+        middle = make_element(style={'display': 'block'})
+        child = make_element(style={'display': 'block', 'height': '50%'})
+        child.parent = middle
+        middle.children = [child]
+        middle.parent = parent
+        parent.children = [middle]
+
+        do_layout(parent, make_container(x=0, y=0, width=400))
+
+        self.assertEqual(child.box.content_height, 0)
+
+
 class TestAtomicInlineSizing(unittest.TestCase):
 
     def test_root_inline_block_auto_width_shrinks_to_contents(self):
