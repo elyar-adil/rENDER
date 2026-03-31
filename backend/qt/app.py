@@ -67,14 +67,35 @@ class Browser:
         from backend.qt.painter import BrowserWidget
         self._win = BrowserWidget('rENDER')
         self._win.navigate_callback = self.navigate
+        self._win.back_callback = self.go_back
+        self._win.forward_callback = self.go_forward
         self._win.viewport_changed.connect(self._on_viewport_changed)
         self._thread: QThread | None = None
         self._loader: _Loader | None = None
         self._current_html: str | None = None
         self._current_url: str = ''
+        self._history: list[str] = []
+        self._history_pos: int = -1
+        self._is_history_nav: bool = False
 
     def navigate(self, target: str) -> None:
         """Start async load of *target* (URL or file path).  Non-blocking."""
+        self._is_history_nav = False
+        self._start_load(target)
+
+    def go_back(self) -> None:
+        if self._history_pos > 0:
+            self._history_pos -= 1
+            self._is_history_nav = True
+            self._start_load(self._history[self._history_pos])
+
+    def go_forward(self) -> None:
+        if self._history_pos < len(self._history) - 1:
+            self._history_pos += 1
+            self._is_history_nav = True
+            self._start_load(self._history[self._history_pos])
+
+    def _start_load(self, target: str) -> None:
         self._win.set_status('Loading...')
         self._win.address_bar.setText(target)
 
@@ -101,6 +122,16 @@ class Browser:
         self._win.set_status('')
         self._current_html = html
         self._current_url = final_url
+
+        if not self._is_history_nav:
+            # Truncate forward history, then push new entry
+            self._history = self._history[:self._history_pos + 1]
+            if not self._history or self._history[-1] != final_url:
+                self._history.append(final_url)
+            self._history_pos = len(self._history) - 1
+
+        self._win.back_btn.setEnabled(self._history_pos > 0)
+        self._win.forward_btn.setEnabled(self._history_pos < len(self._history) - 1)
 
     def _on_error(self, msg: str) -> None:
         self._win.set_status(f'Error: {msg}')
