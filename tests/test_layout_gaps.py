@@ -147,11 +147,29 @@ class TestVisibilityHidden:
         box = layout_node(el, c, LayoutContext())
         assert box is not None
 
-    @pytest.mark.xfail(reason="visibility:hidden content should not appear in display list (rendering gap)")
     def test_visibility_hidden_not_in_display_list(self):
         """visibility:hidden elements should produce draw commands with opacity=0 or be omitted."""
-        # Without PyQt6 we can only assert this expectation; mark xfail for future
-        raise NotImplementedError("requires rendering layer verification")
+        from tests.render_helper import render, get_display_list
+        from rendering.display_list import DrawRect, DrawText
+
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <div style="visibility:hidden; width:200px; height:100px;
+                      background-color:red">Hidden</div>
+          <div style="width:200px; height:100px;
+                      background-color:blue">Visible</div>
+        </body></html>
+        ''')
+        dl = get_display_list(doc)
+
+        red_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'red']
+        hidden_texts = [cmd for cmd in dl if isinstance(cmd, DrawText) and 'Hidden' in cmd.text]
+        blue_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'blue']
+
+        assert len(red_rects) == 0, "visibility:hidden background should not be painted"
+        assert len(hidden_texts) == 0, "visibility:hidden text should not be painted"
+        assert len(blue_rects) >= 1, "visible sibling should still be painted"
 
 
 # ===========================================================================
@@ -315,7 +333,6 @@ class TestTextPropertiesNotApplied:
         lines, _ = layout_inline(el, 0.0, 0.0, 200.0)
         assert len(lines) == 1, f"Expected 1 line (nowrap), got {len(lines)} lines"
 
-    @pytest.mark.xfail(reason="white-space:pre preserves whitespace and newlines")
     def test_white_space_pre_preserves_newlines(self):
         """white-space:pre must preserve literal newlines in text nodes."""
         from layout.inline import layout_inline

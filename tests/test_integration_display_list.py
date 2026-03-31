@@ -157,6 +157,28 @@ class TestDisplayNoneNoDraw:
         assert len(blue_rects) >= 1, "Visible element should have draw commands"
 
 
+class TestVisibilityHiddenNoDraw:
+    """visibility:hidden preserves layout but suppresses painting."""
+
+    def test_visibility_hidden_element_no_commands(self):
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <div style="visibility:hidden; width:200px; height:100px;
+                      background-color:red">Hidden</div>
+          <div style="width:200px; height:100px;
+                      background-color:blue">Visible</div>
+        </body></html>
+        ''')
+        dl = get_display_list(doc)
+        red_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'red']
+        hidden_texts = [cmd for cmd in dl if isinstance(cmd, DrawText) and 'Hidden' in cmd.text]
+        blue_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'blue']
+        assert len(red_rects) == 0, "visibility:hidden background should not be painted"
+        assert len(hidden_texts) == 0, "visibility:hidden text should not be painted"
+        assert len(blue_rects) >= 1, "Visible element should still have draw commands"
+
+
 class TestDrawOrder:
     """Draw order: background → border → content (painter's algorithm)."""
 

@@ -117,6 +117,20 @@ class TestWhiteSpace:
         assert len(d.line_boxes) == 1, \
             f"nowrap should produce 1 line, got {len(d.line_boxes)}"
 
+    def test_pre_preserves_newlines(self):
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <pre id="d" style="white-space:pre; font-size:16px; margin:0">line1
+line2
+line3</pre>
+        </body></html>
+        ''')
+        d = find_element(doc, id_name='d')
+        assert hasattr(d, 'line_boxes')
+        assert len(d.line_boxes) == 3, \
+            f"pre should preserve 3 lines, got {len(d.line_boxes)}"
+
 
 class TestBrElement:
     """<br> forces a line break."""

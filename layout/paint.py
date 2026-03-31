@@ -364,6 +364,8 @@ def build_display_list(node, display_list, stacking_top: list) -> None:
         style = node.style if hasattr(node, 'style') else {}
         display = style.get('display', 'block')
         position = style.get('position', 'static')
+        visibility = style.get('visibility', 'visible')
+        paint_self = visibility != 'hidden'
 
         if display == 'none':
             return
@@ -432,42 +434,43 @@ def build_display_list(node, display_list, stacking_top: list) -> None:
         except Exception:
             pass
 
-        # box-shadow (outer, drawn behind background)
-        shadow = style.get('box-shadow', 'none')
-        if shadow and shadow not in ('none', ''):
-            for ox, oy, blur, spread, scolor, inset in reversed(_parse_all_shadows(shadow)):
-                if not inset:
-                    _emit(DrawBoxShadow(box.border_rect, ox, oy, blur, spread,
-                                        scolor, border_radius=radius))
+        if paint_self:
+            # box-shadow (outer, drawn behind background)
+            shadow = style.get('box-shadow', 'none')
+            if shadow and shadow not in ('none', ''):
+                for ox, oy, blur, spread, scolor, inset in reversed(_parse_all_shadows(shadow)):
+                    if not inset:
+                        _emit(DrawBoxShadow(box.border_rect, ox, oy, blur, spread,
+                                            scolor, border_radius=radius))
 
-        # Background colour
-        bg = style.get('background-color', 'transparent')
-        if bg and bg != 'transparent':
-            _emit(DrawRect(box.border_rect, bg, border_radius=radius))
+            # Background colour
+            bg = style.get('background-color', 'transparent')
+            if bg and bg != 'transparent':
+                _emit(DrawRect(box.border_rect, bg, border_radius=radius))
 
-        # Pre-fetched background image (raster)
-        node_bg_image = getattr(node, 'background_image', None)
-        if node_bg_image is not None:
-            _emit(DrawImage(box.border_rect.x, box.border_rect.y,
-                            node_bg_image, box.border_rect.width, box.border_rect.height))
+            # Pre-fetched background image (raster)
+            node_bg_image = getattr(node, 'background_image', None)
+            if node_bg_image is not None:
+                _emit(DrawImage(box.border_rect.x, box.border_rect.y,
+                                node_bg_image, box.border_rect.width, box.border_rect.height))
 
-        # <img> tag
-        if node.tag == 'img':
-            image = getattr(node, 'image', None)
-            if image is not None:
-                _emit(DrawImage(box.x, box.y, image, box.content_width, box.content_height))
+            # <img> tag
+            if node.tag == 'img':
+                image = getattr(node, 'image', None)
+                if image is not None:
+                    _emit(DrawImage(box.x, box.y, image, box.content_width, box.content_height))
 
-        # CSS background-image (gradient)
-        bg_image = style.get('background-image', 'none')
-        if bg_image and bg_image not in ('none', ''):
-            grad = _parse_linear_gradient(bg_image, box.border_rect)
-            if grad is not None:
-                _emit(DrawLinearGradient(box.border_rect, grad[0], grad[1]))
-            else:
-                rgrad = _parse_radial_gradient(bg_image, box.border_rect)
-                if rgrad is not None:
-                    rcx, rcy, rrx, rry, rstops = rgrad
-                    _emit(DrawRadialGradient(box.border_rect, rcx, rcy, rrx, rry, rstops))
+            # CSS background-image (gradient)
+            bg_image = style.get('background-image', 'none')
+            if bg_image and bg_image not in ('none', ''):
+                grad = _parse_linear_gradient(bg_image, box.border_rect)
+                if grad is not None:
+                    _emit(DrawLinearGradient(box.border_rect, grad[0], grad[1]))
+                else:
+                    rgrad = _parse_radial_gradient(bg_image, box.border_rect)
+                    if rgrad is not None:
+                        rcx, rcy, rrx, rry, rstops = rgrad
+                        _emit(DrawRadialGradient(box.border_rect, rcx, rcy, rrx, rry, rstops))
 
         # Border
         _SIDES = ('top', 'right', 'bottom', 'left')
@@ -479,12 +482,12 @@ def build_display_list(node, display_list, stacking_top: list) -> None:
             (lambda c: el_color if c == 'currentcolor' else c)(
                 style.get(f'border-{s}-color', style.get('border-color', el_color)))
             for s in _SIDES)
-        if any(s not in ('none', '', 'hidden') for s in side_styles):
+        if paint_self and any(s not in ('none', '', 'hidden') for s in side_styles):
             _emit(DrawBorder(box.border_rect, box.border, side_colors, side_styles))
 
         # Outline
         outline_style = style.get('outline-style', 'none')
-        if outline_style and outline_style not in ('none', '', 'hidden'):
+        if paint_self and outline_style and outline_style not in ('none', '', 'hidden'):
             outline_width = _parse_px(style.get('outline-width', '0'))
             if outline_width > 0:
                 _emit(DrawOutline(box.border_rect, outline_width, outline_style,
@@ -498,7 +501,7 @@ def build_display_list(node, display_list, stacking_top: list) -> None:
             _emit(PushClip(box.padding_rect))
 
         # List item marker
-        if display == 'list-item':
+        if paint_self and display == 'list-item':
             list_type = style.get('list-style-type', '')
             if not list_type:
                 parent = getattr(node, 'parent', None)
@@ -535,7 +538,7 @@ def build_display_list(node, display_list, stacking_top: list) -> None:
                 build_display_list(child, display_list, stacking_top)
 
         # Inline line boxes (text, images, inputs)
-        if hasattr(node, 'line_boxes'):
+        if paint_self and hasattr(node, 'line_boxes'):
             for line in node.line_boxes:
                 for item in line.items:
                     if getattr(item, 'image', None) is not None:

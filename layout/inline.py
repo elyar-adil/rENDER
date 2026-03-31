@@ -599,7 +599,9 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
     if isinstance(node, Text):
         style = inherited_style
         text = node.data
-        if not text.strip():
+        white_space = style.get('white-space', 'normal')
+        preserve_preformatted = white_space == 'pre'
+        if not preserve_preformatted and not text.strip():
             return
 
         family = style.get('font-family', 'Arial')
@@ -620,14 +622,77 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
             except Exception:
                 letter_spacing = 0.0
 
-        tokens = re.findall(r'\S+|\s+', text)
         space_w, space_h = measure_text(' ', family, size_px, weight, italic)
-        for token in tokens:
-            if token.isspace():
-                items.append(InlineItem(
-                    text='',
-                    width=space_w + word_spacing,
-                    height=space_h,
+        if preserve_preformatted:
+            pre_lines = text.split('\n')
+            for line_idx, segment in enumerate(pre_lines):
+                for token in re.findall(r'[^\t ]+|[\t ]+', segment):
+                    if not token:
+                        continue
+                    if token.isspace():
+                        expanded = token.expandtabs(4)
+                        items.append(InlineItem(
+                            text='',
+                            width=len(expanded) * (space_w + word_spacing),
+                            height=space_h,
+                            color=color,
+                            font_family=family,
+                            font_size=size_px,
+                            font_weight=weight,
+                            font_italic=italic,
+                            decoration=decoration,
+                            word_spacing=word_spacing,
+                            origin_node=current_link,
+                            type='SPACE',
+                        ))
+                        continue
+
+                    w, h = measure_text(token, family, size_px, weight, italic)
+                    if letter_spacing != 0.0:
+                        w += letter_spacing * len(token)
+                    items.append(InlineItem(
+                        text=token,
+                        width=w,
+                        height=h,
+                        color=color,
+                        font_family=family,
+                        font_size=size_px,
+                        font_weight=weight,
+                        font_italic=italic,
+                        decoration=decoration,
+                        word_spacing=word_spacing,
+                        origin_node=current_link,
+                    ))
+
+                if line_idx < len(pre_lines) - 1:
+                    items.append(InlineItem(text='', width=0, height=0, type='BR'))
+        else:
+            tokens = re.findall(r'\S+|\s+', text)
+            for token in tokens:
+                if token.isspace():
+                    items.append(InlineItem(
+                        text='',
+                        width=space_w + word_spacing,
+                        height=space_h,
+                        color=color,
+                        font_family=family,
+                        font_size=size_px,
+                        font_weight=weight,
+                        font_italic=italic,
+                        decoration=decoration,
+                        word_spacing=word_spacing,
+                        origin_node=current_link,
+                        type='SPACE',
+                    ))
+                    continue
+
+                w, h = measure_text(token, family, size_px, weight, italic)
+                if letter_spacing != 0.0:
+                    w += letter_spacing * len(token)
+                item = InlineItem(
+                    text=token,
+                    width=w,
+                    height=h,
                     color=color,
                     font_family=family,
                     font_size=size_px,
@@ -636,27 +701,8 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
                     decoration=decoration,
                     word_spacing=word_spacing,
                     origin_node=current_link,
-                    type='SPACE',
-                ))
-                continue
-
-            w, h = measure_text(token, family, size_px, weight, italic)
-            if letter_spacing != 0.0:
-                w += letter_spacing * len(token)
-            item = InlineItem(
-                text=token,
-                width=w,
-                height=h,
-                color=color,
-                font_family=family,
-                font_size=size_px,
-                font_weight=weight,
-                font_italic=italic,
-                decoration=decoration,
-                word_spacing=word_spacing,
-                origin_node=current_link,
-            )
-            items.append(item)
+                )
+                items.append(item)
 
     elif isinstance(node, Element):
         style = node.style or inherited_style
