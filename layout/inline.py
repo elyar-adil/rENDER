@@ -2,8 +2,9 @@
 import logging
 _logger = logging.getLogger(__name__)
 import re
-from dataclasses import dataclass, field
-from layout.box import BoxModel
+from dataclasses import dataclass, field, replace as _dc_replace
+from html.dom import Element, Text
+from layout.box import BoxModel, get_node_style as _get_style
 from layout.text import measure_word, measure_text, _parse_px
 
 from layout.block import _BLOCK_DISPLAYS, _shift_subtree  # shared constants/helpers
@@ -118,9 +119,7 @@ class LineBox:
 
 def _compute_line_height(node, max_font_size: float) -> float:
     """Compute the CSS line-height for a node as an absolute pixel value."""
-    lh_val = 'normal'
-    if hasattr(node, 'style') and node.style:
-        lh_val = node.style.get('line-height', 'normal')
+    lh_val = _get_style(node, 'line-height', 'normal') or 'normal'
 
     if lh_val == 'normal' or not lh_val:
         return 1.2 * max_font_size
@@ -153,20 +152,16 @@ def layout_inline(node, container_x: float, container_y: float,
     if not items:
         return [], 0.0
 
-    text_align = 'left'
-    white_space = 'normal'
-    text_overflow = 'clip'
+    text_align = _get_style(node, 'text-align', 'left') or 'left'
+    white_space = _get_style(node, 'white-space', 'normal') or 'normal'
+    text_overflow = _get_style(node, 'text-overflow', 'clip') or 'clip'
     text_indent = 0.0
-    if hasattr(node, 'style') and node.style:
-        text_align = node.style.get('text-align', 'left')
-        white_space = node.style.get('white-space', 'normal')
-        text_overflow = node.style.get('text-overflow', 'clip')
-        indent_str = node.style.get('text-indent', '')
-        if indent_str and indent_str not in ('0', '0px', ''):
-            try:
-                text_indent = _parse_px(indent_str)
-            except Exception:
-                text_indent = 0.0
+    indent_str = _get_style(node, 'text-indent', '')
+    if indent_str and indent_str not in ('0', '0px'):
+        try:
+            text_indent = _parse_px(indent_str)
+        except Exception as exc:
+            _logger.debug("Invalid text-indent %r: %s", indent_str, exc)
 
     nowrap = white_space in ('nowrap', 'pre', 'pre-line', 'pre-wrap')
 
@@ -270,10 +265,10 @@ def _apply_ellipsis(line: LineBox, available_width: float) -> None:
     if line.items:
         first = line.items[0]
         try:
-            from layout.text import measure_text
             ew, _ = measure_text('...', first.font_family, first.font_size, first.font_weight, first.font_italic)
             ellipsis_width = ew
-        except Exception:
+        except Exception as exc:
+            _logger.debug("measure_text failed for ellipsis: %s", exc)
             ellipsis_width = first.font_size * 1.2  # rough estimate
 
     budget = available_width - ellipsis_width
@@ -289,7 +284,6 @@ def _apply_ellipsis(line: LineBox, available_width: float) -> None:
     # Add ellipsis item
     if line.items:
         ref = line.items[0]
-        from dataclasses import replace
         ellipsis_item = InlineItem(
             text='...',
             x=line.x + total_w,
@@ -339,7 +333,8 @@ def _resolve_inline_block_width(style: dict, container_width: float) -> float | 
         if width.endswith('%'):
             return max(0.0, container_width * float(width[:-1]) / 100.0)
         return max(0.0, _parse_px(width))
-    except Exception:
+    except Exception as exc:
+        _logger.debug("Invalid inline-block width %r: %s", width, exc)
         return None
 
 
@@ -351,13 +346,12 @@ def _measure_text_span(text: str, style: dict) -> float:
     try:
         width, _ = measure_text(text, family, size_px, weight, italic)
         return width
-    except Exception:
+    except Exception as exc:
+        _logger.debug("measure_text failed: %s", exc)
         return max(0.0, len(text) * size_px * 0.6)
 
 
 def _measure_inline_block_intrinsic_width(node, inherited_style: dict) -> float:
-    from html.dom import Element, Text
-
     width = 0.0
 
     if isinstance(node, Text):
@@ -386,7 +380,8 @@ def _measure_inline_block_intrinsic_width(node, inherited_style: dict) -> float:
             if width_str and width_str not in ('auto', ''):
                 try:
                     content_width = _parse_px(width_str)
-                except Exception:
+                except Exception as exc:
+                    _logger.debug("Invalid input width %r: %s", width_str, exc)
                     content_width = 0.0
             if content_width <= 0.0:
                 size_attr = node.attributes.get('size', '').strip()
@@ -449,7 +444,8 @@ def _build_text_input_item(node, style: dict, current_link) -> InlineItem | None
     if width_str and width_str not in ('auto', ''):
         try:
             width = _parse_px(width_str)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("Invalid input width %r: %s", width_str, exc)
             width = 0.0
     if width <= 0.0:
         size_attr = node.attributes.get('size', '').strip()
@@ -464,7 +460,8 @@ def _build_text_input_item(node, style: dict, current_link) -> InlineItem | None
     if height_str and height_str not in ('auto', ''):
         try:
             height = _parse_px(height_str)
-        except Exception:
+        except Exception as exc:
+            _logger.debug("Invalid input height %r: %s", height_str, exc)
             height = 0.0
     if height <= 0.0:
         _, text_h = measure_text('Hg', family, size_px, weight, italic)
@@ -591,8 +588,6 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
     For inline element children we recurse, inheriting their style.
     current_link: the nearest <a> ancestor element (or None).
     """
-    from html.dom import Element, Text
-
     if inherited_style is None:
         inherited_style = {}
 
@@ -619,7 +614,8 @@ def _collect(node, items: list, inherited_style: dict = None, container_width: f
         else:
             try:
                 letter_spacing = _parse_px(letter_spacing_val)
-            except Exception:
+            except Exception as exc:
+                _logger.debug("Invalid letter-spacing %r: %s", letter_spacing_val, exc)
                 letter_spacing = 0.0
 
         space_w, space_h = measure_text(' ', family, size_px, weight, italic)

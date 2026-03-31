@@ -18,6 +18,7 @@ _SFNT_MAGIC = {b'\x00\x01\x00\x00', b'OTTO', b'true', b'ttcf'}
 _SAFE_FONT_EXTS = {'.ttf', '.otf', '.ttc', '.otc'}
 _VAR_SHORTHANDS = {'border', 'border-top', 'border-right', 'border-bottom', 'border-left'}
 _RE_MEDIA_AND = re.compile(r'(?i)\band\b\s*')
+_RE_CAPITALIZE = re.compile(r'(^|[\s\t\r\n\f\v]+)(\S)')
 
 
 def bind(document: Document, ua_css_path: str,
@@ -358,7 +359,7 @@ def _build_index(tagged_rules: list, viewport_width: int = 980,
             return
 
         sel_text = rule.prelude.strip()
-        for single_sel in _split_selectors(sel_text):
+        for single_sel in split_paren_aware(sel_text):
             single_sel = single_sel.strip()
             if not single_sel:
                 continue
@@ -871,9 +872,7 @@ def _transform_text(text: str, text_transform: str) -> str:
     if text_transform == 'lowercase':
         return text.lower()
     if text_transform == 'capitalize':
-        return re.sub(r'(^|[\s\t\r\n\f\v]+)(\S)',
-                      lambda m: m.group(1) + m.group(2).upper(),
-                      text)
+        return _RE_CAPITALIZE.sub(lambda m: m.group(1) + m.group(2).upper(), text)
     return text
 
 
@@ -939,5 +938,3 @@ def _border_side_longhands_look_unresolved(style: dict, side: str) -> bool:
 # Utility
 # ---------------------------------------------------------------------------
 
-def _split_selectors(sel_text: str) -> list:
-    return split_paren_aware(sel_text)
