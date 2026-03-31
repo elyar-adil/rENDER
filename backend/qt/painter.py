@@ -314,66 +314,168 @@ class BrowserWidget(QMainWindow):
     """Main browser window with address bar and render area."""
     viewport_changed = pyqtSignal(int, int)
 
+    _NAV_BTN_STYLE = """
+        QPushButton {
+            background: transparent;
+            border: none;
+            border-radius: 16px;
+            color: #e8eaed;
+            font-size: 18px;
+            padding: 0;
+        }
+        QPushButton:hover { background: rgba(232,234,237,0.12); }
+        QPushButton:pressed { background: rgba(232,234,237,0.22); }
+        QPushButton:disabled { color: #5f6368; }
+    """
+
     def __init__(self, title: str = 'rENDER Browser'):
         super().__init__()
         self.setWindowTitle(title)
         self.setMinimumSize(1024, 768)
 
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Toolbar
+        # ── Toolbar ──────────────────────────────────────────────────────────
         toolbar = QWidget()
-        toolbar.setFixedHeight(40)
-        toolbar.setStyleSheet('background: #f0f0f0; border-bottom: 1px solid #ccc;')
+        toolbar.setFixedHeight(52)
+        toolbar.setStyleSheet('background: #35363a;')
         toolbar_layout = QHBoxLayout(toolbar)
-        toolbar_layout.setContentsMargins(6, 4, 6, 4)
+        toolbar_layout.setContentsMargins(10, 8, 10, 8)
         toolbar_layout.setSpacing(4)
 
-        self.back_btn = QPushButton('←')
-        self.back_btn.setFixedSize(30, 28)
-        self.forward_btn = QPushButton('→')
-        self.forward_btn.setFixedSize(30, 28)
+        self.back_btn = QPushButton('‹')
+        self.back_btn.setFixedSize(34, 34)
+        self.back_btn.setStyleSheet(self._NAV_BTN_STYLE)
+        self.back_btn.setToolTip('Back')
+        self.back_btn.setEnabled(False)
+
+        self.forward_btn = QPushButton('›')
+        self.forward_btn.setFixedSize(34, 34)
+        self.forward_btn.setStyleSheet(self._NAV_BTN_STYLE)
+        self.forward_btn.setToolTip('Forward')
+        self.forward_btn.setEnabled(False)
+
         self.reload_btn = QPushButton('↻')
-        self.reload_btn.setFixedSize(30, 28)
+        self.reload_btn.setFixedSize(34, 34)
+        self.reload_btn.setStyleSheet(self._NAV_BTN_STYLE)
+        self.reload_btn.setToolTip('Reload')
+        self.reload_btn.clicked.connect(self._on_reload)
+
+        # Address bar pill
+        addr_pill = QWidget()
+        addr_pill.setStyleSheet("""
+            QWidget {
+                background: #202124;
+                border-radius: 18px;
+            }
+        """)
+        addr_layout = QHBoxLayout(addr_pill)
+        addr_layout.setContentsMargins(12, 0, 10, 0)
+        addr_layout.setSpacing(6)
+
+        self._security_icon = QLabel()
+        self._security_icon.setFixedWidth(18)
+        self._security_icon.setStyleSheet('background: transparent; font-size: 13px;')
 
         self.address_bar = QLineEdit()
-        self.address_bar.setPlaceholderText('Enter URL or file path...')
+        self.address_bar.setPlaceholderText('Search or enter address')
         self.address_bar.returnPressed.connect(self._on_navigate)
+        self.address_bar.textChanged.connect(self._update_security_icon)
+        self.address_bar.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                border: none;
+                color: #e8eaed;
+                font-size: 14px;
+                padding: 4px 0;
+                selection-background-color: #4a90d9;
+            }
+            QLineEdit::placeholder { color: #9aa0a6; }
+        """)
 
-        self.go_btn = QPushButton('Go')
-        self.go_btn.setFixedWidth(40)
-        self.go_btn.clicked.connect(self._on_navigate)
+        self._spin_label = QLabel()
+        self._spin_label.setFixedWidth(20)
+        self._spin_label.setStyleSheet('color: #9aa0a6; background: transparent; font-size: 14px;')
+
+        addr_layout.addWidget(self._security_icon)
+        addr_layout.addWidget(self.address_bar)
+        addr_layout.addWidget(self._spin_label)
 
         toolbar_layout.addWidget(self.back_btn)
         toolbar_layout.addWidget(self.forward_btn)
+        toolbar_layout.addSpacing(4)
         toolbar_layout.addWidget(self.reload_btn)
-        toolbar_layout.addWidget(self.address_bar)
-        toolbar_layout.addWidget(self.go_btn)
+        toolbar_layout.addSpacing(8)
+        toolbar_layout.addWidget(addr_pill, 1)
 
-        # Scroll area + canvas
+        # ── Scroll area + canvas ──────────────────────────────────────────────
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea { border: none; background: white; }
+            QScrollBar:vertical {
+                background: transparent; width: 10px; margin: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: #c1c1c1; border-radius: 5px; min-height: 28px;
+            }
+            QScrollBar::handle:vertical:hover { background: #a0a0a0; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar:horizontal {
+                background: transparent; height: 10px; margin: 2px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #c1c1c1; border-radius: 5px; min-width: 28px;
+            }
+            QScrollBar::handle:horizontal:hover { background: #a0a0a0; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+        """)
 
         self.canvas = RenderCanvas()
         self.canvas.link_clicked.connect(self._on_link_click)
         self.scroll_area.setWidget(self.canvas)
 
-        main_layout.addWidget(toolbar)
-        main_layout.addWidget(self.scroll_area)
+        # ── Status bar ────────────────────────────────────────────────────────
+        self._status_bar = QLabel()
+        self._status_bar.setFixedHeight(22)
+        self._status_bar.setStyleSheet("""
+            QLabel {
+                background: #f1f3f4;
+                color: #5f6368;
+                padding: 0 10px;
+                font-size: 12px;
+                border-top: 1px solid #dadce0;
+            }
+        """)
+        self._status_bar.hide()
 
-        # Navigation callback (set by engine)
+        main_layout.addWidget(toolbar)
+        main_layout.addWidget(self.scroll_area, 1)
+        main_layout.addWidget(self._status_bar)
+
+        # Loading spinner
+        self._spin_chars = ('◐', '◓', '◑', '◒')
+        self._spin_idx = 0
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(140)
+        self._spin_timer.timeout.connect(self._spin_tick)
+
         self.navigate_callback = None
+        self._current_url = ''
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(120)
         self._resize_timer.timeout.connect(self._emit_viewport_changed)
+
+        self._update_security_icon('')
+
+    # ── Public API ────────────────────────────────────────────────────────────
 
     def set_display_list(self, dl: DisplayList, page_height: int = 600, title: str = '') -> None:
         self.canvas.set_display_list(dl)
@@ -389,12 +491,42 @@ class BrowserWidget(QMainWindow):
         self.address_bar.setText(url)
 
     def set_status(self, msg: str) -> None:
-        """Show loading status in the title bar."""
         if msg:
-            self.setWindowTitle(f'{msg} — rENDER')
-        # Don't clear the title here; set_display_list will update it
+            self._status_bar.setText(msg)
+            self._status_bar.show()
+            self._spin_idx = 0
+            self._spin_timer.start()
+        else:
+            self._spin_timer.stop()
+            self._spin_label.setText('')
+            self._status_bar.hide()
+
+    # ── Internal slots ────────────────────────────────────────────────────────
+
+    def _spin_tick(self) -> None:
+        self._spin_label.setText(self._spin_chars[self._spin_idx % len(self._spin_chars)])
+        self._spin_idx += 1
+
+    def _update_security_icon(self, text: str = '') -> None:
+        url = text or self.address_bar.text()
+        if url.startswith('https://'):
+            self._security_icon.setText('\U0001f512')  # lock
+            self._security_icon.setStyleSheet('background: transparent; color: #81c995; font-size: 13px;')
+        elif url.startswith('http://'):
+            self._security_icon.setText('\u26a0')  # warning
+            self._security_icon.setStyleSheet('background: transparent; color: #f9ab00; font-size: 13px;')
+        elif url.startswith('file://'):
+            self._security_icon.setText('\U0001f4c4')  # page
+            self._security_icon.setStyleSheet('background: transparent; color: #9aa0a6; font-size: 13px;')
+        else:
+            self._security_icon.setText('')
 
     def _on_navigate(self) -> None:
+        url = self.address_bar.text().strip()
+        if self.navigate_callback and url:
+            self.navigate_callback(url)
+
+    def _on_reload(self) -> None:
         url = self.address_bar.text().strip()
         if self.navigate_callback and url:
             self.navigate_callback(url)
