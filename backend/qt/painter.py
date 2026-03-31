@@ -352,12 +352,14 @@ class BrowserWidget(QMainWindow):
         self.back_btn.setStyleSheet(self._NAV_BTN_STYLE)
         self.back_btn.setToolTip('Back')
         self.back_btn.setEnabled(False)
+        self.back_btn.clicked.connect(self._on_back)
 
         self.forward_btn = QPushButton('›')
         self.forward_btn.setFixedSize(34, 34)
         self.forward_btn.setStyleSheet(self._NAV_BTN_STYLE)
         self.forward_btn.setToolTip('Forward')
         self.forward_btn.setEnabled(False)
+        self.forward_btn.clicked.connect(self._on_forward)
 
         self.reload_btn = QPushButton('↻')
         self.reload_btn.setFixedSize(34, 34)
@@ -467,6 +469,8 @@ class BrowserWidget(QMainWindow):
         self._spin_timer.timeout.connect(self._spin_tick)
 
         self.navigate_callback = None
+        self.back_callback = None
+        self.forward_callback = None
         self._current_url = ''
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
@@ -520,6 +524,14 @@ class BrowserWidget(QMainWindow):
             self._security_icon.setStyleSheet('background: transparent; color: #9aa0a6; font-size: 13px;')
         else:
             self._security_icon.setText('')
+
+    def _on_back(self) -> None:
+        if self.back_callback:
+            self.back_callback()
+
+    def _on_forward(self) -> None:
+        if self.forward_callback:
+            self.forward_callback()
 
     def _on_navigate(self) -> None:
         url = self.address_bar.text().strip()
