@@ -301,7 +301,6 @@ class TestTextPropertiesNotApplied:
         # The actual text output must also be uppercase:
         assert t.data == 'HELLO WORLD', f"Expected uppercase, got: {t.data!r}"
 
-    @pytest.mark.xfail(reason="white-space:nowrap not enforced during inline layout")
     def test_white_space_nowrap_prevents_wrap(self):
         """white-space:nowrap must prevent line breaks even when text overflows."""
         from layout.inline import layout_inline
@@ -330,7 +329,6 @@ class TestTextPropertiesNotApplied:
         lines, _ = layout_inline(el, 0.0, 0.0, 500.0)
         assert len(lines) == 3, f"Expected 3 lines (pre), got {len(lines)}"
 
-    @pytest.mark.xfail(reason="text-indent not applied to first line of inline content")
     def test_text_indent_applied(self):
         """text-indent:40px shifts the first line of text."""
         from layout.inline import layout_inline
@@ -348,7 +346,6 @@ class TestTextPropertiesNotApplied:
         # First item x should be offset by the indent
         assert first_item.x >= 40.0, f"Expected x>=40 for text-indent, got {first_item.x}"
 
-    @pytest.mark.xfail(reason="text-overflow:ellipsis not implemented")
     def test_text_overflow_ellipsis(self):
         """overflow:hidden + white-space:nowrap + text-overflow:ellipsis should truncate."""
         from layout.inline import layout_inline
