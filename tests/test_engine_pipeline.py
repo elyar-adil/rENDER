@@ -95,6 +95,46 @@ class TestEnginePipelineHelpers(unittest.TestCase):
             )
         )
 
+    def test_execute_scripts_exposes_location_search_and_document_url(self):
+        doc = parse_html(
+            """
+            <html><body>
+              <script>
+                document.body.setAttribute('data-search', window.location.search);
+                document.body.setAttribute('data-url', document.URL);
+              </script>
+            </body></html>
+            """
+        )
+        url = 'https://www.google.com/search?q=render&hl=en#frag'
+        engine._execute_scripts(doc, base_url=url)
+        body = next(
+            node for node in doc.children[0].children
+            if getattr(node, 'tag', '') == 'body'
+        )
+        self.assertEqual(body.attributes.get('data-search'), '?q=render&hl=en')
+        self.assertEqual(body.attributes.get('data-url'), url)
+
+    def test_execute_scripts_sets_document_current_script(self):
+        doc = parse_html(
+            """
+            <html><body>
+              <script>
+                document.body.setAttribute(
+                  'data-current-script-tag',
+                  (document.currentScript && document.currentScript.tagName) || ''
+                );
+              </script>
+            </body></html>
+            """
+        )
+        engine._execute_scripts(doc, base_url='https://example.com/')
+        body = next(
+            node for node in doc.children[0].children
+            if getattr(node, 'tag', '') == 'body'
+        )
+        self.assertEqual(body.attributes.get('data-current-script-tag'), 'SCRIPT')
+
 
 
 if __name__ == '__main__':

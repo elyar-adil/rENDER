@@ -101,6 +101,7 @@ class Interpreter:
         self.console_prefix = '[JS]'
         self._setup_globals()
         self._iteration_count = 0
+        self._current_url = ''
 
     # ------------------------------------------------------------------
     # Global environment setup
@@ -148,6 +149,9 @@ class Interpreter:
         g.define('decodeURIComponent', lambda s: _up.unquote(_to_str(s)))
         g.define('encodeURI', lambda s: _up.quote(_to_str(s), safe=":/?#[]@!$&'()*+,;=-._~"))
         g.define('decodeURI', lambda s: _up.unquote(_to_str(s)))
+        import base64
+        g.define('atob', lambda s: base64.b64decode(_to_str(s)).decode('latin1'))
+        g.define('btoa', lambda s: base64.b64encode(_to_str(s).encode('latin1')).decode('ascii'))
 
         # String constructor
         def _string_ctor(v=_UNDEF):
@@ -250,8 +254,16 @@ class Interpreter:
         # window / globalThis
         window = JSObject()
         window['document'] = _UNDEF
-        window['location'] = JSObject({'href': '', 'hostname': '', 'pathname': '/'})
-        window['navigator'] = JSObject({'userAgent': 'rENDER/1.0'})
+        window['location'] = self._make_location('')
+        window['navigator'] = JSObject({
+            'userAgent': 'rENDER/1.0',
+            'language': 'en-US',
+            'languages': JSArray(['en-US', 'en']),
+            'platform': 'Linux x86_64',
+        })
+        perf = JSObject()
+        perf['now'] = lambda: 0
+        window['performance'] = perf
         window['innerWidth'] = 980
         window['innerHeight'] = 600
         window['setTimeout'] = g.get('setTimeout')
@@ -266,6 +278,43 @@ class Interpreter:
         g.define('window', window)
         g.define('self', window)
         g.define('globalThis', window)
+        g.define('location', window['location'])
+        g.define('navigator', window['navigator'])
+        g.define('performance', window['performance'])
+        g.define('atob', g.get('atob'))
+        g.define('btoa', g.get('btoa'))
+
+    def _make_location(self, href: str) -> JSObject:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(href or '')
+        loc = JSObject()
+        loc['href'] = href or ''
+        loc['protocol'] = f'{parsed.scheme}:' if parsed.scheme else ''
+        loc['host'] = parsed.netloc or ''
+        loc['hostname'] = parsed.hostname or ''
+        loc['port'] = str(parsed.port or '')
+        loc['pathname'] = parsed.path or '/'
+        loc['search'] = f'?{parsed.query}' if parsed.query else ''
+        loc['hash'] = f'#{parsed.fragment}' if parsed.fragment else ''
+        loc['origin'] = (
+            f'{parsed.scheme}://{parsed.netloc}'
+            if parsed.scheme and parsed.netloc else ''
+        )
+        loc['assign'] = lambda next_href: self.set_browser_url(_to_str(next_href))
+        loc['replace'] = lambda next_href: self.set_browser_url(_to_str(next_href))
+        loc['reload'] = lambda: None
+        loc['toString'] = lambda: loc.get('href', '')
+        return loc
+
+    def set_browser_url(self, href: str) -> None:
+        """Configure window.location for browser execution context."""
+        self._current_url = href or ''
+        loc = self._make_location(self._current_url)
+        self.global_env.set('location', loc)
+        window = self.global_env.get('window')
+        if isinstance(window, dict):
+            window['location'] = loc
 
     def _console_log(self, *args):
         msg = ' '.join(_to_str(a) for a in args)

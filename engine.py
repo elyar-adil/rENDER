@@ -287,6 +287,7 @@ def _execute_scripts(document, base_url: str) -> None:
     invalidation_graph = InvalidationGraph()
 
     interp = Interpreter()
+    interp.set_browser_url(base_url or '')
     binding = DOMBinding(document, interp, invalidation_graph=invalidation_graph)
     binding.setup()
     xhr_ctor = lambda: create_xhr(interp=interp, base_url=base_url)
@@ -331,6 +332,10 @@ def _execute_scripts(document, base_url: str) -> None:
         src = attrs.get('src', '').strip()
         js_code = ''
         script_label = ''
+        document_obj = interp.global_env.get('document')
+        current_script = binding.wrap(script_node)
+        if isinstance(document_obj, dict):
+            document_obj['currentScript'] = current_script
         if src:
             try:
                 from network.http import fetch as fetch_text, resolve_url
@@ -350,6 +355,9 @@ def _execute_scripts(document, base_url: str) -> None:
             interp.execute(ast)
         except Exception as e:
             print(f'[JS] Script error in {script_label}: {e}', file=sys.stderr)
+        finally:
+            if isinstance(document_obj, dict):
+                document_obj['currentScript'] = None
 
     for sn in blocking:
         get_event_loop().enqueue_task('script', lambda sn=sn: _run_script(sn))

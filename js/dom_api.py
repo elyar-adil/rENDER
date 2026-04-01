@@ -790,7 +790,17 @@ class DOMBinding:
         doc['title'] = ''
         doc['readyState'] = 'complete'
         doc['cookie'] = ''
-        doc['location'] = self.interpreter.global_env.get('window')['location'] if isinstance(self.interpreter.global_env.get('window'), dict) else JSObject()
+        location = (
+            self.interpreter.global_env.get('window')['location']
+            if isinstance(self.interpreter.global_env.get('window'), dict)
+            else JSObject()
+        )
+        doc['location'] = location
+        doc['URL'] = location.get('href', '')
+        doc['documentURI'] = location.get('href', '')
+        doc['baseURI'] = location.get('href', '')
+        doc['referrer'] = ''
+        doc['currentScript'] = None
 
         return doc
 
