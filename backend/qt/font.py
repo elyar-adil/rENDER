@@ -24,6 +24,22 @@ _text_cache: dict = {}
 _installed_fonts: set | None = None
 
 
+def _fallback_measure(text: str, size_px: float, weight: str = 'normal') -> tuple[float, float]:
+    size = max(1.0, float(size_px or 16.0))
+    width = 0.0
+    for ch in text:
+        codepoint = ord(ch)
+        if ch.isspace():
+            width += size * 0.33
+        elif codepoint >= 0x2E80:
+            width += size * 1.0
+        else:
+            width += size * 0.56
+    if str(weight).lower() in {'bold', '700', '800', '900'}:
+        width *= 1.05
+    return width, size * 1.2
+
+
 def _ensure_app() -> None:
     global _app
     from PyQt6.QtWidgets import QApplication
@@ -62,13 +78,16 @@ def _get_qfont(family: str, size_px: float, weight: str = 'normal', italic: bool
 def _measure(text: str, family: str, size_px: float,
              weight: str = 'normal', italic: bool = False) -> tuple[float, float]:
     """Measure text dimensions in pixels (module-level dict cache)."""
-    from PyQt6.QtGui import QFontMetrics
     cache_key = (family, size_px, weight, italic, text)
     if cache_key in _text_cache:
         return _text_cache[cache_key]
-    font = _get_qfont(family, size_px, weight, italic)
-    fm = QFontMetrics(font)
-    result = (float(fm.horizontalAdvance(text)), float(fm.height()))
+    try:
+        from PyQt6.QtGui import QFontMetrics
+        font = _get_qfont(family, size_px, weight, italic)
+        fm = QFontMetrics(font)
+        result = (float(fm.horizontalAdvance(text)), float(fm.height()))
+    except Exception:
+        result = _fallback_measure(text, size_px, weight)
     _text_cache[cache_key] = result
     return result
 
