@@ -43,8 +43,15 @@ class QtImageLoader(ImageLoader):
 
     def attach_images(self, img_data: list) -> None:
         """Decode raw bytes and attach QImage to each node as ``node.image``."""
-        from PyQt6.QtGui import QImage
-        from PyQt6.QtCore import QByteArray
+        try:
+            from PyQt6.QtGui import QImage
+            from PyQt6.QtCore import QByteArray
+        except Exception:
+            for node, _raw in img_data:
+                node.image = None
+                node.natural_width = 0
+                node.natural_height = 0
+            return
 
         for node, raw in img_data:
             if raw is None:

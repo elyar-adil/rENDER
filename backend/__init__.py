@@ -46,5 +46,10 @@ def get_image_loader():
 
 
 def _auto_register() -> None:
-    from backend.qt import register
-    register()
+    from backend.qt import register as register_qt
+
+    try:
+        register_qt()
+    except Exception:
+        from backend.fallback import register as register_fallback
+        register_fallback()
