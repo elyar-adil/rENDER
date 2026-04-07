@@ -8,6 +8,8 @@ line-length = 100
 extend-exclude = [
     ".cache",
     "tests/fixtures/webkit/upstream_raw",
+    "third_party",
+    "lib",
 ]
 
 [tool.ruff.lint]

@@ -15,7 +15,7 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
+# lib/ — rENDER lib directory is tracked (not venv lib)
 lib64/
 parts/
 sdist/

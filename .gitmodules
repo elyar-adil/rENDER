@@ -1,0 +1,4 @@
+[submodule "third_party/pyx"]
+	path = third_party/pyx
+	url = https://github.com/elyar-adil/pyx.git
+	branch = main

@@ -3,7 +3,18 @@ import os
 import sys
 
 # Ensure project root is on path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
+
+# ---------------------------------------------------------------------------
+# .pyx import hook — must be installed before any rENDER module imports so
+# that CPython resolves .pyx source files via the normal import machinery.
+# ---------------------------------------------------------------------------
+import importlib.machinery as _imllib
+if ".pyx" not in _imllib.SOURCE_SUFFIXES:
+    _imllib.SOURCE_SUFFIXES.insert(0, ".pyx")
+    sys.path_importer_cache.clear()
+del _imllib
 
 # Force offscreen Qt platform for headless testing
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
