@@ -1,5 +1,4 @@
 """Dependency-free fallback backend used when Qt backend is unavailable."""
-from __future__ import annotations
 
 from typing import Any
 

@@ -2,7 +2,6 @@
 
 Imports from css.tokenizer.
 """
-from __future__ import annotations
 
 from css.tokenizer import (
     Tokenizer, Token,
@@ -54,11 +53,11 @@ class AtRule:
 
     name: str
     prelude: str
-    rules: list[QualifiedRule | AtRule]
+    rules: list
     declarations: list[Declaration]
 
     def __init__(self, name: str, prelude: str,
-                 rules: list[QualifiedRule | AtRule] | None = None,
+                 rules: list | None = None,
                  declarations: list[Declaration] | None = None) -> None:
         self.name         = name
         self.prelude      = prelude

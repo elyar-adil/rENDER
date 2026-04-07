@@ -2,7 +2,6 @@
 
 This is a simplified but robust HTML5-style state-machine parser.
 """
-from __future__ import annotations
 
 from typing import Any
 

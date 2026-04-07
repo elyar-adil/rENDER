@@ -1,5 +1,4 @@
 """CSS property metadata: initial values and inheritance flags."""
-from __future__ import annotations
 
 
 import re

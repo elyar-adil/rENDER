@@ -1,5 +1,4 @@
 """Float manager: tracks floated elements within a Block Formatting Context."""
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 

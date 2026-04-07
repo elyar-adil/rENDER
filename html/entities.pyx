@@ -1,5 +1,4 @@
 """HTML entities decoder for the rENDER browser engine."""
-from __future__ import annotations
 
 import re
 

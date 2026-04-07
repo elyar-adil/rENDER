@@ -2,7 +2,6 @@
 
 Parses a subset of JavaScript (ES2020) into an AST suitable for interpretation.
 """
-from __future__ import annotations
 
 from js.lexer import Token, KEYWORD, IDENT, NUMBER, STRING, PUNCT, OP, EOF, TEMPLATE
 from js.ast import ASTNode, _node

@@ -25,7 +25,6 @@ Platform support
 - **Linux / macOS**: module imports without error but creates no windows
   (useful for unit tests on CI)
 """
-from __future__ import annotations
 
 from .app import Application
 from .events import (

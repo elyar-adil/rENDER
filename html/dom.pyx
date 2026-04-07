@@ -1,12 +1,11 @@
 """DOM node classes for the rENDER browser engine."""
-from __future__ import annotations
 
 from typing import Any
 
 
 class Node:
-    children: list[Node]
-    parent: Node | None
+    children: list
+    parent: Any
     node_type: str
 
     def __init__(self) -> None:

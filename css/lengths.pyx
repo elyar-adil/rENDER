@@ -10,7 +10,6 @@ Supports:
   - calc() with +, -, *, /  (nested parens supported)
   - var(--name, fallback) inside calc — fallback resolved, var itself → 1
 """
-from __future__ import annotations
 
 import re
 
@@ -49,9 +48,14 @@ def resolve_length_expr(
 # ---------------------------------------------------------------------------
 
 class _Context:
-    __slots__ = ('percentage_base', 'em_base', 'rem_base', 'vw', 'vh')
+    percentage_base: float | None
+    em_base: float
+    rem_base: float
+    vw: float
+    vh: float
 
-    def __init__(self, *, percentage_base, em_base, rem_base, vw, vh):
+    def __init__(self, *, percentage_base: float | None, em_base: float,
+                 rem_base: float, vw: float, vh: float) -> None:
         self.percentage_base = percentage_base
         self.em_base = float(em_base)
         self.rem_base = float(rem_base)

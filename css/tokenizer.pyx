@@ -1,5 +1,4 @@
 """CSS Tokenizer per CSS Syntax Module Level 3."""
-from __future__ import annotations
 
 # Token type constants
 IDENT       = 'IDENT'

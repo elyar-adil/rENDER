@@ -4,7 +4,6 @@ The :class:`Application` singleton initialises common controls, owns the
 event loop, and provides convenience factory methods for the most common
 top-level windows.
 """
-from __future__ import annotations
 
 import sys
 from typing import Callable

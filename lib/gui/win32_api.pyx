@@ -5,7 +5,6 @@ GUI framework.  All declarations are plain ctypes – no C headers required.
 
 Supported targets: Windows x86-64 (tested on Windows 10/11).
 """
-from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt

@@ -1,5 +1,4 @@
 """CSS cascade: applies styles from all sources to every Element in the DOM."""
-from __future__ import annotations
 
 import re
 import logging

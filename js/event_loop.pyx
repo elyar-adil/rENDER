@@ -6,7 +6,6 @@ Promise settlement. Timers are scheduled against a virtual monotonic clock so
 future callbacks do not execute during the same initial bootstrap turn.
 """
 
-from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field

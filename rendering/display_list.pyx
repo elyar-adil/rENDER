@@ -1,5 +1,4 @@
 """Display list: draw commands emitted by the layout engine."""
-from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 

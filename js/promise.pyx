@@ -1,5 +1,4 @@
 """Promise and microtask queue helpers for the rENDER browser engine."""
-from __future__ import annotations
 
 
 from js.event_loop import get_event_loop

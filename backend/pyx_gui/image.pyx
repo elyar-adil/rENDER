@@ -4,7 +4,6 @@ On Windows, uses ctypes to decode images via WIC (Windows Imaging Component).
 On other platforms, attempts stdlib-only decoding (struct + zlib for PNG),
 falling back gracefully to no-op so layout continues without images.
 """
-from __future__ import annotations
 
 import sys
 import struct

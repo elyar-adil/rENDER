@@ -4,7 +4,6 @@ Events are simple dataclasses passed to registered handler callables.
 The dispatcher maps (hwnd, message) pairs to Python-level handlers so
 that the raw WndProc stays decoupled from application logic.
 """
-from __future__ import annotations
 
 import dataclasses
 from collections import defaultdict

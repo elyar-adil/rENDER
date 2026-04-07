@@ -1,5 +1,4 @@
 """Qt image loading — ImageLoader implementation backed by PyQt6."""
-from __future__ import annotations
 
 import logging
 from backend.base import ImageLoader

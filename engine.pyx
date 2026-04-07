@@ -1,5 +1,4 @@
 """rENDER browser engine pipeline and entry point."""
-from __future__ import annotations
 
 # ---------------------------------------------------------------------------
 # .pyx import hook — must run before any intra-project imports.

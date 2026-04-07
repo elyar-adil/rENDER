@@ -1,5 +1,4 @@
 """Central dispatch: map CSS display values to LayoutEngine instances."""
-from __future__ import annotations
 from layout.box import BoxModel
 from layout.context import LayoutContext
 

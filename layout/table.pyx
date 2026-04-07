@@ -1,5 +1,4 @@
 """Table layout — CSS display:table."""
-from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
 import re

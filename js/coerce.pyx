@@ -1,5 +1,4 @@
 """JavaScript type coercion and operator helpers for rENDER browser engine."""
-from __future__ import annotations
 
 import re as _re
 from js.types import _UNDEF, JSFunction, JSArray

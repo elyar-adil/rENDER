@@ -1,5 +1,4 @@
 """DOM/BOM API bindings for the JavaScript interpreter."""
-from __future__ import annotations
 
 import logging
 _logger = logging.getLogger(__name__)

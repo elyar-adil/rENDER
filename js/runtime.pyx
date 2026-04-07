@@ -14,7 +14,6 @@ Supports:
   - require() for relative/absolute JS files (CommonJS module.exports)
   - console.log/warn/error/info without the browser [JS] prefix
 """
-from __future__ import annotations
 
 import os
 import sys

@@ -10,7 +10,6 @@ Architecture
 BrowserWindow  ← lib/gui Window + custom WM_PAINT handler
   └─ renders DisplayList commands via GDI (DrawRect, DrawText, DrawImage, …)
 """
-from __future__ import annotations
 
 import sys
 import logging

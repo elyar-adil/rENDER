@@ -1,12 +1,11 @@
 """Box model data structures."""
-from __future__ import annotations
-
+from typing import Any
 from dataclasses import dataclass, field
 
 
-def get_node_style(node, prop: str, default: str = '') -> str:
+def get_node_style(node: Any, prop: str, default: str = '') -> str:
     """Return the computed style value for *prop* on *node*, or *default*."""
-    style = getattr(node, 'style', None)
+    style: Any = node.style if hasattr(node, 'style') else None
     return style.get(prop, default) if style else default
 
 

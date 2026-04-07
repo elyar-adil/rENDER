@@ -4,7 +4,6 @@ Layouts arrange child widgets within a container rectangle.  They are
 *not* traditional Win32 containers – they just compute positions and
 resize children on demand.
 """
-from __future__ import annotations
 
 import dataclasses
 from typing import Sequence

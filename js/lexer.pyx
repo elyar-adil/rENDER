@@ -1,17 +1,18 @@
 """JavaScript lexer for rENDER browser engine."""
-from __future__ import annotations
-
+from typing import Any
 
 
 class Token:
-    __slots__ = ('type', 'value', 'line')
+    type: str
+    value: Any
+    line: int
 
-    def __init__(self, type_: str, value=None, line: int = 0):
+    def __init__(self, type_: str, value: Any = None, line: int = 0) -> None:
         self.type = type_
         self.value = value
         self.line = line
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f'Token({self.type}, {self.value!r})'
 
 
@@ -51,7 +52,12 @@ _PUNCTS = set('{}[]();,.')
 class Lexer:
     """Tokenize JavaScript source code."""
 
-    def __init__(self, source: str):
+    source: str
+    pos: int
+    line: int
+    tokens: list
+
+    def __init__(self, source: str) -> None:
         self.source = source
         self.pos = 0
         self.line = 1

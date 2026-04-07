@@ -4,7 +4,6 @@ A :class:`Window` wraps a Win32 overlapped window, registers a
 ``WNDCLASSEXW``, and routes raw Win32 messages to the application-level
 :class:`~pyx.gui.events.EventDispatcher`.
 """
-from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt

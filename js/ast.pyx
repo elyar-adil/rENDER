@@ -1,5 +1,4 @@
 """AST node type for the JavaScript parser."""
-from __future__ import annotations
 
 from js.types import _UNDEF  # re-exported so callers can do: from js.ast import _UNDEF
 

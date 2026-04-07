@@ -1,5 +1,4 @@
 """Resolve CSS computed values: convert relative units to absolute px values."""
-from __future__ import annotations
 
 import re
 from html.dom import Document, Element

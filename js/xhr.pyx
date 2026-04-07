@@ -1,6 +1,5 @@
 """XMLHttpRequest bridge for the rENDER JavaScript engine."""
 
-from __future__ import annotations
 
 import logging
 

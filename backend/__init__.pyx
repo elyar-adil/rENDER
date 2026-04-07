@@ -13,7 +13,6 @@ different backend (e.g. for testing or a non-Qt GUI toolkit)::
     set_font_metrics(MyFontMetrics())
     set_image_loader(MyImageLoader())
 """
-from __future__ import annotations
 
 from typing import Any
 

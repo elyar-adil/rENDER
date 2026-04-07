@@ -1,6 +1,7 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+norecursedirs = ["third_party", "lib", ".git", "__pycache__"]
 
 [tool.ruff]
 target-version = "py310"

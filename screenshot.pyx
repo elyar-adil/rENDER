@@ -5,7 +5,6 @@ Usage:
 
 Renders the page headlessly and saves to a PNG file.
 """
-from __future__ import annotations
 
 import argparse
 import sys

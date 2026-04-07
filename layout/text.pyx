@@ -7,7 +7,6 @@ All font/metrics operations are forwarded to ``backend.get_font_metrics()``,
 which defaults to the Qt implementation but can be swapped for testing or
 alternative GUI toolkits.
 """
-from __future__ import annotations
 
 from functools import lru_cache
 

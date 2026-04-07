@@ -4,7 +4,6 @@ On platforms where lib/gui (Win32) is available, this backend can use
 Win32 GDI text metrics.  On other platforms it falls back to a heuristic
 estimate so layout still produces sensible output in headless / CI runs.
 """
-from __future__ import annotations
 
 import sys
 from typing import Any

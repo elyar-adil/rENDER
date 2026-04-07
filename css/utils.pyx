@@ -1,5 +1,4 @@
 """Shared CSS parsing utilities."""
-from __future__ import annotations
 
 
 def split_paren_aware(text: str, sep: str = ',') -> list[str]:
@@ -29,7 +28,7 @@ def split_paren_aware(text: str, sep: str = ',') -> list[str]:
             i += 1
         elif depth == 0 and text[i:i + sep_len] == sep:
             result.append(''.join(current))
-            current = []
+            current: list[str] = []
             i += sep_len
         else:
             current.append(ch)

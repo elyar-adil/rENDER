@@ -1,5 +1,4 @@
 """Qt font metrics — FontMetrics implementation backed by PyQt6."""
-from __future__ import annotations
 
 import sys
 from functools import lru_cache

@@ -1,5 +1,4 @@
 """Qt backend — registers Qt implementations as the active backend."""
-from __future__ import annotations
 
 
 def register() -> None:

@@ -1,6 +1,5 @@
 """Render invalidation tracking for DOM/style/layout/paint changes."""
 
-from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,10 +21,10 @@ class InvalidationSnapshot:
     style_dirty: bool = False
     layout_dirty: bool = False
     paint_dirty: bool = False
-    records: tuple[InvalidationRecord, ...] = field(default_factory=tuple)
+    records: tuple = field(default_factory=tuple)
 
     @property
-    def dirty_phases(self) -> tuple[str, ...]:
+    def dirty_phases(self) -> tuple:
         phases: list[str] = []
         if self.style_dirty:
             phases.append('style')

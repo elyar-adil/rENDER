@@ -1,5 +1,4 @@
 """JavaScript built-in property access and method dispatch for rENDER browser engine."""
-from __future__ import annotations
 
 import logging
 import time as _time

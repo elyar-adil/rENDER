@@ -1,4 +1,3 @@
-from __future__ import annotations
 #!/usr/bin/env python3
 """jsrun — run JavaScript with the rENDER JS engine (Node-like).
 

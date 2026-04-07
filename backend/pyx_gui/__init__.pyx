@@ -8,7 +8,6 @@ Registration::
     from backend.pyx_gui import register
     register()
 """
-from __future__ import annotations
 
 from backend.pyx_gui.font import PyxFontMetrics
 from backend.pyx_gui.image import PyxImageLoader

@@ -17,7 +17,6 @@ Available widgets
 - :class:`ComboBox`     – drop-down combo (CBS_DROPDOWNLIST)
 - :class:`ProgressBar`  – progress bar via comctl32
 """
-from __future__ import annotations
 
 import ctypes
 from typing import Callable, Sequence

@@ -1,5 +1,4 @@
 """LayoutContext — shared state for a layout pass, and LayoutEngine ABC."""
-from __future__ import annotations
 from abc import ABC, abstractmethod
 from layout.box import BoxModel
 
@@ -22,7 +21,7 @@ class LayoutContext:
         self.absolute_containing_block = None
         self.absolute_containing_node = None
 
-    def fork(self) -> LayoutContext:
+    def fork(self) -> 'LayoutContext':
         """Return a new context with a fresh FloatManager (new BFC)."""
         child = LayoutContext(self.viewport_width, self.viewport_height)
         child.absolute_nodes = self.absolute_nodes

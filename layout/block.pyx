@@ -1,5 +1,4 @@
 """Block Formatting Context layout."""
-from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
 from html.dom import Element, Text

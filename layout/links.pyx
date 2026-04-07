@@ -1,5 +1,4 @@
 """Link extraction helpers for the layout engine."""
-from __future__ import annotations
 
 from html.dom import Element
 from layout.box import Rect

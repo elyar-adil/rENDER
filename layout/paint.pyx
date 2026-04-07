@@ -1,5 +1,4 @@
 """CSS visual-effect parsing and display-list painting for rENDER browser engine."""
-from __future__ import annotations
 
 import logging
 import math

@@ -1,5 +1,4 @@
 """CSS Grid layout (simplified — supports fixed/fr/auto column tracks)."""
-from __future__ import annotations
 import logging
 _logger = logging.getLogger(__name__)
 from layout.box import BoxModel, EdgeSizes, get_node_style as _get_style

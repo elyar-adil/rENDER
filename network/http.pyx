@@ -1,5 +1,5 @@
 """HTTP/HTTPS client using Python stdlib urllib."""
-from __future__ import annotations
+from typing import Any
 
 import codecs
 import logging
@@ -61,15 +61,17 @@ def clear_cache() -> None:
 
 def _is_cert_verification_failure(exc: Exception) -> bool:
     """Return True when urllib failed due to TLS certificate verification."""
-    seen = set()
-    current = exc
+    seen: set = set()
+    current: Any = exc
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         if isinstance(current, ssl.SSLCertVerificationError):
             return True
         if isinstance(current, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(current):
             return True
-        current = getattr(current, 'reason', None) or getattr(current, '__cause__', None)
+        reason: Any = current.reason if hasattr(current, 'reason') else None
+        cause: Any = current.__cause__ if hasattr(current, '__cause__') else None
+        current = reason or cause
     return False
 
 

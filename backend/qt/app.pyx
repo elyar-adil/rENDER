@@ -1,5 +1,4 @@
 """Qt application controller — Browser window and background page loader."""
-from __future__ import annotations
 
 import os
 import sys
