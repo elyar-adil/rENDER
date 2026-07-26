@@ -1,0 +1,15 @@
+[package]
+name = "render-net"
+description = "Bounded HTTP transport adapter for the rENDER browser engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rustls = { version = "0.23.42", default-features = false, features = ["std"] }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+url = "2.5.7"
+
+[lints]
+workspace = true

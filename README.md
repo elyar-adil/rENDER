@@ -1,6 +1,9 @@
 # rENDER
 
-`rENDER` is a small browser engine written in Python with `PyQt6`. It parses HTML, CSS, and a growing subset of JavaScript, computes styles, builds layout boxes, and paints real pages without delegating rendering to an existing browser engine.
+`rENDER` is a self-contained browser engine being built around a new Rust core.
+It does not delegate HTML, CSS, JavaScript, layout, or painting to Chromium or a
+system WebView. The earlier Python/PyQt implementation remains runnable as a
+prototype while standards-correct browser behavior is implemented in Rust.
 
 The project is intentionally hands-on: core subsystems such as parsing, cascade, layout, and painting live in this repository and are readable end to end.
 
@@ -9,7 +12,9 @@ The project is intentionally hands-on: core subsystems such as parsing, cascade,
 - HTML, CSS, DOM, layout, and painting are implemented in Python.
 - Real-page compatibility work is covered by focused regression tests.
 - Layout coverage includes block, inline, float, flex, grid, table, and positioned flows.
-- External stylesheets and images are fetched concurrently during pipeline execution.
+- The GUI paints after HTML and blocking CSS, then hydrates images, backgrounds,
+  and external scripts through a shared parallel resource pool.
+- A persistent page session keeps DOM, JavaScript, timers, and rendering invalidation alive after load.
 - Headless screenshot tooling and browser-vs-engine visual diff helpers are included.
 - WebKit-inspired layout fixtures are imported and adapted into deterministic geometry tests.
 
@@ -22,6 +27,29 @@ The project is intentionally hands-on: core subsystems such as parsing, cascade,
 ![rENDER rendering hao123.html](docs/screenshot_hao123.png)
 
 ## Quick Start
+
+### Rust native browser (experimental)
+
+The all-Rust browser opens a native window and presents the CPU surface produced
+by `render-core`; it does not embed Chromium, a system WebView, or the Python
+prototype. With no argument it displays the built-in new-tab page:
+
+```powershell
+cargo run -p render-browser
+```
+
+To open a local HTML file:
+
+```powershell
+cargo run -p render-browser -- example/index.html
+```
+
+The native chrome provides tabs, an editable address bar, history controls,
+window controls, dark-theme colors, and fractional-DPI painting. HTTP/HTTPS
+documents load on background Rust workers; HTML encoding detection and external
+stylesheets flow into the same DOM/style/layout/paint pipeline. The executable
+is still experimental: substantial CSS layout, JavaScript/Web API, media,
+images, security isolation, accessibility, and interaction work remains.
 
 ### 1. Create an environment
 
@@ -62,6 +90,12 @@ Run the test suite:
 python -m pytest
 ```
 
+Run tests with the CI coverage gate:
+
+```bash
+python -m pytest --cov --cov-report=term --cov-fail-under=60
+```
+
 Testing strategy details: [`docs/testing_strategy.md`](docs/testing_strategy.md).
 Generic engine backlog: [`docs/generic-browser-todo.md`](docs/generic-browser-todo.md).
 
@@ -69,7 +103,7 @@ Run syntax and lint checks:
 
 ```bash
 python -m compileall engine.py screenshot.py css html js layout network rendering tests
-python -m ruff check engine.py screenshot.py css html js layout network rendering tests
+python -m ruff check engine.py screenshot.py css html js layout network rendering
 ```
 
 ## Repository Layout
@@ -89,7 +123,7 @@ example/                 Local HTML fixtures for manual testing
 
 ## Architecture
 
-The main render path looks like this:
+The complete headless render path looks like this:
 
 1. Parse HTML into a DOM tree.
 2. Fetch external CSS and image resources.
@@ -97,7 +131,38 @@ The main render path looks like this:
 4. Bind CSS, compute styles, and resolve layout boxes.
 5. Paint the display list with the PyQt6 backend.
 
+After the initial load, the page session continues to dispatch DOM click events,
+advance timers, and rebuild style/layout/paint output when JavaScript mutates the page.
+
+The interactive GUI uses a progressive variant of that pipeline. It emits the
+first display list after HTML and external CSS are ready, while ordinary images,
+CSS backgrounds, and external scripts download concurrently. Completed images
+are attached in batches so slow or broken archival resources cannot hold the
+first visible page hostage.
+
 The central orchestration lives in [`engine.py`](engine.py). Layout engines are split by formatting context under [`layout/`](layout/).
+
+## Rust browser architecture
+
+rENDER's product target is a complete, lightweight desktop browser with a
+self-owned Rust engine. Headless automation, deterministic Agent workflows, and
+future Python bindings consume the same DOM, event loop, layout, and display
+list as the desktop browser; they are not a separate compatibility backend.
+
+Rust-core work currently takes priority over extending the Python prototype,
+which is not the behavioral specification. WHATWG/CSS/ECMAScript standards,
+WPT/test262, and interoperable browser behavior take precedence. See
+[`docs/rust_migration.md`](docs/rust_migration.md) for the architecture,
+correctness rules, and subsystem migration policy.
+
+Run the migrated Rust core and Python-binding checks with:
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+maturin develop --manifest-path bindings/python/Cargo.toml
+python -m pytest -q bindings/python/tests
+```
 
 ## Compatibility Strategy
 
@@ -113,9 +178,14 @@ Site-specific render adapters and external-browser fallbacks are intentionally o
 
 This keeps behavior improvements concrete and reviewable.
 
-## Historical Code
+## Security Model
 
-Some top-level modules such as `graphics.py`, `layout.py`, `run_hao123.py`, `res.py`, and `paser/` are older prototypes kept for reference. Active engine work should target `engine.py`, the package directories, and `tests/`.
+- TLS certificate errors are fatal and are never retried with verification disabled.
+- JavaScript `fetch` and XHR are same-origin only until CORS response handling is implemented.
+- Remote pages cannot read `file:` URLs; local file access is enabled only for local documents and their resources.
+- Network responses and data URIs have in-memory size limits.
+
+This is still an experimental single-process browser engine, not a hardened sandbox for hostile web content.
 
 ## Contributing
 
@@ -123,4 +193,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, review expectations, and chang
 
 ## License
 
-Distributed under the terms in [COPYING](COPYING).
+Project source is distributed under the terms in [COPYING](COPYING). PyQt6 is
+GPL/commercial dual-licensed, so distributors must also comply with the chosen
+PyQt6 license.

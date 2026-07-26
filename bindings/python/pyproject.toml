@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "render-web-runtime"
+version = "0.1.0"
+description = "Python API for the rENDER embeddable, deterministic web runtime"
+requires-python = ">=3.10"
+license = { text = "WTFPL" }
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "render_runtime._native"
+python-source = "python"
+features = ["pyo3/extension-module"]

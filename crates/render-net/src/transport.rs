@@ -1,0 +1,413 @@
+use std::fmt;
+use std::io::Read;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+
+use ureq::ResponseExt;
+use url::Url;
+
+/// Cooperative cancellation shared by a request and its caller.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(Arc<AtomicBool>);
+
+impl CancelToken {
+    /// Requests cancellation. Blocking socket operations observe this at their
+    /// next transport checkpoint; queued batch work is cancelled immediately.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Reports whether cancellation has been requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// HTTP status returned by the origin, including non-success statuses.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HttpStatus(u16);
+
+impl HttpStatus {
+    /// Returns the numeric HTTP status code.
+    #[must_use]
+    pub const fn as_u16(self) -> u16 {
+        self.0
+    }
+
+    /// Whether the status is in the inclusive 200..=299 range.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        self.0 >= 200 && self.0 <= 299
+    }
+}
+
+/// A response header. Values remain bytes so legal non-UTF-8 field values are
+/// not silently corrupted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Header {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+/// Parsed metadata from the `Content-Type` response header.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContentType {
+    /// Lowercase ASCII media type, for example `text/html`.
+    pub media_type: String,
+    /// Lowercase charset label when a `charset` parameter was present.
+    pub charset: Option<String>,
+}
+
+/// A normalized HTTP GET request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchRequest {
+    pub url: Url,
+    /// Optional request `Accept` value. Browser content negotiation policy
+    /// belongs to the caller rather than this transport adapter.
+    pub accept: Option<String>,
+}
+
+impl FetchRequest {
+    #[must_use]
+    pub const fn get(url: Url) -> Self {
+        Self { url, accept: None }
+    }
+
+    #[must_use]
+    pub fn with_accept(mut self, accept: impl Into<String>) -> Self {
+        self.accept = Some(accept.into());
+        self
+    }
+}
+
+/// Bounded transport configuration.
+#[derive(Clone, Debug)]
+pub struct FetchConfig {
+    pub redirect_limit: u32,
+    pub max_body_bytes: usize,
+    pub max_header_bytes: usize,
+    pub timeout: Duration,
+    pub user_agent: String,
+}
+
+impl Default for FetchConfig {
+    fn default() -> Self {
+        Self {
+            redirect_limit: 10,
+            max_body_bytes: 16 * 1024 * 1024,
+            max_header_bytes: 64 * 1024,
+            timeout: Duration::from_secs(30),
+            user_agent: format!("rENDER/{}", env!("CARGO_PKG_VERSION")),
+        }
+    }
+}
+
+/// Successful response bytes and transport metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FetchResponse {
+    pub requested_url: Url,
+    pub final_url: Url,
+    /// Redirect chain including the requested and final URLs.
+    pub redirect_chain: Vec<Url>,
+    pub status: HttpStatus,
+    pub headers: Vec<Header>,
+    pub content_type: Option<ContentType>,
+    pub body: Vec<u8>,
+}
+
+/// Typed transport failures. HTTP 4xx/5xx responses are successful transport
+/// results and retain their status in [`FetchResponse`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FetchError {
+    Cancelled,
+    UnsupportedScheme(String),
+    InvalidUrl(String),
+    Dns,
+    Timeout,
+    Tls(String),
+    RedirectLimitExceeded { limit: u32 },
+    HeaderLimitExceeded { limit: usize },
+    BodyLimitExceeded { limit: usize },
+    Protocol(String),
+    Io(String),
+    WorkerStopped,
+    Transport(String),
+}
+
+impl fmt::Display for FetchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("request cancelled"),
+            Self::UnsupportedScheme(scheme) => {
+                write!(formatter, "unsupported URL scheme: {scheme}")
+            }
+            Self::InvalidUrl(message) => write!(formatter, "invalid request URL: {message}"),
+            Self::Dns => formatter.write_str("host name lookup failed"),
+            Self::Timeout => formatter.write_str("request timed out"),
+            Self::Tls(message) => write!(formatter, "TLS verification/transport failed: {message}"),
+            Self::RedirectLimitExceeded { limit } => {
+                write!(formatter, "redirect limit exceeded ({limit})")
+            }
+            Self::HeaderLimitExceeded { limit } => {
+                write!(formatter, "response header limit exceeded ({limit} bytes)")
+            }
+            Self::BodyLimitExceeded { limit } => {
+                write!(formatter, "response body limit exceeded ({limit} bytes)")
+            }
+            Self::Protocol(message) => write!(formatter, "HTTP protocol error: {message}"),
+            Self::Io(message) => write!(formatter, "network I/O error: {message}"),
+            Self::WorkerStopped => formatter.write_str("network worker stopped"),
+            Self::Transport(message) => write!(formatter, "transport error: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+pub type FetchResult = Result<FetchResponse, FetchError>;
+
+/// Cloneable blocking HTTP transport. Call this on a network thread, or use
+/// [`crate::NetworkWorker`] from GUI/event-loop code.
+#[derive(Clone)]
+pub struct HttpTransport {
+    config: Arc<FetchConfig>,
+    agent: ureq::Agent,
+}
+
+impl fmt::Debug for HttpTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HttpTransport")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpTransport {
+    /// Creates a transport with verified rustls HTTPS and bounded headers.
+    #[must_use]
+    pub fn new(config: FetchConfig) -> Self {
+        let agent_config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(config.redirect_limit)
+            .max_redirects_will_error(true)
+            .save_redirect_history(true)
+            .max_response_header_size(config.max_header_bytes)
+            .timeout_global(Some(config.timeout))
+            .user_agent(config.user_agent.clone())
+            .build();
+        Self {
+            config: Arc::new(config),
+            agent: agent_config.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn config(&self) -> &FetchConfig {
+        &self.config
+    }
+
+    /// Performs one bounded HTTP/HTTPS GET.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`FetchError`] for cancellation, invalid schemes,
+    /// configured limit violations, TLS verification, and transport failures.
+    pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        validate_scheme(&request.url)?;
+        if cancel.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+
+        let mut builder = self.agent.get(request.url.as_str());
+        if let Some(accept) = request.accept.as_deref() {
+            builder = builder.header("Accept", accept);
+        }
+        let mut response = builder.call().map_err(|error| self.map_error(error))?;
+
+        if cancel.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+
+        let final_url = Url::parse(&response.get_uri().to_string())
+            .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
+        let redirect_chain = response
+            .get_redirect_history()
+            .unwrap_or_default()
+            .iter()
+            .map(|uri| Url::parse(&uri.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
+        let status = HttpStatus(response.status().as_u16());
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| Header {
+                name: name.as_str().to_owned(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect::<Vec<_>>();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_type);
+        let body = read_bounded_body(
+            response.body_mut().as_reader(),
+            self.config.max_body_bytes,
+            cancel,
+        )?;
+
+        Ok(FetchResponse {
+            requested_url: request.url.clone(),
+            final_url,
+            redirect_chain,
+            status,
+            headers,
+            content_type,
+            body,
+        })
+    }
+
+    fn map_error(&self, error: ureq::Error) -> FetchError {
+        match error {
+            ureq::Error::TooManyRedirects => FetchError::RedirectLimitExceeded {
+                limit: self.config.redirect_limit,
+            },
+            ureq::Error::LargeResponseHeader(_, _) => FetchError::HeaderLimitExceeded {
+                limit: self.config.max_header_bytes,
+            },
+            ureq::Error::Timeout(_) => FetchError::Timeout,
+            ureq::Error::HostNotFound => FetchError::Dns,
+            ureq::Error::Tls(message) => FetchError::Tls(message.to_owned()),
+            ureq::Error::Rustls(error) => FetchError::Tls(error.to_string()),
+            ureq::Error::TlsRequired => FetchError::Tls("TLS was required but unavailable".into()),
+            ureq::Error::BadUri(message) => FetchError::InvalidUrl(message),
+            ureq::Error::Protocol(error) => FetchError::Protocol(error.to_string()),
+            ureq::Error::Io(error) => map_io_error(&error),
+            other => FetchError::Transport(other.to_string()),
+        }
+    }
+}
+
+fn map_io_error(error: &std::io::Error) -> FetchError {
+    if let Some(error) = rustls_error_from_io(error) {
+        FetchError::Tls(error.to_string())
+    } else {
+        FetchError::Io(error.to_string())
+    }
+}
+
+fn rustls_error_from_io(error: &std::io::Error) -> Option<&rustls::Error> {
+    let mut current = error
+        .get_ref()
+        .map(|source| source as &(dyn std::error::Error + 'static));
+    while let Some(source) = current {
+        if let Some(error) = source.downcast_ref::<rustls::Error>() {
+            return Some(error);
+        }
+        current = source.source();
+    }
+    None
+}
+
+fn validate_scheme(url: &Url) -> Result<(), FetchError> {
+    match url.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => Err(FetchError::UnsupportedScheme(scheme.to_owned())),
+    }
+}
+
+fn read_bounded_body(
+    mut reader: impl Read,
+    limit: usize,
+    cancel: &CancelToken,
+) -> Result<Vec<u8>, FetchError> {
+    let mut body = Vec::with_capacity(limit.min(64 * 1024));
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|error| FetchError::Io(error.to_string()))?;
+        if read == 0 {
+            return Ok(body);
+        }
+        let remaining = limit.saturating_sub(body.len());
+        if read > remaining {
+            return Err(FetchError::BodyLimitExceeded { limit });
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn parse_content_type(value: &str) -> Option<ContentType> {
+    let mut parts = value.split(';');
+    let media_type = parts.next()?.trim().to_ascii_lowercase();
+    if media_type.is_empty() || !media_type.contains('/') {
+        return None;
+    }
+    let charset = parts.find_map(|parameter| {
+        let (name, value) = parameter.split_once('=')?;
+        name.trim().eq_ignore_ascii_case("charset").then(|| {
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase()
+        })
+    });
+    Some(ContentType {
+        media_type,
+        charset,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{ContentType, FetchError, map_io_error, parse_content_type};
+
+    #[test]
+    fn parses_content_type_and_charset_case_insensitively() {
+        assert_eq!(
+            parse_content_type("Text/HTML; boundary=x; CHARSET=\"GBK\""),
+            Some(ContentType {
+                media_type: "text/html".into(),
+                charset: Some("gbk".into()),
+            })
+        );
+        assert_eq!(parse_content_type("not-a-media-type"), None);
+    }
+
+    #[test]
+    fn classifies_rustls_errors_wrapped_by_io_as_tls() {
+        let error = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::General("certificate rejected".into()),
+        );
+
+        assert_eq!(
+            map_io_error(&error),
+            FetchError::Tls("unexpected error: certificate rejected".into())
+        );
+    }
+
+    #[test]
+    fn preserves_non_tls_io_errors() {
+        let error = io::Error::new(io::ErrorKind::ConnectionReset, "peer reset connection");
+
+        assert_eq!(
+            map_io_error(&error),
+            FetchError::Io("peer reset connection".into())
+        );
+    }
+}

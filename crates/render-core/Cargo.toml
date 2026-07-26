@@ -1,0 +1,20 @@
+[package]
+name = "render-core"
+description = "Standards-driven core for the rENDER embeddable web runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "render_core"
+
+[dependencies]
+cssparser = "0.35.0"
+encoding_rs = "0.8.35"
+entities = "1.0.2-rc.1"
+image-codec = { package = "image", version = "0.25.8", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+url = "2.5.4"
+
+[lints]
+workspace = true
