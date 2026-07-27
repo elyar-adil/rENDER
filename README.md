@@ -98,6 +98,7 @@ python -m pytest --cov --cov-report=term --cov-fail-under=60
 
 Testing strategy details: [`docs/testing_strategy.md`](docs/testing_strategy.md).
 Generic engine backlog: [`docs/generic-browser-todo.md`](docs/generic-browser-todo.md).
+Prioritized improvement plan: [`docs/improvement_plan.md`](docs/improvement_plan.md).
 
 Run syntax and lint checks:
 
