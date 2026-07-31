@@ -17,4 +17,5 @@ pub mod layout;
 pub mod navigation;
 pub mod page;
 pub mod paint;
+pub mod script;
 pub mod spec;

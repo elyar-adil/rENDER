@@ -8,4 +8,5 @@ pub mod images;
 pub mod model;
 pub mod navigation;
 pub mod resources;
+pub mod scripts;
 pub mod worker;

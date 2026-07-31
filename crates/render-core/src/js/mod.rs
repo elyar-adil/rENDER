@@ -13,8 +13,10 @@ mod value;
 use std::error::Error;
 use std::fmt;
 
-pub use runtime::JsRuntime;
+pub use runtime::{JsMicrotask, JsRuntime};
 pub use value::{JsObject, JsValue, ObjectId, PropertyDescriptor, Realm};
+
+use parser::Statement;
 
 use crate::dom::DomRevision;
 
@@ -51,13 +53,15 @@ pub enum JsErrorKind {
     Type,
     Dom,
     ResourceLimit,
+    Throw,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JsError {
     kind: JsErrorKind,
     message: String,
     offset: Option<usize>,
+    thrown: Option<JsValue>,
 }
 
 impl JsError {
@@ -76,6 +80,11 @@ impl JsError {
         self.offset
     }
 
+    #[must_use]
+    pub fn thrown_value(&self) -> Option<&JsValue> {
+        self.thrown.as_ref()
+    }
+
     pub(crate) fn new(
         kind: JsErrorKind,
         message: impl Into<String>,
@@ -85,6 +94,7 @@ impl JsError {
             kind,
             message: message.into(),
             offset,
+            thrown: None,
         }
     }
 
@@ -107,6 +117,15 @@ impl JsError {
     pub(crate) fn resource(message: impl Into<String>) -> Self {
         Self::new(JsErrorKind::ResourceLimit, message, None)
     }
+
+    pub(crate) fn thrown(value: JsValue) -> Self {
+        Self {
+            kind: JsErrorKind::Throw,
+            message: value.to_js_string(),
+            offset: None,
+            thrown: Some(value),
+        }
+    }
 }
 
 impl fmt::Display for JsError {
@@ -125,6 +144,29 @@ impl fmt::Display for JsError {
 
 impl Error for JsError {}
 
+/// Parsed script reusable across isolated realms.
+///
+/// Compilation enforces source, token, and statement limits. Execution applies
+/// the target runtime's independent step, call-depth, heap, and DOM limits.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompiledScript {
+    statements: Vec<Statement>,
+}
+
+impl CompiledScript {
+    /// Tokenize and parse one classic script without creating a Realm.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed syntax or resource-limit error. Unsupported syntax is
+    /// never ignored or deferred until execution.
+    pub fn compile(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
+        let tokens = lexer::tokenize(source, limits)?;
+        let statements = parser::parse(tokens, limits)?;
+        Ok(Self { statements })
+    }
+}
+
 /// Observable result of running one script.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScriptOutcome {
@@ -135,7 +177,7 @@ pub struct ScriptOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsErrorKind, JsRuntime, RuntimeLimits};
+    use super::{CompiledScript, JsErrorKind, JsRuntime, RuntimeLimits};
     use crate::dom::{MutationKind, NodeKind};
     use crate::html::parse_document;
 
@@ -205,6 +247,110 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(text, "updated");
+    }
+
+    #[test]
+    fn compiled_script_can_run_in_isolated_realms() {
+        let limits = RuntimeLimits::default();
+        let script = CompiledScript::compile(
+            "var counter = typeof counter === 'undefined' ? 1 : counter + 1; counter;",
+            &limits,
+        )
+        .expect("supported script should compile once");
+        let mut first = parse_document("<!doctype html><p>first</p>");
+        let mut second = parse_document("<!doctype html><p>second</p>");
+        let mut first_runtime = JsRuntime::with_limits(&first.dom, limits);
+        let mut second_runtime = JsRuntime::with_limits(&second.dom, limits);
+
+        let first_value = first_runtime
+            .execute_compiled(&mut first.dom, &script)
+            .expect("first Realm executes")
+            .value;
+        let repeated_value = first_runtime
+            .execute_compiled(&mut first.dom, &script)
+            .expect("same Realm preserves globals")
+            .value;
+        let isolated_value = second_runtime
+            .execute_compiled(&mut second.dom, &script)
+            .expect("second Realm executes independently")
+            .value;
+
+        assert_eq!(first_value, super::JsValue::Number(1.0));
+        assert_eq!(repeated_value, super::JsValue::Number(2.0));
+        assert_eq!(isolated_value, super::JsValue::Number(1.0));
+    }
+
+    #[test]
+    fn declaration_lists_are_instantiated_without_internal_panics() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+
+        let global = runtime
+            .execute(
+                &mut parsed.dom,
+                "let first = 1, second = 2; const third = 3, fourth = 4; first + second + third + fourth;",
+            )
+            .expect("global declaration lists should instantiate every lexical binding");
+        assert_eq!(global.value, super::JsValue::Number(10.0));
+
+        let block = runtime
+            .execute(
+                &mut parsed.dom,
+                "{ let fifth = 5, sixth = 6; const seventh = 7, eighth = 8; fifth + sixth + seventh + eighth; }",
+            )
+            .expect("block declaration lists should instantiate every lexical binding");
+        assert_eq!(block.value, super::JsValue::Number(26.0));
+    }
+
+    #[test]
+    fn arrow_functions_support_expression_bodies_closures_and_lexical_this() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    var addArrow = (left, right) => left + right;
+                    var makeAdderArrow = base => value => base + value;
+                    var holder = {
+                        value: 40,
+                        read: function() {
+                            var arrow = () => this.value;
+                            return arrow();
+                        }
+                    };
+                    addArrow(1, 2) + makeAdderArrow(4)(5) + holder.read();
+                ",
+            )
+            .expect("arrow functions should execute");
+        assert_eq!(outcome.value, super::JsValue::Number(52.0));
+
+        let error = runtime
+            .execute(&mut parsed.dom, "new (() => 1); ")
+            .expect_err("arrow functions are not constructors");
+        assert_eq!(error.kind(), JsErrorKind::Type);
+    }
+
+    #[test]
+    fn update_expressions_and_member_assignments_evaluate_references_once() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+                    var calls = 0;
+                    var item = { value: 4 };
+                    function getItem() { calls += 1; return item; }
+                    var postfix = getItem().value++;
+                    var prefix = ++getItem().value;
+                    getItem().value = calls;
+                    postfix * 1000 + prefix * 100 + item.value * 10 + calls;
+                ",
+            )
+            .expect("updates and assignments should execute");
+
+        assert_eq!(outcome.value, super::JsValue::Number(4_633.0));
     }
 
     #[test]

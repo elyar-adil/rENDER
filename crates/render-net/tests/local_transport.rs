@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use render_net::{
-    BatchOptions, CancelToken, FetchConfig, FetchError, FetchRequest, FixedOriginLimit,
+    BatchOptions, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest, FixedOriginLimit,
     HttpTransport, NetworkWorker, Url,
 };
 
@@ -96,6 +96,47 @@ fn transport(configure: impl FnOnce(&mut FetchConfig)) -> HttpTransport {
     };
     configure(&mut config);
     HttpTransport::new(config)
+}
+
+#[test]
+fn cookie_jar_absorbs_set_cookie_and_decorates_the_next_request() {
+    let seen_profile = Arc::new(Mutex::new(String::new()));
+    let captured_profile = Arc::clone(&seen_profile);
+    let (base, server) = spawn_server(2, move |request| {
+        if request_path(&request) == "/login" {
+            let mut response = WireResponse::ok("logged-in");
+            response.headers.push((
+                "Set-Cookie".into(),
+                "session=abc123; Path=/; HttpOnly; SameSite=Lax".into(),
+            ));
+            response
+        } else {
+            *captured_profile.lock().expect("capture profile") = request;
+            WireResponse::ok("profile")
+        }
+    });
+    let client = transport(|_| {});
+    let login_url = base.join("login").expect("login URL");
+    let profile_url = base.join("profile").expect("profile URL");
+
+    let login = client
+        .fetch(&FetchRequest::get(login_url), &CancelToken::default())
+        .expect("login response");
+    let mut jar = CookieJar::default();
+    assert!(jar.absorb_response(&login).is_empty());
+    let profile_request = jar.decorate_request(FetchRequest::get(profile_url));
+    client
+        .fetch(&profile_request, &CancelToken::default())
+        .expect("profile response");
+    server.join().expect("server exits");
+
+    assert!(
+        seen_profile
+            .lock()
+            .expect("profile request")
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("cookie: session=abc123"))
+    );
 }
 
 #[test]

@@ -1,0 +1,15 @@
+# Official test262 paths relative to third_party/test262/test.
+# Keep this list explicit until the runner supports feature-based discovery.
+language/directive-prologue/10.1.1-5gs.js
+language/directive-prologue/10.1.1-8gs.js
+language/directive-prologue/14.1-4gs.js
+language/directive-prologue/10.1.1-2gs.js
+language/directive-prologue/14.1-5gs.js
+language/statements/if/cptn-no-else-true-nrml.js
+language/statements/while/cptn-no-iter.js
+language/statements/function/S13_A7_T1.js
+language/statements/return/S12.9_A1_T1.js
+language/statements/variable/S12.2_A1.js
+language/expressions/logical-and/S11.11.1_A2.1_T1.js
+language/expressions/logical-or/S11.11.2_A2.1_T1.js
+language/statements/variable/cptn-value.js

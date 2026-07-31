@@ -69,17 +69,30 @@ pub struct FetchRequest {
     /// Optional request `Accept` value. Browser content negotiation policy
     /// belongs to the caller rather than this transport adapter.
     pub accept: Option<String>,
+    /// Optional serialized Cookie request header supplied by the browser
+    /// context. The transport remains stateless and never owns a cookie jar.
+    pub cookie: Option<String>,
 }
 
 impl FetchRequest {
     #[must_use]
     pub const fn get(url: Url) -> Self {
-        Self { url, accept: None }
+        Self {
+            url,
+            accept: None,
+            cookie: None,
+        }
     }
 
     #[must_use]
     pub fn with_accept(mut self, accept: impl Into<String>) -> Self {
         self.accept = Some(accept.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_cookie(mut self, cookie: impl Into<String>) -> Self {
+        self.cookie = Some(cookie.into());
         self
     }
 }
@@ -227,6 +240,9 @@ impl HttpTransport {
         let mut builder = self.agent.get(request.url.as_str());
         if let Some(accept) = request.accept.as_deref() {
             builder = builder.header("Accept", accept);
+        }
+        if let Some(cookie) = request.cookie.as_deref() {
+            builder = builder.header("Cookie", cookie);
         }
         let mut response = builder.call().map_err(|error| self.map_error(error))?;
 

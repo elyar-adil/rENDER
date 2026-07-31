@@ -38,8 +38,8 @@ use render_core::layout::{PhysicalPoint, PhysicalSize};
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
 use render_core::paint::{Color, CpuRasterizer, DisplayList, Surface};
 use render_net::{
-    BatchOptions, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult, HttpTransport,
-    NetworkWorker, RequestHandle, Url,
+    BatchOptions, CookieJar, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult,
+    HttpTransport, NetworkWorker, RequestHandle, Url,
 };
 use softbuffer::{Context, Surface as WindowSurface};
 use winit::application::ApplicationHandler;
@@ -394,6 +394,7 @@ fn process_page_render(
 
 struct PageState {
     navigation: PageNavigation<RequestHandle<FetchResult>>,
+    cookies: CookieJar,
     style_sheets: ExternalStyleSheets,
     style_batch: Option<(StylesheetFetchPlan, Vec<FetchResult>)>,
     styles_resolved: bool,
@@ -467,6 +468,7 @@ impl PageState {
         .expect("browser-created page URLs fit the session-history limits");
         Self {
             navigation: PageNavigation::new(source),
+            cookies: CookieJar::default(),
             style_sheets: ExternalStyleSheets::default(),
             style_batch: None,
             styles_resolved: false,
@@ -978,6 +980,9 @@ impl BrowserApp {
     fn start_network_navigation(&mut self, id: TabId, url: Url) {
         let request =
             FetchRequest::get(url.clone()).with_accept("text/html,text/plain;q=0.8,*/*;q=0.1");
+        let request = self.pages.get(&id).map_or(request.clone(), |page| {
+            page.cookies.decorate_request(request)
+        });
         let handle = self.network.submit(request);
         let Some(page) = self.pages.get_mut(&id) else {
             handle.cancel();
@@ -1029,9 +1034,12 @@ impl BrowserApp {
             return;
         }
 
-        let handle = self
-            .network
-            .submit_batch(plan.requests(), BatchOptions::default());
+        let requests = plan
+            .requests()
+            .into_iter()
+            .map(|request| page.cookies.decorate_request(request))
+            .collect();
+        let handle = self.network.submit_batch(requests, BatchOptions::default());
         page.pending_style_sheets = Some(PendingStyleSheets { plan, handle });
         self.tabs.set_loading(id, true);
         self.repaint_chrome();
@@ -1100,6 +1108,9 @@ impl BrowserApp {
         };
         let final_url = response.final_url.clone();
         if let Some(page) = self.pages.get_mut(&id) {
+            for issue in page.cookies.absorb_response(&response) {
+                eprintln!("browser cookie rejected: {}", issue.message);
+            }
             let _history_result = page.history.replace(HistoryEntry::new(final_url.clone()));
         }
         match source_from_network_response(&response) {
@@ -1121,6 +1132,11 @@ impl BrowserApp {
         let Some(pending) = page.pending_style_sheets.take() else {
             return;
         };
+        for response in results.iter().flatten() {
+            for issue in page.cookies.absorb_response(response) {
+                eprintln!("browser cookie rejected: {}", issue.message);
+            }
+        }
         page.style_batch = Some((pending.plan, results));
         page.external_styles_generation = page.external_styles_generation.saturating_add(1);
 

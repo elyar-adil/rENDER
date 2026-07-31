@@ -1,15 +1,19 @@
 //! Bounded HTTP/HTTPS transport for rENDER.
 //!
 //! This crate is deliberately below browser Fetch semantics. It does not own
-//! navigation/history, CORS, caching, cookies, content sniffing, or document
-//! decoding. It only transfers bytes for already-normalized [`url::Url`]s.
+//! navigation/history, CORS, caching, content sniffing, or document decoding.
+//! The transport is stateless; the exported [`CookieJar`] is an explicit
+//! browser-context helper that callers use to decorate requests and absorb
+//! response cookies. It only transfers bytes for normalized [`url::Url`]s.
 //! HTTPS uses rustls and Web PKI verification; no API disables verification.
 
 mod batch;
+mod cookie;
 mod transport;
 mod worker;
 
 pub use batch::{BatchOptions, FixedOriginLimit, Origin, OriginConcurrencyPolicy};
+pub use cookie::{Cookie, CookieIssue, CookieJar, CookieLimits, CookieRejection, SameSite};
 pub use transport::{
     CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult,
     Header, HttpStatus, HttpTransport,

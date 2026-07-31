@@ -86,17 +86,35 @@ pub(crate) enum NativeFunction {
     CreateElement,
     SetAttribute,
     AppendChild,
+    QueueMicrotask,
+    PromiseResolve,
+    PromiseReject,
+    PromiseThen,
+    PromiseCatch,
+    ArrayIsArray,
+    ArrayPush,
+    ArrayPop,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ObjectHost {
     #[default]
     Ordinary,
+    Array,
     Document(NodeId),
     Node(NodeId),
+    NativeFunction(NativeFunction),
     BoundFunction {
         function: NativeFunction,
         receiver: ObjectId,
+    },
+    UserFunction(usize),
+    ArrowFunction(usize),
+    PromiseConstructor,
+    Promise(usize),
+    PromiseSettler {
+        promise: usize,
+        fulfilled: bool,
     },
 }
 
@@ -127,6 +145,7 @@ pub struct Realm {
     objects: Vec<JsObject>,
     global: ObjectId,
     document: ObjectId,
+    array_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
 }
 
@@ -148,12 +167,113 @@ impl Realm {
                 configurable: false,
             },
         );
+        let queue_microtask = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::QueueMicrotask,
+                receiver: global,
+            },
+            ..JsObject::default()
+        });
+        objects[global.0].properties.insert(
+            "queueMicrotask".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(queue_microtask),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        Self::install_promise(&mut objects, global);
+        let array_prototype = Self::install_array(&mut objects, global);
         Self {
             objects,
             global,
             document,
+            array_prototype,
             node_wrappers: BTreeMap::new(),
         }
+    }
+
+    fn install_promise(objects: &mut Vec<JsObject>, global: ObjectId) {
+        let promise = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::PromiseConstructor,
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("resolve", NativeFunction::PromiseResolve),
+            ("reject", NativeFunction::PromiseReject),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::BoundFunction {
+                    function,
+                    receiver: promise,
+                },
+                ..JsObject::default()
+            });
+            objects[promise.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::data(JsValue::Object(method)),
+            );
+        }
+        objects[global.0].properties.insert(
+            "Promise".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(promise),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
+    fn install_array(objects: &mut Vec<JsObject>, global: ObjectId) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject::default());
+        for (name, function) in [
+            ("push", NativeFunction::ArrayPush),
+            ("pop", NativeFunction::ArrayPop),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::data(JsValue::Object(method)),
+            );
+        }
+        let array = ObjectId(objects.len());
+        objects.push(JsObject::default());
+        let is_array = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::ArrayIsArray,
+                receiver: array,
+            },
+            ..JsObject::default()
+        });
+        objects[array.0].properties.insert(
+            "isArray".to_owned(),
+            PropertyDescriptor::data(JsValue::Object(is_array)),
+        );
+        objects[array.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::data(JsValue::Object(prototype)),
+        );
+        objects[global.0].properties.insert(
+            "Array".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(array),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        prototype
     }
 
     #[must_use]
@@ -175,6 +295,14 @@ impl Realm {
     pub fn create_object(&mut self, prototype: Option<ObjectId>) -> ObjectId {
         self.allocate(JsObject {
             prototype,
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn create_array(&mut self) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.array_prototype),
+            host: ObjectHost::Array,
             ..JsObject::default()
         })
     }
@@ -238,6 +366,14 @@ impl Realm {
         None
     }
 
+    pub(crate) fn remove_property(&mut self, object: ObjectId, key: &str) -> Option<JsValue> {
+        self.objects
+            .get_mut(object.0)?
+            .properties
+            .remove(key)
+            .map(|descriptor| descriptor.value)
+    }
+
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
@@ -274,6 +410,54 @@ impl Realm {
     ) -> ObjectId {
         self.allocate(JsObject {
             host: ObjectHost::BoundFunction { function, receiver },
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn arrow_function(&mut self, function: usize) -> ObjectId {
+        self.allocate(JsObject {
+            host: ObjectHost::ArrowFunction(function),
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn user_function(&mut self, function: usize) -> ObjectId {
+        let prototype = self.create_object(None);
+        let callable = self.allocate(JsObject {
+            host: ObjectHost::UserFunction(function),
+            ..JsObject::default()
+        });
+        self.objects[callable.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(prototype),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        self.objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(callable),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        callable
+    }
+
+    pub(crate) fn promise(&mut self, promise: usize) -> ObjectId {
+        self.allocate(JsObject {
+            host: ObjectHost::Promise(promise),
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn promise_settler(&mut self, promise: usize, fulfilled: bool) -> ObjectId {
+        self.allocate(JsObject {
+            host: ObjectHost::PromiseSettler { promise, fulfilled },
             ..JsObject::default()
         })
     }

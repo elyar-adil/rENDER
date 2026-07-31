@@ -8,16 +8,62 @@ pub(super) enum TokenKind {
     Let,
     Const,
     Var,
+    Function,
+    Return,
+    New,
+    Throw,
+    Try,
+    Catch,
+    Finally,
+    If,
+    Else,
+    While,
+    For,
+    Break,
+    Continue,
+    Typeof,
+    Instanceof,
+    Switch,
+    Case,
+    Default,
     True,
     False,
     Null,
     Undefined,
+    This,
     Dot,
     Comma,
     Semicolon,
-    Equal,
     LeftParen,
     RightParen,
+    LeftBrace,
+    RightBrace,
+    LeftBracket,
+    RightBracket,
+    Colon,
+    Plus,
+    PlusPlus,
+    PlusEqual,
+    Minus,
+    MinusMinus,
+    MinusEqual,
+    Star,
+    Slash,
+    Percent,
+    Bang,
+    Equal,
+    EqualEqual,
+    EqualEqualEqual,
+    BangEqual,
+    BangEqualEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    AndAnd,
+    OrOr,
+    Question,
+    Arrow,
     Eof,
 }
 
@@ -67,12 +113,52 @@ impl Lexer<'_> {
                 '.' => self.single(TokenKind::Dot),
                 ',' => self.single(TokenKind::Comma),
                 ';' => self.single(TokenKind::Semicolon),
-                '=' => self.single(TokenKind::Equal),
                 '(' => self.single(TokenKind::LeftParen),
                 ')' => self.single(TokenKind::RightParen),
-                '\'' | '"' => self.string(character)?,
-                '0'..='9' => self.number()?,
-                value if is_identifier_start(value) => self.identifier(),
+                '{' => self.single(TokenKind::LeftBrace),
+                '}' => self.single(TokenKind::RightBrace),
+                '[' => self.single(TokenKind::LeftBracket),
+                ']' => self.single(TokenKind::RightBracket),
+                ':' => self.single(TokenKind::Colon),
+                '?' => self.single(TokenKind::Question),
+                '+' if self.peek_second() == Some('+') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::PlusPlus
+                }
+                '+' if self.peek_second() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::PlusEqual
+                }
+                '+' => self.single(TokenKind::Plus),
+                '-' if self.peek_second() == Some('-') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::MinusMinus
+                }
+                '-' if self.peek_second() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::MinusEqual
+                }
+                '-' => self.single(TokenKind::Minus),
+                '*' => self.single(TokenKind::Star),
+                '%' => self.single(TokenKind::Percent),
+                '=' => self.equals(),
+                '!' => self.bang(),
+                '<' => self.less(),
+                '>' => self.greater(),
+                '&' if self.peek_second() == Some('&') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::AndAnd
+                }
+                '|' if self.peek_second() == Some('|') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::OrOr
+                }
                 '/' if self.peek_second() == Some('/') => {
                     self.line_comment();
                     continue;
@@ -81,6 +167,10 @@ impl Lexer<'_> {
                     self.block_comment(start)?;
                     continue;
                 }
+                '/' => self.single(TokenKind::Slash),
+                '\'' | '"' => self.string(character)?,
+                '0'..='9' => self.number()?,
+                value if is_identifier_start(value) => self.identifier(),
                 _ => {
                     return Err(JsError::syntax(
                         format!("unsupported character {character:?}"),
@@ -99,6 +189,58 @@ impl Lexer<'_> {
         kind
     }
 
+    fn equals(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some('>') {
+            self.advance();
+            return TokenKind::Arrow;
+        }
+        if self.peek() != Some('=') {
+            return TokenKind::Equal;
+        }
+        self.advance();
+        if self.peek() == Some('=') {
+            self.advance();
+            TokenKind::EqualEqualEqual
+        } else {
+            TokenKind::EqualEqual
+        }
+    }
+
+    fn bang(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() != Some('=') {
+            return TokenKind::Bang;
+        }
+        self.advance();
+        if self.peek() == Some('=') {
+            self.advance();
+            TokenKind::BangEqualEqual
+        } else {
+            TokenKind::BangEqual
+        }
+    }
+
+    fn less(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some('=') {
+            self.advance();
+            TokenKind::LessEqual
+        } else {
+            TokenKind::Less
+        }
+    }
+
+    fn greater(&mut self) -> TokenKind {
+        self.advance();
+        if self.peek() == Some('=') {
+            self.advance();
+            TokenKind::GreaterEqual
+        } else {
+            TokenKind::Greater
+        }
+    }
+
     fn identifier(&mut self) -> TokenKind {
         let start = self.offset;
         self.advance();
@@ -109,10 +251,29 @@ impl Lexer<'_> {
             "let" => TokenKind::Let,
             "const" => TokenKind::Const,
             "var" => TokenKind::Var,
+            "function" => TokenKind::Function,
+            "return" => TokenKind::Return,
+            "new" => TokenKind::New,
+            "throw" => TokenKind::Throw,
+            "try" => TokenKind::Try,
+            "catch" => TokenKind::Catch,
+            "finally" => TokenKind::Finally,
+            "if" => TokenKind::If,
+            "else" => TokenKind::Else,
+            "while" => TokenKind::While,
+            "for" => TokenKind::For,
+            "break" => TokenKind::Break,
+            "continue" => TokenKind::Continue,
+            "typeof" => TokenKind::Typeof,
+            "instanceof" => TokenKind::Instanceof,
+            "switch" => TokenKind::Switch,
+            "case" => TokenKind::Case,
+            "default" => TokenKind::Default,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
             "undefined" => TokenKind::Undefined,
+            "this" => TokenKind::This,
             identifier => TokenKind::Identifier((*identifier).to_owned()),
         }
     }
@@ -240,12 +401,24 @@ mod tests {
     use crate::js::RuntimeLimits;
 
     #[test]
-    fn tokenizes_member_calls_and_strings() {
+    fn tokenizes_member_calls_strings_and_control_flow() {
         let tokens = tokenize(
-            "const node = document.getElementById('message');",
+            "if (value >= 2 && value !== 3) { const node = document.getElementById('message'); }",
             &RuntimeLimits::default(),
         )
         .expect("supported source should tokenize");
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::If));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::GreaterEqual)
+        );
+        assert!(tokens.iter().any(|token| token.kind == TokenKind::AndAnd));
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::BangEqualEqual)
+        );
         assert!(
             tokens
                 .iter()

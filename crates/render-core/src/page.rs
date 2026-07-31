@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use url::Url;
+
 use crate::document::{Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput};
 use crate::dom::DomRevision;
 use crate::event_loop::{
@@ -17,9 +19,13 @@ use crate::event_loop::{
     TaskSource, TurnOutcome,
 };
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
-use crate::js::{JsError, JsRuntime, RuntimeLimits, ScriptOutcome};
+use crate::js::{CompiledScript, JsError, JsMicrotask, JsRuntime, RuntimeLimits, ScriptOutcome};
 use crate::layout::SimpleTextMeasurer;
 use crate::paint::{DisplayListDiff, NoGlyphMasks, ReferenceTextShaper};
+use crate::script::{
+    ClassicScript, ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling, ScriptSource,
+    discover_scripts,
+};
 
 /// Page-level memory bounds in addition to per-script and scheduler limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,10 +55,12 @@ pub struct PageOptions {
 /// The enum is the typed extension point for future promise jobs, event
 /// dispatch, parser callbacks, and networking completion tasks. Unsupported
 /// work is not represented as a stringly typed callback.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum PageTask {
     Script(String),
+    CompiledScript(CompiledScript),
+    JsMicrotask(JsMicrotask),
 }
 
 impl PageTask {
@@ -64,6 +72,7 @@ impl PageTask {
     fn source_bytes(&self) -> usize {
         match self {
             Self::Script(source) => source.len(),
+            Self::CompiledScript(_) | Self::JsMicrotask(_) => 0,
         }
     }
 }
@@ -117,6 +126,60 @@ impl From<QueueError> for PageQueueError {
     fn from(error: QueueError) -> Self {
         Self::Scheduler(error)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentScriptQueueError {
+    StaleDiscovery {
+        discovered_revision: DomRevision,
+        current_revision: DomRevision,
+    },
+    ExternalScriptPending {
+        owner: crate::dom::NodeId,
+        source_order: usize,
+        resolved_url: Url,
+    },
+    Queue {
+        owner: crate::dom::NodeId,
+        source_order: usize,
+        error: PageQueueError,
+    },
+}
+
+impl fmt::Display for DocumentScriptQueueError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleDiscovery {
+                discovered_revision,
+                current_revision,
+            } => write!(
+                formatter,
+                "script discovery at DOM revision {discovered_revision:?} is stale; current revision is {current_revision:?}"
+            ),
+            Self::ExternalScriptPending { resolved_url, .. } => write!(
+                formatter,
+                "external script {resolved_url} requires the browser resource loader"
+            ),
+            Self::Queue { error, .. } => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DocumentScriptQueueError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Queue { error, .. } => Some(error),
+            Self::StaleDiscovery { .. } | Self::ExternalScriptPending { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentScriptQueue {
+    pub revision: DomRevision,
+    pub queued: Vec<TaskId>,
+    pub diagnostics: Vec<ScriptDiagnostic>,
+    pub errors: Vec<DocumentScriptQueueError>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +333,84 @@ impl Page {
         self.queue_task(TaskSource::DomManipulation, PageTask::script(source))
     }
 
+    /// Queue an already tokenized and parsed classic script without repeating
+    /// compilation in the event-loop task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_compiled_script(
+        &mut self,
+        script: CompiledScript,
+    ) -> Result<TaskId, PageQueueError> {
+        self.queue_task(
+            TaskSource::DomManipulation,
+            PageTask::CompiledScript(script),
+        )
+    }
+
+    /// Discover document scripts once and queue supported parser-blocking inline
+    /// classic scripts in DOM tree order.
+    ///
+    /// External scripts are deliberately reported rather than fetched here:
+    /// network I/O belongs to the browser resource coordinator. Unsupported
+    /// module and scheduling modes remain available as discovery diagnostics.
+    #[must_use]
+    pub fn queue_document_scripts(
+        &mut self,
+        base_url: &Url,
+        limits: ScriptDiscoveryLimits,
+    ) -> DocumentScriptQueue {
+        let discovery = discover_scripts(&self.document, base_url, limits);
+        let current_revision = self.document.dom().revision();
+        if discovery.revision != current_revision {
+            return DocumentScriptQueue {
+                revision: discovery.revision,
+                queued: Vec::new(),
+                diagnostics: discovery.diagnostics,
+                errors: vec![DocumentScriptQueueError::StaleDiscovery {
+                    discovered_revision: discovery.revision,
+                    current_revision,
+                }],
+            };
+        }
+
+        let external_errors = discovery
+            .scripts
+            .iter()
+            .filter_map(|script| match &script.source {
+                ScriptSource::External { resolved_url, .. } => {
+                    Some(DocumentScriptQueueError::ExternalScriptPending {
+                        owner: script.owner,
+                        source_order: script.source_order,
+                        resolved_url: resolved_url.clone(),
+                    })
+                }
+                ScriptSource::Inline { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if !external_errors.is_empty() {
+            return DocumentScriptQueue {
+                revision: discovery.revision,
+                queued: Vec::new(),
+                diagnostics: discovery.diagnostics,
+                errors: external_errors,
+            };
+        }
+
+        let mut queued = Vec::new();
+        let mut errors = Vec::new();
+        for script in discovery.scripts {
+            queue_discovered_inline_script(self, script, &mut queued, &mut errors);
+        }
+        DocumentScriptQueue {
+            revision: discovery.revision,
+            queued,
+            diagnostics: discovery.diagnostics,
+            errors,
+        }
+    }
+
     /// Queue typed page work on an explicit task source.
     ///
     /// # Errors
@@ -337,7 +478,7 @@ impl Page {
         let queued_source_bytes = &mut self.queued_source_bytes;
 
         let Some(event_loop_outcome) =
-            event_loop.run_one_turn(document.dom_mut(), |runnable, _, dom| {
+            event_loop.run_one_turn(document.dom_mut(), |runnable, scheduler, dom| {
                 let (job, task, bytes) = match runnable {
                     Runnable::Task {
                         id,
@@ -357,6 +498,23 @@ impl Page {
                 *queued_source_bytes = queued_source_bytes.saturating_sub(bytes);
                 let result = execute_task(runtime, dom, task);
                 executions.push(PageExecution { job, result });
+                for microtask in runtime.take_pending_microtasks() {
+                    match scheduler.queue_microtask(PageTask::JsMicrotask(microtask)) {
+                        Ok(id) => {
+                            microtask_source_bytes.insert(id, 0);
+                        }
+                        Err(error) => {
+                            if let Some(execution) = executions.last_mut()
+                                && execution.result.is_ok()
+                            {
+                                execution.result = Err(JsError::resource(format!(
+                                    "could not schedule JavaScript microtask: {error}"
+                                )));
+                            }
+                            break;
+                        }
+                    }
+                }
             })
         else {
             return Ok(None);
@@ -428,6 +586,26 @@ impl Page {
     }
 }
 
+fn queue_discovered_inline_script(
+    page: &mut Page,
+    script: ClassicScript,
+    queued: &mut Vec<TaskId>,
+    errors: &mut Vec<DocumentScriptQueueError>,
+) {
+    debug_assert_eq!(script.scheduling, ScriptScheduling::ParserBlocking);
+    let ScriptSource::Inline { source } = script.source else {
+        unreachable!("external scripts are rejected before queuing begins");
+    };
+    match page.queue_script(source) {
+        Ok(id) => queued.push(id),
+        Err(error) => errors.push(DocumentScriptQueueError::Queue {
+            owner: script.owner,
+            source_order: script.source_order,
+            error,
+        }),
+    }
+}
+
 fn execute_task(
     runtime: &mut JsRuntime,
     dom: &mut crate::dom::Dom,
@@ -435,15 +613,30 @@ fn execute_task(
 ) -> Result<ScriptOutcome, JsError> {
     match task {
         PageTask::Script(source) => runtime.execute(dom, &source),
+        PageTask::CompiledScript(script) => runtime.execute_compiled(dom, &script),
+        PageTask::JsMicrotask(microtask) => {
+            let from_revision = dom.revision();
+            runtime
+                .invoke_microtask(dom, microtask)
+                .map(|value| ScriptOutcome {
+                    value,
+                    from_revision,
+                    to_revision: dom.revision(),
+                })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Page, PageJob, PageLimits, PageOptions, PageQueueError, PageTask};
+    use super::{
+        DocumentScriptQueueError, Page, PageJob, PageLimits, PageOptions, PageQueueError, PageTask,
+    };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
     use crate::js::RuntimeLimits;
+    use crate::script::{ScriptDiagnosticCode, ScriptDiscoveryLimits};
+    use url::Url;
 
     fn element_with_id(dom: &Dom, id: &str) -> NodeId {
         let mut pending = vec![dom.document()];
@@ -458,6 +651,110 @@ mod tests {
             pending.extend(dom.children(node).unwrap_or_default().iter().rev());
         }
         panic!("test element #{id} must exist");
+    }
+
+    #[test]
+    fn document_inline_scripts_share_one_realm_and_render_after_dom_mutation() {
+        let mut page = Page::new(
+            "<!doctype html><p id=message>before</p>\
+             <script>var suffix = '-first'; document.getElementById('message').textContent = 'script' + suffix;</script>\
+             <script>document.getElementById('message').setAttribute('data-order', suffix + '-second');</script>",
+        );
+        let initial_revision = page.snapshot().revision;
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/page").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+
+        assert_eq!(queue.queued.len(), 2);
+        assert!(queue.diagnostics.is_empty());
+        assert!(queue.errors.is_empty());
+
+        let first = page
+            .run_one_turn_reference()
+            .expect("first invalidation succeeds")
+            .expect("first script is queued");
+        assert!(first.executions[0].result.is_ok());
+        assert!(first.render.is_some());
+
+        let second = page
+            .run_one_turn_reference()
+            .expect("second invalidation succeeds")
+            .expect("second script is queued");
+        assert!(second.executions[0].result.is_ok());
+        assert!(second.render.is_some());
+
+        let message = element_with_id(page.document().dom(), "message");
+        assert_eq!(
+            page.document().dom().attribute(message, "data-order"),
+            Ok(Some("-first-second"))
+        );
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "script-first"
+        ));
+        assert!(page.snapshot().revision > initial_revision);
+    }
+
+    #[test]
+    fn document_script_queue_reports_unsupported_and_external_work_atomically() {
+        let mut page = Page::new(
+            "<!doctype html>\
+             <script>document.title = 'must-not-run-ahead';</script>\
+             <script type=module>ignored()</script>\
+             <script src=/app.js></script>\
+             <script>document.title = 'also-blocked';</script>\
+             <script async>ignored()</script>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/path/").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+
+        assert!(queue.queued.is_empty());
+        assert_eq!(page.event_loop().pending_task_count(), 0);
+        assert_eq!(
+            queue
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                ScriptDiagnosticCode::ModuleUnsupported,
+                ScriptDiagnosticCode::AsyncUnsupported,
+            ]
+        );
+        assert!(matches!(
+            queue.errors.as_slice(),
+            [DocumentScriptQueueError::ExternalScriptPending { resolved_url, .. }]
+                if resolved_url.as_str() == "https://example.test/app.js"
+        ));
+    }
+
+    #[test]
+    fn compiled_script_task_executes_without_reparsing_in_the_page_realm() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        let script = crate::js::CompiledScript::compile(
+            "document.getElementById('message').textContent = 'compiled';",
+            &RuntimeLimits::default(),
+        )
+        .expect("script compiles before queuing");
+        page.queue_compiled_script(script)
+            .expect("compiled task fits scheduler");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("compiled task is ready");
+
+        assert!(turn.executions[0].result.is_ok());
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "compiled"
+        ));
     }
 
     #[test]
@@ -556,6 +853,297 @@ mod tests {
         assert!(matches!(
             page.document().dom().node(text).map(crate::dom::Node::kind),
             Some(NodeKind::Text(value)) if value == "microtask"
+        ));
+    }
+
+    #[test]
+    fn script_queue_microtask_runs_before_the_same_turns_rendering_opportunity() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "function update() { const target = document.getElementById('message'); target.textContent = 'microtask'; } queueMicrotask(update);",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2);
+        assert!(matches!(turn.executions[0].job, PageJob::Task { .. }));
+        assert!(matches!(turn.executions[1].job, PageJob::Microtask { .. }));
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        assert!(matches!(
+            turn.event_loop.microtasks,
+            MicrotaskCheckpoint::Complete { executed: 1 }
+        ));
+        assert!(turn.invalidation.layout.is_required());
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "microtask"
+        ));
+    }
+
+    #[test]
+    fn promise_reactions_run_in_registration_order_before_rendering() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); let order = ''; Promise.resolve('A').then(function(value) { order = order + value; target.textContent = order; return 'B'; }).then(function(value) { order = order + value; target.textContent = order; }); order = order + 'S';",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 3);
+        assert!(matches!(turn.executions[0].job, PageJob::Task { .. }));
+        assert!(
+            turn.executions[1..]
+                .iter()
+                .all(|execution| matches!(execution.job, PageJob::Microtask { .. }))
+        );
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        assert!(matches!(
+            turn.event_loop.microtasks,
+            MicrotaskCheckpoint::Complete { executed: 2 }
+        ));
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "SAB"
+        ));
+    }
+
+    #[test]
+    fn promise_rejection_is_recovered_by_catch_before_rendering() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); Promise.reject('failure').catch(function(reason) { target.textContent = 'caught-' + reason; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2, "{:#?}", turn.executions);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "caught-failure"
+        ));
+    }
+
+    #[test]
+    fn queue_microtask_and_promise_reactions_share_fifo_ordering() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); let order = ''; queueMicrotask(function() { order = order + 'Q'; target.textContent = order; }); Promise.resolve().then(function() { order = order + 'P'; target.textContent = order; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 3);
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "QP"
+        ));
+    }
+
+    #[test]
+    fn thrown_reaction_rejects_the_chained_promise() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); Promise.resolve().then(function() { throw 'reaction-failed'; }).catch(function(reason) { target.textContent = reason; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 3);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "reaction-failed"
+        ));
+    }
+
+    #[test]
+    fn promise_chain_adopts_a_returned_promise() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); Promise.resolve('outer').then(function() { return Promise.resolve('inner'); }).then(function(value) { target.textContent = value; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 3);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "inner"
+        ));
+    }
+
+    #[test]
+    fn promise_constructor_resolve_adopts_another_promise() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); const inner = Promise.resolve('adopted'); const outer = new Promise(function(resolve) { resolve(inner); }); outer.then(function(value) { target.textContent = value; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "adopted"
+        ));
+    }
+
+    #[test]
+    fn promise_constructor_executor_settles_only_once() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "const target = document.getElementById('message'); const promise = new Promise(function(resolve, reject) { resolve('first'); reject('second'); }); promise.then(function(value) { target.textContent = value; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "first"
+        ));
+    }
+
+    #[test]
+    fn each_javascript_microtask_gets_a_fresh_execution_budget() {
+        let options = PageOptions {
+            runtime_limits: RuntimeLimits {
+                max_execution_steps: 200,
+                ..RuntimeLimits::default()
+            },
+            ..PageOptions::default()
+        };
+        let mut page = Page::with_options("<!doctype html><p id=message>before</p>", options);
+        page.queue_script(
+            "let i = 0; while (i < 10) { i = i + 1; } queueMicrotask(function() { let j = 0; while (j < 10) { j = j + 1; } document.getElementById('message').textContent = 'fresh-budget'; });",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2, "{:#?}", turn.executions);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok()),
+            "{:#?}",
+            turn.executions
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "fresh-budget"
+        ));
+    }
+
+    #[test]
+    fn queued_closure_retains_its_shared_environment_until_the_checkpoint() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        page.queue_script(
+            "function schedule() { let prefix = 'closed-'; function update() { const target = document.getElementById('message'); target.textContent = prefix + 'over'; } queueMicrotask(update); prefix = 'carried-'; } schedule();",
+        )
+        .expect("script task fits");
+
+        let turn = page
+            .run_one_turn_reference()
+            .expect("invalidation succeeds")
+            .expect("script task is ready");
+
+        assert_eq!(turn.executions.len(), 2);
+        assert!(
+            turn.executions
+                .iter()
+                .all(|execution| execution.result.is_ok())
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "carried-over"
         ));
     }
 

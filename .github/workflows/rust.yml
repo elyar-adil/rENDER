@@ -14,6 +14,9 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      - name: Fetch pinned test262
+        run: tools/fetch-test262.sh
+
       - name: Formatting
         run: cargo fmt --all --check
 

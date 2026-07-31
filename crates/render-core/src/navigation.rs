@@ -773,6 +773,26 @@ fn is_windows_drive_path(value: &str) -> bool {
 }
 
 fn file_url(value: &str) -> Result<Url, NavigationError> {
+    if is_windows_drive_path(value) {
+        let normalized = value.replace('\\', "/");
+        let mut url = Url::parse("file:///").expect("the static file URL base is valid");
+        url.set_path(&format!("/{normalized}"));
+        return Ok(url);
+    }
+    if let Some(unc) = value.strip_prefix("\\\\") {
+        let normalized = unc.replace('\\', "/");
+        let Some((host, path)) = normalized.split_once('/') else {
+            return Err(NavigationError::InvalidFilePath(value.to_owned()));
+        };
+        if host.is_empty() || path.is_empty() {
+            return Err(NavigationError::InvalidFilePath(value.to_owned()));
+        }
+        let mut url = Url::parse("file:///").expect("the static file URL base is valid");
+        url.set_host(Some(host))
+            .map_err(|_| NavigationError::InvalidFilePath(value.to_owned()))?;
+        url.set_path(&format!("/{path}"));
+        return Ok(url);
+    }
     Url::from_file_path(value).map_err(|()| NavigationError::InvalidFilePath(value.to_owned()))
 }
 
@@ -874,7 +894,12 @@ mod tests {
         let file =
             AddressInput::parse(r"C:\Users\Elyar\index.html", &config_with_search()).unwrap();
         assert_eq!(file.url().scheme(), "file");
-        assert!(file.url().path().ends_with("/Users/Elyar/index.html"));
+        assert_eq!(file.url().path(), "/C:/Users/Elyar/index.html");
+
+        let unc = AddressInput::parse(r"\\server\share\index.html", &config_with_search()).unwrap();
+        assert_eq!(unc.url().scheme(), "file");
+        assert_eq!(unc.url().host_str(), Some("server"));
+        assert_eq!(unc.url().path(), "/share/index.html");
 
         let search = AddressInput::parse("docs/index.html", &config_with_search()).unwrap();
         assert!(
