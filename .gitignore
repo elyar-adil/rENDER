@@ -69,6 +69,13 @@ docs/_build/
 # PyBuilder
 target/
 
+# Local browser, screenshot, and standalone acceptance-test artifacts
+.artifacts/
+artifacts/
+crates/render-core/.artifacts/
+bindings/python/python/render_runtime/*.pdb
+tests/real_site_tasks/Cargo.lock
+
 # IPython Notebook
 .ipynb_checkpoints
 
