@@ -946,6 +946,10 @@ pub enum TypedPropertyValue {
     BorderWidth(BorderWidth),
     BorderStyle(BorderStyle),
     Color(CssColor),
+    BackgroundImage(String),
+    BackgroundRepeat(String),
+    BackgroundPosition(String),
+    BackgroundSize(String),
     FlexDirection(FlexDirection),
     FlexBasis(FlexBasis),
     FlexGrow(f32),
@@ -977,6 +981,10 @@ impl TypedPropertyValue {
             Self::BorderWidth(_) => "border-width",
             Self::BorderStyle(_) => "border-style",
             Self::Color(_) => "color",
+            Self::BackgroundImage(_) => "background-image",
+            Self::BackgroundRepeat(_) => "background-repeat",
+            Self::BackgroundPosition(_) => "background-position",
+            Self::BackgroundSize(_) => "background-size",
             Self::FlexDirection(_) => "flex-direction",
             Self::FlexBasis(_) => "flex-basis",
             Self::FlexGrow(_) => "flex-grow",
@@ -1009,6 +1017,10 @@ impl TypedPropertyValue {
             Self::BorderWidth(value) => value.to_css(),
             Self::BorderStyle(value) => value.as_str().to_owned(),
             Self::Color(value) => value.to_css(),
+            Self::BackgroundImage(value) => value.clone(),
+            Self::BackgroundRepeat(value)
+            | Self::BackgroundPosition(value)
+            | Self::BackgroundSize(value) => value.clone(),
             Self::FlexDirection(value) => value.as_str().to_owned(),
             Self::FlexBasis(value) => value.to_css(),
             Self::JustifyContent(value) => value.as_str().to_owned(),
@@ -1213,6 +1225,10 @@ pub fn parse_typed_property(
         "display"
             | "color"
             | "background-color"
+            | "background-image"
+            | "background-repeat"
+            | "background-position"
+            | "background-size"
             | "position"
             | "float"
             | "clear"
@@ -1282,6 +1298,10 @@ fn parse_property<'i>(
     input: &mut Parser<'i, '_>,
 ) -> CssResult<'i, TypedPropertyValue> {
     match property {
+        "background-image" => parse_background_image(input).map(TypedPropertyValue::BackgroundImage),
+        "background-repeat" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundRepeat),
+        "background-position" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundPosition),
+        "background-size" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundSize),
         "color"
         | "background-color"
         | "border-top-color"
@@ -1396,6 +1416,38 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
             input.parse_nested_block(parse_rgb_color)
         }
         _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, String> {
+    let location = input.current_source_location();
+    let token = input.next()?.clone();
+    match token {
+        Token::UnquotedUrl(url) => Ok(format!("url({url})")),
+        Token::Function(name) if name.eq_ignore_ascii_case("url") => {
+            input.parse_nested_block(|nested| {
+                let value = nested.next()?.clone();
+                match value {
+                    Token::UnquotedUrl(url) | Token::Ident(url) | Token::QuotedString(url) => {
+                        Ok(format!("url({url})"))
+                    }
+                    _ => Err(location.new_custom_error(())),
+                }
+            })
+        }
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok("none".to_owned()),
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_raw_single_layer<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, String> {
+    let start = input.position();
+    while input.next_including_whitespace_and_comments().is_ok() {}
+    let value = input.slice_from(start).trim();
+    if value.is_empty() || value.contains(',') {
+        Err(input.new_custom_error(()))
+    } else {
+        Ok(value.to_ascii_lowercase())
     }
 }
 
@@ -2292,6 +2344,10 @@ mod tests {
         assert_eq!(
             parse("background-color", "#0f08").to_css(),
             "rgba(0, 255, 0, 0.53333336)"
+        );
+        assert_eq!(
+            parse("background-image", "url(https://example.com/bg.png)").to_css(),
+            "url(https://example.com/bg.png)"
         );
         assert_eq!(
             parse("color", "rgb(100%, 0%, 50%)").to_css(),

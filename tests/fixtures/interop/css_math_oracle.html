@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CSS math interoperability oracle</title>
+<style>
+  html, body { margin: 0; }
+  #percentage-container { width: 1440px; }
+  #percentage { width: calc(100% - 40px); }
+  #multiplication { width: calc(456px*2); }
+  #viewport { width: max(10px, 2vw); }
+</style>
+<div id="percentage-container"><div id="percentage"></div></div>
+<div id="multiplication"></div>
+<div id="viewport"></div>
+<pre id="result"></pre>
+<script>
+  const px = id => getComputedStyle(document.getElementById(id)).width;
+  const result = {
+    percentage: px("percentage"),
+    multiplication: px("multiplication"),
+    viewport: px("viewport"),
+    rejectsMixedAddition: !CSS.supports("width", "calc(1px + 2)"),
+    rejectsLengthMultiplication: !CSS.supports("width", "calc(1px * 2px)"),
+    rejectsUnitlessLength: !CSS.supports("width", "12"),
+    requiresAddWhitespace: !CSS.supports("width", "calc(10px+2px)"),
+  };
+  document.getElementById("result").textContent = JSON.stringify(result);
+</script>

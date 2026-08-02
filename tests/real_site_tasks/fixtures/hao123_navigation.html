@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Navigation portal task fixture</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main id="scenario" class="scenario-shell">
+    <h1>网站导航</h1>
+    <nav aria-label="常用网站">
+      <section><h2>资讯</h2><a href="https://news.example/">新闻</a><a href="https://weather.example/">天气</a></section>
+      <section><h2>视频</h2><a href="https://video.example/">视频</a><a href="https://live.example/">直播</a></section>
+      <section><h2>工具</h2><a href="https://mail.example/">邮箱</a><a href="https://maps.example/">地图</a></section>
+    </nav>
+    <form action="/search" method="get">
+      <label for="portal-query">搜索</label><input id="portal-query" name="q" type="search">
+      <button type="submit">提交</button>
+    </form>
+  </main>
+</body>
+</html>
+

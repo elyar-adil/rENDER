@@ -1,6 +1,7 @@
 //! Deterministic CPU reference rasterizer.
 
 use crate::css::properties::BorderStyle;
+use crate::image::ImageResources;
 use crate::layout::{PhysicalPoint, PhysicalRect};
 
 use super::color::{Color, clamped_rounded_u8};
@@ -141,11 +142,23 @@ impl CpuRasterizer {
         glyphs: &dyn GlyphMaskProvider,
         viewport_origin: PhysicalPoint,
     ) -> CpuRasterOutput {
+        self.rasterize_viewport_with_images(list, background, glyphs, viewport_origin, None)
+    }
+
+    #[must_use]
+    pub fn rasterize_viewport_with_images(
+        &self,
+        list: &DisplayList,
+        background: Color,
+        glyphs: &dyn GlyphMaskProvider,
+        viewport_origin: PhysicalPoint,
+        images: Option<&ImageResources>,
+    ) -> CpuRasterOutput {
         let width = ceil_to_u32(list.viewport.width);
         let height = ceil_to_u32(list.viewport.height);
         let mut state = RasterState::new(width, height, background, viewport_origin);
         for item in list.items() {
-            state.process_item(item, glyphs);
+            state.process_item(item, glyphs, images);
         }
         state.finish()
     }
@@ -188,7 +201,12 @@ impl RasterState {
         }
     }
 
-    fn process_item(&mut self, item: &DisplayItem, glyphs: &dyn GlyphMaskProvider) {
+    fn process_item(
+        &mut self,
+        item: &DisplayItem,
+        glyphs: &dyn GlyphMaskProvider,
+        images: Option<&ImageResources>,
+    ) {
         let offset = self.item_offset(item.coordinate_space);
         match &item.command {
             DisplayCommand::SolidRect { rect, color } => {
@@ -230,10 +248,27 @@ impl RasterState {
                     clip,
                 );
             }
+            DisplayCommand::Image(image) => {
+                if let Some(decoded) = images.and_then(|images| images.get(image.resource)) {
+                    let clip = self.current_clip();
+                    paint_image(
+                        self.current_surface(),
+                        decoded,
+                        translate_rect(image.destination, offset),
+                        image.source,
+                        clip,
+                    );
+                } else {
+                    self.diagnostics.push(RasterDiagnostic {
+                        item: item.id,
+                        code: RasterDiagnosticCode::UnsupportedCommand,
+                        message: "image resource is not available to the rasterizer".to_owned(),
+                    });
+                }
+            }
             DisplayCommand::BoxShadow(_)
             | DisplayCommand::PushTransform(_)
             | DisplayCommand::PopTransform
-            | DisplayCommand::Image(_)
             | DisplayCommand::LinearGradient(_)
             | DisplayCommand::RadialGradient(_)
             | DisplayCommand::Canvas { .. } => self.diagnostics.push(RasterDiagnostic {
@@ -461,6 +496,42 @@ fn paint_glyph(
                     color.with_opacity(f32::from(coverage) / 255.0),
                     1.0,
                 );
+            }
+        }
+    }
+}
+
+fn paint_image(
+    surface: &mut Surface,
+    image: &crate::image::DecodedImage,
+    destination: PhysicalRect,
+    source: PhysicalRect,
+    clip: Option<PhysicalRect>,
+) {
+    if destination.size.width <= 0.0
+        || destination.size.height <= 0.0
+        || source.size.width <= 0.0
+        || source.size.height <= 0.0
+    {
+        return;
+    }
+    let Some(visible) = intersection(Some(destination), clip.unwrap_or(destination)) else {
+        return;
+    };
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    for y in top..bottom {
+        for x in left..right {
+            let unit_x = (u32_to_f32(x) + 0.5 - destination.origin.x) / destination.size.width;
+            let unit_y = (u32_to_f32(y) + 0.5 - destination.origin.y) / destination.size.height;
+            let source_x = floor_to_u32(source.origin.x + unit_x * source.size.width);
+            let source_y = floor_to_u32(source.origin.y + unit_y * source.size.height);
+            if let (Some(color), Some(index)) =
+                (image.pixel(source_x, source_y), surface.index(x, y))
+            {
+                surface.pixels[index] = blend(surface.pixels[index], color, 1.0);
             }
         }
     }

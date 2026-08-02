@@ -12,7 +12,7 @@ pub use display_list::{
     DisplayListDiagnosticCode, DisplayListDiff, FontInstanceId, GlyphId, GlyphInstance, GlyphRun,
     GradientStop, ImagePaint, ImageResourceId, LinearGradient, PaintCoordinateSpace, PaintPhase,
     RadialGradient, ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
-    TextShaper, Transform2D, build_display_list,
+    TextShaper, Transform2D, build_display_list, build_display_list_with_images,
 };
 pub use raster::{
     CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks, RasterDiagnostic,

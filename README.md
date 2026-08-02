@@ -38,6 +38,12 @@ prototype. With no argument it displays the built-in new-tab page:
 cargo run -p render-browser
 ```
 
+To open a network page directly:
+
+```powershell
+cargo run -p render-browser -- https://www.baidu.com/
+```
+
 To open a local HTML file:
 
 ```powershell

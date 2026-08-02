@@ -11,7 +11,7 @@ use crate::dom::{Dom, NodeId};
 
 use super::properties::{expand_flex_shorthand, expand_gap_shorthand};
 use super::selector::{MatchContext, Specificity, matching_specificity};
-use super::stylesheet::{CssWideKeyword, LayerName, StyleSheet, css_wide_keyword};
+use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CascadeOrigin {
@@ -83,6 +83,18 @@ pub fn cascade_element(
     sources: &[CascadeInput<'_>],
     context: &MatchContext,
 ) -> CascadedStyle {
+    cascade_element_with_inline(dom, element, sources, context, &[])
+}
+
+/// Select cascaded declaration winners including an inline declaration list.
+#[must_use]
+pub fn cascade_element_with_inline(
+    dom: &Dom,
+    element: NodeId,
+    sources: &[CascadeInput<'_>],
+    context: &MatchContext,
+    inline_declarations: &[Declaration],
+) -> CascadedStyle {
     let layer_orders = collect_layer_orders(sources);
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     let mut source_order = 0_u64;
@@ -132,6 +144,42 @@ pub fn cascade_element(
         }
     }
 
+    let inline_specificity = Specificity {
+        ids: u32::MAX,
+        classes: u32::MAX,
+        types: u32::MAX,
+    };
+    for declaration in inline_declarations {
+        source_order = source_order.saturating_add(1);
+        let priority = Priority {
+            important: declaration.important,
+            origin: origin_rank(CascadeOrigin::Author, declaration.important),
+            layer: layer_rank(
+                &layer_orders,
+                CascadeOrigin::Author,
+                sources.len(),
+                None,
+                declaration.important,
+            ),
+            specificity: inline_specificity,
+            source_order,
+        };
+        for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
+            candidates.entry(name).or_default().push(Candidate {
+                priority,
+                value: CascadedValue {
+                    value: specified_value,
+                    important: declaration.important,
+                    origin: CascadeOrigin::Author,
+                    layer: None,
+                    specificity: inline_specificity,
+                    source_order,
+                },
+                layer_key: None,
+            });
+        }
+    }
+
     CascadedStyle {
         properties: candidates
             .into_iter()
@@ -143,14 +191,25 @@ pub fn cascade_element(
 }
 
 fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
-    if name != "gap" && name != "flex" {
+    if name.eq_ignore_ascii_case("background") {
+        return expand_background_shorthand(value);
+    }
+    if matches!(name, "margin" | "padding") {
+        return expand_box_shorthand(name, value);
+    }
+    if name == "border" {
+        return expand_border_shorthand(value);
+    }
+    if name != "gap" && name != "flex" && name != "overflow" {
         return vec![(name.to_owned(), value.to_owned())];
     }
     if css_wide_keyword(value).is_some() {
         let longhands: &[&str] = if name == "gap" {
             &["row-gap", "column-gap"]
-        } else {
+        } else if name == "flex" {
             &["flex-grow", "flex-shrink", "flex-basis"]
+        } else {
+            &["overflow-x", "overflow-y"]
         };
         return longhands
             .iter()
@@ -177,7 +236,105 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
                 ]
             },
         ),
+        "overflow" => {
+            let values: Vec<_> = value.split_ascii_whitespace().collect();
+            if values.len() == 1 || values.len() == 2 {
+                let y = values[0];
+                let x = values.get(1).copied().unwrap_or(y);
+                vec![
+                    ("overflow-x".to_owned(), x.to_owned()),
+                    ("overflow-y".to_owned(), y.to_owned()),
+                ]
+            } else {
+                vec![(name.to_owned(), value.to_owned())]
+            }
+        }
         _ => unreachable!(),
+    }
+}
+
+fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
+    let lower = value.to_ascii_lowercase();
+    let image = extract_css_url(value).map_or_else(|| "none".to_owned(), |url| format!("url({url})"));
+    let repeat = ["no-repeat", "repeat-x", "repeat-y", "repeat"]
+        .into_iter()
+        .find(|keyword| lower.split_ascii_whitespace().any(|part| part == *keyword))
+        .unwrap_or("repeat")
+        .to_owned();
+    let size = value
+        .split_once('/')
+        .map(|(_, tail)| tail.split_ascii_whitespace().next().unwrap_or("auto"))
+        .filter(|part| matches!(part.to_ascii_lowercase().as_str(), "cover" | "contain" | "auto"))
+        .unwrap_or("auto")
+        .to_owned();
+    let position = if lower.contains("center") {
+        "center center"
+    } else if lower.contains("right") {
+        "right center"
+    } else {
+        "0% 0%"
+    };
+    vec![
+        ("background-image".to_owned(), image),
+        ("background-repeat".to_owned(), repeat),
+        ("background-position".to_owned(), position.to_owned()),
+        ("background-size".to_owned(), size),
+    ]
+}
+
+fn extract_css_url(value: &str) -> Option<&str> {
+    let start = value.to_ascii_lowercase().find("url(")?.saturating_add(4);
+    let tail = &value[start..];
+    let end = tail.find(')')?;
+    Some(tail[..end].trim().trim_matches(['\'', '"']))
+}
+
+fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let values: Vec<&str> = value.split_ascii_whitespace().collect();
+    if values.is_empty() || values.len() > 4 {
+        return vec![(name.to_owned(), value.to_owned())];
+    }
+    let edges = match values.len() {
+        1 => [values[0], values[0], values[0], values[0]],
+        2 => [values[0], values[1], values[0], values[1]],
+        3 => [values[0], values[1], values[2], values[1]],
+        _ => [values[0], values[1], values[2], values[3]],
+    };
+    ["top", "right", "bottom", "left"]
+        .into_iter()
+        .zip(edges)
+        .map(|(edge, value)| (format!("{name}-{edge}"), value.to_owned()))
+        .collect()
+}
+
+fn expand_border_shorthand(value: &str) -> Vec<(String, String)> {
+    let values: Vec<&str> = value.split_ascii_whitespace().collect();
+    let mut result = Vec::new();
+    for token in values {
+        let property =
+            if token.ends_with("px") || token == "thin" || token == "medium" || token == "thick" {
+                "border-width"
+            } else if matches!(
+                token,
+                "none" | "hidden" | "dotted" | "dashed" | "solid" | "double"
+            ) {
+                "border-style"
+            } else {
+                "border-color"
+            };
+        for edge in ["top", "right", "bottom", "left"] {
+            let suffix = match property {
+                "border-width" => "width",
+                "border-style" => "style",
+                _ => "color",
+            };
+            result.push((format!("border-{edge}-{suffix}"), token.to_owned()));
+        }
+    }
+    if result.is_empty() {
+        vec![("border".to_owned(), value.to_owned())]
+    } else {
+        result
     }
 }
 

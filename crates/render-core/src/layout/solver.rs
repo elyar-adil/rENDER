@@ -4,12 +4,13 @@ use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::{
-    AlignItems, AutoLengthPercentage, BorderStyle, BorderWidth, BoxSizing, FlexBasis,
-    FlexDirection, Gap, GridAutoRepeat, GridTemplate, GridTrack, GridTrackBreadth, JustifyContent,
-    LengthPercentage, LengthResolutionContext, MaxSize, NumericType, Position, Size,
-    TypedPropertyValue,
+    AlignItems, AutoLengthPercentage, BorderStyle, BorderWidth, BoxSizing, Clear, Display,
+    DisplayInside, FlexBasis, FlexDirection, Float, Gap, GridAutoRepeat, GridTemplate, GridTrack,
+    GridTrackBreadth, JustifyContent, LengthPercentage, LengthResolutionContext, MaxSize,
+    NumericType, Position, Size, TypedPropertyValue,
 };
 use crate::dom::{Dom, Node, NodeId, NodeKind};
+use crate::image::ImageResources;
 
 use super::fragment::{
     BoxGeometry, Fragment, FragmentId, FragmentKind, FragmentTree, TextFragmentData,
@@ -144,12 +145,26 @@ pub fn layout_formatting_tree(
     options: LayoutOptions,
     text_measurer: &dyn TextMeasurer,
 ) -> LayoutOutput {
+    layout_formatting_tree_with_images(dom, formatting, styles, options, text_measurer, None)
+}
+
+/// Layout with decoded replaced-element resources available for intrinsic sizing.
+#[must_use]
+pub fn layout_formatting_tree_with_images(
+    dom: &Dom,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: LayoutOptions,
+    text_measurer: &dyn TextMeasurer,
+    images: Option<&ImageResources>,
+) -> LayoutOutput {
     let mut solver = Solver {
         dom,
         formatting,
         styles,
         options,
         text_measurer,
+        images,
         fragments: Vec::new(),
         diagnostics: Vec::new(),
         inline_characters: 0,
@@ -182,7 +197,9 @@ pub fn layout_formatting_tree(
     let mut cursor_y = viewport_rect.origin.y;
     let mut children = Vec::new();
     for child in root_children {
-        if let Some(result) = solver.layout_block_like(child, viewport_rect, cursor_y, 0) {
+        if let Some(result) =
+            solver.layout_block_like(child, viewport_rect, viewport_rect, cursor_y, 0)
+        {
             cursor_y += result.outer_height;
             children.push(result.fragment);
         }
@@ -206,6 +223,7 @@ struct Solver<'a> {
     styles: &'a BTreeMap<NodeId, ComputedStyle>,
     options: LayoutOptions,
     text_measurer: &'a dyn TextMeasurer,
+    images: Option<&'a ImageResources>,
     fragments: Vec<Fragment>,
     diagnostics: Vec<LayoutDiagnostic>,
     inline_characters: usize,
@@ -228,6 +246,8 @@ struct FlexItem {
     target_outer: f32,
     fragment: Option<FragmentId>,
     natural_outer_cross: f32,
+    auto_main_before: bool,
+    auto_main_after: bool,
 }
 
 struct GridItem {
@@ -236,6 +256,12 @@ struct GridItem {
     column: usize,
     natural_outer_height: f32,
     stretch_height: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FloatArea {
+    side: Float,
+    rect: PhysicalRect,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -249,6 +275,7 @@ impl Solver<'_> {
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         margin_box_y: f32,
         depth: usize,
     ) -> Option<BlockResult> {
@@ -282,8 +309,23 @@ impl Solver<'_> {
                         ),
                     });
                 }
-                self.layout_block(node_id, containing, margin_box_y, depth, None)
+                self.layout_block(
+                    node_id,
+                    containing,
+                    positioning_containing,
+                    margin_box_y,
+                    depth,
+                    None,
+                )
             }
+            FormattingNodeKind::AtomicInline { .. } => self.layout_block(
+                node_id,
+                containing,
+                positioning_containing,
+                margin_box_y,
+                depth,
+                None,
+            ),
             FormattingNodeKind::Root => None,
         }
     }
@@ -295,6 +337,7 @@ impl Solver<'_> {
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         margin_box_y: f32,
         depth: usize,
         forced_content_width: Option<f32>,
@@ -310,7 +353,23 @@ impl Solver<'_> {
                 message: "formatting box has no computed style".to_owned(),
             });
         }
-        self.diagnose_positioning(node.source, style);
+        let position = position(style);
+        let out_of_flow = matches!(position, Position::Absolute | Position::Fixed);
+        let containing = match position {
+            Position::Fixed => PhysicalRect::new(
+                0.0,
+                0.0,
+                self.options.viewport.width,
+                self.options.viewport.height,
+            ),
+            Position::Absolute => positioning_containing,
+            _ => containing,
+        };
+        let margin_box_y = if out_of_flow {
+            containing.origin.y
+        } else {
+            margin_box_y
+        };
 
         let basis = containing.size.width;
         let mut margin_left = self.resolve_auto_edge(style, "margin-left", basis, node.source);
@@ -342,19 +401,63 @@ impl Solver<'_> {
             _ => BoxSizing::ContentBox,
         };
 
-        let specified_width = self.resolve_size(style, "width", basis, node.source);
+        let css_width = self.resolve_size(style, "width", basis, node.source);
+        let css_height = self.resolve_size(style, "height", containing.size.height, node.source);
+        let replaced_size = self.replaced_size(node.source, css_width, css_height);
+        let specified_width = css_width.or(replaced_size.map(|size| size.width));
         let non_content = padding.horizontal() + border.horizontal();
         let fixed_margins = margin_left.value + margin_right.value;
+        let left = self.resolve_inset(style, "left", containing.size.width, node.source);
+        let right = self.resolve_inset(style, "right", containing.size.width, node.source);
+        let positioned_content_width = if out_of_flow && specified_width.is_none() {
+            left.zip(right).map(|(left, right)| {
+                (containing.size.width
+                    - left
+                    - right
+                    - non_content
+                    - margin_left.value
+                    - margin_right.value)
+                    .max(0.0)
+            })
+        } else {
+            None
+        };
+        let shrink_to_fit_width = if out_of_flow
+            && specified_width.is_none()
+            && positioned_content_width.is_none()
+            && (left.is_some() || right.is_some())
+        {
+            Some(
+                self.max_content_width(node_id).min(
+                    (containing.size.width - non_content - margin_left.value - margin_right.value)
+                        .max(0.0),
+                ),
+            )
+        } else {
+            None
+        };
+        let forced_content_width = forced_content_width.or(positioned_content_width);
         let mut content_width = forced_content_width.unwrap_or_else(|| {
             specified_width.map_or_else(
-                || (containing.size.width - non_content - fixed_margins).max(0.0),
-                |width| match box_sizing {
-                    BoxSizing::ContentBox => width,
-                    BoxSizing::BorderBox => (width - non_content).max(0.0),
+                || {
+                    shrink_to_fit_width.unwrap_or_else(|| {
+                        (containing.size.width - non_content - fixed_margins).max(0.0)
+                    })
+                },
+                |width| match (css_width.is_some(), box_sizing) {
+                    (true, BoxSizing::BorderBox) => (width - non_content).max(0.0),
+                    _ => width,
                 },
             )
         });
-        content_width = self.apply_min_max_width(style, content_width, basis, node.source);
+        content_width = self.apply_min_max_width(
+            style,
+            content_width,
+            basis,
+            node.source,
+            non_content,
+            box_sizing,
+        );
 
         if forced_content_width.is_some() {
             margin_left.value = if margin_left.auto {
@@ -412,28 +515,50 @@ impl Solver<'_> {
             }),
         )?;
 
-        let specified_content_height = self
-            .resolve_size(style, "height", containing.size.height, node.source)
-            .map(|height| match box_sizing {
-                BoxSizing::ContentBox => height,
-                BoxSizing::BorderBox => (height - padding.vertical() - border.vertical()).max(0.0),
-            });
+        let specified_content_height =
+            css_height
+                .or(replaced_size.map(|size| size.height))
+                .map(|height| match (css_height.is_some(), box_sizing) {
+                    (true, BoxSizing::BorderBox) => {
+                        (height - padding.vertical() - border.vertical()).max(0.0)
+                    }
+                    _ => height,
+                });
+        let top = self.resolve_inset(style, "top", containing.size.height, node.source);
+        let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
         let context = match node.kind {
-            FormattingNodeKind::BlockContainer { context } => context,
+            FormattingNodeKind::BlockContainer { context }
+            | FormattingNodeKind::AtomicInline { context } => context,
             _ => FormattingContextKind::Block,
         };
-        let (children, auto_height) = match context {
+        let positioned_child_containing = if position == Position::Static {
+            positioning_containing
+        } else {
+            PhysicalRect::new(
+                content_x - padding.left,
+                content_y - padding.top,
+                content_width + padding.horizontal(),
+                specified_content_height.unwrap_or(0.0) + padding.vertical(),
+            )
+        };
+        let (flow_children, positioned_children): (Vec<_>, Vec<_>) = node
+            .children
+            .into_iter()
+            .partition(|child| !self.is_out_of_flow(*child));
+        let (mut children, auto_height) = match context {
             FormattingContextKind::Flex => self.layout_flex_children(
-                &node.children,
+                &flow_children,
                 PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                positioned_child_containing,
                 specified_content_height,
                 depth.saturating_add(1),
                 style,
                 node.source,
             ),
             FormattingContextKind::Grid => self.layout_grid_children(
-                &node.children,
+                &flow_children,
                 PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                positioned_child_containing,
                 specified_content_height,
                 depth.saturating_add(1),
                 style,
@@ -442,29 +567,153 @@ impl Solver<'_> {
             _ => {
                 let mut cursor_y = content_y;
                 let mut children = Vec::new();
-                for child in node.children {
-                    if let Some(result) = self.layout_block_like(
+                let mut floats = Vec::new();
+                for child in flow_children {
+                    cursor_y = self.cleared_y(child, cursor_y, &floats);
+                    let float = self.float_side(child);
+                    if float == Float::None {
+                        let result = if matches!(
+                            self.formatting.get(child).map(|node| &node.kind),
+                            Some(
+                                FormattingNodeKind::AnonymousBlock
+                                    | FormattingNodeKind::Inline
+                                    | FormattingNodeKind::Text(_)
+                            )
+                        ) {
+                            self.layout_anonymous_block_with_floats(
+                                child,
+                                PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                                cursor_y,
+                                depth.saturating_add(1),
+                                &floats,
+                            )
+                        } else {
+                            let band =
+                                float_band(&floats, cursor_y, content_x, content_x + content_width);
+                            self.layout_block_like(
+                                child,
+                                PhysicalRect::new(
+                                    band.0,
+                                    content_y,
+                                    (band.1 - band.0).max(0.0),
+                                    0.0,
+                                ),
+                                positioned_child_containing,
+                                cursor_y,
+                                depth.saturating_add(1),
+                            )
+                        };
+                        if let Some(result) = result {
+                            cursor_y += result.outer_height;
+                            children.push(result.fragment);
+                        }
+                    } else if let Some((fragment, area)) = self.layout_float(
                         child,
+                        float,
                         PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                        positioned_child_containing,
                         cursor_y,
+                        &floats,
                         depth.saturating_add(1),
                     ) {
-                        cursor_y += result.outer_height;
-                        children.push(result.fragment);
+                        floats.push(area);
+                        children.push(fragment);
                     }
                 }
-                (children, (cursor_y - content_y).max(0.0))
+                let flow_height = (cursor_y - content_y).max(0.0);
+                let contains_floats = matches!(node.kind, FormattingNodeKind::AtomicInline { .. })
+                    || matches!(
+                        style.and_then(|style| style.typed("display")),
+                        Some(TypedPropertyValue::Display(Display::Normal {
+                            inside: DisplayInside::FlowRoot,
+                            ..
+                        }))
+                    );
+                let float_height = floats
+                    .iter()
+                    .map(|area| area.rect.bottom() - content_y)
+                    .fold(0.0_f32, f32::max);
+                (
+                    children,
+                    if contains_floats {
+                        flow_height.max(float_height)
+                    } else {
+                        flow_height
+                    },
+                )
             }
         };
-        let content_height = specified_content_height.unwrap_or(auto_height);
-        self.finish_box(fragment, content_height, children);
+        let content_height = self.apply_min_max_height(
+            style,
+            specified_content_height.unwrap_or(auto_height),
+            containing.size.height,
+            node.source,
+            padding.vertical() + border.vertical(),
+            box_sizing,
+        );
+        self.finish_box(fragment, content_height, children.clone());
+        let positioned_child_containing = if position == Position::Static {
+            positioning_containing
+        } else {
+            PhysicalRect::new(
+                content_x - padding.left,
+                content_y - padding.top,
+                content_width + padding.horizontal(),
+                content_height + padding.vertical(),
+            )
+        };
+        for child in positioned_children {
+            if let Some(result) = self.layout_block_like(
+                child,
+                PhysicalRect::new(content_x, content_y, content_width, content_height),
+                positioned_child_containing,
+                content_y,
+                depth.saturating_add(1),
+            ) {
+                children.push(result.fragment);
+            }
+        }
+        self.set_children(fragment, children);
+        if out_of_flow {
+            if specified_content_height.is_none()
+                && let (Some(top), Some(bottom)) = (top, bottom)
+            {
+                self.resize_fragment_outer_height(
+                    fragment,
+                    (containing.size.height - top - bottom).max(0.0),
+                );
+            }
+            if let Some(outer) = self.fragment_outer_rect(fragment) {
+                let target_x = left.map_or_else(
+                    || {
+                        right.map_or(outer.origin.x, |right| {
+                            containing.right() - right - outer.size.width
+                        })
+                    },
+                    |left| containing.origin.x + left,
+                );
+                let target_y = top.map_or_else(
+                    || {
+                        bottom.map_or(outer.origin.y, |bottom| {
+                            containing.bottom() - bottom - outer.size.height
+                        })
+                    },
+                    |top| containing.origin.y + top,
+                );
+                self.translate_fragment_subtree(
+                    fragment,
+                    target_x - outer.origin.x,
+                    target_y - outer.origin.y,
+                );
+            }
+        }
         Some(BlockResult {
             fragment,
-            outer_height: margin_top
-                + border.vertical()
-                + padding.vertical()
-                + content_height
-                + margin_bottom,
+            outer_height: if out_of_flow {
+                0.0
+            } else {
+                margin_top + border.vertical() + padding.vertical() + content_height + margin_bottom
+            },
         })
     }
 
@@ -473,6 +722,7 @@ impl Solver<'_> {
         &mut self,
         children: &[FormattingNodeId],
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -555,6 +805,7 @@ impl Solver<'_> {
                         track_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    positioning_containing,
                     containing.origin.y,
                     depth,
                     Some(forced_content_width),
@@ -726,11 +977,12 @@ impl Solver<'_> {
         });
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn layout_flex_children(
         &mut self,
         children: &[FormattingNodeId],
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         specified_height: Option<f32>,
         depth: usize,
         container_style: Option<&ComputedStyle>,
@@ -781,6 +1033,12 @@ impl Solver<'_> {
                 let extras =
                     self.flex_outer_extras(style, horizontal, containing.size.width, source);
                 let base_outer = (basis + extras).max(0.0);
+                let (before_property, after_property) = match direction {
+                    FlexDirection::Row => ("margin-left", "margin-right"),
+                    FlexDirection::RowReverse => ("margin-right", "margin-left"),
+                    FlexDirection::Column => ("margin-top", "margin-bottom"),
+                    FlexDirection::ColumnReverse => ("margin-bottom", "margin-top"),
+                };
                 Some(FlexItem {
                     node: *node,
                     source,
@@ -791,6 +1049,8 @@ impl Solver<'_> {
                     target_outer: base_outer,
                     fragment: None,
                     natural_outer_cross: 0.0,
+                    auto_main_before: Self::margin_is_auto(style, before_property),
+                    auto_main_after: Self::margin_is_auto(style, after_property),
                 })
             })
             .collect::<Vec<_>>();
@@ -857,6 +1117,7 @@ impl Solver<'_> {
                         outer_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    positioning_containing,
                     containing.origin.y,
                     depth,
                     Some(forced_content_width),
@@ -904,17 +1165,33 @@ impl Solver<'_> {
         };
         let used_main = items.iter().map(|item| item.target_outer).sum::<f32>() + gaps;
         let free_main = (available_main - used_main).max(0.0);
+        let auto_main_margin_count = items
+            .iter()
+            .map(|item| usize::from(item.auto_main_before) + usize::from(item.auto_main_after))
+            .sum::<usize>();
+        let auto_main_margin = if auto_main_margin_count > 0 {
+            free_main / count_as_f32(auto_main_margin_count)
+        } else {
+            0.0
+        };
         let justify = match container_style.and_then(|style| style.typed("justify-content")) {
             Some(TypedPropertyValue::JustifyContent(value)) => *value,
             _ => JustifyContent::Normal,
         };
-        let (main_offset, distributed_gap) = justify_offsets(justify, free_main, items.len(), gap);
+        let (main_offset, distributed_gap) = if auto_main_margin_count > 0 {
+            (0.0, gap)
+        } else {
+            justify_offsets(justify, free_main, items.len(), gap)
+        };
         let mut cursor = main_offset;
         let mut fragments = Vec::new();
         for item in items {
             let Some(fragment) = item.fragment else {
                 continue;
             };
+            if item.auto_main_before {
+                cursor += auto_main_margin;
+            }
             if horizontal {
                 if align == AlignItems::Stretch && self.flex_cross_is_auto(item.node, "height") {
                     self.stretch_fragment_outer_height(fragment, line_cross);
@@ -961,6 +1238,9 @@ impl Solver<'_> {
                 );
             }
             cursor += item.target_outer + distributed_gap;
+            if item.auto_main_after {
+                cursor += auto_main_margin;
+            }
             fragments.push(fragment);
         }
         let auto_height = if horizontal {
@@ -1161,6 +1441,13 @@ impl Solver<'_> {
         )
     }
 
+    fn margin_is_auto(style: Option<&ComputedStyle>, property: &str) -> bool {
+        matches!(
+            style.and_then(|style| style.typed(property)),
+            Some(TypedPropertyValue::Margin(AutoLengthPercentage::Auto))
+        )
+    }
+
     fn flex_cross_is_auto(&self, node: FormattingNodeId, property: &str) -> bool {
         let style = self
             .formatting
@@ -1242,6 +1529,17 @@ impl Solver<'_> {
         y: f32,
         depth: usize,
     ) -> Option<BlockResult> {
+        self.layout_anonymous_block_with_floats(node_id, containing, y, depth, &[])
+    }
+
+    fn layout_anonymous_block_with_floats(
+        &mut self,
+        node_id: FormattingNodeId,
+        containing: PhysicalRect,
+        y: f32,
+        depth: usize,
+        floats: &[FloatArea],
+    ) -> Option<BlockResult> {
         let node = self.formatting.get(node_id)?.clone();
         let inline_roots = if matches!(
             node.kind,
@@ -1262,7 +1560,7 @@ impl Solver<'_> {
             // An isolated inline-grid is an atomic inline-level box. The
             // surrounding inline solver does not yet mix atomic boxes and text,
             // but it can preserve the grid formatting context and geometry.
-            return self.layout_block(*inline_root, containing, y, depth, None);
+            return self.layout_block(*inline_root, containing, containing, y, depth, None);
         }
         let fragment = self.allocate_fragment(
             node_id,
@@ -1279,6 +1577,7 @@ impl Solver<'_> {
             &inline_roots,
             PhysicalRect::new(containing.origin.x, y, containing.size.width, 0.0),
             depth.saturating_add(1),
+            floats,
         );
         self.finish_box(fragment, height, children);
         Some(BlockResult {
@@ -1287,17 +1586,19 @@ impl Solver<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn layout_inline_content(
         &mut self,
         roots: &[FormattingNodeId],
         containing: PhysicalRect,
         depth: usize,
+        floats: &[FloatArea],
     ) -> (Vec<FragmentId>, f32) {
         let atoms = self.collect_inline_content_atoms(roots, depth);
         if atoms.is_empty()
-            || atoms
-                .iter()
-                .all(|atom| !atom.forced_break && atom.character.is_whitespace())
+            || atoms.iter().all(|atom| {
+                atom.atomic.is_none() && !atom.forced_break && atom.character.is_whitespace()
+            })
         {
             return (Vec::new(), 0.0);
         }
@@ -1312,8 +1613,11 @@ impl Solver<'_> {
             line_height: self.options.default_line_height,
         };
         let mut fragments = Vec::new();
-        let mut line_x = containing.origin.x;
         let mut line_y = containing.origin.y;
+        let (mut line_left, mut line_right) =
+            inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+        let mut line_x = line_left;
+        let mut current_line_height = style.line_height;
         let mut pending_space = None;
         let mut current_run: Option<TextRun> = None;
         let mut cursor = 0;
@@ -1322,9 +1626,79 @@ impl Solver<'_> {
             let atom = atoms[cursor];
             if atom.forced_break {
                 self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
-                line_x = containing.origin.x;
-                line_y += style.line_height;
+                line_y += current_line_height;
+                current_line_height = style.line_height;
+                (line_left, line_right) =
+                    inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                line_x = line_left;
                 pending_space = None;
+                cursor += 1;
+                continue;
+            }
+            if let Some(atomic) = atom.atomic {
+                self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                if let Some(space) = pending_space.take()
+                    && line_x > line_left
+                {
+                    let width = self.text_measurer.measure(" ", style).advance;
+                    self.push_character(
+                        &mut current_run,
+                        &mut fragments,
+                        space,
+                        ' ',
+                        line_x,
+                        line_y,
+                        width,
+                        style,
+                    );
+                    self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                    line_x += width;
+                }
+                if let Some((fragment, outer)) = self.layout_atomic_inline(
+                    atomic,
+                    containing,
+                    line_x,
+                    line_y,
+                    depth.saturating_add(1),
+                ) {
+                    if (line_x - line_left).abs() < f32::EPSILON
+                        && line_x + outer.size.width > line_right
+                    {
+                        (line_left, line_right) = inline_float_band(
+                            floats,
+                            containing,
+                            &mut line_y,
+                            style.line_height,
+                            outer.size.width,
+                        );
+                        line_x = line_left;
+                        self.translate_fragment_subtree(
+                            fragment,
+                            line_x - outer.origin.x,
+                            line_y - outer.origin.y,
+                        );
+                    }
+                    if line_x > line_left && line_x + outer.size.width > line_right {
+                        line_y += current_line_height;
+                        current_line_height = style.line_height;
+                        (line_left, line_right) = inline_float_band(
+                            floats,
+                            containing,
+                            &mut line_y,
+                            style.line_height,
+                            0.0,
+                        );
+                        line_x = line_left;
+                        self.translate_fragment_subtree(
+                            fragment,
+                            line_x - outer.origin.x,
+                            line_y - outer.origin.y,
+                        );
+                    }
+                    line_x += outer.size.width;
+                    current_line_height = current_line_height.max(outer.size.height);
+                    fragments.push(fragment);
+                }
                 cursor += 1;
                 continue;
             }
@@ -1337,21 +1711,35 @@ impl Solver<'_> {
             let segment_end = inline_segment_end(&atoms, cursor);
             let segment = &atoms[cursor..segment_end];
             let segment_width = self.measure_inline_segment(segment, style);
+            if (line_x - line_left).abs() < f32::EPSILON && segment_width > line_right - line_left {
+                (line_left, line_right) = inline_float_band(
+                    floats,
+                    containing,
+                    &mut line_y,
+                    style.line_height,
+                    segment_width,
+                );
+                line_x = line_left;
+            }
             let space_width = pending_space
                 .as_ref()
-                .filter(|_| line_x > containing.origin.x)
+                .filter(|_| line_x > line_left)
                 .map_or(0.0, |_| self.text_measurer.measure(" ", style).advance);
-            if line_x > containing.origin.x
-                && line_x + space_width + segment_width > containing.right()
+            if segment.first().is_some_and(|atom| atom.wrap_allowed)
+                && line_x > line_left
+                && line_x + space_width + segment_width > line_right
             {
                 self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
-                line_x = containing.origin.x;
-                line_y += style.line_height;
+                line_y += current_line_height;
+                current_line_height = style.line_height;
+                (line_left, line_right) =
+                    inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                line_x = line_left;
                 pending_space = None;
             }
 
             if let Some(space) = pending_space.take()
-                && line_x > containing.origin.x
+                && line_x > line_left
             {
                 let width = self.text_measurer.measure(" ", style).advance;
                 self.push_character(
@@ -1369,10 +1757,13 @@ impl Solver<'_> {
 
             for atom in segment {
                 let width = self.measure_inline_character(atom.character, style);
-                if line_x + width > containing.right() && line_x > containing.origin.x {
+                if atom.wrap_allowed && line_x + width > line_right && line_x > line_left {
                     self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
-                    line_x = containing.origin.x;
-                    line_y += style.line_height;
+                    line_y += current_line_height;
+                    current_line_height = style.line_height;
+                    (line_left, line_right) =
+                        inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                    line_x = line_left;
                 }
                 self.push_character(
                     &mut current_run,
@@ -1392,7 +1783,7 @@ impl Solver<'_> {
         let trailing_line_height = if ends_with_forced_break {
             0.0
         } else {
-            style.line_height
+            current_line_height
         };
         let height = line_y - containing.origin.y + trailing_line_height;
         (fragments, height)
@@ -1442,6 +1833,11 @@ impl Solver<'_> {
             return;
         };
         if let FormattingNodeKind::Text(text) = node.kind {
+            let wrap_allowed = node
+                .style_source
+                .and_then(|source| self.styles.get(&source))
+                .and_then(|style| style.get("white-space"))
+                .is_none_or(|value| !value.css_text().eq_ignore_ascii_case("nowrap"));
             for character in text.chars() {
                 if self.inline_characters >= self.options.limits.max_inline_characters {
                     self.diagnostics.push(LayoutDiagnostic {
@@ -1457,6 +1853,8 @@ impl Solver<'_> {
                     source: node.source,
                     character,
                     forced_break: false,
+                    wrap_allowed,
+                    atomic: None,
                 });
             }
             return;
@@ -1472,12 +1870,270 @@ impl Solver<'_> {
                 source: node.source,
                 character: '\n',
                 forced_break: true,
+                wrap_allowed: false,
+                atomic: None,
+            });
+            return;
+        }
+        if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
+            atoms.push(InlineAtom {
+                formatting_node: node_id,
+                source: node.source,
+                character: '\0',
+                forced_break: false,
+                wrap_allowed: true,
+                atomic: Some(node_id),
             });
             return;
         }
         for child in node.children {
             self.collect_inline_atoms(child, atoms, depth.saturating_add(1));
         }
+    }
+
+    fn layout_atomic_inline(
+        &mut self,
+        node_id: FormattingNodeId,
+        containing: PhysicalRect,
+        x: f32,
+        y: f32,
+        depth: usize,
+    ) -> Option<(FragmentId, PhysicalRect)> {
+        let content_width = self.atomic_inline_content_width(node_id, containing.size.width);
+        let result = self.layout_block(
+            node_id,
+            PhysicalRect::new(
+                x,
+                containing.origin.y,
+                containing.size.width,
+                containing.size.height,
+            ),
+            containing,
+            y,
+            depth,
+            Some(content_width),
+        )?;
+        let outer = self.fragment_outer_rect(result.fragment)?;
+        Some((result.fragment, outer))
+    }
+
+    fn atomic_inline_content_width(
+        &mut self,
+        node_id: FormattingNodeId,
+        containing_width: f32,
+    ) -> f32 {
+        let node = self.formatting.get(node_id).cloned();
+        let source = node.as_ref().and_then(|node| node.source);
+        let style = node
+            .as_ref()
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source))
+            .cloned();
+        let padding = self.resolve_edge(style.as_ref(), "padding-left", containing_width, source)
+            + self.resolve_edge(style.as_ref(), "padding-right", containing_width, source);
+        let border = self.resolve_border(
+            style.as_ref(),
+            "border-left-width",
+            containing_width,
+            source,
+        ) + self.resolve_border(
+            style.as_ref(),
+            "border-right-width",
+            containing_width,
+            source,
+        );
+        let box_sizing = match style.as_ref().and_then(|style| style.typed("box-sizing")) {
+            Some(TypedPropertyValue::BoxSizing(value)) => *value,
+            _ => BoxSizing::ContentBox,
+        };
+        let css_width = self.resolve_size(style.as_ref(), "width", containing_width, source);
+        let css_height = self.resolve_size(
+            style.as_ref(),
+            "height",
+            self.options.viewport.height,
+            source,
+        );
+        let replaced_width = self
+            .replaced_size(source, css_width, css_height)
+            .map(|size| size.width);
+        let width = css_width.or(replaced_width).map_or_else(
+            || {
+                self.atomic_inline_intrinsic_width(node_id)
+                    .min(containing_width)
+            },
+            |width| match (css_width.is_some(), box_sizing) {
+                (true, BoxSizing::BorderBox) => (width - padding - border).max(0.0),
+                _ => width,
+            },
+        );
+        self.apply_min_max_width(
+            style.as_ref(),
+            width,
+            containing_width,
+            source,
+            padding + border,
+            box_sizing,
+        )
+    }
+
+    fn replaced_size(
+        &self,
+        source: Option<NodeId>,
+        css_width: Option<f32>,
+        css_height: Option<f32>,
+    ) -> Option<PhysicalSize> {
+        let source = source?;
+        let Some(NodeKind::Element(element)) = self.dom.node(source).map(Node::kind) else {
+            return None;
+        };
+        if element.local_name != "img" {
+            return None;
+        }
+        let html_width = self.html_image_dimension(source, "width");
+        let html_height = self.html_image_dimension(source, "height");
+        let intrinsic = self
+            .images
+            .and_then(|images| images.get_for_node(source))
+            .map(|loaded| {
+                let (width, height) = loaded.image.intrinsic_size();
+                (
+                    image_dimension_to_f32(width),
+                    image_dimension_to_f32(height),
+                )
+            });
+        let ratio = intrinsic
+            .filter(|(_, height)| *height > 0.0)
+            .map(|(width, height)| width / height)
+            .or_else(|| {
+                html_width
+                    .zip(html_height)
+                    .filter(|(_, height)| *height > 0.0)
+                    .map(|(width, height)| width / height)
+            });
+        let width = css_width
+            .or(html_width)
+            .or_else(|| {
+                css_height
+                    .or(html_height)
+                    .zip(ratio)
+                    .map(|(height, ratio)| height * ratio)
+            })
+            .or_else(|| intrinsic.map(|(width, _)| width))
+            .unwrap_or(300.0);
+        let height = css_height
+            .or(html_height)
+            .or_else(|| {
+                ratio
+                    .filter(|ratio| *ratio > 0.0)
+                    .map(|ratio| width / ratio)
+            })
+            .or_else(|| intrinsic.map(|(_, height)| height))
+            .unwrap_or(150.0);
+        Some(PhysicalSize {
+            width: width.max(0.0),
+            height: height.max(0.0),
+        })
+    }
+
+    fn html_image_dimension(&self, source: NodeId, name: &str) -> Option<f32> {
+        self.dom
+            .attribute(source, name)
+            .ok()
+            .flatten()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .map(image_dimension_to_f32)
+    }
+
+    fn atomic_inline_intrinsic_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let children = self
+            .formatting
+            .get(node_id)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        children
+            .into_iter()
+            .map(|child| self.max_content_width(child))
+            .fold(0.0_f32, f32::max)
+    }
+
+    fn max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let Some(node) = self.formatting.get(node_id).cloned() else {
+            return 0.0;
+        };
+        if let FormattingNodeKind::Text(text) = &node.kind {
+            return self
+                .text_measurer
+                .measure(
+                    text,
+                    TextStyle {
+                        font_size: self.options.root_font_size,
+                        line_height: self.options.default_line_height,
+                    },
+                )
+                .advance;
+        }
+        if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
+            return self.atomic_outer_max_content_width(node_id);
+        }
+        let inline_sequence = matches!(
+            node.kind,
+            FormattingNodeKind::AnonymousBlock | FormattingNodeKind::Inline
+        );
+        let widths = node
+            .children
+            .into_iter()
+            .map(|child| self.max_content_width(child));
+        if inline_sequence {
+            widths.sum()
+        } else {
+            widths.fold(0.0_f32, f32::max)
+        }
+    }
+
+    fn atomic_outer_max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let node = self.formatting.get(node_id).cloned();
+        let source = node.as_ref().and_then(|node| node.source);
+        let style = node
+            .as_ref()
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source))
+            .cloned();
+        let basis = self.options.viewport.width;
+        let margin = self.resolve_edge(style.as_ref(), "margin-left", basis, source)
+            + self.resolve_edge(style.as_ref(), "margin-right", basis, source);
+        let padding = self.resolve_edge(style.as_ref(), "padding-left", basis, source)
+            + self.resolve_edge(style.as_ref(), "padding-right", basis, source);
+        let border = self.resolve_border(style.as_ref(), "border-left-width", basis, source)
+            + self.resolve_border(style.as_ref(), "border-right-width", basis, source);
+        let non_content = padding + border;
+        let box_sizing = match style.as_ref().and_then(|style| style.typed("box-sizing")) {
+            Some(TypedPropertyValue::BoxSizing(value)) => *value,
+            _ => BoxSizing::ContentBox,
+        };
+        let specified = self.resolve_size(style.as_ref(), "width", basis, source);
+        let content_width = specified.map_or_else(
+            || {
+                node.map_or(0.0, |node| {
+                    node.children
+                        .into_iter()
+                        .map(|child| self.max_content_width(child))
+                        .fold(0.0_f32, f32::max)
+                })
+            },
+            |width| match box_sizing {
+                BoxSizing::ContentBox => width,
+                BoxSizing::BorderBox => (width - non_content).max(0.0),
+            },
+        );
+        self.apply_min_max_width(
+            style.as_ref(),
+            content_width,
+            basis,
+            source,
+            non_content,
+            box_sizing,
+        ) + non_content
+            + margin
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1577,6 +2233,21 @@ impl Solver<'_> {
         })
     }
 
+    fn resolve_inset(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        property: &str,
+        basis: f32,
+        node: Option<NodeId>,
+    ) -> Option<f32> {
+        match style.and_then(|style| style.typed(property)) {
+            Some(TypedPropertyValue::Inset(AutoLengthPercentage::LengthPercentage(value))) => {
+                Some(self.resolve_length(value, basis, node, property))
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_border(
         &mut self,
         style: Option<&ComputedStyle>,
@@ -1641,20 +2312,64 @@ impl Solver<'_> {
         width: f32,
         basis: f32,
         node: Option<NodeId>,
+        non_content: f32,
+        box_sizing: BoxSizing,
     ) -> f32 {
+        let to_content_width = |value: f32| match box_sizing {
+            BoxSizing::ContentBox => value.max(0.0),
+            BoxSizing::BorderBox => (value - non_content).max(0.0),
+        };
         let min = match style.and_then(|style| style.typed("min-width")) {
             Some(TypedPropertyValue::Size(Size::LengthPercentage(value))) => {
-                self.resolve_length(value, basis, node, "min-width")
+                to_content_width(self.resolve_length(value, basis, node, "min-width"))
             }
             _ => 0.0,
         };
         let max = match style.and_then(|style| style.typed("max-width")) {
             Some(TypedPropertyValue::MaxSize(MaxSize::Size(Size::LengthPercentage(value)))) => {
-                Some(self.resolve_length(value, basis, node, "max-width"))
+                Some(to_content_width(self.resolve_length(
+                    value,
+                    basis,
+                    node,
+                    "max-width",
+                )))
             }
             _ => None,
         };
         max.map_or(width.max(min), |max| width.max(min).min(max))
+    }
+
+    fn apply_min_max_height(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        height: f32,
+        basis: f32,
+        node: Option<NodeId>,
+        non_content: f32,
+        box_sizing: BoxSizing,
+    ) -> f32 {
+        let to_content_height = |value: f32| match box_sizing {
+            BoxSizing::ContentBox => value.max(0.0),
+            BoxSizing::BorderBox => (value - non_content).max(0.0),
+        };
+        let min = match style.and_then(|style| style.typed("min-height")) {
+            Some(TypedPropertyValue::Size(Size::LengthPercentage(value))) => {
+                to_content_height(self.resolve_length(value, basis, node, "min-height"))
+            }
+            _ => 0.0,
+        };
+        let max = match style.and_then(|style| style.typed("max-height")) {
+            Some(TypedPropertyValue::MaxSize(MaxSize::Size(Size::LengthPercentage(value)))) => {
+                Some(to_content_height(self.resolve_length(
+                    value,
+                    basis,
+                    node,
+                    "max-height",
+                )))
+            }
+            _ => None,
+        };
+        max.map_or(height.max(min), |max| height.min(max).max(min))
     }
 
     fn resolve_length(
@@ -1687,17 +2402,105 @@ impl Solver<'_> {
         }
     }
 
-    fn diagnose_positioning(&mut self, node: Option<NodeId>, style: Option<&ComputedStyle>) {
-        let position = match style.and_then(|style| style.typed("position")) {
-            Some(TypedPropertyValue::Position(position)) => *position,
-            _ => Position::Static,
+    fn is_out_of_flow(&self, node: FormattingNodeId) -> bool {
+        let style = self
+            .formatting
+            .get(node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        matches!(position(style), Position::Absolute | Position::Fixed)
+    }
+
+    fn float_side(&self, node: FormattingNodeId) -> Float {
+        let style = self
+            .formatting
+            .get(node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        match style.and_then(|style| style.typed("float")) {
+            Some(TypedPropertyValue::Float(Float::Left | Float::InlineStart)) => Float::Left,
+            Some(TypedPropertyValue::Float(Float::Right | Float::InlineEnd)) => Float::Right,
+            _ => Float::None,
+        }
+    }
+
+    fn cleared_y(&self, node: FormattingNodeId, y: f32, floats: &[FloatArea]) -> f32 {
+        let style = self
+            .formatting
+            .get(node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        let clear = match style.and_then(|style| style.typed("clear")) {
+            Some(TypedPropertyValue::Clear(value)) => *value,
+            _ => Clear::None,
         };
-        if !matches!(position, Position::Static | Position::Relative) {
-            self.diagnostics.push(LayoutDiagnostic {
+        floats
+            .iter()
+            .filter(|area| match clear {
+                Clear::Left | Clear::InlineStart => area.side == Float::Left,
+                Clear::Right | Clear::InlineEnd => area.side == Float::Right,
+                Clear::Both => true,
+                Clear::None => false,
+            })
+            .map(|area| area.rect.bottom())
+            .fold(y, f32::max)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn layout_float(
+        &mut self,
+        node: FormattingNodeId,
+        side: Float,
+        containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        mut y: f32,
+        floats: &[FloatArea],
+        depth: usize,
+    ) -> Option<(FragmentId, FloatArea)> {
+        loop {
+            let (left, right) = float_band(floats, y, containing.origin.x, containing.right());
+            let available = (right - left).max(0.0);
+            let forced_content_width = self.atomic_inline_content_width(node, available);
+            let result = self.layout_block(
                 node,
-                code: LayoutDiagnosticCode::PositioningNotImplemented,
-                message: format!("{position:?} positioning is not implemented yet"),
-            });
+                PhysicalRect::new(left, containing.origin.y, available, 0.0),
+                positioning_containing,
+                y,
+                depth,
+                Some(forced_content_width),
+            )?;
+            let outer = self.fragment_outer_rect(result.fragment)?;
+            if outer.size.width <= available || available >= containing.size.width {
+                let target_x = if side == Float::Right {
+                    right - outer.size.width
+                } else {
+                    left
+                };
+                self.translate_fragment_subtree(
+                    result.fragment,
+                    target_x - outer.origin.x,
+                    y - outer.origin.y,
+                );
+                let rect = self.fragment_outer_rect(result.fragment)?;
+                return Some((result.fragment, FloatArea { side, rect }));
+            }
+            let next_y = floats
+                .iter()
+                .filter(|area| area.rect.origin.y <= y && area.rect.bottom() > y)
+                .map(|area| area.rect.bottom())
+                .fold(y, f32::max);
+            if next_y <= y {
+                return Some((result.fragment, FloatArea { side, rect: outer }));
+            }
+            self.remove_fragment_subtree(result.fragment);
+            y = next_y;
+        }
+    }
+
+    fn remove_fragment_subtree(&mut self, root: FragmentId) {
+        let root = usize::try_from(root.as_u32()).unwrap_or(self.fragments.len());
+        if root < self.fragments.len() {
+            self.fragments.truncate(root);
         }
     }
 
@@ -1759,12 +2562,22 @@ impl Solver<'_> {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "CSS layout geometry is f32 and decoded image dimensions are bounded by image limits"
+)]
+fn image_dimension_to_f32(value: u32) -> f32 {
+    value as f32
+}
+
 #[derive(Clone, Copy)]
 struct InlineAtom {
     formatting_node: FormattingNodeId,
     source: Option<NodeId>,
     character: char,
     forced_break: bool,
+    wrap_allowed: bool,
+    atomic: Option<FormattingNodeId>,
 }
 
 struct TextRun {
@@ -1781,6 +2594,83 @@ fn grid_template(style: Option<&ComputedStyle>, property: &str) -> GridTemplate 
         Some(TypedPropertyValue::GridTemplate(template)) => template.clone(),
         _ => GridTemplate::None,
     }
+}
+
+fn position(style: Option<&ComputedStyle>) -> Position {
+    match style.and_then(|style| style.typed("position")) {
+        Some(TypedPropertyValue::Position(position)) => *position,
+        _ => Position::Static,
+    }
+}
+
+fn float_band(floats: &[FloatArea], y: f32, mut left: f32, mut right: f32) -> (f32, f32) {
+    for area in floats
+        .iter()
+        .filter(|area| area.rect.origin.y <= y && area.rect.bottom() > y)
+    {
+        match area.side {
+            Float::Left => left = left.max(area.rect.right()),
+            Float::Right => right = right.min(area.rect.origin.x),
+            _ => {}
+        }
+    }
+    (left, right.max(left))
+}
+
+fn inline_float_band(
+    floats: &[FloatArea],
+    containing: PhysicalRect,
+    y: &mut f32,
+    line_height: f32,
+    minimum_width: f32,
+) -> (f32, f32) {
+    loop {
+        let (left, right) = float_line_band(
+            floats,
+            *y,
+            line_height,
+            containing.origin.x,
+            containing.right(),
+        );
+        let active = floats
+            .iter()
+            .any(|area| area.rect.origin.y < *y + line_height && area.rect.bottom() > *y);
+        if right - left >= minimum_width && right > left || !active {
+            return (left, right);
+        }
+        let Some(next_y) = floats
+            .iter()
+            .filter(|area| area.rect.origin.y < *y + line_height && area.rect.bottom() > *y)
+            .map(|area| area.rect.bottom())
+            .min_by(f32::total_cmp)
+        else {
+            return (left, right);
+        };
+        if next_y <= *y {
+            return (left, right);
+        }
+        *y = next_y;
+    }
+}
+
+fn float_line_band(
+    floats: &[FloatArea],
+    y: f32,
+    line_height: f32,
+    mut left: f32,
+    mut right: f32,
+) -> (f32, f32) {
+    for area in floats
+        .iter()
+        .filter(|area| area.rect.origin.y < y + line_height && area.rect.bottom() > y)
+    {
+        match area.side {
+            Float::Left => left = left.max(area.rect.right()),
+            Float::Right => right = right.min(area.rect.origin.x),
+            _ => {}
+        }
+    }
+    (left.min(right), right.max(left))
 }
 
 fn grid_length_depends_on_percentage(value: &LengthPercentage) -> bool {
@@ -1840,8 +2730,12 @@ fn inline_segment_end(atoms: &[InlineAtom], start: usize) -> usize {
     while let Some(next) = atoms.get(end) {
         let previous = atoms[end - 1];
         if next.forced_break
+            || next.atomic.is_some()
+            || previous.atomic.is_some()
             || next.character.is_whitespace()
-            || is_soft_line_break(previous.character, next.character)
+            || (previous.wrap_allowed
+                && next.wrap_allowed
+                && is_soft_line_break(previous.character, next.character))
         {
             break;
         }
@@ -2018,6 +2912,66 @@ mod tests {
     }
 
     #[test]
+    fn auto_inline_block_max_content_includes_fixed_atomic_children() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='outer'><div id='sites'><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div></div></body>",
+            "html, body, #outer { display:block; margin:0 } #outer { width:1190px } #sites, #sites > span { display:inline-block } #sites > span { box-sizing:border-box; width:106px; height:20px; margin-left:23px }",
+            1190.0,
+        );
+        let sites = find(&output.dom, "#sites");
+        let fragment = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(sites))
+            .expect("sites fragment");
+        let FragmentKind::Box(geometry) = &fragment.kind else {
+            panic!("expected atomic box fragment")
+        };
+        assert_eq!(geometry.content_rect.size.width, 1032.0);
+    }
+
+    #[test]
+    fn border_box_min_max_width_constrain_the_border_box() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='min'></div><div id='max'></div></body>",
+            "html, body, div { display:block; margin:0 } div { box-sizing:border-box; padding-left:10px; padding-right:10px; border-left:5px solid; border-right:5px solid } #min { width:20px; min-width:100px } #max { width:200px; max-width:120px }",
+            800.0,
+        );
+        let fragment_for = |selector| {
+            let node = find(&output.dom, selector);
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(node))
+                .expect("box fragment")
+        };
+        assert_eq!(fragment_for("#min").rect.size.width, 100.0);
+        assert_eq!(fragment_for("#max").rect.size.width, 120.0);
+    }
+
+    #[test]
+    fn block_height_applies_min_max_and_border_box_constraints() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=min>x</div><div id=max>x</div><div id=conflict></div><div id=border></div></body>",
+            "html, body, div { display:block; margin:0 } #min { min-height:80px } #max { height:100px; max-height:40px } #conflict { height:20px; min-height:60px; max-height:40px } #border { box-sizing:border-box; min-height:50px; padding-top:10px; padding-bottom:10px; border-top:2px solid; border-bottom:2px solid }",
+            800.0,
+        );
+        let fragment_for = |selector| {
+            let node = find(&output.dom, selector);
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(node))
+                .expect("box fragment")
+        };
+
+        assert_eq!(fragment_for("#min").rect.size.height, 80.0);
+        assert_eq!(fragment_for("#max").rect.size.height, 40.0);
+        assert_eq!(fragment_for("#conflict").rect.size.height, 60.0);
+        assert_eq!(fragment_for("#border").rect.size.height, 50.0);
+    }
+
+    #[test]
     fn inline_text_collapses_spaces_wraps_and_preserves_text_node_identity() {
         let (output, _, layout) = pipeline(
             "<!doctype html><body><p id='p'>hello    world世界</p></body>",
@@ -2089,6 +3043,237 @@ mod tests {
 
         assert!(fragments.len() > 1);
         assert_eq!(fragments.concat(), "abcdefgh");
+    }
+
+    #[test]
+    fn nowrap_text_overflows_a_narrow_container_without_character_wrapping() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='narrow'><span id='label'>complex question</span></div></body>",
+            "html, body, div { display:block; margin:0 } #narrow { width:20px } #label { display:inline; white-space:nowrap }",
+            320.0,
+        );
+        let label = find(&output.dom, "#label");
+        let text = output.dom.children(label).unwrap()[0];
+        let fragments = layout
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.source == Some(text))
+            .filter_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(text) => Some((text.text.as_str(), fragment.rect)),
+                FragmentKind::Box(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(fragments.len(), 1);
+        assert_eq!(fragments[0].0, "complex question");
+        assert_eq!(fragments[0].1.origin.y, 0.0);
+        assert!(fragments[0].1.size.width > 20.0);
+    }
+
+    #[test]
+    fn inline_blocks_are_atomic_and_preserve_their_box_model_between_text() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><p id=row>start<a id=one><span>one</span><span id=inside>inner</span></a><a id=two>two</a>end</p></body>",
+            "html, body, p { display:block; margin:0 } a { display:inline-block; width:40px; height:24px; padding-left:5px; padding-right:5px; border-left-width:2px; border-left-style:solid; border-right-width:2px; border-right-style:solid } #one { background-color:red } #two { background-color:blue }",
+            320.0,
+        );
+        let one = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#one")))
+            .expect("first atomic box");
+        let two = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#two")))
+            .expect("second atomic box");
+        let FragmentKind::Box(one_geometry) = &one.kind else {
+            panic!("expected atomic box fragment")
+        };
+
+        assert_eq!(
+            one.rect.size,
+            crate::layout::PhysicalSize {
+                width: 54.0,
+                height: 24.0
+            }
+        );
+        assert_eq!(one_geometry.content_rect.size.width, 40.0);
+        assert_eq!(two.rect.origin.x, one.rect.right());
+        assert_eq!(one.rect.origin.y, two.rect.origin.y);
+        let inside_text = output.dom.children(find(&output.dom, "#inside")).unwrap()[0];
+        let inside_fragment = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(inside_text))
+            .expect("second inline child text");
+        assert_eq!(
+            inside_fragment.rect.origin.y,
+            one_geometry.content_rect.origin.y
+        );
+        assert!(inside_fragment.rect.origin.x > one_geometry.content_rect.origin.x);
+        assert!(one.children.iter().any(|child| {
+            matches!(
+                layout.fragments.get(*child).map(|fragment| &fragment.kind),
+                Some(FragmentKind::Box(_))
+            )
+        }));
+    }
+
+    #[test]
+    fn inline_block_wraps_as_one_unit_when_the_line_is_full() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><p>abcdefgh<a id=tile>inside</a></p></body>",
+            "html, body, p { display:block; margin:0 } #tile { display:inline-block; width:60px; height:30px; padding-top:5px; padding-right:5px; padding-bottom:5px; padding-left:5px; border-top-width:1px; border-right-width:1px; border-bottom-width:1px; border-left-width:1px; border-top-style:solid; border-right-style:solid; border-bottom-style:solid; border-left-style:solid }",
+            100.0,
+        );
+        let tile = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#tile")))
+            .expect("atomic box");
+
+        assert_eq!(tile.rect.origin.x, 0.0);
+        assert_eq!(
+            tile.rect.origin.y,
+            LayoutOptions::default().default_line_height
+        );
+        assert_eq!(tile.rect.size.width, 72.0);
+        assert_eq!(tile.rect.size.height, 42.0);
+    }
+
+    #[test]
+    fn left_and_right_floats_share_a_row_and_following_block_uses_the_remaining_band() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=left></div><div id=right></div><div id=middle></div></body>",
+            "html, body, div { display:block; margin:0 } #left { float:left; width:60px; height:40px } #right { float:right; width:50px; height:30px } #middle { height:20px; background-color:red }",
+            240.0,
+        );
+        let rect = |selector| {
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                .expect("box fragment")
+                .rect
+        };
+
+        assert_eq!(rect("#left"), PhysicalRect::new(0.0, 0.0, 60.0, 40.0));
+        assert_eq!(rect("#right"), PhysicalRect::new(190.0, 0.0, 50.0, 30.0));
+        assert_eq!(rect("#middle"), PhysicalRect::new(60.0, 0.0, 130.0, 20.0));
+    }
+
+    #[test]
+    fn inline_lines_avoid_a_float_and_restore_full_width_below_it() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=float></div>aaaaaaaaaa aaaaaaaaaa aaaaaaaaaaaaaaaa</body>",
+            "html, body, div { display:block; margin:0 } #float { float:left; width:60px; height:38.4px }",
+            160.0,
+        );
+        let text = output
+            .dom
+            .children(find(&output.dom, "body"))
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|node| {
+                matches!(
+                    output.dom.node(*node).map(crate::dom::Node::kind),
+                    Some(crate::dom::NodeKind::Text(_))
+                )
+            })
+            .expect("body text node");
+        let lines = layout
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.source == Some(text))
+            .filter_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(text) => Some((text.text.as_str(), fragment.rect)),
+                FragmentKind::Box(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].1.origin.x, 60.0);
+        assert_eq!(lines[1].1.origin.x, 60.0);
+        assert_eq!(lines[2].0, "aaaaaaaaaaaaaaaa");
+        assert_eq!(lines[2].1.origin.x, 0.0);
+        assert_eq!(lines[2].1.origin.y, 38.4);
+        assert!(lines[2].1.size.width > 100.0);
+    }
+
+    #[test]
+    fn inline_line_advances_when_opposing_floats_leave_no_space() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=left></div><div id=right></div>word</body>",
+            "html, body, div { display:block; margin:0 } #left { float:left; width:80px; height:40px } #right { float:right; width:80px; height:20px }",
+            160.0,
+        );
+        let body = find(&output.dom, "body");
+        let text = output
+            .dom
+            .children(body)
+            .unwrap()
+            .iter()
+            .copied()
+            .find(|node| {
+                matches!(
+                    output.dom.node(*node).map(crate::dom::Node::kind),
+                    Some(crate::dom::NodeKind::Text(_))
+                )
+            })
+            .expect("body text node");
+        let fragment = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(text))
+            .expect("text fragment");
+
+        assert_eq!(fragment.rect.origin.x, 80.0);
+        assert_eq!(fragment.rect.origin.y, 20.0);
+    }
+
+    #[test]
+    fn clear_both_moves_below_floats_and_restores_the_full_containing_width() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=left></div><div id=right></div><div id=clear></div></body>",
+            "html, body, div { display:block; margin:0 } #left { float:left; width:60px; height:40px } #right { float:right; width:50px; height:30px } #clear { clear:both; height:10px }",
+            240.0,
+        );
+        let clear = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#clear")))
+            .expect("cleared block");
+
+        assert_eq!(clear.rect, PhysicalRect::new(0.0, 40.0, 240.0, 10.0));
+    }
+
+    #[test]
+    fn ordinary_auto_height_excludes_floats_but_flow_root_contains_them() {
+        let (ordinary_output, _, ordinary) = pipeline(
+            "<!doctype html><body><div id=container><div id=float></div></div></body>",
+            "html, body, div { display:block; margin:0 } #float { float:left; width:50px; height:35px }",
+            200.0,
+        );
+        let ordinary_container = ordinary
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&ordinary_output.dom, "#container")))
+            .expect("ordinary container");
+        assert_eq!(ordinary_container.rect.size.height, 0.0);
+
+        let (flow_root_output, _, flow_root) = pipeline(
+            "<!doctype html><body><div id=container><div id=float></div></div></body>",
+            "html, body, div { display:block; margin:0 } #container { display:flow-root } #float { float:left; width:50px; height:35px }",
+            200.0,
+        );
+        let flow_root_container = flow_root
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&flow_root_output.dom, "#container")))
+            .expect("flow-root container");
+        assert_eq!(flow_root_container.rect.size.height, 35.0);
     }
 
     #[test]
@@ -2425,6 +3610,33 @@ mod tests {
         });
         assert_eq!(rects[0], PhysicalRect::new(80.0, 0.0, 40.0, 50.0));
         assert_eq!(rects[1], PhysicalRect::new(80.0, 250.0, 40.0, 50.0));
+    }
+
+    #[test]
+    fn flex_main_axis_auto_margins_absorb_positive_free_space() {
+        let (output, _, row) = pipeline(
+            "<!doctype html><body><div id='row'><div id='a'></div><div id='b'></div></div></body>",
+            "html, body, #a, #b { display:block; margin:0 } #row { display:flex; width:300px } #a, #b { flex:0 0 50px } #b { margin-left:auto }",
+            300.0,
+        );
+        let b = row
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#b")))
+            .unwrap();
+        assert_eq!(b.rect.origin.x, 250.0);
+
+        let (output, _, column) = pipeline(
+            "<!doctype html><body><div id='column'><div id='a'></div><div id='b'></div></div></body>",
+            "html, body, #a, #b { display:block; margin:0 } #column { display:flex; flex-direction:column; width:100px; height:300px } #a, #b { flex:0 0 50px } #b { margin-top:auto }",
+            100.0,
+        );
+        let b = column
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#b")))
+            .unwrap();
+        assert_eq!(b.rect.origin.y, 250.0);
     }
 
     #[test]

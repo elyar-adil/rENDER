@@ -17,15 +17,16 @@ use crate::css::selector::MatchContext;
 use crate::css::stylesheet::{StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::dom::{Dom, DomRevision, ElementData, Node, NodeId, NodeKind};
 use crate::html::{HtmlParseError, QuirksMode, parse_document};
+use crate::image::ImageResources;
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
     LayoutOutput, PhysicalPoint, SimpleTextMeasurer, TextMeasurer, build_formatting_tree,
-    layout_formatting_tree,
+    layout_formatting_tree_with_images,
 };
 use crate::paint::{
     Color, CpuRasterOutput, CpuRasterizer, DisplayListBuildOutput, DisplayListBuilderOptions,
     DisplayListDiagnostic, GlyphMaskProvider, NoGlyphMasks, RasterDiagnostic, ReferenceTextShaper,
-    TextShaper, build_display_list,
+    TextShaper, build_display_list_with_images,
 };
 
 /// Minimal interoperable defaults used before a generated HTML UA sheet lands.
@@ -46,6 +47,7 @@ caption { display: table-caption; }
 colgroup { display: table-column-group; }
 col { display: table-column; }
 button, input, select, textarea { display: inline-block; }
+input:not([type="hidden" i]) { width: 180px; min-height: 22px; padding-left: 4px; padding-right: 4px; border: 1px solid #888; }
 input[type="hidden" i] { display: none; }
 ruby { display: ruby; }
 rb { display: ruby-base; }
@@ -320,6 +322,25 @@ impl Document {
             backends,
             None,
             &ExternalStyleSheets::default(),
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn render_with_images(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        images: &ImageResources,
+    ) -> DocumentRenderOutput {
+        render_dom(
+            &self.dom,
+            self.quirks_mode,
+            options,
+            backends,
+            None,
+            &ExternalStyleSheets::default(),
+            Some(images),
         )
     }
 
@@ -351,6 +372,27 @@ impl Document {
             backends,
             Some(base_url),
             external,
+            None,
+        )
+    }
+
+    #[must_use]
+    pub fn render_with_external_style_sheets_and_images(
+        &self,
+        options: DocumentRenderOptions,
+        backends: DocumentBackends<'_>,
+        base_url: &Url,
+        external: &ExternalStyleSheets,
+        images: &ImageResources,
+    ) -> DocumentRenderOutput {
+        render_dom(
+            &self.dom,
+            self.quirks_mode,
+            options,
+            backends,
+            Some(base_url),
+            external,
+            Some(images),
         )
     }
 
@@ -408,6 +450,7 @@ fn render_dom(
     backends: DocumentBackends<'_>,
     base_url: Option<&Url>,
     external: &ExternalStyleSheets,
+    images: Option<&ImageResources>,
 ) -> DocumentRenderOutput {
     let ua_sheet = parse_stylesheet(UA_STYLE_SHEET);
     let collected = collect_author_style_sheets(dom, base_url, external, options.document_limits);
@@ -429,26 +472,29 @@ fn render_dom(
         &MatchContext::default(),
     );
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
-    let layout = layout_formatting_tree(
+    let layout = layout_formatting_tree_with_images(
         dom,
         &formatting,
         &styles,
         options.layout,
         backends.text_measurer,
+        images,
     );
-    let display = build_display_list(
+    let display = build_display_list_with_images(
         &layout.fragments,
         &formatting,
         &styles,
         options.display_list,
         backends.text_shaper,
+        images,
     );
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
-    let raster = CpuRasterizer.rasterize_viewport(
+    let raster = CpuRasterizer.rasterize_viewport_with_images(
         &display.list,
         options.raster_background,
         backends.glyph_masks,
         paint_viewport_origin,
+        images,
     );
 
     let mut document_diagnostics = collected.diagnostics;
@@ -628,7 +674,6 @@ impl StyleDiscoveryState {
         base_url: Option<&Url>,
         limits: DocumentLimits,
     ) {
-        diagnose_inline_style(node, element, &mut self.diagnostics);
         if element.local_name == "style" {
             let eligibility = style_eligibility(node, element, &mut self.diagnostics);
             self.push_slot(
@@ -738,20 +783,6 @@ impl StyleDiscoveryState {
             slots: self.slots,
             diagnostics: self.diagnostics,
         }
-    }
-}
-
-fn diagnose_inline_style(
-    node: NodeId,
-    element: &ElementData,
-    diagnostics: &mut Vec<DocumentDiagnostic>,
-) {
-    if attribute(element, "style").is_some() {
-        diagnostics.push(DocumentDiagnostic {
-            node: Some(node),
-            code: DocumentDiagnosticCode::InlineStyleUnsupported,
-            message: "the style attribute is not wired into the author cascade yet".to_owned(),
-        });
     }
 }
 
@@ -953,7 +984,8 @@ mod tests {
     };
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::dom::{Dom, NodeId, NodeKind};
-    use crate::layout::{PhysicalPoint, PhysicalSize};
+    use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
+    use crate::layout::{FragmentKind, PhysicalPoint, PhysicalSize};
     use crate::paint::{Color, DisplayCommand};
     use url::Url;
 
@@ -1009,6 +1041,116 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "test image coordinates are small, finite, non-negative CSS pixel positions"
+    )]
+    fn decoded_image_preserves_ratio_and_paints_pixels() {
+        let document = Document::parse(
+            "<!doctype html><style>body{margin:0}img{width:8px}</style><img src=hero.png>",
+        );
+        let url = Url::parse("https://example.test/").unwrap();
+        let key = discover_images(document.dom(), &url, ImageLimits::default()).resources[0]
+            .key
+            .clone();
+        let image =
+            DecodedImage::from_pixels(2, 1, vec![Color::rgb(255, 0, 0), Color::rgb(0, 0, 255)])
+                .unwrap();
+        let mut images = ImageResources::default();
+        images.insert(key, image, ImageLimits::default()).unwrap();
+        let render = document.render_with_images(
+            DocumentRenderOptions::default(),
+            super::DocumentBackends {
+                text_measurer: &crate::layout::SimpleTextMeasurer,
+                text_shaper: &crate::paint::ReferenceTextShaper,
+                glyph_masks: &crate::paint::NoGlyphMasks,
+            },
+            &images,
+        );
+        let node = target_id(document.dom(), "img");
+        let size = render
+            .layout
+            .fragments
+            .iter()
+            .find_map(
+                |fragment| match (&fragment.kind, fragment.source == Some(node)) {
+                    (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size),
+                    _ => None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            size,
+            PhysicalSize {
+                width: 8.0,
+                height: 4.0
+            }
+        );
+        let destination = render
+            .display
+            .list
+            .items()
+            .iter()
+            .find_map(|item| match item.command {
+                DisplayCommand::Image(image) => Some(image.destination),
+                _ => None,
+            })
+            .unwrap();
+        let sample_y = destination.origin.y as u32 + 1;
+        assert_eq!(
+            render
+                .raster
+                .surface
+                .pixel(destination.origin.x as u32 + 1, sample_y),
+            Some(Color::rgb(255, 0, 0))
+        );
+        assert_eq!(
+            render
+                .raster
+                .surface
+                .pixel(destination.origin.x as u32 + 6, sample_y),
+            Some(Color::rgb(0, 0, 255))
+        );
+    }
+
+    #[test]
+    fn unloaded_image_uses_html_or_default_dimensions() {
+        let document = Document::parse(
+            "<!doctype html><style>body{margin:0}</style><img id=a src=a width=40 height=20><img id=b src=b>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+        let size = |selector| {
+            let node = target_id(document.dom(), selector);
+            render
+                .layout
+                .fragments
+                .iter()
+                .find_map(
+                    |fragment| match (&fragment.kind, fragment.source == Some(node)) {
+                        (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size),
+                        _ => None,
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            size("#a"),
+            PhysicalSize {
+                width: 40.0,
+                height: 20.0
+            }
+        );
+        assert_eq!(
+            size("#b"),
+            PhysicalSize {
+                width: 300.0,
+                height: 150.0
+            }
+        );
+    }
+
+    #[test]
     fn unsupported_css_sources_are_never_silently_ignored() {
         let document = Document::parse(
             "<!doctype html><link rel=stylesheet href=theme.css>\
@@ -1026,7 +1168,10 @@ mod tests {
 
         assert!(codes.contains(&DocumentDiagnosticCode::ExternalStyleSheetUnsupported));
         assert!(codes.contains(&DocumentDiagnosticCode::MediaQueryUnsupported));
-        assert!(codes.contains(&DocumentDiagnosticCode::InlineStyleUnsupported));
+        assert_eq!(
+            typed_css(&document, &render, "body", "color"),
+            "rgb(0, 0, 255)"
+        );
         assert_eq!(
             codes
                 .iter()
@@ -1070,6 +1215,32 @@ mod tests {
             "none"
         );
         assert_eq!(typed_css(&document, &render, "#hidden", "display"), "none");
+    }
+
+    #[test]
+    fn inline_style_hides_template_text_and_wins_author_specificity() {
+        let document = Document::parse(
+            "<!doctype html><style>#template { display:block !important; color:red !important }</style>\
+             <textarea id=template style='display:none !important; color:blue !important'><div>raw template</div></textarea>",
+        );
+        let render = document.render_reference(DocumentRenderOptions::default());
+
+        assert_eq!(
+            typed_css(&document, &render, "#template", "display"),
+            "none"
+        );
+        assert_eq!(
+            typed_css(&document, &render, "#template", "color"),
+            "rgb(0, 0, 255)"
+        );
+        let template = target_id(document.dom(), "#template");
+        assert!(
+            render
+                .layout
+                .fragments
+                .iter()
+                .all(|fragment| fragment.source != Some(template))
+        );
     }
 
     #[test]

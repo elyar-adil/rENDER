@@ -12,10 +12,10 @@ use cssparser::{ParseError, Parser, ParserInput, Token};
 
 use crate::dom::{Dom, Node, NodeId, NodeKind};
 
-use super::cascade::{CascadeInput, CascadedStyle, cascade_element};
+use super::cascade::{CascadeInput, CascadedStyle, cascade_element_with_inline};
 use super::properties::{TypedPropertyValue, parse_typed_property};
 use super::selector::MatchContext;
-use super::stylesheet::{CssWideKeyword, css_wide_keyword};
+use super::stylesheet::{CssWideKeyword, css_wide_keyword, parse_declaration_list};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyDefinition {
@@ -87,6 +87,10 @@ impl PropertyRegistry {
         }
         for (name, initial) in [
             ("background-color", "transparent"),
+            ("background-image", "none"),
+            ("background-repeat", "repeat"),
+            ("background-position", "0% 0%"),
+            ("background-size", "auto"),
             ("display", "inline"),
             ("position", "static"),
             ("float", "none"),
@@ -1082,7 +1086,12 @@ pub fn compute_document_styles(
     while let Some((node, parent_element)) = stack.pop() {
         let current_parent = if matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
         {
-            let cascaded = cascade_element(dom, node, sources, context);
+            let inline = dom
+                .attribute(node, "style")
+                .ok()
+                .flatten()
+                .map_or_else(Vec::new, |source| parse_declaration_list(source).0);
+            let cascaded = cascade_element_with_inline(dom, node, sources, context, &inline);
             let style = compute_style(
                 &cascaded,
                 parent_element.and_then(|parent| styles.get(&parent)),

@@ -1,0 +1,51 @@
+<!doctype html>
+<html><head><style id="oracle-style">
+@layer reset, theme;
+@layer theme {
+  #target { --layer-normal: theme; --layer-important: theme !important; }
+}
+@layer reset {
+  #target {
+    --layer-normal: reset;
+    --layer-important: reset !important;
+    --revert-layer-outside: layered;
+  }
+}
+#target {
+  --layer-normal: unlayered;
+  --layer-important: unlayered !important;
+  --source-order: first;
+  --source-order: second;
+  --Theme: Upper;
+  --theme: lower;
+  --function-value: calc(1px + 2px);
+  --string-value: "a;!important";
+  --revert-layer-outside: revert-layer;
+  --revert-origin: revert;
+}
+#missing, div { --matched-specificity: from-list; }
+.target { --matched-specificity: from-class; }
+</style></head><body>
+<div id="target" class="target"></div>
+<script>
+  const target = document.querySelector("#target");
+  const computed = getComputedStyle(target);
+  const properties = [
+    "--layer-normal",
+    "--layer-important",
+    "--source-order",
+    "--Theme",
+    "--theme",
+    "--function-value",
+    "--string-value",
+    "--matched-specificity",
+    "--revert-layer-outside",
+    "--revert-origin",
+  ];
+  const result = Object.fromEntries(properties.map(name => [
+    name,
+    computed.getPropertyValue(name).trim(),
+  ]));
+  document.body.setAttribute("data-cascade-oracle", JSON.stringify(result));
+</script>
+</body></html>

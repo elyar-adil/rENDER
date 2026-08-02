@@ -6,12 +6,15 @@
 //! before an embedding queues any of them for execution.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::hash::BuildHasher;
 
 use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
 use render_core::js::{CompiledScript, JsError, RuntimeLimits};
+use render_core::page::PreparedPageScript;
 use render_core::script::{
-    ScriptDiagnostic, ScriptDiscoveryLimits, ScriptSource, discover_scripts,
+    ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling, ScriptSource, discover_scripts,
 };
 use render_net::{FetchRequest, FetchResponse, FetchResult, Url};
 
@@ -34,6 +37,7 @@ enum PlannedSource {
 struct PlannedScript {
     owner: NodeId,
     source_order: usize,
+    scheduling: ScriptScheduling,
     source: PlannedSource,
 }
 
@@ -52,6 +56,15 @@ impl ScriptFetchPlan {
             .iter()
             .map(|resource| resource.request.clone())
             .collect()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.scripts.is_empty()
+    }
+
+    pub fn owners(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.scripts.iter().map(|script| script.owner)
     }
 }
 
@@ -90,9 +103,21 @@ pub struct ScriptResourceDiagnostic {
 pub struct PreparedClassicScript {
     pub owner: NodeId,
     pub source_order: usize,
+    pub scheduling: ScriptScheduling,
     pub final_url: Option<Url>,
     pub byte_len: usize,
     pub compiled: CompiledScript,
+}
+
+impl From<PreparedClassicScript> for PreparedPageScript {
+    fn from(script: PreparedClassicScript) -> Self {
+        Self {
+            owner: script.owner,
+            source_order: script.source_order,
+            scheduling: script.scheduling,
+            compiled: script.compiled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,12 +134,34 @@ pub fn plan_classic_scripts(
     base_url: &Url,
     limits: ScriptDiscoveryLimits,
 ) -> ScriptFetchPlan {
+    plan_unstarted_classic_scripts(document, base_url, limits, &HashSet::new(), false)
+}
+
+/// Plans scripts that have not already started in this page lifecycle.
+///
+/// Follow-up scans represent DOM-inserted scripts. External classic scripts
+/// inserted after parsing default to async even when they omit the attribute.
+#[must_use]
+pub fn plan_unstarted_classic_scripts<S: BuildHasher>(
+    document: &Document,
+    base_url: &Url,
+    limits: ScriptDiscoveryLimits,
+    started: &HashSet<NodeId, S>,
+    follow_up_scan: bool,
+) -> ScriptFetchPlan {
     let discovery = discover_scripts(document, base_url, limits);
     let mut resources = Vec::new();
     let scripts = discovery
         .scripts
         .into_iter()
+        .filter(|script| !started.contains(&script.owner))
         .map(|script| {
+            let scheduling =
+                if follow_up_scan && matches!(&script.source, ScriptSource::External { .. }) {
+                    ScriptScheduling::Async
+                } else {
+                    script.scheduling
+                };
             let source = match script.source {
                 ScriptSource::Inline { source } => PlannedSource::Inline(source),
                 ScriptSource::External { resolved_url, .. } => {
@@ -130,6 +177,7 @@ pub fn plan_classic_scripts(
             PlannedScript {
                 owner: script.owner,
                 source_order: script.source_order,
+                scheduling,
                 source,
             }
         })
@@ -296,6 +344,7 @@ fn compile_source(
         Ok(compiled) => preparation.scripts.push(PreparedClassicScript {
             owner: script.owner,
             source_order: script.source_order,
+            scheduling: script.scheduling,
             final_url,
             byte_len,
             compiled,
@@ -357,6 +406,7 @@ fn general_diagnostic(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::thread;
@@ -364,11 +414,12 @@ mod tests {
 
     use render_core::document::Document;
     use render_core::js::{JsRuntime, RuntimeLimits};
-    use render_core::script::ScriptDiscoveryLimits;
+    use render_core::script::{ScriptDiscoveryLimits, ScriptScheduling};
     use render_net::{BatchOptions, CancelToken, FetchConfig, HttpTransport, Url};
 
     use super::{
-        SCRIPT_ACCEPT, ScriptResourceDiagnosticCode, plan_classic_scripts, prepare_script_batch,
+        SCRIPT_ACCEPT, ScriptResourceDiagnosticCode, plan_classic_scripts,
+        plan_unstarted_classic_scripts, prepare_script_batch,
     };
 
     #[test]
@@ -403,6 +454,74 @@ mod tests {
         assert_eq!(
             plan.resources[0].request.accept.as_deref(),
             Some(SCRIPT_ACCEPT)
+        );
+    }
+
+    #[test]
+    fn planning_and_preparation_preserve_classic_script_scheduling() {
+        let (base, server) = serve(3, |_| {
+            response("200 OK", Some("text/javascript"), b"var loaded = true;")
+        });
+        let document = Document::parse(
+            "<script src=blocking.js></script>\
+             <script defer src=deferred.js></script>\
+             <script async src=asynchronous.js></script>",
+        );
+        let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let results = transport.fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+
+        let preparation =
+            prepare_script_batch(&document, &plan, results, &RuntimeLimits::default());
+        server.join().expect("server thread");
+
+        assert_eq!(
+            preparation
+                .scripts
+                .iter()
+                .map(|script| script.scheduling)
+                .collect::<Vec<_>>(),
+            [
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::Defer,
+                ScriptScheduling::Async,
+            ]
+        );
+    }
+
+    #[test]
+    fn follow_up_planning_skips_started_scripts_and_defaults_external_scripts_to_async() {
+        let document = Document::parse(
+            "<script id=initial>var initial = true;</script>\
+             <script id=chunk src=chunk.js></script>\
+             <script id=inline>var follow_up = true;</script>",
+        );
+        let base = Url::parse("https://example.test/index.html").expect("base URL");
+        let initial = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        let owners = initial.owners().collect::<Vec<_>>();
+        let started = HashSet::from([owners[0]]);
+
+        let follow_up = plan_unstarted_classic_scripts(
+            &document,
+            &base,
+            ScriptDiscoveryLimits::default(),
+            &started,
+            true,
+        );
+
+        assert_eq!(follow_up.owners().collect::<Vec<_>>(), owners[1..]);
+        assert_eq!(follow_up.scripts.len(), 2);
+        assert_eq!(follow_up.scripts[0].scheduling, ScriptScheduling::Async);
+        assert_eq!(
+            follow_up.scripts[1].scheduling,
+            ScriptScheduling::ParserBlocking
         );
     }
 

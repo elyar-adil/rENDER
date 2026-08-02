@@ -20,6 +20,7 @@ pub use geometry::{
 pub use solver::{
     LayoutDiagnostic, LayoutDiagnosticCode, LayoutLimits, LayoutOptions, LayoutOutput,
     SimpleTextMeasurer, TextMeasure, TextMeasurer, TextStyle, layout_formatting_tree,
+    layout_formatting_tree_with_images,
 };
 pub use tree::{
     FormattingContextKind, FormattingDiagnostic, FormattingDiagnosticCode, FormattingLimits,

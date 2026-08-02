@@ -15,6 +15,8 @@ pub(super) enum UnaryOp {
     Plus,
     Minus,
     Typeof,
+    Delete,
+    BitwiseNot,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +37,12 @@ pub(super) enum BinaryOp {
     StrictNotEqual,
     LogicalAnd,
     LogicalOr,
+    BitwiseAnd,
+    BitwiseXor,
+    BitwiseOr,
+    LeftShift,
+    RightShift,
+    UnsignedRightShift,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -83,6 +91,12 @@ pub(super) enum Statement {
         initializer: Option<Box<Statement>>,
         condition: Option<Expr>,
         update: Option<Expr>,
+        body: Box<Statement>,
+    },
+    ForIn {
+        kind: VariableKind,
+        name: String,
+        iterable: Expr,
         body: Box<Statement>,
     },
     Break,
@@ -209,6 +223,9 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Statement, JsError> {
+        if self.take(&TokenKind::Semicolon) {
+            return Ok(Statement::Block(Vec::new()));
+        }
         if self.take(&TokenKind::LeftBrace) {
             let statements = self.statement_list(true)?;
             self.require(&TokenKind::RightBrace, "expected '}' after block")?;
@@ -405,6 +422,24 @@ impl Parser {
         let initializer = if self.take(&TokenKind::Semicolon) {
             None
         } else if let Some(kind) = self.take_variable_kind() {
+            let declaration_start = self.cursor;
+            let TokenKind::Identifier(name) = self.advance().kind else {
+                return Err(self.error("expected an identifier after declaration keyword"));
+            };
+            if self.take(&TokenKind::In) {
+                let iterable = self.assignment()?;
+                self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
+                self.loop_depth = self.loop_depth.saturating_add(1);
+                let body = self.statement();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                return Ok(Statement::ForIn {
+                    kind,
+                    name,
+                    iterable,
+                    body: Box::new(body?),
+                });
+            }
+            self.cursor = declaration_start;
             let statement = self.variable_declaration(kind, false)?;
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(statement))
@@ -440,11 +475,15 @@ impl Parser {
     fn try_statement(&mut self) -> Result<Statement, JsError> {
         let body = self.required_block("expected '{' after try")?;
         let catch = if self.take(&TokenKind::Catch) {
-            self.require(&TokenKind::LeftParen, "expected '(' after catch")?;
-            let TokenKind::Identifier(parameter) = self.advance().kind else {
-                return Err(self.error("expected catch parameter"));
+            let parameter = if self.take(&TokenKind::LeftParen) {
+                let TokenKind::Identifier(parameter) = self.advance().kind else {
+                    return Err(self.error("expected catch parameter"));
+                };
+                self.require(&TokenKind::RightParen, "expected ')' after catch parameter")?;
+                parameter
+            } else {
+                "\0optional-catch-binding".to_owned()
             };
-            self.require(&TokenKind::RightParen, "expected ')' after catch parameter")?;
             Some(CatchClause {
                 parameter,
                 body: self.required_block("expected '{' after catch")?,
@@ -485,6 +524,18 @@ impl Parser {
             self.assignment_value(target, Some(BinaryOp::Add))
         } else if self.take(&TokenKind::MinusEqual) {
             self.assignment_value(target, Some(BinaryOp::Subtract))
+        } else if self.take(&TokenKind::AmpersandEqual) {
+            self.assignment_value(target, Some(BinaryOp::BitwiseAnd))
+        } else if self.take(&TokenKind::CaretEqual) {
+            self.assignment_value(target, Some(BinaryOp::BitwiseXor))
+        } else if self.take(&TokenKind::PipeEqual) {
+            self.assignment_value(target, Some(BinaryOp::BitwiseOr))
+        } else if self.take(&TokenKind::LeftShiftEqual) {
+            self.assignment_value(target, Some(BinaryOp::LeftShift))
+        } else if self.take(&TokenKind::RightShiftEqual) {
+            self.assignment_value(target, Some(BinaryOp::RightShift))
+        } else if self.take(&TokenKind::UnsignedRightShiftEqual) {
+            self.assignment_value(target, Some(BinaryOp::UnsignedRightShift))
         } else {
             Ok(target)
         }
@@ -513,7 +564,7 @@ impl Parser {
                         return Err(self.error("duplicate arrow parameters are not supported"));
                     }
                     parameters.push(parameter);
-                    if !self.take(&TokenKind::Comma) {
+                    if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                         break;
                     }
                 }
@@ -602,8 +653,29 @@ impl Parser {
 
     fn logical_and(&mut self) -> Result<Expr, JsError> {
         self.binary_level(
-            Self::equality,
+            Self::bitwise_or,
             &[(&TokenKind::AndAnd, BinaryOp::LogicalAnd)],
+        )
+    }
+
+    fn bitwise_or(&mut self) -> Result<Expr, JsError> {
+        self.binary_level(
+            Self::bitwise_xor,
+            &[(&TokenKind::Pipe, BinaryOp::BitwiseOr)],
+        )
+    }
+
+    fn bitwise_xor(&mut self) -> Result<Expr, JsError> {
+        self.binary_level(
+            Self::bitwise_and,
+            &[(&TokenKind::Caret, BinaryOp::BitwiseXor)],
+        )
+    }
+
+    fn bitwise_and(&mut self) -> Result<Expr, JsError> {
+        self.binary_level(
+            Self::equality,
+            &[(&TokenKind::Ampersand, BinaryOp::BitwiseAnd)],
         )
     }
 
@@ -621,13 +693,24 @@ impl Parser {
 
     fn comparison(&mut self) -> Result<Expr, JsError> {
         self.binary_level(
-            Self::term,
+            Self::shift,
             &[
                 (&TokenKind::LessEqual, BinaryOp::LessEqual),
                 (&TokenKind::GreaterEqual, BinaryOp::GreaterEqual),
                 (&TokenKind::Less, BinaryOp::Less),
                 (&TokenKind::Greater, BinaryOp::Greater),
                 (&TokenKind::Instanceof, BinaryOp::Instanceof),
+            ],
+        )
+    }
+
+    fn shift(&mut self) -> Result<Expr, JsError> {
+        self.binary_level(
+            Self::term,
+            &[
+                (&TokenKind::LeftShift, BinaryOp::LeftShift),
+                (&TokenKind::RightShift, BinaryOp::RightShift),
+                (&TokenKind::UnsignedRightShift, BinaryOp::UnsignedRightShift),
             ],
         )
     }
@@ -690,12 +773,16 @@ impl Parser {
         }
         let operator = if self.take(&TokenKind::Bang) {
             Some(UnaryOp::Not)
+        } else if self.take(&TokenKind::Delete) {
+            Some(UnaryOp::Delete)
         } else if self.take(&TokenKind::Typeof) {
             Some(UnaryOp::Typeof)
         } else if self.take(&TokenKind::Plus) {
             Some(UnaryOp::Plus)
         } else if self.take(&TokenKind::Minus) {
             Some(UnaryOp::Minus)
+        } else if self.take(&TokenKind::Tilde) {
+            Some(UnaryOp::BitwiseNot)
         } else {
             None
         };
@@ -779,7 +866,7 @@ impl Parser {
         if !self.at(&TokenKind::RightParen) {
             loop {
                 arguments.push(self.assignment()?);
-                if !self.take(&TokenKind::Comma) {
+                if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
                 }
             }
@@ -842,7 +929,7 @@ impl Parser {
                     return Err(self.error("duplicate function parameters are not supported"));
                 }
                 parameters.push(parameter);
-                if !self.take(&TokenKind::Comma) {
+                if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
                 }
             }
@@ -866,8 +953,19 @@ impl Parser {
         if !self.at(&TokenKind::RightBrace) {
             loop {
                 let key = self.property_name()?;
-                self.require(&TokenKind::Colon, "expected ':' after object property name")?;
-                properties.push((key, self.assignment()?));
+                let value = if self.take(&TokenKind::Colon) {
+                    self.assignment()?
+                } else if self.at(&TokenKind::LeftParen) {
+                    let (parameters, body) = self.function_tail()?;
+                    Expr::Function {
+                        name: Some(key.clone()),
+                        parameters,
+                        body,
+                    }
+                } else {
+                    Expr::Identifier(key.clone())
+                };
+                properties.push((key, value));
                 if !self.take(&TokenKind::Comma) {
                     break;
                 }
@@ -1030,6 +1128,21 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         Statement::While { body, .. } | Statement::For { body, .. } => {
             validate_strict_statement(body)
         }
+        Statement::ForIn {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            if is_strict_reserved_word(name) {
+                return Err(JsError::syntax(
+                    format!("{name} is reserved in strict mode"),
+                    0,
+                ));
+            }
+            validate_strict_expression(iterable)?;
+            validate_strict_statement(body)
+        }
         Statement::Switch { expression, cases } => {
             validate_strict_expression(expression)?;
             for (test, statements) in cases {
@@ -1100,6 +1213,13 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             .iter()
             .try_for_each(|(_, value)| validate_strict_expression(value)),
         Expr::Array(elements) => elements.iter().try_for_each(validate_strict_expression),
+        Expr::Unary {
+            operator: UnaryOp::Delete,
+            operand,
+        } if matches!(operand.as_ref(), Expr::Identifier(_)) => Err(JsError::syntax(
+            "delete of an unqualified identifier is not allowed in strict mode",
+            0,
+        )),
         Expr::Unary { operand, .. } => validate_strict_expression(operand),
         Expr::Binary { left, right, .. } => {
             validate_strict_expression(left)?;
@@ -1190,10 +1310,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_for_in_declarations_and_delete() {
+        let tokens = tokenize(
+            "for (var key in object) { delete object[key]; } for (const name in object) {}",
+            &RuntimeLimits::default(),
+        )
+        .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(matches!(
+            statements.first(),
+            Some(Statement::ForIn {
+                kind: super::VariableKind::Var,
+                name,
+                ..
+            }) if name == "key"
+        ));
+        assert!(matches!(
+            statements.get(1),
+            Some(Statement::ForIn {
+                kind: super::VariableKind::Const,
+                name,
+                ..
+            }) if name == "name"
+        ));
+    }
+
+    #[test]
     fn strict_reserved_word_is_an_early_error() {
         let tokens = tokenize("\"use strict\"; var public = 1;", &RuntimeLimits::default())
             .expect("source should tokenize");
         let error = parse(tokens, &RuntimeLimits::default()).expect_err("strict error expected");
         assert_eq!(error.kind(), super::JsErrorKind::Syntax);
+    }
+
+    #[test]
+    fn parses_unicode_escaped_variable_name() {
+        let tokens = tokenize(r"let \u0061 = 1;", &RuntimeLimits::default())
+            .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
     }
 }

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::{
-    Display, DisplayBox, DisplayInside, DisplayOutside, TypedPropertyValue,
+    Display, DisplayBox, DisplayInside, DisplayOutside, Float, TypedPropertyValue,
 };
 use crate::dom::{Dom, DomRevision, NodeId, NodeKind};
 
@@ -35,6 +35,7 @@ pub enum FormattingContextKind {
 pub enum FormattingNodeKind {
     Root,
     BlockContainer { context: FormattingContextKind },
+    AtomicInline { context: FormattingContextKind },
     AnonymousBlock,
     Inline,
     Text(String),
@@ -44,7 +45,10 @@ impl FormattingNodeKind {
     const fn accepts_inline_children(&self) -> bool {
         matches!(
             self,
-            Self::Root | Self::BlockContainer { .. } | Self::AnonymousBlock
+            Self::Root
+                | Self::BlockContainer { .. }
+                | Self::AtomicInline { .. }
+                | Self::AnonymousBlock
         )
     }
 }
@@ -138,7 +142,9 @@ impl FormattingTree {
         self.nodes
             .iter()
             .filter_map(|node| {
-                let FormattingNodeKind::BlockContainer { context } = node.kind else {
+                let (FormattingNodeKind::BlockContainer { context }
+                | FormattingNodeKind::AtomicInline { context }) = node.kind
+                else {
                     return None;
                 };
                 Some(FormattingWorkUnit {
@@ -222,6 +228,8 @@ impl Builder<'_> {
             matches!(
                 node.kind,
                 FormattingNodeKind::BlockContainer {
+                    context: FormattingContextKind::Flex | FormattingContextKind::Grid
+                } | FormattingNodeKind::AtomicInline {
                     context: FormattingContextKind::Flex | FormattingContextKind::Grid
                 }
             )
@@ -321,12 +329,31 @@ impl Builder<'_> {
                     return;
                 }
 
-                let (mut kind, inline_level) = self.formatting_kind(dom_node, &display);
-                if independent_children && matches!(kind, FormattingNodeKind::Inline) {
+                let (mut kind, mut inline_level) = self.formatting_kind(dom_node, &display);
+                if inline_level && float(style) != Float::None {
+                    kind = match kind {
+                        FormattingNodeKind::Inline => FormattingNodeKind::BlockContainer {
+                            context: FormattingContextKind::Block,
+                        },
+                        FormattingNodeKind::AtomicInline { context } => {
+                            FormattingNodeKind::BlockContainer { context }
+                        }
+                        other => other,
+                    };
+                    inline_level = false;
+                }
+                if independent_children {
                     // Flex and grid items are blockified for layout, while
-                    // retaining their computed display value for the cascade.
-                    kind = FormattingNodeKind::BlockContainer {
-                        context: FormattingContextKind::Block,
+                    // retaining their inner formatting context and computed
+                    // display value for the cascade.
+                    kind = match kind {
+                        FormattingNodeKind::Inline => FormattingNodeKind::BlockContainer {
+                            context: FormattingContextKind::Block,
+                        },
+                        FormattingNodeKind::AtomicInline { context } => {
+                            FormattingNodeKind::BlockContainer { context }
+                        }
+                        other => other,
                     };
                 }
                 let Some(id) = self.allocate(Some(dom_node), Some(dom_node), kind) else {
@@ -355,6 +382,28 @@ impl Builder<'_> {
                     self.append_child(format_parent, id);
                 }
                 self.append_dom_children(dom_node, id, Some(dom_node), depth.saturating_add(1));
+                if matches!(
+                    self.dom.node(dom_node).map(crate::dom::Node::kind),
+                    Some(NodeKind::Element(element))
+                        if element.local_name == "input"
+                            && !self
+                                .dom
+                                .attribute(dom_node, "type")
+                                .ok()
+                                .flatten()
+                                .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
+                ) && let Some(value) = self.dom.attribute(dom_node, "value").ok().flatten()
+                    && !value.is_empty()
+                {
+                    let Some(text_id) = self.allocate(
+                        Some(dom_node),
+                        Some(dom_node),
+                        FormattingNodeKind::Text(value.to_owned()),
+                    ) else {
+                        return;
+                    };
+                    self.append_child(id, text_id);
+                }
             }
             NodeKind::Document | NodeKind::DocumentFragment => {
                 self.append_dom_children(
@@ -371,6 +420,24 @@ impl Builder<'_> {
     }
 
     fn formatting_kind(&mut self, node: NodeId, display: &Display) -> (FormattingNodeKind, bool) {
+        if matches!(
+            self.dom.node(node).map(crate::dom::Node::kind),
+            Some(NodeKind::Element(element)) if element.local_name == "img"
+        ) {
+            let inline = matches!(
+                display,
+                Display::Normal {
+                    outside: DisplayOutside::Inline | DisplayOutside::RunIn,
+                    ..
+                }
+            );
+            return (
+                FormattingNodeKind::AtomicInline {
+                    context: FormattingContextKind::Block,
+                },
+                inline,
+            );
+        }
         match display {
             Display::Normal {
                 outside, inside, ..
@@ -383,8 +450,15 @@ impl Builder<'_> {
                     });
                 }
                 let inline = *outside == DisplayOutside::Inline;
-                if inline && matches!(inside, DisplayInside::Flow | DisplayInside::FlowRoot) {
+                if inline && *inside == DisplayInside::Flow {
                     (FormattingNodeKind::Inline, true)
+                } else if inline {
+                    (
+                        FormattingNodeKind::AtomicInline {
+                            context: context_for_inside(*inside),
+                        },
+                        true,
+                    )
                 } else {
                     (
                         FormattingNodeKind::BlockContainer {
@@ -489,6 +563,13 @@ fn display(style: &ComputedStyle) -> Display {
     }
 }
 
+fn float(style: &ComputedStyle) -> Float {
+    match style.typed("float") {
+        Some(TypedPropertyValue::Float(value)) => *value,
+        _ => Float::None,
+    }
+}
+
 const fn context_for_inside(inside: DisplayInside) -> FormattingContextKind {
     match inside {
         DisplayInside::Flow | DisplayInside::FlowRoot => FormattingContextKind::Block,
@@ -582,6 +663,71 @@ mod tests {
         assert!(!tree.iter().any(|node| node.source == Some(hidden)));
         assert!(!tree.iter().any(|node| node.source == Some(contents)));
         assert!(tree.iter().any(|node| node.source == Some(kept)));
+    }
+
+    #[test]
+    fn text_input_value_becomes_visible_formatting_text() {
+        let output =
+            parse_document("<!doctype html><body><input id=query type=search value='百度'>");
+        let styles = styles(
+            &output.dom,
+            "body { display:block } input { display:inline-block; width:180px }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let input = find(&output.dom, "#query");
+
+        assert!(tree.iter().any(|node| {
+            node.source == Some(input)
+                && matches!(&node.kind, FormattingNodeKind::Text(value) if value == "百度")
+        }));
+    }
+
+    #[test]
+    fn inline_block_creates_an_atomic_inline_formatting_context() {
+        let output = parse_document(
+            "<!doctype html><body><span>before</span><a id=tile><b>inside</b></a><span>after</span>",
+        );
+        let styles = styles(
+            &output.dom,
+            "body { display:block } span, b { display:inline } #tile { display:inline-block }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let tile = find(&output.dom, "#tile");
+        let tile_box = tree
+            .iter()
+            .find(|node| node.source == Some(tile))
+            .expect("inline-block formatting node");
+
+        assert!(matches!(
+            tile_box.kind,
+            FormattingNodeKind::AtomicInline {
+                context: FormattingContextKind::Block
+            }
+        ));
+        assert!(!tile_box.children.is_empty());
+    }
+
+    #[test]
+    fn floating_inline_element_is_blockified_before_parent_flow_construction() {
+        let output = parse_document(
+            "<!doctype html><body><span id=float>navigation</span><span id=after>after</span>",
+        );
+        let styles = styles(
+            &output.dom,
+            "body { display:block } span { display:inline } #float { float:left }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let floated = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#float")))
+            .expect("floated formatting node");
+
+        assert!(matches!(
+            floated.kind,
+            FormattingNodeKind::BlockContainer {
+                context: FormattingContextKind::Block
+            }
+        ));
     }
 
     #[test]

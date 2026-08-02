@@ -61,9 +61,6 @@ pub enum ScriptDiagnosticCode {
     ModuleUnsupported,
     ImportMapUnsupported,
     UnsupportedType,
-    NoModuleIgnored,
-    AsyncUnsupported,
-    DeferUnsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,9 +80,9 @@ pub struct ScriptDiscovery {
 
 /// Discover executable classic scripts in DOM tree order.
 ///
-/// Inline and external scripts are represented uniformly, while module,
-/// import-map, async, and defer semantics remain explicit diagnostics until the
-/// corresponding execution algorithms are implemented.
+/// Inline and external scripts are represented uniformly. Module and import-map
+/// semantics remain explicit diagnostics until their execution algorithms are
+/// implemented.
 #[must_use]
 pub fn discover_scripts(
     document: &Document,
@@ -224,22 +221,6 @@ impl DiscoveryState {
                     "script type {script_type:?} is not a supported classic JavaScript MIME type"
                 ),
             ))
-        } else if has_attribute(element, "nomodule") {
-            Some((
-                ScriptDiagnosticCode::NoModuleIgnored,
-                "nomodule classic script was ignored because module semantics are supported"
-                    .to_owned(),
-            ))
-        } else if has_attribute(element, "async") {
-            Some((
-                ScriptDiagnosticCode::AsyncUnsupported,
-                "async script scheduling is not implemented; the script is not executed".to_owned(),
-            ))
-        } else if has_attribute(element, "defer") {
-            Some((
-                ScriptDiagnosticCode::DeferUnsupported,
-                "defer script scheduling is not implemented; the script is not executed".to_owned(),
-            ))
         } else {
             None
         };
@@ -247,7 +228,15 @@ impl DiscoveryState {
             self.diagnose(owner, source_order, code, message);
             None
         } else {
-            Some(ScriptScheduling::ParserBlocking)
+            Some(
+                if has_attribute(element, "src") && has_attribute(element, "async") {
+                    ScriptScheduling::Async
+                } else if has_attribute(element, "src") && has_attribute(element, "defer") {
+                    ScriptScheduling::Defer
+                } else {
+                    ScriptScheduling::ParserBlocking
+                },
+            )
         }
     }
 
@@ -469,11 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_scheduling_and_types_are_explicit() {
+    fn discovers_async_and_defer_while_rejecting_unsupported_types() {
         let document = Document::parse(
             "<script type=module src=m.js></script>\
              <script async src=a.js></script>\
              <script defer src=d.js></script>\
+             <script nomodule src=legacy.js></script>\
+             <script async>var inline_async = true;</script>\
+             <script defer>var inline_defer = true;</script>\
              <script type=application/json>{}</script>",
         );
         let discovery = discover_scripts(&document, &base_url(), ScriptDiscoveryLimits::default());
@@ -483,13 +475,24 @@ mod tests {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>();
 
-        assert!(discovery.scripts.is_empty());
+        assert_eq!(
+            discovery
+                .scripts
+                .iter()
+                .map(|script| script.scheduling)
+                .collect::<Vec<_>>(),
+            [
+                ScriptScheduling::Async,
+                ScriptScheduling::Defer,
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::ParserBlocking,
+                ScriptScheduling::ParserBlocking,
+            ]
+        );
         assert_eq!(
             codes,
             [
                 ScriptDiagnosticCode::ModuleUnsupported,
-                ScriptDiagnosticCode::AsyncUnsupported,
-                ScriptDiagnosticCode::DeferUnsupported,
                 ScriptDiagnosticCode::UnsupportedType,
             ]
         );

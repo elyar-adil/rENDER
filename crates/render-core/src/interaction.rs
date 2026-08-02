@@ -8,6 +8,8 @@ use std::cmp::Ordering;
 use std::error::Error;
 use std::fmt;
 
+use url::Url;
+
 use crate::dom::{Dom, MutationBatch, MutationKind, Namespace, NodeId, NodeKind};
 
 pub mod hit_test;
@@ -728,6 +730,265 @@ pub enum DefaultActionStatus {
     NotImplemented,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormMethod {
+    Get,
+    Post,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormField {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormSubmissionPlan {
+    pub form: NodeId,
+    pub submitter: NodeId,
+    pub method: FormMethod,
+    pub target: Url,
+    pub fields: Vec<FormField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormSubmissionError {
+    UnknownSubmitter,
+    NoAssociatedForm,
+    InvalidAction(String),
+}
+
+impl fmt::Display for FormSubmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownSubmitter => formatter.write_str("form submitter is not an HTML element"),
+            Self::NoAssociatedForm => formatter.write_str("submitter has no associated form"),
+            Self::InvalidAction(action) => write!(formatter, "form action {action:?} is invalid"),
+        }
+    }
+}
+
+impl Error for FormSubmissionError {}
+
+/// Build a deterministic HTML form submission plan for an embedding.
+///
+/// GET submissions produce their final navigation URL. POST submissions retain
+/// the encoded field set so a network coordinator can apply origin, policy,
+/// and body limits without putting transport behavior in the DOM layer.
+///
+/// # Errors
+///
+/// Returns an error when `submitter` is not an HTML element, has no associated
+/// form, or the form action cannot be resolved against `document_url`.
+pub fn plan_form_submission(
+    dom: &Dom,
+    submitter: NodeId,
+    document_url: &Url,
+) -> Result<FormSubmissionPlan, FormSubmissionError> {
+    let submitter_element =
+        html_element(dom, submitter).ok_or(FormSubmissionError::UnknownSubmitter)?;
+    let form = associated_form(dom, submitter, submitter_element)
+        .ok_or(FormSubmissionError::NoAssociatedForm)?;
+    let action = dom
+        .attribute(form, "action")
+        .ok()
+        .flatten()
+        .unwrap_or("")
+        .trim();
+    let mut target = if action.is_empty() {
+        document_url.clone()
+    } else {
+        document_url
+            .join(action)
+            .map_err(|_| FormSubmissionError::InvalidAction(action.to_owned()))?
+    };
+    target.set_fragment(None);
+    let method = dom
+        .attribute(form, "method")
+        .ok()
+        .flatten()
+        .filter(|value| value.eq_ignore_ascii_case("post"))
+        .map_or(FormMethod::Get, |_| FormMethod::Post);
+    let fields = collect_successful_controls(dom, form, submitter);
+    if method == FormMethod::Get {
+        target.set_query(None);
+        target
+            .query_pairs_mut()
+            .extend_pairs(fields.iter().map(|field| (&field.name, &field.value)));
+    }
+    Ok(FormSubmissionPlan {
+        form,
+        submitter,
+        method,
+        target,
+        fields,
+    })
+}
+
+fn associated_form(
+    dom: &Dom,
+    submitter: NodeId,
+    element: &crate::dom::ElementData,
+) -> Option<NodeId> {
+    if element.local_name == "form" {
+        return Some(submitter);
+    }
+    if let Some(form_id) = dom.attribute(submitter, "form").ok().flatten() {
+        let mut pending = vec![dom.document()];
+        while let Some(node) = pending.pop() {
+            if matches!(html_element(dom, node), Some(candidate) if candidate.local_name == "form")
+                && dom.attribute(node, "id").ok().flatten() == Some(form_id)
+            {
+                return Some(node);
+            }
+            pending.extend(dom.children(node).unwrap_or_default().iter().rev());
+        }
+        return None;
+    }
+    let mut ancestor = dom.parent(submitter);
+    while let Some(node) = ancestor {
+        if matches!(html_element(dom, node), Some(candidate) if candidate.local_name == "form") {
+            return Some(node);
+        }
+        ancestor = dom.parent(node);
+    }
+    None
+}
+
+fn collect_successful_controls(dom: &Dom, form: NodeId, submitter: NodeId) -> Vec<FormField> {
+    let mut fields = Vec::new();
+    let mut pending = dom
+        .children(form)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        if associated_form_for_control(dom, node) == Some(form) {
+            append_control_field(dom, node, submitter, &mut fields);
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+    }
+    fields
+}
+
+fn associated_form_for_control(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let element = html_element(dom, node)?;
+    if !matches!(
+        element.local_name.as_str(),
+        "button" | "input" | "select" | "textarea"
+    ) {
+        return None;
+    }
+    associated_form(dom, node, element)
+}
+
+fn append_control_field(dom: &Dom, node: NodeId, submitter: NodeId, fields: &mut Vec<FormField>) {
+    let Some(element) = html_element(dom, node) else {
+        return;
+    };
+    if has_attribute(dom, node, "disabled") {
+        return;
+    }
+    let Some(name) = dom
+        .attribute(node, "name")
+        .ok()
+        .flatten()
+        .filter(|name| !name.is_empty())
+    else {
+        return;
+    };
+    let value = match element.local_name.as_str() {
+        "input" => {
+            let input_type = dom
+                .attribute(node, "type")
+                .ok()
+                .flatten()
+                .unwrap_or("text")
+                .to_ascii_lowercase();
+            match input_type.as_str() {
+                "button" | "reset" | "file" | "image" => return,
+                "submit" if node != submitter => return,
+                "checkbox" | "radio" if !has_attribute(dom, node, "checked") => return,
+                "checkbox" | "radio" => dom
+                    .attribute(node, "value")
+                    .ok()
+                    .flatten()
+                    .unwrap_or("on")
+                    .to_owned(),
+                _ => dom
+                    .attribute(node, "value")
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_owned(),
+            }
+        }
+        "button" => {
+            if node != submitter || button_behavior(dom, node) != ButtonBehavior::Submit {
+                return;
+            }
+            dom.attribute(node, "value")
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_owned()
+        }
+        "textarea" => descendant_text(dom, node),
+        "select" => selected_option_value(dom, node).unwrap_or_default(),
+        _ => return,
+    };
+    fields.push(FormField {
+        name: name.to_owned(),
+        value,
+    });
+}
+
+fn selected_option_value(dom: &Dom, select: NodeId) -> Option<String> {
+    let mut pending = dom
+        .children(select)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    let mut first = None;
+    while let Some(node) = pending.pop() {
+        if matches!(html_element(dom, node), Some(element) if element.local_name == "option") {
+            let value = dom
+                .attribute(node, "value")
+                .ok()
+                .flatten()
+                .map_or_else(|| descendant_text(dom, node), str::to_owned);
+            if has_attribute(dom, node, "selected") {
+                return Some(value);
+            }
+            first.get_or_insert(value);
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+    }
+    first
+}
+
+fn descendant_text(dom: &Dom, root: NodeId) -> String {
+    let mut output = String::new();
+    let mut pending = dom
+        .children(root)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        if let Some(NodeKind::Text(text)) = dom.node(node).map(crate::dom::Node::kind) {
+            output.push_str(text);
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+    }
+    output
+}
+
 /// Typed activation description. It intentionally does not claim that a
 /// default action happened; frontends can inspect `status` explicitly.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -821,8 +1082,9 @@ fn button_behavior(dom: &Dom, node: NodeId) -> ButtonBehavior {
 mod tests {
     use super::{
         BoundaryPoint, DefaultActionKind, DefaultActionStatus, DomRange, FocusManager,
-        FocusNavigationDirection, InteractionErrorKind, InteractiveKind, Selection,
-        SelectionDirection, SelectionRepair, activation_plan, sequential_focus_order,
+        FocusNavigationDirection, FormMethod, InteractionErrorKind, InteractiveKind, Selection,
+        SelectionDirection, SelectionRepair, activation_plan, plan_form_submission,
+        sequential_focus_order,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::html::parse_document;
@@ -1039,6 +1301,45 @@ mod tests {
                 .expect("textarea should classify")
                 .kind,
             InteractiveKind::Textarea
+        );
+    }
+
+    #[test]
+    fn get_form_submission_builds_a_baidu_style_search_navigation() {
+        let parsed = parse_document(
+            "<!doctype html><form id=search action='/s?old=discarded' method=get>\
+             <input type=hidden name=ie value=utf-8>\
+             <input id=query type=search name=wd value='Rust 浏览器'>\
+             <input type=checkbox name=source value=web>\
+             <select name=scope><option value=all selected>All</option></select>\
+             <button id=submit name=from value=render>搜索</button>\
+             <button name=ignored value=yes>Other</button>\
+             <input disabled name=disabled value=yes></form>",
+        );
+        let submitter = by_id(&parsed.dom, "submit");
+        let plan = plan_form_submission(
+            &parsed.dom,
+            submitter,
+            &url::Url::parse("https://www.baidu.com/index.html#top").expect("document URL"),
+        )
+        .expect("search form should submit");
+
+        assert_eq!(plan.method, FormMethod::Get);
+        assert_eq!(
+            plan.target.as_str(),
+            "https://www.baidu.com/s?ie=utf-8&wd=Rust+%E6%B5%8F%E8%A7%88%E5%99%A8&scope=all&from=render"
+        );
+        assert_eq!(
+            plan.fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.value.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("ie", "utf-8"),
+                ("wd", "Rust 浏览器"),
+                ("scope", "all"),
+                ("from", "render"),
+            ]
         );
     }
 }

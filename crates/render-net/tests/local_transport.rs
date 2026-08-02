@@ -7,8 +7,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use render_net::{
-    BatchOptions, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest, FixedOriginLimit,
-    HttpTransport, NetworkWorker, Url,
+    BatchOptions, ByteRange, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest,
+    FixedOriginLimit, HttpTransport, NetworkWorker, Url,
 };
 
 #[derive(Clone, Debug)]
@@ -171,6 +171,43 @@ fn gets_status_headers_body_metadata_and_user_agent() {
             .to_ascii_lowercase()
             .contains("user-agent: render-test/1")
     );
+}
+
+#[test]
+fn byte_range_request_sends_range_and_accepts_partial_content() {
+    let seen_request = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_request);
+    let (url, server) = spawn_server(1, move |request| {
+        *captured.lock().expect("capture range request") = request;
+        WireResponse {
+            status: "206 Partial Content",
+            headers: vec![("Content-Range".into(), "bytes 100-199/1000".into())],
+            body: vec![7; 100],
+            delay: Duration::ZERO,
+        }
+    });
+    let request = FetchRequest::get(url)
+        .with_byte_range(ByteRange::inclusive(100, 199).expect("ordered byte range"));
+
+    let response = transport(|config| config.max_body_bytes = 128)
+        .fetch(&request, &CancelToken::default())
+        .expect("partial response");
+    server.join().expect("server exits");
+
+    assert_eq!(response.status.as_u16(), 206);
+    assert_eq!(response.body.len(), 100);
+    assert!(
+        seen_request
+            .lock()
+            .expect("range request")
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("range: bytes=100-199"))
+    );
+    assert_eq!(
+        ByteRange::inclusive(9, 8),
+        Err(FetchError::InvalidByteRange { start: 9, end: 8 })
+    );
+    assert_eq!(ByteRange::suffix(0), Err(FetchError::EmptyByteRangeSuffix));
 }
 
 #[test]

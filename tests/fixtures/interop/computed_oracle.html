@@ -1,0 +1,58 @@
+<!doctype html>
+<html><head><style id="oracle-style">
+#parent {
+  --base: red;
+  --derived: var(--base);
+  --number: 2px;
+  --nested: calc(var(--number) + 1px);
+  --Case: exact;
+  visibility: hidden;
+}
+#child {
+  --base: blue;
+  --fallback: var(--missing, var(--base));
+  --case-pick: var(--Case);
+  --upper-function: VAR(--base);
+  --comma-fallback: var(--missing, rgb(1, 2, 3));
+  --empty-fallback: var(--missing,);
+  --a: var(--b, red);
+  --b: var(--a, blue);
+  --safe: var(--a, green);
+  --gone: initial;
+  visibility: unset;
+  opacity: unset;
+  position: var(--missing, relative);
+  display: var(--a);
+  margin-left: unset;
+}
+</style></head><body>
+<div id="parent"><span id="child"></span></div>
+<script>
+  const computed = getComputedStyle(document.querySelector("#child"));
+  const properties = [
+    "--base",
+    "--derived",
+    "--number",
+    "--nested",
+    "--fallback",
+    "--case-pick",
+    "--upper-function",
+    "--comma-fallback",
+    "--empty-fallback",
+    "--a",
+    "--b",
+    "--safe",
+    "--gone",
+    "visibility",
+    "opacity",
+    "position",
+    "display",
+    "margin-left",
+  ];
+  const result = Object.fromEntries(properties.map(name => [
+    name,
+    computed.getPropertyValue(name).trim(),
+  ]));
+  document.body.setAttribute("data-computed-oracle", JSON.stringify(result));
+</script>
+</body></html>

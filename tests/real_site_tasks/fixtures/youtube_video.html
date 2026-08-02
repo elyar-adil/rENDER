@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Video task fixture A</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main id="scenario" class="scenario-shell">
+    <h1>Standards-based video page</h1>
+    <section class="player" aria-label="Video player">
+      <video id="player" controls preload="metadata" poster="/assets/poster.png">
+        <source src="/media/youtube-init.mp4" type="video/mp4">
+      </video>
+      <div class="controls" role="group" aria-label="Playback controls">
+        <button type="button" data-command="play">Play</button>
+        <button type="button" data-command="pause">Pause</button>
+        <input type="range" min="0" max="120" value="0" aria-label="Timeline">
+        <button type="button" data-command="fullscreen">Fullscreen</button>
+      </div>
+    </section>
+    <aside><a href="/watch/related">Related video</a></aside>
+  </main>
+</body>
+</html>
+

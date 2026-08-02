@@ -15,6 +15,7 @@ use image_codec::{ImageFormat as CodecImageFormat, ImageReader};
 use url::Url;
 
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, NodeId, NodeKind};
+use crate::css::computed::ComputedStyle;
 use crate::paint::{Color, ImageResourceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +72,13 @@ pub struct ImageResourceKey {
     pub owner: NodeId,
     pub requested_url: Url,
     pub source_snapshot: String,
+    pub source: ImageSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageSource {
+    Element,
+    CssBackground,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +191,7 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
                 owner: node,
                 requested_url,
                 source_snapshot: source.to_owned(),
+                source: ImageSource::Element,
             },
         });
     }
@@ -195,10 +204,77 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
     }
 }
 
+/// Add fetchable computed `background-image: url(...)` values to ordinary
+/// HTML image discovery. Computed URLs are resolved against the document's
+/// effective base URL.
+#[must_use]
+pub fn discover_images_with_styles(
+    dom: &Dom,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    document_url: &Url,
+    limits: ImageLimits,
+) -> ImageDiscovery {
+    let mut discovery = discover_images(dom, document_url, limits);
+    let (elements, _) = collect_elements(dom, limits.max_discovery_nodes);
+    for node in elements {
+        if discovery.resources.len() >= limits.max_resources {
+            break;
+        }
+        let Some(value) = styles
+            .get(&node)
+            .and_then(|style| style.typed("background-image"))
+            .and_then(|value| match value {
+                crate::css::properties::TypedPropertyValue::BackgroundImage(value) => Some(value),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        let Some(reference) = background_url(value) else {
+            continue;
+        };
+        let Ok(requested_url) = discovery.effective_base_url.join(reference) else {
+            continue;
+        };
+        if !matches!(requested_url.scheme(), "http" | "https")
+            || requested_url.as_str().len() > limits.max_url_bytes
+        {
+            continue;
+        }
+        if discovery.resources.iter().any(|resource| {
+            resource.key.owner == node
+                && resource.key.requested_url == requested_url
+                && resource.key.source == ImageSource::CssBackground
+        }) {
+            continue;
+        }
+        discovery.resources.push(DiscoveredImage {
+            source_order: discovery.resources.len(),
+            key: ImageResourceKey {
+                owner: node,
+                requested_url,
+                source_snapshot: value.clone(),
+                source: ImageSource::CssBackground,
+            },
+        });
+    }
+    discovery
+}
+
+#[must_use]
+pub fn background_url(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let inner = value.strip_prefix("url(")?.strip_suffix(')')?.trim();
+    Some(inner.trim_matches(['\'', '"']))
+}
+
 /// Whether a completed request still represents the element's current `src`
 /// and current document-base resolution.
 #[must_use]
 pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKey) -> bool {
+    if key.source == ImageSource::CssBackground {
+        return true;
+    }
     let Some(element) = html_element(dom, key.owner) else {
         return false;
     };
@@ -469,7 +545,7 @@ pub struct LoadedImage {
 
 #[derive(Clone, Debug, Default)]
 pub struct ImageResources {
-    by_node: BTreeMap<NodeId, LoadedImage>,
+    by_node_url: BTreeMap<(NodeId, String), LoadedImage>,
     by_id: BTreeMap<ImageResourceId, Arc<DecodedImage>>,
     next_id: u64,
     decoded_bytes: usize,
@@ -478,12 +554,12 @@ pub struct ImageResources {
 impl ImageResources {
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_node.len()
+        self.by_node_url.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.by_node.is_empty()
+        self.by_node_url.is_empty()
     }
 
     #[must_use]
@@ -493,7 +569,23 @@ impl ImageResources {
 
     #[must_use]
     pub fn get_for_node(&self, node: NodeId) -> Option<&LoadedImage> {
-        self.by_node.get(&node)
+        self.by_node_url
+            .values()
+            .find(|loaded| loaded.key.owner == node && loaded.key.source == ImageSource::Element)
+    }
+
+    #[must_use]
+    pub fn get_for_node_url(&self, node: NodeId, requested_url: &Url) -> Option<&LoadedImage> {
+        self.by_node_url.get(&(node, requested_url.to_string()))
+    }
+
+    #[must_use]
+    pub fn get_css_background(&self, node: NodeId, snapshot: &str) -> Option<&LoadedImage> {
+        self.by_node_url.values().find(|loaded| {
+            loaded.key.owner == node
+                && loaded.key.source == ImageSource::CssBackground
+                && loaded.key.source_snapshot == snapshot
+        })
     }
 
     #[must_use]
@@ -513,9 +605,10 @@ impl ImageResources {
         image: DecodedImage,
         limits: ImageLimits,
     ) -> Result<ImageResourceId, ImageStoreError> {
+        let map_key = (key.owner, key.requested_url.to_string());
         let replaced_bytes = self
-            .by_node
-            .get(&key.owner)
+            .by_node_url
+            .get(&map_key)
             .map_or(0, |loaded| loaded.image.decoded_bytes());
         let new_total = self
             .decoded_bytes
@@ -531,7 +624,9 @@ impl ImageResources {
                 limit: limits.max_total_decoded_bytes,
             });
         }
-        if !self.by_node.contains_key(&key.owner) && self.by_node.len() >= limits.max_resources {
+        if !self.by_node_url.contains_key(&map_key)
+            && self.by_node_url.len() >= limits.max_resources
+        {
             return Err(ImageStoreError::ResourceLimit {
                 limit: limits.max_resources,
             });
@@ -542,19 +637,24 @@ impl ImageResources {
             .ok_or(ImageStoreError::IdentifierExhausted)?;
         let id = ImageResourceId(next);
         let image = Arc::new(image);
-        if let Some(previous) = self.by_node.remove(&key.owner) {
+        if let Some(previous) = self.by_node_url.remove(&map_key) {
             self.by_id.remove(&previous.id);
         }
         self.by_id.insert(id, Arc::clone(&image));
-        self.by_node
-            .insert(key.owner, LoadedImage { id, key, image });
+        self.by_node_url
+            .insert(map_key, LoadedImage { id, key, image });
         self.next_id = next;
         self.decoded_bytes = new_total;
         Ok(id)
     }
 
     pub fn remove_node(&mut self, node: NodeId) -> Option<LoadedImage> {
-        let loaded = self.by_node.remove(&node)?;
+        let key = self
+            .by_node_url
+            .keys()
+            .find(|(owner, _)| *owner == node)
+            .cloned()?;
+        let loaded = self.by_node_url.remove(&key)?;
         self.by_id.remove(&loaded.id);
         self.decoded_bytes = self
             .decoded_bytes

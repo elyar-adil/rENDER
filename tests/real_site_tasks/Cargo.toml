@@ -1,0 +1,24 @@
+[package]
+name = "render-real-site-tasks"
+description = "Headless task-level fixtures and opt-in live smoke checks for rENDER"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# This is an intentionally independent test harness. Keeping it outside the
+# root workspace lets it evolve without adding test-only dependencies to the
+# runtime crates.
+[workspace]
+
+[dependencies]
+render-core = { path = "../../crates/render-core" }
+render-net = { path = "../../crates/render-net" }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+

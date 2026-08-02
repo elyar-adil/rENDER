@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Article reading task fixture</title>
+  <link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+  <main id="scenario" class="scenario-shell article-shell">
+    <article id="story">
+      <h1>一篇用于阅读任务的长文章</h1>
+      <p>第一段包含足够的文本，用于验证 HTML 文档、段落布局和文本选择基础能力。</p>
+      <figure>
+        <img src="/assets/article.png" alt="文章插图">
+        <figcaption>一张通过独立资源请求加载的插图。</figcaption>
+      </figure>
+      <p>第二段包含一个<a href="/question/standard-link">站内文章链接</a>，测试只识别导航意图。</p>
+      <p>第三段继续展开正文，页面内容应超过较小测试视口，从而形成可滚动文档。</p>
+      <p>第四段继续展开正文，保持语义结构，不依赖任何真实网站的 class 或选择器。</p>
+      <p>第五段继续展开正文，选区由 DOM Range 原语建立，不依赖窗口系统。</p>
+      <p>第六段继续展开正文，外部 CSS 由文档协调层发现、抓取并注入级联。</p>
+      <div class="content-spacer">文章后续内容占位</div>
+    </article>
+    <aside aria-label="Authentication boundary">
+      <a href="/login" rel="nofollow">登录后参与互动</a>
+    </aside>
+  </main>
+</body>
+</html>
+

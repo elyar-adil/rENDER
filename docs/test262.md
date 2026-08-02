@@ -24,6 +24,7 @@ runner 默认使用逻辑 CPU 一半、最多 8 个隔离 worker。协调器逐�
 - `RENDER_TEST262_TIMEOUT_SECS`：单个官方测试文件的硬超时，默认 30 秒；
 - `RENDER_TEST262_RUN_DIR`：结果目录；再次使用相同目录会读取 `completed.txt` 和 `results.tsv`，从未完成文件继续；
 - `RENDER_TEST262_MAX_FILES`：仅用于 runner 冒烟测试和吞吐基准，不可用于报告全量通过率。
+- `RENDER_TEST262_PATH_PREFIX`：仅运行指定测试目录，例如 `language`、`built-ins/Array`；与 `MAX_FILES` 组合时先过滤再截断。
 
 runner 递归发现固定 revision 的 `third_party/test262/test/**/*.js`，当前共 53,869 个官方 JavaScript 文件。每个测试使用新的 `Dom` 和 `JsRuntime`，并将结果分为：
 

@@ -561,6 +561,7 @@ pub struct Canvas<'a> {
     pixels: &'a mut [u32],
     width: u32,
     height: u32,
+    clip: Rect,
 }
 
 impl<'a> Canvas<'a> {
@@ -570,7 +571,30 @@ impl<'a> Canvas<'a> {
             pixels,
             width,
             height,
+            clip: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+            },
         }
+    }
+
+    pub fn with_clip<R>(&mut self, rect: Rect, paint: impl FnOnce(&mut Self) -> R) -> R {
+        let previous = self.clip;
+        let left = previous.x.max(rect.x);
+        let top = previous.y.max(rect.y);
+        let right = (previous.x + previous.width).min(rect.x + rect.width);
+        let bottom = (previous.y + previous.height).min(rect.y + rect.height);
+        self.clip = Rect {
+            x: left,
+            y: top,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        };
+        let result = paint(self);
+        self.clip = previous;
+        result
     }
 
     pub fn fill(&mut self, color: u32) {
@@ -583,10 +607,18 @@ impl<'a> Canvas<'a> {
         reason = "rectangles are clipped to finite framebuffer bounds before conversion"
     )]
     pub fn rect(&mut self, rect: Rect, color: u32) {
-        let left = rect.x.floor().max(0.0) as u32;
-        let top = rect.y.floor().max(0.0) as u32;
-        let right = (rect.x + rect.width).ceil().clamp(0.0, self.width as f32) as u32;
-        let bottom = (rect.y + rect.height).ceil().clamp(0.0, self.height as f32) as u32;
+        let left = rect.x.max(self.clip.x).floor().max(0.0) as u32;
+        let top = rect.y.max(self.clip.y).floor().max(0.0) as u32;
+        let right = (rect.x + rect.width)
+            .min(self.clip.x + self.clip.width)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let right = right.max(left);
+        let bottom = (rect.y + rect.height)
+            .min(self.clip.y + self.clip.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        let bottom = bottom.max(top);
         for y in top..bottom {
             let start = y as usize * self.width as usize + left as usize;
             let end = y as usize * self.width as usize + right as usize;
@@ -600,10 +632,18 @@ impl<'a> Canvas<'a> {
         reason = "rounded rectangles are clipped to finite framebuffer bounds"
     )]
     pub fn rounded_rect(&mut self, rect: Rect, radius: f32, color: u32) {
-        let left = rect.x.floor().max(0.0) as u32;
-        let top = rect.y.floor().max(0.0) as u32;
-        let right = (rect.x + rect.width).ceil().clamp(0.0, self.width as f32) as u32;
-        let bottom = (rect.y + rect.height).ceil().clamp(0.0, self.height as f32) as u32;
+        let left = rect.x.max(self.clip.x).floor().max(0.0) as u32;
+        let top = rect.y.max(self.clip.y).floor().max(0.0) as u32;
+        let right = (rect.x + rect.width)
+            .min(self.clip.x + self.clip.width)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let right = right.max(left);
+        let bottom = (rect.y + rect.height)
+            .min(self.clip.y + self.clip.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        let bottom = bottom.max(top);
         let radius = radius.min(rect.width * 0.5).min(rect.height * 0.5);
         for y in top..bottom {
             for x in left..right {
@@ -670,6 +710,10 @@ impl<'a> Canvas<'a> {
                 || glyph_y < 0
                 || glyph_x >= i32::try_from(self.width).unwrap_or(i32::MAX)
                 || glyph_y >= i32::try_from(self.height).unwrap_or(i32::MAX)
+                || (glyph_x as f32) < self.clip.x
+                || (glyph_y as f32) < self.clip.y
+                || (glyph_x as f32) >= self.clip.x + self.clip.width
+                || (glyph_y as f32) >= self.clip.y + self.clip.height
             {
                 continue;
             }
@@ -1001,6 +1045,19 @@ fn paint_address(
             palette.address_focused,
         );
     }
+    let clip = layout.address.inset(4.0 * layout.scale);
+    canvas.with_clip(clip, |canvas| {
+        paint_address_contents(canvas, layout, editor, text, palette);
+    });
+}
+
+fn paint_address_contents(
+    canvas: &mut Canvas<'_>,
+    layout: &ChromeLayout,
+    editor: &AddressEditor,
+    text: &impl TextPainter,
+    palette: Palette,
+) {
     let geometry = address_text_geometry(layout, editor, text);
     let size = geometry.size;
     let text_x = geometry.base_x;
@@ -1501,6 +1558,33 @@ mod tests {
             _color: u32,
         ) {
         }
+    }
+
+    #[test]
+    fn canvas_clip_limits_paint_to_the_requested_rectangle() {
+        let mut pixels = [0_u32; 4];
+        let mut canvas = Canvas::new(&mut pixels, 4, 1);
+        canvas.with_clip(
+            Rect {
+                x: 1.0,
+                y: 0.0,
+                width: 2.0,
+                height: 1.0,
+            },
+            |canvas| {
+                canvas.rect(
+                    Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 4.0,
+                        height: 1.0,
+                    },
+                    7,
+                );
+            },
+        );
+
+        assert_eq!(pixels, [0, 7, 7, 0]);
     }
 
     #[test]

@@ -95,7 +95,7 @@
 | 表格 | `table caption colgroup col thead tbody tfoot tr th td` 🟡 | — |
 | 表单 | `form input button select option optgroup textarea label fieldset legend output datalist` | `<form method=dialog>` ⛔ |
 | 嵌入 | `img picture source figure figcaption` | `embed object applet` ⛔ |
-| 媒体 | `<audio>` / `<video>` 仅作为**占位元素**（保留尺寸、控制条骨架） | 解码/播放 ⛔ NON-GOAL |
+| 媒体 | `<audio>` / `<video>` 元素状态、资源选择、分段加载、解码、播放和控制条 | 🔵 PLANNED；以 Bilibili 点播为端到端验收 |
 | iframe | `<iframe>` 渲染为占位框（宽高/边框正确，不做内嵌文档加载） | 完整子文档加载 ⛔（M3 之后再议） |
 | 交互 | `details summary` | `dialog` 🔵 PLANNED M3（仅 modal showModal/close） |
 | 编辑 | `contenteditable=""` 显示为只读 | 真正编辑 ⛔ |
@@ -283,7 +283,7 @@ Color 4 / Color 5、Houdini、Container Queries、Subgrid、Masonry、Scroll-dri
 
 ### 5.3 媒体
 
-`<video>` / `<audio>` 仅作为占位元素（呈现海报、控制条骨架，不可播放）。**编解码、字幕（WebVTT）、Media Source Extensions、Picture-in-Picture、自动播放策略全部 ⛔ NON-GOAL。**
+`<video>` / `<audio>` 当前仅有布局占位，但媒体播放已经进入项目目标。实施顺序为：HTTP Range 与资源状态、HTMLMediaElement 状态机、MP4/DASH 解复用、H.264/AAC 解码与音频输出、A/V 同步和视频合成，再补齐 Bilibili 所需的 Media Source Extensions 子集。WebVTT、Picture-in-Picture 和完整自动播放策略仍在基础点播链路之后。
 
 ---
 

@@ -4,12 +4,15 @@
 //! ordered `render-net` batch to validated decoded resources. It does not
 //! perform GUI work and it never disables TLS verification.
 
+use std::collections::BTreeMap;
+
+use render_core::css::computed::ComputedStyle;
 use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
 use render_core::image::{
     ImageDiscoveryDiagnostic, ImageDiscoveryDiagnosticCode, ImageFormat, ImageLimits,
-    ImageResourceKey, ImageResources, decode_image, discover_images, image_key_is_current,
-    sniff_image_format,
+    ImageResourceKey, ImageResources, decode_image, discover_images_with_styles,
+    image_key_is_current, sniff_image_format,
 };
 use render_core::paint::ImageResourceId;
 use render_net::{FetchRequest, FetchResponse, FetchResult, Url};
@@ -101,7 +104,18 @@ pub struct ImageBatchApplication {
 
 #[must_use]
 pub fn plan_images(document: &Document, document_url: &Url, limits: ImageLimits) -> ImageFetchPlan {
-    let discovery = discover_images(document.dom(), document_url, limits);
+    plan_images_with_styles(document, &BTreeMap::new(), document_url, &ImageResources::default(), limits)
+}
+
+#[must_use]
+pub fn plan_images_with_styles(
+    document: &Document,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    document_url: &Url,
+    loaded: &ImageResources,
+    limits: ImageLimits,
+) -> ImageFetchPlan {
+    let discovery = discover_images_with_styles(document.dom(), styles, document_url, limits);
     let diagnostics = discovery
         .diagnostics
         .into_iter()
@@ -110,6 +124,7 @@ pub fn plan_images(document: &Document, document_url: &Url, limits: ImageLimits)
     let resources = discovery
         .resources
         .into_iter()
+        .filter(|image| loaded.get_for_node_url(image.key.owner, &image.key.requested_url).is_none())
         .map(|image| ImageFetch {
             source_order: image.source_order,
             request: FetchRequest::get(image.key.requested_url.clone()).with_accept(IMAGE_ACCEPT),

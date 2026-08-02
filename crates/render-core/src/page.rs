@@ -182,6 +182,14 @@ pub struct DocumentScriptQueue {
     pub errors: Vec<DocumentScriptQueueError>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedPageScript {
+    pub owner: crate::dom::NodeId,
+    pub source_order: usize,
+    pub scheduling: ScriptScheduling,
+    pub compiled: CompiledScript,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageJob {
     Task { id: TaskId, source: TaskSource },
@@ -261,11 +269,31 @@ impl Page {
         Self::with_options(html, PageOptions::default())
     }
 
+    /// Create a page whose JavaScript realm observes the committed document URL.
+    #[must_use]
+    pub fn with_url(html: &str, document_url: &Url) -> Self {
+        Self::with_options_and_url(html, PageOptions::default(), document_url)
+    }
+
     /// Parse and render an initial snapshot with deterministic reference
     /// backends and explicit resource options.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// The built-in `about:blank` URL is a constant and always parses.
     pub fn with_options(html: &str, options: PageOptions) -> Self {
-        Self::with_backends(
+        Self::with_options_and_url(
+            html,
+            options,
+            &Url::parse("about:blank").expect("about:blank is a valid URL"),
+        )
+    }
+
+    /// Create a URL-aware page with explicit resource options.
+    #[must_use]
+    pub fn with_options_and_url(html: &str, options: PageOptions, document_url: &Url) -> Self {
+        Self::with_backends_and_url(
             html,
             options,
             DocumentBackends {
@@ -273,15 +301,37 @@ impl Page {
                 text_shaper: &ReferenceTextShaper,
                 glyph_masks: &NoGlyphMasks,
             },
+            document_url,
         )
     }
 
     /// Parse exactly once and create the initial render snapshot.
     #[must_use]
+    ///
+    /// # Panics
+    ///
+    /// The built-in `about:blank` URL is a constant and always parses.
     pub fn with_backends(html: &str, options: PageOptions, backends: DocumentBackends<'_>) -> Self {
+        Self::with_backends_and_url(
+            html,
+            options,
+            backends,
+            &Url::parse("about:blank").expect("about:blank is a valid URL"),
+        )
+    }
+
+    /// Parse once and bind an explicit committed URL into the initial Realm.
+    #[must_use]
+    pub fn with_backends_and_url(
+        html: &str,
+        options: PageOptions,
+        backends: DocumentBackends<'_>,
+        document_url: &Url,
+    ) -> Self {
         let document = Document::parse(html);
         let snapshot = document.render(options.render, backends);
-        let runtime = JsRuntime::with_limits(document.dom(), options.runtime_limits);
+        let runtime =
+            JsRuntime::with_limits_and_url(document.dom(), options.runtime_limits, document_url);
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
         Self {
@@ -302,6 +352,11 @@ impl Page {
     #[must_use]
     pub const fn document(&self) -> &Document {
         &self.document
+    }
+
+    #[must_use]
+    pub const fn document_mut(&mut self) -> &mut Document {
+        &mut self.document
     }
 
     #[must_use]
@@ -349,12 +404,73 @@ impl Page {
         )
     }
 
+    /// Queue a revision-bound batch prepared by an embedding resource loader.
+    ///
+    /// Parser-blocking scripts retain document order. Async scripts then run in
+    /// the order the embedding supplies them, which lets a streaming loader
+    /// pass completion order. Deferred scripts run last in document order.
+    #[must_use]
+    pub fn queue_prepared_scripts(
+        &mut self,
+        revision: DomRevision,
+        scripts: Vec<PreparedPageScript>,
+    ) -> DocumentScriptQueue {
+        let current_revision = self.document.dom().revision();
+        if revision != current_revision {
+            return DocumentScriptQueue {
+                revision,
+                queued: Vec::new(),
+                diagnostics: Vec::new(),
+                errors: vec![DocumentScriptQueueError::StaleDiscovery {
+                    discovered_revision: revision,
+                    current_revision,
+                }],
+            };
+        }
+
+        let mut parser_blocking = Vec::new();
+        let mut deferred = Vec::new();
+        let mut asynchronous = Vec::new();
+        for script in scripts {
+            match script.scheduling {
+                ScriptScheduling::ParserBlocking => parser_blocking.push(script),
+                ScriptScheduling::Defer => deferred.push(script),
+                ScriptScheduling::Async => asynchronous.push(script),
+            }
+        }
+        parser_blocking.sort_by_key(|script| script.source_order);
+        deferred.sort_by_key(|script| script.source_order);
+
+        let mut queued = Vec::new();
+        let mut errors = Vec::new();
+        for script in parser_blocking
+            .into_iter()
+            .chain(asynchronous)
+            .chain(deferred)
+        {
+            match self.queue_compiled_script(script.compiled) {
+                Ok(id) => queued.push(id),
+                Err(error) => errors.push(DocumentScriptQueueError::Queue {
+                    owner: script.owner,
+                    source_order: script.source_order,
+                    error,
+                }),
+            }
+        }
+        DocumentScriptQueue {
+            revision,
+            queued,
+            diagnostics: Vec::new(),
+            errors,
+        }
+    }
+
     /// Discover document scripts once and queue supported parser-blocking inline
     /// classic scripts in DOM tree order.
     ///
     /// External scripts are deliberately reported rather than fetched here:
     /// network I/O belongs to the browser resource coordinator. Unsupported
-    /// module and scheduling modes remain available as discovery diagnostics.
+    /// module types remain available as discovery diagnostics.
     #[must_use]
     pub fn queue_document_scripts(
         &mut self,
@@ -631,11 +747,12 @@ fn execute_task(
 mod tests {
     use super::{
         DocumentScriptQueueError, Page, PageJob, PageLimits, PageOptions, PageQueueError, PageTask,
+        PreparedPageScript,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
     use crate::js::RuntimeLimits;
-    use crate::script::{ScriptDiagnosticCode, ScriptDiscoveryLimits};
+    use crate::script::{ScriptDiagnosticCode, ScriptDiscoveryLimits, ScriptScheduling};
     use url::Url;
 
     fn element_with_id(dom: &Dom, id: &str) -> NodeId {
@@ -720,10 +837,7 @@ mod tests {
                 .iter()
                 .map(|diagnostic| diagnostic.code)
                 .collect::<Vec<_>>(),
-            [
-                ScriptDiagnosticCode::ModuleUnsupported,
-                ScriptDiagnosticCode::AsyncUnsupported,
-            ]
+            [ScriptDiagnosticCode::ModuleUnsupported]
         );
         assert!(matches!(
             queue.errors.as_slice(),
@@ -754,6 +868,100 @@ mod tests {
         assert!(matches!(
             page.document().dom().node(text).map(crate::dom::Node::kind),
             Some(NodeKind::Text(value)) if value == "compiled"
+        ));
+    }
+
+    #[test]
+    fn prepared_script_batch_preserves_browser_scheduling_groups() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        let revision = page.document().dom().revision();
+        let limits = RuntimeLimits::default();
+        let compile = |source| {
+            crate::js::CompiledScript::compile(source, &limits).expect("prepared script compiles")
+        };
+        let owner = element_with_id(page.document().dom(), "message");
+        let queue = page.queue_prepared_scripts(
+            revision,
+            vec![
+                PreparedPageScript {
+                    owner,
+                    source_order: 3,
+                    scheduling: ScriptScheduling::Defer,
+                    compiled: compile("order += 'D3';"),
+                },
+                PreparedPageScript {
+                    owner,
+                    source_order: 0,
+                    scheduling: ScriptScheduling::ParserBlocking,
+                    compiled: compile("var order = 'P0';"),
+                },
+                PreparedPageScript {
+                    owner,
+                    source_order: 4,
+                    scheduling: ScriptScheduling::Async,
+                    compiled: compile("order += 'A4';"),
+                },
+                PreparedPageScript {
+                    owner,
+                    source_order: 1,
+                    scheduling: ScriptScheduling::Defer,
+                    compiled: compile("order += 'D1';"),
+                },
+                PreparedPageScript {
+                    owner,
+                    source_order: 2,
+                    scheduling: ScriptScheduling::Async,
+                    compiled: compile("order += 'A2';"),
+                },
+            ],
+        );
+        assert_eq!(queue.queued.len(), 5);
+        assert!(queue.errors.is_empty());
+        page.queue_script("document.getElementById('message').setAttribute('data-order', order);")
+            .expect("observer script fits");
+
+        while page
+            .run_one_turn_reference()
+            .expect("prepared script turn renders")
+            .is_some()
+        {}
+
+        assert_eq!(
+            page.document().dom().attribute(owner, "data-order"),
+            Ok(Some("P0A4A2D1D3"))
+        );
+    }
+
+    #[test]
+    fn prepared_script_batch_rejects_a_stale_dom_revision_atomically() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        let stale_revision = page.document().dom().revision();
+        let owner = element_with_id(page.document().dom(), "message");
+        page.document
+            .dom_mut()
+            .set_attribute(owner, "data-mutated", "true")
+            .expect("test mutation succeeds");
+        let script = crate::js::CompiledScript::compile(
+            "document.getElementById('message').textContent = 'must not run';",
+            &RuntimeLimits::default(),
+        )
+        .expect("prepared script compiles");
+
+        let queue = page.queue_prepared_scripts(
+            stale_revision,
+            vec![PreparedPageScript {
+                owner,
+                source_order: 0,
+                scheduling: ScriptScheduling::ParserBlocking,
+                compiled: script,
+            }],
+        );
+
+        assert!(queue.queued.is_empty());
+        assert_eq!(page.event_loop().pending_task_count(), 0);
+        assert!(matches!(
+            queue.errors.as_slice(),
+            [DocumentScriptQueueError::StaleDiscovery { .. }]
         ));
     }
 
@@ -1191,4 +1399,23 @@ mod tests {
         ));
         assert_eq!(page.queued_script_source_bytes(), 0);
     }
+}
+#[test]
+fn page_url_is_visible_to_scripts_in_the_persistent_realm() {
+    let url = Url::parse("https://www.baidu.com/s?wd=rust#result").expect("page URL");
+    let mut page = Page::with_url("<!doctype html><p></p>", &url);
+    page.queue_script("location.hostname + location.pathname + location.search + location.hash;")
+        .expect("script should queue");
+    let turn = page
+        .run_one_turn_reference()
+        .expect("turn should run")
+        .expect("script turn");
+    assert_eq!(
+        turn.executions[0]
+            .result
+            .as_ref()
+            .expect("script result")
+            .value,
+        crate::js::JsValue::String("www.baidu.com/s?wd=rust#result".to_owned())
+    );
 }

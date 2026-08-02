@@ -14,6 +14,7 @@ pub mod interaction;
 pub mod invalidation;
 pub mod js;
 pub mod layout;
+pub mod media;
 pub mod navigation;
 pub mod page;
 pub mod paint;

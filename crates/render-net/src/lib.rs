@@ -15,8 +15,8 @@ mod worker;
 pub use batch::{BatchOptions, FixedOriginLimit, Origin, OriginConcurrencyPolicy};
 pub use cookie::{Cookie, CookieIssue, CookieJar, CookieLimits, CookieRejection, SameSite};
 pub use transport::{
-    CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult,
-    Header, HttpStatus, HttpTransport,
+    ByteRange, CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, FetchResponse,
+    FetchResult, Header, HttpStatus, HttpTransport,
 };
 pub use worker::{NetworkWorker, RequestHandle};
 

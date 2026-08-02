@@ -298,7 +298,8 @@ fn apply_response(
         ));
     }
 
-    let sheet = parse_stylesheet(&decoded.text);
+    let mut sheet = parse_stylesheet(&decoded.text);
+    absolutize_background_urls(&mut sheet, &response.final_url);
     for diagnostic in &sheet.diagnostics {
         application.diagnostics.push(resource_diagnostic(
             resource,
@@ -320,6 +321,50 @@ fn apply_response(
         byte_len: response.body.len(),
         parser_diagnostic_count,
     });
+}
+
+fn absolutize_background_urls(
+    sheet: &mut render_core::css::stylesheet::StyleSheet,
+    base_url: &Url,
+) {
+    for rule in &mut sheet.rules {
+        for declaration in &mut rule.declarations {
+            if declaration.name.eq_ignore_ascii_case("background-image")
+                || declaration.name.eq_ignore_ascii_case("background")
+            {
+                declaration.value = absolutize_css_urls(&declaration.value, base_url);
+            }
+        }
+    }
+}
+
+fn absolutize_css_urls(value: &str, base_url: &Url) -> String {
+    let lower = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while let Some(relative_start) = lower[cursor..].find("url(") {
+        let start = cursor + relative_start;
+        output.push_str(&value[cursor..start]);
+        let content_start = start + 4;
+        let Some(relative_end) = value[content_start..].find(')') else {
+            output.push_str(&value[start..]);
+            return output;
+        };
+        let end = content_start + relative_end;
+        let reference = value[content_start..end]
+            .trim()
+            .trim_matches(['\'', '"']);
+        if let Ok(url) = base_url.join(reference) {
+            output.push_str("url(\"");
+            output.push_str(url.as_str());
+            output.push_str("\")");
+        } else {
+            output.push_str(&value[start..=end]);
+        }
+        cursor = end + 1;
+    }
+    output.push_str(&value[cursor..]);
+    output
 }
 
 fn slot_url(slot: &render_core::document::AuthorStyleSlot) -> Option<&Url> {

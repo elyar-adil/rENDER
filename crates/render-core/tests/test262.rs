@@ -85,6 +85,9 @@ struct ResultRecord {
 fn pinned_test262_manifest_reports_a_real_baseline() {
     assert_pinned_revision();
     let mut paths = discover_test_paths();
+    if let Ok(prefix) = env::var("RENDER_TEST262_PATH_PREFIX") {
+        paths.retain(|path| path_matches_prefix(path, &prefix));
+    }
     if let Some(max_files) = env_usize("RENDER_TEST262_MAX_FILES") {
         paths.truncate(max_files);
     }
@@ -577,6 +580,12 @@ fn discover_test_paths() -> Vec<String> {
     paths
 }
 
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim().replace('\\', "/");
+    let prefix = prefix.trim_matches('/');
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
 fn collect_test_paths(directory: &Path, paths: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
@@ -897,7 +906,23 @@ fn parse_list(value: &str) -> Vec<String> {
 mod runner_tests {
     use render_core::js::{CompiledScript, RuntimeLimits};
 
-    use super::{Status, parse_metadata, run_manifest_case, run_variant};
+    use super::{Status, parse_metadata, path_matches_prefix, run_manifest_case, run_variant};
+
+    #[test]
+    fn path_prefix_filter_respects_directory_boundaries() {
+        assert!(path_matches_prefix(
+            "built-ins/Array/from.js",
+            "built-ins/Array"
+        ));
+        assert!(path_matches_prefix(
+            "language/statements/for.js",
+            "language"
+        ));
+        assert!(!path_matches_prefix(
+            "built-ins/ArrayBuffer/name.js",
+            "built-ins/Array"
+        ));
+    }
 
     #[test]
     fn parses_inline_flags_includes_and_negative_metadata() {
@@ -956,7 +981,7 @@ mod runner_tests {
 
     #[test]
     fn classifies_module_tests_as_unsupported() {
-        let records = run_manifest_case("language/module-code/instn-iee-bndng-var.js");
+        let records = run_manifest_case("language/module-code/eval-export-dflt-cls-anon-semi.js");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].status, Status::Unsupported);
     }

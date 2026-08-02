@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
-use crate::css::properties::{BorderStyle, CssColor, Position, TypedPropertyValue};
+use crate::css::properties::{BorderStyle, CssColor, Overflow, Position, TypedPropertyValue};
 use crate::dom::{DomRevision, NodeId};
+use crate::image::ImageResources;
 use crate::layout::{
     EdgeSizes, FormattingTree, Fragment, FragmentId, FragmentKind, FragmentTree, PhysicalPoint,
     PhysicalRect, PhysicalSize,
@@ -428,12 +429,25 @@ pub fn build_display_list(
     options: DisplayListBuilderOptions,
     shaper: &dyn TextShaper,
 ) -> DisplayListBuildOutput {
+    build_display_list_with_images(fragments, formatting, styles, options, shaper, None)
+}
+
+#[must_use]
+pub fn build_display_list_with_images(
+    fragments: &FragmentTree,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: DisplayListBuilderOptions,
+    shaper: &dyn TextShaper,
+    images: Option<&ImageResources>,
+) -> DisplayListBuildOutput {
     let mut builder = Builder {
         fragments,
         formatting,
         styles,
         options,
         shaper,
+        images,
         items: Vec::new(),
         diagnostics: Vec::new(),
         ordinals: BTreeMap::new(),
@@ -457,6 +471,7 @@ struct Builder<'a> {
     styles: &'a BTreeMap<NodeId, ComputedStyle>,
     options: DisplayListBuilderOptions,
     shaper: &'a dyn TextShaper,
+    images: Option<&'a ImageResources>,
     items: Vec<DisplayItem>,
     diagnostics: Vec<DisplayListDiagnostic>,
     ordinals: BTreeMap<(Option<NodeId>, PaintPhase), u32>,
@@ -503,13 +518,40 @@ impl Builder<'_> {
                     current_color,
                     coordinate_space,
                 );
+                self.paint_image(&fragment, geometry, coordinate_space);
             }
             FragmentKind::Text(text) => {
                 self.paint_text(&fragment, text, current_color, coordinate_space);
             }
         }
+        let overflow_clip = match (&fragment.kind, style.as_ref()) {
+            (FragmentKind::Box(geometry), Some(style)) => {
+                if let Some(rect) = overflow_clip_rect(geometry, style) {
+                    self.push(
+                        &fragment,
+                        PaintPhase::Content,
+                        rect,
+                        coordinate_space,
+                        DisplayCommand::PushClip(ClipShape::Rect(rect)),
+                    );
+                    Some(rect)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
         for child in &fragment.children {
             self.paint_fragment(*child, coordinate_space);
+        }
+        if let Some(rect) = overflow_clip {
+            self.push(
+                &fragment,
+                PaintPhase::Content,
+                rect,
+                coordinate_space,
+                DisplayCommand::PopClip,
+            );
         }
         if opacity < 1.0 {
             self.push(
@@ -559,6 +601,7 @@ impl Builder<'_> {
                 },
             );
         }
+        self.paint_background_image(fragment, geometry, style, coordinate_space);
         let border = border_paint(style, geometry, current_color, self.options.palette);
         if border.widths.horizontal() > 0.0 || border.widths.vertical() > 0.0 {
             self.push(
@@ -569,6 +612,151 @@ impl Builder<'_> {
                 DisplayCommand::Border(border),
             );
         }
+    }
+
+    fn paint_background_image(
+        &mut self,
+        fragment: &Fragment,
+        geometry: &crate::layout::BoxGeometry,
+        style: Option<&ComputedStyle>,
+        coordinate_space: PaintCoordinateSpace,
+    ) {
+        let Some(style) = style else { return };
+        let Some(TypedPropertyValue::BackgroundImage(snapshot)) = style.typed("background-image")
+        else {
+            return;
+        };
+        let Some(loaded) = fragment.source.and_then(|node| {
+            self.images
+                .and_then(|images| images.get_css_background(node, snapshot))
+        }) else {
+            return;
+        };
+        let (width, height) = loaded.image.intrinsic_size();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let area = geometry.padding_rect();
+        if area.size.width <= 0.0 || area.size.height <= 0.0 {
+            return;
+        }
+        let size = style
+            .typed("background-size")
+            .and_then(|value| match value {
+                TypedPropertyValue::BackgroundSize(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .unwrap_or("auto");
+        let position = style
+            .typed("background-position")
+            .and_then(|value| match value {
+                TypedPropertyValue::BackgroundPosition(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .unwrap_or("0% 0%");
+        let repeat = style
+            .typed("background-repeat")
+            .and_then(|value| match value {
+                TypedPropertyValue::BackgroundRepeat(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .unwrap_or("repeat");
+        let intrinsic_width = image_dimension_to_f32(width);
+        let intrinsic_height = image_dimension_to_f32(height);
+        let (paint_width, paint_height, source) = match size {
+            "cover" => {
+                let scale = (area.size.width / intrinsic_width)
+                    .max(area.size.height / intrinsic_height);
+                let source_width = area.size.width / scale;
+                let source_height = area.size.height / scale;
+                let (position_x, position_y) = background_position(position);
+                let source_x = (intrinsic_width - source_width) * position_x;
+                let source_y = (intrinsic_height - source_height) * position_y;
+                (
+                    area.size.width,
+                    area.size.height,
+                    PhysicalRect::new(source_x, source_y, source_width, source_height),
+                )
+            }
+            "contain" => {
+                let scale = (area.size.width / intrinsic_width)
+                    .min(area.size.height / intrinsic_height);
+                (
+                    intrinsic_width * scale,
+                    intrinsic_height * scale,
+                    PhysicalRect::new(0.0, 0.0, intrinsic_width, intrinsic_height),
+                )
+            }
+            _ => (
+                intrinsic_width,
+                intrinsic_height,
+                PhysicalRect::new(0.0, 0.0, intrinsic_width, intrinsic_height),
+            ),
+        };
+        let (position_x, position_y) = background_position(position);
+        let origin_x = area.origin.x + (area.size.width - paint_width) * position_x;
+        let origin_y = area.origin.y + (area.size.height - paint_height) * position_y;
+        self.push(
+            fragment,
+            PaintPhase::Background,
+            area,
+            coordinate_space,
+            DisplayCommand::PushClip(ClipShape::Rect(area)),
+        );
+        let repeat_x = matches!(repeat, "repeat" | "repeat-x");
+        let repeat_y = matches!(repeat, "repeat" | "repeat-y");
+        let start_x = if repeat_x {
+            origin_x - ((origin_x - area.origin.x) / paint_width).ceil() * paint_width
+        } else {
+            origin_x
+        };
+        let start_y = if repeat_y {
+            origin_y - ((origin_y - area.origin.y) / paint_height).ceil() * paint_height
+        } else {
+            origin_y
+        };
+        let end_x = if repeat_x {
+            area.origin.x + area.size.width
+        } else {
+            start_x + paint_width
+        };
+        let end_y = if repeat_y {
+            area.origin.y + area.size.height
+        } else {
+            start_y + paint_height
+        };
+        let mut y = start_y;
+        let mut tiles = 0_usize;
+        while y < end_y && tiles < 4_096 {
+            let mut x = start_x;
+            while x < end_x && tiles < 4_096 {
+                let destination = PhysicalRect::new(x, y, paint_width, paint_height);
+                self.push(
+                    fragment,
+                    PaintPhase::Background,
+                    destination,
+                    coordinate_space,
+                    DisplayCommand::Image(ImagePaint {
+                        resource: loaded.id,
+                        destination,
+                        source,
+                        interpolate: true,
+                    }),
+                );
+                tiles += 1;
+                if !repeat_x { break; }
+                x += paint_width;
+            }
+            if !repeat_y { break; }
+            y += paint_height;
+        }
+        self.push(
+            fragment,
+            PaintPhase::Background,
+            area,
+            coordinate_space,
+            DisplayCommand::PopClip,
+        );
     }
 
     /// CSS paints the root element background over the whole canvas rather
@@ -632,6 +820,45 @@ impl Builder<'_> {
         }
     }
 
+    fn paint_image(
+        &mut self,
+        fragment: &Fragment,
+        geometry: &crate::layout::BoxGeometry,
+        coordinate_space: PaintCoordinateSpace,
+    ) {
+        let Some(loaded) = fragment
+            .source
+            .and_then(|source| self.images.and_then(|images| images.get_for_node(source)))
+        else {
+            return;
+        };
+        let (width, height) = loaded.image.intrinsic_size();
+        if width == 0
+            || height == 0
+            || geometry.content_rect.size.width <= 0.0
+            || geometry.content_rect.size.height <= 0.0
+        {
+            return;
+        }
+        self.push(
+            fragment,
+            PaintPhase::Content,
+            geometry.content_rect,
+            coordinate_space,
+            DisplayCommand::Image(ImagePaint {
+                resource: loaded.id,
+                destination: geometry.content_rect,
+                source: PhysicalRect::new(
+                    0.0,
+                    0.0,
+                    image_dimension_to_f32(width),
+                    image_dimension_to_f32(height),
+                ),
+                interpolate: true,
+            }),
+        );
+    }
+
     fn style_for(&mut self, fragment: &Fragment) -> Option<&ComputedStyle> {
         let source = self
             .formatting
@@ -684,6 +911,64 @@ impl Builder<'_> {
             command,
         });
     }
+}
+
+fn overflow_clip_rect(
+    geometry: &crate::layout::BoxGeometry,
+    style: &ComputedStyle,
+) -> Option<PhysicalRect> {
+    let clips_x = matches!(
+        style.typed("overflow-x"),
+        Some(TypedPropertyValue::Overflow(value))
+            if !matches!(value, Overflow::Visible)
+    );
+    let clips_y = matches!(
+        style.typed("overflow-y"),
+        Some(TypedPropertyValue::Overflow(value))
+            if !matches!(value, Overflow::Visible)
+    );
+    if clips_x || clips_y {
+        Some(geometry.padding_rect())
+    } else {
+        None
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "display-list geometry is f32 and decoded image dimensions are bounded by image limits"
+)]
+fn image_dimension_to_f32(value: u32) -> f32 {
+    value as f32
+}
+
+fn background_position(value: &str) -> (f32, f32) {
+    let lower = value.to_ascii_lowercase();
+    let horizontal = if lower.split_ascii_whitespace().any(|part| part == "right") {
+        1.0
+    } else if lower.split_ascii_whitespace().any(|part| part == "center") {
+        0.5
+    } else {
+        lower
+            .split_ascii_whitespace()
+            .next()
+            .and_then(|part| part.strip_suffix('%'))
+            .and_then(|number| number.parse::<f32>().ok())
+            .map_or(0.0, |number| (number / 100.0).clamp(0.0, 1.0))
+    };
+    let vertical = if lower.split_ascii_whitespace().any(|part| part == "bottom") {
+        1.0
+    } else if lower.split_ascii_whitespace().any(|part| part == "center") {
+        0.5
+    } else {
+        lower
+            .split_ascii_whitespace()
+            .nth(1)
+            .and_then(|part| part.strip_suffix('%'))
+            .and_then(|number| number.parse::<f32>().ok())
+            .map_or(0.0, |number| (number / 100.0).clamp(0.0, 1.0))
+    };
+    (horizontal, vertical)
 }
 
 fn fragment_coordinate_space(
@@ -764,7 +1049,7 @@ const fn is_wide_character(character: char) -> bool {
 mod tests {
     use crate::css::cascade::{CascadeInput, CascadeOrigin};
     use crate::css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
-    use crate::css::selector::MatchContext;
+    use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::css::stylesheet::parse_stylesheet;
     use crate::html::parse_document;
     use crate::layout::{
@@ -774,7 +1059,8 @@ mod tests {
     use crate::paint::Color;
 
     use super::{
-        DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper, build_display_list,
+        ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
+        build_display_list,
     };
 
     #[test]
@@ -845,5 +1131,150 @@ mod tests {
                         && color == Color::rgb(0x10, 0x20, 0x30)
             )
         }));
+    }
+
+    #[test]
+    fn atomic_inline_box_emits_its_own_background_and_border() {
+        let output = parse_document("<!doctype html><body>before<a id=tile>inside</a>after</body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #tile { display:inline-block; width:80px; height:20px; padding-left:4px; padding-right:4px; background-color:#123456; border-left-width:2px; border-left-style:solid; border-right-width:2px; border-right-style:solid }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        let selector = parse_selector_list("#tile").unwrap();
+        let tile = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+
+        assert!(display.list.items().iter().any(|item| {
+            item.source == Some(tile)
+                && matches!(
+                    item.command,
+                    DisplayCommand::SolidRect { rect, color }
+                        if (rect.size.width - 92.0).abs() < f32::EPSILON
+                            && color == Color::rgb(0x12, 0x34, 0x56)
+                )
+        }));
+        assert!(display.list.items().iter().any(|item| {
+            item.source == Some(tile) && matches!(item.command, DisplayCommand::Border(_))
+        }));
+    }
+
+    #[test]
+    fn overflow_hidden_wraps_descendants_in_a_padding_clip() {
+        let output =
+            parse_document("<!doctype html><body><div id=clip><span>child</span></div></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #clip { display:block; width:100px; height:20px; padding:4px; overflow-x:hidden; overflow-y:hidden; background-color:#123456 }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        let selector = parse_selector_list("#clip").unwrap();
+        let clip_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let items: Vec<_> = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(clip_node))
+            .collect();
+        assert!(items.iter().any(|item| {
+            matches!(item.command, DisplayCommand::PushClip(ClipShape::Rect(rect)) if rect.size.width > 0.0 && rect.size.height > 0.0)
+        }));
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item.command, DisplayCommand::PopClip))
+        );
+    }
+
+    #[test]
+    fn overflow_visible_does_not_emit_a_clip() {
+        let output = parse_document("<!doctype html><body><div id=box>child</div></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #box { display:block; overflow:visible }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(!display.list.items().iter().any(|item| matches!(
+            item.command,
+            DisplayCommand::PushClip(_) | DisplayCommand::PopClip
+        )));
     }
 }

@@ -155,6 +155,48 @@ interoperability, while specification and WPT results remain authoritative.
   microtask checkpoints, resource-bounded virtual timers, and a rendering
   opportunity after each turn. Rendering decisions consume the same mutation
   journal used by the document pipeline.
+- Classic-script discovery now distinguishes parser-blocking, `async`, and
+  `defer` external scripts while correctly ignoring those attributes on inline
+  classic scripts. Until module execution lands, `nomodule` classic scripts are
+  executed as the standards-defined compatibility fallback. The browser
+  resource adapter preserves that scheduling
+  metadata through fetch, MIME/UTF-8 validation, and compilation. Embeddings
+  can submit the resulting revision-bound compiled batch to `Page` without
+  reparsing source or creating a second DOM/Realm; stale batches fail
+  atomically.
+
+## Fully functional browser critical path
+
+The next compatibility work is ordered by whether ordinary applications can
+boot and remain interactive, not by raw feature count:
+
+1. Complete classic-script lifecycle semantics: parser blocking during tree
+   construction, independent async completion tasks, ordered defer execution,
+   load/error events, `DOMContentLoaded`, cancellation on navigation, and
+   dynamic script insertion.
+2. Add ECMAScript modules with URL-keyed module maps, dependency fetching,
+   linking/evaluation, import maps, and top-level await. Module support must use
+   the same page Realm and network policy as classic scripts.
+3. Expand event targets and Web APIs needed by application bootstraps: complete
+   capture/target/bubble dispatch, default actions, `fetch`, abort signals,
+   URL APIs, storage policy, mutation observers, and navigation/location.
+4. Close layout and paint blockers after dynamic applications can boot:
+   intrinsic sizing, positioned/fixed/sticky layout, replaced elements,
+   stacking contexts, transforms, overflow/clipping, and font shaping.
+5. Add an end-to-end media pipeline: ranged resource loading, media element
+   state, MP4/DASH demuxing, H.264/AAC decode, audio output, A/V clocks,
+   compositing, and the Media Source Extensions subset used by major video
+   sites.
+
+The native browser now keeps one persistent `Page` per committed document.
+External classic-script completions are revision-bound, queued into that
+page's Realm and event loop, and DOM mutations feed subsequent display lists.
+Navigation and source replacement cancel outstanding script batches.
+
+Passing a hand-picked JavaScript subset or rendering a static first frame is
+not a completion criterion. A capability is complete only when the native
+browser and embedding API exercise the same persistent DOM, Realm, event loop,
+network loader, and rendering revisions.
 
 Remaining HTML parser work includes the adoption agency algorithm, templates,
 select-specific modes, foreign SVG/MathML content, form pointers, and the full

@@ -308,6 +308,14 @@ pub fn parse_stylesheet(source: &str) -> StyleSheet {
     sheet
 }
 
+/// Parse an HTML `style` attribute as a CSS declaration list.
+#[must_use]
+pub fn parse_declaration_list(source: &str) -> (Vec<Declaration>, Vec<StyleSheetDiagnostic>) {
+    let mut input = ParserInput::new(source);
+    let mut parser = Parser::new(&mut input);
+    parse_declarations(&mut parser)
+}
+
 pub(crate) fn css_wide_keyword(source: &str) -> Option<CssWideKeyword> {
     let mut input = ParserInput::new(source);
     let mut parser = Parser::new(&mut input);

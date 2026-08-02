@@ -62,6 +62,47 @@ pub struct ContentType {
     pub charset: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ByteRange {
+    From { start: u64 },
+    Inclusive { start: u64, end: u64 },
+    Suffix { length: u64 },
+}
+
+impl ByteRange {
+    /// Create an inclusive byte range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `end` precedes `start`.
+    pub fn inclusive(start: u64, end: u64) -> Result<Self, FetchError> {
+        if end < start {
+            return Err(FetchError::InvalidByteRange { start, end });
+        }
+        Ok(Self::Inclusive { start, end })
+    }
+
+    /// Create a suffix range requesting the final `length` bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a zero-length suffix.
+    pub fn suffix(length: u64) -> Result<Self, FetchError> {
+        if length == 0 {
+            return Err(FetchError::EmptyByteRangeSuffix);
+        }
+        Ok(Self::Suffix { length })
+    }
+
+    fn header_value(self) -> String {
+        match self {
+            Self::From { start } => format!("bytes={start}-"),
+            Self::Inclusive { start, end } => format!("bytes={start}-{end}"),
+            Self::Suffix { length } => format!("bytes=-{length}"),
+        }
+    }
+}
+
 /// A normalized HTTP GET request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchRequest {
@@ -72,6 +113,9 @@ pub struct FetchRequest {
     /// Optional serialized Cookie request header supplied by the browser
     /// context. The transport remains stateless and never owns a cookie jar.
     pub cookie: Option<String>,
+    /// Optional single HTTP byte range. Multipart ranges are intentionally not
+    /// exposed until the media/cache layer can consume multipart responses.
+    pub byte_range: Option<ByteRange>,
 }
 
 impl FetchRequest {
@@ -81,6 +125,7 @@ impl FetchRequest {
             url,
             accept: None,
             cookie: None,
+            byte_range: None,
         }
     }
 
@@ -93,6 +138,12 @@ impl FetchRequest {
     #[must_use]
     pub fn with_cookie(mut self, cookie: impl Into<String>) -> Self {
         self.cookie = Some(cookie.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_byte_range(mut self, byte_range: ByteRange) -> Self {
+        self.byte_range = Some(byte_range);
         self
     }
 }
@@ -114,7 +165,12 @@ impl Default for FetchConfig {
             max_body_bytes: 16 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             timeout: Duration::from_secs(30),
-            user_agent: format!("rENDER/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) \
+                 Chrome/120.0.0.0 Safari/537.36 rENDER/{}",
+                env!("CARGO_PKG_VERSION")
+            ),
         }
     }
 }
@@ -146,6 +202,8 @@ pub enum FetchError {
     RedirectLimitExceeded { limit: u32 },
     HeaderLimitExceeded { limit: usize },
     BodyLimitExceeded { limit: usize },
+    InvalidByteRange { start: u64, end: u64 },
+    EmptyByteRangeSuffix,
     Protocol(String),
     Io(String),
     WorkerStopped,
@@ -171,6 +229,12 @@ impl fmt::Display for FetchError {
             }
             Self::BodyLimitExceeded { limit } => {
                 write!(formatter, "response body limit exceeded ({limit} bytes)")
+            }
+            Self::InvalidByteRange { start, end } => {
+                write!(formatter, "invalid byte range {start}-{end}")
+            }
+            Self::EmptyByteRangeSuffix => {
+                formatter.write_str("byte-range suffix length must be non-zero")
             }
             Self::Protocol(message) => write!(formatter, "HTTP protocol error: {message}"),
             Self::Io(message) => write!(formatter, "network I/O error: {message}"),
@@ -244,19 +308,27 @@ impl HttpTransport {
         if let Some(cookie) = request.cookie.as_deref() {
             builder = builder.header("Cookie", cookie);
         }
+        if let Some(byte_range) = request.byte_range {
+            builder = builder.header("Range", &byte_range.header_value());
+        }
         let mut response = builder.call().map_err(|error| self.map_error(error))?;
 
         if cancel.is_cancelled() {
             return Err(FetchError::Cancelled);
         }
 
-        let final_url = Url::parse(&response.get_uri().to_string())
-            .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
+        let final_url = normalize_redirect_url(
+            Url::parse(&response.get_uri().to_string())
+                .map_err(|error| FetchError::InvalidUrl(error.to_string()))?,
+            &request.url,
+        );
         let redirect_chain = response
             .get_redirect_history()
             .unwrap_or_default()
             .iter()
-            .map(|uri| Url::parse(&uri.to_string()))
+            .map(|uri| {
+                Url::parse(&uri.to_string()).map(|url| normalize_redirect_url(url, &request.url))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
         let status = HttpStatus(response.status().as_u16());
@@ -309,6 +381,19 @@ impl HttpTransport {
             other => FetchError::Transport(other.to_string()),
         }
     }
+}
+
+fn normalize_redirect_url(mut url: Url, request_url: &Url) -> Url {
+    let path = url.path().to_owned();
+    let marker = format!("//{}/", request_url.host_str().unwrap_or_default());
+    if path
+        .get(..marker.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&marker))
+    {
+        let corrected = &path[marker.len() - 1..];
+        url.set_path(corrected);
+    }
+    url
 }
 
 fn map_io_error(error: &std::io::Error) -> FetchError {
@@ -390,7 +475,20 @@ fn parse_content_type(value: &str) -> Option<ContentType> {
 mod tests {
     use std::io;
 
-    use super::{ContentType, FetchError, map_io_error, parse_content_type};
+    use super::{
+        ContentType, FetchConfig, FetchError, map_io_error, normalize_redirect_url,
+        parse_content_type,
+    };
+    use url::Url;
+
+    #[test]
+    fn default_user_agent_is_browser_compatible_and_product_identifiable() {
+        let user_agent = FetchConfig::default().user_agent;
+        assert!(user_agent.starts_with("Mozilla/5.0 "));
+        assert!(user_agent.contains("AppleWebKit/537.36"));
+        assert!(user_agent.contains("Chrome/"));
+        assert!(user_agent.contains("rENDER/"));
+    }
 
     #[test]
     fn parses_content_type_and_charset_case_insensitively() {
@@ -425,5 +523,13 @@ mod tests {
             map_io_error(&error),
             FetchError::Io("peer reset connection".into())
         );
+    }
+
+    #[test]
+    fn preserves_protocol_relative_redirect_paths() {
+        let request = Url::parse("https://www.zhihu.com/").unwrap();
+        let parsed = Url::parse("https://www.zhihu.com//www.zhihu.com/signin?next=%2F").unwrap();
+        let normalized = normalize_redirect_url(parsed, &request);
+        assert_eq!(normalized.as_str(), "https://www.zhihu.com/signin?next=%2F");
     }
 }
