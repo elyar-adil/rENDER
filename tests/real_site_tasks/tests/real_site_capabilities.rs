@@ -100,7 +100,7 @@ fn netease_home_lazy_images_have_no_severe_discovery_diagnostics() {
         "163 lazy image discovery produced severe diagnostics: {severe:?}"
     );
 
-    let missing_source_warnings = plan
+    let missing_source_diagnostics = plan
         .diagnostics
         .iter()
         .filter(|diagnostic| {
@@ -109,11 +109,12 @@ fn netease_home_lazy_images_have_no_severe_discovery_diagnostics() {
                     ImageDiscoveryDiagnosticCode::MissingSource,
                 )
         })
-        .count();
+        .collect::<Vec<_>>();
     assert!(
-        missing_source_warnings >= 4,
-        "expected deferred 163 images to be warning-only MissingSource diagnostics, got {missing_source_warnings}: {:?}",
-        plan.diagnostics
+        missing_source_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity == ImageDiagnosticSeverity::Warning),
+        "deferred 163 images may only produce warning-level MissingSource diagnostics: {missing_source_diagnostics:?}"
     );
     assert!(plan.diagnostics.iter().any(|diagnostic| {
         diagnostic.code
@@ -122,8 +123,8 @@ fn netease_home_lazy_images_have_no_severe_discovery_diagnostics() {
             )
     }));
     assert!(
-        plan.resources.len() >= 2,
-        "expected immediate 163 image sources to remain fetchable"
+        plan.resources.len() >= 6,
+        "expected 163 src and supported lazy-source images to remain fetchable"
     );
 }
 
