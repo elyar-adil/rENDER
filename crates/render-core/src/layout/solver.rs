@@ -2996,6 +2996,50 @@ mod tests {
     }
 
     #[test]
+    fn legacy_163_news_display_values_keep_rows_in_normal_flow() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><ul id=news><li id=first><a>first</a></li><li id=second><a>second</a></li></ul></body>",
+            "html, body, ul { display:block; margin:0 } #news li { display:-webkit-box; height:30px; line-height:30px; overflow:hidden } a { display:inline }",
+            800.0,
+        );
+        let rect_for = |selector| {
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                .map(|fragment| fragment.rect)
+                .expect("news row fragment")
+        };
+
+        assert_eq!(rect_for("#first").origin.y, 0.0);
+        assert_eq!(rect_for("#second").origin.y, 30.0);
+        assert_eq!(rect_for("#first").size.height, 30.0);
+    }
+
+    #[test]
+    fn fixed_163_columns_honor_body_min_width_and_float_containment() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id=container><div id=area><div id=left></div><div id=right></div></div></div></body>",
+            "html, body { display:block; margin:0 } body { min-width:1220px } #container { display:block; width:1200px; margin-left:auto; margin-right:auto } #area { display:block; overflow:hidden } #left { display:block; float:left; width:860px; height:20px } #right { display:block; float:right; width:300px; height:20px }",
+            800.0,
+        );
+        let rect_for = |selector| {
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                .map(|fragment| fragment.rect)
+                .expect("163 layout fragment")
+        };
+
+        assert_eq!(rect_for("body").size.width, 1220.0);
+        assert_eq!(rect_for("#container").origin.x, 10.0);
+        assert_eq!(rect_for("#left").origin.x, 10.0);
+        assert_eq!(rect_for("#right").origin.x, 910.0);
+        assert_eq!(rect_for("#area").size.height, 20.0);
+    }
+
+    #[test]
     fn inline_text_collapses_spaces_wraps_and_preserves_text_node_identity() {
         let (output, _, layout) = pipeline(
             "<!doctype html><body><p id='p'>hello    world世界</p></body>",

@@ -260,8 +260,7 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
     let color = split_css_components(value)
         .into_iter()
         .find(|component| {
-            parse_typed_property("background-color", component)
-                .is_some_and(|result| result.is_ok())
+            parse_typed_property("background-color", component).is_some_and(|result| result.is_ok())
         })
         .unwrap_or("transparent")
         .to_owned();
@@ -281,23 +280,30 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
         })
         .unwrap_or("auto")
         .to_owned();
-    let position = if lower.contains("center") {
-        "center center"
-    } else if lower.contains("right") {
-        "right center"
-    } else if let Some(component) = split_css_components(value)
+    let positions: Vec<_> = split_css_components(value)
         .into_iter()
-        .find(|component| component.ends_with('%'))
-    {
-        Box::leak(format!("{component} {component}").into_boxed_str())
-    } else {
-        "0% 0%"
+        .filter(|component| {
+            component.ends_with('%')
+                || matches!(
+                    component.to_ascii_lowercase().as_str(),
+                    "left" | "center" | "right" | "top" | "bottom"
+                )
+        })
+        .collect();
+    let position = match positions.as_slice() {
+        [horizontal, vertical] => format!("{horizontal} {vertical}"),
+        [single] if matches!(single.to_ascii_lowercase().as_str(), "top" | "bottom") => {
+            format!("center {single}")
+        }
+        [single] if single.eq_ignore_ascii_case("center") => "center center".to_owned(),
+        [single] => format!("{single} 50%"),
+        _ => "0% 0%".to_owned(),
     };
     vec![
         ("background-color".to_owned(), color),
         ("background-image".to_owned(), image),
         ("background-repeat".to_owned(), repeat),
-        ("background-position".to_owned(), position.to_owned()),
+        ("background-position".to_owned(), position),
         ("background-size".to_owned(), size),
     ]
 }
@@ -751,9 +757,8 @@ mod tests {
     #[test]
     fn background_shorthand_resets_color_and_keeps_percentage_position() {
         let (dom, target) = document_and_target();
-        let sheet = parse_stylesheet(
-            "#target { background: rgba(0,0,0,.6) url(icon.png) no-repeat 50% }",
-        );
+        let sheet =
+            parse_stylesheet("#target { background: rgba(0,0,0,.6) url(icon.png) no-repeat 50% }");
         let style = cascade_element(
             &dom,
             target,
@@ -765,7 +770,9 @@ mod tests {
         );
 
         assert_eq!(
-            style.get("background-color").map(|value| value.value.as_str()),
+            style
+                .get("background-color")
+                .map(|value| value.value.as_str()),
             Some("rgba(0,0,0,.6)")
         );
         assert_eq!(
