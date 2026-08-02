@@ -90,16 +90,16 @@ impl CookieJar {
         self.cookies.is_empty()
     }
 
-    /// Absorb every `Set-Cookie` response field against the final response URL.
+    /// Absorb every `Set-Cookie` response field against each response URL in
+    /// the redirect chain and the final response URL.
     /// Invalid individual cookies are reported without hiding valid siblings.
     pub fn absorb_response(&mut self, response: &FetchResponse) -> Vec<CookieIssue> {
-        response
-            .headers
-            .iter()
-            .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
-            .filter_map(|header| std::str::from_utf8(&header.value).ok())
-            .filter_map(|value| self.set_cookie(&response.final_url, value).err())
-            .collect()
+        let mut issues = Vec::new();
+        for redirect in &response.redirects {
+            issues.extend(self.absorb_headers(&redirect.url, &redirect.headers));
+        }
+        issues.extend(self.absorb_headers(&response.final_url, &response.headers));
+        issues
     }
 
     /// Parse and store one Set-Cookie field. `Max-Age<=0` removes the matching
@@ -169,6 +169,15 @@ impl CookieJar {
     pub fn decorate_request(&self, mut request: FetchRequest) -> FetchRequest {
         request.cookie = self.cookie_header(&request.url);
         request
+    }
+
+    fn absorb_headers(&mut self, origin: &Url, headers: &[crate::Header]) -> Vec<CookieIssue> {
+        headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("set-cookie"))
+            .filter_map(|header| std::str::from_utf8(&header.value).ok())
+            .filter_map(|value| self.set_cookie(origin, value).err())
+            .collect()
     }
 }
 

@@ -141,13 +141,30 @@ impl PropertyDescriptor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     GetElementById,
+    QuerySelector,
+    QuerySelectorAll,
     CreateElement,
     SetAttribute,
+    GetAttribute,
+    HasAttribute,
+    RemoveAttribute,
     AppendChild,
+    RemoveChild,
+    InsertBefore,
+    RemoveNode,
+    Contains,
+    Matches,
+    Click,
     AddEventListener,
     RemoveEventListener,
     DispatchEvent,
     EventPreventDefault,
+    ClassListAdd,
+    ClassListRemove,
+    ClassListToggle,
+    ClassListContains,
+    ClassListItem,
+    ClassListToString,
     LocationToString,
     QueueMicrotask,
     PromiseResolve,
@@ -220,6 +237,7 @@ pub(crate) enum ObjectHost {
     Array,
     Document(NodeId),
     Node(NodeId),
+    ClassList(NodeId),
     NativeFunction(NativeFunction),
     BoundFunction {
         function: NativeFunction,
@@ -277,6 +295,7 @@ pub struct Realm {
     function_prototype: ObjectId,
     array_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
+    class_list_wrappers: BTreeMap<NodeId, ObjectId>,
 }
 
 impl Realm {
@@ -372,6 +391,7 @@ impl Realm {
             function_prototype,
             array_prototype,
             node_wrappers: BTreeMap::new(),
+            class_list_wrappers: BTreeMap::new(),
         }
     }
 
@@ -1104,6 +1124,19 @@ impl Realm {
             ..JsObject::default()
         });
         self.node_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    pub(crate) fn class_list_wrapper(&mut self, node: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.class_list_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(self.object_prototype),
+            host: ObjectHost::ClassList(node),
+            ..JsObject::default()
+        });
+        self.class_list_wrappers.insert(node, wrapper);
         wrapper
     }
 

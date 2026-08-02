@@ -48,15 +48,17 @@ runner 已实现的执行骨架遵循官方 `INTERPRETING.md`：
 7. 核对 `negative.phase` 与错误类型；
 8. `module`、`async` 和 `_FIXTURE` 先显式分类，不伪造通过率。
 
-第一份完成的全量基线为：
+2026-08-02 在新增 DOM/JS、布局和网络改动之后重新完成的全量基线为：
 
 ```text
 files=53869
 variants=98096
-pass=7953
-fail=83495
+pass=11628
+fail=79820
 skip=294
 unsupported=6354
+timeout=0
+crash=0
 ```
 
 这只是固定 revision、当前 runner 和当前引擎边界下的工程基线，不是完整 ECMAScript 合规率。该次扫描的主要失败簇包括未实现语法、默认 harness 编译失败、异步完成协议和模块执行；后续以失败簇为单位修复，禁止按具体测试路径写特判。

@@ -2,8 +2,8 @@
 //!
 //! This module performs no I/O. Browser/document coordinators turn discovery
 //! entries into network requests, then insert successfully decoded resources
-//! into [`ImageResources`]. Resource keys retain the exact `src` value so a
-//! response for an older dynamic attribute value can be rejected.
+//! into [`ImageResources`]. Resource keys retain the selected source value so
+//! a response for an older dynamic attribute value can be rejected.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -14,8 +14,8 @@ use std::sync::Arc;
 use image_codec::{ImageFormat as CodecImageFormat, ImageReader};
 use url::Url;
 
-use crate::dom::{Dom, DomRevision, ElementData, Namespace, NodeId, NodeKind};
 use crate::css::computed::ComputedStyle;
+use crate::dom::{Dom, DomRevision, ElementData, Namespace, NodeId, NodeKind};
 use crate::paint::{Color, ImageResourceId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +81,16 @@ pub enum ImageSource {
     CssBackground,
 }
 
+// These attributes are common compatibility hooks on Chinese news and portal
+// sites. They are only fallbacks when `src` is absent or empty; this is not a
+// general lazy-loading script or `srcset` implementation.
+const LAZY_IMAGE_SOURCE_ATTRIBUTES: &[&str] = &[
+    "data-src",
+    "data-original",
+    "data-lazy-src",
+    "data-actualsrc",
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredImage {
     pub source_order: usize,
@@ -114,26 +124,13 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
             diagnostics.push(ImageDiscoveryDiagnostic {
                 node: Some(node),
                 code: ImageDiscoveryDiagnosticCode::SrcsetUnsupported,
-                message: "img srcset candidate selection is not implemented; using src only"
+                message: "img srcset candidate selection is not implemented; using src or a supported lazy-source fallback"
                     .to_owned(),
             });
         }
-        let Some(source) = attribute(element, "src") else {
-            diagnostics.push(ImageDiscoveryDiagnostic {
-                node: Some(node),
-                code: ImageDiscoveryDiagnosticCode::MissingSource,
-                message: "img has no src attribute".to_owned(),
-            });
+        let Some(source) = element_image_source(element) else {
             continue;
         };
-        if source.is_empty() {
-            diagnostics.push(ImageDiscoveryDiagnostic {
-                node: Some(node),
-                code: ImageDiscoveryDiagnosticCode::EmptySource,
-                message: "empty img src is not fetched by this bounded loader".to_owned(),
-            });
-            continue;
-        }
         if source.len() > limits.max_url_bytes {
             diagnostics.push(ImageDiscoveryDiagnostic {
                 node: Some(node),
@@ -268,8 +265,8 @@ pub fn background_url(value: &str) -> Option<&str> {
     Some(inner.trim_matches(['\'', '"']))
 }
 
-/// Whether a completed request still represents the element's current `src`
-/// and current document-base resolution.
+/// Whether a completed request still represents the element's current image
+/// source and current document-base resolution.
 #[must_use]
 pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKey) -> bool {
     if key.source == ImageSource::CssBackground {
@@ -278,14 +275,16 @@ pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKe
     let Some(element) = html_element(dom, key.owner) else {
         return false;
     };
-    if element.local_name != "img" || attribute(element, "src") != Some(&key.source_snapshot) {
+    let Some(source) = element_image_source(element) else {
+        return false;
+    };
+    if element.local_name != "img" || source != key.source_snapshot {
         return false;
     }
     let (elements, _) = collect_elements(dom, usize::MAX);
     let mut diagnostics = Vec::new();
     let base = effective_base_url(dom, &elements, document_url, &mut diagnostics);
-    base.join(&key.source_snapshot)
-        .is_ok_and(|url| url == key.requested_url)
+    base.join(source).is_ok_and(|url| url == key.requested_url)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -756,6 +755,19 @@ fn attribute<'a>(element: &'a ElementData, name: &str) -> Option<&'a str> {
         .map(|attribute| attribute.value.as_str())
 }
 
+fn element_image_source(element: &ElementData) -> Option<&str> {
+    attribute(element, "src")
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+        .or_else(|| {
+            LAZY_IMAGE_SOURCE_ATTRIBUTES.iter().find_map(|name| {
+                attribute(element, name)
+                    .map(str::trim)
+                    .filter(|source| !source.is_empty())
+            })
+        })
+}
+
 fn pixel_len(width: u32, height: u32) -> Option<usize> {
     usize::try_from(width)
         .ok()?
@@ -821,8 +833,32 @@ mod tests {
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>();
         assert!(codes.contains(&ImageDiscoveryDiagnosticCode::SrcsetUnsupported));
-        assert!(codes.contains(&ImageDiscoveryDiagnosticCode::MissingSource));
-        assert!(codes.contains(&ImageDiscoveryDiagnosticCode::EmptySource));
+        assert!(!codes.contains(&ImageDiscoveryDiagnosticCode::MissingSource));
+        assert!(!codes.contains(&ImageDiscoveryDiagnosticCode::EmptySource));
+    }
+
+    #[test]
+    fn discovers_data_src_when_src_is_missing_or_empty_without_warning() {
+        let parsed = parse_document(
+            "<img id=lazy data-src='lazy.png'><img id=plain><img id=empty src='' data-src='fallback.png'><img src='normal.png' data-src='ignored.png'>",
+        );
+        let document_url = Url::parse("https://example.test/page/").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+
+        let urls = discovery
+            .resources
+            .iter()
+            .map(|resource| resource.key.requested_url.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://example.test/page/lazy.png",
+                "https://example.test/page/fallback.png",
+                "https://example.test/page/normal.png",
+            ]
+        );
+        assert!(discovery.diagnostics.is_empty());
     }
 
     #[test]
@@ -836,6 +872,23 @@ mod tests {
         parsed.dom.set_attribute(image, "alt", "changed").unwrap();
         assert!(image_key_is_current(&parsed.dom, &document_url, &key));
         parsed.dom.set_attribute(image, "src", "new.png").unwrap();
+        assert!(!image_key_is_current(&parsed.dom, &document_url, &key));
+    }
+
+    #[test]
+    fn stale_dynamic_lazy_source_is_rejected_without_rejecting_unrelated_mutations() {
+        let mut parsed = parse_document("<img id=hero data-src='old.png'><p>before</p>");
+        let document_url = Url::parse("https://example.test/").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+        let key = discovery.resources[0].key.clone();
+        let image = by_id(&parsed.dom, "hero");
+
+        parsed.dom.set_attribute(image, "alt", "changed").unwrap();
+        assert!(image_key_is_current(&parsed.dom, &document_url, &key));
+        parsed
+            .dom
+            .set_attribute(image, "data-src", "new.png")
+            .unwrap();
         assert!(!image_key_is_current(&parsed.dom, &document_url, &key));
     }
 

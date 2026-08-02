@@ -182,6 +182,8 @@ pub struct FetchResponse {
     pub final_url: Url,
     /// Redirect chain including the requested and final URLs.
     pub redirect_chain: Vec<Url>,
+    /// Redirect responses followed before the final response.
+    pub redirects: Vec<RedirectResponse>,
     pub status: HttpStatus,
     pub headers: Vec<Header>,
     pub content_type: Option<ContentType>,
@@ -248,6 +250,17 @@ impl std::error::Error for FetchError {}
 
 pub type FetchResult = Result<FetchResponse, FetchError>;
 
+/// Metadata for one HTTP redirect response followed by the transport.
+///
+/// Keeping these headers lets the browser context process cookies set during
+/// a redirect chain without making the transport own browser state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedirectResponse {
+    pub url: Url,
+    pub status: HttpStatus,
+    pub headers: Vec<Header>,
+}
+
 /// Cloneable blocking HTTP transport. Call this on a network thread, or use
 /// [`crate::NetworkWorker`] from GUI/event-loop code.
 #[derive(Clone)]
@@ -271,9 +284,10 @@ impl HttpTransport {
     pub fn new(config: FetchConfig) -> Self {
         let agent_config = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .max_redirects(config.redirect_limit)
+            // Redirects are handled here so intermediate response headers are
+            // available to the browser cookie jar.
+            .max_redirects(0)
             .max_redirects_will_error(true)
-            .save_redirect_history(true)
             .max_response_header_size(config.max_header_bytes)
             .timeout_global(Some(config.timeout))
             .user_agent(config.user_agent.clone())
@@ -301,65 +315,96 @@ impl HttpTransport {
             return Err(FetchError::Cancelled);
         }
 
-        let mut builder = self.agent.get(request.url.as_str());
-        if let Some(accept) = request.accept.as_deref() {
-            builder = builder.header("Accept", accept);
-        }
-        if let Some(cookie) = request.cookie.as_deref() {
-            builder = builder.header("Cookie", cookie);
-        }
-        if let Some(byte_range) = request.byte_range {
-            builder = builder.header("Range", &byte_range.header_value());
-        }
-        let mut response = builder.call().map_err(|error| self.map_error(error))?;
+        let mut current_url = request.url.clone();
+        let mut redirect_chain = vec![request.url.clone()];
+        let mut redirects = Vec::new();
+        let mut redirect_count = 0;
 
-        if cancel.is_cancelled() {
-            return Err(FetchError::Cancelled);
+        loop {
+            if cancel.is_cancelled() {
+                return Err(FetchError::Cancelled);
+            }
+
+            let mut builder = self.agent.get(current_url.as_str());
+            if let Some(accept) = request.accept.as_deref() {
+                builder = builder.header("Accept", accept);
+            }
+            // A caller-provided Cookie header was computed for the original
+            // URL. Reusing it only on same-origin hops avoids leaking it to a
+            // cross-origin redirect while retaining normal login redirects.
+            if same_origin(&current_url, &request.url)
+                && let Some(cookie) = request.cookie.as_deref()
+            {
+                builder = builder.header("Cookie", cookie);
+            }
+            if let Some(byte_range) = request.byte_range {
+                builder = builder.header("Range", &byte_range.header_value());
+            }
+            let mut response = builder.call().map_err(|error| self.map_error(error))?;
+
+            if cancel.is_cancelled() {
+                return Err(FetchError::Cancelled);
+            }
+
+            let status = HttpStatus(response.status().as_u16());
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| Header {
+                    name: name.as_str().to_owned(),
+                    value: value.as_bytes().to_vec(),
+                })
+                .collect::<Vec<_>>();
+            if is_redirect_status(status)
+                && self.config.redirect_limit > 0
+                && let Some(location) = header_text(&headers, "location")
+            {
+                if redirect_count >= self.config.redirect_limit {
+                    return Err(FetchError::RedirectLimitExceeded {
+                        limit: self.config.redirect_limit,
+                    });
+                }
+                let next_url = current_url
+                    .join(location.trim())
+                    .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
+                validate_scheme(&next_url)?;
+                redirects.push(RedirectResponse {
+                    url: current_url.clone(),
+                    status,
+                    headers,
+                });
+                current_url = next_url.clone();
+                redirect_chain.push(next_url);
+                redirect_count = redirect_count.saturating_add(1);
+                continue;
+            }
+
+            let final_url = normalize_redirect_url(
+                Url::parse(&response.get_uri().to_string())
+                    .map_err(|error| FetchError::InvalidUrl(error.to_string()))?,
+                &request.url,
+            );
+            if let Some(last) = redirect_chain.last_mut() {
+                *last = final_url.clone();
+            }
+            let content_type = header_text(&headers, "content-type").and_then(parse_content_type);
+            let body = read_bounded_body(
+                response.body_mut().as_reader(),
+                self.config.max_body_bytes,
+                cancel,
+            )?;
+
+            return Ok(FetchResponse {
+                requested_url: request.url.clone(),
+                final_url,
+                redirect_chain,
+                redirects,
+                status,
+                headers,
+                content_type,
+                body,
+            });
         }
-
-        let final_url = normalize_redirect_url(
-            Url::parse(&response.get_uri().to_string())
-                .map_err(|error| FetchError::InvalidUrl(error.to_string()))?,
-            &request.url,
-        );
-        let redirect_chain = response
-            .get_redirect_history()
-            .unwrap_or_default()
-            .iter()
-            .map(|uri| {
-                Url::parse(&uri.to_string()).map(|url| normalize_redirect_url(url, &request.url))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
-        let status = HttpStatus(response.status().as_u16());
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(name, value)| Header {
-                name: name.as_str().to_owned(),
-                value: value.as_bytes().to_vec(),
-            })
-            .collect::<Vec<_>>();
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_content_type);
-        let body = read_bounded_body(
-            response.body_mut().as_reader(),
-            self.config.max_body_bytes,
-            cancel,
-        )?;
-
-        Ok(FetchResponse {
-            requested_url: request.url.clone(),
-            final_url,
-            redirect_chain,
-            status,
-            headers,
-            content_type,
-            body,
-        })
     }
 
     fn map_error(&self, error: ureq::Error) -> FetchError {
@@ -381,6 +426,26 @@ impl HttpTransport {
             other => FetchError::Transport(other.to_string()),
         }
     }
+}
+
+fn is_redirect_status(status: HttpStatus) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+fn header_text<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|header| header.name.eq_ignore_ascii_case(name))
+        .and_then(|header| std::str::from_utf8(&header.value).ok())
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme().eq_ignore_ascii_case(right.scheme())
+        && left
+            .host_str()
+            .zip(right.host_str())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 fn normalize_redirect_url(mut url: Url, request_url: &Url) -> Url {

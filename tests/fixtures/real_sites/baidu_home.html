@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>百度一下，你就知道</title>
+  <link rel="stylesheet" href="/assets/site-shell.css">
+  <link rel="stylesheet" href="/assets/home.css">
+  <script src="/assets/home.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    body { background: #f5f6f7; color: #222; font-family: sans-serif; }
+    .site-header { background: #fff; border-bottom: 1px solid #e5e6e7; }
+    .header-inner, .page-shell { width: 960px; margin: 0 auto; }
+    .header-inner { min-height: 56px; display: flex; align-items: center; }
+    .brand { width: 96px; margin-right: 24px; }
+    .brand img { width: 80px; height: 28px; }
+    .site-nav a { margin-right: 16px; color: #333; text-decoration: none; }
+    main { display: block; }
+    .search-panel { margin-top: 36px; padding: 28px; background: #fff; }
+    .search-panel h1 { margin: 0 0 22px; font-size: 28px; }
+    .search-form { display: flex; align-items: center; }
+    .search-form label { margin-right: 8px; }
+    .search-form input { width: 560px; height: 38px; padding: 0 12px; border: 1px solid #c9ccd1; }
+    .search-form button { height: 40px; margin-left: 8px; padding: 0 22px; border: 0; background: #4e6ef2; color: #fff; }
+    .topic-grid { display: flex; margin-top: 18px; }
+    .topic-grid section { width: 33%; margin-right: 16px; padding: 18px; background: #fff; }
+    .topic-grid section:last-child { margin-right: 0; }
+    .topic-grid h2 { margin: 0 0 12px; font-size: 18px; }
+    .topic-grid a, .feed a { color: #315efb; text-decoration: none; }
+    .feed { margin-top: 18px; }
+    .feed article { margin-bottom: 14px; padding: 18px; background: #fff; }
+    .feed article h2 { margin: 0 0 8px; font-size: 20px; }
+    .feed article p { line-height: 1.7; }
+    .feed article img { width: 120px; height: 72px; object-fit: cover; }
+    #scroll-content { min-height: 1200px; padding-bottom: 48px; }
+    footer { margin-top: 24px; padding: 24px 0; color: #777; }
+  </style>
+</head>
+<body>
+  <header id="site-header" class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/"><img src="/img/baidu-logo.png" alt="百度"></a>
+      <nav class="site-nav" aria-label="百度服务">
+        <a href="/">网页</a>
+        <a href="/s?wd=新闻">新闻</a>
+        <a href="https://image.baidu.com/">图片</a>
+        <a href="https://map.baidu.com/">地图</a>
+        <a href="https://tieba.baidu.com/">贴吧</a>
+      </nav>
+    </div>
+  </header>
+  <div class="page-shell">
+    <main id="main-content">
+      <section id="search-panel" class="search-panel" aria-labelledby="page-heading">
+        <h1 id="page-heading">百度一下，你就知道</h1>
+        <form id="search-form" class="search-form" role="search" action="/s" method="get">
+          <label for="search-query">搜索</label>
+          <input id="search-query" name="wd" type="search" placeholder="输入搜索内容">
+          <button type="submit">百度一下</button>
+        </form>
+      </section>
+      <div id="scroll-content">
+        <section class="topic-grid" aria-label="热门服务">
+          <section>
+            <h2>常用服务</h2>
+            <a href="/s?wd=天气">天气</a>
+            <a href="/s?wd=翻译">翻译</a>
+            <a href="/s?wd=百科">百科</a>
+          </section>
+          <section>
+            <h2>今日热点</h2>
+            <a href="/s?wd=科技">科技资讯</a>
+            <a href="/s?wd=教育">教育资讯</a>
+            <a href="/s?wd=体育">体育资讯</a>
+          </section>
+          <section>
+            <h2>工具入口</h2>
+            <a href="/s?wd=计算器">计算器</a>
+            <a href="/s?wd=文库">文库</a>
+            <a href="/s?wd=视频">视频</a>
+          </section>
+        </section>
+        <section class="feed" aria-labelledby="feed-heading">
+          <h2 id="feed-heading">推荐内容</h2>
+          <article>
+            <h2><a href="/s?wd=浏览器">浏览器如何展示网页内容</a></h2>
+            <p>从地址栏输入网址，到页面中的标题、链接、表单和图片出现在视口中，浏览器需要完成解析、样式计算、布局和绘制。</p>
+            <img src="/img/feature-browser.png" alt="网页内容示意图">
+          </article>
+          <article>
+            <h2><a href="/s?wd=网页标准">网页标准与兼容性</a></h2>
+            <p>HTML 语义结构和 CSS 布局共同决定页面的可读性。长页面还必须保持正常的文档流，使用户可以继续向下滚动阅读。</p>
+          </article>
+          <article>
+            <h2><a href="/s?wd=搜索技巧">搜索技巧</a></h2>
+            <p>搜索表单使用 GET 方法提交查询词，结果页保留标题、结果链接和相关内容，方便用户继续查找信息。</p>
+          </article>
+        </section>
+        <section class="feed" aria-label="更多内容">
+          <article><p>更多内容用于保证离线验收能够覆盖长文档的块级布局和滚动区域。每一段都属于正常的文档流，不依赖脚本注入。</p></article>
+          <article><p>页面资源引用来自外部样式表、图片和脚本。验收测试只检查分类与加载顺序，并用本地伪响应替代网络请求。</p></article>
+          <article><p>这些内容是通用浏览器能力的缩减样本，不在运行时根据主机名选择特殊渲染路径。</p></article>
+        </section>
+      </div>
+    </main>
+    <footer><a href="/about">关于百度</a> <a href="/help">帮助中心</a></footer>
+  </div>
+</body>
+</html>

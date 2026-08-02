@@ -105,6 +105,19 @@ mod tests {
     }
 
     #[test]
+    fn common_chinese_sites_are_normalized_to_https_navigation() {
+        for input in ["www.zhihu.com", "www.baidu.com"] {
+            let NavigationIntent::Navigate(AddressInput::Url(url)) =
+                intent_from_address(input).expect("host input")
+            else {
+                panic!("host input should be a URL navigation");
+            };
+            assert_eq!(url.scheme(), "https");
+            assert_eq!(url.path(), "/");
+        }
+    }
+
+    #[test]
     fn network_url_is_not_a_local_path() {
         let intent = intent_from_address("http://example.test/a").expect("valid URL input");
         let NavigationIntent::Navigate(input) = intent else {

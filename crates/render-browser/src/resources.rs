@@ -342,18 +342,23 @@ fn absolutize_css_urls(value: &str, base_url: &Url) -> String {
     let lower = value.to_ascii_lowercase();
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0;
-    while let Some(relative_start) = lower[cursor..].find("url(") {
-        let start = cursor + relative_start;
+    while let Some((start, open)) = find_css_url_function(&lower, cursor) {
         output.push_str(&value[cursor..start]);
-        let content_start = start + 4;
-        let Some(relative_end) = value[content_start..].find(')') else {
+        let content_start = open + 1;
+        let Some(end) = find_css_url_end(value, content_start) else {
             output.push_str(&value[start..]);
             return output;
         };
-        let end = content_start + relative_end;
-        let reference = value[content_start..end]
-            .trim()
-            .trim_matches(['\'', '"']);
+        let reference = value[content_start..end].trim();
+        let reference = reference
+            .strip_prefix('"')
+            .and_then(|reference| reference.strip_suffix('"'))
+            .or_else(|| {
+                reference
+                    .strip_prefix('\'')
+                    .and_then(|reference| reference.strip_suffix('\''))
+            })
+            .unwrap_or(reference);
         if let Ok(url) = base_url.join(reference) {
             output.push_str("url(\"");
             output.push_str(url.as_str());
@@ -365,6 +370,56 @@ fn absolutize_css_urls(value: &str, base_url: &Url) -> String {
     }
     output.push_str(&value[cursor..]);
     output
+}
+
+fn find_css_url_function(value: &str, from: usize) -> Option<(usize, usize)> {
+    let mut cursor = from;
+    while let Some(relative_start) = value[cursor..].find("url") {
+        let start = cursor + relative_start;
+        let mut open = start + 3;
+        while value
+            .as_bytes()
+            .get(open)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            open += 1;
+        }
+        let valid_start = start == 0
+            || value
+                .as_bytes()
+                .get(start - 1)
+                .is_some_and(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-');
+        if value.as_bytes().get(open) == Some(&b'(') && valid_start {
+            return Some((start, open));
+        }
+        cursor = start + 3;
+    }
+    None
+}
+
+fn find_css_url_end(value: &str, from: usize) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (offset, byte) in value.as_bytes().iter().copied().enumerate().skip(from) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(expected) = quote {
+            if byte == expected {
+                quote = None;
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b')' {
+            return Some(offset);
+        }
+    }
+    None
 }
 
 fn slot_url(slot: &render_core::document::AuthorStyleSlot) -> Option<&Url> {
@@ -486,8 +541,8 @@ mod tests {
     use render_net::{BatchOptions, CancelToken, FetchConfig, FetchError, HttpTransport, Url};
 
     use super::{
-        CSS_ACCEPT, StylesheetDiagnosticCode, apply_stylesheet_batch, decode_css_bytes,
-        plan_external_style_sheets,
+        CSS_ACCEPT, StylesheetDiagnosticCode, absolutize_css_urls, apply_stylesheet_batch,
+        decode_css_bytes, plan_external_style_sheets,
     };
 
     #[test]
@@ -704,6 +759,17 @@ mod tests {
         let declared = decode_css_bytes(&legacy_bytes, None);
         assert_eq!(declared.encoding.name(), "Shift_JIS");
         assert!(declared.text.contains("日本"));
+    }
+
+    #[test]
+    fn css_url_references_resolve_against_the_final_stylesheet_url() {
+        let base = Url::parse("https://cdn.example/assets/css/main.css").expect("base URL");
+        let value = "url( ../images/logo.png ) url('/icons/site.svg')";
+
+        assert_eq!(
+            absolutize_css_urls(value, &base),
+            "url(\"https://cdn.example/assets/images/logo.png\") url(\"https://cdn.example/icons/site.svg\")"
+        );
     }
 
     fn serve(

@@ -116,6 +116,47 @@ fn fixed_box_uses_viewport_and_does_not_advance_document_flow() {
 }
 
 #[test]
+fn overflow_hidden_contains_floats_in_auto_height() {
+    let (dom, output) = layout(
+        "<!doctype html><body><div id='clip'><div id='float'></div></div><div id='after'></div></body>",
+        &format!(
+            "{RESET} #clip {{ width:200px; overflow:hidden }} #float {{ float:left; width:60px; height:40px }} #after {{ height:10px }}"
+        ),
+        PhysicalSize {
+            width: 320.0,
+            height: 200.0,
+        },
+    );
+
+    assert_eq!(rect(&dom, &output, "#clip").size.height, 40.0);
+    assert_eq!(rect(&dom, &output, "#after").origin.y, 40.0);
+}
+
+#[test]
+fn relative_offsets_move_the_subtree_without_changing_document_flow() {
+    let (dom, output) = layout(
+        "<!doctype html><body><div id='before'></div><div id='relative'><div id='absolute'></div></div><div id='after'></div></body>",
+        &format!(
+            "{RESET} #before {{ height:20px }} #relative {{ position:relative; left:15px; top:10px; width:100px; height:30px }} #absolute {{ position:absolute; left:0; top:0; width:10px; height:10px }} #after {{ height:20px }}"
+        ),
+        PhysicalSize {
+            width: 320.0,
+            height: 200.0,
+        },
+    );
+
+    assert_eq!(
+        rect(&dom, &output, "#relative"),
+        PhysicalRect::new(15.0, 30.0, 100.0, 30.0)
+    );
+    assert_eq!(
+        rect(&dom, &output, "#absolute"),
+        PhysicalRect::new(15.0, 30.0, 10.0, 10.0)
+    );
+    assert_eq!(rect(&dom, &output, "#after").origin.y, 50.0);
+}
+
+#[test]
 fn opposing_insets_stretch_auto_sized_absolute_box() {
     let (dom, output) = layout(
         "<!doctype html><body><div id='container'><div id='absolute'></div></div></body>",

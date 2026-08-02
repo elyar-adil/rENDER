@@ -170,6 +170,29 @@ class TestVisibilityHidden:
         assert len(hidden_texts) == 0, "visibility:hidden text should not be painted"
         assert len(blue_rects) >= 1, "visible sibling should still be painted"
 
+    def test_hidden_parent_can_reveal_explicitly_visible_descendant(self):
+        """visibility is inherited, but a visible descendant can override it."""
+        from tests.render_helper import render, get_display_list
+        from rendering.display_list import DrawRect
+
+        doc = render('''
+        <html><head><style>body { margin: 0; }</style></head>
+        <body>
+          <div style="visibility:hidden; width:200px; height:50px;
+                      background-color:red">
+            <div style="visibility:visible; width:100px; height:20px;
+                        background-color:blue"></div>
+          </div>
+        </body></html>
+        ''')
+        dl = get_display_list(doc)
+
+        red_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'red']
+        blue_rects = [cmd for cmd in dl if isinstance(cmd, DrawRect) and cmd.color == 'blue']
+
+        assert len(red_rects) == 0, "hidden parent background should not be painted"
+        assert len(blue_rects) >= 1, "visible descendant should still be painted"
+
 
 # ===========================================================================
 # 4. overflow: hidden – CONTENT SHOULD BE CLIPPED

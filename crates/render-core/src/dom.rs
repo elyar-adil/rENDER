@@ -750,6 +750,34 @@ impl Dom {
         Ok(())
     }
 
+    /// Remove an HTML attribute using ASCII case-insensitive local-name
+    /// matching. Missing attributes are ignored, as in the platform DOM.
+    pub fn remove_attribute(&mut self, element: NodeId, local_name: &str) -> Result<(), DomError> {
+        let NodeKind::Element(data) = self.kind(element)? else {
+            return Err(DomError::invalid_node_type("attributes require an element"));
+        };
+        let normalized = if data.namespace == Namespace::Html {
+            local_name.to_ascii_lowercase()
+        } else {
+            local_name.to_owned()
+        };
+        let node = self.node_mut(element)?;
+        let NodeKind::Element(data) = &mut node.kind else {
+            unreachable!("element kind was checked")
+        };
+        let removed = data.attributes.iter().position(|attribute| {
+            attribute.namespace.is_none() && attribute.local_name == normalized
+        });
+        if let Some(index) = removed {
+            data.attributes.remove(index);
+            self.record_mutations([MutationKind::Attribute {
+                target: element,
+                local_name: normalized,
+            }]);
+        }
+        Ok(())
+    }
+
     /// Return an attribute value from an element.
     ///
     /// # Errors

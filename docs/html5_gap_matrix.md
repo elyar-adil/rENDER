@@ -12,9 +12,9 @@
 
 | 测试层 | 当前状态 | 下一道门槛 |
 | --- | --- | --- |
-| Rust 单元/集成测试 | `render-core` 247 项通过 | 每个规范修复必须先有最小回归测试 |
-| test262 | 固定 revision 共 98,096 变体，7,953 pass、83,495 fail、6,354 unsupported、294 skip | 按失败簇提升；已通过集合不得回退 |
-| WPT | 注册表记录了目录，但尚无可重复执行和结果汇总入口 | 导入固定 revision，先运行 CSS Syntax/Cascade/Block/Flex/Text/Background 子集 |
+| Rust 单元/集成测试 | `render-core` 249 项通过，workspace 全量通过 | 每个规范修复必须先有最小回归测试 |
+| test262 | 固定 revision 共 98,096 变体，11,628 pass、79,820 fail、6,354 unsupported、294 skip，无 timeout/crash | 按失败簇提升；已通过集合不得回退 |
+| WPT | 官方固定 revision 的完整外部 checkout 和静态 reftest 批量 runner 已接入，尚未因网络限制完成 checkout 执行 | 运行 `tools/run-wpt-reftests.py`，再单独接入 testharness/navigation |
 | 浏览器视觉对比 | 有 fixture 和 Chromium 对比工具，尚未形成规范分组基线 | 每个布局簇提供参考截图或几何断言 |
 
 test262 的当前 pass 约占全部变体的 8.1%，不能描述为 JavaScript 已完成。WPT runner 建立前，任何 CSS/DOM 子系统也不能标为 `Conformant`。

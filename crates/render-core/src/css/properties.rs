@@ -1298,9 +1298,15 @@ fn parse_property<'i>(
     input: &mut Parser<'i, '_>,
 ) -> CssResult<'i, TypedPropertyValue> {
     match property {
-        "background-image" => parse_background_image(input).map(TypedPropertyValue::BackgroundImage),
-        "background-repeat" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundRepeat),
-        "background-position" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundPosition),
+        "background-image" => {
+            parse_background_image(input).map(TypedPropertyValue::BackgroundImage)
+        }
+        "background-repeat" => {
+            parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundRepeat)
+        }
+        "background-position" => {
+            parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundPosition)
+        }
         "background-size" => parse_raw_single_layer(input).map(TypedPropertyValue::BackgroundSize),
         "color"
         | "background-color"
@@ -1574,7 +1580,9 @@ fn parse_single_display(value: &str) -> Option<Display> {
         "run-in" => normal(DisplayOutside::RunIn, DisplayInside::Flow, false),
         "flow-root" => normal(DisplayOutside::Block, DisplayInside::FlowRoot, false),
         "table" => normal(DisplayOutside::Block, DisplayInside::Table, false),
-        "flex" => normal(DisplayOutside::Block, DisplayInside::Flex, false),
+        "flex" | "-webkit-box" | "-webkit-flex" | "-ms-flexbox" => {
+            normal(DisplayOutside::Block, DisplayInside::Flex, false)
+        }
         "grid" => normal(DisplayOutside::Block, DisplayInside::Grid, false),
         "ruby" => normal(DisplayOutside::Inline, DisplayInside::Ruby, false),
         "list-item" => normal(DisplayOutside::Block, DisplayInside::Flow, true),
@@ -2417,6 +2425,13 @@ mod tests {
             super::expand_flex_shorthand("1"),
             Some(("1".to_owned(), "1".to_owned(), "0%".to_owned()))
         );
+    }
+
+    #[test]
+    fn accepts_legacy_flex_display_values_used_by_163() {
+        for value in ["-webkit-box", "-webkit-flex", "-ms-flexbox"] {
+            assert_eq!(parse("display", value).to_css(), "flex", "{value}");
+        }
     }
 
     #[test]

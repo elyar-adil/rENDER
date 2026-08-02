@@ -104,7 +104,13 @@ pub struct ImageBatchApplication {
 
 #[must_use]
 pub fn plan_images(document: &Document, document_url: &Url, limits: ImageLimits) -> ImageFetchPlan {
-    plan_images_with_styles(document, &BTreeMap::new(), document_url, &ImageResources::default(), limits)
+    plan_images_with_styles(
+        document,
+        &BTreeMap::new(),
+        document_url,
+        &ImageResources::default(),
+        limits,
+    )
 }
 
 #[must_use]
@@ -124,7 +130,11 @@ pub fn plan_images_with_styles(
     let resources = discovery
         .resources
         .into_iter()
-        .filter(|image| loaded.get_for_node_url(image.key.owner, &image.key.requested_url).is_none())
+        .filter(|image| {
+            loaded
+                .get_for_node_url(image.key.owner, &image.key.requested_url)
+                .is_none()
+        })
         .map(|image| ImageFetch {
             source_order: image.source_order,
             request: FetchRequest::get(image.key.requested_url.clone()).with_accept(IMAGE_ACCEPT),
@@ -232,35 +242,72 @@ fn apply_response(
         ));
         return;
     }
-    let Some(content_type) = response.content_type.as_ref() else {
-        application.diagnostics.push(resource_diagnostic(
-            resource,
-            ImageDiagnosticSeverity::Error,
-            ImageResourceDiagnosticCode::MissingContentType,
-            "image response omitted Content-Type".to_owned(),
-        ));
-        return;
+    let sniffed_format = sniff_image_format(&response.body);
+    let format = match response.content_type.as_ref() {
+        Some(content_type) => {
+            if let Some(declared_format) = ImageFormat::from_media_type(&content_type.media_type) {
+                declared_format
+            } else if is_generic_binary_media_type(&content_type.media_type)
+                && let Some(sniffed_format) = sniffed_format
+            {
+                application.diagnostics.push(resource_diagnostic(
+                    resource,
+                    ImageDiagnosticSeverity::Warning,
+                    ImageResourceDiagnosticCode::UnsupportedContentType,
+                    format!(
+                        "image response declared generic content type '{}'; using sniffed '{}'",
+                        content_type.media_type,
+                        sniffed_format.media_type()
+                    ),
+                ));
+                sniffed_format
+            } else {
+                application.diagnostics.push(resource_diagnostic(
+                    resource,
+                    ImageDiagnosticSeverity::Error,
+                    ImageResourceDiagnosticCode::UnsupportedContentType,
+                    format!(
+                        "image response has unsupported content type '{}'",
+                        content_type.media_type
+                    ),
+                ));
+                return;
+            }
+        }
+        None => {
+            let Some(sniffed_format) = sniffed_format else {
+                application.diagnostics.push(resource_diagnostic(
+                    resource,
+                    ImageDiagnosticSeverity::Error,
+                    ImageResourceDiagnosticCode::MissingContentType,
+                    "image response omitted Content-Type and has no supported image signature"
+                        .to_owned(),
+                ));
+                return;
+            };
+            application.diagnostics.push(resource_diagnostic(
+                resource,
+                ImageDiagnosticSeverity::Warning,
+                ImageResourceDiagnosticCode::MissingContentType,
+                format!(
+                    "image response omitted Content-Type; using sniffed '{}'",
+                    sniffed_format.media_type()
+                ),
+            ));
+            sniffed_format
+        }
     };
-    let Some(format) = ImageFormat::from_media_type(&content_type.media_type) else {
-        application.diagnostics.push(resource_diagnostic(
-            resource,
-            ImageDiagnosticSeverity::Error,
-            ImageResourceDiagnosticCode::UnsupportedContentType,
-            format!(
-                "image response has unsupported content type '{}'",
-                content_type.media_type
-            ),
-        ));
-        return;
-    };
-    if sniff_image_format(&response.body) != Some(format) {
+    if sniffed_format != Some(format) {
         application.diagnostics.push(resource_diagnostic(
             resource,
             ImageDiagnosticSeverity::Error,
             ImageResourceDiagnosticCode::ContentTypeMismatch,
             format!(
                 "image bytes do not match declared content type '{}'",
-                content_type.media_type
+                response
+                    .content_type
+                    .as_ref()
+                    .map_or("unknown", |content_type| content_type.media_type.as_str())
             ),
         ));
         return;
@@ -297,6 +344,13 @@ fn apply_response(
             error.to_string(),
         )),
     }
+}
+
+fn is_generic_binary_media_type(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        "application/octet-stream" | "binary/octet-stream"
+    )
 }
 
 fn discovery_diagnostic(diagnostic: ImageDiscoveryDiagnostic) -> ImageResourceDiagnostic {
@@ -359,7 +413,7 @@ mod tests {
 
     #[test]
     fn local_parallel_batch_loads_decodes_and_indexes_images() {
-        let (base, server) = serve(2, "image/png", PNG);
+        let (base, server) = serve(2, Some("image/png"), PNG);
         let document = Document::parse("<base href='/assets/'><img src='a.png'><img src='b.png'>");
         let plan = plan_images(&document, &base, ImageLimits::default());
         assert_eq!(plan.resources.len(), 2);
@@ -399,7 +453,7 @@ mod tests {
 
     #[test]
     fn changed_src_rejects_the_completed_response_as_stale() {
-        let (base, server) = serve(1, "image/png", PNG);
+        let (base, server) = serve(1, Some("image/png"), PNG);
         let mut document = Document::parse("<img src='old.png'>");
         let plan = plan_images(&document, &base, ImageLimits::default());
         let response = transport().fetch_batch(
@@ -432,7 +486,7 @@ mod tests {
 
     #[test]
     fn content_type_mismatch_fails_closed() {
-        let (base, server) = serve(1, "image/jpeg", PNG);
+        let (base, server) = serve(1, Some("image/jpeg"), PNG);
         let document = Document::parse("<img src='not-a-jpeg.jpg'>");
         let plan = plan_images(&document, &base, ImageLimits::default());
         let results = transport().fetch_batch(
@@ -455,6 +509,35 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn missing_content_type_uses_a_supported_image_signature() {
+        let (base, server) = serve(1, None, PNG);
+        let document = Document::parse("<img src='image'>");
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        server.join().expect("server thread");
+
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+
+        assert_eq!(application.loaded.len(), 1);
+        assert_eq!(images.len(), 1);
+        assert!(application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == ImageResourceDiagnosticCode::MissingContentType
+                && diagnostic.severity == super::ImageDiagnosticSeverity::Warning
+        }));
+    }
+
     fn transport() -> HttpTransport {
         HttpTransport::new(FetchConfig {
             timeout: Duration::from_secs(2),
@@ -464,7 +547,7 @@ mod tests {
 
     fn serve(
         expected_connections: usize,
-        content_type: &'static str,
+        content_type: Option<&'static str>,
         body: &'static [u8],
     ) -> (Url, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local server");
@@ -485,7 +568,7 @@ mod tests {
         )
     }
 
-    fn serve_one(mut stream: TcpStream, content_type: &str, body: &[u8]) {
+    fn serve_one(mut stream: TcpStream, content_type: Option<&str>, body: &[u8]) {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
@@ -498,8 +581,10 @@ mod tests {
             }
             request.extend_from_slice(&buffer[..count]);
         }
+        let content_type =
+            content_type.map_or_else(String::new, |value| format!("Content-Type: {value}\r\n"));
         let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(headers.as_bytes()).expect("write headers");

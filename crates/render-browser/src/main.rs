@@ -20,10 +20,7 @@ use render_browser::chrome::{
 use render_browser::editor::{AddressCommand, AddressEditor, Clipboard, NativeClipboard};
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::home::{HOME_HTML, HOME_TITLE};
-use render_browser::images::{
-    ImageFetchPlan, apply_image_batch, plan_images_with_styles,
-};
-use render_core::css::computed::ComputedStyle;
+use render_browser::images::{ImageFetchPlan, apply_image_batch, plan_images_with_styles};
 use render_browser::model::{PageScrollState, TabId, TabIntent, TabModel};
 use render_browser::navigation::{NavigationIntent, NavigationTarget, intent_from_address};
 use render_browser::resources::{
@@ -38,6 +35,7 @@ use render_browser::worker::{
     CompletedRender, RenderCancellation, RenderFailure, RenderIdentity, RenderJob, RenderOffset,
     RenderViewport, RenderWorker, RenderWorkerOptions,
 };
+use render_core::css::computed::ComputedStyle;
 use render_core::document::{
     Document, DocumentBackends, DocumentRenderOptions, ExternalStyleSheets,
 };

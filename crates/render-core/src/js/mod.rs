@@ -281,6 +281,74 @@ mod tests {
     }
 
     #[test]
+    fn selector_class_list_and_dom_insertion_drive_the_shared_tree() {
+        let mut parsed = parse_document(
+            "<!doctype html><main id='app'><article class='card first'>one</article><article class='card'>two</article></main>",
+        );
+        let mut runtime = JsRuntime::new(&parsed.dom);
+
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r##"
+                    const root = document.querySelector("#app");
+                    const cards = root.querySelectorAll("article.card");
+                    cards[0].classList.add("selected", "visible");
+                    cards[1].classList.toggle("card", false);
+                    const badge = document.createElement("span");
+                    badge.className = "badge";
+                    badge.textContent = "ok";
+                    root.insertBefore(badge, cards[0]);
+                    const selected = root.querySelector(".selected");
+                    const result = selected.classList.contains("visible") &&
+                        selected.classList.item(0) === "card" &&
+                        selected.classList.toString() === "card first selected visible" &&
+                        root.querySelectorAll(".card").length === 1 &&
+                        root.firstChild.className === "badge" &&
+                        root.textContent === "okonetwo";
+                "##,
+            )
+            .expect("selector and classList APIs should mutate the shared DOM");
+
+        assert_eq!(
+            runtime.realm().global("result"),
+            Some(super::JsValue::Boolean(true))
+        );
+    }
+
+    #[test]
+    fn click_dispatches_listener_property_handler_and_bubbles() {
+        let mut parsed =
+            parse_document("<!doctype html><main id='app'><button id='go'>go</button></main>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r##"
+                    const app = document.querySelector("#app");
+                    const button = document.querySelector("#go");
+                    let log = "";
+                    app.addEventListener("click", function(event) {
+                        log = log + event.type + event.target.id + event.currentTarget.id;
+                    });
+                    button.addEventListener("click", function() { log = log + "listener"; });
+                    button.onclick = function() { log = log + "property"; };
+                    button.click();
+                    const result = log;
+                "##,
+            )
+            .expect("click should invoke listeners, onclick, and bubbling ancestors");
+
+        assert_eq!(
+            runtime.realm().global("result"),
+            Some(super::JsValue::String(
+                "listenerpropertyclickgoapp".to_owned(),
+            ))
+        );
+    }
+
+    #[test]
     fn declaration_lists_are_instantiated_without_internal_panics() {
         let mut parsed = parse_document("<!doctype html><p></p>");
         let mut runtime = JsRuntime::new(&parsed.dom);

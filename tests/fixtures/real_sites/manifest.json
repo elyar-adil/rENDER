@@ -1,0 +1,59 @@
+{
+  "fixtures": [
+    {
+      "name": "baidu_home",
+      "source_url": "https://www.baidu.com/",
+      "title": "百度一下，你就知道",
+      "required_sections": ["header", "nav", "main", "section", "article"],
+      "search_action": "/s",
+      "search_name": "wd",
+      "minimum_links": 8,
+      "minimum_scroll_text": 240
+    },
+    {
+      "name": "baidu_search",
+      "source_url": "https://www.baidu.com/s?wd=浏览器",
+      "title": "浏览器 - 百度搜索",
+      "required_sections": ["header", "nav", "main", "section", "article"],
+      "search_action": "/s",
+      "search_name": "wd",
+      "minimum_links": 8,
+      "minimum_scroll_text": 240
+    },
+    {
+      "name": "zhihu_home",
+      "source_url": "https://www.zhihu.com/",
+      "title": "知乎 - 有问题，就会有答案",
+      "required_sections": ["header", "nav", "main", "section", "article"],
+      "search_action": "/search",
+      "search_name": "q",
+      "minimum_links": 8,
+      "minimum_scroll_text": 240
+    },
+    {
+      "name": "zhihu_article",
+      "source_url": "https://zhuanlan.zhihu.com/p/123456789",
+      "title": "如何判断一个浏览器内核是否真的可用？",
+      "required_sections": ["header", "nav", "main", "article", "aside"],
+      "search_action": "/search",
+      "search_name": "q",
+      "minimum_links": 6,
+      "minimum_scroll_text": 300
+    },
+    {
+      "name": "163_home",
+      "source_url": "https://www.163.com/",
+      "title": "网易",
+      "required_sections": ["header", "nav", "main", "section", "article", "aside"],
+      "search_action": "/search",
+      "search_name": "query",
+      "minimum_links": 12,
+      "minimum_scroll_text": 900,
+      "minimum_images": 5,
+      "lazy_image_minimum": 4,
+      "lazy_data_src_minimum": 4,
+      "srcset_image_minimum": 1,
+      "resource_hosts": ["static.ws.126.net", "nimg.ws.126.net"]
+    }
+  ]
+}

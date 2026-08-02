@@ -7,7 +7,7 @@ use crate::css::properties::{
     AlignItems, AutoLengthPercentage, BorderStyle, BorderWidth, BoxSizing, Clear, Display,
     DisplayInside, FlexBasis, FlexDirection, Float, Gap, GridAutoRepeat, GridTemplate, GridTrack,
     GridTrackBreadth, JustifyContent, LengthPercentage, LengthResolutionContext, MaxSize,
-    NumericType, Position, Size, TypedPropertyValue,
+    NumericType, Overflow, Position, Size, TypedPropertyValue,
 };
 use crate::dom::{Dom, Node, NodeId, NodeKind};
 use crate::image::ImageResources;
@@ -526,6 +526,14 @@ impl Solver<'_> {
                 });
         let top = self.resolve_inset(style, "top", containing.size.height, node.source);
         let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
+        let relative_offset = if position == Position::Relative {
+            (
+                left.map_or_else(|| right.map_or(0.0, |right| -right), |left| left),
+                top.map_or_else(|| bottom.map_or(0.0, |bottom| -bottom), |top| top),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let context = match node.kind {
             FormattingNodeKind::BlockContainer { context }
             | FormattingNodeKind::AtomicInline { context } => context,
@@ -621,6 +629,9 @@ impl Solver<'_> {
                     }
                 }
                 let flow_height = (cursor_y - content_y).max(0.0);
+                // A non-visible overflow establishes a block formatting
+                // context, so floats inside it contribute to its auto height
+                // instead of escaping into the parent flow.
                 let contains_floats = matches!(node.kind, FormattingNodeKind::AtomicInline { .. })
                     || matches!(
                         style.and_then(|style| style.typed("display")),
@@ -628,7 +639,8 @@ impl Solver<'_> {
                             inside: DisplayInside::FlowRoot,
                             ..
                         }))
-                    );
+                    )
+                    || establishes_block_formatting_context(style);
                 let float_height = floats
                     .iter()
                     .map(|area| area.rect.bottom() - content_y)
@@ -674,6 +686,9 @@ impl Solver<'_> {
             }
         }
         self.set_children(fragment, children);
+        if position == Position::Relative {
+            self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);
+        }
         if out_of_flow {
             if specified_content_height.is_none()
                 && let (Some(top), Some(bottom)) = (top, bottom)
@@ -2601,6 +2616,15 @@ fn position(style: Option<&ComputedStyle>) -> Position {
         Some(TypedPropertyValue::Position(position)) => *position,
         _ => Position::Static,
     }
+}
+
+fn establishes_block_formatting_context(style: Option<&ComputedStyle>) -> bool {
+    ["overflow-x", "overflow-y"].into_iter().any(|property| {
+        matches!(
+            style.and_then(|style| style.typed(property)),
+            Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
+        )
+    })
 }
 
 fn float_band(floats: &[FloatArea], y: f32, mut left: f32, mut right: f32) -> (f32, f32) {

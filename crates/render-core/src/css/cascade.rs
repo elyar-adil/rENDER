@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::dom::{Dom, NodeId};
 
-use super::properties::{expand_flex_shorthand, expand_gap_shorthand};
+use super::properties::{expand_flex_shorthand, expand_gap_shorthand, parse_typed_property};
 use super::selector::{MatchContext, Specificity, matching_specificity};
 use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
 
@@ -255,7 +255,16 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
 
 fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
     let lower = value.to_ascii_lowercase();
-    let image = extract_css_url(value).map_or_else(|| "none".to_owned(), |url| format!("url({url})"));
+    let image =
+        extract_css_url(value).map_or_else(|| "none".to_owned(), |url| format!("url({url})"));
+    let color = split_css_components(value)
+        .into_iter()
+        .find(|component| {
+            parse_typed_property("background-color", component)
+                .is_some_and(|result| result.is_ok())
+        })
+        .unwrap_or("transparent")
+        .to_owned();
     let repeat = ["no-repeat", "repeat-x", "repeat-y", "repeat"]
         .into_iter()
         .find(|keyword| lower.split_ascii_whitespace().any(|part| part == *keyword))
@@ -264,22 +273,60 @@ fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
     let size = value
         .split_once('/')
         .map(|(_, tail)| tail.split_ascii_whitespace().next().unwrap_or("auto"))
-        .filter(|part| matches!(part.to_ascii_lowercase().as_str(), "cover" | "contain" | "auto"))
+        .filter(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "cover" | "contain" | "auto"
+            )
+        })
         .unwrap_or("auto")
         .to_owned();
     let position = if lower.contains("center") {
         "center center"
     } else if lower.contains("right") {
         "right center"
+    } else if let Some(component) = split_css_components(value)
+        .into_iter()
+        .find(|component| component.ends_with('%'))
+    {
+        Box::leak(format!("{component} {component}").into_boxed_str())
     } else {
         "0% 0%"
     };
     vec![
+        ("background-color".to_owned(), color),
         ("background-image".to_owned(), image),
         ("background-repeat".to_owned(), repeat),
         ("background-position".to_owned(), position.to_owned()),
         ("background-size".to_owned(), size),
     ]
+}
+
+fn split_css_components(value: &str) -> Vec<&str> {
+    let mut components = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth = depth.saturating_add(1),
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, character) if character.is_ascii_whitespace() && depth == 0 => {
+                if let Some(start) = start.take() {
+                    components.push(&value[start..index]);
+                }
+            }
+            (None, _) if start.is_none() => start = Some(index),
+            _ => {}
+        }
+    }
+    if let Some(start) = start {
+        components.push(&value[start..]);
+    }
+    components
 }
 
 fn extract_css_url(value: &str) -> Option<&str> {
@@ -698,6 +745,34 @@ mod tests {
         assert_eq!(
             style.get("column-gap").map(|value| value.value.as_str()),
             Some("30px")
+        );
+    }
+
+    #[test]
+    fn background_shorthand_resets_color_and_keeps_percentage_position() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { background: rgba(0,0,0,.6) url(icon.png) no-repeat 50% }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style.get("background-color").map(|value| value.value.as_str()),
+            Some("rgba(0,0,0,.6)")
+        );
+        assert_eq!(
+            style
+                .get("background-position")
+                .map(|value| value.value.as_str()),
+            Some("50% 50%")
         );
     }
 }

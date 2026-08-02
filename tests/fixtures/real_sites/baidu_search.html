@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>浏览器 - 百度搜索</title>
+  <link rel="stylesheet" href="/assets/site-shell.css">
+  <link rel="stylesheet" href="/assets/search.css">
+  <script src="/assets/search.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; }
+    body { background: #f5f6f7; color: #222; font-family: sans-serif; }
+    .site-header { background: #fff; border-bottom: 1px solid #e5e6e7; }
+    .header-inner, .page-shell { width: 960px; margin: 0 auto; }
+    .header-inner { min-height: 62px; display: flex; align-items: center; }
+    .brand { width: 96px; margin-right: 24px; }
+    .brand img { width: 80px; height: 28px; }
+    .site-nav a { margin-right: 16px; color: #333; text-decoration: none; }
+    .search-strip { padding: 18px 0; }
+    .search-form { display: flex; align-items: center; }
+    .search-form label { margin-right: 8px; }
+    .search-form input { width: 600px; height: 38px; padding: 0 12px; border: 1px solid #c9ccd1; }
+    .search-form button { height: 40px; margin-left: 8px; padding: 0 22px; border: 0; background: #4e6ef2; color: #fff; }
+    .results-shell { display: flex; align-items: flex-start; }
+    .results { width: 680px; }
+    .result-item { margin-bottom: 14px; padding: 18px; background: #fff; }
+    .result-item h2 { margin: 0 0 8px; font-size: 20px; }
+    .result-item p { line-height: 1.7; }
+    .result-item a, .related a { color: #315efb; text-decoration: none; }
+    .result-item img { width: 120px; height: 72px; object-fit: cover; }
+    .related { width: 240px; margin-left: 18px; padding: 18px; background: #fff; }
+    .related h2 { margin: 0 0 12px; font-size: 18px; }
+    #scroll-content { min-height: 1200px; padding-bottom: 48px; }
+    footer { margin-top: 24px; padding: 24px 0; color: #777; }
+  </style>
+</head>
+<body>
+  <header id="site-header" class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="/"><img src="/img/baidu-logo.png" alt="百度"></a>
+      <nav class="site-nav" aria-label="搜索服务">
+        <a href="/">首页</a>
+        <a href="/s?wd=新闻">新闻</a>
+        <a href="https://image.baidu.com/">图片</a>
+        <a href="https://map.baidu.com/">地图</a>
+        <a href="https://tieba.baidu.com/">贴吧</a>
+      </nav>
+    </div>
+  </header>
+  <div class="page-shell">
+    <main id="main-content">
+      <section class="search-strip" aria-label="搜索框">
+        <form id="search-form" class="search-form" role="search" action="/s" method="get">
+          <label for="search-query">搜索</label>
+          <input id="search-query" name="wd" type="search" value="浏览器">
+          <button type="submit">百度一下</button>
+        </form>
+      </section>
+      <div id="scroll-content" class="results-shell">
+        <section id="search-results" class="results" aria-labelledby="results-heading">
+          <h1 id="results-heading">浏览器的搜索结果</h1>
+          <article class="result-item">
+            <h2><a href="/s?wd=浏览器标准">浏览器标准与网页渲染</a></h2>
+            <p>网页渲染包含 HTML 解析、CSS 级联、布局和绘制。稳定的文档结构能够让页面在不同视口中保持可读。</p>
+            <img src="/img/result-browser.png" alt="浏览器页面截图">
+          </article>
+          <article class="result-item">
+            <h2><a href="/s?wd=HTML">HTML 文档结构</a></h2>
+            <p>标题、导航、主要内容、文章和表单都可以使用语义元素表达，搜索结果页也应当保留这些可访问结构。</p>
+          </article>
+          <article class="result-item">
+            <h2><a href="/s?wd=CSS布局">CSS 布局和绘制</a></h2>
+            <p>块布局、弹性布局、边框、背景、替换元素和长文档滚动共同构成常见网站的基础视觉体验。</p>
+          </article>
+          <article class="result-item">
+            <h2><a href="/s?wd=表单">搜索表单</a></h2>
+            <p>GET 表单把输入框中的查询词编码到目标地址，用户可以通过链接继续导航到下一页。</p>
+          </article>
+          <article class="result-item">
+            <h2><a href="/s?wd=可访问性">语义结构和可访问性</a></h2>
+            <p>明确的标题层级、导航标签和文章边界有助于用户理解页面，也能给自动化验收提供稳定的通用契约。</p>
+          </article>
+        </section>
+        <aside class="related" aria-label="相关搜索">
+          <h2>相关搜索</h2>
+          <a href="/s?wd=浏览器内核">浏览器内核</a>
+          <a href="/s?wd=网页性能">网页性能</a>
+          <a href="/s?wd=网页安全">网页安全</a>
+        </aside>
+      </div>
+    </main>
+    <footer><a href="/help">搜索帮助</a> <a href="/settings">搜索设置</a></footer>
+  </div>
+</body>
+</html>

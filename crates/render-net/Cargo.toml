@@ -8,8 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 rustls = { version = "0.23.42", default-features = false, features = ["std"] }
-ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+ureq = { version = "3.3.0", default-features = false, features = ["brotli", "gzip", "rustls"] }
 url = "2.5.7"
+
+[dev-dependencies]
+flate2 = "1.1.9"
 
 [lints]
 workspace = true

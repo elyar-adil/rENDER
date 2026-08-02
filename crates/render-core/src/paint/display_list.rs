@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
-use crate::css::properties::{BorderStyle, CssColor, Overflow, Position, TypedPropertyValue};
+use crate::css::properties::{
+    BorderStyle, CssColor, Overflow, Position, TypedPropertyValue, Visibility,
+};
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
 use crate::layout::{
@@ -493,6 +495,12 @@ impl Builder<'_> {
         let coordinate_space = fragment_coordinate_space(style.as_ref(), parent_space);
         let current_color = self.current_color(style.as_ref());
         let opacity = fragment_opacity(style.as_ref());
+        let hidden = matches!(
+            style.as_ref().and_then(|style| style.typed("visibility")),
+            Some(TypedPropertyValue::Visibility(
+                Visibility::Hidden | Visibility::Collapse
+            ))
+        );
         if opacity < 1.0 {
             self.push(
                 &fragment,
@@ -509,19 +517,21 @@ impl Builder<'_> {
             );
         }
 
-        match &fragment.kind {
-            FragmentKind::Box(geometry) => {
-                self.paint_box(
-                    &fragment,
-                    geometry,
-                    style.as_ref(),
-                    current_color,
-                    coordinate_space,
-                );
-                self.paint_image(&fragment, geometry, coordinate_space);
-            }
-            FragmentKind::Text(text) => {
-                self.paint_text(&fragment, text, current_color, coordinate_space);
+        if !hidden {
+            match &fragment.kind {
+                FragmentKind::Box(geometry) => {
+                    self.paint_box(
+                        &fragment,
+                        geometry,
+                        style.as_ref(),
+                        current_color,
+                        coordinate_space,
+                    );
+                    self.paint_image(&fragment, geometry, coordinate_space);
+                }
+                FragmentKind::Text(text) => {
+                    self.paint_text(&fragment, text, current_color, coordinate_space);
+                }
             }
         }
         let overflow_clip = match (&fragment.kind, style.as_ref()) {
@@ -636,8 +646,16 @@ impl Builder<'_> {
         if width == 0 || height == 0 {
             return;
         }
-        let area = geometry.padding_rect();
-        if area.size.width <= 0.0 || area.size.height <= 0.0 {
+        // The default background-origin is the padding box, while the
+        // default background-clip is the border box. Keep those spaces
+        // separate so transparent borders can reveal the background image.
+        let positioning_area = geometry.padding_rect();
+        let painting_area = geometry.border_rect();
+        if positioning_area.size.width <= 0.0
+            || positioning_area.size.height <= 0.0
+            || painting_area.size.width <= 0.0
+            || painting_area.size.height <= 0.0
+        {
             return;
         }
         let size = style
@@ -665,22 +683,22 @@ impl Builder<'_> {
         let intrinsic_height = image_dimension_to_f32(height);
         let (paint_width, paint_height, source) = match size {
             "cover" => {
-                let scale = (area.size.width / intrinsic_width)
-                    .max(area.size.height / intrinsic_height);
-                let source_width = area.size.width / scale;
-                let source_height = area.size.height / scale;
+                let scale = (positioning_area.size.width / intrinsic_width)
+                    .max(positioning_area.size.height / intrinsic_height);
+                let source_width = positioning_area.size.width / scale;
+                let source_height = positioning_area.size.height / scale;
                 let (position_x, position_y) = background_position(position);
                 let source_x = (intrinsic_width - source_width) * position_x;
                 let source_y = (intrinsic_height - source_height) * position_y;
                 (
-                    area.size.width,
-                    area.size.height,
+                    positioning_area.size.width,
+                    positioning_area.size.height,
                     PhysicalRect::new(source_x, source_y, source_width, source_height),
                 )
             }
             "contain" => {
-                let scale = (area.size.width / intrinsic_width)
-                    .min(area.size.height / intrinsic_height);
+                let scale = (positioning_area.size.width / intrinsic_width)
+                    .min(positioning_area.size.height / intrinsic_height);
                 (
                     intrinsic_width * scale,
                     intrinsic_height * scale,
@@ -694,34 +712,36 @@ impl Builder<'_> {
             ),
         };
         let (position_x, position_y) = background_position(position);
-        let origin_x = area.origin.x + (area.size.width - paint_width) * position_x;
-        let origin_y = area.origin.y + (area.size.height - paint_height) * position_y;
+        let origin_x =
+            positioning_area.origin.x + (positioning_area.size.width - paint_width) * position_x;
+        let origin_y =
+            positioning_area.origin.y + (positioning_area.size.height - paint_height) * position_y;
         self.push(
             fragment,
             PaintPhase::Background,
-            area,
+            painting_area,
             coordinate_space,
-            DisplayCommand::PushClip(ClipShape::Rect(area)),
+            DisplayCommand::PushClip(ClipShape::Rect(painting_area)),
         );
         let repeat_x = matches!(repeat, "repeat" | "repeat-x");
         let repeat_y = matches!(repeat, "repeat" | "repeat-y");
         let start_x = if repeat_x {
-            origin_x - ((origin_x - area.origin.x) / paint_width).ceil() * paint_width
+            origin_x - ((origin_x - painting_area.origin.x) / paint_width).ceil() * paint_width
         } else {
             origin_x
         };
         let start_y = if repeat_y {
-            origin_y - ((origin_y - area.origin.y) / paint_height).ceil() * paint_height
+            origin_y - ((origin_y - painting_area.origin.y) / paint_height).ceil() * paint_height
         } else {
             origin_y
         };
         let end_x = if repeat_x {
-            area.origin.x + area.size.width
+            painting_area.origin.x + painting_area.size.width
         } else {
             start_x + paint_width
         };
         let end_y = if repeat_y {
-            area.origin.y + area.size.height
+            painting_area.origin.y + painting_area.size.height
         } else {
             start_y + paint_height
         };
@@ -744,16 +764,20 @@ impl Builder<'_> {
                     }),
                 );
                 tiles += 1;
-                if !repeat_x { break; }
+                if !repeat_x {
+                    break;
+                }
                 x += paint_width;
             }
-            if !repeat_y { break; }
+            if !repeat_y {
+                break;
+            }
             y += paint_height;
         }
         self.push(
             fragment,
             PaintPhase::Background,
-            area,
+            painting_area,
             coordinate_space,
             DisplayCommand::PopClip,
         );

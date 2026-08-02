@@ -8,6 +8,7 @@ use super::{
     JsError, JsErrorKind, JsObject, JsValue, ObjectId, PropertyDescriptor, Realm, RuntimeLimits,
     ScriptOutcome,
 };
+use crate::css::selector::{MatchContext, matches_selector_list, parse_selector_list, select_all};
 use crate::dom::{Dom, DomError, NodeId, NodeKind};
 use url::Url;
 
@@ -119,6 +120,7 @@ pub struct JsRuntime {
     promises: Vec<PromiseRecord>,
     pending_microtasks: Vec<JsMicrotask>,
     event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<ObjectId>>>,
+    event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
     global_bindings: BTreeMap<String, GlobalBinding>,
 }
 
@@ -166,6 +168,7 @@ impl JsRuntime {
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
             event_listeners: BTreeMap::new(),
+            event_handlers: BTreeMap::new(),
             global_bindings: BTreeMap::new(),
             limits,
         }
@@ -1333,11 +1336,132 @@ impl JsRuntime {
         if let Some(value) = self.realm.get_property(object, property) {
             return Ok(value);
         }
+        match self.realm.host(object) {
+            Some(ObjectHost::Document(document)) => match property {
+                "documentElement" | "body" | "head" => {
+                    let tag = match property {
+                        "documentElement" => "html",
+                        "body" => "body",
+                        _ => "head",
+                    };
+                    return match self.find_element_by_tag(dom, document, tag)? {
+                        Some(node) => self.wrap_node(node),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "readyState" => return Ok(JsValue::String("complete".to_owned())),
+                "querySelector" | "querySelectorAll" => {}
+                _ => {}
+            },
+            Some(ObjectHost::Node(node)) => match property {
+                "textContent" => return self.text_content(dom, node).map(JsValue::String),
+                "classList" => {
+                    self.ensure_heap_capacity(1)?;
+                    return Ok(JsValue::Object(self.realm.class_list_wrapper(node)));
+                }
+                "className" => {
+                    return Ok(JsValue::String(
+                        dom.attribute(node, "class")?.unwrap_or_default().to_owned(),
+                    ));
+                }
+                "parentNode" | "parentElement" => {
+                    let parent = dom.parent(node).filter(|parent| {
+                        property == "parentNode"
+                            || matches!(
+                                dom.node(*parent).map(crate::dom::Node::kind),
+                                Some(NodeKind::Element(_))
+                            )
+                    });
+                    return match parent {
+                        Some(parent) => self.wrap_node(parent),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "firstChild" | "lastChild" | "nextSibling" | "previousSibling" => {
+                    let related = match property {
+                        "firstChild" => dom
+                            .children(node)
+                            .and_then(|children| children.first())
+                            .copied(),
+                        "lastChild" => dom
+                            .children(node)
+                            .and_then(|children| children.last())
+                            .copied(),
+                        "nextSibling" => dom.next_sibling(node),
+                        _ => dom.previous_sibling(node),
+                    };
+                    return match related {
+                        Some(related) => self.wrap_node(related),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "ownerDocument" => return Ok(JsValue::Object(self.realm.document_object())),
+                "children" | "childNodes" => {
+                    let elements_only = property == "children";
+                    let values = dom
+                        .children(node)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|child| {
+                            !elements_only
+                                || matches!(
+                                    dom.node(*child).map(crate::dom::Node::kind),
+                                    Some(NodeKind::Element(_))
+                                )
+                        })
+                        .map(|child| self.wrap_node(child))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(JsValue::Object(self.create_array_from_values(&values)?));
+                }
+                property if property.starts_with("on") && property.len() > 2 => {
+                    let event_type = property[2..].to_ascii_lowercase();
+                    return Ok(self
+                        .event_handlers
+                        .get(&node)
+                        .and_then(|handlers| handlers.get(&event_type))
+                        .copied()
+                        .map_or(JsValue::Null, JsValue::Object));
+                }
+                property if node_attribute_property(property).is_some() => {
+                    let attribute = node_attribute_property(property).expect("checked above");
+                    if node_boolean_property(property) {
+                        return Ok(JsValue::Boolean(dom.attribute(node, attribute)?.is_some()));
+                    }
+                    return Ok(JsValue::String(
+                        dom.attribute(node, attribute)?
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ));
+                }
+                _ => {}
+            },
+            Some(ObjectHost::ClassList(node)) => match property {
+                "length" => {
+                    return Ok(JsValue::Number(
+                        self.class_list_tokens(dom, node)?.len() as f64
+                    ));
+                }
+                "value" => {
+                    return Ok(JsValue::String(
+                        self.class_list_tokens(dom, node)?.join(" "),
+                    ));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         let function = match (self.realm.host(object), property) {
             (Some(ObjectHost::Promise(_)), "then") => Some(NativeFunction::PromiseThen),
             (Some(ObjectHost::Promise(_)), "catch") => Some(NativeFunction::PromiseCatch),
             (Some(ObjectHost::Document(_)), "getElementById") => {
                 Some(NativeFunction::GetElementById)
+            }
+            (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "querySelector") => {
+                Some(NativeFunction::QuerySelector)
+            }
+            (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "querySelectorAll") => {
+                Some(NativeFunction::QuerySelectorAll)
             }
             (Some(ObjectHost::Document(_)), "createElement") => Some(NativeFunction::CreateElement),
             (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "addEventListener") => {
@@ -1350,10 +1474,22 @@ impl JsRuntime {
                 Some(NativeFunction::DispatchEvent)
             }
             (Some(ObjectHost::Node(_)), "setAttribute") => Some(NativeFunction::SetAttribute),
+            (Some(ObjectHost::Node(_)), "getAttribute") => Some(NativeFunction::GetAttribute),
+            (Some(ObjectHost::Node(_)), "hasAttribute") => Some(NativeFunction::HasAttribute),
+            (Some(ObjectHost::Node(_)), "removeAttribute") => Some(NativeFunction::RemoveAttribute),
             (Some(ObjectHost::Node(_)), "appendChild") => Some(NativeFunction::AppendChild),
-            (Some(ObjectHost::Node(node)), "textContent") => {
-                return self.text_content(dom, node).map(JsValue::String);
-            }
+            (Some(ObjectHost::Node(_)), "removeChild") => Some(NativeFunction::RemoveChild),
+            (Some(ObjectHost::Node(_)), "insertBefore") => Some(NativeFunction::InsertBefore),
+            (Some(ObjectHost::Node(_)), "remove") => Some(NativeFunction::RemoveNode),
+            (Some(ObjectHost::Node(_)), "contains") => Some(NativeFunction::Contains),
+            (Some(ObjectHost::Node(_)), "matches") => Some(NativeFunction::Matches),
+            (Some(ObjectHost::Node(_)), "click") => Some(NativeFunction::Click),
+            (Some(ObjectHost::ClassList(_)), "add") => Some(NativeFunction::ClassListAdd),
+            (Some(ObjectHost::ClassList(_)), "remove") => Some(NativeFunction::ClassListRemove),
+            (Some(ObjectHost::ClassList(_)), "toggle") => Some(NativeFunction::ClassListToggle),
+            (Some(ObjectHost::ClassList(_)), "contains") => Some(NativeFunction::ClassListContains),
+            (Some(ObjectHost::ClassList(_)), "item") => Some(NativeFunction::ClassListItem),
+            (Some(ObjectHost::ClassList(_)), "toString") => Some(NativeFunction::ClassListToString),
             _ => None,
         };
         if let Some(function) = function {
@@ -1378,6 +1514,41 @@ impl JsRuntime {
         }
         if let (Some(ObjectHost::Node(node)), "textContent") = (self.realm.host(object), property) {
             return self.set_text_content(dom, node, value.to_js_string());
+        }
+        match self.realm.host(object) {
+            Some(ObjectHost::Node(node)) => {
+                if property == "className" {
+                    return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
+                }
+                if property.starts_with("on") && property.len() > 2 {
+                    let event_type = property[2..].to_ascii_lowercase();
+                    match value {
+                        JsValue::Null | JsValue::Undefined => {
+                            if let Some(handlers) = self.event_handlers.get_mut(&node) {
+                                handlers.remove(&event_type);
+                            }
+                        }
+                        value => {
+                            let callback = Self::require_callable_object(&value, &self.realm)?;
+                            self.event_handlers
+                                .entry(node)
+                                .or_default()
+                                .insert(event_type, callback);
+                        }
+                    }
+                    return Ok(());
+                }
+                if let Some(attribute) = node_attribute_property(property) {
+                    if node_boolean_property(property) && !value.is_truthy() {
+                        return Ok(dom.remove_attribute(node, attribute)?);
+                    }
+                    return Ok(dom.set_attribute(node, attribute, value.to_js_string())?);
+                }
+            }
+            Some(ObjectHost::ClassList(node)) if property == "value" => {
+                return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
+            }
+            _ => {}
         }
         if !self.realm.set_property(object, property.to_owned(), value) {
             return Err(JsError::type_error(format!(
@@ -1634,6 +1805,30 @@ impl JsRuntime {
                     None => Ok(JsValue::Null),
                 }
             }
+            NativeFunction::QuerySelector => {
+                let root = self.query_root(receiver)?;
+                let selector = required_argument(arguments, 0, "querySelector")?.to_js_string();
+                let selectors = parse_selector_list(&selector)
+                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                match select_all(dom, root, &selectors, &MatchContext::default())
+                    .into_iter()
+                    .next()
+                {
+                    Some(node) => self.wrap_node(node),
+                    None => Ok(JsValue::Null),
+                }
+            }
+            NativeFunction::QuerySelectorAll => {
+                let root = self.query_root(receiver)?;
+                let selector = required_argument(arguments, 0, "querySelectorAll")?.to_js_string();
+                let selectors = parse_selector_list(&selector)
+                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let nodes = select_all(dom, root, &selectors, &MatchContext::default())
+                    .into_iter()
+                    .map(|node| self.wrap_node(node))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
+            }
             NativeFunction::CreateElement => {
                 self.require_document(receiver)?;
                 let name = required_argument(arguments, 0, "createElement")?.to_js_string();
@@ -1657,16 +1852,94 @@ impl JsRuntime {
                 dom.set_attribute(node, name, value)?;
                 Ok(JsValue::Undefined)
             }
+            NativeFunction::GetAttribute => {
+                let node = self.require_node(receiver)?;
+                let name = required_argument(arguments, 0, "getAttribute")?.to_js_string();
+                Ok(dom
+                    .attribute(node, &name)?
+                    .map_or(JsValue::Null, |value| JsValue::String(value.to_owned())))
+            }
+            NativeFunction::HasAttribute => {
+                let node = self.require_node(receiver)?;
+                let name = required_argument(arguments, 0, "hasAttribute")?.to_js_string();
+                Ok(JsValue::Boolean(dom.attribute(node, &name)?.is_some()))
+            }
+            NativeFunction::RemoveAttribute => {
+                let node = self.require_node(receiver)?;
+                let name = required_argument(arguments, 0, "removeAttribute")?.to_js_string();
+                dom.remove_attribute(node, &name)?;
+                Ok(JsValue::Undefined)
+            }
             NativeFunction::AppendChild => {
                 let parent = self.require_node(receiver)?;
                 let child = self.value_as_node(required_argument(arguments, 0, "appendChild")?)?;
                 dom.append_child(parent, child)?;
                 self.wrap_node(child)
             }
+            NativeFunction::RemoveChild => {
+                let parent = self.require_node(receiver)?;
+                let child = self.value_as_node(required_argument(arguments, 0, "removeChild")?)?;
+                dom.remove_child(parent, child)?;
+                self.wrap_node(child)
+            }
+            NativeFunction::InsertBefore => {
+                let parent = self.require_node(receiver)?;
+                let child = self.value_as_node(required_argument(arguments, 0, "insertBefore")?)?;
+                let reference = match arguments.get(1) {
+                    None | Some(JsValue::Null | JsValue::Undefined) => None,
+                    Some(value) => Some(self.value_as_node(value)?),
+                };
+                dom.insert_before(parent, child, reference)?;
+                self.wrap_node(child)
+            }
+            NativeFunction::RemoveNode => {
+                let node = self.require_node(receiver)?;
+                if let Some(parent) = dom.parent(node) {
+                    dom.remove_child(parent, node)?;
+                }
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::Contains => {
+                let root = self.require_node(receiver)?;
+                let candidate = self.value_as_node(required_argument(arguments, 0, "contains")?)?;
+                Ok(JsValue::Boolean(dom_contains(dom, root, candidate)))
+            }
+            NativeFunction::Matches => {
+                let node = self.require_node(receiver)?;
+                let selector = required_argument(arguments, 0, "matches")?.to_js_string();
+                let selectors = parse_selector_list(&selector)
+                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                Ok(JsValue::Boolean(matches_selector_list(
+                    dom,
+                    node,
+                    &selectors,
+                    &MatchContext::default(),
+                )))
+            }
+            NativeFunction::Click => {
+                self.require_node(receiver)?;
+                let options = self.realm.create_ordinary_object();
+                self.realm
+                    .set_property(options, "bubbles".to_owned(), JsValue::Boolean(true));
+                self.realm
+                    .set_property(options, "cancelable".to_owned(), JsValue::Boolean(true));
+                let event = self.event_constructor(&[
+                    JsValue::String("click".to_owned()),
+                    JsValue::Object(options),
+                ])?;
+                let _ = self.dispatch_event(dom, receiver, &[event])?;
+                Ok(JsValue::Undefined)
+            }
             NativeFunction::AddEventListener => self.add_event_listener(receiver, arguments),
             NativeFunction::RemoveEventListener => self.remove_event_listener(receiver, arguments),
             NativeFunction::DispatchEvent => self.dispatch_event(dom, receiver, arguments),
             NativeFunction::EventPreventDefault => Ok(self.event_prevent_default(receiver)),
+            NativeFunction::ClassListAdd => self.class_list_add(dom, receiver, arguments),
+            NativeFunction::ClassListRemove => self.class_list_remove(dom, receiver, arguments),
+            NativeFunction::ClassListToggle => self.class_list_toggle(dom, receiver, arguments),
+            NativeFunction::ClassListContains => self.class_list_contains(dom, receiver, arguments),
+            NativeFunction::ClassListItem => self.class_list_item(dom, receiver, arguments),
+            NativeFunction::ClassListToString => self.class_list_to_string(dom, receiver),
             NativeFunction::LocationToString => match self.realm.host(receiver) {
                 Some(ObjectHost::Location(url)) => Ok(JsValue::String(url.to_string())),
                 _ => Err(JsError::type_error("incompatible Location method receiver")),
@@ -1898,6 +2171,19 @@ impl JsRuntime {
                 .cloned()
                 .unwrap_or_default();
             for callback in callbacks {
+                self.call_with_this(
+                    dom,
+                    callback,
+                    &[JsValue::Object(event)],
+                    JsValue::Object(current_target),
+                )?;
+            }
+            if let Some(callback) = self
+                .event_handlers
+                .get(&node)
+                .and_then(|handlers| handlers.get(&event_type))
+                .copied()
+            {
                 self.call_with_this(
                     dom,
                     callback,
@@ -2476,6 +2762,178 @@ impl JsRuntime {
         )
     }
 
+    fn query_root(&self, object: ObjectId) -> Result<NodeId, JsError> {
+        match self.realm.host(object) {
+            Some(ObjectHost::Document(document) | ObjectHost::Node(document)) => Ok(document),
+            _ => Err(JsError::type_error(
+                "querySelector method called on a non-Document/non-Element object",
+            )),
+        }
+    }
+
+    fn find_element_by_tag(
+        &mut self,
+        dom: &Dom,
+        root: NodeId,
+        tag: &str,
+    ) -> Result<Option<NodeId>, JsError> {
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            self.consume_step()?;
+            if let Some(NodeKind::Element(data)) = dom.node(node).map(crate::dom::Node::kind)
+                && data.local_name.eq_ignore_ascii_case(tag)
+            {
+                return Ok(Some(node));
+            }
+            pending.extend(dom.children(node).unwrap_or_default().iter().rev());
+        }
+        Ok(None)
+    }
+
+    fn class_list_tokens(&self, dom: &Dom, node: NodeId) -> Result<Vec<String>, JsError> {
+        let value = dom.attribute(node, "class")?.unwrap_or_default();
+        Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
+    }
+
+    fn require_class_list(&self, object: ObjectId) -> Result<NodeId, JsError> {
+        match self.realm.host(object) {
+            Some(ObjectHost::ClassList(node)) => Ok(node),
+            _ => Err(JsError::type_error("incompatible DOMTokenList receiver")),
+        }
+    }
+
+    fn class_list_token(
+        arguments: &[JsValue],
+        index: usize,
+        function: &str,
+    ) -> Result<String, JsError> {
+        let token = required_argument(arguments, index, function)?.to_js_string();
+        if token.is_empty()
+            || token
+                .chars()
+                .any(|character| character.is_ascii_whitespace())
+        {
+            return Err(JsError::dom(format!(
+                "{function} token must be non-empty and contain no ASCII whitespace"
+            )));
+        }
+        Ok(token)
+    }
+
+    fn class_list_add(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let mut tokens = self.class_list_tokens(dom, node)?;
+        let mut changed = false;
+        for index in 0..arguments.len() {
+            let token = Self::class_list_token(arguments, index, "classList.add")?;
+            if !tokens.contains(&token) {
+                tokens.push(token);
+                changed = true;
+            }
+        }
+        if changed {
+            dom.set_attribute(node, "class", tokens.join(" "))?;
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    fn class_list_remove(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let mut tokens = self.class_list_tokens(dom, node)?;
+        let original_len = tokens.len();
+        for index in 0..arguments.len() {
+            let token = Self::class_list_token(arguments, index, "classList.remove")?;
+            tokens.retain(|candidate| candidate != &token);
+        }
+        if tokens.len() != original_len {
+            if tokens.is_empty() {
+                dom.remove_attribute(node, "class")?;
+            } else {
+                dom.set_attribute(node, "class", tokens.join(" "))?;
+            }
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    fn class_list_toggle(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let token = Self::class_list_token(arguments, 0, "classList.toggle")?;
+        let mut tokens = self.class_list_tokens(dom, node)?;
+        let present = tokens.iter().any(|candidate| candidate == &token);
+        let next = match arguments.get(1) {
+            Some(force) => force.is_truthy(),
+            None => !present,
+        };
+        if next && !present {
+            tokens.push(token);
+            dom.set_attribute(node, "class", tokens.join(" "))?;
+        } else if !next && present {
+            tokens.retain(|candidate| candidate != &token);
+            if tokens.is_empty() {
+                dom.remove_attribute(node, "class")?;
+            } else {
+                dom.set_attribute(node, "class", tokens.join(" "))?;
+            }
+        }
+        Ok(JsValue::Boolean(next))
+    }
+
+    fn class_list_contains(
+        &self,
+        dom: &Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let token = Self::class_list_token(arguments, 0, "classList.contains")?;
+        Ok(JsValue::Boolean(
+            self.class_list_tokens(dom, node)?
+                .iter()
+                .any(|candidate| candidate == &token),
+        ))
+    }
+
+    fn class_list_item(
+        &self,
+        dom: &Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let index = to_number(required_argument(arguments, 0, "classList.item")?)?;
+        if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
+            return Ok(JsValue::Null);
+        }
+        let index = index as usize;
+        Ok(self
+            .class_list_tokens(dom, node)?
+            .get(index)
+            .cloned()
+            .map_or(JsValue::Null, JsValue::String))
+    }
+
+    fn class_list_to_string(&self, dom: &Dom, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        Ok(JsValue::String(
+            self.class_list_tokens(dom, node)?.join(" "),
+        ))
+    }
+
     fn find_element_by_id(&mut self, dom: &Dom, id: &str) -> Result<Option<NodeId>, JsError> {
         let mut pending = vec![dom.document()];
         while let Some(node) = pending.pop() {
@@ -2804,6 +3262,62 @@ fn number_equal(left: f64, right: f64) -> bool {
     // every value, while +0 and -0 compare equal. An epsilon comparison would
     // implement different language semantics.
     left == right
+}
+
+fn dom_contains(dom: &Dom, root: NodeId, candidate: NodeId) -> bool {
+    let mut current = Some(candidate);
+    while let Some(node) = current {
+        if node == root {
+            return true;
+        }
+        current = dom.parent(node);
+    }
+    false
+}
+
+fn node_attribute_property(property: &str) -> Option<&str> {
+    match property {
+        "id" => Some("id"),
+        "className" => Some("class"),
+        "value" => Some("value"),
+        "name" => Some("name"),
+        "title" => Some("title"),
+        "href" => Some("href"),
+        "src" => Some("src"),
+        "alt" => Some("alt"),
+        "role" => Some("role"),
+        "type" => Some("type"),
+        "placeholder" => Some("placeholder"),
+        "action" => Some("action"),
+        "method" => Some("method"),
+        "target" => Some("target"),
+        "rel" => Some("rel"),
+        "tabIndex" => Some("tabindex"),
+        "disabled" => Some("disabled"),
+        "checked" => Some("checked"),
+        "selected" => Some("selected"),
+        "hidden" => Some("hidden"),
+        "readOnly" => Some("readonly"),
+        "required" => Some("required"),
+        "multiple" => Some("multiple"),
+        "autofocus" | "autoFocus" => Some("autofocus"),
+        _ => None,
+    }
+}
+
+fn node_boolean_property(property: &str) -> bool {
+    matches!(
+        property,
+        "disabled"
+            | "checked"
+            | "selected"
+            | "hidden"
+            | "readOnly"
+            | "required"
+            | "multiple"
+            | "autofocus"
+            | "autoFocus"
+    )
 }
 
 fn abstract_equal(left: &JsValue, right: &JsValue) -> Result<bool, JsError> {

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use flate2::{Compression, write::GzEncoder};
 use render_net::{
     BatchOptions, ByteRange, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest,
     FixedOriginLimit, HttpTransport, NetworkWorker, Url,
@@ -215,7 +216,10 @@ fn follows_redirects_and_reports_final_url() {
     let (base, server) = spawn_server(2, |request| match request_path(&request) {
         "/start" => WireResponse {
             status: "302 Found",
-            headers: vec![("Location".into(), "/final".into())],
+            headers: vec![
+                ("Location".into(), "/final".into()),
+                ("Set-Cookie".into(), "redirect=1; Path=/".into()),
+            ],
             body: Vec::new(),
             delay: Duration::ZERO,
         },
@@ -231,8 +235,51 @@ fn follows_redirects_and_reports_final_url() {
 
     assert_eq!(result.requested_url, start);
     assert_eq!(result.final_url, final_url);
-    assert_eq!(result.redirect_chain, vec![start, final_url]);
+    assert_eq!(result.redirect_chain, vec![start, final_url.clone()]);
+    assert_eq!(result.redirects.len(), 1);
+    assert_eq!(result.redirects[0].status.as_u16(), 302);
     assert_eq!(result.body, b"done");
+
+    let mut jar = CookieJar::default();
+    assert!(jar.absorb_response(&result).is_empty());
+    assert_eq!(jar.cookie_header(&final_url), Some("redirect=1".to_owned()));
+}
+
+#[test]
+fn transparently_decodes_gzip_responses() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    std::io::Write::write_all(&mut encoder, b"<html>compressed</html>").expect("compress response");
+    let compressed = encoder.finish().expect("finish gzip response");
+    let seen_request = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_request);
+    let (url, server) = spawn_server(1, move |request| {
+        *captured.lock().expect("capture request") = request;
+        let mut response = WireResponse::ok(compressed.clone());
+        response
+            .headers
+            .push(("Content-Encoding".into(), "gzip".into()));
+        response
+    });
+
+    let response = transport(|_| {})
+        .fetch(&FetchRequest::get(url), &CancelToken::default())
+        .expect("gzip response");
+    server.join().expect("server exits");
+
+    assert_eq!(response.body, b"<html>compressed</html>");
+    assert!(
+        !response
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-encoding"))
+    );
+    assert!(
+        seen_request
+            .lock()
+            .expect("read request")
+            .to_ascii_lowercase()
+            .contains("accept-encoding: gzip, br")
+    );
 }
 
 #[test]
