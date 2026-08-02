@@ -7,6 +7,25 @@ prototype while standards-correct browser behavior is implemented in Rust.
 
 The project is intentionally hands-on: core subsystems such as parsing, cascade, layout, and painting live in this repository and are readable end to end.
 
+## Current Completion Snapshot
+
+**As of 2026-08-03.** These are engineering estimates for the primary Rust
+browser reaching the project's minimum usable scope. They are not WPT,
+test262, or web-compatibility pass rates; `100%` means the currently planned
+browser scope is implemented and covered well enough to maintain.
+
+| Component | Completion | Current boundary |
+| --- | ---: | --- |
+| HTML parsing and encoding | 55% | Tokenization, tree construction, recovery, and common Chinese encodings work; full HTML5 edge cases remain. |
+| DOM, events, and forms | 40% | Tree mutation, selectors, common events, inputs, and GET submission work; broad Web APIs and event options remain. |
+| CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, and major value grammars work; full CSS syntax and cascade coverage remain. |
+| Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
+| Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
+| JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run is 11,628/98,096 variants passed (11.9%). |
+| Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; Fetch/CORS, cache, and service workers remain. |
+| Browser shell and interaction | 55% | Native window, tabs, address editing, history, scrolling, links, forms, and DPI-aware painting work; accessibility and broader input remain. |
+| **Overall minimum usable browser** | **42%** | Enough infrastructure exists for iterative Baidu, Zhihu, and 163 compatibility work; this is not a claim of general web compatibility. |
+
 ## Highlights
 
 - HTML, CSS, DOM, layout, and painting are implemented in Python.
