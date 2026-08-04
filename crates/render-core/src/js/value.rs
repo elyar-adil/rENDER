@@ -178,7 +178,14 @@ pub(crate) enum NativeFunction {
     FunctionPrototype,
     FunctionCall,
     FunctionBind,
+    MathAbs,
+    MathCeil,
+    MathFloor,
+    MathMax,
+    MathMin,
     MathPow,
+    MathRound,
+    MathSqrt,
     ObjectAssign,
     ObjectKeys,
     ObjectValues,
@@ -784,20 +791,31 @@ impl Realm {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
-        let pow = ObjectId(objects.len());
-        objects.push(JsObject {
-            host: ObjectHost::NativeFunction(NativeFunction::MathPow),
-            ..JsObject::default()
-        });
-        objects[math.0].properties.insert(
-            "pow".to_owned(),
-            PropertyDescriptor {
-                value: JsValue::Object(pow),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        for (name, function) in [
+            ("abs", NativeFunction::MathAbs),
+            ("ceil", NativeFunction::MathCeil),
+            ("floor", NativeFunction::MathFloor),
+            ("max", NativeFunction::MathMax),
+            ("min", NativeFunction::MathMin),
+            ("pow", NativeFunction::MathPow),
+            ("round", NativeFunction::MathRound),
+            ("sqrt", NativeFunction::MathSqrt),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[math.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(method),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
         objects[global.0].properties.insert(
             "Math".to_owned(),
             PropertyDescriptor {

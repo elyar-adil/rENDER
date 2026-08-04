@@ -1983,7 +1983,14 @@ impl JsRuntime {
             NativeFunction::ArrayPush => self.array_push(receiver, arguments),
             NativeFunction::ArrayPop => self.array_pop(receiver),
             NativeFunction::ArrayJoin => self.array_join(receiver, arguments),
+            NativeFunction::MathAbs => Self::math_unary(arguments, f64::abs),
+            NativeFunction::MathCeil => Self::math_unary(arguments, f64::ceil),
+            NativeFunction::MathFloor => Self::math_unary(arguments, f64::floor),
+            NativeFunction::MathMax => Self::math_min_max(arguments, f64::NEG_INFINITY, f64::max),
+            NativeFunction::MathMin => Self::math_min_max(arguments, f64::INFINITY, f64::min),
             NativeFunction::MathPow => Self::math_pow(arguments),
+            NativeFunction::MathRound => Self::math_unary(arguments, js_math_round),
+            NativeFunction::MathSqrt => Self::math_unary(arguments, f64::sqrt),
             NativeFunction::ObjectAssign => self.object_assign(arguments),
             NativeFunction::ObjectKeys => self.object_entries(arguments, ObjectEntryKind::Keys),
             NativeFunction::ObjectValues => self.object_entries(arguments, ObjectEntryKind::Values),
@@ -2553,6 +2560,31 @@ impl JsRuntime {
             }
         }
         Ok(JsValue::String(output))
+    }
+
+    fn math_unary(
+        arguments: &[JsValue],
+        operation: impl FnOnce(f64) -> f64,
+    ) -> Result<JsValue, JsError> {
+        Ok(JsValue::Number(operation(to_number(
+            arguments.first().unwrap_or(&JsValue::Undefined),
+        )?)))
+    }
+
+    fn math_min_max(
+        arguments: &[JsValue],
+        identity: f64,
+        operation: impl Fn(f64, f64) -> f64,
+    ) -> Result<JsValue, JsError> {
+        let mut result = identity;
+        for argument in arguments {
+            let value = to_number(argument)?;
+            if value.is_nan() {
+                return Ok(JsValue::Number(f64::NAN));
+            }
+            result = operation(result, value);
+        }
+        Ok(JsValue::Number(result))
     }
 
     fn math_pow(arguments: &[JsValue]) -> Result<JsValue, JsError> {
@@ -3155,6 +3187,13 @@ impl JsValue {
             Self::Object(_) => true,
         }
     }
+}
+
+fn js_math_round(value: f64) -> f64 {
+    if value.is_nan() || value.is_infinite() || value == 0.0 {
+        return value;
+    }
+    (value + 0.5).floor()
 }
 
 fn to_number(value: &JsValue) -> Result<f64, JsError> {
