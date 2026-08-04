@@ -187,6 +187,16 @@ const LANGUAGE_CASES: &[Case] = &[
         expected: Expected::Value("result", JsValueRef::Number(23.0)),
     },
     Case {
+        id: "math/common-unary-methods",
+        source: "const result = Math.abs(-5) + Math.ceil(1.2) + Math.floor(3.8) + Math.round(4.5) + Math.sqrt(81);",
+        expected: Expected::Value("result", JsValueRef::Number(24.0)),
+    },
+    Case {
+        id: "math/min-max-variable-arity",
+        source: "const result = Math.max(1, 9, 3) + Math.min(7, 2, 4);",
+        expected: Expected::Value("result", JsValueRef::Number(11.0)),
+    },
+    Case {
         id: "exceptions/catch-thrown-value",
         source: "let result = 'bad'; try { throw 'caught'; } catch (error) { result = error; }",
         expected: Expected::Value("result", JsValueRef::String("caught")),
