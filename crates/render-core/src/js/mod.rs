@@ -7,13 +7,17 @@
 
 mod lexer;
 mod parser;
+mod regex;
 mod runtime;
 mod value;
 
 use std::error::Error;
 use std::fmt;
 
-pub use runtime::{JsMicrotask, JsRuntime};
+pub use runtime::{
+    ConsoleLevel, ConsoleMessage, ElementRect, JsMicrotask, JsRuntime, NavigationRequest,
+    TimerEntry, TimerKind, TimerRequest,
+};
 pub use value::{JsObject, JsValue, ObjectId, PropertyDescriptor, Realm};
 
 use parser::Statement;
@@ -35,13 +39,16 @@ pub struct RuntimeLimits {
 impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
-            max_source_bytes: 256 * 1_024,
-            max_tokens: 32_768,
-            max_statements: 4_096,
-            max_execution_steps: 100_000,
+            // Real-world bundles (jQuery, analytics, site bundles) routinely
+            // exceed 256 KiB; 2 MiB plus proportional token/statement budgets
+            // keep the interpreter bounded while accepting them.
+            max_source_bytes: 2 * 1_024 * 1_024,
+            max_tokens: 512_000,
+            max_statements: 65_536,
+            max_execution_steps: 10_000_000,
             max_call_depth: 64,
-            max_heap_objects: 16_384,
-            max_dom_nodes_created: 4_096,
+            max_heap_objects: 131_072,
+            max_dom_nodes_created: 16_384,
         }
     }
 }

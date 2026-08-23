@@ -9,18 +9,22 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use url::Url;
 
 use crate::document::{Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput};
-use crate::dom::DomRevision;
+use crate::dom::{DomRevision, NodeId};
 use crate::event_loop::{
-    EventLoop, EventLoopLimits, MicrotaskCheckpoint, MicrotaskId, QueueError, Runnable, TaskId,
-    TaskSource, TurnOutcome,
+    ClockError, EventLoop, EventLoopLimits, MicrotaskCheckpoint, MicrotaskId, QueueError, Runnable,
+    TaskId, TaskSource, TimerId, TurnOutcome,
 };
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
-use crate::js::{CompiledScript, JsError, JsMicrotask, JsRuntime, RuntimeLimits, ScriptOutcome};
-use crate::layout::SimpleTextMeasurer;
+use crate::js::{
+    CompiledScript, ElementRect, JsError, JsMicrotask, JsRuntime, JsValue, RuntimeLimits,
+    ScriptOutcome, TimerRequest,
+};
+use crate::layout::{FragmentKind, SimpleTextMeasurer};
 use crate::paint::{DisplayListDiff, NoGlyphMasks, ReferenceTextShaper};
 use crate::script::{
     ClassicScript, ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling, ScriptSource,
@@ -61,6 +65,50 @@ pub enum PageTask {
     Script(String),
     CompiledScript(CompiledScript),
     JsMicrotask(JsMicrotask),
+    /// Fire one registered script timer (timeout, interval, or animation
+    /// frame callback). Ids are the runtime's timer identities.
+    Timer {
+        id: u64,
+    },
+    /// Dispatch a trusted DOM event as if produced by the user agent.
+    DispatchEvent(PageDomEvent),
+}
+
+/// A trusted DOM event queued by the embedding on behalf of real input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageDomEvent {
+    pub target: NodeId,
+    pub event_type: String,
+    pub bubbles: bool,
+    pub cancelable: bool,
+    /// Extra event properties beyond the standard Event fields, such as
+    /// `key` on keyboard events.
+    pub properties: Vec<(String, JsValue)>,
+}
+
+impl PageDomEvent {
+    #[must_use]
+    pub fn new(target: NodeId, event_type: &str) -> Self {
+        Self {
+            target,
+            event_type: event_type.to_owned(),
+            bubbles: false,
+            cancelable: false,
+            properties: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn bubbles(mut self, bubbles: bool) -> Self {
+        self.bubbles = bubbles;
+        self
+    }
+
+    #[must_use]
+    pub const fn cancelable(mut self, cancelable: bool) -> Self {
+        self.cancelable = cancelable;
+        self
+    }
 }
 
 impl PageTask {
@@ -72,7 +120,7 @@ impl PageTask {
     fn source_bytes(&self) -> usize {
         match self {
             Self::Script(source) => source.len(),
-            Self::CompiledScript(_) | Self::JsMicrotask(_) => 0,
+            _ => 0,
         }
     }
 }
@@ -222,12 +270,16 @@ pub struct PageTurnOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PageError {
     Invalidation(InvalidationError),
+    /// The embedding requested a clock instant earlier than the page's
+    /// current virtual time.
+    Clock(ClockError),
 }
 
 impl fmt::Display for PageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Invalidation(error) => error.fmt(formatter),
+            Self::Clock(error) => error.fmt(formatter),
         }
     }
 }
@@ -236,6 +288,7 @@ impl Error for PageError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Invalidation(error) => Some(error),
+            Self::Clock(error) => Some(error),
         }
     }
 }
@@ -245,6 +298,26 @@ impl From<InvalidationError> for PageError {
         Self::Invalidation(error)
     }
 }
+
+impl From<ClockError> for PageError {
+    fn from(error: ClockError) -> Self {
+        Self::Clock(error)
+    }
+}
+
+/// Summary of one [`Page::pump_until_idle`] call.
+#[derive(Clone, Debug)]
+pub struct PagePumpOutcome {
+    pub executed_turns: usize,
+    pub rendered_turns: usize,
+    /// Per-task script results observed during the pump, keyed by task id.
+    /// Embeddings use these to honor `preventDefault()` on trusted events.
+    pub task_results: Vec<(TaskId, Result<ScriptOutcome, JsError>)>,
+}
+
+/// Upper bound of turns per pump so a runaway `setInterval` cannot starve the
+/// embedding; remaining work stays queued for the next pump.
+const MAX_PUMP_TURNS: usize = 1024;
 
 /// Coordinator for one document and its persistent JavaScript realm.
 pub struct Page {
@@ -259,6 +332,11 @@ pub struct Page {
     queued_source_bytes: usize,
     task_source_bytes: BTreeMap<TaskId, usize>,
     microtask_source_bytes: BTreeMap<MicrotaskId, usize>,
+    /// Runtime timer id -> event-loop timer id for timers awaiting their
+    /// deadline. Entries are removed when they fire or are cancelled.
+    js_timers: BTreeMap<u64, TimerId>,
+    /// Latest border-box geometry per DOM node, refreshed after each render.
+    geometry_index: BTreeMap<u64, ElementRect>,
 }
 
 impl Page {
@@ -334,7 +412,7 @@ impl Page {
             JsRuntime::with_limits_and_url(document.dom(), options.runtime_limits, document_url);
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
-        Self {
+        let mut page = Self {
             document,
             runtime,
             event_loop,
@@ -346,7 +424,11 @@ impl Page {
             queued_source_bytes: 0,
             task_source_bytes: BTreeMap::new(),
             microtask_source_bytes: BTreeMap::new(),
-        }
+            js_timers: BTreeMap::new(),
+            geometry_index: BTreeMap::new(),
+        };
+        page.refresh_geometry_index();
+        page
     }
 
     #[must_use]
@@ -362,6 +444,11 @@ impl Page {
     #[must_use]
     pub const fn runtime(&self) -> &JsRuntime {
         &self.runtime
+    }
+
+    #[must_use]
+    pub const fn runtime_mut(&mut self) -> &mut JsRuntime {
+        &mut self.runtime
     }
 
     #[must_use]
@@ -560,6 +647,133 @@ impl Page {
         Ok(id)
     }
 
+    /// Queue a trusted DOM event on the user-interaction task source.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_dom_event(&mut self, event: PageDomEvent) -> Result<TaskId, PageQueueError> {
+        self.queue_task(TaskSource::UserInteraction, PageTask::DispatchEvent(event))
+    }
+
+    /// Queue a trusted, bubbling, cancelable `click` event at an element.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_click(&mut self, target: NodeId) -> Result<TaskId, PageQueueError> {
+        self.queue_dom_event(
+            PageDomEvent::new(target, "click")
+                .bubbles(true)
+                .cancelable(true),
+        )
+    }
+
+    /// Queue a trusted, bubbling `input` event at an element whose value the
+    /// user just changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_input_event(&mut self, target: NodeId) -> Result<TaskId, PageQueueError> {
+        self.queue_dom_event(PageDomEvent::new(target, "input").bubbles(true))
+    }
+
+    /// Queue a trusted cancelable `keydown` event at the document.
+    ///
+    /// The engine has no focus model yet, so keyboard events target the
+    /// document itself; listeners on any ancestor still observe them because
+    /// document is the path root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_keydown(&mut self, key: &str) -> Result<TaskId, PageQueueError> {
+        let mut event =
+            PageDomEvent::new(self.document.dom().document(), "keydown").cancelable(true);
+        event
+            .properties
+            .push(("key".to_owned(), JsValue::String(key.to_owned())));
+        self.queue_dom_event(event)
+    }
+
+    /// Advance the virtual clock to `now` and run every ready turn until the
+    /// loop is idle or [`MAX_PUMP_TURNS`] turns have executed. Rendering uses
+    /// the supplied backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock errors when `now` moves backwards and invalidation or
+    /// script errors exactly as repeated [`Self::run_one_turn`] calls would.
+    pub fn pump_until_idle(
+        &mut self,
+        now: Duration,
+        backends: DocumentBackends<'_>,
+    ) -> Result<PagePumpOutcome, PageError> {
+        self.event_loop.advance_time_to(now)?;
+        let mut executed_turns = 0;
+        let mut rendered_turns = 0;
+        let mut task_results = Vec::new();
+        while executed_turns < MAX_PUMP_TURNS {
+            let Some(outcome) = self.run_one_turn(backends)? else {
+                break;
+            };
+            executed_turns += 1;
+            rendered_turns += usize::from(outcome.render.is_some());
+            for execution in outcome.executions {
+                if let PageJob::Task { id, .. } = execution.job {
+                    task_results.push((id, execution.result));
+                }
+            }
+        }
+        Ok(PagePumpOutcome {
+            executed_turns,
+            rendered_turns,
+            task_results,
+        })
+    }
+
+    /// [`Self::pump_until_idle`] with the deterministic reference backends.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock, invalidation, and script errors as the backend-taking
+    /// variant does.
+    pub fn pump_until_idle_reference(
+        &mut self,
+        now: Duration,
+    ) -> Result<PagePumpOutcome, PageError> {
+        self.pump_until_idle(
+            now,
+            DocumentBackends {
+                text_measurer: &SimpleTextMeasurer,
+                text_shaper: &ReferenceTextShaper,
+                glyph_masks: &NoGlyphMasks,
+            },
+        )
+    }
+
+    /// Whether any task, timer, or microtask still awaits execution.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        self.event_loop.pending_task_count() > 0
+            || self.event_loop.pending_timer_count() > 0
+            || self.event_loop.pending_microtask_count() > 0
+    }
+
+    /// Virtual-clock instant of the earliest pending timer, if any.
+    #[must_use]
+    pub fn next_wake_deadline(&self) -> Option<Duration> {
+        self.event_loop.next_timer_deadline()
+    }
+
+    /// Border-box geometry for a DOM node from the latest completed layout,
+    /// in CSS pixels relative to the page origin.
+    #[must_use]
+    pub fn element_rect(&self, node: NodeId) -> Option<ElementRect> {
+        self.geometry_index.get(&node.as_u64()).copied()
+    }
+
     /// Run one event-loop turn with deterministic reference rendering.
     ///
     /// # Errors
@@ -581,6 +795,10 @@ impl Page {
     ///
     /// Returns an invalidation lineage error. Script failures remain explicit
     /// per execution in the successful turn result.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one turn interleaves tasks, microtasks and painting in a fixed order"
+    )]
     pub fn run_one_turn(
         &mut self,
         backends: DocumentBackends<'_>,
@@ -592,6 +810,7 @@ impl Page {
         let task_source_bytes = &mut self.task_source_bytes;
         let microtask_source_bytes = &mut self.microtask_source_bytes;
         let queued_source_bytes = &mut self.queued_source_bytes;
+        let js_timers = &mut self.js_timers;
 
         let Some(event_loop_outcome) =
             event_loop.run_one_turn(document.dom_mut(), |runnable, scheduler, dom| {
@@ -612,8 +831,56 @@ impl Page {
                     ),
                 };
                 *queued_source_bytes = queued_source_bytes.saturating_sub(bytes);
-                let result = execute_task(runtime, dom, task);
+                let result = match task {
+                    PageTask::Timer { id } => {
+                        let from_revision = dom.revision();
+                        let fired = runtime.fire_timer(dom, id);
+                        if let Ok(Some(delay_ms)) = fired {
+                            // Intervals re-arm from their registration period;
+                            // the runtime keeps the entry registered.
+                            let delay = timer_delay_duration(delay_ms);
+                            if let Ok(timer_id) =
+                                scheduler.set_timeout(delay, PageTask::Timer { id })
+                            {
+                                js_timers.insert(id, timer_id);
+                            }
+                        }
+                        fired.map(|_| ScriptOutcome {
+                            value: JsValue::Undefined,
+                            from_revision,
+                            to_revision: dom.revision(),
+                        })
+                    }
+                    task => execute_task(runtime, dom, task),
+                };
                 executions.push(PageExecution { job, result });
+                for request in runtime.take_pending_timer_requests() {
+                    match request {
+                        TimerRequest::Schedule { id, delay_ms } => {
+                            let delay = timer_delay_duration(delay_ms);
+                            match scheduler.set_timeout(delay, PageTask::Timer { id }) {
+                                Ok(timer_id) => {
+                                    js_timers.insert(id, timer_id);
+                                }
+                                Err(error) => {
+                                    if let Some(execution) = executions.last_mut()
+                                        && execution.result.is_ok()
+                                    {
+                                        execution.result = Err(JsError::resource(format!(
+                                            "could not schedule JavaScript timer: {error}"
+                                        )));
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        TimerRequest::Cancel { id } => {
+                            js_timers.remove(&id);
+                            scheduler
+                                .cancel_timers(|payload| matches!(payload, PageTask::Timer { id: pending } if *pending == id));
+                        }
+                    }
+                }
                 for microtask in runtime.take_pending_microtasks() {
                     match scheduler.queue_microtask(PageTask::JsMicrotask(microtask)) {
                         Ok(id) => {
@@ -694,11 +961,36 @@ impl Page {
         let display_list_diff = next.display.list.diff(&self.snapshot.display.list);
         let revision = next.revision;
         self.snapshot = next;
+        self.refresh_geometry_index();
         PageRenderUpdate {
             previous_revision: Some(previous_revision),
             revision,
             display_list_diff: Some(display_list_diff),
         }
+    }
+
+    /// Capture border-box geometry from the latest layout and publish it to
+    /// both this page's index and the script runtime. Geometry visible to
+    /// script is therefore at most one render turn stale.
+    fn refresh_geometry_index(&mut self) {
+        let mut index = BTreeMap::new();
+        for fragment in self.snapshot.layout.fragments.iter() {
+            let FragmentKind::Box(geometry) = &fragment.kind else {
+                continue;
+            };
+            let Some(source) = fragment.source else {
+                continue;
+            };
+            let rect = geometry.border_rect();
+            index.entry(source.as_u64()).or_insert(ElementRect {
+                x: rect.origin.x,
+                y: rect.origin.y,
+                width: rect.size.width,
+                height: rect.size.height,
+            });
+        }
+        self.geometry_index = index.clone();
+        self.runtime.install_element_geometry(index);
     }
 }
 
@@ -722,6 +1014,11 @@ fn queue_discovered_inline_script(
     }
 }
 
+fn timer_delay_duration(delay_ms: f64) -> Duration {
+    let clamped = delay_ms.max(0.0);
+    Duration::from_secs_f64(clamped / 1000.0)
+}
+
 fn execute_task(
     runtime: &mut JsRuntime,
     dom: &mut crate::dom::Dom,
@@ -740,6 +1037,30 @@ fn execute_task(
                     to_revision: dom.revision(),
                 })
         }
+        PageTask::DispatchEvent(event) => {
+            let from_revision = dom.revision();
+            let properties = event
+                .properties
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect::<Vec<_>>();
+            let not_canceled = runtime.dispatch_dom_event(
+                dom,
+                event.target,
+                &event.event_type,
+                event.bubbles,
+                event.cancelable,
+                &properties,
+            )?;
+            Ok(ScriptOutcome {
+                value: JsValue::Boolean(not_canceled),
+                from_revision,
+                to_revision: dom.revision(),
+            })
+        }
+        // The page turn loop intercepts timer tasks before calling this
+        // function so interval re-arming can reach the scheduler.
+        PageTask::Timer { .. } => unreachable!("timer tasks are executed by the page turn loop"),
     }
 }
 

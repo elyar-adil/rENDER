@@ -5,6 +5,7 @@ pub(super) enum TokenKind {
     Identifier(String),
     String(String),
     Number(f64),
+    RegexLiteral { pattern: String, flags: String },
     Let,
     Const,
     Var,
@@ -18,11 +19,13 @@ pub(super) enum TokenKind {
     If,
     Else,
     While,
+    Do,
     For,
     Break,
     Continue,
     Delete,
     Typeof,
+    Void,
     In,
     Instanceof,
     Switch,
@@ -50,8 +53,11 @@ pub(super) enum TokenKind {
     MinusMinus,
     MinusEqual,
     Star,
+    StarEqual,
     Slash,
+    SlashEqual,
     Percent,
+    PercentEqual,
     Bang,
     Equal,
     EqualEqual,
@@ -166,7 +172,22 @@ impl Lexer<'_> {
                     TokenKind::MinusEqual
                 }
                 '-' => self.single(TokenKind::Minus),
+                '*' if self.peek_second() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::StarEqual
+                }
                 '*' => self.single(TokenKind::Star),
+                '/' if self.peek_second() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::SlashEqual
+                }
+                '%' if self.peek_second() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::PercentEqual
+                }
                 '%' => self.single(TokenKind::Percent),
                 '=' => self.equals(),
                 '!' => self.bang(),
@@ -208,6 +229,7 @@ impl Lexer<'_> {
                     self.block_comment(start)?;
                     continue;
                 }
+                '/' if self.regex_allowed() => self.regex_literal(start)?,
                 '/' => self.single(TokenKind::Slash),
                 '\'' | '"' => self.string(character)?,
                 '0'..='9' => self.number()?,
@@ -229,6 +251,88 @@ impl Lexer<'_> {
     fn single(&mut self, kind: TokenKind) -> TokenKind {
         self.advance();
         kind
+    }
+
+    /// Decide whether the `/` at the cursor opens a regex literal instead of a
+    /// division operator, using the standard "previous token" heuristic.
+    fn regex_allowed(&self) -> bool {
+        match self.tokens.last().map(|token| &token.kind) {
+            None => true,
+            Some(kind) => !matches!(
+                kind,
+                TokenKind::Identifier(_)
+                    | TokenKind::String(_)
+                    | TokenKind::Number(_)
+                    | TokenKind::RegexLiteral { .. }
+                    | TokenKind::True
+                    | TokenKind::False
+                    | TokenKind::Null
+                    | TokenKind::Undefined
+                    | TokenKind::This
+                    | TokenKind::RightParen
+                    | TokenKind::RightBracket
+                    | TokenKind::RightBrace
+                    | TokenKind::PlusPlus
+                    | TokenKind::MinusMinus
+            ),
+        }
+    }
+
+    /// Scan a regex literal body plus flags. `/` inside a character class
+    /// never terminates the literal, per the ECMAScript lexical grammar.
+    fn regex_literal(&mut self, start: usize) -> Result<TokenKind, JsError> {
+        self.advance();
+        let mut pattern = String::new();
+        let mut in_class = false;
+        loop {
+            let Some(character) = self.peek() else {
+                return Err(JsError::syntax("unterminated regex literal", start));
+            };
+            if matches!(character, '\n' | '\r') {
+                return Err(JsError::syntax("newline in regex literal", self.offset));
+            }
+            self.advance();
+            match character {
+                '\\' => {
+                    let Some(escaped) = self.peek() else {
+                        return Err(JsError::syntax("unterminated regex escape", self.offset));
+                    };
+                    if matches!(escaped, '\n' | '\r') {
+                        return Err(JsError::syntax("newline in regex literal", self.offset));
+                    }
+                    self.advance();
+                    pattern.push('\\');
+                    pattern.push(escaped);
+                }
+                '[' => {
+                    in_class = true;
+                    pattern.push(character);
+                }
+                ']' => {
+                    in_class = false;
+                    pattern.push(character);
+                }
+                '/' if !in_class => break,
+                other => pattern.push(other),
+            }
+        }
+        let mut flags = String::new();
+        while let Some(character) = self.peek()
+            && character.is_ascii_alphabetic()
+        {
+            self.advance();
+            if flags.contains(character) {
+                return Err(JsError::syntax(
+                    format!("duplicate regex flag {character:?}"),
+                    start,
+                ));
+            }
+            flags.push(character);
+        }
+        if self.peek().is_some_and(is_identifier_start) {
+            return Err(JsError::syntax("invalid regex flag", start));
+        }
+        Ok(TokenKind::RegexLiteral { pattern, flags })
     }
 
     fn equals(&mut self) -> TokenKind {
@@ -342,11 +446,13 @@ impl Lexer<'_> {
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
             "while" => TokenKind::While,
+            "do" => TokenKind::Do,
             "for" => TokenKind::For,
             "break" => TokenKind::Break,
             "continue" => TokenKind::Continue,
             "delete" => TokenKind::Delete,
             "typeof" => TokenKind::Typeof,
+            "void" => TokenKind::Void,
             "in" => TokenKind::In,
             "instanceof" => TokenKind::Instanceof,
             "switch" => TokenKind::Switch,

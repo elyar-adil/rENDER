@@ -17,6 +17,7 @@ pub(super) enum UnaryOp {
     Typeof,
     Delete,
     BitwiseNot,
+    Void,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +32,7 @@ pub(super) enum BinaryOp {
     Greater,
     GreaterEqual,
     Instanceof,
+    In,
     Equal,
     NotEqual,
     StrictEqual,
@@ -87,6 +89,10 @@ pub(super) enum Statement {
         condition: Expr,
         body: Box<Statement>,
     },
+    DoWhile {
+        condition: Box<Expr>,
+        body: Box<Statement>,
+    },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expr>,
@@ -99,8 +105,17 @@ pub(super) enum Statement {
         iterable: Expr,
         body: Box<Statement>,
     },
-    Break,
-    Continue,
+    ForInExpr {
+        target: Expr,
+        iterable: Expr,
+        body: Box<Statement>,
+    },
+    Labeled {
+        label: String,
+        body: Box<Statement>,
+    },
+    Break(Option<String>),
+    Continue(Option<String>),
     Block(Vec<Statement>),
     Expression(Expr),
 }
@@ -108,6 +123,10 @@ pub(super) enum Statement {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
     Literal(JsValue),
+    RegexLiteral {
+        pattern: String,
+        flags: String,
+    },
     This,
     Identifier(String),
     Function {
@@ -165,6 +184,7 @@ pub(super) enum Expr {
         operator: BinaryOp,
         value: Box<Self>,
     },
+    Sequence(Vec<Self>),
 }
 
 pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
@@ -175,6 +195,8 @@ pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<St
         max_statements: limits.max_statements,
         function_depth: 0,
         loop_depth: 0,
+        switch_depth: 0,
+        no_in: false,
     }
     .program()
 }
@@ -186,6 +208,9 @@ struct Parser {
     max_statements: usize,
     function_depth: usize,
     loop_depth: usize,
+    switch_depth: usize,
+    /// While set, `in` is not treated as a binary operator (for-heads).
+    no_in: bool,
 }
 
 impl Parser {
@@ -243,22 +268,43 @@ impl Parser {
         if self.take(&TokenKind::While) {
             return self.while_statement();
         }
+        if self.take(&TokenKind::Do) {
+            return self.do_while_statement();
+        }
         if self.take(&TokenKind::For) {
             return self.for_statement();
         }
+        if matches!(&self.current().kind, TokenKind::Identifier(_))
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Colon)
+            )
+        {
+            let TokenKind::Identifier(label) = self.advance().kind else {
+                unreachable!("checked above");
+            };
+            self.advance();
+            let body = self.statement()?;
+            return Ok(Statement::Labeled {
+                label,
+                body: Box::new(body),
+            });
+        }
         if self.take(&TokenKind::Break) {
-            if self.loop_depth == 0 {
-                return Err(self.error("break is only valid inside a loop"));
+            let label = self.take_loop_label();
+            if self.loop_depth == 0 && self.switch_depth == 0 {
+                return Err(self.error("break is only valid inside a loop or switch"));
             }
-            self.end_statement()?;
-            return Ok(Statement::Break);
+            self.end_statement();
+            return Ok(Statement::Break(label));
         }
         if self.take(&TokenKind::Continue) {
+            let label = self.take_loop_label();
             if self.loop_depth == 0 {
                 return Err(self.error("continue is only valid inside a loop"));
             }
-            self.end_statement()?;
-            return Ok(Statement::Continue);
+            self.end_statement();
+            return Ok(Statement::Continue(label));
         }
         if self.take(&TokenKind::Try) {
             return self.try_statement();
@@ -267,8 +313,8 @@ impl Parser {
             if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RightBrace) {
                 return Err(self.error("throw requires an expression"));
             }
-            let value = self.assignment()?;
-            self.end_statement()?;
+            let value = self.expression()?;
+            self.end_statement();
             return Ok(Statement::Throw(value));
         }
         if self.take(&TokenKind::Return) {
@@ -278,17 +324,41 @@ impl Parser {
             let value = if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RightBrace) {
                 None
             } else {
-                Some(self.assignment()?)
+                Some(self.expression()?)
             };
-            self.end_statement()?;
+            self.end_statement();
             return Ok(Statement::Return(value));
         }
         if let Some(kind) = self.take_variable_kind() {
             return self.variable_declaration(kind, true);
         }
-        let expression = self.assignment()?;
-        self.end_statement()?;
+        let expression = self.expression()?;
+        self.end_statement();
         Ok(Statement::Expression(expression))
+    }
+
+    /// Consume an identifier in `break`/`continue` label position.
+    fn take_loop_label(&mut self) -> Option<String> {
+        if let TokenKind::Identifier(name) = &self.current().kind {
+            let name = name.clone();
+            self.advance();
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    /// Comma-separated expression sequence (the comma operator).
+    fn expression(&mut self) -> Result<Expr, JsError> {
+        let mut expressions = vec![self.assignment()?];
+        while self.take(&TokenKind::Comma) {
+            expressions.push(self.assignment()?);
+        }
+        if expressions.len() == 1 {
+            Ok(expressions.pop().expect("checked length"))
+        } else {
+            Ok(Expr::Sequence(expressions))
+        }
     }
 
     fn take_variable_kind(&mut self) -> Option<VariableKind> {
@@ -327,7 +397,7 @@ impl Parser {
             }
         }
         if end_statement {
-            self.end_statement()?;
+            self.end_statement();
         }
         if declarations.len() == 1 {
             let (name, value) = declarations.pop().expect("one declaration exists");
@@ -351,7 +421,7 @@ impl Parser {
 
     fn if_statement(&mut self) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after if")?;
-        let condition = self.assignment()?;
+        let condition = self.expression()?;
         self.require(&TokenKind::RightParen, "expected ')' after if condition")?;
         let consequent = Box::new(self.statement()?);
         let alternate = if self.take(&TokenKind::Else) {
@@ -368,7 +438,7 @@ impl Parser {
 
     fn switch_statement(&mut self) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after switch")?;
-        let expression = self.assignment()?;
+        let expression = self.expression()?;
         self.require(
             &TokenKind::RightParen,
             "expected ')' after switch expression",
@@ -378,6 +448,7 @@ impl Parser {
             "expected '{' after switch expression",
         )?;
         let mut cases = Vec::new();
+        self.switch_depth = self.switch_depth.saturating_add(1);
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
             let test = if self.take(&TokenKind::Case) {
                 let test = self.assignment()?;
@@ -400,13 +471,14 @@ impl Parser {
             }
             cases.push((test, consequent));
         }
+        self.switch_depth = self.switch_depth.saturating_sub(1);
         self.require(&TokenKind::RightBrace, "expected '}' after switch")?;
         Ok(Statement::Switch { expression, cases })
     }
 
     fn while_statement(&mut self) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after while")?;
-        let condition = self.assignment()?;
+        let condition = self.expression()?;
         self.require(&TokenKind::RightParen, "expected ')' after while condition")?;
         self.loop_depth = self.loop_depth.saturating_add(1);
         let body = self.statement();
@@ -417,8 +489,25 @@ impl Parser {
         })
     }
 
+    fn do_while_statement(&mut self) -> Result<Statement, JsError> {
+        self.loop_depth = self.loop_depth.saturating_add(1);
+        let body = self.statement();
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        let body = body?;
+        self.require(&TokenKind::While, "expected 'while' after do body")?;
+        self.require(&TokenKind::LeftParen, "expected '(' after while")?;
+        let condition = self.expression()?;
+        self.require(&TokenKind::RightParen, "expected ')' after while condition")?;
+        let _ = self.take(&TokenKind::Semicolon);
+        Ok(Statement::DoWhile {
+            condition: Box::new(condition),
+            body: Box::new(body),
+        })
+    }
+
     fn for_statement(&mut self) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after for")?;
+        self.no_in = true;
         let initializer = if self.take(&TokenKind::Semicolon) {
             None
         } else if let Some(kind) = self.take_variable_kind() {
@@ -427,7 +516,8 @@ impl Parser {
                 return Err(self.error("expected an identifier after declaration keyword"));
             };
             if self.take(&TokenKind::In) {
-                let iterable = self.assignment()?;
+                self.no_in = false;
+                let iterable = self.expression()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
                 let body = self.statement();
@@ -444,21 +534,36 @@ impl Parser {
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(statement))
         } else {
-            let expression = self.assignment()?;
+            let expression = self.expression()?;
+            if self.take(&TokenKind::In) {
+                self.no_in = false;
+                let iterable = self.expression()?;
+                self.validate_assignment_target(&expression)?;
+                self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
+                self.loop_depth = self.loop_depth.saturating_add(1);
+                let body = self.statement();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                return Ok(Statement::ForInExpr {
+                    target: expression,
+                    iterable,
+                    body: Box::new(body?),
+                });
+            }
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(Statement::Expression(expression)))
         };
+        self.no_in = false;
         let condition = if self.take(&TokenKind::Semicolon) {
             None
         } else {
-            let condition = self.assignment()?;
+            let condition = self.expression()?;
             self.require(&TokenKind::Semicolon, "expected ';' after for condition")?;
             Some(condition)
         };
         let update = if self.at(&TokenKind::RightParen) {
             None
         } else {
-            Some(self.assignment()?)
+            Some(self.expression()?)
         };
         self.require(&TokenKind::RightParen, "expected ')' after for clauses")?;
         self.loop_depth = self.loop_depth.saturating_add(1);
@@ -524,6 +629,12 @@ impl Parser {
             self.assignment_value(target, Some(BinaryOp::Add))
         } else if self.take(&TokenKind::MinusEqual) {
             self.assignment_value(target, Some(BinaryOp::Subtract))
+        } else if self.take(&TokenKind::StarEqual) {
+            self.assignment_value(target, Some(BinaryOp::Multiply))
+        } else if self.take(&TokenKind::SlashEqual) {
+            self.assignment_value(target, Some(BinaryOp::Divide))
+        } else if self.take(&TokenKind::PercentEqual) {
+            self.assignment_value(target, Some(BinaryOp::Remainder))
         } else if self.take(&TokenKind::AmpersandEqual) {
             self.assignment_value(target, Some(BinaryOp::BitwiseAnd))
         } else if self.take(&TokenKind::CaretEqual) {
@@ -692,16 +803,17 @@ impl Parser {
     }
 
     fn comparison(&mut self) -> Result<Expr, JsError> {
-        self.binary_level(
-            Self::shift,
-            &[
-                (&TokenKind::LessEqual, BinaryOp::LessEqual),
-                (&TokenKind::GreaterEqual, BinaryOp::GreaterEqual),
-                (&TokenKind::Less, BinaryOp::Less),
-                (&TokenKind::Greater, BinaryOp::Greater),
-                (&TokenKind::Instanceof, BinaryOp::Instanceof),
-            ],
-        )
+        let mut operators = vec![
+            (&TokenKind::LessEqual, BinaryOp::LessEqual),
+            (&TokenKind::GreaterEqual, BinaryOp::GreaterEqual),
+            (&TokenKind::Less, BinaryOp::Less),
+            (&TokenKind::Greater, BinaryOp::Greater),
+            (&TokenKind::Instanceof, BinaryOp::Instanceof),
+        ];
+        if !self.no_in {
+            operators.push((&TokenKind::In, BinaryOp::In));
+        }
+        self.binary_level(Self::shift, &operators)
     }
 
     fn shift(&mut self) -> Result<Expr, JsError> {
@@ -777,6 +889,8 @@ impl Parser {
             Some(UnaryOp::Delete)
         } else if self.take(&TokenKind::Typeof) {
             Some(UnaryOp::Typeof)
+        } else if self.take(&TokenKind::Void) {
+            Some(UnaryOp::Void)
         } else if self.take(&TokenKind::Plus) {
             Some(UnaryOp::Plus)
         } else if self.take(&TokenKind::Minus) {
@@ -793,14 +907,37 @@ impl Parser {
             });
         }
         if self.take(&TokenKind::New) {
-            let constructor = self.primary()?;
-            let (constructor, arguments) = if self.take(&TokenKind::LeftParen) {
-                (constructor, self.arguments_after_left_paren()?)
+            // `new` binds to a whole member chain (`new A.B.C(...)`), so
+            // consume dots/computed members BEFORE the argument list.
+            let mut target = self.primary()?;
+            loop {
+                if self.take(&TokenKind::Dot) {
+                    let property = self.property_name()?;
+                    target = Expr::Member {
+                        object: Box::new(target),
+                        property,
+                    };
+                } else if self.take(&TokenKind::LeftBracket) {
+                    let property = self.assignment()?;
+                    self.require(
+                        &TokenKind::RightBracket,
+                        "expected ']' after computed property",
+                    )?;
+                    target = Expr::ComputedMember {
+                        object: Box::new(target),
+                        property: Box::new(property),
+                    };
+                } else {
+                    break;
+                }
+            }
+            let arguments = if self.take(&TokenKind::LeftParen) {
+                self.arguments_after_left_paren()?
             } else {
-                (constructor, Vec::new())
+                Vec::new()
             };
             let expression = Expr::New {
-                constructor: Box::new(constructor),
+                constructor: Box::new(target),
                 arguments,
             };
             return self.postfix_tail(expression);
@@ -881,6 +1018,7 @@ impl Parser {
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
+            TokenKind::RegexLiteral { pattern, flags } => Ok(Expr::RegexLiteral { pattern, flags }),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
@@ -890,9 +1028,20 @@ impl Parser {
             TokenKind::LeftBrace => self.object_literal(),
             TokenKind::LeftBracket => self.array_literal(),
             TokenKind::LeftParen => {
-                let expression = self.assignment()?;
+                // Parentheses restore normal `in` handling ([+In] context).
+                let previous_no_in = self.no_in;
+                self.no_in = false;
+                let mut expressions = vec![self.assignment()?];
+                while self.take(&TokenKind::Comma) {
+                    expressions.push(self.assignment()?);
+                }
                 self.require(&TokenKind::RightParen, "expected ')' after expression")?;
-                Ok(expression)
+                self.no_in = previous_no_in;
+                if expressions.len() == 1 {
+                    Ok(expressions.pop().expect("checked length"))
+                } else {
+                    Ok(Expr::Sequence(expressions))
+                }
             }
             _ => Err(JsError::syntax("expected an expression", token.offset)),
         }
@@ -922,8 +1071,11 @@ impl Parser {
         let mut parameters = Vec::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
-                let TokenKind::Identifier(parameter) = self.advance().kind else {
-                    return Err(self.error("expected a parameter name"));
+                // `undefined` is an ordinary identifier in parameter position.
+                let parameter = match self.advance().kind {
+                    TokenKind::Identifier(name) => name,
+                    TokenKind::Undefined => "undefined".to_owned(),
+                    _ => return Err(self.error("expected a parameter name")),
                 };
                 if parameters.contains(&parameter) {
                     return Err(self.error("duplicate function parameters are not supported"));
@@ -938,11 +1090,14 @@ impl Parser {
         self.require(&TokenKind::LeftBrace, "expected '{' before function body")?;
         let previous_function_depth = self.function_depth;
         let previous_loop_depth = self.loop_depth;
+        let previous_no_in = self.no_in;
         self.function_depth = self.function_depth.saturating_add(1);
         self.loop_depth = 0;
+        self.no_in = false;
         let body = self.statement_list(true);
         self.function_depth = previous_function_depth;
         self.loop_depth = previous_loop_depth;
+        self.no_in = previous_no_in;
         let body = body?;
         self.require(&TokenKind::RightBrace, "expected '}' after function body")?;
         Ok((parameters, body))
@@ -980,15 +1135,16 @@ impl Parser {
 
     fn array_literal(&mut self) -> Result<Expr, JsError> {
         let mut elements = Vec::new();
-        if !self.at(&TokenKind::RightBracket) {
-            loop {
-                elements.push(self.assignment()?);
-                if !self.take(&TokenKind::Comma) {
-                    break;
-                }
-                if self.at(&TokenKind::RightBracket) {
-                    break;
-                }
+        // Elisions (`[, ,]`) produce holes; the runtime models them as
+        // `undefined` entries.
+        while !self.at(&TokenKind::RightBracket) && !self.at(&TokenKind::Eof) {
+            if self.take(&TokenKind::Comma) {
+                elements.push(Expr::Literal(JsValue::Undefined));
+                continue;
+            }
+            elements.push(self.assignment()?);
+            if !self.take(&TokenKind::Comma) {
+                break;
             }
         }
         self.require(&TokenKind::RightBracket, "expected ']' after array literal")?;
@@ -1000,10 +1156,32 @@ impl Parser {
         match token.kind {
             TokenKind::Identifier(name) | TokenKind::String(name) => Ok(name),
             TokenKind::Number(value) => Ok(value.to_string()),
+            // Keywords are valid property names after `.`.
+            TokenKind::Let => Ok("let".to_owned()),
+            TokenKind::Const => Ok("const".to_owned()),
+            TokenKind::Var => Ok("var".to_owned()),
+            TokenKind::Function => Ok("function".to_owned()),
+            TokenKind::Return => Ok("return".to_owned()),
+            TokenKind::New => Ok("new".to_owned()),
+            TokenKind::Throw => Ok("throw".to_owned()),
+            TokenKind::Try => Ok("try".to_owned()),
             TokenKind::Catch => Ok("catch".to_owned()),
             TokenKind::Finally => Ok("finally".to_owned()),
-            TokenKind::Function => Ok("function".to_owned()),
-            TokenKind::New => Ok("new".to_owned()),
+            TokenKind::If => Ok("if".to_owned()),
+            TokenKind::Else => Ok("else".to_owned()),
+            TokenKind::While => Ok("while".to_owned()),
+            TokenKind::Do => Ok("do".to_owned()),
+            TokenKind::For => Ok("for".to_owned()),
+            TokenKind::Break => Ok("break".to_owned()),
+            TokenKind::Continue => Ok("continue".to_owned()),
+            TokenKind::Delete => Ok("delete".to_owned()),
+            TokenKind::Typeof => Ok("typeof".to_owned()),
+            TokenKind::Void => Ok("void".to_owned()),
+            TokenKind::In => Ok("in".to_owned()),
+            TokenKind::Instanceof => Ok("instanceof".to_owned()),
+            TokenKind::Switch => Ok("switch".to_owned()),
+            TokenKind::Case => Ok("case".to_owned()),
+            TokenKind::Default => Ok("default".to_owned()),
             TokenKind::This => Ok("this".to_owned()),
             TokenKind::True => Ok("true".to_owned()),
             TokenKind::False => Ok("false".to_owned()),
@@ -1013,15 +1191,11 @@ impl Parser {
         }
     }
 
-    fn end_statement(&mut self) -> Result<(), JsError> {
-        if self.take(&TokenKind::Semicolon)
-            || self.at(&TokenKind::Eof)
-            || self.at(&TokenKind::RightBrace)
-        {
-            Ok(())
-        } else {
-            Err(self.error("expected ';' between statements"))
-        }
+    /// Automatic semicolon insertion: accept the statement as terminated
+    /// when no explicit separator is present. The recursive-descent
+    /// structure ensures each statement consumes exactly its own tokens.
+    fn end_statement(&mut self) {
+        let _ = self.take(&TokenKind::Semicolon);
     }
 
     fn require(&mut self, expected: &TokenKind, message: &str) -> Result<(), JsError> {
@@ -1088,6 +1262,10 @@ fn validate_strict_statements(statements: &[Statement]) -> Result<(), JsError> {
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per statement kind keeps the strict-mode rules explicit"
+)]
 fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
     match statement {
         Statement::Variable {
@@ -1128,6 +1306,11 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         Statement::While { body, .. } | Statement::For { body, .. } => {
             validate_strict_statement(body)
         }
+        Statement::DoWhile { condition, body } => {
+            validate_strict_expression(condition)?;
+            validate_strict_statement(body)
+        }
+        Statement::Labeled { body, .. } => validate_strict_statement(body),
         Statement::ForIn {
             name,
             iterable,
@@ -1140,6 +1323,15 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
                     0,
                 ));
             }
+            validate_strict_expression(iterable)?;
+            validate_strict_statement(body)
+        }
+        Statement::ForInExpr {
+            target,
+            iterable,
+            body,
+        } => {
+            validate_strict_expression(target)?;
             validate_strict_expression(iterable)?;
             validate_strict_statement(body)
         }
@@ -1177,7 +1369,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             .try_for_each(validate_strict_expression),
         Statement::Return(value) => value.as_ref().map_or(Ok(()), validate_strict_expression),
         Statement::Throw(value) => validate_strict_expression(value),
-        Statement::Break | Statement::Continue => Ok(()),
+        Statement::Break(_) | Statement::Continue(_) => Ok(()),
     }
 }
 
@@ -1256,7 +1448,8 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(constructor)?;
             arguments.iter().try_for_each(validate_strict_expression)
         }
-        Expr::Literal(_) | Expr::This | Expr::Identifier(_) => Ok(()),
+        Expr::Literal(_) | Expr::RegexLiteral { .. } | Expr::This | Expr::Identifier(_) => Ok(()),
+        Expr::Sequence(expressions) => expressions.iter().try_for_each(validate_strict_expression),
     }
 }
 

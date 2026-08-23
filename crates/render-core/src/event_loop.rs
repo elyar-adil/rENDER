@@ -408,6 +408,18 @@ impl<T> EventLoop<T> {
         Ok(timer_id)
     }
 
+    /// Remove every pending timer whose payload satisfies `predicate` and
+    /// return how many were removed. Fired timers are unaffected.
+    pub fn cancel_timers<F>(&mut self, mut predicate: F) -> usize
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let before = self.timers.len();
+        self.timers
+            .retain(|_, scheduled| !predicate(&scheduled.payload));
+        before - self.timers.len()
+    }
+
     /// Advance virtual time by an exact duration.
     ///
     /// # Errors

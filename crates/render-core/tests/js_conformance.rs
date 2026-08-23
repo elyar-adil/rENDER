@@ -157,9 +157,9 @@ const LANGUAGE_CASES: &[Case] = &[
         expected: Expected::Value("result", JsValueRef::Number(42.0)),
     },
     Case {
-        id: "objects/plain-call-this-is-undefined",
+        id: "objects/plain-call-this-is-global",
         source: "function read() { return this === undefined; } const result = read();",
-        expected: Expected::Value("result", JsValueRef::Boolean(true)),
+        expected: Expected::Value("result", JsValueRef::Boolean(false)),
     },
     Case {
         id: "objects/computed-member-assignment",

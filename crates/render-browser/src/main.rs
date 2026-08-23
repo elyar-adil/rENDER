@@ -44,7 +44,7 @@ use render_core::image::{ImageLimits, ImageResources};
 use render_core::interaction::{
     ButtonBehavior, DefaultActionKind, FormMethod, activation_plan, plan_form_submission,
 };
-use render_core::js::RuntimeLimits;
+use render_core::js::{JsValue, RuntimeLimits};
 use render_core::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
 use render_core::page::{Page, PageJob};
@@ -137,17 +137,46 @@ fn get_content_navigation_target(
 
 type NativeSurface = WindowSurface<Arc<Window>, Arc<Window>>;
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let Some(initial) = load_initial_page()? else {
+fn main() {
+    // The interpreter and parser recurse deeply on minified real-world
+    // scripts; the default main-thread stack overflows. Run the entire
+    // event loop on a dedicated thread with a generous stack.
+    let child = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(browser_main)
+        .expect("spawn browser main thread");
+    match child.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(message)) => {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
+    }
+}
+
+fn browser_main() -> Result<(), String> {
+    use winit::platform::windows::EventLoopBuilderExtWindows as _;
+    let Some(initial) = load_initial_page().map_err(|error| error.to_string())? else {
         return Ok(());
     };
-    let fonts = Arc::new(SystemFontBackend::load()?);
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let fonts = Arc::new(SystemFontBackend::load().map_err(|error| error.to_string())?);
+    let event_loop = {
+        let mut builder = EventLoop::<UserEvent>::with_user_event();
+        // The event loop lives on our dedicated big-stack thread for the
+        // whole program lifetime; no other thread touches it.
+        builder.with_any_thread(true);
+        builder.build().map_err(|error| error.to_string())?
+    };
     event_loop.set_control_flow(ControlFlow::Wait);
-    let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))?;
-    let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())?;
+    let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))
+        .map_err(|error| error.to_string())?;
+    let render_worker = start_render_worker(Arc::clone(&fonts), event_loop.create_proxy())
+        .map_err(|error| error.to_string())?;
     let mut app = BrowserApp::new(initial, fonts, network, render_worker);
-    event_loop.run_app(&mut app)?;
+    event_loop
+        .run_app(&mut app)
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -528,6 +557,8 @@ struct PageState {
     external_styles_generation: u64,
     render_generation: u64,
     expected_render: Option<RenderIdentity>,
+    /// Wall-clock anchor for the page's virtual event-loop clock.
+    created_at: Instant,
 }
 
 struct PageNavigation<H> {
@@ -621,6 +652,7 @@ impl PageState {
             external_styles_generation: 0,
             render_generation: 0,
             expected_render: None,
+            created_at: Instant::now(),
         }
     }
 
@@ -644,6 +676,7 @@ impl PageState {
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.external_styles_generation = 0;
         self.expected_render = None;
+        self.created_at = Instant::now();
     }
 
     fn cancel_pending(&mut self) {
@@ -760,6 +793,52 @@ impl PageState {
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.page.document().dom().revision() != revision_before_execution
     }
+
+    /// Print buffered `console.*` output from the page's script runtime.
+    fn drain_console(&mut self) {
+        for message in self.page.runtime_mut().take_console_messages() {
+            eprintln!("[console.{}] {}", message.level.label(), message.text);
+        }
+    }
+
+    /// Advance the page's virtual clock to real elapsed time and run every
+    /// ready turn (timers, queued events, scripts).
+    ///
+    /// Returns whether any turn rendered plus per-task default-action results
+    /// (`true` when the task's event was not `preventDefault()`-ed).
+    fn run_page_turns(&mut self) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {
+        let now = self.created_at.elapsed();
+        let mut rendered = false;
+        let mut defaults = HashMap::new();
+        match self.page.pump_until_idle_reference(now) {
+            Ok(outcome) => {
+                rendered = outcome.rendered_turns > 0;
+                for (id, result) in outcome.task_results {
+                    let default_allowed = match &result {
+                        Ok(script) => matches!(script.value, JsValue::Boolean(true)),
+                        // A throwing listener never prevents the default action.
+                        Err(_) => true,
+                    };
+                    defaults.insert(id, default_allowed);
+                }
+            }
+            Err(error) => eprintln!("render-browser page pump failed: {error}"),
+        }
+        self.drain_console();
+        (rendered, defaults)
+    }
+
+    /// Earliest wall-clock instant at which this page needs a wake-up.
+    fn next_wake_instant(&self) -> Option<Instant> {
+        self.page
+            .next_wake_deadline()
+            .map(|deadline| self.created_at + deadline)
+    }
+
+    /// Whether the page still has script work that requires future turns.
+    fn has_pending_script_work(&self) -> bool {
+        self.page.has_pending_work()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -767,7 +846,6 @@ enum HistoryMode {
     Push,
     Current,
 }
-
 struct BrowserApp {
     tabs: TabModel,
     pages: HashMap<TabId, PageState>,
@@ -1168,6 +1246,30 @@ impl BrowserApp {
             NavigationIntent::Back => self.traverse_active(false),
             NavigationIntent::Forward => self.traverse_active(true),
         }
+    }
+
+    /// Perform any navigations the page's script requested since the last
+    /// pump (`location.assign`/`replace`/`href`). Only the newest request is
+    /// honored; scripts that redirect repeatedly cannot loop the browser.
+    fn drain_script_navigations(&mut self, id: TabId) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        let base = page.navigation.committed().target.history_url();
+        let requests = page.page.runtime_mut().take_pending_navigations();
+        let Some(request) = requests.into_iter().next_back() else {
+            return;
+        };
+        let Ok(url) = Url::options().base_url(Some(&base)).parse(&request.url) else {
+            eprintln!("render-browser ignoring invalid script navigation URL");
+            return;
+        };
+        let mode = if request.replace {
+            HistoryMode::Current
+        } else {
+            HistoryMode::Push
+        };
+        self.navigate_target(id, NavigationTarget::from_url(url), mode);
     }
 
     fn navigate_target(&mut self, id: TabId, target: NavigationTarget, mode: HistoryMode) {
@@ -1654,6 +1756,10 @@ impl BrowserApp {
         })
     }
 
+    fn has_pending_script_work(&self) -> bool {
+        self.pages.values().any(PageState::has_pending_script_work)
+    }
+
     fn handle_pointer_press(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(menu) = self.address_menu.take() {
             if let Some(item) = menu.item_at(self.cursor)
@@ -1773,6 +1879,20 @@ impl BrowserApp {
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
+        // Give page scripts a chance to observe or cancel the click before
+        // any default action (navigation) runs.
+        let mut default_allowed = true;
+        let click_task = hit_node.and_then(|node| {
+            let page = self.pages.get_mut(&id)?;
+            page.page.queue_click(node).ok()
+        });
+        if let Some(task) = click_task
+            && let Some(page) = self.pages.get_mut(&id)
+        {
+            let (_, defaults) = page.run_page_turns();
+            default_allowed = defaults.get(&task).copied().unwrap_or(true);
+            self.drain_script_navigations(id);
+        }
         let navigation = hit_node.and_then(|hit_node| {
             let page = self.pages.get(&id)?;
             get_content_navigation_target(
@@ -1781,7 +1901,7 @@ impl BrowserApp {
                 &page.navigation.committed().target.history_url(),
             )
         });
-        if let Some(url) = navigation {
+        if let Some(url) = navigation.filter(|_| default_allowed) {
             self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Push);
         }
         self.repaint_chrome();
@@ -1826,9 +1946,16 @@ impl BrowserApp {
                 .dom_mut()
                 .set_attribute(node, "value", value)
                 .is_ok()
+            && page.page.queue_input_event(node).is_ok()
         {
-            self.schedule_page_render_for_tab(tab);
+            let (rendered, _) = page.run_page_turns();
+            if rendered {
+                self.schedule_page_render_for_tab(tab);
+            }
+            self.drain_script_navigations(tab);
+            return;
         }
+        self.schedule_page_render_for_tab(tab);
     }
 
     fn content_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
@@ -2031,6 +2158,7 @@ impl BrowserApp {
             if menu_was_open {
                 self.repaint_chrome();
             }
+            self.forward_keydown_to_page(event);
             return;
         }
         match &event.logical_key {
@@ -2075,6 +2203,28 @@ impl BrowserApp {
             _ => return,
         }
         self.repaint_chrome();
+    }
+
+    /// Forward a printable or named key to the page as a trusted `keydown`
+    /// event so script can react to the keyboard.
+    fn forward_keydown_to_page(&mut self, event: &winit::event::KeyEvent) {
+        let Some(key) = page_key_name(event) else {
+            return;
+        };
+        let id = self.tabs.active_id();
+        let queued = self
+            .pages
+            .get_mut(&id)
+            .and_then(|page| page.page.queue_keydown(&key).ok());
+        if queued.is_some()
+            && let Some(page) = self.pages.get_mut(&id)
+        {
+            let (rendered, _) = page.run_page_turns();
+            if rendered {
+                self.schedule_page_render_for_tab(id);
+            }
+            self.drain_script_navigations(id);
+        }
     }
 
     fn handle_content_keyboard(&mut self, event: &winit::event::KeyEvent) -> bool {
@@ -2258,18 +2408,81 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_network();
-        if self.has_pending_network() {
+        let active = self.tabs.active_id();
+        let mut rendered_active = false;
+        let mut navigation_candidates = Vec::new();
+        for (id, page) in &mut self.pages {
+            let now = page.created_at.elapsed();
+            match page.page.pump_until_idle_reference(now) {
+                Ok(outcome) => rendered_active |= *id == active && outcome.rendered_turns > 0,
+                Err(error) => eprintln!("render-browser page pump failed: {error}"),
+            }
+            page.drain_console();
+            if !page
+                .page
+                .runtime_mut()
+                .take_pending_navigations()
+                .is_empty()
+            {
+                navigation_candidates.push(*id);
+            }
+        }
+        if rendered_active {
+            self.schedule_page_render_for_tab(active);
+        }
+        for id in navigation_candidates {
+            self.drain_script_navigations(id);
+        }
+        if self.has_pending_network() || self.has_pending_script_work() {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
             ));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
         }
+        if let Some(wake) = self
+            .pages
+            .values()
+            .filter_map(PageState::next_wake_instant)
+            .min()
+        {
+            // Cap the sleep so far-future timers still poll at a sane rate.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                wake.min(Instant::now() + Duration::from_millis(250)),
+            ));
+            return;
+        }
+        event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
 
 fn key_character_is(key: &Key, expected: &str) -> bool {
     matches!(key, Key::Character(value) if value.eq_ignore_ascii_case(expected))
+}
+
+/// Map a winit key event to the DOM `KeyboardEvent.key` string it represents.
+fn page_key_name(event: &winit::event::KeyEvent) -> Option<String> {
+    if let Some(text) = &event.text {
+        return Some(text.to_string());
+    }
+    let Key::Named(named) = &event.logical_key else {
+        return None;
+    };
+    let name = match named {
+        NamedKey::Enter => "Enter",
+        NamedKey::Backspace => "Backspace",
+        NamedKey::Delete => "Delete",
+        NamedKey::Escape => "Escape",
+        NamedKey::ArrowLeft => "ArrowLeft",
+        NamedKey::ArrowRight => "ArrowRight",
+        NamedKey::ArrowUp => "ArrowUp",
+        NamedKey::ArrowDown => "ArrowDown",
+        NamedKey::Home => "Home",
+        NamedKey::End => "End",
+        NamedKey::Tab => "Tab",
+        NamedKey::Space => " ",
+        _ => return None,
+    };
+    Some(name.to_owned())
 }
 
 fn wheel_document_delta_y(delta: MouseScrollDelta) -> f32 {
