@@ -1017,8 +1017,8 @@ impl TypedPropertyValue {
             Self::BorderWidth(value) => value.to_css(),
             Self::BorderStyle(value) => value.as_str().to_owned(),
             Self::Color(value) => value.to_css(),
-            Self::BackgroundImage(value) => value.clone(),
-            Self::BackgroundRepeat(value)
+            Self::BackgroundImage(value)
+            | Self::BackgroundRepeat(value)
             | Self::BackgroundPosition(value)
             | Self::BackgroundSize(value) => value.clone(),
             Self::FlexDirection(value) => value.as_str().to_owned(),

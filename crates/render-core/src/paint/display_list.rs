@@ -624,6 +624,7 @@ impl Builder<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn paint_background_image(
         &mut self,
         fragment: &Fragment,

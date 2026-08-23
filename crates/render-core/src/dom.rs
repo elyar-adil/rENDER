@@ -752,6 +752,11 @@ impl Dom {
 
     /// Remove an HTML attribute using ASCII case-insensitive local-name
     /// matching. Missing attributes are ignored, as in the platform DOM.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `element` does not refer to a valid node or does
+    /// not resolve to an element.
     pub fn remove_attribute(&mut self, element: NodeId, local_name: &str) -> Result<(), DomError> {
         let NodeKind::Element(data) = self.kind(element)? else {
             return Err(DomError::invalid_node_type("attributes require an element"));

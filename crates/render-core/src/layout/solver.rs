@@ -527,10 +527,17 @@ impl Solver<'_> {
         let top = self.resolve_inset(style, "top", containing.size.height, node.source);
         let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
         let relative_offset = if position == Position::Relative {
-            (
-                left.map_or_else(|| right.map_or(0.0, |right| -right), |left| left),
-                top.map_or_else(|| bottom.map_or(0.0, |bottom| -bottom), |top| top),
-            )
+            let horizontal = match (left, right) {
+                (Some(left), _) => left,
+                (None, Some(right)) => -right,
+                (None, None) => 0.0,
+            };
+            let vertical = match (top, bottom) {
+                (Some(top), _) => top,
+                (None, Some(bottom)) => -bottom,
+                (None, None) => 0.0,
+            };
+            (horizontal, vertical)
         } else {
             (0.0, 0.0)
         };

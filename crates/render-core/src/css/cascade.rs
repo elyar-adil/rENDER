@@ -316,7 +316,6 @@ fn split_css_components(value: &str) -> Vec<&str> {
     for (index, character) in value.char_indices() {
         match (quote, character) {
             (Some(expected), character) if character == expected => quote = None,
-            (Some(_), _) => {}
             (None, '\'' | '"') => quote = Some(character),
             (None, '(') => depth = depth.saturating_add(1),
             (None, ')') => depth = depth.saturating_sub(1),

@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "bindings/python",
     "crates/render-browser",
     "crates/render-core",
     "crates/render-net",

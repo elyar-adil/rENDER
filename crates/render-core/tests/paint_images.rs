@@ -73,8 +73,14 @@ fn background_image_uses_border_box_as_the_default_painting_area() {
                 && matches!(item.command, render_core::paint::DisplayCommand::Image(_))
         })
         .expect("background image should be painted");
-    assert_eq!(image_item.bounds.origin.x, -6.0);
-    assert_eq!(image_item.bounds.origin.y, -6.0);
+    #[allow(
+        clippy::float_cmp,
+        reason = "the geometry is derived from exact integral pixel values"
+    )]
+    {
+        assert_eq!(image_item.bounds.origin.x, -6.0);
+        assert_eq!(image_item.bounds.origin.y, -6.0);
+    }
 
     // The box's 4px transparent border is part of the default border-box
     // painting area, so the centered 40px image remains visible at (1, 1).

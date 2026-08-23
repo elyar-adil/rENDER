@@ -1326,6 +1326,7 @@ impl JsRuntime {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn get_member(
         &mut self,
         dom: &Dom,
@@ -1350,7 +1351,6 @@ impl JsRuntime {
                     };
                 }
                 "readyState" => return Ok(JsValue::String("complete".to_owned())),
-                "querySelector" | "querySelectorAll" => {}
                 _ => {}
             },
             Some(ObjectHost::Node(node)) => match property {
@@ -1438,13 +1438,16 @@ impl JsRuntime {
             },
             Some(ObjectHost::ClassList(node)) => match property {
                 "length" => {
-                    return Ok(JsValue::Number(
-                        self.class_list_tokens(dom, node)?.len() as f64
-                    ));
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "class-list sizes are far below any precision boundary"
+                    )]
+                    let length = Self::class_list_tokens(dom, node)?.len() as f64;
+                    return Ok(JsValue::Number(length));
                 }
                 "value" => {
                     return Ok(JsValue::String(
-                        self.class_list_tokens(dom, node)?.join(" "),
+                        Self::class_list_tokens(dom, node)?.join(" "),
                     ));
                 }
                 _ => {}
@@ -2822,7 +2825,7 @@ impl JsRuntime {
         Ok(None)
     }
 
-    fn class_list_tokens(&self, dom: &Dom, node: NodeId) -> Result<Vec<String>, JsError> {
+    fn class_list_tokens(dom: &Dom, node: NodeId) -> Result<Vec<String>, JsError> {
         let value = dom.attribute(node, "class")?.unwrap_or_default();
         Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
     }
@@ -2859,7 +2862,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let mut tokens = self.class_list_tokens(dom, node)?;
+        let mut tokens = Self::class_list_tokens(dom, node)?;
         let mut changed = false;
         for index in 0..arguments.len() {
             let token = Self::class_list_token(arguments, index, "classList.add")?;
@@ -2881,7 +2884,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let mut tokens = self.class_list_tokens(dom, node)?;
+        let mut tokens = Self::class_list_tokens(dom, node)?;
         let original_len = tokens.len();
         for index in 0..arguments.len() {
             let token = Self::class_list_token(arguments, index, "classList.remove")?;
@@ -2905,7 +2908,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
         let token = Self::class_list_token(arguments, 0, "classList.toggle")?;
-        let mut tokens = self.class_list_tokens(dom, node)?;
+        let mut tokens = Self::class_list_tokens(dom, node)?;
         let present = tokens.iter().any(|candidate| candidate == &token);
         let next = match arguments.get(1) {
             Some(force) => force.is_truthy(),
@@ -2934,7 +2937,7 @@ impl JsRuntime {
         let node = self.require_class_list(receiver)?;
         let token = Self::class_list_token(arguments, 0, "classList.contains")?;
         Ok(JsValue::Boolean(
-            self.class_list_tokens(dom, node)?
+            Self::class_list_tokens(dom, node)?
                 .iter()
                 .any(|candidate| candidate == &token),
         ))
@@ -2951,9 +2954,13 @@ impl JsRuntime {
         if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
             return Ok(JsValue::Null);
         }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "index was validated as a finite non-negative integer"
+        )]
         let index = index as usize;
-        Ok(self
-            .class_list_tokens(dom, node)?
+        Ok(Self::class_list_tokens(dom, node)?
             .get(index)
             .cloned()
             .map_or(JsValue::Null, JsValue::String))
@@ -2962,7 +2969,7 @@ impl JsRuntime {
     fn class_list_to_string(&self, dom: &Dom, receiver: ObjectId) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
         Ok(JsValue::String(
-            self.class_list_tokens(dom, node)?.join(" "),
+            Self::class_list_tokens(dom, node)?.join(" "),
         ))
     }
 

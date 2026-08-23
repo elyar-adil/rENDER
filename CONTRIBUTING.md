@@ -2,45 +2,38 @@
 
 ## Setup
 
+Install a stable Rust toolchain (1.85 or newer), then build the workspace:
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-dev.txt
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements-dev.txt
+cargo build --workspace
 ```
 
 ## Testing Philosophy
 
 - A test passing should imply the page still renders correctly, not just that parsing succeeded.
-- Prefer adding assertions in `tests/test_modern_rendering_contracts.py` for real-page fixtures when fixing compatibility bugs.
-- Use browser-vs-engine visual diffs as a secondary guardrail for parity with Chromium/Chrome.
-- See `docs/testing_strategy.md` for the layered test model and rollout expectations.
+- Standards are the authority: WHATWG/CSS/ECMAScript specs, WPT, and test262 outrank intuition.
+- Prefer conformance-backed fixes: reproduce a gap with a pinned test262 or WPT case when possible.
+- Keep behavior deterministic; avoid tests that depend on network access.
 
 ## Required Checks
 
 Before sending a change, run:
 
 ```bash
-python -m pytest
-python -m compileall engine.py screenshot.py css html js layout network rendering tests
-python -m ruff check engine.py screenshot.py css html js layout network rendering tests
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
+
+All three must pass. CI enforces them.
 
 ## Change Guidelines
 
 - Prefer small, test-backed changes over broad rewrites.
-- Preserve behavior unless the change explicitly fixes a bug or improves compatibility.
+- Preserve behavior unless the change explicitly fixes a bug or improves standards conformance.
 - Add or update regression tests for parser, cascade, layout, network, or engine changes.
 - Do not revert unrelated work in a dirty tree.
-- Keep active work in `engine.py`, package directories, and `tests/`.
-- Treat `graphics.py`, `layout.py`, `run_hao123.py`, `res.py`, and `paser/` as historical code unless a change explicitly targets those paths.
+- Delete dead code rather than working around it; there is no legacy implementation to stay compatible with.
 
 ## Review Expectations
 
@@ -50,14 +43,3 @@ Good contributions usually include:
 - the minimal code change needed to fix it
 - an explanation of any tradeoff in semantics or compatibility
 - verification output for the commands above
-
-## Optional Visual Checks
-
-The repository includes headless and browser-based helpers for visual comparisons:
-
-```bash
-python screenshot.py example/index.html out.png 1280 900
-python tests/browser_visual_regression.py --module header
-```
-
-The browser-based regression helper requires a locally installed Chromium or Chrome-compatible binary.

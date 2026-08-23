@@ -243,59 +243,13 @@ fn apply_response(
         return;
     }
     let sniffed_format = sniff_image_format(&response.body);
-    let format = match response.content_type.as_ref() {
-        Some(content_type) => {
-            if let Some(declared_format) = ImageFormat::from_media_type(&content_type.media_type) {
-                declared_format
-            } else if is_generic_binary_media_type(&content_type.media_type)
-                && let Some(sniffed_format) = sniffed_format
-            {
-                application.diagnostics.push(resource_diagnostic(
-                    resource,
-                    ImageDiagnosticSeverity::Warning,
-                    ImageResourceDiagnosticCode::UnsupportedContentType,
-                    format!(
-                        "image response declared generic content type '{}'; using sniffed '{}'",
-                        content_type.media_type,
-                        sniffed_format.media_type()
-                    ),
-                ));
-                sniffed_format
-            } else {
-                application.diagnostics.push(resource_diagnostic(
-                    resource,
-                    ImageDiagnosticSeverity::Error,
-                    ImageResourceDiagnosticCode::UnsupportedContentType,
-                    format!(
-                        "image response has unsupported content type '{}'",
-                        content_type.media_type
-                    ),
-                ));
-                return;
-            }
-        }
-        None => {
-            let Some(sniffed_format) = sniffed_format else {
-                application.diagnostics.push(resource_diagnostic(
-                    resource,
-                    ImageDiagnosticSeverity::Error,
-                    ImageResourceDiagnosticCode::MissingContentType,
-                    "image response omitted Content-Type and has no supported image signature"
-                        .to_owned(),
-                ));
-                return;
-            };
-            application.diagnostics.push(resource_diagnostic(
-                resource,
-                ImageDiagnosticSeverity::Warning,
-                ImageResourceDiagnosticCode::MissingContentType,
-                format!(
-                    "image response omitted Content-Type; using sniffed '{}'",
-                    sniffed_format.media_type()
-                ),
-            ));
-            sniffed_format
-        }
+    let Some(format) = resolve_image_format(
+        resource,
+        response.content_type.as_ref(),
+        sniffed_format,
+        application,
+    ) else {
+        return;
     };
     if sniffed_format != Some(format) {
         application.diagnostics.push(resource_diagnostic(
@@ -344,6 +298,64 @@ fn apply_response(
             error.to_string(),
         )),
     }
+}
+
+fn resolve_image_format(
+    resource: &ImageFetch,
+    content_type: Option<&render_net::ContentType>,
+    sniffed_format: Option<ImageFormat>,
+    application: &mut ImageBatchApplication,
+) -> Option<ImageFormat> {
+    let Some(content_type) = content_type else {
+        let Some(sniffed_format) = sniffed_format else {
+            application.diagnostics.push(resource_diagnostic(
+                resource,
+                ImageDiagnosticSeverity::Error,
+                ImageResourceDiagnosticCode::MissingContentType,
+                "image response omitted Content-Type and has no supported image signature"
+                    .to_owned(),
+            ));
+            return None;
+        };
+        application.diagnostics.push(resource_diagnostic(
+            resource,
+            ImageDiagnosticSeverity::Warning,
+            ImageResourceDiagnosticCode::MissingContentType,
+            format!(
+                "image response omitted Content-Type; using sniffed '{}'",
+                sniffed_format.media_type()
+            ),
+        ));
+        return Some(sniffed_format);
+    };
+    if let Some(declared_format) = ImageFormat::from_media_type(&content_type.media_type) {
+        return Some(declared_format);
+    }
+    if is_generic_binary_media_type(&content_type.media_type)
+        && let Some(sniffed_format) = sniffed_format
+    {
+        application.diagnostics.push(resource_diagnostic(
+            resource,
+            ImageDiagnosticSeverity::Warning,
+            ImageResourceDiagnosticCode::UnsupportedContentType,
+            format!(
+                "image response declared generic content type '{}'; using sniffed '{}'",
+                content_type.media_type,
+                sniffed_format.media_type()
+            ),
+        ));
+        return Some(sniffed_format);
+    }
+    application.diagnostics.push(resource_diagnostic(
+        resource,
+        ImageDiagnosticSeverity::Error,
+        ImageResourceDiagnosticCode::UnsupportedContentType,
+        format!(
+            "image response has unsupported content type '{}'",
+            content_type.media_type
+        ),
+    ));
+    None
 }
 
 fn is_generic_binary_media_type(media_type: &str) -> bool {

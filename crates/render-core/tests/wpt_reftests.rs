@@ -13,7 +13,7 @@ use render_core::document::{
     AuthorStyleSource, Document, DocumentLimits, DocumentRenderOptions, ExternalStyleSheetKey,
     ExternalStyleSheets,
 };
-use render_core::dom::{Dom, NodeKind};
+use render_core::dom::{Dom, Node, NodeKind};
 use render_core::layout::{LayoutOptions, PhysicalSize};
 use render_core::paint::Color;
 use url::Url;
@@ -127,9 +127,7 @@ fn official_wpt_reftests() {
 
 fn required_value(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| {
-        panic!(
-            "{name} is required; run tools/run-wpt-reftests.py or set RENDER_WPT_ROOT, RENDER_WPT_TEST, and RENDER_WPT_REFERENCE"
-        )
+        panic!("{name} is required; set RENDER_WPT_ROOT, RENDER_WPT_TEST, and RENDER_WPT_REFERENCE")
     })
 }
 
@@ -150,7 +148,7 @@ fn load_cases() -> Vec<WptCase> {
             panic!("use either the single WPT case variables or RENDER_WPT_MANIFEST, not both")
         }
         (None, None, None) => {
-            panic!("RENDER_WPT_MANIFEST is required for a batch run; run tools/run-wpt-reftests.py")
+            panic!("RENDER_WPT_MANIFEST is required for a batch run; set RENDER_WPT_MANIFEST")
         }
     }
 }
@@ -260,7 +258,7 @@ fn run_case(root: &Path, case: &WptCase) -> Result<(Outcome, String), String> {
     let test_document = Document::parse(&test_source);
     let reference_document = Document::parse(&reference_source);
 
-    if has_skip_flag(&test_document.dom()) || has_skip_flag(&reference_document.dom()) {
+    if has_skip_flag(test_document.dom()) || has_skip_flag(reference_document.dom()) {
         return Ok((
             Outcome::Skip,
             "WPT flags require an interactive, print, or paged environment".to_owned(),
@@ -273,7 +271,7 @@ fn run_case(root: &Path, case: &WptCase) -> Result<(Outcome, String), String> {
                 .to_owned(),
         ));
     }
-    if !match_link_targets(&test_document.dom(), &test_path, &reference_path) {
+    if !match_link_targets(test_document.dom(), &test_path, &reference_path) {
         return Ok((
             Outcome::Fail,
             "test does not declare the supplied reference with link rel=match".to_owned(),
@@ -317,10 +315,7 @@ fn run_case(root: &Path, case: &WptCase) -> Result<(Outcome, String), String> {
     if differing != 0 {
         return Ok((
             Outcome::Fail,
-            format!(
-                "{differing} pixels differ; first difference: {:?}",
-                first_difference
-            ),
+            format!("{differing} pixels differ; first difference: {first_difference:?}"),
         ));
     }
     Ok((Outcome::Pass, "exact pixel match".to_owned()))
@@ -419,7 +414,7 @@ fn has_unsupported_markup(source: &str) -> bool {
 fn has_skip_flag(dom: &Dom) -> bool {
     let mut pending = vec![dom.document()];
     while let Some(node) = pending.pop() {
-        if let Some(NodeKind::Element(element)) = dom.node(node).map(|node| node.kind()) {
+        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind) {
             if element.local_name == "meta"
                 && dom
                     .attribute(node, "name")
@@ -448,13 +443,12 @@ fn has_skip_flag(dom: &Dom) -> bool {
 }
 
 fn match_link_targets(dom: &Dom, test_path: &Path, reference_path: &Path) -> bool {
-    let expected = match reference_path.canonicalize() {
-        Ok(path) => path,
-        Err(_) => return false,
+    let Ok(expected) = reference_path.canonicalize() else {
+        return false;
     };
     let mut pending = vec![dom.document()];
     while let Some(node) = pending.pop() {
-        if let Some(NodeKind::Element(element)) = dom.node(node).map(|node| node.kind()) {
+        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind) {
             if element.local_name == "link"
                 && dom
                     .attribute(node, "rel")
