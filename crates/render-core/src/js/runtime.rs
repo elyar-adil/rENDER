@@ -2289,6 +2289,26 @@ impl JsRuntime {
             }
         }
         match self.realm.host(object) {
+            Some(ObjectHost::Array) => {
+                if property == "length" {
+                    return self.set_array_length_value(object, &value);
+                }
+                if let Some(index) = array_index(property) {
+                    if !self.realm.set_property(object, property.to_owned(), value) {
+                        return Err(JsError::type_error(format!(
+                            "property {property:?} is not writable"
+                        )));
+                    }
+                    let length = self.array_length(object)?;
+                    if index >= length {
+                        let next_length = index.checked_add(1).ok_or_else(|| {
+                            JsError::type_error("array length exceeds the supported range")
+                        })?;
+                        self.set_array_length(object, next_length)?;
+                    }
+                    return Ok(());
+                }
+            }
             Some(ObjectHost::Node(node)) => {
                 if property == "className" {
                     return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
@@ -2378,6 +2398,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match self.realm.host(constructor) {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
+            Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
                 None | Some(JsValue::Undefined) => 0.0,
                 Some(value) => to_number(value)?,
@@ -2480,6 +2501,7 @@ impl JsRuntime {
         self.calls_active = self.calls_active.saturating_add(1);
         let result = match self.realm.host(callee) {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
+            Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
             Some(ObjectHost::FunctionConstructor) => Ok(JsValue::Undefined),
             Some(ObjectHost::StringConstructor) => Ok(JsValue::String(
                 arguments
@@ -2648,6 +2670,45 @@ impl JsRuntime {
             bound_receiver,
             bound_arguments,
         )))
+    }
+
+    fn array_constructor(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let array = self.realm.create_array();
+        match arguments {
+            [] => {}
+            [JsValue::Number(length)] => {
+                if !length.is_finite()
+                    || *length < 0.0
+                    || length.fract() != 0.0
+                    || *length > f64::from(u32::MAX)
+                {
+                    return Err(JsError::type_error("invalid array length"));
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                self.set_array_length(array, *length as u32)?;
+            }
+            [value] => {
+                if !self
+                    .realm
+                    .set_property(array, "0".to_owned(), value.clone())
+                {
+                    return Err(JsError::type_error("could not define array element"));
+                }
+                self.set_array_length(array, 1)?;
+            }
+            values => {
+                for (index, value) in values.iter().enumerate() {
+                    self.realm
+                        .set_property(array, index.to_string(), value.clone());
+                }
+                let length = u32::try_from(values.len()).map_err(|_| {
+                    JsError::resource("array length exceeds the supported u32 range")
+                })?;
+                self.set_array_length(array, length)?;
+            }
+        }
+        Ok(JsValue::Object(array))
     }
 
     fn call_user(
@@ -4773,9 +4834,10 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let mut elements = self.array_elements(receiver)?;
         elements.splice(0..0, arguments.iter().cloned());
+        let new_length = elements.len();
         self.set_array_elements(receiver, &elements)?;
         #[allow(clippy::cast_precision_loss)]
-        Ok(JsValue::Number(arguments.len() as f64))
+        Ok(JsValue::Number(new_length as f64))
     }
 
     fn array_iterate_with(
@@ -4844,22 +4906,44 @@ impl JsRuntime {
     }
 
     fn array_length(&self, object: ObjectId) -> Result<u32, JsError> {
-        match self.realm.get_property(object, "length") {
-            Some(JsValue::Number(length))
-                if length.is_finite()
-                    && length >= 0.0
-                    && length <= f64::from(u32::MAX)
-                    && length.fract() == 0.0 =>
-            {
-                length
-                    .to_string()
-                    .parse::<u32>()
-                    .map_err(|_| JsError::type_error("array length is outside the u32 range"))
-            }
-            _ => Err(JsError::type_error(
-                "array length is not a supported integer",
-            )),
+        let value = self
+            .realm
+            .get_property(object, "length")
+            .unwrap_or(JsValue::Undefined);
+        let number = to_number(&value)?;
+        if number.is_nan() || number <= 0.0 {
+            return Ok(0);
         }
+        if number.is_infinite() {
+            return Ok(u32::MAX);
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Ok(number.trunc().min(f64::from(u32::MAX)) as u32)
+    }
+
+    fn set_array_length_value(&mut self, object: ObjectId, value: &JsValue) -> Result<(), JsError> {
+        let number = to_number(value)?;
+        if !number.is_finite()
+            || number < 0.0
+            || number.fract() != 0.0
+            || number > f64::from(u32::MAX)
+        {
+            return Err(JsError::type_error("invalid array length"));
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let length = number as u32;
+        let old_length = self.array_length(object)?;
+        if length < old_length {
+            for name in self.realm.own_property_names(object).unwrap_or_default() {
+                if let Some(index) = array_index(&name)
+                    && index >= length
+                    && !self.realm.delete_property(object, &name)
+                {
+                    return Err(JsError::type_error("could not shrink array length"));
+                }
+            }
+        }
+        self.set_array_length(object, length)
     }
 
     fn set_array_length(&mut self, object: ObjectId, length: u32) -> Result<(), JsError> {
@@ -6422,6 +6506,11 @@ fn to_number(value: &JsValue) -> Result<f64, JsError> {
     }
 }
 
+fn array_index(property: &str) -> Option<u32> {
+    let index = property.parse::<u32>().ok()?;
+    (index.to_string() == property && index < u32::MAX).then_some(index)
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn to_uint32(value: &JsValue) -> Result<u32, JsError> {
     let number = to_number(value)?;
@@ -6908,6 +6997,49 @@ mod tests {
             )
             .expect("Object.prototype methods should execute");
         assert_eq!(outcome.value, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn array_constructor_and_length_follow_common_ecmascript_semantics() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var empty = new Array();
+                    var sized = Array(3);
+                    var one = Array("x");
+                    var many = new Array(1, 2, 3);
+                    sized[4] = 5;
+                    sized.length = 2;
+                    var unshifted = many.unshift(0);
+                    empty.length + ":" + sized.length + ":" +
+                        (sized[4] === undefined) + ":" + one[0] + ":" +
+                        many.join(",") + ":" + unshifted + ":" + Array.isArray(many);
+                "#,
+            )
+            .expect("Array constructor and length semantics should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("0:2:true:x:0,1,2,3:4:true".to_owned())
+        );
+    }
+
+    #[test]
+    fn array_length_reads_use_to_length_for_generic_array_methods() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var object = { 0: "a", length: "1.9" };
+                    Array.prototype.join.call(object, "-");
+                "#,
+            )
+            .expect("generic array methods should normalize length");
+        assert_eq!(outcome.value, JsValue::String("a".to_owned()));
     }
 
     #[test]

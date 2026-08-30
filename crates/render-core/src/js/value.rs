@@ -1640,11 +1640,21 @@ impl Realm {
     }
 
     pub(crate) fn create_array(&mut self) -> ObjectId {
-        self.allocate(JsObject {
+        let array = self.allocate(JsObject {
             prototype: Some(self.array_prototype),
             host: ObjectHost::Array,
             ..JsObject::default()
-        })
+        });
+        self.objects[array.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Number(0.0),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        array
     }
 
     /// Define or replace an own data property.

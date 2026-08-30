@@ -26,7 +26,7 @@ jQuery 与 ESL AMD 加载器完整执行；baidu_diag 报错从 23 → 10。
 | all_async_search / min_super | value is not a constructor | 待查（agent D 未完成）|
 | hectorstatic | `.apply of undefined` | 待查 |
 
-## Agent C 调查报告（array length）— 已定位未修复
+## Agent C 调查报告（array length）— 已修复（2026-08-30）
 
 **产生点**：`runtime.rs:4846 array_length()` 严格要求 Number 整数；所有 11 个数组
 原生方法都经它取 length。写入侧 `set_member` 没有 Array+length 分支（存原始值不校验）。
@@ -37,13 +37,14 @@ ToLength(undefined)→0，我们直接抛 TypeError。
 
 **修法**：
 1. `array_length` 改用 ToLength 语义（to_number→NaN/∞/<0 钳 0，向零截断）。
-2. `set_member` 增加 Array+"length" 分支：ArraySetLength 规范语义
-   （非法值抛 RangeError，缩容截断元素）。
-3. **必改**：`construct_dispatch`（runtime.rs:2373）缺 `ObjectHost::ArrayConstructor`
-   分支 → `new Array(...)` 报 "value is not a constructor"，polyfill 下一个检测就死在这。
-4. 附带 bug：`unshift` 返回 args.len() 应返回新长度（4778 行附近）。
+2. `set_member` 增加 Array+"length" 分支：非法值拒绝，缩容截断元素。
+3. `construct_dispatch` 与普通调用分派补齐 `ObjectHost::ArrayConstructor`。
+4. `Array()` / `new Array()` 支持空参数、单数字长度、单值和多值构造。
+5. `unshift` 返回新数组长度；新增运行时回归测试覆盖上述行为。
 
 ## 其他已知问题
+
+- 性能修复（2026-08-30）：浏览器事件线程不再同步执行页面布局/栅格化；鼠标移动不再无条件重绘整窗；等待中的 `setInterval` 不再触发 16ms 空转。
 
 - data: URI 图片不支持（网络层 UnsupportedScheme），NodeId(476) 反复报错。
 - @font-face/@keyframes/@media 已解析未评估。

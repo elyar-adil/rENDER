@@ -753,12 +753,53 @@ impl Page {
         )
     }
 
+    /// Advance the event loop without synchronously laying out or painting.
+    ///
+    /// The returned outcome still includes task results; a background renderer
+    /// can consume the DOM revision after the pump.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock, invalidation, and script errors as the rendering variant.
+    pub fn pump_until_idle_without_render(
+        &mut self,
+        now: Duration,
+    ) -> Result<PagePumpOutcome, PageError> {
+        self.event_loop.advance_time_to(now)?;
+        let mut executed_turns = 0;
+        let mut rendered_turns = 0;
+        let mut task_results = Vec::new();
+        while executed_turns < MAX_PUMP_TURNS {
+            let Some(outcome) = self.run_one_turn_without_render()? else {
+                break;
+            };
+            executed_turns += 1;
+            rendered_turns += usize::from(outcome.render.is_some());
+            for execution in outcome.executions {
+                if let PageJob::Task { id, .. } = execution.job {
+                    task_results.push((id, execution.result));
+                }
+            }
+        }
+        Ok(PagePumpOutcome {
+            executed_turns,
+            rendered_turns,
+            task_results,
+        })
+    }
+
     /// Whether any task, timer, or microtask still awaits execution.
     #[must_use]
     pub fn has_pending_work(&self) -> bool {
         self.event_loop.pending_task_count() > 0
             || self.event_loop.pending_timer_count() > 0
             || self.event_loop.pending_microtask_count() > 0
+    }
+
+    /// Whether a task or microtask is ready to run immediately.
+    #[must_use]
+    pub fn has_pending_immediate_work(&self) -> bool {
+        self.event_loop.ready_task_count() > 0 || self.event_loop.pending_microtask_count() > 0
     }
 
     /// Virtual-clock instant of the earliest pending timer, if any.
@@ -782,11 +823,24 @@ impl Page {
     /// are retained in [`PageTurnOutcome::executions`] because a failed script
     /// may already have mutated the DOM.
     pub fn run_one_turn_reference(&mut self) -> Result<Option<PageTurnOutcome>, PageError> {
-        self.run_one_turn(DocumentBackends {
+        self.run_one_turn_with_backends(Some(DocumentBackends {
             text_measurer: &SimpleTextMeasurer,
             text_shaper: &ReferenceTextShaper,
             glyph_masks: &NoGlyphMasks,
-        })
+        }))
+    }
+
+    /// Run one event-loop turn without doing synchronous layout or painting.
+    ///
+    /// Embeddings with a background renderer can use this path to keep their
+    /// event thread responsive while still advancing tasks, microtasks, timers,
+    /// and the DOM invalidation cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalidation lineage error or a clock error.
+    pub fn run_one_turn_without_render(&mut self) -> Result<Option<PageTurnOutcome>, PageError> {
+        self.run_one_turn_with_backends(None)
     }
 
     /// Run task -> microtask checkpoint -> rendering opportunity.
@@ -802,6 +856,14 @@ impl Page {
     pub fn run_one_turn(
         &mut self,
         backends: DocumentBackends<'_>,
+    ) -> Result<Option<PageTurnOutcome>, PageError> {
+        self.run_one_turn_with_backends(Some(backends))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_one_turn_with_backends(
+        &mut self,
+        backends: Option<DocumentBackends<'_>>,
     ) -> Result<Option<PageTurnOutcome>, PageError> {
         let mut executions = Vec::new();
         let event_loop = &mut self.event_loop;
@@ -916,11 +978,9 @@ impl Page {
         }
 
         let invalidation = self.invalidation.take(self.document.dom())?;
-        let render = if invalidation.is_empty() {
-            None
-        } else {
-            Some(self.render_update(backends))
-        };
+        let render = (!invalidation.is_empty())
+            .then(|| backends.map(|backends| self.render_update(backends)))
+            .flatten();
         Ok(Some(PageTurnOutcome {
             event_loop: event_loop_outcome,
             executions,
@@ -1074,6 +1134,7 @@ mod tests {
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
     use crate::js::RuntimeLimits;
     use crate::script::{ScriptDiagnosticCode, ScriptDiscoveryLimits, ScriptScheduling};
+    use std::time::Duration;
     use url::Url;
 
     fn element_with_id(dom: &Dom, id: &str) -> NodeId {
@@ -1133,6 +1194,28 @@ mod tests {
             Some(NodeKind::Text(value)) if value == "script-first"
         ));
         assert!(page.snapshot().revision > initial_revision);
+    }
+
+    #[test]
+    fn no_render_pump_advances_scripts_without_blocking_on_layout() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        let initial_snapshot_revision = page.snapshot().revision;
+        page.queue_script("document.getElementById('message').textContent = 'after';")
+            .expect("script fits the page limits");
+
+        let outcome = page
+            .pump_until_idle_without_render(Duration::ZERO)
+            .expect("script task should execute without rendering");
+
+        assert_eq!(outcome.executed_turns, 1);
+        assert_eq!(outcome.rendered_turns, 0);
+        assert_eq!(page.snapshot().revision, initial_snapshot_revision);
+        let message = element_with_id(page.document().dom(), "message");
+        let text = page.document().dom().children(message).unwrap()[0];
+        assert!(matches!(
+            page.document().dom().node(text).map(crate::dom::Node::kind),
+            Some(NodeKind::Text(value)) if value == "after"
+        ));
     }
 
     #[test]

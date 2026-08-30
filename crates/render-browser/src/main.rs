@@ -764,7 +764,7 @@ impl PageState {
             })
             .collect::<HashMap<_, _>>();
         loop {
-            match self.page.run_one_turn_reference() {
+            match self.page.run_one_turn_without_render() {
                 Ok(Some(turn)) => {
                     let mut turn_origin = None;
                     for execution in turn.executions {
@@ -804,15 +804,14 @@ impl PageState {
     /// Advance the page's virtual clock to real elapsed time and run every
     /// ready turn (timers, queued events, scripts).
     ///
-    /// Returns whether any turn rendered plus per-task default-action results
-    /// (`true` when the task's event was not `preventDefault()`-ed).
+    /// Returns whether any turn mutated the DOM plus per-task default-action
+    /// results (`true` when the task's event was not `preventDefault()`-ed).
     fn run_page_turns(&mut self) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {
         let now = self.created_at.elapsed();
-        let mut rendered = false;
+        let revision_before = self.page.document().dom().revision().as_u64();
         let mut defaults = HashMap::new();
-        match self.page.pump_until_idle_reference(now) {
+        match self.page.pump_until_idle_without_render(now) {
             Ok(outcome) => {
-                rendered = outcome.rendered_turns > 0;
                 for (id, result) in outcome.task_results {
                     let default_allowed = match &result {
                         Ok(script) => matches!(script.value, JsValue::Boolean(true)),
@@ -825,7 +824,9 @@ impl PageState {
             Err(error) => eprintln!("render-browser page pump failed: {error}"),
         }
         self.drain_console();
-        (rendered, defaults)
+        let revision_after = self.page.document().dom().revision().as_u64();
+        self.dom_revision = revision_after;
+        (revision_after != revision_before, defaults)
     }
 
     /// Earliest wall-clock instant at which this page needs a wake-up.
@@ -837,7 +838,7 @@ impl PageState {
 
     /// Whether the page still has script work that requires future turns.
     fn has_pending_script_work(&self) -> bool {
-        self.page.has_pending_work()
+        self.page.has_pending_immediate_work()
     }
 }
 
@@ -864,6 +865,7 @@ struct BrowserApp {
     theme: ChromeTheme,
     cursor: Point,
     hot: HitTarget,
+    cursor_icon: CursorIcon,
     drag: Option<TabDrag>,
     address_selecting: bool,
     address_menu: Option<AddressContextMenu>,
@@ -901,6 +903,7 @@ impl BrowserApp {
             theme: ChromeTheme::Light,
             cursor: Point::default(),
             hot: HitTarget::Chrome,
+            cursor_icon: CursorIcon::Default,
             drag: None,
             address_selecting: false,
             address_menu: None,
@@ -2030,7 +2033,9 @@ impl BrowserApp {
         let Some(layout) = &self.layout else {
             return;
         };
+        let previous_hot = self.hot;
         self.hot = layout.hit_test(self.cursor);
+        let hot_changed = self.hot != previous_hot;
         let cursor_icon = match self.hot {
             HitTarget::AddressBar => CursorIcon::Text,
             HitTarget::Content => self
@@ -2051,8 +2056,11 @@ impl BrowserApp {
             | HitTarget::WindowControl(_) => CursorIcon::Pointer,
             HitTarget::TitleBar | HitTarget::Chrome => CursorIcon::Default,
         };
-        if let Some(window) = &self.window {
-            window.set_cursor(cursor_icon);
+        if cursor_icon != self.cursor_icon {
+            if let Some(window) = &self.window {
+                window.set_cursor(cursor_icon);
+            }
+            self.cursor_icon = cursor_icon;
         }
         if self.address_selecting {
             let index =
@@ -2067,7 +2075,7 @@ impl BrowserApp {
             .and_then(|drag| drag.update(self.cursor.x, layout));
         if let Some(intent) = move_intent {
             self.handle_tab_intent(intent);
-        } else {
+        } else if hot_changed || self.drag.is_some() {
             self.repaint_chrome();
         }
     }
@@ -2413,8 +2421,13 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         let mut navigation_candidates = Vec::new();
         for (id, page) in &mut self.pages {
             let now = page.created_at.elapsed();
-            match page.page.pump_until_idle_reference(now) {
-                Ok(outcome) => rendered_active |= *id == active && outcome.rendered_turns > 0,
+            let revision_before = page.dom_revision;
+            match page.page.pump_until_idle_without_render(now) {
+                Ok(_) => {
+                    let revision_after = page.page.document().dom().revision().as_u64();
+                    page.dom_revision = revision_after;
+                    rendered_active |= *id == active && revision_after != revision_before;
+                }
                 Err(error) => eprintln!("render-browser page pump failed: {error}"),
             }
             page.drain_console();

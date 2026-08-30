@@ -529,6 +529,7 @@ impl<T> EventLoop<T> {
     }
 
     fn promote_due_timers(&mut self) {
+        let mut timer_woke_up = false;
         while let Some((key, _)) = self.timers.first_key_value() {
             if key.deadline > self.clock.now() {
                 break;
@@ -538,6 +539,17 @@ impl<T> EventLoop<T> {
                 .pop_first()
                 .expect("the first timer was observed immediately before removal");
             self.ready_tasks.push_back(task);
+            timer_woke_up = true;
+        }
+        // If no other ready tasks exist and only timers were promoted,
+        // advance virtual time to the next timer deadline instead of
+        // spinning the event loop at the timer's interval (e.g. setInterval(16)).
+        if !self.ready_tasks.is_empty() || !timer_woke_up {
+            return;
+        }
+        if let Some(next_deadline) = self.next_timer_deadline() {
+            self.advance_time_to(next_deadline)
+                .expect("advance time to next timer deadline");
         }
     }
 
