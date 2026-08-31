@@ -138,6 +138,17 @@ fn get_content_navigation_target(
 type NativeSurface = WindowSurface<Arc<Window>, Arc<Window>>;
 
 fn main() {
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(message) = browser_main() {
+            eprintln!("error: {message}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
     // The interpreter and parser recurse deeply on minified real-world
     // scripts; the default main-thread stack overflows. Run the entire
     // event loop on a dedicated thread with a generous stack.
@@ -153,9 +164,11 @@ fn main() {
         }
         Err(panic_payload) => std::panic::resume_unwind(panic_payload),
     }
+    }
 }
 
 fn browser_main() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
     use winit::platform::windows::EventLoopBuilderExtWindows as _;
     let Some(initial) = load_initial_page().map_err(|error| error.to_string())? else {
         return Ok(());
@@ -165,6 +178,7 @@ fn browser_main() -> Result<(), String> {
         let mut builder = EventLoop::<UserEvent>::with_user_event();
         // The event loop lives on our dedicated big-stack thread for the
         // whole program lifetime; no other thread touches it.
+        #[cfg(target_os = "windows")]
         builder.with_any_thread(true);
         builder.build().map_err(|error| error.to_string())?
     };
