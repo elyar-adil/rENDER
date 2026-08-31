@@ -872,6 +872,7 @@ struct BrowserApp {
     modifiers: ModifiersState,
     title_bar_clicks: TitleBarClickTracker,
     address_clicks: AddressClickTracker,
+    left_pointer_down: bool,
     started_at: Instant,
 }
 
@@ -910,6 +911,7 @@ impl BrowserApp {
             modifiers: ModifiersState::default(),
             title_bar_clicks: TitleBarClickTracker::default(),
             address_clicks: AddressClickTracker::default(),
+            left_pointer_down: false,
             started_at: Instant::now(),
         }
     }
@@ -1194,6 +1196,9 @@ impl BrowserApp {
     }
 
     fn handle_tab_intent(&mut self, intent: TabIntent) {
+        if matches!(intent, TabIntent::Close(_)) {
+            self.drag = None;
+        }
         match intent {
             TabIntent::New => {
                 let id = self.tabs.apply(intent).expect("new tab creates an id");
@@ -1764,6 +1769,7 @@ impl BrowserApp {
     }
 
     fn handle_pointer_press(&mut self, event_loop: &ActiveEventLoop) {
+        self.left_pointer_down = true;
         if let Some(menu) = self.address_menu.take() {
             if let Some(item) = menu.item_at(self.cursor)
                 && item.enabled
@@ -2049,12 +2055,13 @@ impl BrowserApp {
                     )
                 })
                 .map_or(CursorIcon::Default, |_| CursorIcon::Pointer),
+            HitTarget::NewTab | HitTarget::Toolbar(_) | HitTarget::WindowControl(_) => {
+                CursorIcon::Pointer
+            }
             HitTarget::Tab(_)
             | HitTarget::CloseTab(_)
-            | HitTarget::NewTab
-            | HitTarget::Toolbar(_)
-            | HitTarget::WindowControl(_) => CursorIcon::Pointer,
-            HitTarget::TitleBar | HitTarget::Chrome => CursorIcon::Default,
+            | HitTarget::TitleBar
+            | HitTarget::Chrome => CursorIcon::Default,
         };
         if cursor_icon != self.cursor_icon {
             if let Some(window) = &self.window {
@@ -2070,9 +2077,13 @@ impl BrowserApp {
             return;
         }
         let move_intent = self
-            .drag
-            .as_mut()
-            .and_then(|drag| drag.update(self.cursor.x, layout));
+            .left_pointer_down
+            .then(|| {
+                self.drag
+                    .as_mut()
+                    .and_then(|drag| drag.update(self.cursor.x, layout))
+            })
+            .flatten();
         if let Some(intent) = move_intent {
             self.handle_tab_intent(intent);
         } else if hot_changed || self.drag.is_some() {
@@ -2081,6 +2092,7 @@ impl BrowserApp {
     }
 
     fn handle_pointer_release(&mut self) {
+        self.left_pointer_down = false;
         self.drag = None;
         if self.address_selecting {
             self.address_selecting = false;
@@ -2128,12 +2140,9 @@ impl BrowserApp {
             return;
         }
         let menu_was_open = self.address_menu.take().is_some();
-        if self.content_editor.is_some() && self.handle_content_keyboard(event) {
-            return;
-        }
-        let control = self.modifiers.control_key();
+        let primary = primary_modifier_active(self.modifiers);
         let shift = self.modifiers.shift_key();
-        if control {
+        if primary {
             if key_character_is(&event.logical_key, "l") {
                 self.editor.set_focused(true);
                 self.editor.select_all();
@@ -2161,6 +2170,9 @@ impl BrowserApp {
                 self.repaint_chrome();
                 return;
             }
+        }
+        if self.content_editor.is_some() && self.handle_content_keyboard(event) {
+            return;
         }
         if !self.editor.is_focused() {
             if menu_was_open {
@@ -2201,9 +2213,7 @@ impl BrowserApp {
             Key::Named(NamedKey::ArrowRight) => self.editor.move_right(shift),
             Key::Named(NamedKey::Home) => self.editor.move_home(shift),
             Key::Named(NamedKey::End) => self.editor.move_end(shift),
-            Key::Character(_)
-                if !control && !self.modifiers.alt_key() && !self.modifiers.super_key() =>
-            {
+            Key::Character(_) if !primary && !self.modifiers.alt_key() => {
                 if let Some(value) = &event.text {
                     self.editor.insert(value);
                 }
@@ -2240,7 +2250,18 @@ impl BrowserApp {
             return true;
         }
         let shift = self.modifiers.shift_key();
-        let control = self.modifiers.control_key();
+        let primary = primary_modifier_active(self.modifiers);
+        if primary && let Some(command) = address_shortcut(&event.logical_key, shift) {
+            let changed = self
+                .content_editor
+                .as_mut()
+                .is_some_and(|content| content.editor.execute(command, &mut self.clipboard));
+            if changed && !matches!(command, AddressCommand::Copy | AddressCommand::SelectAll) {
+                self.sync_content_editor();
+            }
+            self.repaint_chrome();
+            return true;
+        }
         let Some(content) = self.content_editor.as_mut() else {
             return false;
         };
@@ -2293,9 +2314,7 @@ impl BrowserApp {
                 content.editor.move_end(shift);
                 true
             }
-            Key::Character(_)
-                if !control && !self.modifiers.alt_key() && !self.modifiers.super_key() =>
-            {
+            Key::Character(_) if !primary && !self.modifiers.alt_key() => {
                 if let Some(value) = &event.text {
                     content.editor.insert(value);
                     self.sync_content_editor();
@@ -2379,6 +2398,8 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.address_selecting = false;
                 self.address_menu = None;
                 self.content_editor = None;
+                self.left_pointer_down = false;
+                self.drag = None;
                 if let Some(window) = &self.window {
                     window.set_ime_allowed(false);
                 }
@@ -2496,6 +2517,28 @@ fn page_key_name(event: &winit::event::KeyEvent) -> Option<String> {
         _ => return None,
     };
     Some(name.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostPlatform {
+    MacOs,
+    Other,
+}
+
+const fn primary_modifier_for(platform: HostPlatform, control: bool, command: bool) -> bool {
+    match platform {
+        HostPlatform::MacOs => command,
+        HostPlatform::Other => control,
+    }
+}
+
+fn primary_modifier_active(modifiers: ModifiersState) -> bool {
+    let platform = if cfg!(target_os = "macos") {
+        HostPlatform::MacOs
+    } else {
+        HostPlatform::Other
+    };
+    primary_modifier_for(platform, modifiers.control_key(), modifiers.super_key())
 }
 
 fn wheel_document_delta_y(delta: MouseScrollDelta) -> f32 {
@@ -2674,9 +2717,10 @@ mod tests {
     use winit::keyboard::Key;
 
     use super::{
-        ContentHitRegion, HOME_TITLE, PageNavigation, PageSource, PageState, address_shortcut,
-        blit_page, get_content_navigation_target, hit_test_content_regions, home_source,
-        network_start_source, surface_to_softbuffer, wheel_document_delta_y,
+        ContentHitRegion, HOME_TITLE, HostPlatform, PageNavigation, PageSource, PageState,
+        address_shortcut, blit_page, get_content_navigation_target, hit_test_content_regions,
+        home_source, network_start_source, primary_modifier_for, surface_to_softbuffer,
+        wheel_document_delta_y,
     };
     use render_browser::chrome::Point;
     use render_browser::editor::AddressCommand;
@@ -2723,6 +2767,14 @@ mod tests {
                 Some(command)
             );
         }
+    }
+
+    #[test]
+    fn primary_modifier_matches_macos_and_windows_conventions() {
+        assert!(primary_modifier_for(HostPlatform::MacOs, false, true));
+        assert!(!primary_modifier_for(HostPlatform::MacOs, true, false));
+        assert!(primary_modifier_for(HostPlatform::Other, true, false));
+        assert!(!primary_modifier_for(HostPlatform::Other, false, true));
     }
 
     #[test]
