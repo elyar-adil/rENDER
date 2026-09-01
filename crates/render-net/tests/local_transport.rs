@@ -9,7 +9,7 @@ use std::time::Duration;
 use flate2::{Compression, write::GzEncoder};
 use render_net::{
     BatchOptions, ByteRange, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest,
-    FixedOriginLimit, HttpTransport, NetworkWorker, Url,
+    FixedOriginLimit, HttpTransport, NetworkWorker, NetworkWorkerConfig, Url,
 };
 
 #[derive(Clone, Debug)]
@@ -406,6 +406,82 @@ fn worker_is_non_blocking_and_batch_cancellation_is_prompt() {
     );
     release.store(true, Ordering::Release);
     server.join().expect("server exits");
+}
+
+#[test]
+fn worker_uses_a_shared_bounded_transfer_pool() {
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let handler_active = Arc::clone(&active);
+    let handler_maximum = Arc::clone(&maximum);
+    let (base, server) = spawn_server(6, move |request| {
+        let now = handler_active.fetch_add(1, Ordering::SeqCst) + 1;
+        handler_maximum.fetch_max(now, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(25));
+        handler_active.fetch_sub(1, Ordering::SeqCst);
+        WireResponse::ok(request_path(&request).as_bytes().to_vec())
+    });
+    let worker = NetworkWorker::start_with_config(
+        transport(|_| {}),
+        NetworkWorkerConfig {
+            worker_count: 2,
+            queue_capacity: 4,
+        },
+    )
+    .expect("start bounded worker pool");
+    let requests = (0..6)
+        .map(|index| FetchRequest::get(base.join(&index.to_string()).expect("resource URL")))
+        .collect();
+    let results = worker
+        .submit_batch(
+            requests,
+            BatchOptions {
+                max_concurrency: 6,
+                origin_policy: Arc::new(FixedOriginLimit(6)),
+            },
+        )
+        .recv_timeout(Duration::from_secs(2))
+        .expect("bounded batch completes");
+    server.join().expect("server exits");
+
+    assert!(results.iter().all(Result::is_ok));
+    assert_eq!(maximum.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn worker_rejects_excess_operations_without_opening_connections() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler_hits = Arc::clone(&hits);
+    let (base, server) = spawn_server(1, move |_| {
+        handler_hits.fetch_add(1, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(60));
+        WireResponse::ok("first")
+    });
+    let worker = NetworkWorker::start_with_config(
+        transport(|_| {}),
+        NetworkWorkerConfig {
+            worker_count: 1,
+            queue_capacity: 1,
+        },
+    )
+    .expect("start bounded worker pool");
+    let first = worker.submit(FetchRequest::get(base.join("first").expect("first URL")));
+    let second = worker.submit(FetchRequest::get(base.join("second").expect("second URL")));
+
+    let rejected = second
+        .recv_timeout(Duration::from_millis(100))
+        .expect("excess operation must fail promptly")
+        .expect_err("second operation is rejected");
+    assert_eq!(
+        rejected,
+        FetchError::Transport("network worker queue is full".into())
+    );
+    first
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first operation completes")
+        .expect("first request succeeds");
+    server.join().expect("server exits");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
 }
 
 #[test]

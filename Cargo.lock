@@ -1507,6 +1507,7 @@ dependencies = [
 name = "render-net"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "flate2",
  "rustls",
  "ureq",

@@ -550,6 +550,32 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn data_url_image_loads_through_the_normal_decode_pipeline() {
+        let document = Document::parse(
+            "<img src='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=='>",
+        );
+        let base = Url::parse("https://example.test/").unwrap();
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+
+        assert_eq!(application.loaded.len(), 1, "{application:?}");
+        assert!(application.diagnostics.is_empty());
+        assert_eq!(images.len(), 1);
+    }
+
     fn transport() -> HttpTransport {
         HttpTransport::new(FetchConfig {
             timeout: Duration::from_secs(2),

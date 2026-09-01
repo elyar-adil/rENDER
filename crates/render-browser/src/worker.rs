@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 
-const MAX_WORKERS: usize = 4;
+const MAX_WORKERS: usize = 16;
 const MAX_QUEUE_CAPACITY: usize = 64;
 
 /// All state that makes a rendered frame safe to commit.
@@ -114,9 +114,18 @@ impl Default for RenderWorkerOptions {
     fn default() -> Self {
         Self {
             queue_capacity: 8,
-            worker_count: 2,
+            worker_count: default_worker_count(),
         }
     }
+}
+
+/// Use the available CPU capacity without competing with the event loop and
+/// the operating system for the final logical core.
+#[must_use]
+pub fn default_worker_count() -> usize {
+    thread::available_parallelism()
+        .map_or(1, |count| count.get().saturating_sub(1).max(1))
+        .min(MAX_WORKERS)
 }
 
 #[derive(Debug)]

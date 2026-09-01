@@ -1,0 +1,66 @@
+name: Renderer Performance
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  perf-smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run generated-fixture smoke benchmark
+        run: |
+          cargo run --locked --release -p render-browser --bin render-perf -- \
+            --fixture generated --iterations 3 --warmup 1 --scroll-steps 4 \
+            > perf-smoke.json
+
+      - name: Validate benchmark JSON
+        run: python -m json.tool perf-smoke.json >/dev/null
+
+      - name: Upload smoke benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-perf-smoke-${{ github.run_id }}
+          path: perf-smoke.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  perf-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run all-fixture benchmark
+        run: |
+          cargo run --locked --release -p render-browser --bin render-perf -- \
+            --fixture all --iterations 20 --warmup 2 --scroll-steps 12 \
+            > perf-full.json
+
+      - name: Validate benchmark JSON
+        run: python -m json.tool perf-full.json >/dev/null
+
+      - name: Upload full benchmark
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-perf-full-${{ github.run_id }}
+          path: perf-full.json
+          if-no-files-found: ignore
+          retention-days: 90

@@ -163,12 +163,12 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
             });
             continue;
         }
-        if !matches!(requested_url.scheme(), "http" | "https") {
+        if !matches!(requested_url.scheme(), "http" | "https" | "data") {
             diagnostics.push(ImageDiscoveryDiagnostic {
                 node: Some(node),
                 code: ImageDiscoveryDiagnosticCode::UnsupportedScheme,
                 message: format!(
-                    "img URL scheme '{}' is not supported by the network loader",
+                    "img URL scheme '{}' is not supported by the image loader",
                     requested_url.scheme()
                 ),
             });
@@ -233,7 +233,7 @@ pub fn discover_images_with_styles(
         let Ok(requested_url) = discovery.effective_base_url.join(reference) else {
             continue;
         };
-        if !matches!(requested_url.scheme(), "http" | "https")
+        if !matches!(requested_url.scheme(), "http" | "https" | "data")
             || requested_url.as_str().len() > limits.max_url_bytes
         {
             continue;
@@ -857,6 +857,20 @@ mod tests {
                 "https://example.test/page/fallback.png",
                 "https://example.test/page/normal.png",
             ]
+        );
+        assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn discovers_data_url_images_without_an_unsupported_scheme_diagnostic() {
+        let parsed = parse_document("<img src='data:image/png;base64,AA=='>");
+        let document_url = Url::parse("https://example.test/page/").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+
+        assert_eq!(discovery.resources.len(), 1);
+        assert_eq!(
+            discovery.resources[0].key.requested_url.as_str(),
+            "data:image/png;base64,AA=="
         );
         assert!(discovery.diagnostics.is_empty());
     }

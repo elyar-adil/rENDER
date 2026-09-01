@@ -317,7 +317,7 @@ pub struct PagePumpOutcome {
 
 /// Upper bound of turns per pump so a runaway `setInterval` cannot starve the
 /// embedding; remaining work stays queued for the next pump.
-const MAX_PUMP_TURNS: usize = 1024;
+pub const MAX_PUMP_TURNS: usize = 1024;
 
 /// Coordinator for one document and its persistent JavaScript realm.
 pub struct Page {
@@ -325,7 +325,7 @@ pub struct Page {
     runtime: JsRuntime,
     event_loop: EventLoop<PageTask>,
     invalidation: InvalidationCursor,
-    snapshot: DocumentRenderOutput,
+    snapshot: Option<DocumentRenderOutput>,
     render_options: DocumentRenderOptions,
     limits: PageLimits,
     max_script_source_bytes: usize,
@@ -351,6 +351,18 @@ impl Page {
     #[must_use]
     pub fn with_url(html: &str, document_url: &Url) -> Self {
         Self::with_options_and_url(html, PageOptions::default(), document_url)
+    }
+
+    /// Create a URL-aware page without synchronously producing its first
+    /// layout or paint snapshot.
+    ///
+    /// Native embeddings can hand the immutable document to a background
+    /// renderer and later publish geometry through
+    /// [`Self::publish_render_geometry`]. The DOM, JavaScript realm, and
+    /// event loop remain owned by this single-threaded page.
+    #[must_use]
+    pub fn with_url_unrendered(html: &str, document_url: &Url) -> Self {
+        Self::with_options_and_url_unrendered(html, PageOptions::default(), document_url)
     }
 
     /// Parse and render an initial snapshot with deterministic reference
@@ -381,6 +393,37 @@ impl Page {
             },
             document_url,
         )
+    }
+
+    /// Create a page without an initial render using explicit resource
+    /// options. This is the non-blocking counterpart to
+    /// [`Self::with_options_and_url`].
+    #[must_use]
+    pub fn with_options_and_url_unrendered(
+        html: &str,
+        options: PageOptions,
+        document_url: &Url,
+    ) -> Self {
+        let document = Document::parse(html);
+        let runtime =
+            JsRuntime::with_limits_and_url(document.dom(), options.runtime_limits, document_url);
+        let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
+        let invalidation = InvalidationCursor::at_current(document.dom());
+        Self {
+            document,
+            runtime,
+            event_loop,
+            invalidation,
+            snapshot: None,
+            render_options: options.render,
+            limits: options.page_limits,
+            max_script_source_bytes: options.runtime_limits.max_source_bytes,
+            queued_source_bytes: 0,
+            task_source_bytes: BTreeMap::new(),
+            microtask_source_bytes: BTreeMap::new(),
+            js_timers: BTreeMap::new(),
+            geometry_index: BTreeMap::new(),
+        }
     }
 
     /// Parse exactly once and create the initial render snapshot.
@@ -417,7 +460,7 @@ impl Page {
             runtime,
             event_loop,
             invalidation,
-            snapshot,
+            snapshot: Some(snapshot),
             render_options: options.render,
             limits: options.page_limits,
             max_script_source_bytes: options.runtime_limits.max_source_bytes,
@@ -457,8 +500,34 @@ impl Page {
     }
 
     #[must_use]
-    pub const fn snapshot(&self) -> &DocumentRenderOutput {
-        &self.snapshot
+    /// Returns the most recently completed synchronous render snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a page created through an unrendered constructor
+    /// before a synchronous render has installed a snapshot.
+    pub fn snapshot(&self) -> &DocumentRenderOutput {
+        self.snapshot
+            .as_ref()
+            .expect("an unrendered Page has no synchronous snapshot")
+    }
+
+    /// Install layout geometry computed by an external renderer when and only
+    /// when it still describes this page's current DOM revision.
+    ///
+    /// This keeps an embedding's render-worker artifacts from making stale
+    /// geometry visible to scripts after a navigation or DOM mutation.
+    pub fn publish_render_geometry(
+        &mut self,
+        revision: u64,
+        geometry: BTreeMap<u64, ElementRect>,
+    ) -> bool {
+        if self.document.dom().revision().as_u64() != revision {
+            return false;
+        }
+        self.geometry_index = geometry.clone();
+        self.runtime.install_element_geometry(geometry);
+        true
     }
 
     #[must_use]
@@ -765,11 +834,31 @@ impl Page {
         &mut self,
         now: Duration,
     ) -> Result<PagePumpOutcome, PageError> {
+        self.pump_at_most_without_render(now, MAX_PUMP_TURNS)
+    }
+
+    /// Advance the virtual clock and run no more than `turn_budget` turns
+    /// without synchronously laying out or painting.
+    ///
+    /// The per-page FIFO and microtask checkpoint semantics are identical to
+    /// [`Self::pump_until_idle_without_render`]. Embeddings use this bounded
+    /// form to round-robin pages so one busy realm cannot monopolize the UI
+    /// event loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns clock, invalidation, and script errors as the unbounded
+    /// variant does.
+    pub fn pump_at_most_without_render(
+        &mut self,
+        now: Duration,
+        turn_budget: usize,
+    ) -> Result<PagePumpOutcome, PageError> {
         self.event_loop.advance_time_to(now)?;
         let mut executed_turns = 0;
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
-        while executed_turns < MAX_PUMP_TURNS {
+        while executed_turns < turn_budget {
             let Some(outcome) = self.run_one_turn_without_render()? else {
                 break;
             };
@@ -1016,16 +1105,18 @@ impl Page {
     }
 
     fn render_update(&mut self, backends: DocumentBackends<'_>) -> PageRenderUpdate {
-        let previous_revision = self.snapshot.revision;
+        let previous = self.snapshot.as_ref();
+        let previous_revision = previous.map(|snapshot| snapshot.revision);
         let next = self.document.render(self.render_options, backends);
-        let display_list_diff = next.display.list.diff(&self.snapshot.display.list);
+        let display_list_diff =
+            previous.map(|snapshot| next.display.list.diff(&snapshot.display.list));
         let revision = next.revision;
-        self.snapshot = next;
+        self.snapshot = Some(next);
         self.refresh_geometry_index();
         PageRenderUpdate {
-            previous_revision: Some(previous_revision),
+            previous_revision,
             revision,
-            display_list_diff: Some(display_list_diff),
+            display_list_diff,
         }
     }
 
@@ -1033,8 +1124,13 @@ impl Page {
     /// both this page's index and the script runtime. Geometry visible to
     /// script is therefore at most one render turn stale.
     fn refresh_geometry_index(&mut self) {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            self.geometry_index.clear();
+            self.runtime.install_element_geometry(BTreeMap::new());
+            return;
+        };
         let mut index = BTreeMap::new();
-        for fragment in self.snapshot.layout.fragments.iter() {
+        for fragment in snapshot.layout.fragments.iter() {
             let FragmentKind::Box(geometry) = &fragment.kind else {
                 continue;
             };

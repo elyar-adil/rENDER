@@ -6,6 +6,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use base64::Engine as _;
 use ureq::ResponseExt;
 use url::Url;
 
@@ -42,6 +43,37 @@ impl HttpStatus {
     #[must_use]
     pub const fn is_success(self) -> bool {
         self.0 >= 200 && self.0 <= 299
+    }
+
+    /// Creates a status from a wire status code.
+    #[must_use]
+    pub const fn from_u16(status: u16) -> Self {
+        Self(status)
+    }
+}
+
+/// Validators that can be sent with a conditional cache request.
+///
+/// Values are kept verbatim (including an entity-tag's quotes and optional
+/// weak marker) so an origin can apply its normal validator comparison rules.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CacheValidators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+impl CacheValidators {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified.is_none()
+    }
+
+    #[must_use]
+    pub fn from_headers(headers: &[Header]) -> Self {
+        Self {
+            etag: header_text(headers, "etag").map(str::to_owned),
+            last_modified: header_text(headers, "last-modified").map(str::to_owned),
+        }
     }
 }
 
@@ -116,6 +148,8 @@ pub struct FetchRequest {
     /// Optional single HTTP byte range. Multipart ranges are intentionally not
     /// exposed until the media/cache layer can consume multipart responses.
     pub byte_range: Option<ByteRange>,
+    /// Optional validators used for conditional cache revalidation.
+    pub cache_validators: Option<CacheValidators>,
 }
 
 impl FetchRequest {
@@ -126,6 +160,7 @@ impl FetchRequest {
             accept: None,
             cookie: None,
             byte_range: None,
+            cache_validators: None,
         }
     }
 
@@ -144,6 +179,32 @@ impl FetchRequest {
     #[must_use]
     pub const fn with_byte_range(mut self, byte_range: ByteRange) -> Self {
         self.byte_range = Some(byte_range);
+        self
+    }
+
+    /// Adds validators for a conditional `GET` (`If-None-Match` and/or
+    /// `If-Modified-Since`). Empty validators are treated as absent.
+    #[must_use]
+    pub fn with_cache_validators(mut self, validators: CacheValidators) -> Self {
+        self.cache_validators = (!validators.is_empty()).then_some(validators);
+        self
+    }
+
+    /// Adds an entity-tag validator for conditional revalidation.
+    #[must_use]
+    pub fn with_etag(mut self, etag: impl Into<String>) -> Self {
+        let mut validators = self.cache_validators.take().unwrap_or_default();
+        validators.etag = Some(etag.into());
+        self.cache_validators = Some(validators);
+        self
+    }
+
+    /// Adds a Last-Modified validator for conditional revalidation.
+    #[must_use]
+    pub fn with_last_modified(mut self, last_modified: impl Into<String>) -> Self {
+        let mut validators = self.cache_validators.take().unwrap_or_default();
+        validators.last_modified = Some(last_modified.into());
+        self.cache_validators = Some(validators);
         self
     }
 }
@@ -303,13 +364,16 @@ impl HttpTransport {
         &self.config
     }
 
-    /// Performs one bounded HTTP/HTTPS GET.
+    /// Performs one bounded HTTP(S) or `data:` GET.
     ///
     /// # Errors
     ///
     /// Returns a typed [`FetchError`] for cancellation, invalid schemes,
     /// configured limit violations, TLS verification, and transport failures.
     pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        if request.url.scheme() == "data" {
+            return self.fetch_data_url(request, cancel);
+        }
         validate_scheme(&request.url)?;
         if cancel.is_cancelled() {
             return Err(FetchError::Cancelled);
@@ -339,6 +403,17 @@ impl HttpTransport {
             }
             if let Some(byte_range) = request.byte_range {
                 builder = builder.header("Range", &byte_range.header_value());
+            }
+            if redirect_count == 0
+                && same_origin(&current_url, &request.url)
+                && let Some(validators) = request.cache_validators.as_ref()
+            {
+                if let Some(etag) = validators.etag.as_deref() {
+                    builder = builder.header("If-None-Match", etag);
+                }
+                if let Some(last_modified) = validators.last_modified.as_deref() {
+                    builder = builder.header("If-Modified-Since", last_modified);
+                }
             }
             let mut response = builder.call().map_err(|error| self.map_error(error))?;
 
@@ -405,6 +480,26 @@ impl HttpTransport {
                 body,
             });
         }
+    }
+
+    fn fetch_data_url(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        if cancel.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        let (content_type, body) = decode_data_url(&request.url, self.config.max_body_bytes)?;
+        if cancel.is_cancelled() {
+            return Err(FetchError::Cancelled);
+        }
+        Ok(FetchResponse {
+            requested_url: request.url.clone(),
+            final_url: request.url.clone(),
+            redirect_chain: vec![request.url.clone()],
+            redirects: Vec::new(),
+            status: HttpStatus(200),
+            headers: Vec::new(),
+            content_type: Some(content_type),
+            body,
+        })
     }
 
     fn map_error(&self, error: ureq::Error) -> FetchError {
@@ -489,6 +584,98 @@ fn validate_scheme(url: &Url) -> Result<(), FetchError> {
     }
 }
 
+fn decode_data_url(url: &Url, body_limit: usize) -> Result<(ContentType, Vec<u8>), FetchError> {
+    let payload = url.path();
+    let (metadata, encoded_body) = payload.split_once(',').ok_or_else(|| {
+        FetchError::InvalidUrl("data URL is missing its required comma separator".to_owned())
+    })?;
+    let (media_type, is_base64) = data_media_type(metadata)?;
+    let body = if is_base64 {
+        let encoded_body = percent_decode_data(encoded_body)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded_body)
+            .map_err(|error| FetchError::InvalidUrl(format!("invalid base64 data URL: {error}")))?
+    } else {
+        percent_decode_data(encoded_body)?
+    };
+    if body.len() > body_limit {
+        return Err(FetchError::BodyLimitExceeded { limit: body_limit });
+    }
+    Ok((
+        parse_content_type(&media_type).expect("validated data media type"),
+        body,
+    ))
+}
+
+fn data_media_type(metadata: &str) -> Result<(String, bool), FetchError> {
+    let mut parts = metadata.split(';');
+    let first = parts.next().unwrap_or_default();
+    let mut media_type = if first.is_empty() {
+        "text/plain".to_owned()
+    } else if first.contains('/') {
+        first.to_ascii_lowercase()
+    } else {
+        return Err(FetchError::InvalidUrl(format!(
+            "invalid data URL media type '{first}'"
+        )));
+    };
+    let mut is_base64 = false;
+    for parameter in parts {
+        if parameter.eq_ignore_ascii_case("base64") {
+            if is_base64 {
+                return Err(FetchError::InvalidUrl(
+                    "data URL contains more than one base64 marker".to_owned(),
+                ));
+            }
+            is_base64 = true;
+        } else if !parameter.is_empty() {
+            media_type.push(';');
+            media_type.push_str(parameter);
+        }
+    }
+    if first.is_empty() && !media_type.contains("charset=") {
+        media_type.push_str(";charset=US-ASCII");
+    }
+    if parse_content_type(&media_type).is_none() {
+        return Err(FetchError::InvalidUrl(format!(
+            "invalid data URL content type '{media_type}'"
+        )));
+    }
+    Ok((media_type, is_base64))
+}
+
+fn percent_decode_data(value: &str) -> Result<Vec<u8>, FetchError> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            decoded.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+        let high = bytes.get(index + 1).and_then(|byte| hex_value(*byte));
+        let low = bytes.get(index + 2).and_then(|byte| hex_value(*byte));
+        let (Some(high), Some(low)) = (high, low) else {
+            return Err(FetchError::InvalidUrl(
+                "data URL contains an invalid percent escape".to_owned(),
+            ));
+        };
+        decoded.push((high << 4) | low);
+        index += 3;
+    }
+    Ok(decoded)
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn read_bounded_body(
     mut reader: impl Read,
     limit: usize,
@@ -539,10 +726,11 @@ fn parse_content_type(value: &str) -> Option<ContentType> {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::io::{Read as _, Write as _};
 
     use super::{
-        ContentType, FetchConfig, FetchError, map_io_error, normalize_redirect_url,
-        parse_content_type,
+        CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, HttpTransport,
+        map_io_error, normalize_redirect_url, parse_content_type,
     };
     use url::Url;
 
@@ -596,5 +784,80 @@ mod tests {
         let parsed = Url::parse("https://www.zhihu.com//www.zhihu.com/signin?next=%2F").unwrap();
         let normalized = normalize_redirect_url(parsed, &request);
         assert_eq!(normalized.as_str(), "https://www.zhihu.com/signin?next=%2F");
+    }
+
+    #[test]
+    fn fetches_percent_encoded_and_base64_data_urls_with_bounded_bodies() {
+        let transport = HttpTransport::new(FetchConfig {
+            max_body_bytes: 5,
+            ..FetchConfig::default()
+        });
+        let encoded = Url::parse("data:text/plain;charset=utf-8,hello%20world").unwrap();
+        let response = transport
+            .fetch(&FetchRequest::get(encoded.clone()), &CancelToken::default())
+            .unwrap_err();
+        assert_eq!(response, FetchError::BodyLimitExceeded { limit: 5 });
+
+        let base64 = Url::parse("data:image/png;base64,AAECAw==").unwrap();
+        let response = transport
+            .fetch(&FetchRequest::get(base64.clone()), &CancelToken::default())
+            .expect("data URL response");
+        assert_eq!(response.requested_url, base64);
+        assert_eq!(response.final_url, base64);
+        assert_eq!(response.status.as_u16(), 200);
+        assert_eq!(response.content_type.unwrap().media_type, "image/png");
+        assert_eq!(response.body, [0, 1, 2, 3]);
+
+        let escaped_base64 = Url::parse("data:image/png;base64,AAECAw%3D%3D").unwrap();
+        let response = transport
+            .fetch(&FetchRequest::get(escaped_base64), &CancelToken::default())
+            .expect("percent-encoded base64 data URL response");
+        assert_eq!(response.body, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn rejects_malformed_data_urls_without_using_the_network() {
+        let transport = HttpTransport::new(FetchConfig::default());
+        let malformed = Url::parse("data:image/png;base64,%%% ").unwrap();
+        let error = transport
+            .fetch(&FetchRequest::get(malformed), &CancelToken::default())
+            .expect_err("invalid base64 must fail");
+        assert!(matches!(error, FetchError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn sends_conditional_cache_validators() {
+        let seen_request = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let captured = std::sync::Arc::clone(&seen_request);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut chunk).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            *captured.lock().unwrap() = String::from_utf8_lossy(&request).into_owned();
+            stream
+                .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let url = Url::parse(&format!("http://{address}/resource")).unwrap();
+        let request = FetchRequest::get(url)
+            .with_etag("\"v1\"")
+            .with_last_modified("Wed, 21 Oct 2015 07:28:00 GMT");
+        let response = HttpTransport::new(FetchConfig::default())
+            .fetch(&request, &CancelToken::default())
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(response.status.as_u16(), 304);
+        let request = seen_request.lock().unwrap().to_ascii_lowercase();
+        assert!(request.contains("if-none-match: \"v1\""));
+        assert!(request.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt"));
     }
 }

@@ -7,7 +7,7 @@ and are readable end to end.
 
 ## Current Completion Snapshot
 
-**As of 2026-08-03.** These are engineering estimates for the browser reaching
+**As of 2026-09-01.** These are engineering estimates for the browser reaching
 the project's minimum usable scope. They are not WPT, test262, or
 web-compatibility pass rates; `100%` means the currently planned browser scope
 is implemented and covered well enough to maintain.
@@ -20,7 +20,7 @@ is implemented and covered well enough to maintain.
 | Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
 | JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run is 11,628/98,096 variants passed (11.9%). |
-| Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; Fetch/CORS, cache, and service workers remain. |
+| Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active, while Fetch/CORS and service workers remain. |
 | Browser shell and interaction | 55% | Native window, tabs, address editing, history, scrolling, links, forms, and DPI-aware painting work; accessibility and broader input remain. |
 | **Overall minimum usable browser** | **42%** | Enough infrastructure exists for iterative real-site compatibility work; this is not a claim of general web compatibility. |
 
@@ -30,20 +30,48 @@ The native browser opens a window and presents the CPU surface produced by
 `render-core`. With no argument it displays the built-in new-tab page:
 
 ```bash
-cargo run -p render-browser
+cargo run --release -p render-browser
 ```
 
 To open a local HTML file or a network page directly:
 
 ```bash
-cargo run -p render-browser -- example/index.html
-cargo run -p render-browser -- https://example.com/
+cargo run --release -p render-browser -- example/index.html
+cargo run --release -p render-browser -- https://example.com/
 ```
 
 The native chrome provides tabs, an editable address bar, history controls,
 window controls, dark-theme colors, and fractional-DPI painting. HTTP/HTTPS
 documents load on background workers; HTML encoding detection and external
 stylesheets flow into the same DOM/style/layout/paint pipeline.
+
+## Performance Measurements
+
+Use the headless, deterministic `render-perf` binary to measure the stable
+HTML-to-pixels pipeline without opening a window or accessing the network. It
+emits one JSON document suitable for saving as a CI artifact:
+
+```bash
+cargo run --release -p render-browser --bin render-perf -- --fixture generated --iterations 20
+cargo run --release -p render-browser --bin render-perf -- --fixture all --iterations 20 > perf.json
+```
+
+The report separates HTML parsing, first render, end-to-end first-visible work,
+and repeated scroll renders. It deliberately excludes network, cache, native
+presentation, and JavaScript execution so evolving web-compatibility work does
+not invalidate renderer baselines. Pull requests run a small generated-fixture
+smoke benchmark; scheduled and manually dispatched workflow runs cover all
+fixtures and retain the JSON report as an artifact. Record a release-build
+baseline before comparing changes; the current performance target is at least
+30% lower `first_visible` p95 on the same machine, not an already-claimed
+result.
+
+The browser also keeps a conservative private HTTP cache (32 MiB memory
+budget) for explicitly fresh anonymous responses and revalidates stale entries
+with `ETag`/`Last-Modified`. The 512 MiB disk-cache store, checksummed atomic
+records, generation-safe clearing, and settings-page status are hosted on a
+dedicated I/O worker; browser resource read-through/write-back remains a
+staged integration boundary while the renderer continues to evolve.
 
 ## Development
 

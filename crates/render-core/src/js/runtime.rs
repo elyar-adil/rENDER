@@ -2918,6 +2918,13 @@ impl JsRuntime {
                 )?;
                 self.array_iterate_with(dom, receiver, callback, false, true)
             }
+            NativeFunction::ArraySome => {
+                let callback = Self::require_callable_object(
+                    required_argument(arguments, 0, "some")?,
+                    &self.realm,
+                )?;
+                self.array_some(dom, receiver, callback)
+            }
             NativeFunction::MathRandom => {
                 let mut state = self.random_state;
                 state ^= state << 13;
@@ -4874,6 +4881,31 @@ impl JsRuntime {
         }
     }
 
+    fn array_some(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        callback: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let elements = self.array_elements(receiver)?;
+        for (index, element) in elements.iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let matches = self.call(
+                dom,
+                callback,
+                &[
+                    element.clone(),
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+            )?;
+            if matches.is_truthy() {
+                return Ok(JsValue::Boolean(true));
+            }
+        }
+        Ok(JsValue::Boolean(false))
+    }
+
     fn math_unary(
         arguments: &[JsValue],
         operation: impl FnOnce(f64) -> f64,
@@ -6807,6 +6839,7 @@ mod tests {
             .execute(
                 &mut parsed.dom,
                 r##"
+                    window === self && self === globalThis && globalThis === window &&
                     window.location === location && document.location === location &&
                     location.href === "https://user:pass@example.test:8443/a/b?q=rust#part" &&
                     location.origin === "https://example.test:8443" &&
@@ -6817,6 +6850,19 @@ mod tests {
                 "##,
             )
             .expect("Location reads should execute");
+        assert_eq!(outcome.value, JsValue::Boolean(true));
+    }
+
+    #[test]
+    fn array_some_short_circuits_on_the_first_matching_callback() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                "var calls = 0; var matched = [1, 2, 3].some(function(value) { calls += 1; return value === 2; }); matched && calls === 2;",
+            )
+            .expect("Array.prototype.some should execute");
         assert_eq!(outcome.value, JsValue::Boolean(true));
     }
 

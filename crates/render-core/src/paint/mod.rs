@@ -3,6 +3,7 @@
 mod color;
 mod display_list;
 mod raster;
+mod scene;
 
 pub use color::{Color, SystemPalette};
 pub use display_list::{
@@ -15,6 +16,11 @@ pub use display_list::{
     TextShaper, Transform2D, build_display_list, build_display_list_with_images,
 };
 pub use raster::{
-    CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks, RasterDiagnostic,
-    RasterDiagnosticCode, Surface,
+    CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks,
+    NoRasterCancellation, RasterCancelled, RasterControl, RasterDiagnostic, RasterDiagnosticCode,
+    RasterRequest, Surface,
+};
+pub use scene::{
+    DEFAULT_PAINT_TILE_SIZE, PaintChunk, PaintChunkClassification, PaintDamage,
+    PaintFallbackReason, PaintScene, PaintSceneClassification, PaintTile, RetainedFrame,
 };

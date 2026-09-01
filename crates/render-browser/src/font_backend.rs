@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::chrome::{Canvas, Point, TextPainter};
 use fontdue::{Font, FontSettings};
@@ -15,7 +15,7 @@ use render_core::paint::{
 };
 
 const MAX_CACHED_GLYPHS: usize = 16_384;
-type GlyphCache = HashMap<(u32, u32), Option<GlyphMask>>;
+type GlyphCache = HashMap<(FontInstanceId, GlyphId, u32), Arc<GlyphMask>>;
 
 pub struct SystemFontBackend {
     fonts: Vec<Font>,
@@ -123,14 +123,24 @@ impl TextShaper for SystemFontBackend {
 }
 
 impl GlyphMaskProvider for SystemFontBackend {
-    fn mask(&self, _font: FontInstanceId, glyph: GlyphId, font_size: f32) -> Option<GlyphMask> {
-        let key = (glyph.0, font_size.to_bits());
+    fn mask(&self, font: FontInstanceId, glyph: GlyphId, font_size: f32) -> Option<GlyphMask> {
+        self.shared_mask(font, glyph, font_size)
+            .map(|mask| (*mask).clone())
+    }
+
+    fn shared_mask(
+        &self,
+        font: FontInstanceId,
+        glyph: GlyphId,
+        font_size: f32,
+    ) -> Option<Arc<GlyphMask>> {
+        let key = (font, glyph, font_size.to_bits());
         if let Some(mask) = self.glyph_cache.lock().ok()?.get(&key) {
-            return mask.clone();
+            return Some(Arc::clone(mask));
         }
         let character = char::from_u32(glyph.0)?;
         let (metrics, coverage) = self.font_for(character).rasterize(character, font_size);
-        let mask = Some(GlyphMask {
+        let mask = Arc::new(GlyphMask {
             width: u32::try_from(metrics.width).ok()?,
             height: u32::try_from(metrics.height).ok()?,
             left: metrics.xmin,
@@ -140,10 +150,13 @@ impl GlyphMaskProvider for SystemFontBackend {
             coverage,
         });
         let mut cache = self.glyph_cache.lock().ok()?;
-        if cache.len() < MAX_CACHED_GLYPHS {
-            cache.insert(key, mask.clone());
+        if let Some(cached) = cache.get(&key) {
+            return Some(Arc::clone(cached));
         }
-        mask
+        if cache.len() < MAX_CACHED_GLYPHS {
+            cache.insert(key, Arc::clone(&mask));
+        }
+        Some(mask)
     }
 }
 

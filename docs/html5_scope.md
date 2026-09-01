@@ -392,7 +392,7 @@ Color 4 / Color 5、Houdini、Container Queries、Subgrid、Masonry、Scroll-dri
 | `localStorage / sessionStorage`（同步、字符串值、配额 5MB） | 🔵 PLANNED M2 |
 | Cookie：`document.cookie` 仅在文档 origin 内读写，遵守 path/domain/secure/SameSite | 🔵 PLANNED M2 |
 | IndexedDB | ⛔ NON-GOAL |
-| Cache API | ⛔ NON-GOAL |
+| Cache API（Web API） | ⛔ NON-GOAL（浏览器 HTTP 缓存是独立的 shell 能力） |
 | File API / FileReader / Blob | ⛔ NON-GOAL（`Blob` 作为 fetch body 占位 🔵 M3） |
 
 ### 7.5 路由 / 历史
@@ -453,10 +453,10 @@ Color 4 / Color 5、Houdini、Container Queries、Subgrid、Masonry、Scroll-dri
 
 ### 8.3 资源加载
 
-- 并发限制：每 origin 6 个连接（与浏览器一致）🔵 PLANNED M2
-- 优先级：document > CSS > 同步脚本 > 字体 > 图像 > 异步/defer 脚本 🔵 PLANNED M2
-- 缓存：内存级 LRU，根据 `Cache-Control: max-age` 与 `ETag/Last-Modified` 条件请求 🔵 PLANNED M2
-- 磁盘缓存 ⛔ NON-GOAL
+- 并发限制：每 origin 6 个连接（与浏览器一致）；bounded dispatcher 与批处理路径已具备，完整优先级策略仍待补齐 🟡 PARTIAL
+- 优先级：document > CSS > 同步脚本 > 字体 > 图像 > 异步/defer 脚本；当前由有界队列、活动页预算和 latest-write-wins 渲染提交提供基础 🟡 PARTIAL
+- HTTP 缓存：私有内存级 LRU（默认 32 MiB），仅接收匿名、直达、显式 `max-age` 响应；过期条目通过 `ETag/Last-Modified` 条件请求重验证 🟡 PARTIAL
+- 磁盘 HTTP 缓存：独立有界 I/O worker、默认 512 MiB、校验和原子记录、代际清理与 settings 状态已落地；资源 read-through/write-back 仍分阶段接入 🟡 PARTIAL
 
 ---
 
@@ -488,7 +488,7 @@ scope 内每条 🟡 / 🔵 都必须挂到至少一个测试套件，否则不�
    - 每个里程碑设最低通过率门槛（M1 70% / M2 60% / M3 50%）。
 3. **页面契约测试**：`tests/test_modern_rendering_contracts.py` 等，30 个静态样本 + 15 个脚本样本 + 10 个 SPA 样本。
 4. **视觉回归**：`tests/browser_visual_regression.py` 与 Chromium 对比，仅作参考、不作合并门槛。
-5. **性能基线**：每周采集 TTFR、layout 次数、JS 执行时长；超阈值 10% 红线。
+5. **性能基线**：使用 release 构建的 `render-perf` 固定 fixture 采集 parse、first render、`first_visible` 与 scroll p95；PR 运行 generated smoke，定时/手动运行 all-fixture 全量并保存 JSON artifact。必须先记录同一测试机基线，阶段目标为 `first_visible` p95 相对基线降低至少 30%；未有基线不得宣称优化完成。
 
 ---
 

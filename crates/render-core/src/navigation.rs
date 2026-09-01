@@ -798,10 +798,8 @@ fn file_url(value: &str) -> Result<Url, NavigationError> {
 
 fn validate_address_scheme(url: &Url) -> Result<(), NavigationError> {
     match url.scheme() {
-        "http" | "https" | "file" | "about" => Ok(()),
-        "javascript" | "vbscript" | "data" => {
-            Err(NavigationError::DangerousScheme(url.scheme().to_owned()))
-        }
+        "http" | "https" | "file" | "about" | "data" => Ok(()),
+        "javascript" | "vbscript" => Err(NavigationError::DangerousScheme(url.scheme().to_owned())),
         scheme => Err(NavigationError::UnsupportedScheme(scheme.to_owned())),
     }
 }
@@ -886,6 +884,10 @@ mod tests {
         assert_eq!(
             parsed_url("例子.测试/路径").host_str(),
             Some("xn--fsqu00a.xn--0zwm56d")
+        );
+        assert_eq!(
+            parsed_url("data:text/html,%3Ch1%3EHello%3C%2Fh1%3E").as_str(),
+            "data:text/html,%3Ch1%3EHello%3C%2Fh1%3E"
         );
     }
 

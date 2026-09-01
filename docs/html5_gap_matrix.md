@@ -16,6 +16,8 @@
 | test262 | 固定 revision 共 98,096 变体，11,628 pass、79,820 fail、6,354 unsupported、294 skip，无 timeout/crash | 按失败簇提升；已通过集合不得回退 |
 | WPT | 官方固定 revision 的完整外部 checkout 和静态 reftest 批量 runner 已接入，尚未因网络限制完成 checkout 执行 | 运行 `tools/run-wpt-reftests.py`，再单独接入 testharness/navigation |
 | 浏览器视觉对比 | 有 fixture 和 Chromium 对比工具，尚未形成规范分组基线 | 每个布局簇提供参考截图或几何断言 |
+| 渲染性能 | 有 release 构建的 deterministic `render-perf`，输出 parse/first-visible/scroll 分布；PR smoke 与定时/手动全量 workflow 已接入 | 在同一测试机记录 JSON 基线，比较 `first_visible` p95，并以至少 30% 相对下降作为阶段目标 |
+| HTTP 缓存基础设施 | 私有内存 LRU、显式 freshness、过期 `ETag/Last-Modified` 条件重验证；磁盘 store/worker 支持有界、校验和、代际安全清理 | 将磁盘 read-through/write-back 接入资源管线，并扩展 Vary、启发式 freshness 与 Fetch 语义 |
 
 test262 的当前 pass 约占全部变体的 8.1%，不能描述为 JavaScript 已完成。WPT runner 建立前，任何 CSS/DOM 子系统也不能标为 `Conformant`。
 
@@ -70,7 +72,7 @@ test262 按失败簇推进，而不是按站点脚本逐文件打补丁：
 - CSSOM、Resize/Intersection/Mutation Observer；
 - storage、cookies、URL/Streams/Encoding Web APIs；
 - accessibility tree、IME、clipboard、drag and drop；
-- cache、service worker、security policy 和多进程隔离。
+- Cache API、service worker、security policy 和多进程隔离；浏览器 shell 的 HTTP 缓存基础设施已单独列入当前能力矩阵。
 
 ## 阶段验收
 

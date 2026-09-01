@@ -174,10 +174,12 @@
 
 - CSS/JS/Image 并发、优先级和依赖关系。
 - 防止阻塞链过长导致白屏。
+- 使用有界共享 worker、每 origin 并发上限和活动页优先预算，避免后台任务挤占首屏。
 
 ### 周 28：缓存与复用
 
-- 内存缓存 + 条件请求（ETag/Last-Modified）基础。
+- 私有内存 LRU + 条件请求（ETag/Last-Modified）基础已落地，过期条目在 reload 时优先走验证器请求。
+- 有界磁盘缓存 worker、校验和原子记录、代际清理和 settings 状态已落地；资源 read-through/write-back 作为后续接线点保留。
 - 重复访问性能验证。
 
 ### 周 29：编码与压缩
@@ -193,7 +195,8 @@
 ### 周 31-32：性能专项
 
 - 引入性能剖析点：解析、样式、布局、绘制、脚本执行。
-- 目标：关键页面 TTFR（首次可见渲染）降低 30%（相对阶段 A 基线）。
+- `render-perf` 固定 fixture 基准输出 parse、first-visible、scroll 分布；PR 做 generated smoke，定时/手动任务跑 all-fixture 全量。
+- 目标：关键页面 `first_visible` p95 降低至少 30%（相对同机阶段 A 基线）；未记录基线不得宣称完成。
 
 **阶段 E 里程碑**：打开页面速度与稳定性达到“可日常试用”。
 

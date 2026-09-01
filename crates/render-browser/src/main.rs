@@ -12,6 +12,8 @@ use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
+use render_browser::cache::disk::{DiskCacheEvent, DiskCacheOperationId, DiskCacheWorker};
+use render_browser::cache::{CacheEpoch, CacheLookup, HttpCache};
 use render_browser::chrome::{
     AddressClickTracker, AddressContextMenu, Canvas, ChromeLayout, ChromeTheme, HitTarget, Point,
     TabDrag, TitleBarClickTracker, TitleBarGesture, WindowAction, address_index_at_x,
@@ -31,6 +33,9 @@ use render_browser::scripts::{
     ScriptBatchPreparation, ScriptFetchPlan, ScriptResourceDiagnostic,
     plan_unstarted_classic_scripts, prepare_script_batch,
 };
+use render_browser::settings::{
+    CacheClearUiState, SETTINGS_TITLE, is_trusted_clear_http_cache_action, settings_html,
+};
 use render_browser::worker::{
     CompletedRender, RenderCancellation, RenderFailure, RenderIdentity, RenderJob, RenderOffset,
     RenderViewport, RenderWorker, RenderWorkerOptions,
@@ -44,17 +49,20 @@ use render_core::image::{ImageLimits, ImageResources};
 use render_core::interaction::{
     ButtonBehavior, DefaultActionKind, FormMethod, activation_plan, plan_form_submission,
 };
-use render_core::js::{JsValue, RuntimeLimits};
-use render_core::layout::{PhysicalPoint, PhysicalRect, PhysicalSize};
+use render_core::js::{ElementRect, JsValue, RuntimeLimits};
+use render_core::layout::{FragmentKind, PhysicalPoint, PhysicalRect, PhysicalSize};
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
 use render_core::page::{Page, PageJob};
-use render_core::paint::{Color, CpuRasterizer, DisplayList, PaintCoordinateSpace, Surface};
+use render_core::paint::{
+    Color, CpuRasterizer, DisplayList, PaintCoordinateSpace, PaintScene, RasterControl,
+    RasterRequest, Surface,
+};
 use render_core::script::{ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling};
 use render_net::{
-    BatchOptions, CookieJar, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult,
-    HttpTransport, NetworkWorker, RequestHandle, Url,
+    CookieJar, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult, HttpTransport,
+    NetworkWorker, RequestHandle, Url,
 };
-use softbuffer::{Context, Surface as WindowSurface};
+use softbuffer::{Context, Rect as SoftBufferRect, Surface as WindowSurface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize as WindowSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -65,6 +73,135 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 const INITIAL_WIDTH: u32 = 1_180;
 const INITIAL_HEIGHT: u32 = 780;
 const SCROLL_LINE_PIXELS: f32 = 40.0;
+const ACTIVE_PAGE_TURN_BUDGET: usize = 8;
+const BACKGROUND_PAGE_TURN_BUDGET: usize = 2;
+const MAX_DAMAGE_RECTS: usize = 16;
+const DAMAGE_FULL_THRESHOLD_PERCENT: u64 = 75;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FrameRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl FrameRect {
+    fn right(self) -> u32 {
+        self.x.saturating_add(self.width)
+    }
+
+    fn bottom(self) -> u32 {
+        self.y.saturating_add(self.height)
+    }
+
+    fn area(self) -> u64 {
+        u64::from(self.width) * u64::from(self.height)
+    }
+
+    fn touches_or_overlaps(self, other: Self) -> bool {
+        self.x <= other.right()
+            && other.x <= self.right()
+            && self.y <= other.bottom()
+            && other.y <= self.bottom()
+    }
+
+    fn union(self, other: Self) -> Self {
+        let right = self.right().max(other.right());
+        let bottom = self.bottom().max(other.bottom());
+        Self {
+            x: self.x.min(other.x),
+            y: self.y.min(other.y),
+            width: right.saturating_sub(self.x.min(other.x)),
+            height: bottom.saturating_sub(self.y.min(other.y)),
+        }
+    }
+
+    fn clip(self, width: u32, height: u32) -> Option<Self> {
+        let right = self.right().min(width);
+        let bottom = self.bottom().min(height);
+        (self.x < right && self.y < bottom).then_some(Self {
+            x: self.x,
+            y: self.y,
+            width: right.saturating_sub(self.x),
+            height: bottom.saturating_sub(self.y),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FrameDamage {
+    full: bool,
+    rects: Vec<FrameRect>,
+}
+
+impl FrameDamage {
+    fn mark_full(&mut self) {
+        self.full = true;
+        self.rects.clear();
+    }
+
+    fn mark_rect(&mut self, rect: FrameRect, frame_width: u32, frame_height: u32) {
+        if self.full || frame_width == 0 || frame_height == 0 {
+            return;
+        }
+        let Some(mut merged) = rect.clip(frame_width, frame_height) else {
+            return;
+        };
+        let mut index = 0;
+        while index < self.rects.len() {
+            if self.rects[index].touches_or_overlaps(merged) {
+                merged = self.rects[index].union(merged);
+                self.rects.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        self.rects.push(merged);
+        let damaged_area = self.rects.iter().map(|item| item.area()).sum::<u64>();
+        let frame_area = u64::from(frame_width) * u64::from(frame_height);
+        if self.rects.len() > MAX_DAMAGE_RECTS
+            || damaged_area.saturating_mul(100)
+                >= frame_area.saturating_mul(DAMAGE_FULL_THRESHOLD_PERCENT)
+        {
+            self.mark_full();
+        }
+    }
+
+    fn take_for_present(&mut self, frame_width: u32, frame_height: u32) -> Vec<SoftBufferRect> {
+        if frame_width == 0 || frame_height == 0 {
+            self.full = false;
+            self.rects.clear();
+            return Vec::new();
+        }
+        if !self.full && self.rects.is_empty() {
+            return Vec::new();
+        }
+        let rects = if self.full || self.rects.is_empty() {
+            vec![SoftBufferRect {
+                x: 0,
+                y: 0,
+                width: NonZeroU32::new(frame_width).expect("frame width is non-zero"),
+                height: NonZeroU32::new(frame_height).expect("frame height is non-zero"),
+            }]
+        } else {
+            self.rects
+                .iter()
+                .filter_map(|rect| {
+                    Some(SoftBufferRect {
+                        x: rect.x,
+                        y: rect.y,
+                        width: NonZeroU32::new(rect.width)?,
+                        height: NonZeroU32::new(rect.height)?,
+                    })
+                })
+                .collect()
+        };
+        self.full = false;
+        self.rects.clear();
+        rects
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ContentHitRegion {
@@ -144,26 +281,25 @@ fn main() {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
-        return;
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-    // The interpreter and parser recurse deeply on minified real-world
-    // scripts; the default main-thread stack overflows. Run the entire
-    // event loop on a dedicated thread with a generous stack.
-    let child = std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(browser_main)
-        .expect("spawn browser main thread");
-    match child.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(message)) => {
-            eprintln!("error: {message}");
-            std::process::exit(1);
+        // The interpreter and parser recurse deeply on minified real-world
+        // scripts; the default main-thread stack overflows. Run the entire
+        // event loop on a dedicated thread with a generous stack.
+        let child = std::thread::Builder::new()
+            .stack_size(512 * 1024 * 1024)
+            .spawn(browser_main)
+            .expect("spawn browser main thread");
+        match child.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            Err(panic_payload) => std::panic::resume_unwind(panic_payload),
         }
-        Err(panic_payload) => std::panic::resume_unwind(panic_payload),
-    }
     }
 }
 
@@ -206,6 +342,115 @@ struct PageSource {
     target: NavigationTarget,
 }
 
+/// A request handle that can resolve immediately from the private browser
+/// cache or asynchronously from the bounded transport worker.
+#[derive(Debug)]
+enum CachedRequestState {
+    Ready(Box<Option<FetchResult>>),
+    Pending(RequestHandle<FetchResult>),
+}
+
+/// Request metadata travels with its response so a late completion can only
+/// update the cache generation that originally submitted it.
+#[derive(Debug)]
+struct CachedRequestHandle {
+    request: FetchRequest,
+    epoch: CacheEpoch,
+    state: CachedRequestState,
+}
+
+impl CachedRequestHandle {
+    fn ready(request: FetchRequest, epoch: CacheEpoch, response: FetchResponse) -> Self {
+        Self {
+            request,
+            epoch,
+            state: CachedRequestState::Ready(Box::new(Some(Ok(response)))),
+        }
+    }
+
+    fn pending(
+        request: FetchRequest,
+        epoch: CacheEpoch,
+        handle: RequestHandle<FetchResult>,
+    ) -> Self {
+        Self {
+            request,
+            epoch,
+            state: CachedRequestState::Pending(handle),
+        }
+    }
+
+    fn cancel(&self) {
+        if let CachedRequestState::Pending(handle) = &self.state {
+            handle.cancel();
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<CachedFetchResult, TryRecvError> {
+        let result = match &mut self.state {
+            CachedRequestState::Ready(value) => value.take().ok_or(TryRecvError::Disconnected)?,
+            CachedRequestState::Pending(handle) => match handle.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return Err(TryRecvError::Empty),
+                Err(TryRecvError::Disconnected) => Err(FetchError::WorkerStopped),
+            },
+        };
+        Ok(CachedFetchResult {
+            request: self.request.clone(),
+            epoch: self.epoch,
+            from_cache: matches!(self.state, CachedRequestState::Ready(_)),
+            result,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CachedBatchHandle {
+    handles: Vec<Option<CachedRequestHandle>>,
+    results: Vec<Option<CachedFetchResult>>,
+}
+
+impl CachedBatchHandle {
+    fn new(handles: Vec<CachedRequestHandle>) -> Self {
+        let len = handles.len();
+        Self {
+            handles: handles.into_iter().map(Some).collect(),
+            results: std::iter::repeat_with(|| None).take(len).collect(),
+        }
+    }
+
+    fn cancel(&self) {
+        for handle in self.handles.iter().flatten() {
+            handle.cancel();
+        }
+    }
+
+    fn try_recv(&mut self) -> Result<Vec<CachedFetchResult>, TryRecvError> {
+        let mut pending = false;
+        for index in 0..self.handles.len() {
+            let Some(handle) = self.handles[index].as_mut() else {
+                continue;
+            };
+            match handle.try_recv() {
+                Ok(result) => {
+                    self.results[index] = Some(result);
+                    self.handles[index] = None;
+                }
+                Err(TryRecvError::Empty) => pending = true,
+                Err(TryRecvError::Disconnected) => unreachable!("cache handle maps disconnects"),
+            }
+        }
+        if pending {
+            return Err(TryRecvError::Empty);
+        }
+        Ok(self
+            .results
+            .iter_mut()
+            .map(|result| result.take().expect("completed batch result"))
+            .collect())
+    }
+}
+
 fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let Some(argument) = arguments.next() else {
@@ -213,7 +458,7 @@ fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> {
     };
     if argument == "-h" || argument == "--help" {
         println!(
-            "Usage: render-browser [URL_OR_LOCAL_HTML_PATH]\n\nNo argument opens the built-in home page. HTTP and HTTPS URLs use the browser's normal navigation pipeline."
+            "Usage: render-browser [URL_OR_LOCAL_HTML_PATH]\n\nNo argument opens the built-in home page. HTTP, HTTPS, and data: URLs use the browser's normal navigation pipeline."
         );
         return Ok(None);
     }
@@ -226,7 +471,7 @@ fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> {
     }
     if let Some(value) = argument.to_str()
         && let Ok(url) = Url::parse(value)
-        && matches!(url.scheme(), "http" | "https")
+        && matches!(url.scheme(), "http" | "https" | "data")
     {
         return Ok(Some(network_start_source(url)));
     }
@@ -234,7 +479,7 @@ fn load_initial_page() -> Result<Option<PageSource>, Box<dyn Error>> {
     if path.to_string_lossy().contains("://") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the command-line URL must use HTTP or HTTPS",
+            "the command-line URL must use HTTP, HTTPS, or data",
         )
         .into());
     }
@@ -246,6 +491,14 @@ fn home_source() -> PageSource {
         html: HOME_HTML.to_owned(),
         title: HOME_TITLE.to_owned(),
         target: NavigationTarget::Home,
+    }
+}
+
+fn settings_source(state: CacheClearUiState) -> PageSource {
+    PageSource {
+        html: settings_html(state),
+        title: SETTINGS_TITLE.to_owned(),
+        target: NavigationTarget::Settings,
     }
 }
 
@@ -385,7 +638,7 @@ fn escape_html(value: &str) -> String {
 enum PageRenderPayload {
     Full(Box<FullPageRenderPayload>),
     RetainedRaster {
-        display_list: Arc<DisplayList>,
+        scene: Arc<PaintScene>,
         images: ImageResources,
         raster_background: Color,
         content_height: f32,
@@ -408,6 +661,7 @@ struct PageRenderFrame {
     frame: Vec<u32>,
     viewport: WindowSize<u32>,
     display_list: Option<Arc<DisplayList>>,
+    paint_scene: Option<Arc<PaintScene>>,
     raster_background: Color,
     content_height: f32,
     viewport_height: f32,
@@ -415,9 +669,21 @@ struct PageRenderFrame {
     style_plan: Option<StylesheetFetchPlan>,
     style_diagnostics: Vec<StylesheetResourceDiagnostic>,
     computed_styles: Option<BTreeMap<render_core::dom::NodeId, ComputedStyle>>,
+    geometry: Option<BTreeMap<u64, ElementRect>>,
+    document_revision: u64,
 }
 
 type PageRenderWorker = RenderWorker<PageRenderPayload, PageRenderFrame>;
+
+struct BrowserRasterControl<'a> {
+    cancellation: &'a RenderCancellation,
+}
+
+impl RasterControl for BrowserRasterControl<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
 
 fn start_render_worker(
     fonts: Arc<SystemFontBackend>,
@@ -498,11 +764,17 @@ fn process_page_render(
             );
             let content_height = output.layout.fragments.scrollable_content_size.height;
             let viewport_height = output.layout.fragments.viewport.height;
+            let geometry = geometry_from_layout(&output.layout.fragments);
+            let display_list = Arc::new(output.display.list);
+            let paint_scene = Arc::new(PaintScene::from_shared_display_list(Arc::clone(
+                &display_list,
+            )));
             let frame = surface_to_softbuffer(&output.raster.surface);
             Ok(PageRenderFrame {
                 frame,
                 viewport,
-                display_list: Some(Arc::new(output.display.list)),
+                display_list: Some(display_list),
+                paint_scene: Some(paint_scene),
                 raster_background,
                 content_height,
                 viewport_height,
@@ -510,30 +782,31 @@ fn process_page_render(
                 style_plan,
                 style_diagnostics,
                 computed_styles: Some(output.styles),
+                geometry: Some(geometry),
+                document_revision: output.revision.as_u64(),
             })
         }
         PageRenderPayload::RetainedRaster {
-            display_list,
+            scene,
             images,
             raster_background,
             content_height,
             viewport_height,
         } => {
-            let raster = CpuRasterizer.rasterize_viewport_with_images(
-                &display_list,
-                raster_background,
-                fonts,
-                PhysicalPoint {
+            let request = RasterRequest::new(&scene, raster_background, fonts)
+                .with_images(&images)
+                .with_viewport_origin(PhysicalPoint {
                     x: job.identity.scroll_offset.x,
                     y: job.identity.scroll_offset.y,
-                },
-                Some(&images),
-            );
-            cancellation.check()?;
+                });
+            let raster = CpuRasterizer
+                .rasterize_request(request, &BrowserRasterControl { cancellation })
+                .map_err(|_| RenderFailure::Cancelled)?;
             Ok(PageRenderFrame {
                 viewport: WindowSize::new(raster.surface.width(), raster.surface.height()),
                 frame: surface_to_softbuffer(&raster.surface),
                 display_list: None,
+                paint_scene: None,
                 raster_background,
                 content_height,
                 viewport_height,
@@ -541,13 +814,15 @@ fn process_page_render(
                 style_plan: None,
                 style_diagnostics: Vec::new(),
                 computed_styles: None,
+                geometry: None,
+                document_revision: job.identity.dom_revision,
             })
         }
     }
 }
 
 struct PageState {
-    navigation: PageNavigation<RequestHandle<FetchResult>>,
+    navigation: PageNavigation<CachedRequestHandle>,
     page: Page,
     cookies: CookieJar,
     style_sheets: ExternalStyleSheets,
@@ -564,6 +839,7 @@ struct PageState {
     frame: Vec<u32>,
     viewport: WindowSize<u32>,
     display_list: Option<Arc<DisplayList>>,
+    paint_scene: Option<Arc<PaintScene>>,
     raster_background: Color,
     scroll: PageScrollState,
     history: SessionHistory,
@@ -587,17 +863,25 @@ struct PendingNavigation<H> {
 
 struct PendingStyleSheets {
     plan: StylesheetFetchPlan,
-    handle: RequestHandle<Vec<FetchResult>>,
+    handle: CachedBatchHandle,
 }
 
 struct PendingScripts {
     plan: ScriptFetchPlan,
-    handle: RequestHandle<Vec<FetchResult>>,
+    handle: CachedBatchHandle,
 }
 
 struct PendingImages {
     plan: ImageFetchPlan,
-    handle: RequestHandle<Vec<FetchResult>>,
+    handle: CachedBatchHandle,
+}
+
+#[derive(Debug)]
+struct CachedFetchResult {
+    request: FetchRequest,
+    epoch: CacheEpoch,
+    from_cache: bool,
+    result: FetchResult,
 }
 
 impl<H> PageNavigation<H> {
@@ -640,7 +924,7 @@ impl PageState {
             NavigationLimits::default(),
         )
         .expect("browser-created page URLs fit the session-history limits");
-        let page = Page::with_url(&source.html, &source.target.history_url());
+        let page = Page::with_url_unrendered(&source.html, &source.target.history_url());
         Self {
             navigation: PageNavigation::new(source),
             page,
@@ -659,6 +943,7 @@ impl PageState {
             frame: Vec::new(),
             viewport: WindowSize::new(0, 0),
             display_list: None,
+            paint_scene: None,
             raster_background: DocumentRenderOptions::default().raster_background,
             scroll: PageScrollState::default(),
             history,
@@ -673,7 +958,7 @@ impl PageState {
     fn set_source(&mut self, source: PageSource) {
         self.cancel_style_sheets();
         self.cancel_scripts();
-        self.page = Page::with_url(&source.html, &source.target.history_url());
+        self.page = Page::with_url_unrendered(&source.html, &source.target.history_url());
         self.navigation.commit(source);
         self.style_sheets = ExternalStyleSheets::default();
         self.style_batch = None;
@@ -686,6 +971,7 @@ impl PageState {
         self.frame.clear();
         self.viewport = WindowSize::new(0, 0);
         self.display_list = None;
+        self.paint_scene = None;
         self.scroll.reset();
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.external_styles_generation = 0;
@@ -821,10 +1107,17 @@ impl PageState {
     /// Returns whether any turn mutated the DOM plus per-task default-action
     /// results (`true` when the task's event was not `preventDefault()`-ed).
     fn run_page_turns(&mut self) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {
+        self.run_page_turns_with_budget(ACTIVE_PAGE_TURN_BUDGET)
+    }
+
+    fn run_page_turns_with_budget(
+        &mut self,
+        turn_budget: usize,
+    ) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {
         let now = self.created_at.elapsed();
         let revision_before = self.page.document().dom().revision().as_u64();
         let mut defaults = HashMap::new();
-        match self.page.pump_until_idle_without_render(now) {
+        match self.page.pump_at_most_without_render(now, turn_budget) {
             Ok(outcome) => {
                 for (id, result) in outcome.task_results {
                     let default_allowed = match &result {
@@ -867,6 +1160,10 @@ struct BrowserApp {
     fonts: Arc<SystemFontBackend>,
     render_worker: PageRenderWorker,
     network: NetworkWorker,
+    http_cache: HttpCache,
+    disk_cache: Option<DiskCacheWorker>,
+    pending_disk_clear: Option<DiskCacheOperationId>,
+    cache_clear_state: CacheClearUiState,
     editor: AddressEditor,
     content_editor: Option<ContentTextEditor>,
     clipboard: NativeClipboard,
@@ -876,6 +1173,7 @@ struct BrowserApp {
     layout: Option<ChromeLayout>,
     frame: Vec<u32>,
     frame_size: WindowSize<u32>,
+    frame_damage: FrameDamage,
     theme: ChromeTheme,
     cursor: Point,
     hot: HitTarget,
@@ -900,12 +1198,29 @@ impl BrowserApp {
         let tabs = TabModel::new(initial.title.clone(), initial.target.display_address());
         let active = tabs.active_id();
         let editor = AddressEditor::new(initial.target.display_address());
+        let disk_cache = match render_browser::cache::disk::DiskCacheConfig::from_environment() {
+            Ok(config) => match DiskCacheWorker::start(config) {
+                Ok(worker) => Some(worker),
+                Err(error) => {
+                    eprintln!("render-browser disk cache disabled: {error}");
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!("render-browser disk cache disabled: {error}");
+                None
+            }
+        };
         Self {
             tabs,
             pages: HashMap::from([(active, PageState::new(initial))]),
             fonts,
             render_worker,
             network,
+            http_cache: HttpCache::default(),
+            disk_cache,
+            pending_disk_clear: None,
+            cache_clear_state: CacheClearUiState::Ready,
             editor,
             content_editor: None,
             clipboard: NativeClipboard::default(),
@@ -915,6 +1230,10 @@ impl BrowserApp {
             layout: None,
             frame: Vec::new(),
             frame_size: WindowSize::new(0, 0),
+            frame_damage: FrameDamage {
+                full: true,
+                rects: Vec::new(),
+            },
             theme: ChromeTheme::Light,
             cursor: Point::default(),
             hot: HitTarget::Chrome,
@@ -952,7 +1271,9 @@ impl BrowserApp {
             .get(&self.tabs.active_id())
             .map(|page| page.navigation.committed().target.clone())
             .and_then(|target| match target {
-                NavigationTarget::Url(url) if matches!(url.scheme(), "http" | "https") => Some(url),
+                NavigationTarget::Url(url) if matches!(url.scheme(), "http" | "https" | "data") => {
+                    Some(url)
+                }
                 _ => None,
             });
         if let Some(url) = initial_network_url {
@@ -973,6 +1294,7 @@ impl BrowserApp {
         if size.width == 0 || size.height == 0 {
             return;
         }
+        self.frame_damage.mark_full();
         let layout = ChromeLayout::new(size.width, size.height, scale, self.tabs.tabs());
         if render_page {
             let viewport =
@@ -980,6 +1302,7 @@ impl BrowserApp {
             self.schedule_page_render(self.tabs.active_id(), viewport, false);
         }
         self.layout = Some(layout);
+        self.mark_chrome_damage(size);
         self.compose_frame(size);
         self.update_window_title();
     }
@@ -1018,13 +1341,13 @@ impl BrowserApp {
         let can_raster_retained = prefer_retained_raster
             && page.viewport == viewport
             && page.style_batch.is_none()
-            && page.display_list.is_some();
+            && page.paint_scene.is_some();
         let payload = if can_raster_retained {
             PageRenderPayload::RetainedRaster {
-                display_list: Arc::clone(
-                    page.display_list
+                scene: Arc::clone(
+                    page.paint_scene
                         .as_ref()
-                        .expect("retained display list was checked"),
+                        .expect("retained paint scene was checked"),
                 ),
                 raster_background: page.raster_background,
                 images: page.images.clone(),
@@ -1096,9 +1419,17 @@ impl BrowserApp {
             if let Some(display_list) = frame.display_list {
                 page.display_list = Some(display_list);
             }
+            if let Some(paint_scene) = frame.paint_scene {
+                page.paint_scene = Some(paint_scene);
+            }
             page.raster_background = frame.raster_background;
             if let Some(styles) = frame.computed_styles {
                 page.computed_styles = styles;
+            }
+            if let Some(geometry) = frame.geometry {
+                let _published = page
+                    .page
+                    .publish_render_geometry(frame.document_revision, geometry);
             }
             page.scroll
                 .update_metrics(frame.content_height, frame.viewport_height);
@@ -1119,8 +1450,9 @@ impl BrowserApp {
             self.start_classic_scripts(id);
         }
         if id == self.tabs.active_id() {
-            if let Some(window) = &self.window {
-                self.compose_frame(window.inner_size());
+            if let Some(size) = self.window.as_ref().map(|window| window.inner_size()) {
+                self.mark_page_damage(size);
+                self.compose_frame(size);
             }
             self.request_redraw();
         } else {
@@ -1129,6 +1461,9 @@ impl BrowserApp {
     }
 
     fn compose_frame(&mut self, size: WindowSize<u32>) {
+        if self.frame_size != size {
+            self.frame_damage.mark_full();
+        }
         let Some(layout) = &self.layout else {
             return;
         };
@@ -1186,8 +1521,44 @@ impl BrowserApp {
         let Some(window) = &self.window else {
             return;
         };
-        self.compose_frame(window.inner_size());
+        let size = window.inner_size();
+        self.mark_chrome_damage(size);
+        self.compose_frame(size);
         self.request_redraw();
+    }
+
+    fn mark_page_damage(&mut self, size: WindowSize<u32>) {
+        let Some(chrome_height) = self.layout.as_ref().map(|layout| layout.chrome_height) else {
+            self.frame_damage.mark_full();
+            return;
+        };
+        self.frame_damage.mark_rect(
+            FrameRect {
+                x: 0,
+                y: chrome_height,
+                width: size.width,
+                height: size.height.saturating_sub(chrome_height),
+            },
+            size.width,
+            size.height,
+        );
+    }
+
+    fn mark_chrome_damage(&mut self, size: WindowSize<u32>) {
+        let chrome_height = self
+            .layout
+            .as_ref()
+            .map_or(size.height, |layout| layout.chrome_height);
+        self.frame_damage.mark_rect(
+            FrameRect {
+                x: 0,
+                y: 0,
+                width: size.width,
+                height: chrome_height.min(size.height),
+            },
+            size.width,
+            size.height,
+        );
     }
 
     fn present(&mut self) -> Result<(), Box<dyn Error>> {
@@ -1204,8 +1575,27 @@ impl BrowserApp {
         if buffer.len() != self.frame.len() {
             return Err(io::Error::other("CPU and native surface sizes differ").into());
         }
-        buffer.copy_from_slice(&self.frame);
-        buffer.present()?;
+        if buffer.age() != 1 {
+            self.frame_damage.mark_full();
+        }
+        let damage = self
+            .frame_damage
+            .take_for_present(self.frame_size.width, self.frame_size.height);
+        if damage.is_empty() {
+            return Ok(());
+        }
+        let full_damage = damage.len() == 1
+            && damage[0].x == 0
+            && damage[0].y == 0
+            && damage[0].width.get() == self.frame_size.width
+            && damage[0].height.get() == self.frame_size.height;
+        if full_damage {
+            buffer.copy_from_slice(&self.frame);
+            buffer.present()?;
+        } else {
+            copy_frame_regions(&mut buffer, &self.frame, self.frame_size, &damage);
+            buffer.present_with_damage(&damage)?;
+        }
         Ok(())
     }
 
@@ -1264,6 +1654,9 @@ impl BrowserApp {
             NavigationIntent::Home => {
                 self.navigate_target(tab, NavigationTarget::Home, HistoryMode::Push);
             }
+            NavigationIntent::Settings => {
+                self.navigate_target(tab, NavigationTarget::Settings, HistoryMode::Push);
+            }
             NavigationIntent::Reload => self.reload_active(),
             NavigationIntent::Back => self.traverse_active(false),
             NavigationIntent::Forward => self.traverse_active(true),
@@ -1316,7 +1709,10 @@ impl BrowserApp {
 
         match target {
             NavigationTarget::Home => self.install_source(id, home_source(), false),
-            NavigationTarget::Url(url) if matches!(url.scheme(), "http" | "https") => {
+            NavigationTarget::Settings => {
+                self.install_source(id, settings_source(self.cache_clear_state), false);
+            }
+            NavigationTarget::Url(url) if matches!(url.scheme(), "http" | "https" | "data") => {
                 self.start_network_navigation(id, url);
             }
             NavigationTarget::Url(url) if url.scheme() == "file" => {
@@ -1386,7 +1782,7 @@ impl BrowserApp {
         let request = self.pages.get(&id).map_or(request.clone(), |page| {
             page.cookies.decorate_request(request)
         });
-        let handle = self.network.submit(request);
+        let handle = self.submit_cached_fetch(request);
         let Some(page) = self.pages.get_mut(&id) else {
             handle.cancel();
             return;
@@ -1408,6 +1804,62 @@ impl BrowserApp {
         self.request_redraw();
     }
 
+    fn submit_cached_fetch(&mut self, request: FetchRequest) -> CachedRequestHandle {
+        let epoch = self.http_cache.epoch();
+        let now = Instant::now();
+        match self.http_cache.lookup(&request, now) {
+            CacheLookup::Hit(response) => CachedRequestHandle::ready(request, epoch, *response),
+            CacheLookup::Miss => {
+                let submitted_request = self
+                    .http_cache
+                    .revalidation_request(&request, now)
+                    .unwrap_or_else(|| request.clone());
+                let handle = self.network.submit(submitted_request.clone());
+                CachedRequestHandle::pending(submitted_request, epoch, handle)
+            }
+        }
+    }
+
+    fn submit_cached_batch(&mut self, requests: Vec<FetchRequest>) -> CachedBatchHandle {
+        CachedBatchHandle::new(
+            requests
+                .into_iter()
+                .map(|request| self.submit_cached_fetch(request))
+                .collect(),
+        )
+    }
+
+    fn finish_cached_fetch(&mut self, completion: CachedFetchResult) -> FetchResult {
+        let CachedFetchResult {
+            request,
+            epoch,
+            from_cache,
+            result,
+        } = completion;
+        match result {
+            Ok(response) if response.status.as_u16() == 304 => self
+                .http_cache
+                .merge_not_modified(&request, &response, Instant::now(), epoch)
+                .ok_or(FetchError::WorkerStopped),
+            Ok(response) => {
+                if !from_cache {
+                    let _outcome =
+                        self.http_cache
+                            .store(&request, &response, Instant::now(), epoch);
+                }
+                Ok(response)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn finish_cached_batch(&mut self, completions: Vec<CachedFetchResult>) -> Vec<FetchResult> {
+        completions
+            .into_iter()
+            .map(|completion| self.finish_cached_fetch(completion))
+            .collect()
+    }
+
     fn install_source(&mut self, id: TabId, source: PageSource, loading: bool) {
         self.tabs
             .update(id, source.title.clone(), source.target.display_address());
@@ -1425,26 +1877,35 @@ impl BrowserApp {
     }
 
     fn start_external_style_sheets(&mut self, id: TabId, plan: StylesheetFetchPlan) {
-        let Some(page) = self.pages.get_mut(&id) else {
-            return;
-        };
-        page.cancel_style_sheets();
         if plan.is_empty() {
             report_stylesheet_diagnostics(&plan.diagnostics);
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            page.cancel_style_sheets();
             page.styles_resolved = true;
             self.tabs.set_loading(id, false);
             self.start_classic_scripts(id);
             self.repaint_chrome();
             return;
         }
-
-        let requests = plan
-            .requests()
-            .into_iter()
-            .map(|request| page.cookies.decorate_request(request))
-            .collect();
-        let handle = self.network.submit_batch(requests, BatchOptions::default());
-        page.pending_style_sheets = Some(PendingStyleSheets { plan, handle });
+        let requests = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            page.cancel_style_sheets();
+            plan.requests()
+                .into_iter()
+                .map(|request| page.cookies.decorate_request(request))
+                .collect::<Vec<_>>()
+        };
+        let handle = self.submit_cached_batch(requests);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.pending_style_sheets = Some(PendingStyleSheets { plan, handle });
+        } else {
+            handle.cancel();
+            return;
+        }
         self.tabs.set_loading(id, true);
         self.repaint_chrome();
     }
@@ -1452,6 +1913,7 @@ impl BrowserApp {
     fn start_classic_scripts(&mut self, id: TabId) {
         let mut rerender = false;
         let mut loading_complete = false;
+        let mut pending_request = None;
         loop {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
@@ -1503,12 +1965,20 @@ impl BrowserApp {
                     .requests()
                     .into_iter()
                     .map(|request| page.cookies.decorate_request(request))
-                    .collect();
-                let handle = self.network.submit_batch(requests, BatchOptions::default());
-                page.pending_scripts = Some(PendingScripts { plan, handle });
-                self.tabs.set_loading(id, true);
+                    .collect::<Vec<_>>();
+                pending_request = Some((plan, requests));
                 break;
             }
+        }
+
+        if let Some((plan, requests)) = pending_request {
+            let handle = self.submit_cached_batch(requests);
+            let Some(page) = self.pages.get_mut(&id) else {
+                handle.cancel();
+                return;
+            };
+            page.pending_scripts = Some(PendingScripts { plan, handle });
+            self.tabs.set_loading(id, true);
         }
 
         if loading_complete {
@@ -1522,30 +1992,37 @@ impl BrowserApp {
     }
 
     fn start_images(&mut self, id: TabId) {
-        let Some(page) = self.pages.get_mut(&id) else {
-            return;
+        let (plan, requests) = {
+            let Some(page) = self.pages.get_mut(&id) else {
+                return;
+            };
+            if page.pending_images.is_some() {
+                return;
+            }
+            let plan = plan_images_with_styles(
+                page.page.document(),
+                &page.computed_styles,
+                &page.navigation.committed().target.history_url(),
+                &page.images,
+                ImageLimits::default(),
+            );
+            let requests = plan
+                .requests()
+                .into_iter()
+                .map(|request| page.cookies.decorate_request(request))
+                .collect::<Vec<_>>();
+            (plan, requests)
         };
-        if page.pending_images.is_some() {
-            return;
-        }
-        let plan = plan_images_with_styles(
-            page.page.document(),
-            &page.computed_styles,
-            &page.navigation.committed().target.history_url(),
-            &page.images,
-            ImageLimits::default(),
-        );
         report_image_diagnostics(&plan.diagnostics);
         if plan.is_empty() {
             return;
         }
-        let requests = plan
-            .requests()
-            .into_iter()
-            .map(|request| page.cookies.decorate_request(request))
-            .collect();
-        let handle = self.network.submit_batch(requests, BatchOptions::default());
-        page.pending_images = Some(PendingImages { plan, handle });
+        let handle = self.submit_cached_batch(requests);
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.pending_images = Some(PendingImages { plan, handle });
+        } else {
+            handle.cancel();
+        }
     }
 
     fn poll_network(&mut self) {
@@ -1554,82 +2031,64 @@ impl BrowserApp {
         let mut completed_scripts = Vec::new();
         let mut completed_images = Vec::new();
         for (id, page) in &mut self.pages {
-            if let Some(pending) = page.navigation.pending.as_ref() {
+            if let Some(pending) = page.navigation.pending.as_mut() {
                 match pending.handle.try_recv() {
                     Ok(result) => completed_documents.push((*id, result)),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
-                        completed_documents.push((*id, Err(FetchError::WorkerStopped)));
+                        unreachable!("cache request handle maps disconnects")
                     }
                 }
             }
-            if let Some(pending) = page.pending_style_sheets.as_ref() {
+            if let Some(pending) = page.pending_style_sheets.as_mut() {
                 match pending.handle.try_recv() {
                     Ok(results) => completed_style_sheets.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
-                        completed_style_sheets.push((
-                            *id,
-                            pending
-                                .plan
-                                .resources
-                                .iter()
-                                .map(|_| Err(FetchError::WorkerStopped))
-                                .collect(),
-                        ));
+                        unreachable!("cache batch handle maps disconnects")
                     }
                 }
             }
-            if let Some(pending) = page.pending_scripts.as_ref() {
+            if let Some(pending) = page.pending_scripts.as_mut() {
                 match pending.handle.try_recv() {
                     Ok(results) => completed_scripts.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
                     Err(TryRecvError::Disconnected) => {
-                        completed_scripts.push((
-                            *id,
-                            pending
-                                .plan
-                                .resources
-                                .iter()
-                                .map(|_| Err(FetchError::WorkerStopped))
-                                .collect(),
-                        ));
+                        unreachable!("cache batch handle maps disconnects")
                     }
                 }
             }
-            if let Some(pending) = page.pending_images.as_ref() {
+            if let Some(pending) = page.pending_images.as_mut() {
                 match pending.handle.try_recv() {
                     Ok(results) => completed_images.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
-                    Err(TryRecvError::Disconnected) => completed_images.push((
-                        *id,
-                        pending
-                            .plan
-                            .resources
-                            .iter()
-                            .map(|_| Err(FetchError::WorkerStopped))
-                            .collect(),
-                    )),
+                    Err(TryRecvError::Disconnected) => {
+                        unreachable!("cache batch handle maps disconnects")
+                    }
                 }
             }
         }
-        for (id, result) in completed_documents {
+        for (id, completion) in completed_documents {
             let requested_url = self
                 .pages
                 .get_mut(&id)
                 .and_then(|page| page.navigation.take_pending())
                 .map(|pending| pending.requested_url);
             if let Some(requested_url) = requested_url {
+                let result = self.finish_cached_fetch(completion);
                 self.finish_network_navigation(id, requested_url, result);
             }
         }
-        for (id, results) in completed_style_sheets {
+        for (id, completions) in completed_style_sheets {
+            let results = self.finish_cached_batch(completions);
             self.finish_external_style_sheets(id, results);
         }
-        for (id, results) in completed_scripts {
+        for (id, completions) in completed_scripts {
+            let results = self.finish_cached_batch(completions);
             self.finish_classic_scripts(id, results);
         }
-        for (id, results) in completed_images {
+        for (id, completions) in completed_images {
+            let results = self.finish_cached_batch(completions);
             self.finish_images(id, results);
         }
     }
@@ -1882,6 +2341,11 @@ impl BrowserApp {
         self.editor.set_focused(false);
         let id = self.tabs.active_id();
         let hit_node = self.content_node_at_cursor();
+        if self.is_cache_clear_control(id, hit_node) {
+            self.clear_http_cache();
+            self.repaint_chrome();
+            return;
+        }
         if let Some(node) = hit_node
             && let Some(value) = self.content_text_input_value(id, node)
         {
@@ -1928,6 +2392,143 @@ impl BrowserApp {
             self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Push);
         }
         self.repaint_chrome();
+    }
+
+    fn is_cache_clear_control(
+        &self,
+        id: TabId,
+        hit_node: Option<render_core::dom::NodeId>,
+    ) -> bool {
+        let Some(mut node) = hit_node else {
+            return false;
+        };
+        let Some(page) = self.pages.get(&id) else {
+            return false;
+        };
+        if page.navigation.committed().target != NavigationTarget::Settings {
+            return false;
+        }
+        let dom = page.page.document().dom();
+        loop {
+            let element_id = dom.attribute(node, "id").ok().flatten();
+            let action = dom.attribute(node, "data-render-action").ok().flatten();
+            if is_trusted_clear_http_cache_action(true, element_id, action) {
+                return true;
+            }
+            let Some(parent) = dom.parent(node) else {
+                return false;
+            };
+            node = parent;
+        }
+    }
+
+    fn clear_http_cache(&mut self) {
+        if self.cache_clear_state.is_busy() {
+            return;
+        }
+        let result = self.http_cache.clear();
+        let memory_entries = result.memory_entries;
+        let memory_bytes = result.memory_bytes;
+        if let Some(worker) = self.disk_cache.as_ref() {
+            match worker.clear() {
+                Ok(operation) => {
+                    self.pending_disk_clear = Some(operation);
+                    self.cache_clear_state = CacheClearUiState::ClearingDisk {
+                        memory_entries,
+                        memory_bytes,
+                    };
+                }
+                Err(error) => {
+                    eprintln!("render-browser could not clear disk cache: {error}");
+                    self.cache_clear_state = CacheClearUiState::DiskClearFailed {
+                        memory_entries,
+                        memory_bytes,
+                    };
+                }
+            }
+        } else {
+            self.cache_clear_state = CacheClearUiState::Cleared {
+                memory_entries,
+                memory_bytes,
+            };
+        }
+        self.refresh_settings_pages();
+    }
+
+    fn poll_disk_cache(&mut self) {
+        let events = {
+            let Some(worker) = self.disk_cache.as_ref() else {
+                return;
+            };
+            let mut events = Vec::new();
+            while let Ok(event) = worker.poll() {
+                events.push(event);
+            }
+            events
+        };
+        let mut refresh_settings = false;
+        for event in events {
+            match event {
+                DiskCacheEvent::Ready { result: Err(error) } => {
+                    eprintln!("render-browser disk cache disabled: {error}");
+                    self.disk_cache = None;
+                    if self.pending_disk_clear.take().is_some() {
+                        self.cache_clear_state = CacheClearUiState::DiskClearFailed {
+                            memory_entries: 0,
+                            memory_bytes: 0,
+                        };
+                        refresh_settings = true;
+                    }
+                }
+                DiskCacheEvent::ClearFinished { id, result } => {
+                    if self.pending_disk_clear != Some(id) {
+                        continue;
+                    }
+                    self.pending_disk_clear = None;
+                    let (memory_entries, memory_bytes) = match self.cache_clear_state {
+                        CacheClearUiState::ClearingDisk {
+                            memory_entries,
+                            memory_bytes,
+                        } => (memory_entries, memory_bytes),
+                        _ => (0, 0),
+                    };
+                    self.cache_clear_state = match result {
+                        Ok(_) => CacheClearUiState::Cleared {
+                            memory_entries,
+                            memory_bytes,
+                        },
+                        Err(error) => {
+                            eprintln!("render-browser disk cache cleanup failed: {error}");
+                            CacheClearUiState::DiskClearFailed {
+                                memory_entries,
+                                memory_bytes,
+                            }
+                        }
+                    };
+                    refresh_settings = true;
+                }
+                DiskCacheEvent::Ready { result: Ok(_) }
+                | DiskCacheEvent::Read { .. }
+                | DiskCacheEvent::Write { .. }
+                | DiskCacheEvent::ClearStarted { .. } => {}
+            }
+        }
+        if refresh_settings {
+            self.refresh_settings_pages();
+        }
+    }
+
+    fn refresh_settings_pages(&mut self) {
+        let settings_tabs = self
+            .pages
+            .iter()
+            .filter_map(|(id, page)| {
+                (page.navigation.committed().target == NavigationTarget::Settings).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in settings_tabs {
+            self.install_source(id, settings_source(self.cache_clear_state), false);
+        }
     }
 
     fn content_text_input_value(
@@ -2451,13 +3052,21 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_network();
+        self.poll_disk_cache();
         let active = self.tabs.active_id();
         let mut rendered_active = false;
         let mut navigation_candidates = Vec::new();
         for (id, page) in &mut self.pages {
-            let now = page.created_at.elapsed();
             let revision_before = page.dom_revision;
-            match page.page.pump_until_idle_without_render(now) {
+            let turn_budget = if *id == active {
+                ACTIVE_PAGE_TURN_BUDGET
+            } else {
+                BACKGROUND_PAGE_TURN_BUDGET
+            };
+            match page
+                .page
+                .pump_at_most_without_render(page.created_at.elapsed(), turn_budget)
+            {
                 Ok(_) => {
                     let revision_after = page.page.document().dom().revision().as_u64();
                     page.dom_revision = revision_after;
@@ -2619,6 +3228,26 @@ fn blit_page(
     }
 }
 
+fn copy_frame_regions(
+    destination: &mut [u32],
+    source: &[u32],
+    frame_size: WindowSize<u32>,
+    regions: &[SoftBufferRect],
+) {
+    let frame_width = frame_size.width as usize;
+    for region in regions {
+        let x = region.x as usize;
+        let y = region.y as usize;
+        let width = region.width.get() as usize;
+        let height = region.height.get() as usize;
+        for row in 0..height {
+            let offset = (y + row) * frame_width + x;
+            let end = offset + width;
+            destination[offset..end].copy_from_slice(&source[offset..end]);
+        }
+    }
+}
+
 #[allow(
     clippy::cast_precision_loss,
     reason = "native dimensions are bounded far below f32's exact integer range"
@@ -2635,6 +3264,28 @@ fn surface_to_softbuffer(surface: &Surface) -> Vec<u32> {
             (u32::from(color.red) << 16) | (u32::from(color.green) << 8) | u32::from(color.blue)
         })
         .collect()
+}
+
+fn geometry_from_layout(
+    fragments: &render_core::layout::FragmentTree,
+) -> BTreeMap<u64, ElementRect> {
+    let mut geometry = BTreeMap::new();
+    for fragment in fragments.iter() {
+        let FragmentKind::Box(box_geometry) = &fragment.kind else {
+            continue;
+        };
+        let Some(source) = fragment.source else {
+            continue;
+        };
+        let rect = box_geometry.border_rect();
+        geometry.entry(source.as_u64()).or_insert(ElementRect {
+            x: rect.origin.x,
+            y: rect.origin.y,
+            width: rect.size.width,
+            height: rect.size.height,
+        });
+    }
+    geometry
 }
 
 fn report_stylesheet_diagnostics(diagnostics: &[StylesheetResourceDiagnostic]) {
@@ -2725,19 +3376,20 @@ mod tests {
     use render_core::paint::PaintCoordinateSpace;
     use render_core::paint::{Color, Surface};
     use render_core::script::ScriptDiscoveryLimits;
-    use render_net::Url;
+    use render_net::{FetchConfig, FetchRequest, HttpTransport, Url};
     use winit::dpi::{PhysicalPosition, PhysicalSize as WindowSize};
     use winit::event::MouseScrollDelta;
     use winit::keyboard::Key;
 
     use super::{
-        ContentHitRegion, HOME_TITLE, HostPlatform, PageNavigation, PageSource, PageState,
-        address_shortcut, blit_page, get_content_navigation_target, hit_test_content_regions,
-        home_source, network_start_source, primary_modifier_for, surface_to_softbuffer,
-        wheel_document_delta_y,
+        ContentHitRegion, FrameDamage, FrameRect, HOME_TITLE, HostPlatform, PageNavigation,
+        PageSource, PageState, address_shortcut, blit_page, get_content_navigation_target,
+        hit_test_content_regions, home_source, network_start_source, primary_modifier_for,
+        source_from_network_response, surface_to_softbuffer, wheel_document_delta_y,
     };
     use render_browser::chrome::Point;
     use render_browser::editor::AddressCommand;
+    use render_browser::navigation::NavigationTarget;
     use render_browser::scripts::{
         plan_classic_scripts, plan_unstarted_classic_scripts, prepare_script_batch,
     };
@@ -2746,6 +3398,73 @@ mod tests {
     fn converts_core_surface_to_softbuffer_rgb_words() {
         let surface = Surface::new(1, 1, Color::rgb(0x12, 0x34, 0x56));
         assert_eq!(surface_to_softbuffer(&surface), [0x0012_3456]);
+    }
+
+    #[test]
+    fn frame_damage_clips_and_merges_touching_regions() {
+        let mut damage = FrameDamage::default();
+        damage.mark_rect(
+            FrameRect {
+                x: 8,
+                y: 8,
+                width: 10,
+                height: 10,
+            },
+            100,
+            100,
+        );
+        damage.mark_rect(
+            FrameRect {
+                x: 18,
+                y: 8,
+                width: 10,
+                height: 10,
+            },
+            100,
+            100,
+        );
+        assert_eq!(
+            damage.rects,
+            [FrameRect {
+                x: 8,
+                y: 8,
+                width: 20,
+                height: 10,
+            }]
+        );
+        damage.mark_rect(
+            FrameRect {
+                x: 95,
+                y: 95,
+                width: 20,
+                height: 20,
+            },
+            100,
+            100,
+        );
+        assert!(damage.rects.contains(&FrameRect {
+            x: 95,
+            y: 95,
+            width: 5,
+            height: 5,
+        }));
+    }
+
+    #[test]
+    fn frame_damage_switches_to_full_for_large_updates() {
+        let mut damage = FrameDamage::default();
+        damage.mark_rect(
+            FrameRect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 100,
+            },
+            100,
+            100,
+        );
+        assert!(damage.full);
+        assert!(damage.rects.is_empty());
     }
 
     #[test]
@@ -2758,6 +3477,23 @@ mod tests {
             render_browser::navigation::NavigationTarget::Url(url)
         );
         assert!(source.html.is_empty());
+    }
+
+    #[test]
+    fn data_document_response_becomes_a_renderable_html_page() {
+        let url =
+            Url::parse("data:text/html,%3Ctitle%3EData%3C%2Ftitle%3E%3Ch1%3EHello%3C%2Fh1%3E")
+                .expect("valid data URL");
+        let response = HttpTransport::new(FetchConfig::default())
+            .fetch(
+                &FetchRequest::get(url.clone()),
+                &render_net::CancelToken::default(),
+            )
+            .expect("data response");
+        let source = source_from_network_response(&response).expect("renderable data document");
+
+        assert_eq!(source.target, NavigationTarget::Url(url));
+        assert!(source.html.contains("<h1>Hello</h1>"));
     }
 
     #[test]

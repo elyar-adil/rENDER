@@ -1346,9 +1346,12 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
         }
         ToolbarButton::Reload => {
             let radius = 6.5 * scale;
-            for segment in 0..20 {
-                let first = segment as f32 / 24.0 * std::f32::consts::TAU;
-                let second = (segment + 1) as f32 / 24.0 * std::f32::consts::TAU;
+            let start = 0.55_f32;
+            let end = std::f32::consts::TAU - 0.55_f32;
+            let segments = 24;
+            for segment in 0..segments {
+                let first = start + (end - start) * segment as f32 / segments as f32;
+                let second = start + (end - start) * (segment + 1) as f32 / segments as f32;
                 canvas.line(
                     Point {
                         x: first.cos().mul_add(radius, center.x),
@@ -1362,14 +1365,36 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
                     color,
                 );
             }
+            let tangent = Point {
+                x: -end.sin(),
+                y: end.cos(),
+            };
+            let wing = Point {
+                x: -tangent.y,
+                y: tangent.x,
+            };
+            let tip = Point {
+                x: end.cos().mul_add(radius, center.x),
+                y: end.sin().mul_add(radius, center.y),
+            };
+            let arrow_base = Point {
+                x: (-tangent.x).mul_add(4.0 * scale, tip.x),
+                y: (-tangent.y).mul_add(4.0 * scale, tip.y),
+            };
             canvas.line(
+                tip,
                 Point {
-                    x: center.x + radius,
-                    y: center.y,
+                    x: arrow_base.x + wing.x * 2.5 * scale,
+                    y: arrow_base.y + wing.y * 2.5 * scale,
                 },
+                line,
+                color,
+            );
+            canvas.line(
+                tip,
                 Point {
-                    x: center.x + radius - 4.0 * scale,
-                    y: center.y - 2.0 * scale,
+                    x: arrow_base.x - wing.x * 2.5 * scale,
+                    y: arrow_base.y - wing.y * 2.5 * scale,
                 },
                 line,
                 color,

@@ -4,12 +4,14 @@ use render_core::navigation::{AddressInput, AddressInputConfig, NavigationError,
 use render_net::Url;
 
 const HOME_ADDRESS: &str = "render://home";
+const SETTINGS_ADDRESS: &str = "render://settings";
 const SEARCH_ENDPOINT: &str = "https://www.google.com/search";
 
 /// A destination understood by the shell without conflating URLs and files.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NavigationTarget {
     Home,
+    Settings,
     Url(Url),
 }
 
@@ -18,6 +20,8 @@ impl NavigationTarget {
     pub fn from_url(url: Url) -> Self {
         if is_home_url(&url) {
             Self::Home
+        } else if is_settings_url(&url) {
+            Self::Settings
         } else {
             Self::Url(url)
         }
@@ -32,6 +36,7 @@ impl NavigationTarget {
     pub fn display_address(&self) -> String {
         match self {
             Self::Home => HOME_ADDRESS.to_owned(),
+            Self::Settings => SETTINGS_ADDRESS.to_owned(),
             Self::Url(url) => url.as_str().to_owned(),
         }
     }
@@ -40,6 +45,7 @@ impl NavigationTarget {
     pub fn history_url(&self) -> Url {
         match self {
             Self::Home => home_url(),
+            Self::Settings => settings_url(),
             Self::Url(url) => url.clone(),
         }
     }
@@ -53,6 +59,7 @@ pub enum NavigationIntent {
     Forward,
     Reload,
     Home,
+    Settings,
 }
 
 /// Parse one address-bar submission through the shared URL Standard adapter.
@@ -67,6 +74,10 @@ pub fn intent_from_address(input: &str) -> Result<NavigationIntent, NavigationEr
     let value = input.trim();
     if value.eq_ignore_ascii_case(HOME_ADDRESS) || value.eq_ignore_ascii_case("about:home") {
         return Ok(NavigationIntent::Home);
+    }
+    if value.eq_ignore_ascii_case(SETTINGS_ADDRESS) || value.eq_ignore_ascii_case("about:settings")
+    {
+        return Ok(NavigationIntent::Settings);
     }
     AddressInput::parse(value, &address_input_config()).map(NavigationIntent::Navigate)
 }
@@ -85,8 +96,24 @@ fn home_url() -> Url {
     Url::parse(HOME_ADDRESS).expect("the built-in home URL is valid")
 }
 
+fn settings_url() -> Url {
+    Url::parse(SETTINGS_ADDRESS).expect("the built-in settings URL is valid")
+}
+
 fn is_home_url(url: &Url) -> bool {
-    url.scheme() == "render" && url.host_str() == Some("home")
+    url.scheme() == "render"
+        && url.host_str() == Some("home")
+        && url.path().is_empty()
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
+fn is_settings_url(url: &Url) -> bool {
+    url.scheme() == "render"
+        && url.host_str() == Some("settings")
+        && url.path().is_empty()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 #[cfg(test)]
@@ -130,6 +157,20 @@ mod tests {
     }
 
     #[test]
+    fn data_url_is_a_document_navigation() {
+        let intent = intent_from_address("data:text/html,%3Ch1%3EHello%3C%2Fh1%3E")
+            .expect("valid data URL input");
+        let NavigationIntent::Navigate(AddressInput::Url(url)) = intent else {
+            panic!("data input should be a URL navigation");
+        };
+        assert_eq!(url.scheme(), "data");
+        assert_eq!(
+            NavigationTarget::from_url(url).display_address(),
+            "data:text/html,%3Ch1%3EHello%3C%2Fh1%3E"
+        );
+    }
+
+    #[test]
     fn whitespace_input_uses_the_configured_search_provider() {
         let intent = intent_from_address("rust browser engine").expect("search input");
         let NavigationIntent::Navigate(AddressInput::Search { terms, url }) = intent else {
@@ -146,5 +187,29 @@ mod tests {
             intent_from_address("about:home").expect("home alias"),
             NavigationIntent::Home
         );
+    }
+
+    #[test]
+    fn settings_alias_is_a_chrome_command() {
+        assert_eq!(
+            intent_from_address("about:settings").expect("settings alias"),
+            NavigationIntent::Settings
+        );
+        assert_eq!(
+            NavigationTarget::from_url("render://settings".parse().expect("internal settings URL")),
+            NavigationTarget::Settings
+        );
+    }
+
+    #[test]
+    fn settings_url_with_path_is_not_privileged() {
+        assert!(matches!(
+            NavigationTarget::from_url(
+                "render://settings/untrusted"
+                    .parse()
+                    .expect("URL with path")
+            ),
+            NavigationTarget::Url(_)
+        ));
     }
 }

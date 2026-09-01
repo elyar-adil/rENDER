@@ -256,6 +256,7 @@ pub(crate) enum NativeFunction {
     ArrayForEach,
     ArrayMap,
     ArrayFilter,
+    ArraySome,
     FunctionPrototype,
     FunctionCall,
     FunctionBind,
@@ -745,15 +746,17 @@ impl Realm {
                 },
             );
         }
-        objects[global.0].properties.insert(
-            "window".to_owned(),
-            PropertyDescriptor {
-                value: JsValue::Object(global),
-                writable: false,
-                enumerable: true,
-                configurable: false,
-            },
-        );
+        for name in ["window", "self", "globalThis"] {
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(global),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            );
+        }
         location
     }
 
@@ -1553,6 +1556,7 @@ impl Realm {
             ("forEach", NativeFunction::ArrayForEach),
             ("map", NativeFunction::ArrayMap),
             ("filter", NativeFunction::ArrayFilter),
+            ("some", NativeFunction::ArraySome),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {

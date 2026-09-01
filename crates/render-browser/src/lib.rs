@@ -1,5 +1,6 @@
 //! Native browser chrome and application models for the Rust renderer.
 
+pub mod cache;
 pub mod chrome;
 pub mod editor;
 pub mod font_backend;
@@ -9,4 +10,5 @@ pub mod model;
 pub mod navigation;
 pub mod resources;
 pub mod scripts;
+pub mod settings;
 pub mod worker;

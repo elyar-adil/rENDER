@@ -15,9 +15,9 @@ mod worker;
 pub use batch::{BatchOptions, FixedOriginLimit, Origin, OriginConcurrencyPolicy};
 pub use cookie::{Cookie, CookieIssue, CookieJar, CookieLimits, CookieRejection, SameSite};
 pub use transport::{
-    ByteRange, CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, FetchResponse,
-    FetchResult, Header, HttpStatus, HttpTransport, RedirectResponse,
+    ByteRange, CacheValidators, CancelToken, ContentType, FetchConfig, FetchError, FetchRequest,
+    FetchResponse, FetchResult, Header, HttpStatus, HttpTransport, RedirectResponse,
 };
-pub use worker::{NetworkWorker, RequestHandle};
+pub use worker::{NetworkWorker, NetworkWorkerConfig, RequestHandle};
 
 pub use url::Url;
