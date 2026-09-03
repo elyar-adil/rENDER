@@ -91,6 +91,7 @@ impl PropertyRegistry {
             ("background-repeat", "repeat"),
             ("background-position", "0% 0%"),
             ("background-size", "auto"),
+            ("object-fit", "fill"),
             ("display", "inline"),
             ("position", "static"),
             ("float", "none"),

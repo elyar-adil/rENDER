@@ -776,6 +776,14 @@ keyword_enum!(Visibility {
     Hidden => "hidden",
     Collapse => "collapse",
 });
+
+keyword_enum!(ObjectFit {
+    Fill => "fill",
+    Contain => "contain",
+    Cover => "cover",
+    None => "none",
+    ScaleDown => "scale-down",
+});
 keyword_enum!(FlexDirection {
     Row => "row",
     RowReverse => "row-reverse",
@@ -937,6 +945,7 @@ pub enum TypedPropertyValue {
     BoxSizing(BoxSizing),
     Overflow(Overflow),
     Visibility(Visibility),
+    ObjectFit(ObjectFit),
     Opacity(f32),
     Size(Size),
     MaxSize(MaxSize),
@@ -972,6 +981,7 @@ impl TypedPropertyValue {
             Self::BoxSizing(_) => "box-sizing",
             Self::Overflow(_) => "overflow",
             Self::Visibility(_) => "visibility",
+            Self::ObjectFit(_) => "object-fit",
             Self::Opacity(_) => "opacity",
             Self::Size(_) => "size",
             Self::MaxSize(_) => "max-size",
@@ -1007,6 +1017,7 @@ impl TypedPropertyValue {
             Self::BoxSizing(value) => value.as_str().to_owned(),
             Self::Overflow(value) => value.as_str().to_owned(),
             Self::Visibility(value) => value.as_str().to_owned(),
+            Self::ObjectFit(value) => value.as_str().to_owned(),
             Self::Opacity(value) | Self::FlexGrow(value) | Self::FlexShrink(value) => {
                 format_number(*value)
             }
@@ -1236,6 +1247,7 @@ pub fn parse_typed_property(
             | "overflow-x"
             | "overflow-y"
             | "visibility"
+            | "object-fit"
             | "opacity"
             | "width"
             | "height"
@@ -1321,6 +1333,7 @@ fn parse_property<'i>(
         "box-sizing" => parse_keyword(input, BoxSizing::parse).map(TypedPropertyValue::BoxSizing),
         "overflow-x" | "overflow-y" => parse_overflow(input).map(TypedPropertyValue::Overflow),
         "visibility" => parse_keyword(input, Visibility::parse).map(TypedPropertyValue::Visibility),
+        "object-fit" => parse_keyword(input, ObjectFit::parse).map(TypedPropertyValue::ObjectFit),
         "opacity" => parse_opacity(input).map(TypedPropertyValue::Opacity),
         "flex-direction" => {
             parse_keyword(input, FlexDirection::parse).map(TypedPropertyValue::FlexDirection)
@@ -2364,6 +2377,17 @@ mod tests {
         assert_eq!(
             parse("color", "rgb(10 20 30 / 25%)").to_css(),
             "rgba(10, 20, 30, 0.25)"
+        );
+    }
+
+    #[test]
+    fn parses_object_fit_keywords() {
+        assert_eq!(parse("object-fit", "cover").to_css(), "cover");
+        assert_eq!(parse("object-fit", "scale-down").to_css(), "scale-down");
+        assert!(
+            parse_typed_property("object-fit", "stretch")
+                .expect("object-fit is supported")
+                .is_err()
         );
     }
 
