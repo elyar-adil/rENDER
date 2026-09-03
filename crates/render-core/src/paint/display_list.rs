@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::{
-    BorderStyle, CssColor, Overflow, Position, TypedPropertyValue, Visibility,
+    BorderStyle, CssColor, ObjectFit, Overflow, Position, TypedPropertyValue, Visibility,
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
@@ -527,7 +527,7 @@ impl Builder<'_> {
                         current_color,
                         coordinate_space,
                     );
-                    self.paint_image(&fragment, geometry, coordinate_space);
+                    self.paint_image(&fragment, geometry, style.as_ref(), coordinate_space);
                 }
                 FragmentKind::Text(text) => {
                     self.paint_text(&fragment, text, current_color, coordinate_space);
@@ -849,6 +849,7 @@ impl Builder<'_> {
         &mut self,
         fragment: &Fragment,
         geometry: &crate::layout::BoxGeometry,
+        style: Option<&ComputedStyle>,
         coordinate_space: PaintCoordinateSpace,
     ) {
         let Some(loaded) = fragment
@@ -865,14 +866,36 @@ impl Builder<'_> {
         {
             return;
         }
+        let destination = Self::object_fit_rect(
+            geometry.content_rect,
+            image_dimension_to_f32(width),
+            image_dimension_to_f32(height),
+            style
+                .and_then(|style| style.typed("object-fit"))
+                .and_then(|value| match value {
+                    TypedPropertyValue::ObjectFit(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(ObjectFit::Fill),
+        );
+        let clips = destination != geometry.content_rect;
+        if clips {
+            self.push(
+                fragment,
+                PaintPhase::Content,
+                geometry.content_rect,
+                coordinate_space,
+                DisplayCommand::PushClip(ClipShape::Rect(geometry.content_rect)),
+            );
+        }
         self.push(
             fragment,
             PaintPhase::Content,
-            geometry.content_rect,
+            destination,
             coordinate_space,
             DisplayCommand::Image(ImagePaint {
                 resource: loaded.id,
-                destination: geometry.content_rect,
+                destination,
                 source: PhysicalRect::new(
                     0.0,
                     0.0,
@@ -882,6 +905,42 @@ impl Builder<'_> {
                 interpolate: true,
             }),
         );
+        if clips {
+            self.push(
+                fragment,
+                PaintPhase::Content,
+                geometry.content_rect,
+                coordinate_space,
+                DisplayCommand::PopClip,
+            );
+        }
+    }
+
+    fn object_fit_rect(
+        content: PhysicalRect,
+        intrinsic_width: f32,
+        intrinsic_height: f32,
+        fit: ObjectFit,
+    ) -> PhysicalRect {
+        let contain_scale =
+            (content.size.width / intrinsic_width).min(content.size.height / intrinsic_height);
+        let cover_scale =
+            (content.size.width / intrinsic_width).max(content.size.height / intrinsic_height);
+        let scale = match fit {
+            ObjectFit::Fill => return content,
+            ObjectFit::Contain => contain_scale,
+            ObjectFit::Cover => cover_scale,
+            ObjectFit::None => 1.0,
+            ObjectFit::ScaleDown => contain_scale.min(1.0),
+        };
+        let width = intrinsic_width * scale;
+        let height = intrinsic_height * scale;
+        PhysicalRect::new(
+            content.origin.x + (content.size.width - width) / 2.0,
+            content.origin.y + (content.size.height - height) / 2.0,
+            width,
+            height,
+        )
     }
 
     fn style_for(&mut self, fragment: &Fragment) -> Option<&ComputedStyle> {
@@ -1074,6 +1133,7 @@ const fn is_wide_character(character: char) -> bool {
 mod tests {
     use crate::css::cascade::{CascadeInput, CascadeOrigin};
     use crate::css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
+    use crate::css::properties::ObjectFit;
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::css::stylesheet::parse_stylesheet;
     use crate::html::parse_document;
@@ -1084,7 +1144,7 @@ mod tests {
     use crate::paint::Color;
 
     use super::{
-        ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
+        Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
         build_display_list,
     };
 
@@ -1301,5 +1361,22 @@ mod tests {
             item.command,
             DisplayCommand::PushClip(_) | DisplayCommand::PopClip
         )));
+    }
+
+    #[test]
+    fn object_fit_preserves_aspect_ratio_and_centers_content() {
+        let content = PhysicalRect::new(10.0, 20.0, 200.0, 100.0);
+        assert_eq!(
+            Builder::object_fit_rect(content, 100.0, 100.0, ObjectFit::Contain),
+            PhysicalRect::new(60.0, 20.0, 100.0, 100.0)
+        );
+        assert_eq!(
+            Builder::object_fit_rect(content, 100.0, 100.0, ObjectFit::Cover),
+            PhysicalRect::new(10.0, -30.0, 200.0, 200.0)
+        );
+        assert_eq!(
+            Builder::object_fit_rect(content, 500.0, 100.0, ObjectFit::ScaleDown),
+            PhysicalRect::new(10.0, 50.0, 200.0, 40.0)
+        );
     }
 }
