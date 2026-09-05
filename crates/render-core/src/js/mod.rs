@@ -40,13 +40,18 @@ impl Default for RuntimeLimits {
     fn default() -> Self {
         Self {
             // Real-world bundles (jQuery, analytics, site bundles) routinely
-            // exceed 256 KiB; 2 MiB plus proportional token/statement budgets
-            // keep the interpreter bounded while accepting them.
-            max_source_bytes: 2 * 1_024 * 1_024,
-            max_tokens: 512_000,
-            max_statements: 65_536,
+            // exceed 256 KiB; 4 MiB accepts current production entry bundles
+            // from sites such as qq.com while the remaining budgets keep each
+            // script turn finite.
+            max_source_bytes: 4 * 1_024 * 1_024,
+            max_tokens: 1_048_576,
+            max_statements: 131_072,
             max_execution_steps: 10_000_000,
-            max_call_depth: 64,
+            // Production bundles routinely compose several layers of
+            // promise/iterator/polyfill helpers before reaching application
+            // code.  Keep recursion bounded, but leave enough room for that
+            // ordinary synchronous call chain.
+            max_call_depth: 256,
             max_heap_objects: 131_072,
             max_dom_nodes_created: 16_384,
         }

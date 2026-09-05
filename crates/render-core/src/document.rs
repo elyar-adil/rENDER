@@ -4,6 +4,8 @@
 //! [`Dom`] owned by [`Document`], then render that same tree at its new
 //! revision; ordinary DOM updates never require reparsing the HTML source.
 
+#![allow(clippy::too_many_lines)]
+
 use std::collections::{BTreeMap, HashMap};
 
 use url::Url;
@@ -469,7 +471,11 @@ fn render_dom(
         &cascade_inputs,
         &PropertyRegistry::standard_baseline(),
         &options.computation_limits,
-        &MatchContext::default(),
+        &MatchContext {
+            viewport_width: Some(options.layout.viewport.width),
+            viewport_height: Some(options.layout.viewport.height),
+            ..MatchContext::default()
+        },
     );
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
     let layout = layout_formatting_tree_with_images(

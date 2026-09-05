@@ -1,5 +1,7 @@
 //! Native browser shell for the self-owned Rust rendering pipeline.
 
+#![allow(clippy::cast_precision_loss)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
@@ -22,7 +24,9 @@ use render_browser::chrome::{
 use render_browser::editor::{AddressCommand, AddressEditor, Clipboard, NativeClipboard};
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::home::{HOME_HTML, HOME_TITLE};
-use render_browser::images::{ImageFetchPlan, apply_image_batch, plan_images_with_styles};
+use render_browser::images::{
+    ImageFetchPlan, apply_image_batch, plan_images_with_styles_and_context,
+};
 use render_browser::model::{PageScrollState, TabId, TabIntent, TabModel};
 use render_browser::navigation::{NavigationIntent, NavigationTarget, intent_from_address};
 use render_browser::resources::{
@@ -45,14 +49,14 @@ use render_core::document::{
     Document, DocumentBackends, DocumentRenderOptions, ExternalStyleSheets,
 };
 use render_core::html::{HtmlDecodeOptions, decode_html_bytes};
-use render_core::image::{ImageLimits, ImageResources};
+use render_core::image::{ImageLimits, ImageResources, ImageSelectionContext, ImageSource};
 use render_core::interaction::{
     ButtonBehavior, DefaultActionKind, FormMethod, activation_plan, plan_form_submission,
 };
 use render_core::js::{ElementRect, JsValue, RuntimeLimits};
 use render_core::layout::{FragmentKind, PhysicalPoint, PhysicalRect, PhysicalSize};
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
-use render_core::page::{Page, PageJob};
+use render_core::page::{Page, PageDomEvent, PageJob};
 use render_core::paint::{
     Color, CpuRasterizer, DisplayList, PaintCoordinateSpace, PaintScene, RasterControl,
     RasterRequest, Surface,
@@ -1426,13 +1430,19 @@ impl BrowserApp {
             if let Some(styles) = frame.computed_styles {
                 page.computed_styles = styles;
             }
+            page.scroll
+                .update_metrics(frame.content_height, frame.viewport_height);
+            page.page.runtime_mut().install_viewport(
+                page.viewport.width as f32,
+                page.viewport.height as f32,
+                0.0,
+                page.scroll.offset_y(),
+            );
             if let Some(geometry) = frame.geometry {
                 let _published = page
                     .page
                     .publish_render_geometry(frame.document_revision, geometry);
             }
-            page.scroll
-                .update_metrics(frame.content_height, frame.viewport_height);
             if let Some(style_sheets) = frame.applied_style_sheets {
                 page.style_sheets = style_sheets;
                 page.style_batch = None;
@@ -1999,12 +2009,17 @@ impl BrowserApp {
             if page.pending_images.is_some() {
                 return;
             }
-            let plan = plan_images_with_styles(
+            let plan = plan_images_with_styles_and_context(
                 page.page.document(),
                 &page.computed_styles,
                 &page.navigation.committed().target.history_url(),
                 &page.images,
                 ImageLimits::default(),
+                ImageSelectionContext {
+                    viewport_width: page.viewport.width.max(1),
+                    viewport_height: page.viewport.height.max(1),
+                    device_pixel_ratio_milli: 1_000,
+                },
             );
             let requests = plan
                 .requests()
@@ -2207,6 +2222,16 @@ impl BrowserApp {
             ImageLimits::default(),
         );
         report_image_diagnostics(&application.diagnostics);
+        for loaded in &application.loaded {
+            if matches!(
+                loaded.source,
+                ImageSource::Element | ImageSource::VideoPoster
+            ) {
+                let _ = page
+                    .page
+                    .queue_dom_event(PageDomEvent::new(loaded.owner, "load"));
+            }
+        }
         if !application.loaded.is_empty() {
             page.external_styles_generation = page.external_styles_generation.saturating_add(1);
             self.schedule_page_render_for_tab(id);
@@ -2731,6 +2756,19 @@ impl BrowserApp {
             .get_mut(&id)
             .is_some_and(|page| page.scroll.scroll_by(delta_y));
         if changed {
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.page.runtime_mut().install_viewport(
+                    page.viewport.width as f32,
+                    page.viewport.height as f32,
+                    0.0,
+                    page.scroll.offset_y(),
+                );
+                page.page.queue_pending_runtime_microtasks();
+                let document = page.page.document().dom().document();
+                let _scroll_event = page
+                    .page
+                    .queue_dom_event(PageDomEvent::new(document, "scroll"));
+            }
             let viewport = self.layout.as_ref().map(|layout| {
                 WindowSize::new(
                     self.frame_size.width,

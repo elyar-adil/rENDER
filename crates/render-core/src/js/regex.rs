@@ -845,9 +845,13 @@ impl PatternParser<'_> {
             self.cursor += 1;
         }
         let text: String = self.characters[start..self.cursor].iter().collect();
-        u32::from_str_radix(&text, 16)
-            .ok()
-            .and_then(char::from_u32)
+        let value = u32::from_str_radix(&text, 16)
+            .map_err(|_| RegexSyntaxError("invalid escape value in pattern".to_owned()))?;
+        if (0xd800..=0xdfff).contains(&value) {
+            return char::from_u32(0xf_0000 + value - 0xd800)
+                .ok_or_else(|| RegexSyntaxError("invalid escape value in pattern".to_owned()));
+        }
+        char::from_u32(value)
             .ok_or_else(|| RegexSyntaxError("invalid escape value in pattern".to_owned()))
     }
 }

@@ -60,7 +60,7 @@ pub(crate) fn number_to_string(value: f64) -> String {
     }
 }
 
-fn location_components(url: &Url) -> [(&'static str, String); 9] {
+pub(crate) fn location_components(url: &Url) -> [(&'static str, String); 9] {
     let hostname = url.host_str().unwrap_or_default().to_owned();
     let port = url.port().map_or_else(String::new, |port| port.to_string());
     let host = if port.is_empty() {
@@ -164,9 +164,20 @@ pub(crate) enum NativeFunction {
     GlobalEscape,
     GlobalUnescape,
     GlobalEvalStub,
+    GlobalImport,
+    GlobalNoop,
+    CssSupports,
+    UrlSearchParamsGet,
+    UrlSearchParamsHas,
+    UrlSearchParamsSet,
+    UrlSearchParamsAppend,
+    UrlSearchParamsToString,
+    UrlSearchParamsForEach,
+    UrlToString,
     SymbolToString,
     SymbolValueOf,
     NumToFixed,
+    NumToPrecision,
     NumToString,
     NumValueOf,
     BoolToString,
@@ -204,6 +215,9 @@ pub(crate) enum NativeFunction {
     RegExpToString,
     StrCharAt,
     StrCharCodeAt,
+    StringFromCharCode,
+    StringFromCodePoint,
+    StringRaw,
     StrIndexOf,
     StrLastIndexOf,
     StrIncludes,
@@ -220,6 +234,8 @@ pub(crate) enum NativeFunction {
     StrSearch,
     StrConcat,
     StrToString,
+    StrForEach,
+    StrPush,
     ConsoleDebug,
     ConsoleError,
     ConsoleInfo,
@@ -232,6 +248,10 @@ pub(crate) enum NativeFunction {
     RequestAnimationFrame,
     CancelAnimationFrame,
     GetBoundingClientRect,
+    IntersectionObserve,
+    IntersectionUnobserve,
+    IntersectionDisconnect,
+    IntersectionTakeRecords,
     StyleGetProperty,
     StyleSetProperty,
     StyleRemoveProperty,
@@ -242,6 +262,7 @@ pub(crate) enum NativeFunction {
     PromiseThen,
     PromiseCatch,
     ArrayIsArray,
+    ArrayFrom,
     ArrayPush,
     ArrayPop,
     ArrayJoin,
@@ -257,12 +278,39 @@ pub(crate) enum NativeFunction {
     ArrayMap,
     ArrayFilter,
     ArraySome,
+    ArrayFind,
+    ArrayFindIndex,
+    ArrayEvery,
+    ArrayIncludes,
+    ArrayReduce,
     FunctionPrototype,
     FunctionCall,
     FunctionBind,
     FunctionApply,
     DateSetTime,
+    DateGetFullYear,
+    DateGetMonth,
+    DateGetDate,
+    DateGetDay,
+    DateGetHours,
+    DateGetMinutes,
+    DateGetSeconds,
+    DateGetMilliseconds,
+    DateGetTimezoneOffset,
+    DateGetUTCFullYear,
+    DateGetUTCMonth,
+    DateGetUTCDate,
+    DateGetUTCDay,
+    DateGetUTCHours,
+    DateGetUTCMinutes,
+    DateGetUTCSeconds,
+    DateGetUTCMilliseconds,
     DateToGMTString,
+    DateToDateString,
+    DateToISOString,
+    DateToJSON,
+    DateParse,
+    DateUTC,
     StringSubstr,
     MathAbs,
     MathCeil,
@@ -279,7 +327,9 @@ pub(crate) enum NativeFunction {
     ObjectEntries,
     ObjectCreate,
     ObjectDefineProperty,
+    ObjectDefineProperties,
     ObjectGetOwnPropertyDescriptor,
+    ObjectGetOwnPropertyDescriptors,
     ObjectGetOwnPropertyNames,
     ObjectGetPrototypeOf,
     ObjectHasOwn,
@@ -293,6 +343,38 @@ pub(crate) enum NativeFunction {
     DateValueOf,
     DateToString,
     ErrorPrototypeToString,
+    JsonParse,
+    JsonStringify,
+    PerformanceNow,
+    CollectionGet,
+    CollectionSet,
+    CollectionAdd,
+    CollectionHas,
+    CollectionDelete,
+    CollectionClear,
+    CollectionForEach,
+    CollectionKeys,
+    CollectionValues,
+    CollectionEntries,
+    CollectionIteratorNext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionKind {
+    Map,
+    WeakMap,
+    Set,
+    WeakSet,
+}
+
+impl CollectionKind {
+    pub(crate) const fn is_map(self) -> bool {
+        matches!(self, Self::Map | Self::WeakMap)
+    }
+
+    pub(crate) const fn is_weak(self) -> bool {
+        matches!(self, Self::WeakMap | Self::WeakSet)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -372,12 +454,35 @@ pub(crate) enum ObjectHost {
     RegExp(usize),
     RegExpConstructor,
     EventConstructor,
+    DomConstructor,
+    ImageConstructor,
+    IntersectionObserverConstructor,
+    IntersectionObserver {
+        callback: ObjectId,
+        targets: Vec<NodeId>,
+    },
     Location(Url),
     ErrorConstructor(ErrorKind),
     Promise(usize),
     PromiseSettler {
         promise: usize,
         fulfilled: bool,
+    },
+    CollectionConstructor(CollectionKind),
+    Collection {
+        kind: CollectionKind,
+        entries: Vec<(JsValue, JsValue)>,
+    },
+    CollectionIterator {
+        values: Vec<JsValue>,
+        index: usize,
+    },
+    UrlConstructor,
+    UrlSearchParamsConstructor,
+    UrlInstance(Url),
+    UrlSearchParams {
+        pairs: Vec<(String, String)>,
+        owner: Option<ObjectId>,
     },
 }
 
@@ -416,6 +521,7 @@ pub struct Realm {
     boolean_primitive_prototype: ObjectId,
     regexp_prototype: ObjectId,
     date_prototype: ObjectId,
+    element_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -477,6 +583,12 @@ impl Realm {
         );
         let object_prototype = Self::install_object(&mut objects, global);
         let function_prototype = Self::install_function(&mut objects, global, object_prototype);
+        let element_prototype = Self::install_dom_interfaces(
+            &mut objects,
+            global,
+            object_prototype,
+            function_prototype,
+        );
         Self::install_location(
             &mut objects,
             global,
@@ -486,6 +598,7 @@ impl Realm {
             document_url,
         );
         Self::install_navigator(&mut objects, global, object_prototype);
+        Self::install_performance(&mut objects, global, object_prototype, function_prototype);
         Self::install_errors(&mut objects, global, object_prototype, function_prototype);
         Self::install_event(&mut objects, global, object_prototype, function_prototype);
         let string_prototype =
@@ -502,7 +615,10 @@ impl Realm {
         Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
         Self::install_promise(&mut objects, global);
-        let array_prototype = Self::install_array(&mut objects, global, object_prototype);
+        let array_prototype =
+            Self::install_array(&mut objects, global, object_prototype, function_prototype);
+        Self::install_collections(&mut objects, global, object_prototype, function_prototype);
+        Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::define_global_function(
             &mut objects,
             global,
@@ -527,12 +643,220 @@ impl Realm {
             ("escape", NativeFunction::GlobalEscape),
             ("unescape", NativeFunction::GlobalUnescape),
             ("eval", NativeFunction::GlobalEvalStub),
+            ("__render_noop", NativeFunction::GlobalNoop),
         ] {
             Self::define_global_function(&mut objects, global, name, function);
         }
-        // Legacy browser globals used by feature-detecting scripts.
+
+        // `import()` is callable in module scripts and also carries the
+        // standard `import.meta` object. Resolution is delegated to the
+        // embedding, so the runtime returns an already-fulfilled namespace
+        // placeholder instead of throwing during feature detection.
+        let dynamic_import = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::GlobalImport,
+                receiver: global,
+            },
+            ..JsObject::default()
+        });
+        let import_meta = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        objects[import_meta.0].properties.insert(
+            "url".to_owned(),
+            PropertyDescriptor::builtin(JsValue::String(document_url.to_string())),
+        );
+        objects[dynamic_import.0].properties.insert(
+            "meta".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(import_meta)),
+        );
+        objects[global.0].properties.insert(
+            "import".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(dynamic_import),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+
+        // Session history is owned by the browser shell. Exposing the
+        // standard object and harmless methods lets application bootstrap
+        // register routes without aborting the document script turn.
+        let history = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for name in ["back", "forward", "go", "pushState", "replaceState"] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::GlobalNoop),
+                ..JsObject::default()
+            });
+            objects[history.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[history.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Number(1.0)),
+        );
+        objects[history.0].properties.insert(
+            "state".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Null),
+        );
+        objects[global.0].properties.insert(
+            "history".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(history)),
+        );
+
+        let system = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        objects[system.0].properties.insert(
+            "import".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(dynamic_import)),
+        );
+        objects[global.0].properties.insert(
+            "System".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(system)),
+        );
+
+        // Every callable native object inherits Function.prototype.  A number
+        // of older installers predate the shared function prototype and left
+        // their methods as prototype-less host objects.  Real-world shims use
+        // patterns such as `Array.prototype.slice.call(...)` and
+        // `fn.apply(...)` during bootstrap, so repair the invariant in one
+        // place instead of relying on each installer to remember it.
+        for object in &mut objects {
+            if matches!(
+                &object.host,
+                ObjectHost::NativeFunction(_)
+                    | ObjectHost::BoundFunction { .. }
+                    | ObjectHost::BoundCallable { .. }
+                    | ObjectHost::PromiseSettler { .. }
+            ) && object.prototype.is_none()
+            {
+                object.prototype = Some(function_prototype);
+            }
+        }
+        // Browser constructors used by page bootstrap and resource discovery.
         let image = ObjectId(objects.len());
-        objects.push(JsObject::default());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::ImageConstructor,
+            ..JsObject::default()
+        });
+        objects[image.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(element_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+
+        let css = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let css_supports = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::CssSupports),
+            ..JsObject::default()
+        });
+        objects[css.0].properties.insert(
+            "supports".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(css_supports)),
+        );
+        objects[global.0].properties.insert(
+            "CSS".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(css)),
+        );
+
+        // URL and URLSearchParams are small but foundational Web APIs.  Many
+        // production bundles use them during startup for query routing and
+        // telemetry; keeping the objects in the realm also gives ordinary
+        // prototype lookup and method calls the same shape as browsers.
+        let url_search_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("get", NativeFunction::UrlSearchParamsGet),
+            ("has", NativeFunction::UrlSearchParamsHas),
+            ("set", NativeFunction::UrlSearchParamsSet),
+            ("append", NativeFunction::UrlSearchParamsAppend),
+            ("toString", NativeFunction::UrlSearchParamsToString),
+            ("forEach", NativeFunction::UrlSearchParamsForEach),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[url_search_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let url_search_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::UrlSearchParamsConstructor,
+            ..JsObject::default()
+        });
+        objects[url_search_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_search_prototype)),
+        );
+        objects[global.0].properties.insert(
+            "URLSearchParams".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_search_constructor)),
+        );
+
+        let url_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let url_to_string = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::UrlToString),
+            ..JsObject::default()
+        });
+        objects[url_prototype.0].properties.insert(
+            "toString".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_to_string)),
+        );
+        let url_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::UrlConstructor,
+            ..JsObject::default()
+        });
+        objects[url_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_prototype)),
+        );
+        objects[global.0].properties.insert(
+            "URL".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(url_constructor)),
+        );
         objects[global.0].properties.insert(
             "Image".to_owned(),
             PropertyDescriptor {
@@ -542,12 +866,81 @@ impl Realm {
                 configurable: true,
             },
         );
+        let intersection_observer_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("observe", NativeFunction::IntersectionObserve),
+            ("unobserve", NativeFunction::IntersectionUnobserve),
+            ("disconnect", NativeFunction::IntersectionDisconnect),
+            ("takeRecords", NativeFunction::IntersectionTakeRecords),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[intersection_observer_prototype.0]
+                .properties
+                .insert(
+                    name.to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(method)),
+                );
+        }
         let intersection_observer = ObjectId(objects.len());
-        objects.push(JsObject::default());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::IntersectionObserverConstructor,
+            ..JsObject::default()
+        });
+        objects[intersection_observer.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(intersection_observer_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         objects[global.0].properties.insert(
             "IntersectionObserver".to_owned(),
             PropertyDescriptor {
                 value: JsValue::Object(intersection_observer),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        let entry_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, value) in [
+            ("intersectionRatio", JsValue::Number(0.0)),
+            ("isIntersecting", JsValue::Boolean(false)),
+        ] {
+            objects[entry_prototype.0]
+                .properties
+                .insert(name.to_owned(), PropertyDescriptor::builtin(value));
+        }
+        let entry_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DomConstructor,
+            ..JsObject::default()
+        });
+        objects[entry_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(entry_prototype)),
+        );
+        objects[global.0].properties.insert(
+            "IntersectionObserverEntry".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(entry_constructor),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -572,8 +965,12 @@ impl Realm {
                     | ObjectHost::ArrayConstructor
                     | ObjectHost::RegExpConstructor
                     | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::ImageConstructor
+                    | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::ErrorConstructor(_)
-                    | ObjectHost::PromiseSettler { .. } => Some(function_prototype),
+                    | ObjectHost::PromiseSettler { .. }
+                    | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
                     _ if index != object_prototype.0 => Some(object_prototype),
                     _ => None,
                 };
@@ -591,6 +988,7 @@ impl Realm {
             boolean_primitive_prototype,
             regexp_prototype,
             date_prototype,
+            element_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
@@ -620,6 +1018,196 @@ impl Realm {
                 configurable: true,
             },
         );
+    }
+
+    fn install_dom_interfaces(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("setAttribute", NativeFunction::SetAttribute),
+            ("getAttribute", NativeFunction::GetAttribute),
+            ("hasAttribute", NativeFunction::HasAttribute),
+            ("removeAttribute", NativeFunction::RemoveAttribute),
+            ("appendChild", NativeFunction::AppendChild),
+            ("removeChild", NativeFunction::RemoveChild),
+            ("insertBefore", NativeFunction::InsertBefore),
+            ("contains", NativeFunction::Contains),
+            ("matches", NativeFunction::Matches),
+            ("querySelector", NativeFunction::QuerySelector),
+            ("querySelectorAll", NativeFunction::QuerySelectorAll),
+            ("addEventListener", NativeFunction::AddEventListener),
+            ("removeEventListener", NativeFunction::RemoveEventListener),
+            ("dispatchEvent", NativeFunction::DispatchEvent),
+            (
+                "getBoundingClientRect",
+                NativeFunction::GetBoundingClientRect,
+            ),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        for name in ["scrollLeft", "scrollTop"] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(0.0)),
+            );
+        }
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DomConstructor,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        for (name, value) in [
+            ("ELEMENT_NODE", 1.0),
+            ("TEXT_NODE", 3.0),
+            ("DOCUMENT_NODE", 9.0),
+            ("DOCUMENT_FRAGMENT_NODE", 11.0),
+        ] {
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(value)),
+            );
+        }
+        for name in ["Element", "HTMLElement", "Node"] {
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(constructor),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        prototype
+    }
+
+    fn install_collections(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        for (name, kind) in [
+            ("Map", CollectionKind::Map),
+            ("WeakMap", CollectionKind::WeakMap),
+            ("Set", CollectionKind::Set),
+            ("WeakSet", CollectionKind::WeakSet),
+        ] {
+            let prototype = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(object_prototype),
+                ..JsObject::default()
+            });
+            let methods: &[(&str, NativeFunction)] = if kind.is_map() {
+                &[
+                    ("get", NativeFunction::CollectionGet),
+                    ("set", NativeFunction::CollectionSet),
+                    ("has", NativeFunction::CollectionHas),
+                    ("delete", NativeFunction::CollectionDelete),
+                    ("clear", NativeFunction::CollectionClear),
+                    ("forEach", NativeFunction::CollectionForEach),
+                    ("keys", NativeFunction::CollectionKeys),
+                    ("values", NativeFunction::CollectionValues),
+                    ("entries", NativeFunction::CollectionEntries),
+                ]
+            } else {
+                &[
+                    ("add", NativeFunction::CollectionAdd),
+                    ("has", NativeFunction::CollectionHas),
+                    ("delete", NativeFunction::CollectionDelete),
+                    ("clear", NativeFunction::CollectionClear),
+                    ("forEach", NativeFunction::CollectionForEach),
+                    ("keys", NativeFunction::CollectionKeys),
+                    ("values", NativeFunction::CollectionValues),
+                    ("entries", NativeFunction::CollectionEntries),
+                ]
+            };
+            for &(method_name, function) in methods {
+                // Weak collections intentionally expose only get/set/add,
+                // has, and delete. They are not enumerable and have no size.
+                if kind.is_weak()
+                    && matches!(
+                        function,
+                        NativeFunction::CollectionClear
+                            | NativeFunction::CollectionForEach
+                            | NativeFunction::CollectionKeys
+                            | NativeFunction::CollectionValues
+                            | NativeFunction::CollectionEntries
+                    )
+                {
+                    continue;
+                }
+                let method = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(function),
+                    ..JsObject::default()
+                });
+                objects[prototype.0].properties.insert(
+                    method_name.to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(method)),
+                );
+            }
+            let constructor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::CollectionConstructor(kind),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                "prototype".to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(prototype),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+            objects[prototype.0].properties.insert(
+                "constructor".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(constructor)),
+            );
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(constructor),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
     }
 
     /// Installs the `console` object with the standard logging methods.
@@ -799,6 +1387,45 @@ impl Realm {
         );
     }
 
+    fn install_performance(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let performance = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let now = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::PerformanceNow,
+                receiver: performance,
+            },
+            ..JsObject::default()
+        });
+        objects[performance.0].properties.insert(
+            "now".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(now)),
+        );
+        objects[performance.0].properties.insert(
+            "timeOrigin".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Number(0.0)),
+        );
+        objects[global.0].properties.insert(
+            "performance".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(performance),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     fn install_object(objects: &mut Vec<JsObject>, global: ObjectId) -> ObjectId {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject::default());
@@ -845,9 +1472,14 @@ impl Realm {
             ("entries", NativeFunction::ObjectEntries),
             ("create", NativeFunction::ObjectCreate),
             ("defineProperty", NativeFunction::ObjectDefineProperty),
+            ("defineProperties", NativeFunction::ObjectDefineProperties),
             (
                 "getOwnPropertyDescriptor",
                 NativeFunction::ObjectGetOwnPropertyDescriptor,
+            ),
+            (
+                "getOwnPropertyDescriptors",
+                NativeFunction::ObjectGetOwnPropertyDescriptors,
             ),
             (
                 "getOwnPropertyNames",
@@ -911,6 +1543,22 @@ impl Realm {
                 configurable: true,
             },
         );
+        for (name, function) in [
+            ("fromCharCode", NativeFunction::StringFromCharCode),
+            ("fromCodePoint", NativeFunction::StringFromCodePoint),
+            ("raw", NativeFunction::StringRaw),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[string.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -937,6 +1585,8 @@ impl Realm {
             ("concat", NativeFunction::StrConcat),
             ("toString", NativeFunction::StrToString),
             ("valueOf", NativeFunction::StrToString),
+            ("forEach", NativeFunction::StrForEach),
+            ("push", NativeFunction::StrPush),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -1090,6 +1740,7 @@ impl Realm {
         });
         for (name, function) in [
             ("toFixed", NativeFunction::NumToFixed),
+            ("toPrecision", NativeFunction::NumToPrecision),
             ("toString", NativeFunction::NumToString),
             ("valueOf", NativeFunction::NumValueOf),
         ] {
@@ -1103,6 +1754,19 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        objects[num_proto.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(num_proto),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         num_proto
     }
 
@@ -1148,6 +1812,19 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        objects[bool_proto.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(bool_proto),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         bool_proto
     }
 
@@ -1181,10 +1858,30 @@ impl Realm {
         for (name, function) in [
             ("getTime", NativeFunction::DateGetValue),
             ("setTime", NativeFunction::DateSetTime),
+            ("getFullYear", NativeFunction::DateGetFullYear),
+            ("getMonth", NativeFunction::DateGetMonth),
+            ("getDate", NativeFunction::DateGetDate),
+            ("getDay", NativeFunction::DateGetDay),
+            ("getHours", NativeFunction::DateGetHours),
+            ("getMinutes", NativeFunction::DateGetMinutes),
+            ("getSeconds", NativeFunction::DateGetSeconds),
+            ("getMilliseconds", NativeFunction::DateGetMilliseconds),
+            ("getTimezoneOffset", NativeFunction::DateGetTimezoneOffset),
+            ("getUTCFullYear", NativeFunction::DateGetUTCFullYear),
+            ("getUTCMonth", NativeFunction::DateGetUTCMonth),
+            ("getUTCDate", NativeFunction::DateGetUTCDate),
+            ("getUTCDay", NativeFunction::DateGetUTCDay),
+            ("getUTCHours", NativeFunction::DateGetUTCHours),
+            ("getUTCMinutes", NativeFunction::DateGetUTCMinutes),
+            ("getUTCSeconds", NativeFunction::DateGetUTCSeconds),
+            ("getUTCMilliseconds", NativeFunction::DateGetUTCMilliseconds),
             ("valueOf", NativeFunction::DateValueOf),
             ("toString", NativeFunction::DateToString),
             ("toGMTString", NativeFunction::DateToGMTString),
             ("toUTCString", NativeFunction::DateToGMTString),
+            ("toDateString", NativeFunction::DateToDateString),
+            ("toISOString", NativeFunction::DateToISOString),
+            ("toJSON", NativeFunction::DateToJSON),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -1205,6 +1902,20 @@ impl Realm {
                 configurable: false,
             },
         );
+        for (name, function) in [
+            ("parse", NativeFunction::DateParse),
+            ("UTC", NativeFunction::DateUTC),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         objects[global.0].properties.insert(
             "Date".to_owned(),
             PropertyDescriptor {
@@ -1497,6 +2208,46 @@ impl Realm {
         );
     }
 
+    fn install_json(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let json = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("parse", NativeFunction::JsonParse),
+            ("stringify", NativeFunction::JsonStringify),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::BoundFunction {
+                    function,
+                    receiver: json,
+                },
+                ..JsObject::default()
+            });
+            objects[json.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[global.0].properties.insert(
+            "JSON".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(json),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     fn install_promise(objects: &mut Vec<JsObject>, global: ObjectId) {
         let promise = ObjectId(objects.len());
         objects.push(JsObject {
@@ -1535,6 +2286,7 @@ impl Realm {
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
+        function_prototype: ObjectId,
     ) -> ObjectId {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
@@ -1557,6 +2309,11 @@ impl Realm {
             ("map", NativeFunction::ArrayMap),
             ("filter", NativeFunction::ArrayFilter),
             ("some", NativeFunction::ArraySome),
+            ("find", NativeFunction::ArrayFind),
+            ("findIndex", NativeFunction::ArrayFindIndex),
+            ("every", NativeFunction::ArrayEvery),
+            ("includes", NativeFunction::ArrayIncludes),
+            ("reduce", NativeFunction::ArrayReduce),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -1585,6 +2342,16 @@ impl Realm {
             "isArray".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(is_array)),
         );
+        let from = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ArrayFrom),
+            ..JsObject::default()
+        });
+        objects[array.0].properties.insert(
+            "from".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(from)),
+        );
         objects[array.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor::data(JsValue::Object(prototype)),
@@ -1612,8 +2379,22 @@ impl Realm {
     }
 
     #[must_use]
+    pub(crate) const fn function_prototype(&self) -> ObjectId {
+        self.function_prototype
+    }
+
+    #[must_use]
+    pub(crate) const fn element_prototype(&self) -> ObjectId {
+        self.element_prototype
+    }
+
+    #[must_use]
     pub fn object(&self, object: ObjectId) -> Option<&JsObject> {
         self.objects.get(object.0)
+    }
+
+    pub(crate) fn object_mut(&mut self, object: ObjectId) -> Option<&mut JsObject> {
+        self.objects.get_mut(object.0)
     }
 
     /// Allocate an ordinary object with an optional prototype.
@@ -1701,6 +2482,12 @@ impl Realm {
 
     pub(crate) fn host(&self, object: ObjectId) -> Option<ObjectHost> {
         self.objects.get(object.0).map(|object| object.host.clone())
+    }
+
+    pub(crate) fn host_mut(&mut self, object: ObjectId) -> Option<&mut ObjectHost> {
+        self.objects
+            .get_mut(object.0)
+            .map(|object| &mut object.host)
     }
 
     pub(crate) fn get_property(&self, object: ObjectId, key: &str) -> Option<JsValue> {
@@ -1832,7 +2619,7 @@ impl Realm {
             return *wrapper;
         }
         let wrapper = self.allocate(JsObject {
-            prototype: Some(self.object_prototype),
+            prototype: Some(self.element_prototype),
             host: ObjectHost::Node(node),
             ..JsObject::default()
         });
@@ -2017,6 +2804,29 @@ impl Realm {
         self.allocate(JsObject {
             prototype: Some(self.object_prototype),
             host: ObjectHost::PromiseSettler { promise, fulfilled },
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn collection(
+        &mut self,
+        kind: CollectionKind,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype,
+            host: ObjectHost::Collection {
+                kind,
+                entries: Vec::new(),
+            },
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn collection_iterator(&mut self, values: Vec<JsValue>) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.object_prototype),
+            host: ObjectHost::CollectionIterator { values, index: 0 },
             ..JsObject::default()
         })
     }

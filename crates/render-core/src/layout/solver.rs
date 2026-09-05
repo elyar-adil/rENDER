@@ -1338,10 +1338,7 @@ impl Solver<'_> {
             return 0.0;
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
-            let style = TextStyle {
-                font_size: self.options.root_font_size,
-                line_height: self.options.default_line_height,
-            };
+            let style = self.text_style(node.style_source);
             return if horizontal {
                 self.text_measurer.measure(text, style).advance
             } else if text.chars().all(char::is_whitespace) {
@@ -1630,39 +1627,45 @@ impl Solver<'_> {
             .find(|atom| atom.forced_break || !atom.character.is_whitespace())
             .is_some_and(|atom| atom.forced_break);
 
-        let style = TextStyle {
+        let default_style = TextStyle {
             font_size: self.options.root_font_size,
             line_height: self.options.default_line_height,
         };
+        let first_style = atoms.first().map_or(default_style, |atom| atom.style);
         let mut fragments = Vec::new();
         let mut line_y = containing.origin.y;
-        let (mut line_left, mut line_right) =
-            inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+        let (mut line_left, mut line_right) = inline_float_band(
+            floats,
+            containing,
+            &mut line_y,
+            first_style.line_height,
+            0.0,
+        );
         let mut line_x = line_left;
-        let mut current_line_height = style.line_height;
-        let mut pending_space = None;
+        let mut current_line_height = first_style.line_height;
+        let mut pending_space: Option<InlineAtom> = None;
         let mut current_run: Option<TextRun> = None;
         let mut cursor = 0;
 
         while cursor < atoms.len() {
             let atom = atoms[cursor];
             if atom.forced_break {
-                self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                self.flush_text_run(&mut current_run, &mut fragments);
                 line_y += current_line_height;
-                current_line_height = style.line_height;
+                current_line_height = atom.style.line_height;
                 (line_left, line_right) =
-                    inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                    inline_float_band(floats, containing, &mut line_y, current_line_height, 0.0);
                 line_x = line_left;
                 pending_space = None;
                 cursor += 1;
                 continue;
             }
             if let Some(atomic) = atom.atomic {
-                self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                self.flush_text_run(&mut current_run, &mut fragments);
                 if let Some(space) = pending_space.take()
                     && line_x > line_left
                 {
-                    let width = self.text_measurer.measure(" ", style).advance;
+                    let width = self.text_measurer.measure(" ", space.style).advance;
                     self.push_character(
                         &mut current_run,
                         &mut fragments,
@@ -1671,9 +1674,9 @@ impl Solver<'_> {
                         line_x,
                         line_y,
                         width,
-                        style,
+                        space.style,
                     );
-                    self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                    self.flush_text_run(&mut current_run, &mut fragments);
                     line_x += width;
                 }
                 if let Some((fragment, outer)) = self.layout_atomic_inline(
@@ -1690,7 +1693,7 @@ impl Solver<'_> {
                             floats,
                             containing,
                             &mut line_y,
-                            style.line_height,
+                            current_line_height,
                             outer.size.width,
                         );
                         line_x = line_left;
@@ -1702,12 +1705,12 @@ impl Solver<'_> {
                     }
                     if line_x > line_left && line_x + outer.size.width > line_right {
                         line_y += current_line_height;
-                        current_line_height = style.line_height;
+                        current_line_height = atom.style.line_height;
                         (line_left, line_right) = inline_float_band(
                             floats,
                             containing,
                             &mut line_y,
-                            style.line_height,
+                            current_line_height,
                             0.0,
                         );
                         line_x = line_left;
@@ -1732,13 +1735,13 @@ impl Solver<'_> {
 
             let segment_end = inline_segment_end(&atoms, cursor);
             let segment = &atoms[cursor..segment_end];
-            let segment_width = self.measure_inline_segment(segment, style);
+            let segment_width = self.measure_inline_segment(segment);
             if (line_x - line_left).abs() < f32::EPSILON && segment_width > line_right - line_left {
                 (line_left, line_right) = inline_float_band(
                     floats,
                     containing,
                     &mut line_y,
-                    style.line_height,
+                    current_line_height,
                     segment_width,
                 );
                 line_x = line_left;
@@ -1746,16 +1749,18 @@ impl Solver<'_> {
             let space_width = pending_space
                 .as_ref()
                 .filter(|_| line_x > line_left)
-                .map_or(0.0, |_| self.text_measurer.measure(" ", style).advance);
+                .map_or(0.0, |space| {
+                    self.text_measurer.measure(" ", space.style).advance
+                });
             if segment.first().is_some_and(|atom| atom.wrap_allowed)
                 && line_x > line_left
                 && line_x + space_width + segment_width > line_right
             {
-                self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                self.flush_text_run(&mut current_run, &mut fragments);
                 line_y += current_line_height;
-                current_line_height = style.line_height;
+                current_line_height = segment[0].style.line_height;
                 (line_left, line_right) =
-                    inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                    inline_float_band(floats, containing, &mut line_y, current_line_height, 0.0);
                 line_x = line_left;
                 pending_space = None;
             }
@@ -1763,7 +1768,7 @@ impl Solver<'_> {
             if let Some(space) = pending_space.take()
                 && line_x > line_left
             {
-                let width = self.text_measurer.measure(" ", style).advance;
+                let width = self.text_measurer.measure(" ", space.style).advance;
                 self.push_character(
                     &mut current_run,
                     &mut fragments,
@@ -1772,21 +1777,27 @@ impl Solver<'_> {
                     line_x,
                     line_y,
                     width,
-                    style,
+                    space.style,
                 );
                 line_x += width;
             }
 
             for atom in segment {
-                let width = self.measure_inline_character(atom.character, style);
+                let width = self.measure_inline_character(atom.character, atom.style);
                 if atom.wrap_allowed && line_x + width > line_right && line_x > line_left {
-                    self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+                    self.flush_text_run(&mut current_run, &mut fragments);
                     line_y += current_line_height;
-                    current_line_height = style.line_height;
-                    (line_left, line_right) =
-                        inline_float_band(floats, containing, &mut line_y, style.line_height, 0.0);
+                    current_line_height = atom.style.line_height;
+                    (line_left, line_right) = inline_float_band(
+                        floats,
+                        containing,
+                        &mut line_y,
+                        current_line_height,
+                        0.0,
+                    );
                     line_x = line_left;
                 }
+                current_line_height = current_line_height.max(atom.style.line_height);
                 self.push_character(
                     &mut current_run,
                     &mut fragments,
@@ -1795,13 +1806,13 @@ impl Solver<'_> {
                     line_x,
                     line_y,
                     width,
-                    style,
+                    atom.style,
                 );
                 line_x += width;
             }
             cursor = segment_end;
         }
-        self.flush_text_run(&mut current_run, &mut fragments, style, line_y);
+        self.flush_text_run(&mut current_run, &mut fragments);
         let trailing_line_height = if ends_with_forced_break {
             0.0
         } else {
@@ -1823,10 +1834,10 @@ impl Solver<'_> {
         atoms
     }
 
-    fn measure_inline_segment(&self, segment: &[InlineAtom], style: TextStyle) -> f32 {
+    fn measure_inline_segment(&self, segment: &[InlineAtom]) -> f32 {
         segment
             .iter()
-            .map(|atom| self.measure_inline_character(atom.character, style))
+            .map(|atom| self.measure_inline_character(atom.character, atom.style))
             .sum()
     }
 
@@ -1835,6 +1846,24 @@ impl Solver<'_> {
         self.text_measurer
             .measure(character.encode_utf8(&mut encoded), style)
             .advance
+    }
+
+    fn text_style(&self, source: Option<NodeId>) -> TextStyle {
+        let computed = source.and_then(|source| self.styles.get(&source));
+        let font_size = computed
+            .and_then(|style| style.get("font-size"))
+            .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
+            .unwrap_or(self.options.root_font_size)
+            .clamp(1.0, 512.0);
+        let line_height = computed
+            .and_then(|style| style.get("line-height"))
+            .and_then(|value| parse_line_height(value.css_text(), font_size))
+            .unwrap_or(font_size * 1.2)
+            .clamp(font_size, 1_024.0);
+        TextStyle {
+            font_size,
+            line_height,
+        }
     }
 
     fn collect_inline_atoms(
@@ -1855,6 +1884,7 @@ impl Solver<'_> {
             return;
         };
         if let FormattingNodeKind::Text(text) = node.kind {
+            let text_style = self.text_style(node.style_source);
             let wrap_allowed = node
                 .style_source
                 .and_then(|source| self.styles.get(&source))
@@ -1877,6 +1907,7 @@ impl Solver<'_> {
                     forced_break: false,
                     wrap_allowed,
                     atomic: None,
+                    style: text_style,
                 });
             }
             return;
@@ -1894,6 +1925,7 @@ impl Solver<'_> {
                 forced_break: true,
                 wrap_allowed: false,
                 atomic: None,
+                style: self.text_style(node.style_source),
             });
             return;
         }
@@ -1905,6 +1937,7 @@ impl Solver<'_> {
                 forced_break: false,
                 wrap_allowed: true,
                 atomic: Some(node_id),
+                style: self.text_style(node.style_source),
             });
             return;
         }
@@ -2008,7 +2041,7 @@ impl Solver<'_> {
         let Some(NodeKind::Element(element)) = self.dom.node(source).map(Node::kind) else {
             return None;
         };
-        if element.local_name != "img" {
+        if !matches!(element.local_name.as_str(), "img" | "video") {
             return None;
         }
         let html_width = self.html_image_dimension(source, "width");
@@ -2083,16 +2116,8 @@ impl Solver<'_> {
             return 0.0;
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
-            return self
-                .text_measurer
-                .measure(
-                    text,
-                    TextStyle {
-                        font_size: self.options.root_font_size,
-                        line_height: self.options.default_line_height,
-                    },
-                )
-                .advance;
+            let style = self.text_style(node.style_source);
+            return self.text_measurer.measure(text, style).advance;
         }
         if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
             return self.atomic_outer_max_content_width(node_id);
@@ -2171,9 +2196,11 @@ impl Solver<'_> {
         style: TextStyle,
     ) {
         if run.as_ref().is_some_and(|run| {
-            run.formatting_node != atom.formatting_node || (run.y - y).abs() > f32::EPSILON
+            run.formatting_node != atom.formatting_node
+                || (run.y - y).abs() > f32::EPSILON
+                || run.style != style
         }) {
-            self.flush_text_run(run, fragments, style, y);
+            self.flush_text_run(run, fragments);
         }
         let run = run.get_or_insert_with(|| TextRun {
             formatting_node: atom.formatting_node,
@@ -2182,23 +2209,18 @@ impl Solver<'_> {
             x,
             y,
             width: 0.0,
+            style,
         });
         run.text.push(character);
         run.width += width;
     }
 
-    fn flush_text_run(
-        &mut self,
-        run: &mut Option<TextRun>,
-        fragments: &mut Vec<FragmentId>,
-        style: TextStyle,
-        _line_y: f32,
-    ) {
+    fn flush_text_run(&mut self, run: &mut Option<TextRun>, fragments: &mut Vec<FragmentId>) {
         let Some(run) = run.take() else {
             return;
         };
-        let metrics = self.text_measurer.measure(&run.text, style);
-        let rect = PhysicalRect::new(run.x, run.y, run.width, style.line_height);
+        let metrics = self.text_measurer.measure(&run.text, run.style);
+        let rect = PhysicalRect::new(run.x, run.y, run.width, run.style.line_height);
         if let Some(fragment) = self.allocate_fragment(
             run.formatting_node,
             run.source,
@@ -2206,7 +2228,7 @@ impl Solver<'_> {
             FragmentKind::Text(TextFragmentData {
                 text: run.text,
                 baseline: run.y + metrics.ascent,
-                font_size: style.font_size,
+                font_size: run.style.font_size,
             }),
         ) {
             fragments.push(fragment);
@@ -2600,6 +2622,7 @@ struct InlineAtom {
     forced_break: bool,
     wrap_allowed: bool,
     atomic: Option<FormattingNodeId>,
+    style: TextStyle,
 }
 
 struct TextRun {
@@ -2609,6 +2632,52 @@ struct TextRun {
     x: f32,
     y: f32,
     width: f32,
+    style: TextStyle,
+}
+
+fn parse_font_size(value: &str, basis: f32) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        _ => parse_text_length(&value, basis),
+    }
+}
+
+fn parse_line_height(value: &str, font_size: f32) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    if value == "normal" {
+        return Some(font_size * 1.2);
+    }
+    value
+        .parse::<f32>()
+        .ok()
+        .map(|factor| factor * font_size)
+        .or_else(|| parse_text_length(&value, font_size))
+}
+
+fn parse_text_length(value: &str, basis: f32) -> Option<f32> {
+    if let Some(value) = value.strip_suffix("px") {
+        value.trim().parse().ok()
+    } else if let Some(value) = value
+        .strip_suffix("rem")
+        .or_else(|| value.strip_suffix("em"))
+    {
+        value.trim().parse::<f32>().ok().map(|value| value * basis)
+    } else if let Some(value) = value.strip_suffix('%') {
+        value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| value * basis / 100.0)
+    } else {
+        None
+    }
 }
 
 fn grid_template(style: Option<&ComputedStyle>, property: &str) -> GridTemplate {
@@ -2918,6 +2987,25 @@ mod tests {
     fn find(dom: &crate::dom::Dom, selector: &str) -> crate::dom::NodeId {
         let selector = parse_selector_list(selector).unwrap();
         select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+    }
+
+    #[test]
+    fn inline_text_uses_computed_font_size_and_line_height() {
+        let (_, _, layout) = pipeline(
+            "<!doctype html><body><p id='large'>hello</p></body>",
+            "html, body, p { display:block; margin:0 } #large { font-size:24px; line-height:36px }",
+            400.0,
+        );
+        let text = layout
+            .fragments
+            .iter()
+            .find(|fragment| matches!(fragment.kind, FragmentKind::Text(_)))
+            .expect("paragraph text fragment");
+        let FragmentKind::Text(text_data) = &text.kind else {
+            unreachable!();
+        };
+        assert_eq!(text_data.font_size, 24.0);
+        assert_eq!(text.rect.size.height, 36.0);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 //! Versioned, bounded payloads for the asynchronous HTTP disk cache.
+
+#![allow(clippy::cast_possible_truncation)]
 //!
 //! Disk entries cannot contain [`std::time::Instant`], because an instant is
 //! meaningful only in the process that created it. This format stores a wall

@@ -5,6 +5,8 @@
 //! into [`ImageResources`]. Resource keys retain the selected source value so
 //! a response for an older dynamic attribute value can be rejected.
 
+#![allow(clippy::cast_precision_loss)]
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -14,7 +16,9 @@ use std::sync::Arc;
 use image_codec::{ImageFormat as CodecImageFormat, ImageReader};
 use url::Url;
 
+use crate::css::cascade::media_query_list_matches;
 use crate::css::computed::ComputedStyle;
+use crate::css::selector::MatchContext;
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, NodeId, NodeKind};
 use crate::paint::{Color, ImageResourceId};
 
@@ -73,23 +77,33 @@ pub struct ImageResourceKey {
     pub requested_url: Url,
     pub source_snapshot: String,
     pub source: ImageSource,
+    pub selection_context: ImageSelectionContext,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ImageSource {
     Element,
+    VideoPoster,
     CssBackground,
 }
 
-// These attributes are common compatibility hooks on Chinese news and portal
-// sites. They are only fallbacks when `src` is absent or empty; this is not a
-// general lazy-loading script or `srcset` implementation.
-const LAZY_IMAGE_SOURCE_ATTRIBUTES: &[&str] = &[
-    "data-src",
-    "data-original",
-    "data-lazy-src",
-    "data-actualsrc",
-];
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ImageSelectionContext {
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    /// Device pixel ratio multiplied by 1,000.
+    pub device_pixel_ratio_milli: u32,
+}
+
+impl Default for ImageSelectionContext {
+    fn default() -> Self {
+        Self {
+            viewport_width: 1_024,
+            viewport_height: 768,
+            device_pixel_ratio_milli: 1_000,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredImage {
@@ -109,6 +123,19 @@ pub struct ImageDiscovery {
 /// the document's first valid `base[href]`, or the caller-provided URL.
 #[must_use]
 pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> ImageDiscovery {
+    discover_images_with_context(dom, document_url, limits, ImageSelectionContext::default())
+}
+
+/// Discover the image candidate selected for a concrete viewport and device
+/// pixel ratio. This covers `picture`, `srcset`, `sizes`, ordinary `img src`,
+/// and `video poster` through one resource pipeline.
+#[must_use]
+pub fn discover_images_with_context(
+    dom: &Dom,
+    document_url: &Url,
+    limits: ImageLimits,
+    context: ImageSelectionContext,
+) -> ImageDiscovery {
     let (elements, mut diagnostics) = collect_elements(dom, limits.max_discovery_nodes);
     let effective_base_url = effective_base_url(dom, &elements, document_url, &mut diagnostics);
     let mut resources = Vec::new();
@@ -117,26 +144,28 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
         let Some(element) = html_element(dom, node) else {
             continue;
         };
-        if element.local_name != "img" {
-            continue;
-        }
-        if attribute(element, "srcset").is_some() {
-            diagnostics.push(ImageDiscoveryDiagnostic {
-                node: Some(node),
-                code: ImageDiscoveryDiagnosticCode::SrcsetUnsupported,
-                message: "img srcset candidate selection is not implemented; using src or a supported lazy-source fallback"
-                    .to_owned(),
-            });
-        }
-        let Some(source) = element_image_source(element) else {
+        let selected = match element.local_name.as_str() {
+            "img" => select_image_source(dom, node, context),
+            "video" => attribute(element, "poster")
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+                .map(|source| SelectedImageSource {
+                    reference: source.to_owned(),
+                    snapshot: source.to_owned(),
+                    source: ImageSource::VideoPoster,
+                }),
+            _ => None,
+        };
+        let Some(selected) = selected else {
             continue;
         };
+        let source = selected.reference.as_str();
         if source.len() > limits.max_url_bytes {
             diagnostics.push(ImageDiscoveryDiagnostic {
                 node: Some(node),
                 code: ImageDiscoveryDiagnosticCode::UrlBytesLimit,
                 message: format!(
-                    "img src uses {} bytes; limit is {}",
+                    "image URL reference uses {} bytes; limit is {}",
                     source.len(),
                     limits.max_url_bytes
                 ),
@@ -147,7 +176,7 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
             diagnostics.push(ImageDiscoveryDiagnostic {
                 node: Some(node),
                 code: ImageDiscoveryDiagnosticCode::InvalidSourceUrl,
-                message: format!("img src '{source}' is not a valid URL reference"),
+                message: format!("image source '{source}' is not a valid URL reference"),
             });
             continue;
         };
@@ -168,7 +197,7 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
                 node: Some(node),
                 code: ImageDiscoveryDiagnosticCode::UnsupportedScheme,
                 message: format!(
-                    "img URL scheme '{}' is not supported by the image loader",
+                    "image URL scheme '{}' is not supported by the image loader",
                     requested_url.scheme()
                 ),
             });
@@ -187,8 +216,9 @@ pub fn discover_images(dom: &Dom, document_url: &Url, limits: ImageLimits) -> Im
             key: ImageResourceKey {
                 owner: node,
                 requested_url,
-                source_snapshot: source.to_owned(),
-                source: ImageSource::Element,
+                source_snapshot: selected.snapshot,
+                source: selected.source,
+                selection_context: context,
             },
         });
     }
@@ -211,7 +241,24 @@ pub fn discover_images_with_styles(
     document_url: &Url,
     limits: ImageLimits,
 ) -> ImageDiscovery {
-    let mut discovery = discover_images(dom, document_url, limits);
+    discover_images_with_styles_and_context(
+        dom,
+        styles,
+        document_url,
+        limits,
+        ImageSelectionContext::default(),
+    )
+}
+
+#[must_use]
+pub fn discover_images_with_styles_and_context(
+    dom: &Dom,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    document_url: &Url,
+    limits: ImageLimits,
+    context: ImageSelectionContext,
+) -> ImageDiscovery {
+    let mut discovery = discover_images_with_context(dom, document_url, limits, context);
     let (elements, _) = collect_elements(dom, limits.max_discovery_nodes);
     for node in elements {
         if discovery.resources.len() >= limits.max_resources {
@@ -252,6 +299,7 @@ pub fn discover_images_with_styles(
                 requested_url,
                 source_snapshot: value.clone(),
                 source: ImageSource::CssBackground,
+                selection_context: context,
             },
         });
     }
@@ -275,16 +323,31 @@ pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKe
     let Some(element) = html_element(dom, key.owner) else {
         return false;
     };
-    let Some(source) = element_image_source(element) else {
+    let selected = match key.source {
+        ImageSource::Element if element.local_name == "img" => {
+            select_image_source(dom, key.owner, key.selection_context)
+        }
+        ImageSource::VideoPoster if element.local_name == "video" => attribute(element, "poster")
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(|source| SelectedImageSource {
+                reference: source.to_owned(),
+                snapshot: source.to_owned(),
+                source: ImageSource::VideoPoster,
+            }),
+        _ => None,
+    };
+    let Some(selected) = selected else {
         return false;
     };
-    if element.local_name != "img" || source != key.source_snapshot {
+    if selected.snapshot != key.source_snapshot || selected.source != key.source {
         return false;
     }
     let (elements, _) = collect_elements(dom, usize::MAX);
     let mut diagnostics = Vec::new();
     let base = effective_base_url(dom, &elements, document_url, &mut diagnostics);
-    base.join(source).is_ok_and(|url| url == key.requested_url)
+    base.join(&selected.reference)
+        .is_ok_and(|url| url == key.requested_url)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -568,9 +631,13 @@ impl ImageResources {
 
     #[must_use]
     pub fn get_for_node(&self, node: NodeId) -> Option<&LoadedImage> {
-        self.by_node_url
-            .values()
-            .find(|loaded| loaded.key.owner == node && loaded.key.source == ImageSource::Element)
+        self.by_node_url.values().find(|loaded| {
+            loaded.key.owner == node
+                && matches!(
+                    loaded.key.source,
+                    ImageSource::Element | ImageSource::VideoPoster
+                )
+        })
     }
 
     #[must_use]
@@ -755,17 +822,261 @@ fn attribute<'a>(element: &'a ElementData, name: &str) -> Option<&'a str> {
         .map(|attribute| attribute.value.as_str())
 }
 
-fn element_image_source(element: &ElementData) -> Option<&str> {
-    attribute(element, "src")
-        .map(str::trim)
-        .filter(|source| !source.is_empty())
+struct SelectedImageSource {
+    reference: String,
+    snapshot: String,
+    source: ImageSource,
+}
+
+#[derive(Clone, Copy)]
+enum SrcsetDescriptor {
+    Density(f32),
+    Width(u32),
+}
+
+struct SrcsetCandidate<'a> {
+    url: &'a str,
+    descriptor: SrcsetDescriptor,
+}
+
+fn select_image_source(
+    dom: &Dom,
+    image: NodeId,
+    context: ImageSelectionContext,
+) -> Option<SelectedImageSource> {
+    let element = html_element(dom, image)?;
+    let snapshot = image_selection_snapshot(dom, image);
+    if let Some(parent) = dom.parent(image)
+        && html_element(dom, parent).is_some_and(|element| element.local_name == "picture")
+    {
+        for child in dom.children(parent).unwrap_or_default() {
+            if *child == image {
+                break;
+            }
+            let Some(source) = html_element(dom, *child) else {
+                continue;
+            };
+            if source.local_name != "source"
+                || attribute(source, "type").is_some_and(|value| !supported_image_type(value))
+                || attribute(source, "media").is_some_and(|value| {
+                    !media_query_list_matches(value, &selection_match_context(context))
+                })
+            {
+                continue;
+            }
+            if let Some(reference) = attribute(source, "srcset").and_then(|srcset| {
+                select_srcset_candidate(srcset, attribute(source, "sizes"), context)
+            }) {
+                return Some(SelectedImageSource {
+                    reference: reference.to_owned(),
+                    snapshot,
+                    source: ImageSource::Element,
+                });
+            }
+        }
+    }
+    let reference = attribute(element, "srcset")
+        .and_then(|srcset| select_srcset_candidate(srcset, attribute(element, "sizes"), context))
         .or_else(|| {
-            LAZY_IMAGE_SOURCE_ATTRIBUTES.iter().find_map(|name| {
-                attribute(element, name)
-                    .map(str::trim)
-                    .filter(|source| !source.is_empty())
-            })
+            attribute(element, "src")
+                .map(str::trim)
+                .filter(|source| !source.is_empty())
+        })?;
+    Some(SelectedImageSource {
+        reference: reference.to_owned(),
+        snapshot,
+        source: ImageSource::Element,
+    })
+}
+
+fn selection_match_context(context: ImageSelectionContext) -> MatchContext {
+    MatchContext {
+        viewport_width: Some(context.viewport_width as f32),
+        viewport_height: Some(context.viewport_height as f32),
+        ..MatchContext::default()
+    }
+}
+
+fn supported_image_type(value: &str) -> bool {
+    matches!(
+        value
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "image/png" | "image/jpeg" | "image/pjpeg" | "image/gif" | "image/webp"
+    )
+}
+
+fn image_selection_snapshot(dom: &Dom, image: NodeId) -> String {
+    let mut snapshot = String::new();
+    if let Some(parent) = dom.parent(image)
+        && html_element(dom, parent).is_some_and(|element| element.local_name == "picture")
+    {
+        for child in dom.children(parent).unwrap_or_default() {
+            if *child == image {
+                break;
+            }
+            let Some(source) = html_element(dom, *child) else {
+                continue;
+            };
+            if source.local_name == "source" {
+                snapshot.push_str("source[");
+                for name in ["srcset", "sizes", "media", "type"] {
+                    snapshot.push_str(name);
+                    snapshot.push('=');
+                    snapshot.push_str(attribute(source, name).unwrap_or_default());
+                    snapshot.push(';');
+                }
+                snapshot.push(']');
+            }
+        }
+    }
+    snapshot.push_str("img[");
+    for name in ["src", "srcset", "sizes"] {
+        snapshot.push_str(name);
+        snapshot.push('=');
+        snapshot.push_str(
+            html_element(dom, image)
+                .and_then(|element| attribute(element, name))
+                .unwrap_or_default(),
+        );
+        snapshot.push(';');
+    }
+    snapshot.push(']');
+    snapshot
+}
+
+fn select_srcset_candidate<'a>(
+    srcset: &'a str,
+    sizes: Option<&str>,
+    context: ImageSelectionContext,
+) -> Option<&'a str> {
+    let candidates = parse_srcset(srcset);
+    let source_size = parse_sizes(sizes, context).max(1.0);
+    let target_density = context.device_pixel_ratio_milli as f32 / 1_000.0;
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let density = match candidate.descriptor {
+                SrcsetDescriptor::Density(density) => density,
+                SrcsetDescriptor::Width(width) => width as f32 / source_size,
+            };
+            density
+                .is_finite()
+                .then_some((candidate.url, density.max(0.0)))
         })
+        .min_by(|(_, left), (_, right)| {
+            let left_distance = if *left >= target_density {
+                *left - target_density
+            } else {
+                f32::MAX / 2.0 + target_density - *left
+            };
+            let right_distance = if *right >= target_density {
+                *right - target_density
+            } else {
+                f32::MAX / 2.0 + target_density - *right
+            };
+            left_distance.total_cmp(&right_distance)
+        })
+        .map(|(url, _)| url)
+}
+
+fn parse_srcset(srcset: &str) -> Vec<SrcsetCandidate<'_>> {
+    srcset
+        .split(',')
+        .filter_map(|candidate| {
+            let mut parts = candidate.split_ascii_whitespace();
+            let url = parts.next()?.trim();
+            if url.is_empty() {
+                return None;
+            }
+            let descriptor = match parts.next() {
+                None => SrcsetDescriptor::Density(1.0),
+                Some(value) if value.ends_with('x') => SrcsetDescriptor::Density(
+                    value
+                        .strip_suffix('x')?
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|v| *v > 0.0)?,
+                ),
+                Some(value) if value.ends_with('w') => SrcsetDescriptor::Width(
+                    value
+                        .strip_suffix('w')?
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|v| *v > 0)?,
+                ),
+                Some(_) => return None,
+            };
+            parts
+                .next()
+                .is_none()
+                .then_some(SrcsetCandidate { url, descriptor })
+        })
+        .collect()
+}
+
+fn parse_sizes(sizes: Option<&str>, context: ImageSelectionContext) -> f32 {
+    let Some(sizes) = sizes else {
+        return context.viewport_width as f32;
+    };
+    for entry in split_top_level_commas(sizes) {
+        let entry = entry.trim();
+        let split = entry.rfind(char::is_whitespace);
+        let (media, length) = split.map_or(("", entry), |index| {
+            (entry[..index].trim(), entry[index..].trim())
+        });
+        if !media.is_empty() && !media_query_list_matches(media, &selection_match_context(context))
+        {
+            continue;
+        }
+        if let Some(length) = parse_source_size(length, context.viewport_width) {
+            return length;
+        }
+    }
+    context.viewport_width as f32
+}
+
+fn split_top_level_commas(value: &str) -> Vec<&str> {
+    let mut entries = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                entries.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    entries.push(&value[start..]);
+    entries
+}
+
+fn parse_source_size(value: &str, viewport_width: u32) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    for (unit, factor) in [
+        ("px", 1.0),
+        ("em", 16.0),
+        ("rem", 16.0),
+        ("vw", viewport_width as f32 / 100.0),
+    ] {
+        if let Some(number) = value.strip_suffix(unit) {
+            return number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|number| number.is_finite() && *number >= 0.0)
+                .map(|number| number * factor);
+        }
+    }
+    None
 }
 
 fn pixel_len(width: u32, height: u32) -> Option<usize> {
@@ -784,8 +1095,8 @@ mod tests {
     use crate::html::parse_document;
 
     use super::{
-        ImageDecodeError, ImageDiscoveryDiagnosticCode, ImageFormat, ImageLimits, ImageResources,
-        decode_image, discover_images, image_key_is_current,
+        ImageDecodeError, ImageFormat, ImageLimits, ImageResources, ImageSelectionContext,
+        decode_image, discover_images, discover_images_with_context, image_key_is_current,
     };
 
     fn png_bytes() -> Vec<u8> {
@@ -815,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn discovers_src_against_first_base_and_diagnoses_srcset() {
+    fn discovers_srcset_against_first_base() {
         let parsed = parse_document(
             "<base href='https://cdn.example/assets/'><img src='a.png' srcset='a@2x.png 2x'><img><img src=''>",
         );
@@ -825,25 +1136,43 @@ mod tests {
         assert_eq!(discovery.resources.len(), 1);
         assert_eq!(
             discovery.resources[0].key.requested_url.as_str(),
-            "https://cdn.example/assets/a.png"
+            "https://cdn.example/assets/a@2x.png"
         );
-        let codes = discovery
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.code)
-            .collect::<Vec<_>>();
-        assert!(codes.contains(&ImageDiscoveryDiagnosticCode::SrcsetUnsupported));
-        assert!(!codes.contains(&ImageDiscoveryDiagnosticCode::MissingSource));
-        assert!(!codes.contains(&ImageDiscoveryDiagnosticCode::EmptySource));
+        assert!(discovery.diagnostics.is_empty());
     }
 
     #[test]
-    fn discovers_data_src_when_src_is_missing_or_empty_without_warning() {
-        let parsed = parse_document(
+    fn nonstandard_data_attributes_wait_for_script_to_set_src() {
+        let mut parsed = parse_document(
             "<img id=lazy data-src='lazy.png'><img id=plain><img id=empty src='' data-src='fallback.png'><img src='normal.png' data-src='ignored.png'>",
         );
         let document_url = Url::parse("https://example.test/page/").unwrap();
-        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+        let mut discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+
+        assert_eq!(discovery.resources.len(), 1);
+        let lazy = by_id(&parsed.dom, "lazy");
+        parsed.dom.set_attribute(lazy, "src", "lazy.png").unwrap();
+        discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+        assert_eq!(discovery.resources.len(), 2);
+        assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn picture_density_and_video_poster_use_the_standard_image_pipeline() {
+        let parsed = parse_document(
+            "<picture><source media='(min-width: 700px)' srcset='wide.png 1x, wide@2x.png 2x'><img src='fallback.png'></picture><video poster='poster.webp'></video>",
+        );
+        let document_url = Url::parse("https://example.test/assets/").unwrap();
+        let discovery = discover_images_with_context(
+            &parsed.dom,
+            &document_url,
+            ImageLimits::default(),
+            ImageSelectionContext {
+                viewport_width: 800,
+                viewport_height: 600,
+                device_pixel_ratio_milli: 2_000,
+            },
+        );
 
         let urls = discovery
             .resources
@@ -853,12 +1182,14 @@ mod tests {
         assert_eq!(
             urls,
             vec![
-                "https://example.test/page/lazy.png",
-                "https://example.test/page/fallback.png",
-                "https://example.test/page/normal.png",
+                "https://example.test/assets/wide@2x.png",
+                "https://example.test/assets/poster.webp",
             ]
         );
-        assert!(discovery.diagnostics.is_empty());
+        assert_eq!(
+            discovery.resources[1].key.source,
+            super::ImageSource::VideoPoster
+        );
     }
 
     #[test]
@@ -890,8 +1221,8 @@ mod tests {
     }
 
     #[test]
-    fn stale_dynamic_lazy_source_is_rejected_without_rejecting_unrelated_mutations() {
-        let mut parsed = parse_document("<img id=hero data-src='old.png'><p>before</p>");
+    fn stale_dynamic_srcset_is_rejected_without_rejecting_unrelated_mutations() {
+        let mut parsed = parse_document("<img id=hero srcset='old.png 1x'><p>before</p>");
         let document_url = Url::parse("https://example.test/").unwrap();
         let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
         let key = discovery.resources[0].key.clone();
@@ -901,7 +1232,7 @@ mod tests {
         assert!(image_key_is_current(&parsed.dom, &document_url, &key));
         parsed
             .dom
-            .set_attribute(image, "data-src", "new.png")
+            .set_attribute(image, "srcset", "new.png 1x")
             .unwrap();
         assert!(!image_key_is_current(&parsed.dom, &document_url, &key));
     }

@@ -226,6 +226,10 @@ enum PseudoClass {
     Active,
     Target,
     Lang(Vec<String>),
+    /// Vendor and shadow-DOM pseudo-classes that this renderer does not
+    /// expose yet.  They remain syntactically valid and simply do not match
+    /// in the current document tree, as a browser does outside that context.
+    Unsupported,
 }
 
 impl PseudoClass {
@@ -273,6 +277,8 @@ pub struct MatchContext {
     pub hovered: HashSet<NodeId>,
     pub active: HashSet<NodeId>,
     pub visited_links: HashSet<NodeId>,
+    pub viewport_width: Option<f32>,
+    pub viewport_height: Option<f32>,
 }
 
 /// Parse a strict selector list. Any invalid selector invalidates the list.
@@ -458,12 +464,6 @@ impl<'a> Parser<'a> {
             if self.is_eof() {
                 break;
             }
-            if compounds
-                .last()
-                .is_some_and(|compound| compound.pseudo_element.is_some())
-            {
-                return Err(self.error("pseudo-element must terminate a complex selector"));
-            }
             let combinator = match self.peek_char() {
                 Some('>') => {
                     self.bump_char();
@@ -540,9 +540,6 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => break,
-            }
-            if pseudo_element.is_some() && matches!(self.peek_char(), Some('#' | '.' | '[' | ':')) {
-                return Err(self.error("pseudo-element must be the final simple selector"));
             }
         }
 
@@ -652,7 +649,7 @@ impl<'a> Parser<'a> {
             ("active", None) => Ok(PseudoClass::Active),
             ("target", None) => Ok(PseudoClass::Target),
             ("lang", Some(value)) => Ok(PseudoClass::Lang(parse_lang_ranges(value)?)),
-            _ => Err(self.error(format!("unsupported or malformed pseudo-class :{name}"))),
+            _ => Ok(PseudoClass::Unsupported),
         }
     }
 
@@ -1308,6 +1305,7 @@ fn matches_pseudo(
                         && language.as_bytes().get(range.len()) == Some(&b'-')
             })
         }),
+        PseudoClass::Unsupported => false,
     }
 }
 

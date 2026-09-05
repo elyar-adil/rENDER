@@ -527,7 +527,26 @@ impl Page {
         }
         self.geometry_index = geometry.clone();
         self.runtime.install_element_geometry(geometry);
+        self.queue_pending_runtime_microtasks();
         true
+    }
+
+    /// Transfer platform callbacks produced outside a script task (for
+    /// example, intersection changes after layout or scrolling) into the
+    /// page event loop's next microtask checkpoint.
+    pub fn queue_pending_runtime_microtasks(&mut self) -> usize {
+        let microtasks = self.runtime.take_pending_microtasks();
+        let mut queued = 0;
+        for microtask in microtasks {
+            if self
+                .queue_microtask(PageTask::JsMicrotask(microtask))
+                .is_err()
+            {
+                break;
+            }
+            queued += 1;
+        }
+        queued
     }
 
     #[must_use]

@@ -6,6 +6,7 @@ pub(super) enum TokenKind {
     String(String),
     Number(f64),
     RegexLiteral { pattern: String, flags: String },
+    Template(Vec<TemplatePart>),
     Let,
     Const,
     Var,
@@ -37,6 +38,7 @@ pub(super) enum TokenKind {
     Undefined,
     This,
     Dot,
+    Ellipsis,
     Comma,
     Semicolon,
     LeftParen,
@@ -53,6 +55,7 @@ pub(super) enum TokenKind {
     MinusMinus,
     MinusEqual,
     Star,
+    StarStar,
     StarEqual,
     Slash,
     SlashEqual,
@@ -86,6 +89,12 @@ pub(super) enum TokenKind {
     Question,
     Arrow,
     Eof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum TemplatePart {
+    String(String),
+    Expression(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +141,12 @@ impl Lexer<'_> {
             }
             let start = self.offset;
             let kind = match character {
+                '.' if self.source[self.offset..].starts_with("...") => {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    TokenKind::Ellipsis
+                }
                 '.' if self
                     .peek_second()
                     .is_some_and(|value| value.is_ascii_digit()) =>
@@ -172,13 +187,18 @@ impl Lexer<'_> {
                     TokenKind::MinusEqual
                 }
                 '-' => self.single(TokenKind::Minus),
+                '*' if self.peek_second() == Some('*') => {
+                    self.advance();
+                    self.advance();
+                    TokenKind::StarStar
+                }
                 '*' if self.peek_second() == Some('=') => {
                     self.advance();
                     self.advance();
                     TokenKind::StarEqual
                 }
                 '*' => self.single(TokenKind::Star),
-                '/' if self.peek_second() == Some('=') => {
+                '/' if self.peek_second() == Some('=') && !self.regex_allowed() => {
                     self.advance();
                     self.advance();
                     TokenKind::SlashEqual
@@ -232,6 +252,7 @@ impl Lexer<'_> {
                 '/' if self.regex_allowed() => self.regex_literal(start)?,
                 '/' => self.single(TokenKind::Slash),
                 '\'' | '"' => self.string(character)?,
+                '`' => self.template()?,
                 '0'..='9' => self.number()?,
                 '\\' if self.peek_second() == Some('u') => self.identifier()?,
                 value if is_identifier_start(value) => self.identifier()?,
@@ -264,6 +285,7 @@ impl Lexer<'_> {
                     | TokenKind::String(_)
                     | TokenKind::Number(_)
                     | TokenKind::RegexLiteral { .. }
+                    | TokenKind::Template(_)
                     | TokenKind::True
                     | TokenKind::False
                     | TokenKind::Null
@@ -624,7 +646,7 @@ impl Lexer<'_> {
                     '\'' => '\'',
                     '"' => '"',
                     'x' => self.hex_escape(2)?,
-                    'u' => self.hex_escape(4)?,
+                    'u' => self.unicode_escape()?,
                     other => other,
                 };
                 value.push(escaped);
@@ -648,6 +670,151 @@ impl Lexer<'_> {
         let value = u32::from_str_radix(&self.source[start..self.offset], 16)
             .map_err(|_| JsError::syntax("invalid hexadecimal escape", start))?;
         char::from_u32(value).ok_or_else(|| JsError::syntax("invalid Unicode escape", start))
+    }
+
+    fn unicode_escape(&mut self) -> Result<char, JsError> {
+        if self.peek() == Some('{') {
+            let start = self.offset;
+            self.advance();
+            let digits_start = self.offset;
+            while self.peek().is_some_and(|value| value.is_ascii_hexdigit()) {
+                self.advance();
+            }
+            if self.offset == digits_start || self.peek() != Some('}') {
+                return Err(JsError::syntax("invalid Unicode escape", start));
+            }
+            let value = u32::from_str_radix(&self.source[digits_start..self.offset], 16)
+                .map_err(|_| JsError::syntax("invalid Unicode escape", start))?;
+            self.advance();
+            return char::from_u32(value)
+                .ok_or_else(|| JsError::syntax("invalid Unicode escape", start));
+        }
+
+        let start = self.offset;
+        let high = self.hex_escape_value(4)?;
+        if (0xd800..=0xdbff).contains(&high)
+            && self.peek() == Some('\\')
+            && self.peek_second() == Some('u')
+        {
+            self.advance();
+            self.advance();
+            let low = self.hex_escape_value(4)?;
+            if (0xdc00..=0xdfff).contains(&low) {
+                let scalar = 0x1_0000 + ((high - 0xd800) << 10) + (low - 0xdc00);
+                return char::from_u32(scalar)
+                    .ok_or_else(|| JsError::syntax("invalid Unicode surrogate pair", start));
+            }
+            return Ok('\u{fffd}');
+        }
+        Ok(char::from_u32(high).unwrap_or_else(|| surrogate_placeholder(high)))
+    }
+
+    fn hex_escape_value(&mut self, digits: usize) -> Result<u32, JsError> {
+        let start = self.offset;
+        for _ in 0..digits {
+            if !self.peek().is_some_and(|value| value.is_ascii_hexdigit()) {
+                return Err(JsError::syntax("invalid hexadecimal escape", start));
+            }
+            self.advance();
+        }
+        u32::from_str_radix(&self.source[start..self.offset], 16)
+            .map_err(|_| JsError::syntax("invalid hexadecimal escape", start))
+    }
+
+    fn template(&mut self) -> Result<TokenKind, JsError> {
+        let start = self.offset;
+        self.advance();
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        loop {
+            let Some(character) = self.peek() else {
+                return Err(JsError::syntax("unterminated template literal", start));
+            };
+            self.advance();
+            match character {
+                '`' => {
+                    parts.push(TemplatePart::String(text));
+                    return Ok(TokenKind::Template(parts));
+                }
+                '$' if self.peek() == Some('{') => {
+                    self.advance();
+                    parts.push(TemplatePart::String(std::mem::take(&mut text)));
+                    parts.push(TemplatePart::Expression(
+                        self.template_interpolation(start)?,
+                    ));
+                }
+                '\\' => {
+                    let escaped = self.peek().ok_or_else(|| {
+                        JsError::syntax("unterminated template escape", self.offset)
+                    })?;
+                    self.advance();
+                    let escaped = match escaped {
+                        '\n' => continue,
+                        '\r' => {
+                            if self.peek() == Some('\n') {
+                                self.advance();
+                            }
+                            continue;
+                        }
+                        '0' if !self.peek().is_some_and(|value| value.is_ascii_digit()) => '\0',
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        'b' => '\u{0008}',
+                        'f' => '\u{000c}',
+                        'v' => '\u{000b}',
+                        'x' => self.hex_escape(2)?,
+                        'u' => self.unicode_escape()?,
+                        other => other,
+                    };
+                    text.push(escaped);
+                }
+                other => text.push(other),
+            }
+        }
+    }
+
+    fn template_interpolation(&mut self, template_start: usize) -> Result<String, JsError> {
+        let expression_start = self.offset;
+        let mut depth = 1_u32;
+        let mut quote = None;
+        while let Some(character) = self.peek() {
+            if let Some(delimiter) = quote {
+                self.advance();
+                if character == '\\' {
+                    if self.peek().is_some() {
+                        self.advance();
+                    }
+                } else if character == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+            match character {
+                '\'' | '"' | '`' => {
+                    quote = Some(character);
+                    self.advance();
+                }
+                '{' => {
+                    depth = depth.saturating_add(1);
+                    self.advance();
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let expression = self.source[expression_start..self.offset].to_owned();
+                        self.advance();
+                        return Ok(expression);
+                    }
+                    self.advance();
+                }
+                _ => self.advance(),
+            }
+        }
+        Err(JsError::syntax(
+            "unterminated template interpolation",
+            template_start,
+        ))
     }
 
     fn line_comment(&mut self) {
@@ -703,6 +870,13 @@ impl Lexer<'_> {
 
 fn is_identifier_start(character: char) -> bool {
     character.is_alphabetic() || matches!(character, '_' | '$')
+}
+
+pub(super) fn surrogate_placeholder(value: u32) -> char {
+    // Rust strings contain Unicode scalar values while ECMAScript strings are
+    // UTF-16 code-unit sequences. Reserve a private-use range for unpaired
+    // surrogates so regexes such as /[\uD800-\uDFFF]/ keep their meaning.
+    char::from_u32(0xf_0000 + value.saturating_sub(0xd800)).unwrap_or('\u{fffd}')
 }
 
 fn is_identifier_continue(character: char) -> bool {

@@ -1,4 +1,12 @@
-use super::lexer::{Token, TokenKind};
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::match_same_arms,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unused_self
+)]
+
+use super::lexer::{TemplatePart, Token, TokenKind, tokenize};
 use super::{JsError, JsErrorKind, RuntimeLimits};
 use crate::js::JsValue;
 
@@ -25,6 +33,7 @@ pub(super) enum BinaryOp {
     Add,
     Subtract,
     Multiply,
+    Exponentiate,
     Divide,
     Remainder,
     Less,
@@ -51,6 +60,59 @@ pub(super) enum BinaryOp {
 pub(super) struct CatchClause {
     pub parameter: String,
     pub body: Vec<Statement>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum PropertyKey {
+    Static(String),
+    Computed(Expr),
+    Spread,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ObjectProperty {
+    pub key: PropertyKey,
+    pub value: Expr,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum BindingPattern {
+    Identifier(String),
+    Object {
+        properties: Vec<(String, Self)>,
+        rest: Option<Box<Self>>,
+    },
+    Array {
+        elements: Vec<Option<Self>>,
+        rest: Option<Box<Self>>,
+    },
+    Default {
+        pattern: Box<Self>,
+        value: Expr,
+    },
+}
+
+fn collect_binding_names(pattern: &BindingPattern, names: &mut Vec<String>) {
+    match pattern {
+        BindingPattern::Identifier(name) => names.push(name.clone()),
+        BindingPattern::Object { properties, rest } => {
+            for (_, pattern) in properties {
+                collect_binding_names(pattern, names);
+            }
+            if let Some(rest) = rest {
+                collect_binding_names(rest, names);
+            }
+        }
+        BindingPattern::Array { elements, rest } => {
+            for pattern in elements.iter().flatten() {
+                collect_binding_names(pattern, names);
+            }
+            if let Some(rest) = rest {
+                collect_binding_names(rest, names);
+            }
+        }
+        BindingPattern::Default { pattern, .. } => collect_binding_names(pattern, names),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,6 +167,12 @@ pub(super) enum Statement {
         iterable: Expr,
         body: Box<Statement>,
     },
+    ForOf {
+        kind: VariableKind,
+        name: String,
+        iterable: Expr,
+        body: Box<Statement>,
+    },
     ForInExpr {
         target: Expr,
         iterable: Expr,
@@ -138,8 +206,13 @@ pub(super) enum Expr {
         parameters: Vec<String>,
         body: Vec<Statement>,
     },
-    Object(Vec<(String, Self)>),
+    Object(Vec<ObjectProperty>),
     Array(Vec<Self>),
+    Spread(Box<Self>),
+    ObjectRest {
+        object: Box<Self>,
+        excluded: Vec<String>,
+    },
     Unary {
         operator: UnaryOp,
         operand: Box<Self>,
@@ -188,17 +261,22 @@ pub(super) enum Expr {
 }
 
 pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
-    Parser {
-        tokens,
-        cursor: 0,
-        statement_count: 0,
-        max_statements: limits.max_statements,
-        function_depth: 0,
-        loop_depth: 0,
-        switch_depth: 0,
-        no_in: false,
+    Parser::new(tokens, limits).program()
+}
+
+impl Parser {
+    fn new(tokens: Vec<Token>, limits: &RuntimeLimits) -> Self {
+        Self {
+            tokens,
+            cursor: 0,
+            statement_count: 0,
+            max_statements: limits.max_statements,
+            function_depth: 0,
+            loop_depth: 0,
+            switch_depth: 0,
+            no_in: false,
+        }
     }
-    .program()
 }
 
 struct Parser {
@@ -257,6 +335,52 @@ impl Parser {
             return Ok(Statement::Block(statements));
         }
         if self.take(&TokenKind::Function) {
+            // Treat async/generator declarations as ordinary functions. The
+            // runtime does not suspend generator frames, but accepting their
+            // syntax lets feature-detection and polyfill code load normally.
+            let _ = self.take(&TokenKind::Star);
+            return self.function_declaration();
+        }
+        // Module declarations are intentionally lowered into the shared page
+        // realm. Static imports/exports are dependency metadata for the
+        // browser loader, so consume their declaration here; the surrounding
+        // module remains executable without aborting on syntax it cannot bind.
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "import" || name == "export")
+            && !matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Dot | TokenKind::LeftParen)
+            )
+        {
+            self.skip_module_declaration();
+            return Ok(Statement::Block(Vec::new()));
+        }
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "class") {
+            self.advance();
+            let name = match self.current().kind.clone() {
+                TokenKind::Identifier(name) => {
+                    self.advance();
+                    name
+                }
+                _ => format!("__class_{}", self.current().offset),
+            };
+            let value = self.class_expression_tail(Some(name.clone()))?;
+            self.end_statement();
+            return Ok(Statement::Variable {
+                kind: VariableKind::Const,
+                name,
+                value: Some(value),
+            });
+        }
+        if matches!(
+            &self.current().kind,
+            TokenKind::Identifier(name) if name == "async"
+        ) && matches!(
+            self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+            Some(TokenKind::Function)
+        ) {
+            self.advance();
+            self.advance();
+            let _ = self.take(&TokenKind::Star);
             return self.function_declaration();
         }
         if self.take(&TokenKind::If) {
@@ -292,7 +416,7 @@ impl Parser {
         }
         if self.take(&TokenKind::Break) {
             let label = self.take_loop_label();
-            if self.loop_depth == 0 && self.switch_depth == 0 {
+            if label.is_none() && self.loop_depth == 0 && self.switch_depth == 0 {
                 return Err(self.error("break is only valid inside a loop or switch"));
             }
             self.end_statement();
@@ -335,6 +459,33 @@ impl Parser {
         let expression = self.expression()?;
         self.end_statement();
         Ok(Statement::Expression(expression))
+    }
+
+    fn skip_module_declaration(&mut self) {
+        let mut parens = 0_u32;
+        let mut brackets = 0_u32;
+        let mut braces = 0_u32;
+        while !self.at(&TokenKind::Eof) {
+            match self.current().kind {
+                TokenKind::LeftParen => parens = parens.saturating_add(1),
+                TokenKind::RightParen => parens = parens.saturating_sub(1),
+                TokenKind::LeftBracket => brackets = brackets.saturating_add(1),
+                TokenKind::RightBracket => brackets = brackets.saturating_sub(1),
+                TokenKind::LeftBrace => braces = braces.saturating_add(1),
+                TokenKind::RightBrace => {
+                    if braces == 0 && parens == 0 && brackets == 0 {
+                        break;
+                    }
+                    braces = braces.saturating_sub(1);
+                }
+                TokenKind::Semicolon if parens == 0 && brackets == 0 && braces == 0 => {
+                    self.advance();
+                    break;
+                }
+                _ => {}
+            }
+            self.advance();
+        }
     }
 
     /// Consume an identifier in `break`/`continue` label position.
@@ -380,18 +531,29 @@ impl Parser {
     ) -> Result<Statement, JsError> {
         let mut declarations = Vec::new();
         loop {
-            let TokenKind::Identifier(name) = self.advance().kind else {
-                return Err(self.error("expected an identifier after declaration keyword"));
-            };
-            let value = if self.take(&TokenKind::Equal) {
-                Some(self.assignment()?)
+            if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                let offset = self.current().offset;
+                let pattern = self.binding_pattern()?;
+                self.require(
+                    &TokenKind::Equal,
+                    "destructuring declarations require an initializer",
+                )?;
+                let initializer = self.assignment()?;
+                Self::lower_binding_pattern(pattern, initializer, &mut declarations, offset);
             } else {
-                None
-            };
-            if kind == VariableKind::Const && value.is_none() {
-                return Err(self.error("const declarations require an initializer"));
+                let TokenKind::Identifier(name) = self.advance().kind else {
+                    return Err(self.error("expected a binding after declaration keyword"));
+                };
+                let value = if self.take(&TokenKind::Equal) {
+                    Some(self.assignment()?)
+                } else {
+                    None
+                };
+                if kind == VariableKind::Const && value.is_none() {
+                    return Err(self.error("const declarations require an initializer"));
+                }
+                declarations.push((name, value));
             }
-            declarations.push((name, value));
             if !self.take(&TokenKind::Comma) {
                 break;
             }
@@ -404,6 +566,172 @@ impl Parser {
             Ok(Statement::Variable { kind, name, value })
         } else {
             Ok(Statement::VariableList { kind, declarations })
+        }
+    }
+
+    fn binding_pattern(&mut self) -> Result<BindingPattern, JsError> {
+        if self.take(&TokenKind::LeftBrace) {
+            let mut properties = Vec::new();
+            let mut rest = None;
+            while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
+                if self.take(&TokenKind::Ellipsis) {
+                    rest = Some(Box::new(self.binding_pattern()?));
+                    let _ = self.take(&TokenKind::Comma);
+                    break;
+                }
+                let property = self.property_name()?;
+                let mut pattern = if self.take(&TokenKind::Colon) {
+                    self.binding_pattern()?
+                } else if is_identifier_name(&property) {
+                    BindingPattern::Identifier(property.clone())
+                } else {
+                    return Err(self.error("object binding shorthand requires an identifier"));
+                };
+                if self.take(&TokenKind::Equal) {
+                    pattern = BindingPattern::Default {
+                        pattern: Box::new(pattern),
+                        value: self.assignment()?,
+                    };
+                }
+                properties.push((property, pattern));
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.require(
+                &TokenKind::RightBrace,
+                "expected '}' after object binding pattern",
+            )?;
+            return Ok(BindingPattern::Object { properties, rest });
+        }
+        if self.take(&TokenKind::LeftBracket) {
+            let mut elements = Vec::new();
+            let mut rest = None;
+            while !self.at(&TokenKind::RightBracket) && !self.at(&TokenKind::Eof) {
+                if self.take(&TokenKind::Comma) {
+                    elements.push(None);
+                    continue;
+                }
+                if self.take(&TokenKind::Ellipsis) {
+                    rest = Some(Box::new(self.binding_pattern()?));
+                    let _ = self.take(&TokenKind::Comma);
+                    break;
+                }
+                let mut pattern = self.binding_pattern()?;
+                if self.take(&TokenKind::Equal) {
+                    pattern = BindingPattern::Default {
+                        pattern: Box::new(pattern),
+                        value: self.assignment()?,
+                    };
+                }
+                elements.push(Some(pattern));
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.require(
+                &TokenKind::RightBracket,
+                "expected ']' after array binding pattern",
+            )?;
+            return Ok(BindingPattern::Array { elements, rest });
+        }
+        let TokenKind::Identifier(name) = self.advance().kind else {
+            return Err(self.error("expected a binding identifier or pattern"));
+        };
+        Ok(BindingPattern::Identifier(name))
+    }
+
+    /// Lower binding patterns into the interpreter's ordinary declarations.
+    /// Composite patterns retain each intermediate value once, preserving
+    /// getter and initializer evaluation order.
+    fn lower_binding_pattern(
+        pattern: BindingPattern,
+        initializer: Expr,
+        declarations: &mut Vec<(String, Option<Expr>)>,
+        offset: usize,
+    ) {
+        match pattern {
+            BindingPattern::Identifier(name) => declarations.push((name, Some(initializer))),
+            BindingPattern::Default { pattern, value } => {
+                let temporary = format!("\0binding_default_{offset}_{}", declarations.len());
+                declarations.push((temporary.clone(), Some(initializer)));
+                Self::lower_binding_pattern(
+                    *pattern,
+                    Expr::Conditional {
+                        condition: Box::new(Expr::Binary {
+                            operator: BinaryOp::StrictEqual,
+                            left: Box::new(Expr::Identifier(temporary.clone())),
+                            right: Box::new(Expr::Literal(JsValue::Undefined)),
+                        }),
+                        consequent: Box::new(value),
+                        alternate: Box::new(Expr::Identifier(temporary)),
+                    },
+                    declarations,
+                    offset,
+                );
+            }
+            BindingPattern::Object { properties, rest } => {
+                let temporary = format!("\0object_binding_{offset}_{}", declarations.len());
+                declarations.push((temporary.clone(), Some(initializer)));
+                let excluded = properties
+                    .iter()
+                    .map(|(property, _)| property.clone())
+                    .collect();
+                for (property, pattern) in properties {
+                    Self::lower_binding_pattern(
+                        pattern,
+                        Expr::Member {
+                            object: Box::new(Expr::Identifier(temporary.clone())),
+                            property,
+                        },
+                        declarations,
+                        offset,
+                    );
+                }
+                if let Some(pattern) = rest {
+                    Self::lower_binding_pattern(
+                        *pattern,
+                        Expr::ObjectRest {
+                            object: Box::new(Expr::Identifier(temporary)),
+                            excluded,
+                        },
+                        declarations,
+                        offset,
+                    );
+                }
+            }
+            BindingPattern::Array { elements, rest } => {
+                let temporary = format!("\0array_binding_{offset}_{}", declarations.len());
+                declarations.push((temporary.clone(), Some(initializer)));
+                let element_count = elements.len();
+                for (index, pattern) in elements.into_iter().enumerate() {
+                    if let Some(pattern) = pattern {
+                        Self::lower_binding_pattern(
+                            pattern,
+                            Expr::Member {
+                                object: Box::new(Expr::Identifier(temporary.clone())),
+                                property: index.to_string(),
+                            },
+                            declarations,
+                            offset,
+                        );
+                    }
+                }
+                if let Some(pattern) = rest {
+                    Self::lower_binding_pattern(
+                        *pattern,
+                        Expr::Call {
+                            callee: Box::new(Expr::Member {
+                                object: Box::new(Expr::Identifier(temporary)),
+                                property: "slice".to_owned(),
+                            }),
+                            arguments: vec![Expr::Literal(JsValue::Number(element_count as f64))],
+                        },
+                        declarations,
+                        offset,
+                    );
+                }
+            }
         }
     }
 
@@ -512,8 +840,13 @@ impl Parser {
             None
         } else if let Some(kind) = self.take_variable_kind() {
             let declaration_start = self.cursor;
-            let TokenKind::Identifier(name) = self.advance().kind else {
-                return Err(self.error("expected an identifier after declaration keyword"));
+            let pattern = if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                Some(self.binding_pattern()?)
+            } else {
+                let TokenKind::Identifier(name) = self.advance().kind else {
+                    return Err(self.error("expected an identifier after declaration keyword"));
+                };
+                Some(BindingPattern::Identifier(name))
             };
             if self.take(&TokenKind::In) {
                 self.no_in = false;
@@ -524,9 +857,52 @@ impl Parser {
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 return Ok(Statement::ForIn {
                     kind,
-                    name,
+                    name: match pattern.expect("pattern parsed") {
+                        BindingPattern::Identifier(name) => name,
+                        _ => return Err(self.error("for-in destructuring is not supported")),
+                    },
                     iterable,
                     body: Box::new(body?),
+                });
+            }
+            if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "of") {
+                self.advance();
+                self.no_in = false;
+                let iterable = self.expression()?;
+                self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
+                self.loop_depth = self.loop_depth.saturating_add(1);
+                let body = self.statement();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                let body = body?;
+                let pattern = pattern.expect("pattern parsed");
+                let name = match pattern {
+                    BindingPattern::Identifier(name) => name,
+                    pattern => {
+                        let temporary = format!("\0for_of_{}", declaration_start);
+                        let mut declarations = Vec::new();
+                        Self::lower_binding_pattern(
+                            pattern,
+                            Expr::Identifier(temporary.clone()),
+                            &mut declarations,
+                            declaration_start,
+                        );
+                        let body = Statement::Block(vec![
+                            Statement::VariableList { kind, declarations },
+                            body,
+                        ]);
+                        return Ok(Statement::ForOf {
+                            kind: VariableKind::Var,
+                            name: temporary,
+                            iterable,
+                            body: Box::new(body),
+                        });
+                    }
+                };
+                return Ok(Statement::ForOf {
+                    kind,
+                    name,
+                    iterable,
+                    body: Box::new(body),
                 });
             }
             self.cursor = declaration_start;
@@ -654,6 +1030,17 @@ impl Parser {
 
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
         let checkpoint = self.cursor;
+        // Async arrows have the same callable shape in this synchronous
+        // runtime; consume the marker while retaining their parameter/body.
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::LeftParen | TokenKind::Identifier(_))
+            )
+        {
+            self.advance();
+        }
+        let mut patterns = Vec::new();
         let parameters = if let TokenKind::Identifier(name) = &self.current().kind {
             let name = name.clone();
             self.advance();
@@ -667,12 +1054,35 @@ impl Parser {
             let mut parameters = Vec::new();
             if !self.at(&TokenKind::RightParen) {
                 loop {
-                    let TokenKind::Identifier(parameter) = self.advance().kind else {
-                        self.cursor = checkpoint;
-                        return Ok(None);
-                    };
-                    if parameters.contains(&parameter) {
-                        return Err(self.error("duplicate arrow parameters are not supported"));
+                    if self.take(&TokenKind::Ellipsis) {
+                        let TokenKind::Identifier(parameter) = self.advance().kind else {
+                            self.cursor = checkpoint;
+                            return Ok(None);
+                        };
+                        parameters.push(parameter);
+                        break;
+                    }
+                    let parameter =
+                        if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                            let pattern = match self.binding_pattern() {
+                                Ok(pattern) => pattern,
+                                Err(_) => {
+                                    self.cursor = checkpoint;
+                                    return Ok(None);
+                                }
+                            };
+                            let temporary = format!("\0arrow_param_{}", parameters.len());
+                            patterns.push((temporary.clone(), pattern));
+                            temporary
+                        } else {
+                            let TokenKind::Identifier(parameter) = self.advance().kind else {
+                                self.cursor = checkpoint;
+                                return Ok(None);
+                            };
+                            parameter
+                        };
+                    if self.take(&TokenKind::Equal) {
+                        let _ = self.assignment()?;
                     }
                     parameters.push(parameter);
                     if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
@@ -689,7 +1099,7 @@ impl Parser {
             return Ok(None);
         };
 
-        let body = if self.take(&TokenKind::LeftBrace) {
+        let mut body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
             self.function_depth = self.function_depth.saturating_add(1);
@@ -706,6 +1116,24 @@ impl Parser {
         } else {
             vec![Statement::Return(Some(self.assignment()?))]
         };
+        if !patterns.is_empty() {
+            let mut declarations = Vec::new();
+            for (temporary, pattern) in patterns {
+                Self::lower_binding_pattern(
+                    pattern,
+                    Expr::Identifier(temporary),
+                    &mut declarations,
+                    checkpoint,
+                );
+            }
+            body.insert(
+                0,
+                Statement::VariableList {
+                    kind: VariableKind::Var,
+                    declarations,
+                },
+            );
+        }
         Ok(Some(Expr::Arrow { parameters, body }))
     }
 
@@ -732,7 +1160,11 @@ impl Parser {
     fn validate_assignment_target(&self, target: &Expr) -> Result<(), JsError> {
         if matches!(
             target,
-            Expr::Identifier(_) | Expr::Member { .. } | Expr::ComputedMember { .. }
+            Expr::Identifier(_)
+                | Expr::Member { .. }
+                | Expr::ComputedMember { .. }
+                | Expr::Array(_)
+                | Expr::Object(_)
         ) {
             Ok(())
         } else {
@@ -839,13 +1271,25 @@ impl Parser {
 
     fn factor(&mut self) -> Result<Expr, JsError> {
         self.binary_level(
-            Self::unary,
+            Self::exponent,
             &[
                 (&TokenKind::Star, BinaryOp::Multiply),
                 (&TokenKind::Slash, BinaryOp::Divide),
                 (&TokenKind::Percent, BinaryOp::Remainder),
             ],
         )
+    }
+
+    fn exponent(&mut self) -> Result<Expr, JsError> {
+        let left = self.unary()?;
+        if !self.take(&TokenKind::StarStar) {
+            return Ok(left);
+        }
+        Ok(Expr::Binary {
+            operator: BinaryOp::Exponentiate,
+            left: Box::new(left),
+            right: Box::new(self.exponent()?),
+        })
     }
 
     fn binary_level(
@@ -867,6 +1311,14 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, JsError> {
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await") {
+            // Promise suspension is outside the synchronous interpreter, but
+            // await has unary expression precedence. Parsing it here avoids
+            // mistaking nested `await (...)` expressions for calls to a
+            // missing global named await.
+            self.advance();
+            return self.unary();
+        }
         let update_operator = if self.take(&TokenKind::PlusPlus) {
             Some(BinaryOp::Add)
         } else if self.take(&TokenKind::MinusMinus) {
@@ -991,6 +1443,20 @@ impl Parser {
                     callee: Box::new(expression),
                     arguments,
                 };
+            } else if matches!(self.current().kind, TokenKind::Template(_)) {
+                // Tagged templates are represented as a normal call with the
+                // cooked template string. This preserves the common
+                // `String.raw\`...\``/CSS-in-JS path without a separate
+                // template object implementation.
+                let token = self.advance();
+                let TokenKind::Template(parts) = token.kind else {
+                    unreachable!("checked above")
+                };
+                let template = self.template_literal(parts, token.offset)?;
+                expression = Expr::Call {
+                    callee: Box::new(expression),
+                    arguments: vec![template],
+                };
             } else {
                 break;
             }
@@ -1002,7 +1468,12 @@ impl Parser {
         let mut arguments = Vec::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
-                arguments.push(self.assignment()?);
+                let argument = if self.take(&TokenKind::Ellipsis) {
+                    Expr::Spread(Box::new(self.assignment()?))
+                } else {
+                    self.assignment()?
+                };
+                arguments.push(argument);
                 if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
                 }
@@ -1015,16 +1486,26 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, JsError> {
         let token = self.advance();
         match token.kind {
+            TokenKind::Identifier(name) if name == "async" && self.at(&TokenKind::Function) => {
+                self.advance();
+                let _ = self.take(&TokenKind::Star);
+                self.function_expression()
+            }
+            TokenKind::Identifier(name) if name == "class" => self.class_expression_tail(None),
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
             TokenKind::RegexLiteral { pattern, flags } => Ok(Expr::RegexLiteral { pattern, flags }),
+            TokenKind::Template(parts) => self.template_literal(parts, token.offset),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
             TokenKind::Null => Ok(Expr::Literal(JsValue::Null)),
             TokenKind::Undefined => Ok(Expr::Literal(JsValue::Undefined)),
-            TokenKind::Function => self.function_expression(),
+            TokenKind::Function => {
+                let _ = self.take(&TokenKind::Star);
+                self.function_expression()
+            }
             TokenKind::LeftBrace => self.object_literal(),
             TokenKind::LeftBracket => self.array_literal(),
             TokenKind::LeftParen => {
@@ -1045,6 +1526,73 @@ impl Parser {
             }
             _ => Err(JsError::syntax("expected an expression", token.offset)),
         }
+    }
+
+    /// Parse a class header and skip its method body. The runtime represents
+    /// classes as ordinary constructible functions; consuming the complete
+    /// balanced body is still valuable because modern bundles use class syntax
+    /// heavily even when a particular class is never instantiated during the
+    /// initial render.
+    fn class_expression_tail(&mut self, name: Option<String>) -> Result<Expr, JsError> {
+        if name.is_none() && matches!(self.current().kind, TokenKind::Identifier(_)) {
+            self.advance();
+        }
+        if matches!(&self.current().kind, TokenKind::Identifier(value) if value == "extends") {
+            self.advance();
+            while !self.at(&TokenKind::LeftBrace) && !self.at(&TokenKind::Eof) {
+                self.advance();
+            }
+        }
+        self.require(&TokenKind::LeftBrace, "expected '{' after class header")?;
+        let mut depth = 1_u32;
+        while depth > 0 && !self.at(&TokenKind::Eof) {
+            match self.current().kind {
+                TokenKind::LeftBrace => depth = depth.saturating_add(1),
+                TokenKind::RightBrace => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.advance();
+        }
+        if depth != 0 {
+            return Err(self.error("unterminated class body"));
+        }
+        Ok(Expr::Function {
+            name,
+            parameters: Vec::new(),
+            body: Vec::new(),
+        })
+    }
+
+    fn template_literal(
+        &mut self,
+        parts: Vec<TemplatePart>,
+        offset: usize,
+    ) -> Result<Expr, JsError> {
+        let mut result = Expr::Literal(JsValue::String(String::new()));
+        for part in parts {
+            let next = match part {
+                TemplatePart::String(value) => Expr::Literal(JsValue::String(value)),
+                TemplatePart::Expression(source) => {
+                    let limits = RuntimeLimits::default();
+                    let tokens = tokenize(&source, &limits)?;
+                    let mut parser = Parser::new(tokens, &limits);
+                    let expression = parser.expression()?;
+                    if !parser.at(&TokenKind::Eof) {
+                        return Err(JsError::syntax(
+                            "unexpected token in template interpolation",
+                            offset,
+                        ));
+                    }
+                    expression
+                }
+            };
+            result = Expr::Binary {
+                operator: BinaryOp::Add,
+                left: Box::new(result),
+                right: Box::new(next),
+            };
+        }
+        Ok(result)
     }
 
     fn function_expression(&mut self) -> Result<Expr, JsError> {
@@ -1071,16 +1619,42 @@ impl Parser {
         let mut parameters = Vec::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
-                // `undefined` is an ordinary identifier in parameter position.
-                let parameter = match self.advance().kind {
-                    TokenKind::Identifier(name) => name,
-                    TokenKind::Undefined => "undefined".to_owned(),
-                    _ => return Err(self.error("expected a parameter name")),
-                };
-                if parameters.contains(&parameter) {
-                    return Err(self.error("duplicate function parameters are not supported"));
+                if self.take(&TokenKind::Ellipsis) {
+                    let TokenKind::Identifier(parameter) = self.advance().kind else {
+                        return Err(self.error("expected a rest parameter name"));
+                    };
+                    parameters.push(parameter);
+                    break;
                 }
-                parameters.push(parameter);
+                // Destructuring parameters are accepted and lowered to their
+                // bound names. The compact runtime does not yet materialize
+                // a separate pattern environment, but retaining the names
+                // keeps modern framework bundles parseable and callable.
+                let mut bound_names = Vec::new();
+                if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                    let pattern = self.binding_pattern()?;
+                    collect_binding_names(&pattern, &mut bound_names);
+                    if bound_names.is_empty() {
+                        bound_names.push(format!("__arg{}", parameters.len()));
+                    }
+                } else {
+                    // `undefined` is an ordinary identifier in parameter position.
+                    let parameter = match self.advance().kind {
+                        TokenKind::Identifier(name) => name,
+                        TokenKind::Undefined => "undefined".to_owned(),
+                        _ => return Err(self.error("expected a parameter name")),
+                    };
+                    bound_names.push(parameter);
+                }
+                if self.take(&TokenKind::Equal) {
+                    let _ = self.assignment()?;
+                }
+                for parameter in bound_names {
+                    if parameters.contains(&parameter) {
+                        return Err(self.error("duplicate function parameters are not supported"));
+                    }
+                    parameters.push(parameter);
+                }
                 if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
                 }
@@ -1107,6 +1681,102 @@ impl Parser {
         let mut properties = Vec::new();
         if !self.at(&TokenKind::RightBrace) {
             loop {
+                if self.take(&TokenKind::Ellipsis) {
+                    properties.push(ObjectProperty {
+                        key: PropertyKey::Spread,
+                        value: self.assignment()?,
+                    });
+                    if !self.take(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(&TokenKind::RightBrace) {
+                        break;
+                    }
+                    continue;
+                }
+                if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+                    && matches!(
+                        self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+                        Some(TokenKind::LeftParen)
+                    )
+                {
+                    self.advance();
+                    let key = self.property_name()?;
+                    let (parameters, body) = self.function_tail()?;
+                    properties.push(ObjectProperty {
+                        key: PropertyKey::Static(key.clone()),
+                        value: Expr::Function {
+                            name: Some(key),
+                            parameters,
+                            body,
+                        },
+                    });
+                    if !self.take(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(&TokenKind::RightBrace) {
+                        break;
+                    }
+                    continue;
+                }
+                if self.take(&TokenKind::LeftBracket) {
+                    let key = self.assignment()?;
+                    self.require(
+                        &TokenKind::RightBracket,
+                        "expected ']' after computed property name",
+                    )?;
+                    let value = if self.at(&TokenKind::LeftParen) {
+                        let (parameters, body) = self.function_tail()?;
+                        Expr::Function {
+                            name: None,
+                            parameters,
+                            body,
+                        }
+                    } else {
+                        self.require(
+                            &TokenKind::Colon,
+                            "expected ':' after computed property name",
+                        )?;
+                        self.assignment()?
+                    };
+                    properties.push(ObjectProperty {
+                        key: PropertyKey::Computed(key),
+                        value,
+                    });
+                    if !self.take(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(&TokenKind::RightBrace) {
+                        break;
+                    }
+                    continue;
+                }
+                if matches!(
+                    &self.current().kind,
+                    TokenKind::Identifier(name) if name == "get" || name == "set"
+                ) && !matches!(
+                    self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                    Some(TokenKind::LeftParen | TokenKind::Colon | TokenKind::Comma)
+                ) {
+                    self.advance();
+                    let key = self.property_name()?;
+                    let (parameters, body) = self.function_tail()?;
+                    properties.push(ObjectProperty {
+                        key: PropertyKey::Static(key.clone()),
+                        value: Expr::Function {
+                            name: Some(key),
+                            parameters,
+                            body,
+                        },
+                    });
+                    if !self.take(&TokenKind::Comma) {
+                        break;
+                    }
+                    if self.at(&TokenKind::RightBrace) {
+                        break;
+                    }
+                    continue;
+                }
                 let key = self.property_name()?;
                 let value = if self.take(&TokenKind::Colon) {
                     self.assignment()?
@@ -1120,7 +1790,10 @@ impl Parser {
                 } else {
                     Expr::Identifier(key.clone())
                 };
-                properties.push((key, value));
+                properties.push(ObjectProperty {
+                    key: PropertyKey::Static(key),
+                    value,
+                });
                 if !self.take(&TokenKind::Comma) {
                     break;
                 }
@@ -1142,7 +1815,12 @@ impl Parser {
                 elements.push(Expr::Literal(JsValue::Undefined));
                 continue;
             }
-            elements.push(self.assignment()?);
+            let element = if self.take(&TokenKind::Ellipsis) {
+                Expr::Spread(Box::new(self.assignment()?))
+            } else {
+                self.assignment()?
+            };
+            elements.push(element);
             if !self.take(&TokenKind::Comma) {
                 break;
             }
@@ -1255,6 +1933,49 @@ fn has_use_strict_directive(statements: &[Statement]) -> bool {
         })
 }
 
+fn is_identifier_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_alphabetic() || matches!(character, '_' | '$'))
+        && characters.all(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '$' | '\u{200c}' | '\u{200d}')
+        })
+        && !matches!(
+            name,
+            "let"
+                | "const"
+                | "var"
+                | "function"
+                | "return"
+                | "new"
+                | "throw"
+                | "try"
+                | "catch"
+                | "finally"
+                | "if"
+                | "else"
+                | "while"
+                | "do"
+                | "for"
+                | "break"
+                | "continue"
+                | "delete"
+                | "typeof"
+                | "void"
+                | "in"
+                | "instanceof"
+                | "switch"
+                | "case"
+                | "default"
+                | "this"
+                | "true"
+                | "false"
+                | "null"
+                | "undefined"
+        )
+}
+
 fn validate_strict_statements(statements: &[Statement]) -> Result<(), JsError> {
     for statement in statements {
         validate_strict_statement(statement)?;
@@ -1312,6 +2033,21 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         }
         Statement::Labeled { body, .. } => validate_strict_statement(body),
         Statement::ForIn {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            if is_strict_reserved_word(name) {
+                return Err(JsError::syntax(
+                    format!("{name} is reserved in strict mode"),
+                    0,
+                ));
+            }
+            validate_strict_expression(iterable)?;
+            validate_strict_statement(body)
+        }
+        Statement::ForOf {
             name,
             iterable,
             body,
@@ -1401,10 +2137,15 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
                 Ok(())
             }
         }
-        Expr::Object(properties) => properties
-            .iter()
-            .try_for_each(|(_, value)| validate_strict_expression(value)),
+        Expr::Object(properties) => properties.iter().try_for_each(|property| {
+            if let PropertyKey::Computed(key) = &property.key {
+                validate_strict_expression(key)?;
+            }
+            validate_strict_expression(&property.value)
+        }),
         Expr::Array(elements) => elements.iter().try_for_each(validate_strict_expression),
+        Expr::Spread(expression) => validate_strict_expression(expression),
+        Expr::ObjectRest { object, .. } => validate_strict_expression(object),
         Expr::Unary {
             operator: UnaryOp::Delete,
             operand,

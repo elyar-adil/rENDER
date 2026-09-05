@@ -205,15 +205,13 @@ pub fn prepare_script_batch(
     };
     let current_revision = document.dom().revision();
     if current_revision != plan.revision {
-        preparation.diagnostics.push(general_diagnostic(
-            ScriptResourceDiagnosticCode::StalePlan,
-            format!(
-                "script plan targets DOM revision {}, but the document is at revision {}",
-                plan.revision.as_u64(),
-                current_revision.as_u64()
-            ),
-        ));
-        return preparation;
+        // Resource completion and DOM mutation are concurrent from the
+        // embedding's perspective.  A script plan remains valid when the
+        // document changed while bytes were in flight; queue it against the
+        // current revision and let the per-script owner checks decide what is
+        // still present.  Rejecting the whole batch strands unrelated page
+        // bootstrap scripts after a harmless image or style mutation.
+        preparation.revision = current_revision;
     }
 
     let result_count = results.len();
@@ -369,6 +367,10 @@ fn is_javascript_mime(media_type: &str) -> bool {
             | "text/ecmascript"
             | "application/ecmascript"
             | "application/x-javascript"
+            // A number of production sites still serve generated bootstrap
+            // code as text/plain. With no nosniff policy this is accepted by
+            // mainstream browsers' compatibility path.
+            | "text/plain"
     )
 }
 

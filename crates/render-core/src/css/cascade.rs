@@ -101,6 +101,13 @@ pub fn cascade_element_with_inline(
 
     for (source_index, source) in sources.iter().enumerate() {
         for rule in &source.sheet.rules {
+            if !rule
+                .media
+                .iter()
+                .all(|query| media_query_list_matches(query, context))
+            {
+                continue;
+            }
             let specificity = matching_specificity(dom, element, &rule.selectors, context);
             for declaration in &rule.declarations {
                 source_order = source_order.saturating_add(1);
@@ -188,6 +195,106 @@ pub fn cascade_element_with_inline(
             })
             .collect(),
     }
+}
+
+pub(crate) fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
+    split_media_list(query)
+        .into_iter()
+        .any(|query| media_query_matches(query, context))
+}
+
+fn split_media_list(query: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    for (index, character) in query.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                result.push(query[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    result.push(query[start..].trim());
+    result
+}
+
+fn media_query_matches(query: &str, context: &MatchContext) -> bool {
+    let query = query.trim().to_ascii_lowercase();
+    let (negated, query) = query
+        .strip_prefix("not ")
+        .map_or((false, query.as_str()), |query| (true, query));
+    let query = query.strip_prefix("only ").unwrap_or(query);
+    let matches = query
+        .split(" and ")
+        .map(str::trim)
+        .all(|condition| media_condition_matches(condition, context));
+    if negated { !matches } else { matches }
+}
+
+fn media_condition_matches(condition: &str, context: &MatchContext) -> bool {
+    match condition {
+        "" | "all" | "screen" => return true,
+        "print" | "speech" => return false,
+        _ => {}
+    }
+    let Some(feature) = condition
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let Some((name, value)) = feature.split_once(':') else {
+        return false;
+    };
+    let name = name.trim();
+    let value = value.trim();
+    let dimension = match name {
+        "width" | "min-width" | "max-width" => context.viewport_width,
+        "height" | "min-height" | "max-height" => context.viewport_height,
+        "orientation" => {
+            let Some((width, height)) = context.viewport_width.zip(context.viewport_height) else {
+                return false;
+            };
+            return match value {
+                "landscape" => width >= height,
+                "portrait" => height > width,
+                _ => false,
+            };
+        }
+        _ => return false,
+    };
+    let Some(actual) = dimension else {
+        return false;
+    };
+    let Some(expected) = parse_media_length(value) else {
+        return false;
+    };
+    match name {
+        "min-width" | "min-height" => actual >= expected,
+        "max-width" | "max-height" => actual <= expected,
+        _ => (actual - expected).abs() < f32::EPSILON,
+    }
+}
+
+fn parse_media_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(0.0);
+    }
+    for (unit, factor) in [("px", 1.0), ("em", 16.0), ("rem", 16.0)] {
+        if let Some(number) = value.strip_suffix(unit) {
+            return number
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|value| value * factor);
+        }
+    }
+    None
 }
 
 fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
@@ -609,6 +716,34 @@ mod tests {
                 .get("color")
                 .map(|value| value.value.as_str()),
             Some("red")
+        );
+    }
+
+    #[test]
+    fn media_rules_match_the_actual_layout_viewport() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { color:black } \
+             @media screen and (min-width: 700px) { #target { color:green } } \
+             @media screen and (max-width: 699px) { #target { color:red } } \
+             @media print { #target { color:blue } }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext {
+                viewport_width: Some(800.0),
+                viewport_height: Some(600.0),
+                ..MatchContext::default()
+            },
+        );
+        assert_eq!(
+            style.get("color").map(|value| value.value.as_str()),
+            Some("green")
         );
     }
 

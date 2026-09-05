@@ -96,6 +96,8 @@ fn run() {
             Err(error) => println!("ERR  {name}: {}", error.message()),
         }
     }
+    let mut target_document = parse_document("<!doctype html><p></p>");
+    let mut target_runtime = JsRuntime::new(&target_document.dom);
     for path in std::env::args().skip(1) {
         let Ok(source) = std::fs::read_to_string(&path) else {
             println!("SKIP {path} (unreadable)");
@@ -106,9 +108,7 @@ fn run() {
             .and_then(|name| name.to_str())
             .unwrap_or(&path)
             .to_owned();
-        let mut parsed = parse_document("<!doctype html><p></p>");
-        let mut runtime = JsRuntime::new(&parsed.dom);
-        match runtime.execute(&mut parsed.dom, &source) {
+        match target_runtime.execute(&mut target_document.dom, &source) {
             Ok(_) => println!("OK   {name}"),
             Err(error) => {
                 println!("ERR  {name}: {} at {:?}", error.message(), error.offset());

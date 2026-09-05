@@ -11,8 +11,8 @@ use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
 use render_core::image::{
     ImageDiscoveryDiagnostic, ImageDiscoveryDiagnosticCode, ImageFormat, ImageLimits,
-    ImageResourceKey, ImageResources, decode_image, discover_images_with_styles,
-    image_key_is_current, sniff_image_format,
+    ImageResourceKey, ImageResources, ImageSelectionContext, ImageSource, decode_image,
+    discover_images_with_styles_and_context, image_key_is_current, sniff_image_format,
 };
 use render_core::paint::ImageResourceId;
 use render_net::{FetchRequest, FetchResponse, FetchResult, Url};
@@ -85,6 +85,7 @@ pub struct ImageResourceDiagnostic {
 pub struct LoadedImageMetadata {
     pub source_order: usize,
     pub owner: NodeId,
+    pub source: ImageSource,
     pub requested_url: Url,
     pub final_url: Url,
     pub resource_id: ImageResourceId,
@@ -121,7 +122,32 @@ pub fn plan_images_with_styles(
     loaded: &ImageResources,
     limits: ImageLimits,
 ) -> ImageFetchPlan {
-    let discovery = discover_images_with_styles(document.dom(), styles, document_url, limits);
+    plan_images_with_styles_and_context(
+        document,
+        styles,
+        document_url,
+        loaded,
+        limits,
+        ImageSelectionContext::default(),
+    )
+}
+
+#[must_use]
+pub fn plan_images_with_styles_and_context(
+    document: &Document,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    document_url: &Url,
+    loaded: &ImageResources,
+    limits: ImageLimits,
+    context: ImageSelectionContext,
+) -> ImageFetchPlan {
+    let discovery = discover_images_with_styles_and_context(
+        document.dom(),
+        styles,
+        document_url,
+        limits,
+        context,
+    );
     let diagnostics = discovery
         .diagnostics
         .into_iter()
@@ -283,6 +309,7 @@ fn apply_response(
         Ok(resource_id) => application.loaded.push(LoadedImageMetadata {
             source_order: resource.source_order,
             owner: resource.key.owner,
+            source: resource.key.source,
             requested_url: resource.key.requested_url.clone(),
             final_url: response.final_url,
             resource_id,

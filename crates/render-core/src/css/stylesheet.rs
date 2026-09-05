@@ -40,6 +40,8 @@ pub struct StyleRule {
     pub selectors: SelectorList,
     pub declarations: Vec<Declaration>,
     pub layer: Option<LayerName>,
+    /// Every enclosing `@media` query, from outermost to innermost.
+    pub media: Vec<String>,
     pub source_order: u64,
 }
 
@@ -87,6 +89,27 @@ enum ParsedRule {
         layer: LayerName,
         rules: Vec<Self>,
         diagnostics: Vec<StyleSheetDiagnostic>,
+        location: SourceLocation,
+    },
+    MediaBlock {
+        query: String,
+        rules: Vec<Self>,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+    },
+    SupportsBlock {
+        query: String,
+        rules: Vec<Self>,
+        diagnostics: Vec<StyleSheetDiagnostic>,
+    },
+    /// Animation/font at-rules are valid stylesheet rules even when the
+    /// compositor does not yet sample their timelines. Keep them in the
+    /// parsed rule stream so they do not poison the rest of the stylesheet
+    /// with false syntax diagnostics.
+    KeyframesBlock {
+        name: String,
+        location: SourceLocation,
+    },
+    FontFaceBlock {
         location: SourceLocation,
     },
     IgnoredAtRule {
@@ -199,6 +222,37 @@ impl<'i> AtRuleParser<'i> for RuleParser<'_> {
             });
         }
 
+        if prelude.name == "media" {
+            let (rules, diagnostics) = parse_rule_list(input, self.next_anonymous_layer);
+            return Ok(ParsedRule::MediaBlock {
+                query: prelude.value,
+                rules,
+                diagnostics,
+            });
+        }
+
+        if prelude.name.ends_with("keyframes") {
+            consume_raw(input);
+            return Ok(ParsedRule::KeyframesBlock {
+                name: prelude.value.trim().to_owned(),
+                location: start.source_location(),
+            });
+        }
+
+        if prelude.name == "supports" {
+            let (rules, diagnostics) = parse_rule_list(input, self.next_anonymous_layer);
+            return Ok(ParsedRule::SupportsBlock {
+                query: prelude.value,
+                rules,
+                diagnostics,
+            });
+        }
+        if prelude.name == "font-face" {
+            let _ = parse_declarations(input);
+            return Ok(ParsedRule::FontFaceBlock {
+                location: start.source_location(),
+            });
+        }
         consume_raw(input);
         Ok(ParsedRule::IgnoredAtRule {
             name: prelude.name,
@@ -304,7 +358,7 @@ pub fn parse_stylesheet(source: &str) -> StyleSheet {
         diagnostics,
         ..StyleSheet::default()
     };
-    flatten_rules(rules, None, &mut sheet);
+    flatten_rules(rules, None, &[], &mut sheet);
     sheet
 }
 
@@ -412,7 +466,12 @@ fn register_layer(sheet: &mut StyleSheet, layer: &LayerName) {
     }
 }
 
-fn flatten_rules(rules: Vec<ParsedRule>, layer: Option<&LayerName>, sheet: &mut StyleSheet) {
+fn flatten_rules(
+    rules: Vec<ParsedRule>,
+    layer: Option<&LayerName>,
+    media: &[String],
+    sheet: &mut StyleSheet,
+) {
     for rule in rules {
         match rule {
             ParsedRule::Style {
@@ -425,6 +484,7 @@ fn flatten_rules(rules: Vec<ParsedRule>, layer: Option<&LayerName>, sheet: &mut 
                     selectors,
                     declarations,
                     layer: layer.cloned(),
+                    media: media.to_vec(),
                     source_order: u64::try_from(sheet.rules.len()).unwrap_or(u64::MAX),
                 });
             }
@@ -454,8 +514,40 @@ fn flatten_rules(rules: Vec<ParsedRule>, layer: Option<&LayerName>, sheet: &mut 
                     ));
                 } else {
                     register_layer(sheet, &nested_layer);
-                    flatten_rules(rules, Some(&nested_layer), sheet);
+                    flatten_rules(rules, Some(&nested_layer), media, sheet);
                 }
+            }
+            ParsedRule::MediaBlock {
+                query,
+                rules,
+                diagnostics,
+            } => {
+                sheet.diagnostics.extend(diagnostics);
+                let mut nested_media = media.to_vec();
+                nested_media.push(query);
+                flatten_rules(rules, layer, &nested_media, sheet);
+            }
+            ParsedRule::SupportsBlock {
+                query,
+                rules,
+                diagnostics,
+            } => {
+                // Property support is intentionally permissive until the
+                // computed-value registry grows a complete CSS.supports
+                // implementation. Parsing the nested rules is still enough
+                // to honor the common `@supports (display: grid)` blocks.
+                let _ = query;
+                sheet.diagnostics.extend(diagnostics);
+                flatten_rules(rules, layer, media, sheet);
+            }
+            ParsedRule::KeyframesBlock { name, location } => {
+                // The current paint pipeline has no animation clock, but the
+                // at-rule is still valid and must not make a stylesheet fail.
+                let _ = name;
+                let _ = location;
+            }
+            ParsedRule::FontFaceBlock { location } => {
+                let _ = location;
             }
             ParsedRule::IgnoredAtRule { name, location } => {
                 sheet.diagnostics.push(capability_diagnostic(

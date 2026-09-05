@@ -58,7 +58,6 @@ pub enum ScriptDiagnosticCode {
     ExternalUrlBytesLimit,
     EmptyExternalSource,
     UnresolvedExternalSource,
-    ModuleUnsupported,
     ImportMapUnsupported,
     UnsupportedType,
 }
@@ -78,11 +77,11 @@ pub struct ScriptDiscovery {
     pub diagnostics: Vec<ScriptDiagnostic>,
 }
 
-/// Discover executable classic scripts in DOM tree order.
+/// Discover executable scripts in DOM tree order.
 ///
-/// Inline and external scripts are represented uniformly. Module and import-map
-/// semantics remain explicit diagnostics until their execution algorithms are
-/// implemented.
+/// Inline, external, and module scripts are represented uniformly. Module
+/// scripts use deferred scheduling and execute in the page realm; import-map
+/// semantics remain an explicit diagnostic until resolution maps are added.
 #[must_use]
 pub fn discover_scripts(
     document: &Document,
@@ -204,17 +203,14 @@ impl DiscoveryState {
         element: &ElementData,
     ) -> Option<ScriptScheduling> {
         let script_type = attribute(element, "type").map_or("", str::trim);
-        let unsupported = if script_type.eq_ignore_ascii_case("module") {
-            Some((
-                ScriptDiagnosticCode::ModuleUnsupported,
-                "JavaScript modules are not implemented".to_owned(),
-            ))
-        } else if script_type.eq_ignore_ascii_case("importmap") {
+        let unsupported = if script_type.eq_ignore_ascii_case("importmap") {
             Some((
                 ScriptDiagnosticCode::ImportMapUnsupported,
                 "import maps are not implemented".to_owned(),
             ))
-        } else if !is_classic_javascript_type(script_type) {
+        } else if !script_type.eq_ignore_ascii_case("module")
+            && !is_classic_javascript_type(script_type)
+        {
             Some((
                 ScriptDiagnosticCode::UnsupportedType,
                 format!(
@@ -228,15 +224,24 @@ impl DiscoveryState {
             self.diagnose(owner, source_order, code, message);
             None
         } else {
-            Some(
-                if has_attribute(element, "src") && has_attribute(element, "async") {
-                    ScriptScheduling::Async
-                } else if has_attribute(element, "src") && has_attribute(element, "defer") {
-                    ScriptScheduling::Defer
-                } else {
-                    ScriptScheduling::ParserBlocking
-                },
-            )
+            // Module scripts are deferred by definition. The JavaScript
+            // runtime accepts their import/export grammar as a single realm
+            // script; static imports are handled by the parser's module
+            // recovery path and dynamic import is provided by the realm.
+            let is_module = script_type.eq_ignore_ascii_case("module");
+            Some(if is_module {
+                ScriptScheduling::Defer
+            } else if has_attribute(element, "nomodule") {
+                // A module-capable browser must not execute the legacy
+                // fallback. `nomodule` is a presence attribute.
+                return None;
+            } else if has_attribute(element, "src") && has_attribute(element, "async") {
+                ScriptScheduling::Async
+            } else if has_attribute(element, "src") && has_attribute(element, "defer") {
+                ScriptScheduling::Defer
+            } else {
+                ScriptScheduling::ParserBlocking
+            })
         }
     }
 
@@ -482,6 +487,7 @@ mod tests {
                 .map(|script| script.scheduling)
                 .collect::<Vec<_>>(),
             [
+                ScriptScheduling::Defer,
                 ScriptScheduling::Async,
                 ScriptScheduling::Defer,
                 ScriptScheduling::ParserBlocking,
@@ -489,13 +495,7 @@ mod tests {
                 ScriptScheduling::ParserBlocking,
             ]
         );
-        assert_eq!(
-            codes,
-            [
-                ScriptDiagnosticCode::ModuleUnsupported,
-                ScriptDiagnosticCode::UnsupportedType,
-            ]
-        );
+        assert_eq!(codes, [ScriptDiagnosticCode::UnsupportedType,]);
     }
 
     #[test]

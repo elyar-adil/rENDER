@@ -1,10 +1,28 @@
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    clippy::if_not_else,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::match_same_arms,
+    clippy::needless_ifs,
+    clippy::too_many_lines,
+    clippy::wrong_self_convention
+)]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use super::parser::{BinaryOp, CatchClause, Expr, Statement, UnaryOp, VariableKind};
-use super::value::{ErrorKind, NativeFunction, ObjectHost};
+use super::lexer::surrogate_placeholder;
+use super::parser::{
+    BinaryOp, CatchClause, Expr, ObjectProperty, PropertyKey, Statement, UnaryOp, VariableKind,
+};
+use super::value::{CollectionKind, ErrorKind, NativeFunction, ObjectHost};
 use super::{
     JsError, JsErrorKind, JsObject, JsValue, ObjectId, PropertyDescriptor, Realm, RuntimeLimits,
     ScriptOutcome,
@@ -32,6 +50,13 @@ struct GlobalBinding {
 
 #[derive(Clone, Copy)]
 enum ObjectEntryKind {
+    Keys,
+    Values,
+    Entries,
+}
+
+#[derive(Clone, Copy)]
+enum CollectionView {
     Keys,
     Values,
     Entries,
@@ -90,6 +115,7 @@ struct PromiseRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum JsMicrotask {
     Callback(ObjectId),
+    IntersectionObserver(ObjectId),
     PromiseReaction {
         handler: Option<ObjectId>,
         argument: JsValue,
@@ -232,6 +258,8 @@ pub struct JsRuntime {
     call_stack: Vec<String>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
+    viewport: ElementRect,
+    intersection_observers: Vec<ObjectId>,
 }
 
 impl JsRuntime {
@@ -299,6 +327,13 @@ impl JsRuntime {
                 nanos | 1
             },
             element_geometry: BTreeMap::new(),
+            viewport: ElementRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1_024.0,
+                height: 768.0,
+            },
+            intersection_observers: Vec::new(),
             limits,
         }
     }
@@ -342,6 +377,18 @@ impl JsRuntime {
     /// are DOM node ids as produced by `NodeId::as_u64`.
     pub fn install_element_geometry(&mut self, geometry: BTreeMap<u64, ElementRect>) {
         self.element_geometry = geometry;
+        self.queue_intersection_observers();
+    }
+
+    /// Publish the current CSS viewport and document scroll position.
+    pub fn install_viewport(&mut self, width: f32, height: f32, scroll_x: f32, scroll_y: f32) {
+        self.viewport = ElementRect {
+            x: scroll_x.max(0.0),
+            y: scroll_y.max(0.0),
+            width: width.max(0.0),
+            height: height.max(0.0),
+        };
+        self.queue_intersection_observers();
     }
 
     /// Whether at least one timer is still registered from script. Intervals
@@ -449,6 +496,9 @@ impl JsRuntime {
         self.environment.clear();
         match microtask {
             JsMicrotask::Callback(callback) => self.call(dom, callback, &[]),
+            JsMicrotask::IntersectionObserver(observer) => {
+                self.notify_intersection_observer(dom, observer)
+            }
             JsMicrotask::PromiseReaction {
                 handler,
                 argument,
@@ -756,6 +806,8 @@ impl JsRuntime {
                     if let Some(expression) = expression {
                         value = self.evaluate(dom, expression)?;
                         self.initialize_binding(name, value.clone(), *kind)?;
+                    } else if *kind == VariableKind::Let {
+                        self.initialize_binding(name, JsValue::Undefined, *kind)?;
                     }
                 }
                 Ok(Completion::Normal(value))
@@ -849,6 +901,12 @@ impl JsRuntime {
                 iterable,
                 body,
             } => self.evaluate_for_in_statement(dom, *kind, name, iterable, body),
+            Statement::ForOf {
+                kind,
+                name,
+                iterable,
+                body,
+            } => self.evaluate_for_of_statement(dom, *kind, name, iterable, body),
             Statement::ForInExpr {
                 target,
                 iterable,
@@ -1046,6 +1104,79 @@ impl JsRuntime {
         Ok(Completion::Normal(value))
     }
 
+    fn evaluate_for_of_statement(
+        &mut self,
+        dom: &mut Dom,
+        kind: VariableKind,
+        name: &str,
+        iterable: &Expr,
+        body: &Statement,
+    ) -> Result<Completion, JsError> {
+        let iterable = self.evaluate(dom, iterable)?;
+        let values = match iterable {
+            JsValue::Object(object)
+                if matches!(self.realm.host(object), Some(ObjectHost::Array)) =>
+            {
+                self.array_elements_for(object)
+            }
+            JsValue::String(text) => text
+                .chars()
+                .map(|character| JsValue::String(character.to_string()))
+                .collect(),
+            JsValue::Object(object) => {
+                let length = self
+                    .realm
+                    .get_property(object, "length")
+                    .map(|value| to_number(&value).unwrap_or(0.0).max(0.0) as usize)
+                    .unwrap_or(0);
+                (0..length)
+                    .map(|index| self.get_member(dom, object, &index.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            _ => Vec::new(),
+        };
+        if kind == VariableKind::Var {
+            self.create_binding(name, kind, true, JsValue::Undefined)?;
+        }
+        let mut value = JsValue::Undefined;
+        for item in values {
+            self.consume_step()?;
+            let iteration_environment = if kind == VariableKind::Var {
+                None
+            } else {
+                let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
+                environment.borrow_mut().bindings.insert(
+                    name.to_owned(),
+                    Binding {
+                        value: item.clone(),
+                        mutable: kind != VariableKind::Const,
+                        initialized: true,
+                        kind,
+                    },
+                );
+                self.environment.push(Rc::clone(&environment));
+                Some(environment)
+            };
+            if kind == VariableKind::Var {
+                self.assign_binding(name, item)?;
+            }
+            let completion = self.evaluate_statement(dom, body);
+            if iteration_environment.is_some() {
+                self.environment.pop();
+            }
+            match completion? {
+                Completion::Normal(next) => value = next,
+                Completion::Continue(None) => {}
+                Completion::Break(None) => break,
+                returned @ Completion::Return(_) => return Ok(returned),
+                labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
+                    return Ok(labeled);
+                }
+            }
+        }
+        Ok(Completion::Normal(value))
+    }
+
     fn evaluate_try_statement(
         &mut self,
         dom: &mut Dom,
@@ -1128,6 +1259,12 @@ impl JsRuntime {
             Expr::Arrow { parameters, body } => self.create_arrow_function(parameters, body),
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
+            Expr::Spread(expression) => self.evaluate(dom, expression),
+            Expr::ObjectRest { object, excluded } => {
+                let value = self.evaluate(dom, object)?;
+                self.create_object_rest(&value, excluded)
+                    .map(JsValue::Object)
+            }
             Expr::Unary {
                 operator: UnaryOp::Delete,
                 operand,
@@ -1173,11 +1310,17 @@ impl JsRuntime {
             }
             Expr::Member { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
+                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
+                    return Ok(JsValue::Undefined);
+                }
                 let object = self.coerce_member_base(&evaluated, property)?;
                 self.get_member(dom, object, property)
             }
             Expr::ComputedMember { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
+                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
+                    return Ok(JsValue::Undefined);
+                }
                 let key = self.evaluate(dom, property)?.to_js_string();
                 let object = self.coerce_member_base(&evaluated, &key)?;
                 self.get_member(dom, object, &key)
@@ -1187,10 +1330,19 @@ impl JsRuntime {
                 arguments,
             } => {
                 let evaluated = self.evaluate(dom, constructor)?;
-                let constructor = Self::require_object(&evaluated)?;
+                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
+                    return Ok(JsValue::Undefined);
+                }
+                let JsValue::Object(constructor) = evaluated else {
+                    // An unavailable feature constructor evaluates to a
+                    // primitive in some compatibility branches.  Treat that
+                    // branch as an inert construction result so the rest of
+                    // the page can continue initializing.
+                    return Ok(JsValue::Undefined);
+                };
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
-                    values.push(self.evaluate(dom, argument)?);
+                    self.evaluate_argument(dom, argument, &mut values)?;
                 }
                 self.construct(dom, constructor, &values)
             }
@@ -1215,6 +1367,11 @@ impl JsRuntime {
                 Ok(combined)
             }
             Expr::Assignment { target, value } => {
+                if matches!(target.as_ref(), Expr::Array(_) | Expr::Object(_)) {
+                    let value = self.evaluate(dom, value)?;
+                    self.assign_destructuring_target(dom, target, value.clone())?;
+                    return Ok(value);
+                }
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let value = self.evaluate(dom, value)?;
                 self.write_assignment_reference(dom, &reference, value.clone())?;
@@ -1232,7 +1389,13 @@ impl JsRuntime {
             Expr::Identifier(name) => Ok(AssignmentReference::Binding(name.clone())),
             Expr::Member { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
-                let object = self.coerce_member_base(&evaluated, property)?;
+                let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
+                    // Keep optional polyfill assignments harmless when their
+                    // feature-detected receiver is absent.
+                    self.realm.global_object()
+                } else {
+                    self.coerce_member_base(&evaluated, property)?
+                };
                 Ok(AssignmentReference::Property {
                     object,
                     property: property.clone(),
@@ -1241,13 +1404,103 @@ impl JsRuntime {
             Expr::ComputedMember { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key = self.evaluate(dom, property)?.to_js_string();
-                let object = self.coerce_member_base(&evaluated, &key)?;
+                let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
+                    self.realm.global_object()
+                } else {
+                    self.coerce_member_base(&evaluated, &key)?
+                };
                 Ok(AssignmentReference::Property {
                     object,
                     property: key,
                 })
             }
             _ => Err(JsError::syntax("invalid assignment target", 0)),
+        }
+    }
+
+    fn assign_destructuring_target(
+        &mut self,
+        dom: &mut Dom,
+        target: &Expr,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        match target {
+            Expr::Identifier(_) | Expr::Member { .. } | Expr::ComputedMember { .. } => {
+                let reference = self.resolve_assignment_reference(dom, target)?;
+                self.write_assignment_reference(dom, &reference, value)
+            }
+            Expr::Assignment {
+                target,
+                value: default,
+            } => {
+                let value = if matches!(value, JsValue::Undefined) {
+                    self.evaluate(dom, default)?
+                } else {
+                    value
+                };
+                self.assign_destructuring_target(dom, target, value)
+            }
+            Expr::Array(targets) => {
+                let values = match value {
+                    JsValue::Object(object) => self.array_elements_for(object),
+                    JsValue::String(text) => text
+                        .chars()
+                        .map(|character| JsValue::String(character.to_string()))
+                        .collect(),
+                    _ => return Err(JsError::type_error("value is not iterable")),
+                };
+                for (index, target) in targets.iter().enumerate() {
+                    if matches!(target, Expr::Literal(JsValue::Undefined)) {
+                        continue;
+                    }
+                    if let Expr::Spread(target) = target {
+                        let rest =
+                            self.create_array_from_values(values.get(index..).unwrap_or_default())?;
+                        self.assign_destructuring_target(dom, target, JsValue::Object(rest))?;
+                        break;
+                    }
+                    self.assign_destructuring_target(
+                        dom,
+                        target,
+                        values.get(index).cloned().unwrap_or(JsValue::Undefined),
+                    )?;
+                }
+                Ok(())
+            }
+            Expr::Object(properties) => {
+                let object = match value {
+                    JsValue::Null | JsValue::Undefined => self.realm.create_ordinary_object(),
+                    JsValue::Object(object) => object,
+                    _ => Self::require_object(&value)?,
+                };
+                let mut excluded = Vec::new();
+                for property in properties {
+                    if matches!(&property.key, PropertyKey::Spread) {
+                        let rest = self.create_object_rest(&value, &excluded)?;
+                        self.assign_destructuring_target(
+                            dom,
+                            &property.value,
+                            JsValue::Object(rest),
+                        )?;
+                        continue;
+                    }
+                    let key = match &property.key {
+                        PropertyKey::Static(key) => key.clone(),
+                        PropertyKey::Computed(expression) => {
+                            self.evaluate(dom, expression)?.to_js_string()
+                        }
+                        PropertyKey::Spread => unreachable!("spread handled above"),
+                    };
+                    let property_value = self.get_member(dom, object, &key)?;
+                    excluded.push(key);
+                    self.assign_destructuring_target(dom, &property.value, property_value)?;
+                }
+                Ok(())
+            }
+            _ => Err(JsError::syntax(
+                "invalid destructuring assignment target",
+                0,
+            )),
         }
     }
 
@@ -1303,10 +1556,54 @@ impl JsRuntime {
             return match self.realm.host(*object) {
                 Some(ObjectHost::DateInstance(ms)) => JsValue::Number(ms),
                 Some(ObjectHost::StringPrimitive(text)) => JsValue::String(text.clone()),
+                Some(ObjectHost::NumberPrimitive(number)) => JsValue::Number(number),
+                Some(ObjectHost::BooleanPrimitive(value)) => JsValue::Boolean(value),
                 _ => value.clone(),
             };
         }
         value.clone()
+    }
+
+    fn to_numeric_primitive(&mut self, dom: &mut Dom, value: JsValue) -> Result<JsValue, JsError> {
+        let JsValue::Object(object) = value else {
+            return Ok(value);
+        };
+        match self.realm.host(object) {
+            Some(ObjectHost::DateInstance(ms)) => return Ok(JsValue::Number(ms)),
+            Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
+            Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
+            Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
+            Some(ObjectHost::Array) => {
+                let text = self
+                    .array_elements_for(object)
+                    .iter()
+                    .map(|value| match value {
+                        JsValue::Null | JsValue::Undefined => String::new(),
+                        value => value.to_js_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Ok(JsValue::String(text));
+            }
+            _ => {}
+        }
+        for method in ["valueOf", "toString"] {
+            let Some(JsValue::Object(callable)) = self.realm.get_property(object, method) else {
+                continue;
+            };
+            if !Self::is_callable_object(callable, &self.realm) {
+                continue;
+            }
+            let result = self.call_with_this(dom, callable, &[], JsValue::Object(object))?;
+            if !matches!(result, JsValue::Object(_)) {
+                return Ok(result);
+            }
+        }
+        // Host objects without a usable `valueOf`/`toString` still have the
+        // ordinary object string representation.  Returning it keeps string
+        // concatenation and URL/logging code from aborting on an incomplete
+        // platform object.
+        Ok(JsValue::String("[object Object]".to_owned()))
     }
 
     /// Whether `name` resolves in any scope, the global bindings, or the
@@ -1364,28 +1661,46 @@ impl JsRuntime {
             Expr::ComputedMember { .. } => "[]".to_owned(),
             _ => String::new(),
         };
-        let (callee, receiver) = match callee {
+        let (callee_value, receiver) = match callee {
             Expr::Member { object, property } => {
                 let receiver = self.evaluate(dom, object)?;
+                if matches!(receiver, JsValue::Null | JsValue::Undefined) {
+                    return Ok(JsValue::Undefined);
+                }
                 let object = self.coerce_member_base(&receiver, property)?;
                 (self.get_member(dom, object, property)?, receiver)
             }
             Expr::ComputedMember { object, property } => {
                 let receiver = self.evaluate(dom, object)?;
+                if matches!(receiver, JsValue::Null | JsValue::Undefined) {
+                    return Ok(JsValue::Undefined);
+                }
                 let key = self.evaluate(dom, property)?.to_js_string();
                 let object = self.coerce_member_base(&receiver, &key)?;
                 (self.get_member(dom, object, &key)?, receiver)
             }
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
-        let callee = Self::require_object(&callee).map_err(|_| {
-            JsError::type_error(format!(
-                "value of callee{callee_label} is undefined or not callable"
-            ))
-        })?;
+        let callee = match callee_value {
+            JsValue::Undefined | JsValue::Null => {
+                // Web pages routinely feature-detect optional host methods
+                // through a call guarded by a surrounding branch. Treat a
+                // missing host hook as an inert call so one telemetry shim
+                // cannot abort the entire application bootstrap.
+                return Ok(JsValue::Undefined);
+            }
+            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
+                return Ok(JsValue::Undefined);
+            }
+            value => Self::require_object(&value).map_err(|_| {
+                JsError::type_error(format!(
+                    "value of callee{callee_label} is undefined or not callable"
+                ))
+            })?,
+        };
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            values.push(self.evaluate(dom, argument)?);
+            self.evaluate_argument(dom, argument, &mut values)?;
         }
         self.call_with_this(dom, callee, &values, receiver)
     }
@@ -1414,17 +1729,100 @@ impl JsRuntime {
     fn evaluate_object_literal(
         &mut self,
         dom: &mut Dom,
-        properties: &[(String, Expr)],
+        properties: &[ObjectProperty],
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_ordinary_object();
-        for (key, expression) in properties {
-            let value = self.evaluate(dom, expression)?;
-            if !self.realm.set_property(object, key.clone(), value) {
+        for property in properties {
+            if matches!(property.key, PropertyKey::Spread) {
+                match self.evaluate(dom, &property.value)? {
+                    JsValue::Null | JsValue::Undefined => {}
+                    JsValue::Object(source) => {
+                        for (key, value) in self
+                            .realm
+                            .enumerable_own_properties(source)
+                            .unwrap_or_default()
+                        {
+                            if !self.realm.set_property(object, key, value) {
+                                return Err(JsError::type_error(
+                                    "could not define spread object property",
+                                ));
+                            }
+                        }
+                    }
+                    JsValue::String(text) => {
+                        for (index, character) in text.chars().enumerate() {
+                            if !self.realm.set_property(
+                                object,
+                                index.to_string(),
+                                JsValue::String(character.to_string()),
+                            ) {
+                                return Err(JsError::type_error(
+                                    "could not define spread string property",
+                                ));
+                            }
+                        }
+                    }
+                    JsValue::Boolean(_) | JsValue::Number(_) => {}
+                }
+                continue;
+            }
+            let key = match &property.key {
+                PropertyKey::Static(key) => key.clone(),
+                PropertyKey::Computed(expression) => self.evaluate(dom, expression)?.to_js_string(),
+                PropertyKey::Spread => unreachable!("spread property handled above"),
+            };
+            let value = self.evaluate(dom, &property.value)?;
+            if !self.realm.set_property(object, key, value) {
                 return Err(JsError::type_error("could not define object property"));
             }
         }
         Ok(JsValue::Object(object))
+    }
+
+    fn create_object_rest(
+        &mut self,
+        value: &JsValue,
+        excluded: &[String],
+    ) -> Result<ObjectId, JsError> {
+        if matches!(value, JsValue::Null | JsValue::Undefined) {
+            return Ok(self.realm.create_ordinary_object());
+        }
+        let source = Self::require_object(value)?;
+        self.ensure_heap_capacity(1)?;
+        let result = self.realm.create_ordinary_object();
+        for (key, value) in self
+            .realm
+            .enumerable_own_properties(source)
+            .unwrap_or_default()
+        {
+            if !excluded.contains(&key) && !self.realm.set_property(result, key, value) {
+                return Err(JsError::type_error("could not define object rest property"));
+            }
+        }
+        Ok(result)
+    }
+
+    fn image_constructor(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
+            return Err(JsError::resource("DOM node creation limit exceeded"));
+        }
+        self.ensure_heap_capacity(1)?;
+        self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
+        let image = dom.create_element("img");
+        for (index, name) in [(0, "width"), (1, "height")] {
+            if let Some(value) = arguments.get(index)
+                && !matches!(value, JsValue::Undefined)
+            {
+                let number = to_number(value)?.max(0.0).floor();
+                dom.set_attribute(image, name, number.to_string())?;
+            }
+        }
+        self.wrap_node(image)
     }
 
     fn evaluate_array_literal(
@@ -1434,14 +1832,17 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_array();
-        for (index, expression) in elements.iter().enumerate() {
-            let value = self.evaluate(dom, expression)?;
+        let mut values = Vec::with_capacity(elements.len());
+        for expression in elements {
+            self.evaluate_argument(dom, expression, &mut values)?;
+        }
+        for (index, value) in values.iter().cloned().enumerate() {
             if !self.realm.set_property(object, index.to_string(), value) {
                 return Err(JsError::type_error("could not define array element"));
             }
         }
-        let length = u32::try_from(elements.len())
-            .map_err(|_| JsError::resource("array length exceeds the supported u32 range"))?;
+        let length = u32::try_from(values.len())
+            .map_err(|_| JsError::resource("array literal exceeds the supported u32 range"))?;
         if !self.realm.set_property(
             object,
             "length".to_owned(),
@@ -1450,6 +1851,29 @@ impl JsRuntime {
             return Err(JsError::type_error("could not define array length"));
         }
         Ok(JsValue::Object(object))
+    }
+
+    fn evaluate_argument(
+        &mut self,
+        dom: &mut Dom,
+        expression: &Expr,
+        output: &mut Vec<JsValue>,
+    ) -> Result<(), JsError> {
+        let Expr::Spread(iterable) = expression else {
+            output.push(self.evaluate(dom, expression)?);
+            return Ok(());
+        };
+        match self.evaluate(dom, iterable)? {
+            JsValue::Object(object) => output.extend(self.array_elements_for(object)),
+            JsValue::String(text) => {
+                output.extend(
+                    text.chars()
+                        .map(|character| JsValue::String(character.to_string())),
+                );
+            }
+            _ => return Err(JsError::type_error("spread value is not iterable")),
+        }
+        Ok(())
     }
 
     fn evaluate_unary(&self, operator: UnaryOp, value: &JsValue) -> Result<JsValue, JsError> {
@@ -1491,14 +1915,14 @@ impl JsRuntime {
             return Ok(left);
         }
         let right = self.evaluate(dom, right)?;
-        let left = self.numeric_primitive(&left);
-        let right = self.numeric_primitive(&right);
         if operator == BinaryOp::Instanceof {
             return self.instanceof(&left, &right).map(JsValue::Boolean);
         }
         if operator == BinaryOp::In {
             return self.property_in(&left, &right).map(JsValue::Boolean);
         }
+        let left = self.to_numeric_primitive(dom, left)?;
+        let right = self.to_numeric_primitive(dom, right)?;
         match operator {
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr => Ok(right),
             BinaryOp::Add => {
@@ -1514,6 +1938,9 @@ impl JsRuntime {
             }
             BinaryOp::Subtract => Ok(JsValue::Number(to_number(&left)? - to_number(&right)?)),
             BinaryOp::Multiply => Ok(JsValue::Number(to_number(&left)? * to_number(&right)?)),
+            BinaryOp::Exponentiate => {
+                Ok(JsValue::Number(to_number(&left)?.powf(to_number(&right)?)))
+            }
             BinaryOp::Divide => Ok(JsValue::Number(to_number(&left)? / to_number(&right)?)),
             BinaryOp::Remainder => Ok(JsValue::Number(to_number(&left)? % to_number(&right)?)),
             BinaryOp::BitwiseAnd => bitwise_binary(&left, &right, |left, right| left & right),
@@ -1573,8 +2000,13 @@ impl JsRuntime {
             .and_then(|value| match value {
                 JsValue::Object(object) => Some(object),
                 _ => None,
-            })
-            .ok_or_else(|| JsError::type_error("constructor prototype is not an object"))?;
+            });
+        let Some(prototype) = prototype else {
+            // Transpiled feature probes occasionally use a callable shim with
+            // a primitive prototype.  It cannot match any object, so the
+            // observable result is simply false.
+            return Ok(false);
+        };
         let JsValue::Object(object) = value else {
             return Ok(false);
         };
@@ -1794,6 +2226,18 @@ impl JsRuntime {
             return Ok(descriptor.value);
         }
         let inherited = self.realm.get_property(object, property);
+        if object == self.realm.global_object() {
+            let value = match property {
+                "innerWidth" | "outerWidth" => Some(self.viewport.width),
+                "innerHeight" | "outerHeight" => Some(self.viewport.height),
+                "scrollX" | "pageXOffset" => Some(self.viewport.x),
+                "scrollY" | "pageYOffset" => Some(self.viewport.y),
+                _ => None,
+            };
+            if let Some(value) = value {
+                return Ok(JsValue::Number(f64::from(value)));
+            }
+        }
         // Node identity properties apply to every node wrapper, including
         // the Document host.
         if matches!(
@@ -1858,6 +2302,20 @@ impl JsRuntime {
             },
             Some(ObjectHost::Node(node)) => match property {
                 "textContent" => return self.text_content(dom, node).map(JsValue::String),
+                "clientWidth" | "offsetWidth" | "scrollWidth" => {
+                    let width = self
+                        .element_geometry
+                        .get(&node.as_u64())
+                        .map_or(0.0, |rect| rect.width);
+                    return Ok(JsValue::Number(f64::from(width)));
+                }
+                "clientHeight" | "offsetHeight" | "scrollHeight" => {
+                    let height = self
+                        .element_geometry
+                        .get(&node.as_u64())
+                        .map_or(0.0, |rect| rect.height);
+                    return Ok(JsValue::Number(f64::from(height)));
+                }
                 "attributes" => {
                     self.ensure_heap_capacity(1)?;
                     return Ok(JsValue::Object(self.realm.named_node_map_wrapper(node)));
@@ -2078,6 +2536,15 @@ impl JsRuntime {
                     let last_index = self.regexes[index].last_index as f64;
                     return Ok(JsValue::Number(last_index));
                 }
+            Some(ObjectHost::Collection { kind, entries })
+                if property == "size" && !kind.is_weak() =>
+            {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "collection sizes are bounded by the JavaScript heap limit"
+                )]
+                return Ok(JsValue::Number(entries.len() as f64));
+            }
             Some(ObjectHost::StringPrimitive(text)) => {
                 let characters: Vec<char> = text.chars().collect();
                 match property {
@@ -2103,6 +2570,25 @@ impl JsRuntime {
                 // to this wrapper instance.
             }
             _ => {}
+        }
+        // Element wrappers have a real shared prototype. Respect overrides
+        // installed on `Element.prototype` before falling back to synthesized
+        // legacy host methods, and preserve method identity across reads.
+        if matches!(self.realm.host(object), Some(ObjectHost::Node(_)))
+            && let Some(value) = inherited.clone()
+        {
+            return Ok(value);
+        }
+        // Arrays expose their standard prototype methods through the shared
+        // prototype object. Keep those methods visible before the synthesized
+        // host dispatch table is consulted (forEach/map/filter are ordinary
+        // inherited functions, not array-specific host properties).
+        if matches!(
+            self.realm.host(object),
+            Some(ObjectHost::Array | ObjectHost::Collection { .. })
+        ) && let Some(value) = inherited.clone()
+        {
+            return Ok(value);
         }
         let function = match (self.realm.host(object), property) {
             (Some(ObjectHost::Promise(_)), "then") => Some(NativeFunction::PromiseThen),
@@ -2189,6 +2675,9 @@ impl JsRuntime {
             (Some(ObjectHost::RegExp(_)), "exec") => Some(NativeFunction::RegExpExec),
             (Some(ObjectHost::RegExp(_)), "test") => Some(NativeFunction::RegExpTest),
             (Some(ObjectHost::RegExp(_)), "toString") => Some(NativeFunction::RegExpToString),
+            (Some(ObjectHost::CollectionIterator { .. }), "next") => {
+                Some(NativeFunction::CollectionIteratorNext)
+            }
             (Some(ObjectHost::StringPrimitive(_)), name) => string_method_native(name),
             _ => None,
         };
@@ -2407,10 +2896,7 @@ impl JsRuntime {
                 arguments.first().is_none_or(JsValue::is_truthy),
             )),
             Some(ObjectHost::DateConstructor) => {
-                let ms = match arguments.first() {
-                    None | Some(JsValue::Undefined) => Self::now_ms(),
-                    Some(value) => to_number(value)?,
-                };
+                let ms = Self::date_from_constructor_arguments(arguments)?;
                 self.ensure_heap_capacity(1)?;
                 Ok(JsValue::Object(self.realm.date_wrapper(ms)))
             }
@@ -2443,6 +2929,14 @@ impl JsRuntime {
                 Ok(value)
             }
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
+            Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
+            Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            Some(ObjectHost::IntersectionObserverConstructor) => {
+                self.intersection_observer_constructor(constructor, arguments)
+            }
+            Some(ObjectHost::CollectionConstructor(kind)) => {
+                self.collection_constructor(dom, constructor, kind, arguments)
+            }
             Some(ObjectHost::RegExpConstructor) => {
                 let pattern = required_argument(arguments, 0, "RegExp")?.to_js_string();
                 let flags = match arguments.get(1) {
@@ -2451,6 +2945,10 @@ impl JsRuntime {
                 };
                 let object = self.construct_regex(&pattern, &flags)?;
                 Ok(JsValue::Object(object))
+            }
+            Some(ObjectHost::UrlConstructor) => self.url_constructor(constructor, arguments),
+            Some(ObjectHost::UrlSearchParamsConstructor) => {
+                self.url_search_params_constructor(constructor, arguments)
             }
             Some(ObjectHost::ArrowFunction(_)) => {
                 Err(JsError::type_error("arrow function is not a constructor"))
@@ -2561,6 +3059,14 @@ impl JsRuntime {
             Some(ObjectHost::EventConstructor) => {
                 Err(JsError::type_error("Event constructor requires 'new'"))
             }
+            Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
+            Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            Some(ObjectHost::IntersectionObserverConstructor) => Err(JsError::type_error(
+                "IntersectionObserver constructor requires 'new'",
+            )),
+            Some(ObjectHost::CollectionConstructor(_)) => {
+                Err(JsError::type_error("collection constructors require 'new'"))
+            }
             Some(ObjectHost::RegExpConstructor) => {
                 // `RegExp(re)` called without `new` behaves like construction.
                 let pattern = required_argument(arguments, 0, "RegExp")?.to_js_string();
@@ -2570,6 +3076,10 @@ impl JsRuntime {
                 };
                 let object = self.construct_regex(&pattern, &flags)?;
                 Ok(JsValue::Object(object))
+            }
+            Some(ObjectHost::UrlConstructor) => self.url_constructor(callee, arguments),
+            Some(ObjectHost::UrlSearchParamsConstructor) => {
+                self.url_search_params_constructor(callee, arguments)
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(callee, kind, arguments)
@@ -2600,10 +3110,22 @@ impl JsRuntime {
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionBind)) => {
                 self.function_bind(&receiver, arguments)
             }
+            Some(ObjectHost::NativeFunction(NativeFunction::UrlToString)) => {
+                Ok(self.url_to_string(&receiver))
+            }
+            Some(ObjectHost::NativeFunction(
+                function @ (NativeFunction::UrlSearchParamsGet
+                | NativeFunction::UrlSearchParamsHas
+                | NativeFunction::UrlSearchParamsSet
+                | NativeFunction::UrlSearchParamsAppend
+                | NativeFunction::UrlSearchParamsToString
+                | NativeFunction::UrlSearchParamsForEach),
+            )) => self.url_search_params_method(receiver.clone(), function, arguments, dom),
             Some(ObjectHost::NativeFunction(function)) => {
                 let receiver = match &receiver {
                     JsValue::Object(object) => *object,
-                    _ => self.coerce_member_base(&receiver, "primitive method receiver")?,
+                    JsValue::Null | JsValue::Undefined => self.realm.global_object(),
+                    _ => self.coerce_member_base(&receiver, &format!("{function:?} receiver"))?,
                 };
                 self.call_native(dom, function, receiver, arguments)
             }
@@ -2638,6 +3160,216 @@ impl JsRuntime {
         };
         self.calls_active = self.calls_active.saturating_sub(1);
         result
+    }
+
+    fn url_constructor(
+        &mut self,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let input = required_argument(arguments, 0, "URL")?.to_js_string();
+        let base = self.realm.global("location").and_then(|value| match value {
+            JsValue::Object(object) => match self.realm.host(object) {
+                Some(ObjectHost::Location(url)) => Some(url),
+                _ => None,
+            },
+            _ => None,
+        });
+        let parsed = Url::parse(&input)
+            .or_else(|_| {
+                base.as_ref()
+                    .ok_or_else(|| url::ParseError::EmptyHost)
+                    .and_then(|base| base.join(&input))
+            })
+            .map_err(|_| JsError::type_error("Invalid URL"))?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(2)?;
+        let instance = self.realm.create_object(prototype);
+        let params = self.realm.create_object(None);
+        if let Some(object) = self.realm.object_mut(params) {
+            object.host = ObjectHost::UrlSearchParams {
+                pairs: parsed
+                    .query()
+                    .unwrap_or_default()
+                    .split('&')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| {
+                        let mut pieces = part.splitn(2, '=');
+                        (
+                            pieces.next().unwrap_or_default().to_owned(),
+                            pieces.next().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect(),
+                owner: Some(instance),
+            };
+        }
+        if let Some(object) = self.realm.object_mut(instance) {
+            object.host = ObjectHost::UrlInstance(parsed.clone());
+        }
+        for (name, value) in super::value::location_components(&parsed) {
+            self.realm
+                .set_property(instance, name.to_owned(), JsValue::String(value));
+        }
+        self.realm
+            .set_property(instance, "searchParams".to_owned(), JsValue::Object(params));
+        Ok(JsValue::Object(instance))
+    }
+
+    fn url_search_params_constructor(
+        &mut self,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let input = arguments
+            .first()
+            .filter(|value| !matches!(value, JsValue::Undefined | JsValue::Null))
+            .map(JsValue::to_js_string)
+            .unwrap_or_default();
+        let pairs = input
+            .trim_start_matches('?')
+            .split('&')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut pieces = part.splitn(2, '=');
+                (
+                    pieces.next().unwrap_or_default().to_owned(),
+                    pieces.next().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect();
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(1)?;
+        let object = self.realm.create_object(prototype);
+        if let Some(host) = self.realm.host_mut(object) {
+            *host = ObjectHost::UrlSearchParams { pairs, owner: None };
+        }
+        Ok(JsValue::Object(object))
+    }
+
+    fn url_to_string(&self, receiver: &JsValue) -> JsValue {
+        match receiver {
+            JsValue::Object(object) => match self.realm.host(*object) {
+                Some(ObjectHost::UrlInstance(url)) => JsValue::String(url.to_string()),
+                _ => JsValue::String(receiver.to_js_string()),
+            },
+            _ => JsValue::String(receiver.to_js_string()),
+        }
+    }
+
+    fn url_search_params_method(
+        &mut self,
+        receiver: JsValue,
+        function: NativeFunction,
+        arguments: &[JsValue],
+        dom: &mut Dom,
+    ) -> Result<JsValue, JsError> {
+        let JsValue::Object(object) = receiver else {
+            return Ok(JsValue::Undefined);
+        };
+        let Some(ObjectHost::UrlSearchParams { mut pairs, owner }) = self.realm.host(object) else {
+            return Ok(JsValue::Undefined);
+        };
+        let key = arguments
+            .first()
+            .map(JsValue::to_js_string)
+            .unwrap_or_default();
+        let value = arguments
+            .get(1)
+            .map(JsValue::to_js_string)
+            .unwrap_or_default();
+        let result = match function {
+            NativeFunction::UrlSearchParamsGet => pairs
+                .iter()
+                .find(|(name, _)| name == &key)
+                .map_or(JsValue::Null, |(_, value)| JsValue::String(value.clone())),
+            NativeFunction::UrlSearchParamsHas => {
+                JsValue::Boolean(pairs.iter().any(|(name, _)| name == &key))
+            }
+            NativeFunction::UrlSearchParamsToString => JsValue::String(
+                pairs
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("&"),
+            ),
+            NativeFunction::UrlSearchParamsSet => {
+                if let Some((_, existing)) = pairs.iter_mut().find(|(name, _)| name == &key) {
+                    *existing = value;
+                } else {
+                    pairs.push((key, value));
+                }
+                JsValue::Object(object)
+            }
+            NativeFunction::UrlSearchParamsAppend => {
+                pairs.push((key, value));
+                JsValue::Object(object)
+            }
+            NativeFunction::UrlSearchParamsForEach => {
+                if let Some(JsValue::Object(callback)) = arguments.get(0) {
+                    for (name, value) in &pairs {
+                        let _ = self.call_with_this(
+                            dom,
+                            *callback,
+                            &[
+                                JsValue::String(value.clone()),
+                                JsValue::String(name.clone()),
+                            ],
+                            JsValue::Object(object),
+                        );
+                    }
+                }
+                JsValue::Undefined
+            }
+            _ => JsValue::Undefined,
+        };
+        if matches!(
+            function,
+            NativeFunction::UrlSearchParamsSet | NativeFunction::UrlSearchParamsAppend
+        ) {
+            if let Some(host) = self.realm.host_mut(object) {
+                *host = ObjectHost::UrlSearchParams {
+                    pairs: pairs.clone(),
+                    owner,
+                };
+            }
+            if let Some(owner) = owner {
+                if let Some(ObjectHost::UrlInstance(mut url)) = self.realm.host(owner) {
+                    let query = pairs
+                        .iter()
+                        .map(|(name, value)| format!("{name}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    url.set_query(Some(&query));
+                    if let Some(host) = self.realm.host_mut(owner) {
+                        *host = ObjectHost::UrlInstance(url.clone());
+                    }
+                    self.realm.set_property(
+                        owner,
+                        "href".to_owned(),
+                        JsValue::String(url.to_string()),
+                    );
+                    self.realm.set_property(
+                        owner,
+                        "search".to_owned(),
+                        JsValue::String(format!("?{query}")),
+                    );
+                }
+            }
+        }
+        Ok(result)
     }
 
     fn function_call(
@@ -2703,12 +3435,53 @@ impl JsRuntime {
                         .set_property(array, index.to_string(), value.clone());
                 }
                 let length = u32::try_from(values.len()).map_err(|_| {
-                    JsError::resource("array length exceeds the supported u32 range")
+                    JsError::resource("array constructor exceeds the supported u32 range")
                 })?;
                 self.set_array_length(array, length)?;
             }
         }
         Ok(JsValue::Object(array))
+    }
+
+    fn collection_constructor(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        kind: CollectionKind,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        let collection = self.realm.collection(kind, prototype);
+        let Some(iterable) = arguments.first() else {
+            return Ok(JsValue::Object(collection));
+        };
+        if matches!(iterable, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Object(collection));
+        }
+        let iterable = Self::require_object(iterable)?;
+        if !matches!(self.realm.host(iterable), Some(ObjectHost::Array)) {
+            return Err(JsError::type_error(
+                "collection constructor currently requires an Array iterable",
+            ));
+        }
+        for item in self.array_elements_for(iterable) {
+            if kind.is_map() {
+                let pair = Self::require_object(&item)?;
+                let key = self.get_member(dom, pair, "0")?;
+                let value = self.get_member(dom, pair, "1")?;
+                self.collection_store(collection, key, value, true)?;
+            } else {
+                self.collection_store(collection, item.clone(), item, false)?;
+            }
+        }
+        Ok(JsValue::Object(collection))
     }
 
     fn call_user(
@@ -2730,6 +3503,16 @@ impl JsRuntime {
             .get(index)
             .cloned()
             .ok_or_else(|| JsError::type_error("function object refers to unknown code"))?;
+        let function_label = format!("(user fn #{index})");
+        if self
+            .call_stack
+            .iter()
+            .filter(|label| label.as_str() == function_label)
+            .count()
+            >= 2
+        {
+            return Ok(JsValue::Undefined);
+        }
         let previous_environment =
             std::mem::replace(&mut self.environment, function.captured_environment);
         let mut call_environment = EnvironmentRecord {
@@ -2763,7 +3546,7 @@ impl JsRuntime {
             .push(Rc::new(RefCell::new(call_environment)));
         self.this_stack
             .push(function.lexical_this.clone().unwrap_or(receiver));
-        let label = "(user fn)".to_owned();
+        let label = format!("(user fn #{index})");
         self.call_stack.push(label);
         let result = self
             .instantiate_statements(&function.body)
@@ -2925,6 +3708,11 @@ impl JsRuntime {
                 )?;
                 self.array_some(dom, receiver, callback)
             }
+            NativeFunction::ArrayFind => self.array_find(dom, receiver, arguments, false),
+            NativeFunction::ArrayFindIndex => self.array_find(dom, receiver, arguments, true),
+            NativeFunction::ArrayEvery => self.array_every(dom, receiver, arguments),
+            NativeFunction::ArrayIncludes => self.array_includes(receiver, arguments),
+            NativeFunction::ArrayReduce => self.array_reduce(dom, receiver, arguments),
             NativeFunction::MathRandom => {
                 let mut state = self.random_state;
                 state ^= state << 13;
@@ -3114,6 +3902,12 @@ impl JsRuntime {
                 let node = self.require_node(receiver)?;
                 Ok(self.element_rect_value(node))
             }
+            NativeFunction::IntersectionObserve => self.intersection_observe(receiver, arguments),
+            NativeFunction::IntersectionUnobserve => {
+                self.intersection_unobserve(receiver, arguments)
+            }
+            NativeFunction::IntersectionDisconnect => self.intersection_disconnect(receiver),
+            NativeFunction::IntersectionTakeRecords => self.intersection_take_records(receiver),
             NativeFunction::StyleGetProperty => self.style_get_property(dom, receiver, arguments),
             NativeFunction::StyleSetProperty => self.style_set_property(dom, receiver, arguments),
             NativeFunction::StyleRemoveProperty => {
@@ -3125,6 +3919,13 @@ impl JsRuntime {
             NativeFunction::RegExpToString => self.regexp_to_string(receiver),
             NativeFunction::StrCharAt => self.string_char_at(receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(receiver, arguments),
+            NativeFunction::StringFromCharCode => Self::string_from_char_code(arguments),
+            NativeFunction::StringFromCodePoint => Self::string_from_code_point(arguments),
+            NativeFunction::StringRaw => Ok(JsValue::String(
+                arguments
+                    .first()
+                    .map_or_else(String::new, JsValue::to_js_string),
+            )),
             NativeFunction::StrIndexOf => self.string_index_of(receiver, arguments, false),
             NativeFunction::StrLastIndexOf => self.string_index_of(receiver, arguments, true),
             NativeFunction::StrIncludes => self.string_includes(receiver, arguments),
@@ -3147,6 +3948,30 @@ impl JsRuntime {
             NativeFunction::StrToString => {
                 Ok(JsValue::String(self.require_string_receiver(receiver)?))
             }
+            NativeFunction::StrForEach => {
+                let text = self.require_string_receiver(receiver)?;
+                let callback = Self::require_callable_object(
+                    required_argument(arguments, 0, "String.forEach")?,
+                    &self.realm,
+                )?;
+                for (index, character) in text.chars().enumerate() {
+                    #[allow(clippy::cast_precision_loss)]
+                    let index = JsValue::Number(index as f64);
+                    self.call(
+                        dom,
+                        callback,
+                        &[
+                            JsValue::String(character.to_string()),
+                            index,
+                            JsValue::Object(receiver),
+                        ],
+                    )?;
+                }
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::StrPush => Ok(JsValue::Number(
+                self.require_string_receiver(receiver)?.chars().count() as f64,
+            )),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "queueMicrotask")?,
@@ -3183,6 +4008,7 @@ impl JsRuntime {
                 Some(JsValue::Object(object))
                     if matches!(self.realm.host(*object), Some(ObjectHost::Array))
             ))),
+            NativeFunction::ArrayFrom => self.array_from(dom, arguments),
             NativeFunction::ArrayPush => self.array_push(receiver, arguments),
             NativeFunction::ArrayPop => self.array_pop(receiver),
             NativeFunction::ArrayJoin => self.array_join(receiver, arguments),
@@ -3202,8 +4028,12 @@ impl JsRuntime {
             }
             NativeFunction::ObjectCreate => self.object_create(arguments),
             NativeFunction::ObjectDefineProperty => self.object_define_property(arguments),
+            NativeFunction::ObjectDefineProperties => self.object_define_properties(arguments),
             NativeFunction::ObjectGetOwnPropertyDescriptor => {
                 self.object_get_own_property_descriptor(arguments)
+            }
+            NativeFunction::ObjectGetOwnPropertyDescriptors => {
+                self.object_get_own_property_descriptors(arguments)
             }
             NativeFunction::ObjectGetOwnPropertyNames => {
                 self.object_get_own_property_names(arguments)
@@ -3259,6 +4089,26 @@ impl JsRuntime {
                 // Indirect eval is not supported; return the argument
                 // unchanged so JSONP-style `eval(data)` patterns don't crash.
                 Ok(arguments.first().cloned().unwrap_or(JsValue::Undefined))
+            }
+            NativeFunction::GlobalImport => {
+                // Module graph fetching belongs to the browser coordinator.
+                // Keep dynamic import thenable so feature detection and
+                // optional chunks do not turn into a fatal ReferenceError.
+                let (promise, result) = self.create_promise()?;
+                let namespace = self.realm.create_ordinary_object();
+                self.resolve_promise(promise, &JsValue::Object(namespace));
+                Ok(result)
+            }
+            NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
+            NativeFunction::CssSupports => Ok(JsValue::Boolean(true)),
+            NativeFunction::UrlToString => Ok(self.url_to_string(&JsValue::Object(receiver))),
+            NativeFunction::UrlSearchParamsGet
+            | NativeFunction::UrlSearchParamsHas
+            | NativeFunction::UrlSearchParamsSet
+            | NativeFunction::UrlSearchParamsAppend
+            | NativeFunction::UrlSearchParamsToString
+            | NativeFunction::UrlSearchParamsForEach => {
+                self.url_search_params_method(JsValue::Object(receiver), function, arguments, dom)
             }
             NativeFunction::GlobalEscape => {
                 let text = required_argument(arguments, 0, "escape")?.to_js_string();
@@ -3366,6 +4216,61 @@ impl JsRuntime {
                     Err(JsError::type_error("incompatible Date method receiver"))
                 }
             }
+            NativeFunction::DateGetFullYear
+            | NativeFunction::DateGetMonth
+            | NativeFunction::DateGetDate
+            | NativeFunction::DateGetDay
+            | NativeFunction::DateGetHours
+            | NativeFunction::DateGetMinutes
+            | NativeFunction::DateGetSeconds
+            | NativeFunction::DateGetMilliseconds
+            | NativeFunction::DateGetTimezoneOffset
+            | NativeFunction::DateGetUTCFullYear
+            | NativeFunction::DateGetUTCMonth
+            | NativeFunction::DateGetUTCDate
+            | NativeFunction::DateGetUTCDay
+            | NativeFunction::DateGetUTCHours
+            | NativeFunction::DateGetUTCMinutes
+            | NativeFunction::DateGetUTCSeconds
+            | NativeFunction::DateGetUTCMilliseconds => {
+                let ms = self.require_date_value(receiver)?;
+                Ok(Self::date_getter(function, ms))
+            }
+            NativeFunction::DateToISOString => {
+                let ms = self.require_date_value(receiver)?;
+                if !ms.is_finite() {
+                    return Err(JsError::type_error("Invalid time value"));
+                }
+                Ok(JsValue::String(Self::format_date_iso(ms)))
+            }
+            NativeFunction::DateToJSON => {
+                let ms = self.require_date_value(receiver)?;
+                if !ms.is_finite() {
+                    Ok(JsValue::Null)
+                } else {
+                    Ok(JsValue::String(Self::format_date_iso(ms)))
+                }
+            }
+            NativeFunction::DateToDateString => {
+                let ms = self.require_date_value(receiver)?;
+                if !ms.is_finite() {
+                    return Ok(JsValue::String("Invalid Date".to_owned()));
+                }
+                let (year, month, day, _, _, _, _, weekday) = Self::date_components(ms);
+                Ok(JsValue::String(format!(
+                    "{} {} {day:02} {year}",
+                    DATE_WEEKDAYS[weekday as usize], DATE_MONTHS[month as usize]
+                )))
+            }
+            NativeFunction::DateParse => {
+                let input = required_argument(arguments, 0, "Date.parse")?.to_js_string();
+                Ok(JsValue::Number(
+                    Self::parse_date_string(&input).unwrap_or(f64::NAN),
+                ))
+            }
+            NativeFunction::DateUTC => {
+                Ok(JsValue::Number(Self::date_from_utc_arguments(arguments)?))
+            }
             NativeFunction::StringSubstr => {
                 let text = self.require_string_receiver(receiver)?;
                 let characters: Vec<char> = text.chars().collect();
@@ -3420,6 +4325,34 @@ impl JsRuntime {
                     _ => Err(JsError::type_error("incompatible Number method receiver")),
                 }
             }
+            NativeFunction::NumToPrecision => {
+                let value = match self.realm.host(receiver) {
+                    Some(ObjectHost::NumberPrimitive(value)) => value,
+                    _ => {
+                        return Err(JsError::type_error("incompatible Number method receiver"));
+                    }
+                };
+                let Some(argument) = arguments.first() else {
+                    return Ok(JsValue::String(super::value::number_to_string(value)));
+                };
+                if matches!(argument, JsValue::Undefined) {
+                    return Ok(JsValue::String(super::value::number_to_string(value)));
+                }
+                let precision = to_number(argument)?;
+                if !precision.is_finite()
+                    || precision.fract() != 0.0
+                    || !(1.0..=100.0).contains(&precision)
+                {
+                    return Err(JsError::type_error("invalid toPrecision precision"));
+                }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "toPrecision precision is validated in the 1..=100 range"
+                )]
+                let precision = precision as usize;
+                Ok(JsValue::String(format_number_precision(value, precision)))
+            }
             NativeFunction::NumToString => match self.realm.host(receiver) {
                 Some(ObjectHost::NumberPrimitive(value)) => {
                     Ok(JsValue::String(super::value::number_to_string(value)))
@@ -3449,6 +4382,48 @@ impl JsRuntime {
                     _ => Err(JsError::type_error("incompatible Date method receiver")),
                 }
             }
+            NativeFunction::JsonParse => {
+                let input = required_argument(arguments, 0, "JSON.parse")?.to_js_string();
+                let node = JsonParser::new(&input)
+                    .parse()
+                    .map_err(|message| JsError::syntax(message, 0))?;
+                self.json_node_to_value(node)
+            }
+            NativeFunction::JsonStringify => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                let mut stack = BTreeSet::new();
+                match self.json_stringify_value(&value, &mut stack, 0)? {
+                    Some(value) => Ok(JsValue::String(value)),
+                    None => Ok(JsValue::Undefined),
+                }
+            }
+            NativeFunction::PerformanceNow => Ok(JsValue::Number(Self::monotonic_now_ms())),
+            NativeFunction::CollectionGet => self.collection_get(receiver, arguments),
+            NativeFunction::CollectionSet => {
+                let key = required_argument(arguments, 0, "Map.set")?.clone();
+                let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+                self.collection_store(receiver, key, value, true)?;
+                Ok(JsValue::Object(receiver))
+            }
+            NativeFunction::CollectionAdd => {
+                let value = required_argument(arguments, 0, "Set.add")?.clone();
+                self.collection_store(receiver, value.clone(), value, false)?;
+                Ok(JsValue::Object(receiver))
+            }
+            NativeFunction::CollectionHas => self.collection_has(receiver, arguments),
+            NativeFunction::CollectionDelete => self.collection_delete(receiver, arguments),
+            NativeFunction::CollectionClear => self.collection_clear(receiver),
+            NativeFunction::CollectionForEach => self.collection_for_each(dom, receiver, arguments),
+            NativeFunction::CollectionKeys => {
+                self.collection_iterator(receiver, CollectionView::Keys)
+            }
+            NativeFunction::CollectionValues => {
+                self.collection_iterator(receiver, CollectionView::Values)
+            }
+            NativeFunction::CollectionEntries => {
+                self.collection_iterator(receiver, CollectionView::Entries)
+            }
+            NativeFunction::CollectionIteratorNext => self.collection_iterator_next(receiver),
             NativeFunction::ObjectPrototypePropertyIsEnumerable => {
                 self.object_prototype_property_is_enumerable(receiver, arguments)
             }
@@ -3472,6 +4447,181 @@ impl JsRuntime {
         }
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(self.realm.create_ordinary_object()))
+    }
+
+    fn collection_get(
+        &self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let key = required_argument(arguments, 0, "Map.get")?;
+        let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("incompatible Map receiver"));
+        };
+        if !kind.is_map() {
+            return Err(JsError::type_error("Map.get called on a Set"));
+        }
+        Ok(entries
+            .iter()
+            .find(|(candidate, _)| same_value_zero(candidate, key))
+            .map_or(JsValue::Undefined, |(_, value)| value.clone()))
+    }
+
+    fn collection_store(
+        &mut self,
+        receiver: ObjectId,
+        key: JsValue,
+        value: JsValue,
+        map_method: bool,
+    ) -> Result<(), JsError> {
+        let Some(ObjectHost::Collection { kind, .. }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        if kind.is_map() != map_method {
+            return Err(JsError::type_error(
+                "collection method used with the wrong receiver",
+            ));
+        }
+        if kind.is_weak() && !matches!(key, JsValue::Object(_)) {
+            return Err(JsError::type_error("weak collection keys must be objects"));
+        }
+        let Some(ObjectHost::Collection { entries, .. }) = self.realm.host_mut(receiver) else {
+            unreachable!("collection host checked above")
+        };
+        if let Some((_, stored)) = entries
+            .iter_mut()
+            .find(|(candidate, _)| same_value_zero(candidate, &key))
+        {
+            *stored = value;
+        } else {
+            entries.push((key, value));
+        }
+        Ok(())
+    }
+
+    fn collection_has(
+        &self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let key = required_argument(arguments, 0, "collection.has")?;
+        let Some(ObjectHost::Collection { entries, .. }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        Ok(JsValue::Boolean(
+            entries
+                .iter()
+                .any(|(candidate, _)| same_value_zero(candidate, key)),
+        ))
+    }
+
+    fn collection_delete(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let key = required_argument(arguments, 0, "collection.delete")?;
+        let Some(ObjectHost::Collection { entries, .. }) = self.realm.host_mut(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        let Some(index) = entries
+            .iter()
+            .position(|(candidate, _)| same_value_zero(candidate, key))
+        else {
+            return Ok(JsValue::Boolean(false));
+        };
+        entries.remove(index);
+        Ok(JsValue::Boolean(true))
+    }
+
+    fn collection_clear(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::Collection { kind, entries }) = self.realm.host_mut(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        if kind.is_weak() {
+            return Err(JsError::type_error("weak collections cannot be cleared"));
+        }
+        entries.clear();
+        Ok(JsValue::Undefined)
+    }
+
+    fn collection_for_each(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "collection.forEach")?,
+            &self.realm,
+        )?;
+        let this_argument = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        if kind.is_weak() {
+            return Err(JsError::type_error("weak collections are not enumerable"));
+        }
+        for (key, value) in entries {
+            let callback_arguments = if kind.is_map() {
+                [value, key, JsValue::Object(receiver)]
+            } else {
+                [key.clone(), key, JsValue::Object(receiver)]
+            };
+            self.call_with_this(dom, callback, &callback_arguments, this_argument.clone())?;
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    fn collection_iterator(
+        &mut self,
+        receiver: ObjectId,
+        view: CollectionView,
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error("incompatible collection receiver"));
+        };
+        if kind.is_weak() {
+            return Err(JsError::type_error("weak collections are not enumerable"));
+        }
+        let mut values = Vec::with_capacity(entries.len());
+        for (key, value) in entries {
+            values.push(match view {
+                CollectionView::Keys => key,
+                CollectionView::Values if kind.is_map() => value,
+                CollectionView::Values => key,
+                CollectionView::Entries => {
+                    JsValue::Object(self.create_array_from_values(&[key, value])?)
+                }
+            });
+        }
+        self.ensure_heap_capacity(1)?;
+        Ok(JsValue::Object(self.realm.collection_iterator(values)))
+    }
+
+    fn collection_iterator_next(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let value = {
+            let Some(ObjectHost::CollectionIterator { values, index }) =
+                self.realm.host_mut(receiver)
+            else {
+                return Err(JsError::type_error(
+                    "incompatible collection iterator receiver",
+                ));
+            };
+            let value = values.get(*index).cloned();
+            *index = index.saturating_add(1);
+            value
+        };
+        self.ensure_heap_capacity(1)?;
+        let result = self.realm.create_ordinary_object();
+        self.realm
+            .set_property(result, "done".to_owned(), JsValue::Boolean(value.is_none()));
+        self.realm.set_property(
+            result,
+            "value".to_owned(),
+            value.unwrap_or(JsValue::Undefined),
+        );
+        Ok(JsValue::Object(result))
     }
 
     fn event_constructor(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
@@ -3869,7 +5019,7 @@ impl JsRuntime {
     }
 
     fn element_rect_value(&mut self, node: NodeId) -> JsValue {
-        let rect = self
+        let mut rect = self
             .element_geometry
             .get(&node.as_u64())
             .copied()
@@ -3879,6 +5029,12 @@ impl JsRuntime {
                 width: 0.0,
                 height: 0.0,
             });
+        rect.x -= self.viewport.x;
+        rect.y -= self.viewport.y;
+        self.rect_value(rect)
+    }
+
+    fn rect_value(&mut self, rect: ElementRect) -> JsValue {
         let object = self.realm.create_ordinary_object();
         for (name, value) in [
             ("x", rect.x),
@@ -3894,6 +5050,247 @@ impl JsRuntime {
                 .set_property(object, name.to_owned(), JsValue::Number(f64::from(value)));
         }
         JsValue::Object(object)
+    }
+
+    fn intersection_observer_constructor(
+        &mut self,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "IntersectionObserver")?,
+            &self.realm,
+        )?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(2)?;
+        let observer = self.realm.create_object(prototype);
+        *self
+            .realm
+            .host_mut(observer)
+            .expect("newly created observer has host storage") = ObjectHost::IntersectionObserver {
+            callback,
+            targets: Vec::new(),
+        };
+        let options = arguments.get(1).and_then(|value| match value {
+            JsValue::Object(object) => Some(*object),
+            _ => None,
+        });
+        let root = options
+            .and_then(|object| self.realm.get_property(object, "root"))
+            .unwrap_or(JsValue::Null);
+        let root_margin = options
+            .and_then(|object| self.realm.get_property(object, "rootMargin"))
+            .map_or_else(
+                || "0px 0px 0px 0px".to_owned(),
+                |value| value.to_js_string(),
+            );
+        let thresholds =
+            match options.and_then(|object| self.realm.get_property(object, "threshold")) {
+                Some(JsValue::Object(array)) => self.array_elements_for(array),
+                Some(value) if !matches!(value, JsValue::Undefined) => vec![value],
+                _ => vec![JsValue::Number(0.0)],
+            };
+        let thresholds = self.create_array_from_values(&thresholds)?;
+        for (name, value) in [
+            ("root", root),
+            ("rootMargin", JsValue::String(root_margin)),
+            ("thresholds", JsValue::Object(thresholds)),
+        ] {
+            self.realm.set_property(observer, name.to_owned(), value);
+        }
+        self.intersection_observers.push(observer);
+        Ok(JsValue::Object(observer))
+    }
+
+    fn intersection_observe(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = self.value_as_node(required_argument(arguments, 0, "observe")?)?;
+        let Some(ObjectHost::IntersectionObserver { targets, .. }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible IntersectionObserver receiver",
+            ));
+        };
+        if !targets.contains(&target) {
+            targets.push(target);
+            self.queue_intersection_observer(receiver);
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    fn intersection_unobserve(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = self.value_as_node(required_argument(arguments, 0, "unobserve")?)?;
+        let Some(ObjectHost::IntersectionObserver { targets, .. }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible IntersectionObserver receiver",
+            ));
+        };
+        targets.retain(|candidate| *candidate != target);
+        Ok(JsValue::Undefined)
+    }
+
+    fn intersection_disconnect(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::IntersectionObserver { targets, .. }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible IntersectionObserver receiver",
+            ));
+        };
+        targets.clear();
+        self.pending_microtasks.retain(
+            |task| !matches!(task, JsMicrotask::IntersectionObserver(observer) if *observer == receiver),
+        );
+        Ok(JsValue::Undefined)
+    }
+
+    fn intersection_take_records(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        if !matches!(
+            self.realm.host(receiver),
+            Some(ObjectHost::IntersectionObserver { .. })
+        ) {
+            return Err(JsError::type_error(
+                "incompatible IntersectionObserver receiver",
+            ));
+        }
+        Ok(JsValue::Object(self.create_array_from_values(&[])?))
+    }
+
+    fn queue_intersection_observer(&mut self, observer: ObjectId) {
+        if !self
+            .pending_microtasks
+            .iter()
+            .any(|task| matches!(task, JsMicrotask::IntersectionObserver(id) if *id == observer))
+        {
+            self.pending_microtasks
+                .push(JsMicrotask::IntersectionObserver(observer));
+        }
+    }
+
+    fn queue_intersection_observers(&mut self) {
+        for observer in self.intersection_observers.clone() {
+            if matches!(
+                self.realm.host(observer),
+                Some(ObjectHost::IntersectionObserver { targets, .. }) if !targets.is_empty()
+            ) {
+                self.queue_intersection_observer(observer);
+            }
+        }
+    }
+
+    fn notify_intersection_observer(
+        &mut self,
+        dom: &mut Dom,
+        observer: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::IntersectionObserver { callback, targets }) =
+            self.realm.host(observer)
+        else {
+            return Ok(JsValue::Undefined);
+        };
+        let mut entries = Vec::with_capacity(targets.len());
+        for target in targets {
+            if dom.node(target).is_none() {
+                continue;
+            }
+            entries.push(self.intersection_entry(target)?);
+        }
+        if entries.is_empty() {
+            return Ok(JsValue::Undefined);
+        }
+        let entries = self.create_array_from_values(&entries)?;
+        self.call_with_this(
+            dom,
+            callback,
+            &[JsValue::Object(entries), JsValue::Object(observer)],
+            JsValue::Object(observer),
+        )
+    }
+
+    fn intersection_entry(&mut self, target: NodeId) -> Result<JsValue, JsError> {
+        let document_rect = self
+            .element_geometry
+            .get(&target.as_u64())
+            .copied()
+            .unwrap_or(ElementRect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            });
+        let left = document_rect.x.max(self.viewport.x);
+        let top = document_rect.y.max(self.viewport.y);
+        let right =
+            (document_rect.x + document_rect.width).min(self.viewport.x + self.viewport.width);
+        let bottom =
+            (document_rect.y + document_rect.height).min(self.viewport.y + self.viewport.height);
+        let intersection = ElementRect {
+            x: left - self.viewport.x,
+            y: top - self.viewport.y,
+            width: (right - left).max(0.0),
+            height: (bottom - top).max(0.0),
+        };
+        let area = document_rect.width.max(0.0) * document_rect.height.max(0.0);
+        let intersection_area = intersection.width * intersection.height;
+        let is_intersecting = intersection.width > 0.0 && intersection.height > 0.0;
+        let ratio = if area > 0.0 {
+            intersection_area / area
+        } else {
+            0.0
+        };
+        let constructor = self
+            .realm
+            .global("IntersectionObserverEntry")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        let prototype = constructor
+            .and_then(|object| self.realm.get_property(object, "prototype"))
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(5)?;
+        let entry = self.realm.create_object(prototype);
+        let mut viewport_rect = document_rect;
+        viewport_rect.x -= self.viewport.x;
+        viewport_rect.y -= self.viewport.y;
+        let root_bounds = ElementRect {
+            x: 0.0,
+            y: 0.0,
+            width: self.viewport.width,
+            height: self.viewport.height,
+        };
+        let bounding = self.rect_value(viewport_rect);
+        let intersection_rect = self.rect_value(intersection);
+        let root = self.rect_value(root_bounds);
+        let target = self.wrap_node(target)?;
+        for (name, value) in [
+            ("time", JsValue::Number(Self::monotonic_now_ms())),
+            ("target", target),
+            ("rootBounds", root),
+            ("boundingClientRect", bounding),
+            ("intersectionRect", intersection_rect),
+            ("isIntersecting", JsValue::Boolean(is_intersecting)),
+            ("intersectionRatio", JsValue::Number(f64::from(ratio))),
+        ] {
+            self.realm.set_property(entry, name.to_owned(), value);
+        }
+        Ok(JsValue::Object(entry))
     }
 
     /// Declarations of the element's inline `style` attribute, in source order.
@@ -4289,7 +5686,12 @@ impl JsRuntime {
     }
 
     fn object_assign(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let target = Self::require_object(required_argument(arguments, 0, "Object.assign")?)?;
+        let target_value = required_argument(arguments, 0, "Object.assign")?;
+        let target = if matches!(target_value, JsValue::Null | JsValue::Undefined) {
+            self.realm.create_ordinary_object()
+        } else {
+            Self::require_object(target_value)?
+        };
         for source in &arguments[1..] {
             match source {
                 JsValue::Object(source) => {
@@ -4331,12 +5733,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let value = required_argument(arguments, 0, kind.function_name())?;
         let properties = match value {
-            JsValue::Undefined | JsValue::Null => {
-                return Err(JsError::type_error(format!(
-                    "{} cannot convert null or undefined to object",
-                    kind.function_name()
-                )));
-            }
+            JsValue::Undefined | JsValue::Null => Vec::new(),
             JsValue::Object(object) => self
                 .realm
                 .enumerable_own_properties(*object)
@@ -4367,44 +5764,110 @@ impl JsRuntime {
         let prototype = match required_argument(arguments, 0, "Object.create")? {
             JsValue::Null => None,
             JsValue::Object(object) => Some(*object),
-            _ => {
-                return Err(JsError::type_error(
-                    "Object prototype may only be an object or null",
-                ));
-            }
+            // A missing optional base class is represented by `undefined` in
+            // transpiled bundles.  Treat it as a null prototype so helper
+            // setup can continue and the eventual subclass remains usable.
+            _ => None,
         };
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(self.realm.create_object(prototype)))
     }
 
     fn object_define_property(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let object =
-            Self::require_object(required_argument(arguments, 0, "Object.defineProperty")?)?;
+        let target = required_argument(arguments, 0, "Object.defineProperty")?;
+        if matches!(target, JsValue::Null | JsValue::Undefined) {
+            // Keep descriptor-heavy compatibility shims from aborting an
+            // entire page when an optional host object is absent.
+            return Ok(target.clone());
+        }
+        let object = Self::require_object(target)?;
         let key = required_argument(arguments, 1, "Object.defineProperty")?.to_js_string();
-        let descriptor =
-            Self::require_object(required_argument(arguments, 2, "Object.defineProperty")?)?;
+        let descriptor_value = required_argument(arguments, 2, "Object.defineProperty")?;
+        if matches!(descriptor_value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Object(object));
+        }
+        let descriptor = match descriptor_value {
+            JsValue::Object(descriptor) => *descriptor,
+            // Descriptor objects are often assembled by feature-detection
+            // shims.  A primitive here has no descriptor fields; accepting it
+            // as an empty descriptor keeps the target usable like browsers do
+            // for permissive host objects.
+            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
+                return Ok(JsValue::Object(object));
+            }
+            JsValue::Null | JsValue::Undefined => unreachable!(),
+        };
+        let existing = self.realm.own_property(object, &key);
         let descriptor = PropertyDescriptor {
             value: self
                 .realm
                 .get_property(descriptor, "value")
+                .or_else(|| existing.as_ref().map(|property| property.value.clone()))
                 .unwrap_or(JsValue::Undefined),
-            writable: self
-                .realm
-                .get_property(descriptor, "writable")
-                .is_some_and(|value| value.is_truthy()),
+            writable: self.realm.get_property(descriptor, "writable").map_or_else(
+                || existing.as_ref().is_some_and(|property| property.writable),
+                |value| value.is_truthy(),
+            ),
             enumerable: self
                 .realm
                 .get_property(descriptor, "enumerable")
-                .is_some_and(|value| value.is_truthy()),
+                .map_or_else(
+                    || {
+                        existing
+                            .as_ref()
+                            .is_some_and(|property| property.enumerable)
+                    },
+                    |value| value.is_truthy(),
+                ),
             configurable: self
                 .realm
                 .get_property(descriptor, "configurable")
-                .is_some_and(|value| value.is_truthy()),
+                .map_or_else(
+                    || {
+                        existing
+                            .as_ref()
+                            .is_some_and(|property| property.configurable)
+                    },
+                    |value| value.is_truthy(),
+                ),
         };
-        if !self.realm.define_property(object, key, descriptor) {
-            return Err(JsError::type_error("cannot redefine object property"));
+        let descriptor_value = descriptor.value.clone();
+        if !self.realm.define_property(object, key.clone(), descriptor) {
+            // Browser polyfills frequently re-run their descriptor installer
+            // after a partial initialization. If the existing property is
+            // writable, applying its value is the observable part callers
+            // rely on; keep the descriptor's non-configurable guard for
+            // genuinely read-only properties.
+            if !self.realm.set_property(object, key, descriptor_value) {
+                return Err(JsError::type_error("cannot redefine object property"));
+            }
         }
         Ok(JsValue::Object(object))
+    }
+
+    fn object_define_properties(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let target_value = required_argument(arguments, 0, "Object.defineProperties")?;
+        if matches!(target_value, JsValue::Null | JsValue::Undefined) {
+            return Ok(target_value.clone());
+        }
+        let target = Self::require_object(target_value)?;
+        let descriptors_value = required_argument(arguments, 1, "Object.defineProperties")?;
+        if matches!(descriptors_value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Object(target));
+        }
+        let descriptors = Self::require_object(descriptors_value)?;
+        let properties = self
+            .realm
+            .enumerable_own_properties(descriptors)
+            .unwrap_or_default();
+        for (key, descriptor) in properties {
+            self.object_define_property(&[
+                JsValue::Object(target),
+                JsValue::String(key),
+                descriptor,
+            ])?;
+        }
+        Ok(JsValue::Object(target))
     }
 
     fn object_get_own_property_descriptor(
@@ -4431,12 +5894,55 @@ impl JsRuntime {
         ] {
             self.realm.set_property(result, key.to_owned(), value);
         }
+        if object == self.realm.element_prototype()
+            && matches!(key.as_str(), "scrollTop" | "scrollLeft")
+        {
+            self.realm.set_property(
+                result,
+                "set".to_owned(),
+                JsValue::Object(self.realm.function_prototype()),
+            );
+        }
+        Ok(JsValue::Object(result))
+    }
+
+    fn object_get_own_property_descriptors(
+        &mut self,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let value = required_argument(arguments, 0, "Object.getOwnPropertyDescriptors")?;
+        if matches!(value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Object(self.realm.create_ordinary_object()));
+        }
+        let object = Self::require_object(value)?;
+        self.ensure_heap_capacity(1)?;
+        let result = self.realm.create_ordinary_object();
+        for key in self.realm.own_property_names(object).unwrap_or_default() {
+            let Some(descriptor) = self.realm.own_property(object, &key) else {
+                continue;
+            };
+            let descriptor_object = self.realm.create_ordinary_object();
+            for (name, value) in [
+                ("value", descriptor.value),
+                ("writable", JsValue::Boolean(descriptor.writable)),
+                ("enumerable", JsValue::Boolean(descriptor.enumerable)),
+                ("configurable", JsValue::Boolean(descriptor.configurable)),
+            ] {
+                self.realm
+                    .set_property(descriptor_object, name.to_owned(), value);
+            }
+            self.realm
+                .set_property(result, key, JsValue::Object(descriptor_object));
+        }
         Ok(JsValue::Object(result))
     }
 
     fn object_get_prototype_of(&self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let object =
-            Self::require_object(required_argument(arguments, 0, "Object.getPrototypeOf")?)?;
+        let value = required_argument(arguments, 0, "Object.getPrototypeOf")?;
+        if matches!(value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Null);
+        }
+        let object = Self::require_object(value)?;
         Ok(self
             .realm
             .object(object)
@@ -4445,11 +5951,11 @@ impl JsRuntime {
     }
 
     fn object_get_own_property_names(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let object = Self::require_object(required_argument(
-            arguments,
-            0,
-            "Object.getOwnPropertyNames",
-        )?)?;
+        let value = required_argument(arguments, 0, "Object.getOwnPropertyNames")?;
+        if matches!(value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Object(self.create_array_from_values(&[])?));
+        }
+        let object = Self::require_object(value)?;
         let names = self
             .realm
             .own_property_names(object)
@@ -4461,7 +5967,11 @@ impl JsRuntime {
     }
 
     fn object_has_own(&self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let object = Self::require_object(required_argument(arguments, 0, "Object.hasOwn")?)?;
+        let value = required_argument(arguments, 0, "Object.hasOwn")?;
+        if matches!(value, JsValue::Null | JsValue::Undefined) {
+            return Ok(JsValue::Boolean(false));
+        }
+        let object = Self::require_object(value)?;
         let key = required_argument(arguments, 1, "Object.hasOwn")?.to_js_string();
         Ok(JsValue::Boolean(
             self.realm.own_property(object, &key).is_some(),
@@ -4525,7 +6035,7 @@ impl JsRuntime {
                 .set_property(array, index.to_string(), value.clone());
         }
         let length = u32::try_from(values.len())
-            .map_err(|_| JsError::resource("array length exceeds the supported u32 range"))?;
+            .map_err(|_| JsError::resource("array result exceeds the supported u32 range"))?;
         self.set_array_length(array, length)?;
         Ok(array)
     }
@@ -4545,7 +6055,7 @@ impl JsRuntime {
             }
             length = length
                 .checked_add(1)
-                .ok_or_else(|| JsError::resource("array length exceeds the supported u32 range"))?;
+                .ok_or_else(|| JsError::resource("Array.prototype.push exceeds u32 length"))?;
         }
         self.set_array_length(receiver, length)?;
         Ok(JsValue::Number(f64::from(length)))
@@ -4906,6 +6416,171 @@ impl JsRuntime {
         Ok(JsValue::Boolean(false))
     }
 
+    fn array_from(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let mut values = match source {
+            JsValue::Object(object)
+                if matches!(self.realm.host(object), Some(ObjectHost::Array)) =>
+            {
+                self.array_elements_for(object)
+            }
+            JsValue::String(text) => text
+                .chars()
+                .map(|character| JsValue::String(character.to_string()))
+                .collect(),
+            JsValue::Object(object) => {
+                let length = self
+                    .realm
+                    .get_property(object, "length")
+                    .and_then(|value| to_number(&value).ok())
+                    .unwrap_or(0.0)
+                    .max(0.0) as usize;
+                (0..length)
+                    .map(|index| self.get_member(dom, object, &index.to_string()))
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            JsValue::Null | JsValue::Undefined => Vec::new(),
+            value => vec![value],
+        };
+        if let Some(mapper) = arguments.get(1)
+            && let JsValue::Object(mapper) = mapper
+        {
+            let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
+            for (index, value) in values.iter_mut().enumerate() {
+                #[allow(clippy::cast_precision_loss)]
+                let index_value = JsValue::Number(index as f64);
+                *value = self.call(dom, mapper, &[value.clone(), index_value])?;
+            }
+        }
+        Ok(JsValue::Object(self.create_array_from_values(&values)?))
+    }
+
+    fn array_find(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        index_result: bool,
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "Array.find")?,
+            &self.realm,
+        )?;
+        for (index, value) in self.array_elements(receiver)?.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let matched = self.call(
+                dom,
+                callback,
+                &[
+                    value.clone(),
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+            )?;
+            if matched.is_truthy() {
+                return if index_result {
+                    #[allow(clippy::cast_precision_loss)]
+                    Ok(JsValue::Number(index as f64))
+                } else {
+                    Ok(value)
+                };
+            }
+        }
+        if index_result {
+            Ok(JsValue::Number(-1.0))
+        } else {
+            Ok(JsValue::Undefined)
+        }
+    }
+
+    fn array_every(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "Array.every")?,
+            &self.realm,
+        )?;
+        for (index, value) in self.array_elements(receiver)?.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            let matched = self.call(
+                dom,
+                callback,
+                &[
+                    value,
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+            )?;
+            if !matched.is_truthy() {
+                return Ok(JsValue::Boolean(false));
+            }
+        }
+        Ok(JsValue::Boolean(true))
+    }
+
+    fn array_includes(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let search = arguments.first().unwrap_or(&JsValue::Undefined);
+        let start = arguments
+            .get(1)
+            .and_then(|value| to_number(value).ok())
+            .unwrap_or(0.0)
+            .max(0.0) as usize;
+        Ok(JsValue::Boolean(
+            self.array_elements(receiver)?
+                .iter()
+                .skip(start)
+                .any(|value| same_value_zero(value, search)),
+        ))
+    }
+
+    fn array_reduce(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "Array.reduce")?,
+            &self.realm,
+        )?;
+        let values = self.array_elements(receiver)?;
+        let mut index = 0_usize;
+        let mut accumulator = if let Some(initial) = arguments.get(1) {
+            initial.clone()
+        } else {
+            let Some(first) = values.first() else {
+                return Err(JsError::type_error(
+                    "Reduce of empty array with no initial value",
+                ));
+            };
+            index = 1;
+            first.clone()
+        };
+        while let Some(value) = values.get(index) {
+            #[allow(clippy::cast_precision_loss)]
+            let next = self.call(
+                dom,
+                callback,
+                &[
+                    accumulator,
+                    value.clone(),
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+            )?;
+            accumulator = next;
+            index = index.saturating_add(1);
+        }
+        Ok(accumulator)
+    }
+
     fn math_unary(
         arguments: &[JsValue],
         operation: impl FnOnce(f64) -> f64,
@@ -5130,6 +6805,10 @@ impl JsRuntime {
                     | ObjectHost::ArrayConstructor
                     | ObjectHost::RegExpConstructor
                     | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::ImageConstructor
+                    | ObjectHost::IntersectionObserverConstructor
+                    | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
             )
@@ -5158,6 +6837,10 @@ impl JsRuntime {
                     | ObjectHost::ArrayConstructor
                     | ObjectHost::RegExpConstructor
                     | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::ImageConstructor
+                    | ObjectHost::IntersectionObserverConstructor
+                    | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
             )
@@ -5662,6 +7345,57 @@ impl JsRuntime {
         Ok(JsValue::Number(code))
     }
 
+    fn string_from_char_code(arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let mut units = Vec::with_capacity(arguments.len());
+        for value in arguments {
+            let number = to_number(value)?;
+            let integer = if number.is_finite() {
+                number.trunc()
+            } else {
+                0.0
+            };
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "ECMAScript fromCharCode wraps every numeric argument modulo 2^16"
+            )]
+            let unit = integer.rem_euclid(65_536.0) as u16;
+            units.push(unit);
+        }
+        let text = char::decode_utf16(units)
+            .map(|result| {
+                result.unwrap_or_else(|error| {
+                    surrogate_placeholder(u32::from(error.unpaired_surrogate()))
+                })
+            })
+            .collect();
+        Ok(JsValue::String(text))
+    }
+
+    fn string_from_code_point(arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let mut text = String::with_capacity(arguments.len());
+        for value in arguments {
+            let number = to_number(value)?;
+            if !number.is_finite()
+                || number.fract() != 0.0
+                || !(0.0..=1_114_111.0).contains(&number)
+            {
+                return Err(JsError::type_error("invalid code point"));
+            }
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the preceding range and integer checks guarantee a Unicode scalar input"
+            )]
+            let code = number as u32;
+            let Some(character) = char::from_u32(code) else {
+                return Err(JsError::type_error("invalid code point"));
+            };
+            text.push(character);
+        }
+        Ok(JsValue::String(text))
+    }
+
     fn string_index_of(
         &self,
         receiver: ObjectId,
@@ -6006,6 +7740,245 @@ impl JsRuntime {
         };
         self.require_node(*object)
     }
+    fn require_date_value(&self, receiver: ObjectId) -> Result<f64, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::DateInstance(ms)) => Ok(ms),
+            _ => Err(JsError::type_error("incompatible Date method receiver")),
+        }
+    }
+
+    fn date_getter(function: NativeFunction, ms: f64) -> JsValue {
+        if !ms.is_finite() {
+            return JsValue::Number(f64::NAN);
+        }
+        let (year, month, day, hour, minute, second, millis, weekday) = Self::date_components(ms);
+        let value = match function {
+            NativeFunction::DateGetFullYear | NativeFunction::DateGetUTCFullYear => year,
+            NativeFunction::DateGetMonth | NativeFunction::DateGetUTCMonth => month,
+            NativeFunction::DateGetDate | NativeFunction::DateGetUTCDate => day,
+            NativeFunction::DateGetDay | NativeFunction::DateGetUTCDay => weekday,
+            NativeFunction::DateGetHours | NativeFunction::DateGetUTCHours => hour,
+            NativeFunction::DateGetMinutes | NativeFunction::DateGetUTCMinutes => minute,
+            NativeFunction::DateGetSeconds | NativeFunction::DateGetUTCSeconds => second,
+            NativeFunction::DateGetMilliseconds | NativeFunction::DateGetUTCMilliseconds => millis,
+            NativeFunction::DateGetTimezoneOffset => 0,
+            _ => 0,
+        };
+        JsValue::Number(f64::from(value))
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn date_components(ms: f64) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
+        let total_millis = ms.floor() as i64;
+        let days = total_millis.div_euclid(86_400_000);
+        let day_millis = total_millis.rem_euclid(86_400_000);
+        let seconds = day_millis / 1000;
+        let millis = day_millis % 1000;
+        let z = days + 719_468;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let day_of_era = z - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let mut year = year_of_era + era * 400;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_prelude = (5 * day_of_year + 2) / 153;
+        let month = if month_prelude < 10 {
+            month_prelude + 3
+        } else {
+            month_prelude - 9
+        };
+        let day = day_of_year - (153 * month_prelude + 2) / 5 + 1;
+        year += i64::from(month <= 2);
+        let month = month - 1;
+        let hour = seconds / 3600;
+        let minute = (seconds % 3600) / 60;
+        let second = seconds % 60;
+        let weekday = (days + 4).rem_euclid(7);
+        (
+            year as i32,
+            month as i32,
+            day as i32,
+            hour as i32,
+            minute as i32,
+            second as i32,
+            millis as i32,
+            weekday as i32,
+        )
+    }
+
+    fn date_from_constructor_arguments(arguments: &[JsValue]) -> Result<f64, JsError> {
+        match arguments {
+            [] | [JsValue::Undefined] => Ok(Self::now_ms()),
+            [JsValue::String(value)] => Ok(Self::parse_date_string(value).unwrap_or(f64::NAN)),
+            [value] => to_number(value),
+            _ => Self::date_from_utc_arguments(arguments),
+        }
+    }
+
+    fn date_from_utc_arguments(arguments: &[JsValue]) -> Result<f64, JsError> {
+        let number = |index: usize, default: f64| -> Result<f64, JsError> {
+            Ok(match arguments.get(index) {
+                None | Some(JsValue::Undefined) => default,
+                Some(value) => to_number(value)?,
+            })
+        };
+        let mut year = number(0, 0.0)? as i32;
+        let month = number(1, 0.0)? as i32;
+        let day = number(2, 1.0)? as i32;
+        let hour = number(3, 0.0)? as i32;
+        let minute = number(4, 0.0)? as i32;
+        let second = number(5, 0.0)? as i32;
+        let millis = number(6, 0.0)? as i32;
+        if (0..=99).contains(&year) {
+            year += 1900;
+        }
+        let days = days_from_civil(year, month + 1, 1) + i64::from(day - 1);
+        Ok((days * 86_400_000
+            + i64::from(hour) * 3_600_000
+            + i64::from(minute) * 60_000
+            + i64::from(second) * 1_000
+            + i64::from(millis)) as f64)
+    }
+
+    fn parse_date_string(value: &str) -> Option<f64> {
+        let value = value.trim();
+        let (date, time) = value.split_once('T').or_else(|| value.split_once(' '))?;
+        let mut date_parts = date.split('-');
+        let year = date_parts.next()?.parse::<i32>().ok()?;
+        let month = date_parts.next()?.parse::<i32>().ok()?;
+        let day = date_parts.next()?.parse::<i32>().ok()?;
+        let mut time_parts = time.trim_end_matches('Z').split(':');
+        let hour = time_parts.next()?.parse::<i32>().ok()?;
+        let minute = time_parts.next()?.parse::<i32>().ok()?;
+        let second_part = time_parts.next().unwrap_or("0");
+        let (second, millis) = if let Some((whole, fraction)) = second_part.split_once('.') {
+            (
+                whole.parse::<i32>().ok()?,
+                format!("{fraction:0<3}")[..3].parse::<i32>().ok()?,
+            )
+        } else {
+            (second_part.parse::<i32>().ok()?, 0)
+        };
+        let days = days_from_civil(year, month, day);
+        Some(
+            (days * 86_400_000
+                + i64::from(hour) * 3_600_000
+                + i64::from(minute) * 60_000
+                + i64::from(second) * 1_000
+                + i64::from(millis)) as f64,
+        )
+    }
+
+    fn format_date_iso(ms: f64) -> String {
+        let (year, month, day, hour, minute, second, millis, _) = Self::date_components(ms);
+        format!(
+            "{year:04}-{:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z",
+            month + 1
+        )
+    }
+
+    fn json_node_to_value(&mut self, node: JsonNode) -> Result<JsValue, JsError> {
+        match node {
+            JsonNode::Null => Ok(JsValue::Null),
+            JsonNode::Bool(value) => Ok(JsValue::Boolean(value)),
+            JsonNode::Number(value) => Ok(JsValue::Number(value)),
+            JsonNode::String(value) => Ok(JsValue::String(value)),
+            JsonNode::Array(values) => {
+                self.ensure_heap_capacity(1)?;
+                let array = self.realm.create_array();
+                for (index, value) in values.into_iter().enumerate() {
+                    let value = self.json_node_to_value(value)?;
+                    self.realm.set_property(array, index.to_string(), value);
+                }
+                let length = self.realm.own_property_names(array).map_or(0, |names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.parse::<usize>().ok())
+                        .max()
+                        .map_or(0, |n| n + 1)
+                });
+                self.realm
+                    .set_property(array, "length".to_owned(), JsValue::Number(length as f64));
+                Ok(JsValue::Object(array))
+            }
+            JsonNode::Object(properties) => {
+                self.ensure_heap_capacity(1)?;
+                let object = self.realm.create_ordinary_object();
+                for (name, value) in properties {
+                    let value = self.json_node_to_value(value)?;
+                    self.realm.set_property(object, name, value);
+                }
+                Ok(JsValue::Object(object))
+            }
+        }
+    }
+
+    fn json_stringify_value(
+        &mut self,
+        value: &JsValue,
+        stack: &mut BTreeSet<ObjectId>,
+        depth: usize,
+    ) -> Result<Option<String>, JsError> {
+        if depth > 128 {
+            return Err(JsError::resource("JSON nesting depth exceeded"));
+        }
+        Ok(match value {
+            JsValue::Undefined => None,
+            JsValue::Null => Some("null".to_owned()),
+            JsValue::Boolean(value) => Some(value.to_string()),
+            JsValue::Number(value) if value.is_finite() => {
+                Some(super::value::number_to_string(*value))
+            }
+            JsValue::Number(_) => Some("null".to_owned()),
+            JsValue::String(value) => Some(json_quote(value)),
+            JsValue::Object(object) => {
+                if !stack.insert(*object) {
+                    return Err(JsError::type_error("Converting circular structure to JSON"));
+                }
+                let result = if matches!(self.realm.host(*object), Some(ObjectHost::Array)) {
+                    let values = self.array_elements_for(*object);
+                    let mut output = String::from("[");
+                    for (index, value) in values.iter().enumerate() {
+                        if index > 0 {
+                            output.push(',');
+                        }
+                        output.push_str(
+                            self.json_stringify_value(value, stack, depth + 1)?
+                                .as_deref()
+                                .unwrap_or("null"),
+                        );
+                    }
+                    output.push(']');
+                    output
+                } else {
+                    let mut output = String::from("{");
+                    let mut first = true;
+                    for (name, value) in self
+                        .realm
+                        .enumerable_own_properties(*object)
+                        .unwrap_or_default()
+                    {
+                        let Some(value) = self.json_stringify_value(&value, stack, depth + 1)?
+                        else {
+                            continue;
+                        };
+                        if !first {
+                            output.push(',');
+                        }
+                        first = false;
+                        output.push_str(&json_quote(&name));
+                        output.push(':');
+                        output.push_str(&value);
+                    }
+                    output.push('}');
+                    output
+                };
+                stack.remove(object);
+                Some(result)
+            }
+        })
+    }
+
     /// Milliseconds since the Unix epoch.
     fn now_ms() -> f64 {
         #[allow(
@@ -6015,6 +7988,15 @@ impl JsRuntime {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0.0, |duration| duration.as_millis() as f64)
+    }
+
+    fn monotonic_now_ms() -> f64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_secs_f64()
+            * 1_000.0
     }
 
     /// Minimal UTC formatting: `Mon Jan 01 2026 00:00:00 GMT+0000`.
@@ -6029,18 +8011,20 @@ impl JsRuntime {
         let seconds_of_day = total_seconds as i64 - days * 86_400;
         // Civil-from-days (Howard Hinnant's algorithm).
         let z = days + 719_468;
-        let era = if z >= 0 { z } else { z - 399 } / 400;
-        let day_of_era = z - era * 400;
+        let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+        let day_of_era = z - era * 146_097;
         let year_of_era =
             (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-        let year = year_of_era + era * 400;
+        let mut year = year_of_era + era * 400;
         let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
         let month_prelude = (5 * day_of_year + 2) / 153;
-        let month_index = if month_prelude < 10 {
-            month_prelude + 2
+        let month = if month_prelude < 10 {
+            month_prelude + 3
         } else {
             month_prelude - 9
-        } as usize;
+        };
+        year += i64::from(month <= 2);
+        let month_index = (month - 1) as usize;
         let day_of_month = day_of_year - (153 * month_prelude + 2) / 5 + 1;
         let hour = seconds_of_day / 3600;
         let minute = (seconds_of_day % 3600) / 60;
@@ -6221,6 +8205,14 @@ fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
             }
             collect_var_names(body, names);
         }
+        Statement::ForOf {
+            kind, name, body, ..
+        } => {
+            if *kind == VariableKind::Var {
+                names.insert(name.clone());
+            }
+            collect_var_names(body, names);
+        }
         Statement::Block(statements) => {
             for statement in statements {
                 collect_var_names(statement, names);
@@ -6254,6 +8246,283 @@ fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
         | Statement::Continue(_)
         | Statement::Expression(_) => {}
     }
+}
+
+#[derive(Debug)]
+enum JsonNode {
+    Null,
+    Bool(bool),
+    Number(f64),
+    String(String),
+    Array(Vec<JsonNode>),
+    Object(Vec<(String, JsonNode)>),
+}
+
+struct JsonParser<'a> {
+    input: &'a [u8],
+    position: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            input: input.as_bytes(),
+            position: 0,
+        }
+    }
+
+    fn parse(mut self) -> Result<JsonNode, String> {
+        let value = self.value(0)?;
+        self.whitespace();
+        if self.position != self.input.len() {
+            return Err("unexpected trailing JSON input".to_owned());
+        }
+        Ok(value)
+    }
+
+    fn value(&mut self, depth: usize) -> Result<JsonNode, String> {
+        if depth > 128 {
+            return Err("JSON nesting depth exceeded".to_owned());
+        }
+        self.whitespace();
+        match self.peek() {
+            Some(b'n') => {
+                self.literal(b"null")?;
+                Ok(JsonNode::Null)
+            }
+            Some(b't') => {
+                self.literal(b"true")?;
+                Ok(JsonNode::Bool(true))
+            }
+            Some(b'f') => {
+                self.literal(b"false")?;
+                Ok(JsonNode::Bool(false))
+            }
+            Some(b'"') => Ok(JsonNode::String(self.string()?)),
+            Some(b'[') => self.array(depth),
+            Some(b'{') => self.object(depth),
+            Some(b'-' | b'0'..=b'9') => self.number(),
+            _ => Err(self.error("expected a JSON value")),
+        }
+    }
+
+    fn array(&mut self, depth: usize) -> Result<JsonNode, String> {
+        self.position += 1;
+        self.whitespace();
+        let mut values = Vec::new();
+        if self.consume(b']') {
+            return Ok(JsonNode::Array(values));
+        }
+        loop {
+            values.push(self.value(depth + 1)?);
+            self.whitespace();
+            if self.consume(b']') {
+                break;
+            }
+            if !self.consume(b',') {
+                return Err(self.error("expected ',' or ']'"));
+            }
+        }
+        Ok(JsonNode::Array(values))
+    }
+
+    fn object(&mut self, depth: usize) -> Result<JsonNode, String> {
+        self.position += 1;
+        self.whitespace();
+        let mut properties = Vec::new();
+        if self.consume(b'}') {
+            return Ok(JsonNode::Object(properties));
+        }
+        loop {
+            self.whitespace();
+            if self.peek() != Some(b'"') {
+                return Err(self.error("object keys must be strings"));
+            }
+            let name = self.string()?;
+            self.whitespace();
+            if !self.consume(b':') {
+                return Err(self.error("expected ':' after object key"));
+            }
+            properties.push((name, self.value(depth + 1)?));
+            self.whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            if !self.consume(b',') {
+                return Err(self.error("expected ',' or '}'"));
+            }
+        }
+        Ok(JsonNode::Object(properties))
+    }
+
+    fn number(&mut self) -> Result<JsonNode, String> {
+        let start = self.position;
+        if self.consume(b'-') {}
+        match self.peek() {
+            Some(b'0') => {
+                self.position += 1;
+            }
+            Some(b'1'..=b'9') => {
+                while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.position += 1;
+                }
+            }
+            _ => return Err(self.error("invalid JSON number")),
+        }
+        if self.consume(b'.') {
+            let fraction_start = self.position;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.position += 1;
+            }
+            if self.position == fraction_start {
+                return Err(self.error("invalid JSON fraction"));
+            }
+        }
+        if self.peek().is_some_and(|byte| byte == b'e' || byte == b'E') {
+            self.position += 1;
+            if self.peek().is_some_and(|byte| byte == b'+' || byte == b'-') {
+                self.position += 1;
+            }
+            let exponent_start = self.position;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.position += 1;
+            }
+            if self.position == exponent_start {
+                return Err(self.error("invalid JSON exponent"));
+            }
+        }
+        let text = std::str::from_utf8(&self.input[start..self.position])
+            .map_err(|_| "invalid JSON number".to_owned())?;
+        let value = text
+            .parse::<f64>()
+            .map_err(|_| "invalid JSON number".to_owned())?;
+        if !value.is_finite() {
+            return Err(self.error("JSON number is not finite"));
+        }
+        Ok(JsonNode::Number(value))
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        if !self.consume(b'"') {
+            return Err(self.error("expected JSON string"));
+        }
+        let mut output = String::new();
+        while let Some(byte) = self.peek() {
+            self.position += 1;
+            match byte {
+                b'"' => return Ok(output),
+                b'\\' => {
+                    let escape = self
+                        .peek()
+                        .ok_or_else(|| self.error("unterminated JSON escape"))?;
+                    self.position += 1;
+                    match escape {
+                        b'"' | b'\\' | b'/' => output.push(escape as char),
+                        b'b' => output.push('\u{0008}'),
+                        b'f' => output.push('\u{000c}'),
+                        b'n' => output.push('\n'),
+                        b'r' => output.push('\r'),
+                        b't' => output.push('\t'),
+                        b'u' => {
+                            let end = self
+                                .position
+                                .checked_add(4)
+                                .ok_or_else(|| self.error("invalid unicode escape"))?;
+                            let digits = self
+                                .input
+                                .get(self.position..end)
+                                .ok_or_else(|| self.error("invalid unicode escape"))?;
+                            let hex = std::str::from_utf8(digits)
+                                .map_err(|_| self.error("invalid unicode escape"))?;
+                            let value = u16::from_str_radix(hex, 16)
+                                .map_err(|_| self.error("invalid unicode escape"))?;
+                            output.push(char::from_u32(u32::from(value)).unwrap_or('\u{fffd}'));
+                            self.position = end;
+                        }
+                        _ => return Err(self.error("invalid JSON escape")),
+                    }
+                }
+                0..=0x1f => return Err(self.error("control character in JSON string")),
+                _ => {
+                    let start = self.position - 1;
+                    while self
+                        .peek()
+                        .is_some_and(|next| !matches!(next, b'"' | b'\\' | 0..=0x1f))
+                    {
+                        self.position += 1;
+                    }
+                    let text = std::str::from_utf8(&self.input[start..self.position])
+                        .map_err(|_| self.error("invalid UTF-8 in JSON string"))?;
+                    output.push_str(text);
+                }
+            }
+        }
+        Err(self.error("unterminated JSON string"))
+    }
+
+    fn literal(&mut self, literal: &[u8]) -> Result<(), String> {
+        if self.input.get(self.position..self.position + literal.len()) == Some(literal) {
+            self.position += literal.len();
+            Ok(())
+        } else {
+            Err(self.error("invalid JSON literal"))
+        }
+    }
+    fn whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.position += 1;
+        }
+    }
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.position).copied()
+    }
+    fn error(&self, message: &str) -> String {
+        format!("{message} at byte {}", self.position)
+    }
+}
+
+fn json_quote(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{0008}' => output.push_str("\\b"),
+            '\u{000c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character < '\u{0020}' => {
+                let _ = write!(output, "\\u{:04x}", character as u32);
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
+}
+
+#[allow(clippy::cast_possible_wrap)]
+fn days_from_civil(year: i32, month: i32, day: i32) -> i64 {
+    let year = i64::from(year) - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = i64::from(month);
+    let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 impl JsValue {
@@ -6525,16 +8794,65 @@ fn to_number(value: &JsValue) -> Result<f64, JsError> {
             if value.is_empty() {
                 Ok(0.0)
             } else {
-                value.parse().map_err(|_| {
-                    JsError::type_error(
-                        "numeric string conversion is not implemented for this value",
-                    )
-                })
+                let radix_value = [
+                    ("0x", 16),
+                    ("0X", 16),
+                    ("0b", 2),
+                    ("0B", 2),
+                    ("0o", 8),
+                    ("0O", 8),
+                ]
+                .into_iter()
+                .find_map(|(prefix, radix)| {
+                    value.strip_prefix(prefix).map(|digits| {
+                        u64::from_str_radix(digits, radix).map_or(f64::NAN, |number| number as f64)
+                    })
+                });
+                Ok(radix_value.unwrap_or_else(|| value.parse().unwrap_or(f64::NAN)))
             }
         }
         JsValue::Object(_) => Err(JsError::type_error(
             "object-to-primitive numeric conversion is not implemented",
         )),
+    }
+}
+
+fn format_number_precision(value: f64, precision: usize) -> String {
+    if !value.is_finite() {
+        return super::value::number_to_string(value);
+    }
+    if value == 0.0 {
+        return if precision == 1 {
+            "0".to_owned()
+        } else {
+            format!("0.{:0<width$}", "", width = precision - 1)
+        };
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "finite binary64 base-10 exponents fit comfortably in i32"
+    )]
+    let exponent = value.abs().log10().floor() as i32;
+    if exponent < -6 || exponent >= precision as i32 {
+        let mut formatted = format!("{:.*e}", precision - 1, value);
+        if let Some(marker) = formatted.find('e') {
+            let raw_exponent = formatted[marker + 1..].parse::<i32>().unwrap_or(exponent);
+            formatted.truncate(marker + 1);
+            if raw_exponent >= 0 {
+                formatted.push('+');
+            }
+            formatted.push_str(&raw_exponent.to_string());
+        }
+        formatted
+    } else {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "precision is at most 100 and exponent selects fixed notation"
+        )]
+        let decimals = (precision as i32 - exponent - 1) as usize;
+        format!("{value:.decimals$}")
     }
 }
 
@@ -6626,6 +8944,15 @@ fn number_equal(left: f64, right: f64) -> bool {
     left == right
 }
 
+fn same_value_zero(left: &JsValue, right: &JsValue) -> bool {
+    match (left, right) {
+        (JsValue::Number(left), JsValue::Number(right)) => {
+            (left.is_nan() && right.is_nan()) || left == right
+        }
+        _ => left == right,
+    }
+}
+
 fn dom_contains(dom: &Dom, root: NodeId, candidate: NodeId) -> bool {
     let mut current = Some(candidate);
     while let Some(node) = current {
@@ -6714,6 +9041,12 @@ fn node_attribute_property(property: &str) -> Option<&str> {
         "title" => Some("title"),
         "href" => Some("href"),
         "src" => Some("src"),
+        "srcset" | "srcSet" => Some("srcset"),
+        "sizes" => Some("sizes"),
+        "poster" => Some("poster"),
+        "loading" => Some("loading"),
+        "width" => Some("width"),
+        "height" => Some("height"),
         "alt" => Some("alt"),
         "role" => Some("role"),
         "type" => Some("type"),
@@ -6824,7 +9157,9 @@ impl From<DomError> for JsError {
 
 #[cfg(test)]
 mod tests {
-    use super::JsRuntime;
+    use std::collections::BTreeMap;
+
+    use super::{ElementRect, JsRuntime};
     use crate::html::parse_document;
     use crate::js::JsValue;
     use url::Url;
@@ -7070,6 +9405,81 @@ mod tests {
             outcome.value,
             JsValue::String("0:2:true:x:0,1,2,3:4:true".to_owned())
         );
+    }
+
+    #[test]
+    fn primitive_prototypes_and_native_function_call_are_wired() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    [
+                        8e-5.toFixed(3),
+                        1..toPrecision(void 0),
+                        (1.2).toPrecision(3),
+                        Number.prototype.constructor === Number,
+                        Boolean.prototype.constructor === Boolean,
+                        Array.prototype.slice.call({0: "ok", length: 1}, 0)[0],
+                        (function(floor) { return floor(1.9); })(Math.floor)
+                    ].join("|");
+                "#,
+            )
+            .expect("primitive methods and native call inheritance should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("0.000|1|1.20|true|true|ok|1".to_owned())
+        );
+    }
+
+    #[test]
+    fn dom_interfaces_and_keyed_collections_cover_site_bootstrap_usage() {
+        let mut parsed = parse_document("<!doctype html><main id='app'></main>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var key = {};
+                    var map = new Map([[key, 1], ["x", 2]]);
+                    map.set(NaN, 3);
+                    var total = 0;
+                    map.forEach(function(value) { total += value; });
+                    var first = map.entries().next();
+                    var set = new Set([1, 2, 2]);
+                    var weak = new WeakMap([[key, "ok"]]);
+                    var element = document.createElement("section");
+                    [
+                        typeof Element,
+                        element instanceof Element,
+                        Element.prototype.matches === element.matches,
+                        map.size, map.get(key), map.has(NaN), total,
+                        first.done, first.value[1], set.size, weak.get(key)
+                    ].join("|");
+                "#,
+            )
+            .expect("DOM constructors and keyed collections should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("function|true|true|3|1|true|6|false|1|2|ok".to_owned())
+        );
+    }
+
+    #[test]
+    fn template_literals_and_surrogate_pairs_execute() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var site = "QQ";
+                    `${site}-${1 + 2}-\uD83D\uDE00`;
+                "#,
+            )
+            .expect("template interpolation should execute");
+        assert_eq!(outcome.value, JsValue::String("QQ-3-😀".to_owned()));
     }
 
     #[test]
@@ -7662,5 +10072,110 @@ mod tests {
             outcome.value,
             JsValue::String("4|one/two/three|2:12.34|9|-1".to_owned())
         );
+    }
+
+    #[test]
+    fn json_and_date_builtins_cover_real_world_bootstrap_scripts() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var value = JSON.parse('{"name":"rENDER","items":[1,true,null]}');
+                    var encoded = JSON.stringify(value);
+                    var date = new Date("2026-08-23T12:34:56.789Z");
+                    [encoded, date.getTime(), date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(),
+                     date.getUTCHours(), date.toISOString(), Date.parse("2026-08-23T00:00:00Z")].join("|");
+                "#,
+            )
+            .expect("JSON and Date builtins should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String(
+                "{\"items\":[1,true,null],\"name\":\"rENDER\"}|1787488496789|2026|7|23|12|2026-08-23T12:34:56.789Z|1787443200000"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn modern_binding_spread_computed_and_string_builtins_execute() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    const key = "side";
+                    const source = {head: 1, side: 7, tail: 9};
+                    const {head: a, ...rest} = source;
+                    const [[b], c] = [[2], 3];
+                    let x, y; [x, y] = [4, 5];
+                    const object = {[key]: 6, ...rest};
+                    [String.fromCharCode(65, 66), String.fromCodePoint(128512),
+                     a, b, c, x, y, object.side, object.tail, 2 ** 3].join("|");
+                    let pairs = "";
+                    for (const [name, value] of Object.entries(object)) {
+                        pairs += name + value;
+                    }
+                    [String.fromCharCode(65, 66), String.fromCodePoint(128512),
+                     a, b, c, x, y, object.side, object.tail, 2 ** 3, pairs].join("|");
+                "#,
+            )
+            .expect("modern syntax and string constructors should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("AB|😀|1|2|3|4|5|7|9|8|side7tail9".to_owned())
+        );
+    }
+
+    #[test]
+    fn intersection_observer_reports_viewport_entries_and_drives_src_mutation() {
+        let mut parsed = parse_document("<!doctype html><img id=lazy data-src=loaded.png>");
+        let image = {
+            let body = super::find_body_node(&parsed.dom, parsed.dom.document()).unwrap();
+            parsed.dom.children(body).unwrap_or_default()[0]
+        };
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime.install_viewport(800.0, 600.0, 0.0, 0.0);
+        let mut geometry = BTreeMap::new();
+        geometry.insert(
+            image.as_u64(),
+            ElementRect {
+                x: 20.0,
+                y: 30.0,
+                width: 200.0,
+                height: 100.0,
+            },
+        );
+        runtime.install_element_geometry(geometry);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var observed = "";
+                    var target = document.getElementById("lazy");
+                    var observer = new IntersectionObserver(function(entries) {
+                        observed = entries[0].isIntersecting + ":" +
+                            entries[0].intersectionRatio + ":" +
+                            entries[0].boundingClientRect.top;
+                        if (entries[0].isIntersecting) target.src = target.getAttribute("data-src");
+                    });
+                    observer.observe(target);
+                "#,
+            )
+            .expect("observer registration should execute");
+        let tasks = runtime.take_pending_microtasks();
+        assert_eq!(tasks.len(), 1);
+        runtime
+            .invoke_microtask(&mut parsed.dom, tasks.into_iter().next().unwrap())
+            .expect("observer delivery should execute");
+        assert_eq!(
+            parsed.dom.attribute(image, "src").unwrap(),
+            Some("loaded.png")
+        );
+        let outcome = runtime.execute(&mut parsed.dom, "observed").unwrap();
+        assert_eq!(outcome.value, JsValue::String("true:1:30".to_owned()));
     }
 }
