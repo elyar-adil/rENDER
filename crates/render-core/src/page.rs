@@ -14,7 +14,7 @@ use std::time::Duration;
 use url::Url;
 
 use crate::document::{Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput};
-use crate::dom::{DomRevision, NodeId};
+use crate::dom::{Dom, DomRevision, Namespace, Node, NodeId, NodeKind};
 use crate::event_loop::{
     ClockError, EventLoop, EventLoopLimits, MicrotaskCheckpoint, MicrotaskId, QueueError, Runnable,
     TaskId, TaskSource, TimerId, TurnOutcome,
@@ -337,6 +337,9 @@ pub struct Page {
     js_timers: BTreeMap<u64, TimerId>,
     /// Latest border-box geometry per DOM node, refreshed after each render.
     geometry_index: BTreeMap<u64, ElementRect>,
+    /// Last `document.title` value this page applied to the document, so a
+    /// repeated own-property read is not mistaken for a fresh assignment.
+    script_title_override: Option<String>,
 }
 
 impl Page {
@@ -423,6 +426,7 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            script_title_override: None,
         }
     }
 
@@ -469,6 +473,7 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            script_title_override: None,
         };
         page.refresh_geometry_index();
         page
@@ -492,6 +497,92 @@ impl Page {
     #[must_use]
     pub const fn runtime_mut(&mut self) -> &mut JsRuntime {
         &mut self.runtime
+    }
+
+    /// The document's title: the text content of its first HTML `title`
+    /// element in tree order.
+    ///
+    /// Returns `None` when the document has no title element or its text is
+    /// empty or whitespace-only, so embeddings can fall back to the URL.
+    #[must_use]
+    pub fn document_title(&self) -> Option<String> {
+        let dom = self.document.dom();
+        let title = first_html_element_named(dom, dom.document(), "title")?;
+        let mut text = String::new();
+        collect_text_content(dom, title, &mut text);
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Set the document's title, per the `document.title` setter: replace the
+    /// text of the existing `title` element, or create one inside `head`
+    /// (creating `head` first when the document element exists).
+    pub fn set_document_title(&mut self, title: &str) {
+        let dom = self.document.dom_mut();
+        if let Some(existing) = first_html_element_named(dom, dom.document(), "title") {
+            for child in dom.children(existing).unwrap_or_default().to_vec() {
+                let _removed = dom.remove_child(existing, child);
+            }
+            if !title.is_empty() {
+                let _appended = dom.append_text(existing, title);
+            }
+            return;
+        }
+        let Some(html) = first_html_element_named(dom, dom.document(), "html") else {
+            return;
+        };
+        let head = if let Some(head) = first_html_element_named(dom, html, "head") {
+            head
+        } else {
+            let head = dom.create_element("head");
+            let reference = dom
+                .children(html)
+                .and_then(|children| children.first())
+                .copied();
+            if dom.insert_before(html, head, reference).is_err() {
+                return;
+            }
+            head
+        };
+        let title_element = dom.create_element("title");
+        if dom.append_child(head, title_element).is_err() {
+            return;
+        }
+        if !title.is_empty() {
+            let _appended = dom.append_text(title_element, title);
+        }
+    }
+
+    /// Apply a script `document.title` assignment to the document.
+    ///
+    /// The runtime records the assignment as a plain own property on the
+    /// document wrapper; this syncs it into the DOM so the embedding observes
+    /// title changes through the document like any other source.
+    fn sync_script_title(&mut self) {
+        let document_object = self.runtime.realm().document_object();
+        let Some(value) = self
+            .runtime
+            .realm()
+            .object(document_object)
+            .and_then(|object| object.own_property("title"))
+            .map(|descriptor| descriptor.value.clone())
+        else {
+            self.script_title_override = None;
+            return;
+        };
+        let title = match value {
+            JsValue::String(text) => text,
+            JsValue::Null | JsValue::Undefined => String::new(),
+            other => other.to_js_string(),
+        };
+        if self.script_title_override.as_deref() == Some(title.as_str()) {
+            return;
+        }
+        self.set_document_title(&title);
+        self.script_title_override = Some(title);
     }
 
     #[must_use]
@@ -1102,6 +1193,7 @@ impl Page {
             microtask_source_bytes.clear();
         }
 
+        self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
         let render = (!invalidation.is_empty())
             .then(|| backends.map(|backends| self.render_update(backends)))
@@ -1252,6 +1344,37 @@ fn execute_task(
         // The page turn loop intercepts timer tasks before calling this
         // function so interval re-arming can reach the scheduler.
         PageTask::Timer { .. } => unreachable!("timer tasks are executed by the page turn loop"),
+    }
+}
+
+/// The first HTML-namespace element named `local_name` under `root`, in tree
+/// order.
+fn first_html_element_named(dom: &Dom, root: NodeId, local_name: &str) -> Option<NodeId> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            dom.node(node).map(Node::kind),
+            Some(NodeKind::Element(element))
+                if element.namespace == Namespace::Html && element.local_name == local_name
+        ) {
+            return Some(node);
+        }
+        if let Some(children) = dom.children(node) {
+            stack.extend(children.iter().rev().copied());
+        }
+    }
+    None
+}
+
+fn collect_text_content(dom: &Dom, root: NodeId, text: &mut String) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if let Some(NodeKind::Text(value)) = dom.node(node).map(Node::kind) {
+            text.push_str(value);
+        }
+        if let Some(children) = dom.children(node) {
+            stack.extend(children.iter().rev().copied());
+        }
     }
 }
 
@@ -1968,6 +2091,80 @@ mod tests {
             }
         ));
         assert_eq!(page.queued_script_source_bytes(), 0);
+    }
+
+    #[test]
+    fn document_title_reads_the_first_title_element() {
+        let page = Page::new(
+            "<!doctype html><html><head><title>百度一下，你就知道</title></head><body></body></html>",
+        );
+        assert_eq!(page.document_title(), Some("百度一下，你就知道".to_owned()));
+    }
+
+    #[test]
+    fn document_title_is_none_without_a_usable_title_element() {
+        let page = Page::new("<!doctype html><html><body><p>no title</p></body></html>");
+        assert_eq!(page.document_title(), None);
+        let blank = Page::new("<!doctype html><html><head><title>   </title></head></html>");
+        assert_eq!(blank.document_title(), None);
+    }
+
+    #[test]
+    fn script_title_assignment_reaches_the_document() {
+        let mut page = Page::new(
+            "<!doctype html><html><head><title>Static</title></head>\
+             <body><script>document.title = 'Script Title';</script></body></html>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/page").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+        assert_eq!(queue.queued.len(), 1);
+        page.run_one_turn_reference()
+            .expect("inline script turn succeeds")
+            .expect("inline script is queued");
+        assert_eq!(page.document_title(), Some("Script Title".to_owned()));
+    }
+
+    #[test]
+    fn timer_deferred_script_title_assignment_reaches_the_document() {
+        let mut page = Page::new("<!doctype html><html><body></body></html>");
+        page.queue_script("setTimeout(function () { document.title = 'Async Title'; }, 10);")
+            .expect("timer script should queue");
+        // Timers schedule relative to the page's virtual clock, so keep
+        // advancing it until the callback has run.
+        for now in [
+            Duration::ZERO,
+            Duration::from_millis(5),
+            Duration::from_millis(40),
+        ] {
+            let _outcome = page
+                .pump_until_idle_reference(now)
+                .expect("timer pump succeeds");
+        }
+        assert_eq!(page.document_title(), Some("Async Title".to_owned()));
+    }
+
+    #[test]
+    fn set_document_title_replaces_the_existing_title_text() {
+        let mut page = Page::new(
+            "<!doctype html><html><head><title>Before</title></head><body></body></html>",
+        );
+        page.set_document_title("After");
+        assert_eq!(page.document_title(), Some("After".to_owned()));
+        page.set_document_title("");
+        assert_eq!(page.document_title(), None);
+    }
+
+    #[test]
+    fn set_document_title_creates_head_and_title_when_missing() {
+        let mut page = Page::new("<!doctype html><html><body><p>x</p></body></html>");
+        page.set_document_title("Made");
+        assert_eq!(page.document_title(), Some("Made".to_owned()));
+        // A second assignment updates the created element instead of adding
+        // another one.
+        page.set_document_title("Updated");
+        assert_eq!(page.document_title(), Some("Updated".to_owned()));
     }
 }
 #[test]

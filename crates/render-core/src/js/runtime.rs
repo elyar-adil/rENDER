@@ -23,7 +23,8 @@ use super::parser::{
     BinaryOp, CatchClause, Expr, ObjectProperty, PropertyKey, Statement, UnaryOp, VariableKind,
 };
 use super::value::{
-    CollectionKind, ErrorKind, NativeFunction, ObjectHost, TypedArrayKind, TypedBuffer,
+    CollectionKind, ErrorKind, MutationWatch, NativeFunction, ObjectHost, TypedArrayKind,
+    TypedBuffer,
 };
 use super::{
     JsError, JsErrorKind, JsObject, JsValue, ObjectId, PropertyDescriptor, Realm, RuntimeLimits,
@@ -31,7 +32,7 @@ use super::{
 };
 use crate::css::selector::{MatchContext, matches_selector_list, parse_selector_list, select_all};
 use crate::css::stylesheet::parse_declaration_list;
-use crate::dom::{Dom, DomError, NodeId, NodeKind};
+use crate::dom::{Dom, DomError, DomRevision, MutationKind, NodeId, NodeKind};
 use crate::html::{serialize_html_fragment, serialize_html_node};
 use url::Url;
 
@@ -118,6 +119,7 @@ struct PromiseRecord {
 pub enum JsMicrotask {
     Callback(ObjectId),
     IntersectionObserver(ObjectId),
+    MutationObserver(ObjectId),
     PromiseReaction {
         handler: Option<ObjectId>,
         argument: JsValue,
@@ -262,6 +264,9 @@ pub struct JsRuntime {
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
     intersection_observers: Vec<ObjectId>,
+    mutation_observers: Vec<ObjectId>,
+    /// Highest DOM revision already copied into observer queues.
+    mutation_seen_revision: DomRevision,
 }
 
 impl JsRuntime {
@@ -336,6 +341,8 @@ impl JsRuntime {
                 height: 768.0,
             },
             intersection_observers: Vec::new(),
+            mutation_observers: Vec::new(),
+            mutation_seen_revision: dom.revision(),
             limits,
         }
     }
@@ -422,6 +429,7 @@ impl JsRuntime {
         self.this_stack.clear();
         self.environment.clear();
         self.call(dom, entry.callback, &[])?;
+        self.queue_mutation_deliveries(dom);
         Ok((entry.kind == TimerKind::Interval).then_some(entry.delay_ms))
     }
 
@@ -477,7 +485,10 @@ impl JsRuntime {
         self.dom_nodes_created = 0;
         self.this_stack.clear();
         self.environment.clear();
-        self.dispatch_prepared_event(dom, target, event, event_type, bubbles)
+        let default_enabled =
+            self.dispatch_prepared_event(dom, target, event, event_type, bubbles)?;
+        self.queue_mutation_deliveries(dom);
+        Ok(default_enabled)
     }
 
     /// Invoke one callable retained by the embedding page.
@@ -501,6 +512,7 @@ impl JsRuntime {
             JsMicrotask::IntersectionObserver(observer) => {
                 self.notify_intersection_observer(dom, observer)
             }
+            JsMicrotask::MutationObserver(observer) => self.notify_mutation_observer(dom, observer),
             JsMicrotask::PromiseReaction {
                 handler,
                 argument,
@@ -559,6 +571,7 @@ impl JsRuntime {
         self.environment.clear();
         self.instantiate_statements(&script.statements)?;
         let completion = self.evaluate_statements(dom, &script.statements)?;
+        self.queue_mutation_deliveries(dom);
         let value = match completion {
             Completion::Normal(value) => value,
             Completion::Return(_) | Completion::Break(_) | Completion::Continue(_) => {
@@ -2716,6 +2729,15 @@ impl JsRuntime {
                 Some(NativeFunction::CollectionIteratorNext)
             }
             (Some(ObjectHost::StringPrimitive(_)), name) => string_method_native(name),
+            (Some(ObjectHost::MutationObserver { .. }), "observe") => {
+                Some(NativeFunction::MutationObserve)
+            }
+            (Some(ObjectHost::MutationObserver { .. }), "disconnect") => {
+                Some(NativeFunction::MutationDisconnect)
+            }
+            (Some(ObjectHost::MutationObserver { .. }), "takeRecords") => {
+                Some(NativeFunction::MutationTakeRecords)
+            }
             _ => None,
         };
         if let Some(function) = function {
@@ -2991,6 +3013,9 @@ impl JsRuntime {
             Some(ObjectHost::IntersectionObserverConstructor) => {
                 self.intersection_observer_constructor(constructor, arguments)
             }
+            Some(ObjectHost::MutationObserverConstructor) => {
+                self.mutation_observer_constructor(constructor, arguments)
+            }
             Some(ObjectHost::CollectionConstructor(kind)) => {
                 self.collection_constructor(dom, constructor, kind, arguments)
             }
@@ -3123,6 +3148,9 @@ impl JsRuntime {
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             Some(ObjectHost::IntersectionObserverConstructor) => Err(JsError::type_error(
                 "IntersectionObserver constructor requires 'new'",
+            )),
+            Some(ObjectHost::MutationObserverConstructor) => Err(JsError::type_error(
+                "MutationObserver constructor requires 'new'",
             )),
             Some(ObjectHost::CollectionConstructor(_)) => {
                 Err(JsError::type_error("collection constructors require 'new'"))
@@ -4458,6 +4486,15 @@ impl JsRuntime {
             }
             NativeFunction::IntersectionDisconnect => self.intersection_disconnect(receiver),
             NativeFunction::IntersectionTakeRecords => self.intersection_take_records(receiver),
+            NativeFunction::MutationObserve => self.mutation_observe(receiver, arguments),
+            NativeFunction::MutationDisconnect => self.mutation_disconnect(receiver),
+            NativeFunction::MutationTakeRecords => self.mutation_take_records(receiver),
+            NativeFunction::ObjectGetOwnPropertySymbols => {
+                Ok(JsValue::Object(self.create_array_from_values(&[])?))
+            }
+            NativeFunction::ArrayPrototypeToString => {
+                self.call_native_dispatch(dom, NativeFunction::ArrayJoin, receiver, &[])
+            }
             NativeFunction::StyleGetProperty => self.style_get_property(dom, receiver, arguments),
             NativeFunction::StyleSetProperty => self.style_set_property(dom, receiver, arguments),
             NativeFunction::StyleRemoveProperty => {
@@ -5767,6 +5804,227 @@ impl JsRuntime {
             ));
         }
         Ok(JsValue::Object(self.create_array_from_values(&[])?))
+    }
+
+    fn mutation_observer_constructor(
+        &mut self,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "MutationObserver")?,
+            &self.realm,
+        )?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.ensure_heap_capacity(2)?;
+        let observer = self.realm.create_object(prototype);
+        *self
+            .realm
+            .host_mut(observer)
+            .expect("newly created observer has host storage") = ObjectHost::MutationObserver {
+            callback,
+            targets: Vec::new(),
+            queued: Vec::new(),
+        };
+        self.mutation_observers.push(observer);
+        Ok(JsValue::Object(observer))
+    }
+
+    fn mutation_observe(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = self.value_as_node(required_argument(arguments, 0, "observe")?)?;
+        let options = arguments.get(1).and_then(|value| match value {
+            JsValue::Object(object) => Some(*object),
+            _ => None,
+        });
+        let enabled = |name: &str| {
+            options
+                .and_then(|object| self.realm.get_property(object, name))
+                .is_some_and(|value| matches!(value, JsValue::Boolean(true)))
+        };
+        let watch = MutationWatch {
+            target,
+            subtree: enabled("subtree"),
+            child_list: enabled("childList"),
+            attributes: enabled("attributes"),
+            character_data: enabled("characterData"),
+        };
+        let Some(ObjectHost::MutationObserver { targets, .. }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible MutationObserver receiver",
+            ));
+        };
+        if !targets.contains(&watch) {
+            targets.push(watch);
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    fn mutation_disconnect(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::MutationObserver {
+            targets, queued, ..
+        }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible MutationObserver receiver",
+            ));
+        };
+        targets.clear();
+        queued.clear();
+        self.pending_microtasks.retain(
+            |task| !matches!(task, JsMicrotask::MutationObserver(observer) if *observer == receiver),
+        );
+        Ok(JsValue::Undefined)
+    }
+
+    fn mutation_take_records(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::MutationObserver { queued, .. }) = self.realm.host_mut(receiver)
+        else {
+            return Err(JsError::type_error(
+                "incompatible MutationObserver receiver",
+            ));
+        };
+        let drained = std::mem::take(queued);
+        let values = drained
+            .iter()
+            .map(|record| self.mutation_record_value(record))
+            .collect::<Vec<_>>();
+        Ok(JsValue::Object(self.create_array_from_values(&values)?))
+    }
+
+    /// Copy journal records newer than the last seen revision into every
+    /// registered observer's queue, then schedule one delivery microtask per
+    /// observer with pending records.
+    fn queue_mutation_deliveries(&mut self, dom: &mut Dom) {
+        if self.mutation_observers.is_empty() {
+            self.mutation_seen_revision = dom.revision();
+            return;
+        }
+        let Ok(batch) = dom.mutations_since(self.mutation_seen_revision) else {
+            return;
+        };
+        self.mutation_seen_revision = batch.to_revision;
+        if batch.records.is_empty() {
+            return;
+        }
+        for observer in std::mem::take(&mut self.mutation_observers) {
+            let watches = match self.realm.host(observer) {
+                Some(ObjectHost::MutationObserver { targets, .. }) => targets.clone(),
+                _ => continue,
+            };
+            if watches.is_empty() {
+                self.mutation_observers.push(observer);
+                continue;
+            }
+            let mut delivered = Vec::new();
+            for watch in &watches {
+                for record in &batch.records {
+                    let target = record.kind.target();
+                    let relevant = target == watch.target
+                        || (watch.subtree && Self::has_ancestor(dom, target, watch.target));
+                    let matches = match &record.kind {
+                        MutationKind::ChildList { .. } => watch.child_list,
+                        MutationKind::Attribute { .. } => watch.attributes,
+                        MutationKind::CharacterData { .. } => watch.character_data,
+                    };
+                    if relevant && matches {
+                        delivered.push(record.clone());
+                    }
+                }
+            }
+            self.mutation_observers.push(observer);
+            if delivered.is_empty() {
+                continue;
+            }
+            if let Some(ObjectHost::MutationObserver { queued, .. }) = self.realm.host_mut(observer)
+            {
+                queued.extend(delivered);
+            }
+            if !self
+                .pending_microtasks
+                .iter()
+                .any(|task| matches!(task, JsMicrotask::MutationObserver(id) if *id == observer))
+            {
+                self.pending_microtasks
+                    .push(JsMicrotask::MutationObserver(observer));
+            }
+        }
+    }
+
+    fn notify_mutation_observer(
+        &mut self,
+        dom: &mut Dom,
+        observer: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let callback = match self.realm.host(observer) {
+            Some(ObjectHost::MutationObserver { callback, .. }) => callback,
+            _ => return Ok(JsValue::Undefined),
+        };
+        let drained = match self.realm.host_mut(observer) {
+            Some(ObjectHost::MutationObserver { queued, .. }) => std::mem::take(queued),
+            _ => Vec::new(),
+        };
+        if drained.is_empty() {
+            return Ok(JsValue::Undefined);
+        }
+        let records = drained
+            .iter()
+            .map(|record| self.mutation_record_value(record))
+            .collect::<Vec<_>>();
+        let records = self.create_array_from_values(&records)?;
+        self.call_with_this(
+            dom,
+            callback,
+            &[JsValue::Object(records), JsValue::Object(observer)],
+            JsValue::Object(observer),
+        )
+    }
+
+    fn mutation_record_value(&mut self, record: &crate::dom::MutationRecord) -> JsValue {
+        let object = self.realm.create_object(None);
+        let kind = &record.kind;
+        let (type_name, target, attribute_name) = match kind {
+            MutationKind::ChildList { target, .. } => ("childList", *target, None),
+            MutationKind::Attribute { target, local_name } => {
+                ("attributes", *target, Some(local_name.clone()))
+            }
+            MutationKind::CharacterData { target } => ("characterData", *target, None),
+        };
+        self.realm.set_property(
+            object,
+            "type".to_owned(),
+            JsValue::String(type_name.to_owned()),
+        );
+        let wrapper = self.realm.node_wrapper(target);
+        self.realm
+            .set_property(object, "target".to_owned(), JsValue::Object(wrapper));
+        self.realm.set_property(
+            object,
+            "attributeName".to_owned(),
+            attribute_name.map_or(JsValue::Null, JsValue::String),
+        );
+        JsValue::Object(object)
+    }
+
+    fn has_ancestor(dom: &Dom, node: NodeId, ancestor: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(candidate) = current {
+            if candidate == ancestor {
+                return true;
+            }
+            current = dom.parent(candidate);
+        }
+        false
     }
 
     fn queue_intersection_observer(&mut self, observer: ObjectId) {

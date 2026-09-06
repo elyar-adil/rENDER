@@ -331,6 +331,7 @@ pub(crate) enum NativeFunction {
     ObjectGetOwnPropertyDescriptor,
     ObjectGetOwnPropertyDescriptors,
     ObjectGetOwnPropertyNames,
+    ObjectGetOwnPropertySymbols,
     ObjectGetPrototypeOf,
     ObjectHasOwn,
     ObjectPrototypeHasOwnProperty,
@@ -368,6 +369,10 @@ pub(crate) enum NativeFunction {
     TypedArrayForEach,
     TypedArrayMap,
     TypedArrayFilter,
+    MutationObserve,
+    MutationDisconnect,
+    MutationTakeRecords,
+    ArrayPrototypeToString,
 }
 
 /// One integer or float element type of the ECMAScript typed-array family.
@@ -603,6 +608,14 @@ pub(crate) enum ObjectHost {
         callback: ObjectId,
         targets: Vec<NodeId>,
     },
+    MutationObserverConstructor,
+    MutationObserver {
+        callback: ObjectId,
+        targets: Vec<MutationWatch>,
+        /// Journal records accumulated since the last delivery, drained by
+        /// the microtask that invokes `callback` with the record list.
+        queued: Vec<crate::dom::MutationRecord>,
+    },
     Location(Url),
     ErrorConstructor(ErrorKind),
     Promise(usize),
@@ -635,6 +648,19 @@ pub(crate) enum ObjectHost {
         pairs: Vec<(String, String)>,
         owner: Option<ObjectId>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the flags mirror MutationObserverInit's independent boolean options"
+)]
+pub(crate) struct MutationWatch {
+    pub target: NodeId,
+    pub subtree: bool,
+    pub child_list: bool,
+    pub attributes: bool,
+    pub character_data: bool,
 }
 
 /// An object stored in a realm. Host identity is intentionally private: DOM
@@ -1098,6 +1124,51 @@ impl Realm {
                 configurable: true,
             },
         );
+        let mutation_observer_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("observe", NativeFunction::MutationObserve),
+            ("disconnect", NativeFunction::MutationDisconnect),
+            ("takeRecords", NativeFunction::MutationTakeRecords),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[mutation_observer_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let mutation_observer = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::MutationObserverConstructor,
+            ..JsObject::default()
+        });
+        objects[mutation_observer.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(mutation_observer_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "MutationObserver".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Object(mutation_observer),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
         Self::install_console(&mut objects, global);
         Self::install_timers(&mut objects, global);
         for (index, object) in objects.iter_mut().enumerate() {
@@ -1120,6 +1191,7 @@ impl Realm {
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
                     | ObjectHost::IntersectionObserverConstructor
+                    | ObjectHost::MutationObserverConstructor
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
                     | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
@@ -1741,6 +1813,10 @@ impl Realm {
                 "getOwnPropertyNames",
                 NativeFunction::ObjectGetOwnPropertyNames,
             ),
+            (
+                "getOwnPropertySymbols",
+                NativeFunction::ObjectGetOwnPropertySymbols,
+            ),
             ("getPrototypeOf", NativeFunction::ObjectGetPrototypeOf),
             ("hasOwn", NativeFunction::ObjectHasOwn),
         ] {
@@ -2216,6 +2292,30 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        // Well-known symbols are emulated as "@@name" string keys: objects
+        // store their `Symbol.toStringTag`-style metadata under these keys and
+        // `Object.prototype.toString` consults them, matching the string-keyed
+        // convention the rest of this engine uses for symbol-keyed behavior.
+        for (name, key) in [
+            ("iterator", "@@iterator"),
+            ("asyncIterator", "@@asyncIterator"),
+            ("toStringTag", "@@toStringTag"),
+            ("toPrimitive", "@@toPrimitive"),
+            ("hasInstance", "@@hasInstance"),
+            ("species", "@@species"),
+            ("isConcatSpreadable", "@@isConcatSpreadable"),
+            ("unscopables", "@@unscopables"),
+            ("match", "@@match"),
+            ("matchAll", "@@matchAll"),
+            ("replace", "@@replace"),
+            ("search", "@@search"),
+            ("split", "@@split"),
+        ] {
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::String(key.to_owned())),
+            );
+        }
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
@@ -2570,6 +2670,7 @@ impl Realm {
             ("every", NativeFunction::ArrayEvery),
             ("includes", NativeFunction::ArrayIncludes),
             ("reduce", NativeFunction::ArrayReduce),
+            ("toString", NativeFunction::ArrayPrototypeToString),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {

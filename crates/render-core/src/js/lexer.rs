@@ -101,6 +101,10 @@ pub(super) enum TemplatePart {
 pub(super) struct Token {
     pub kind: TokenKind,
     pub offset: usize,
+    /// Whether a line terminator (or a comment containing one) precedes this
+    /// token. Restricted productions such as `return` need this for correct
+    /// automatic semicolon insertion.
+    pub after_newline: bool,
 }
 
 pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token>, JsError> {
@@ -122,6 +126,7 @@ pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token
         max_tokens: limits.max_tokens,
         brace_stack: Vec::new(),
         last_block_close: true,
+        newline: false,
     }
     .run()
 }
@@ -137,6 +142,8 @@ struct Lexer<'a> {
     brace_stack: Vec<bool>,
     /// Whether the most recently closed `{}` was a block.
     last_block_close: bool,
+    /// Whether a line terminator was seen since the previous token.
+    newline: bool,
 }
 
 impl Lexer<'_> {
@@ -146,6 +153,9 @@ impl Lexer<'_> {
             // ECMA-262 WhiteSpace includes <ZWNBSP> (U+FEFF); source files
             // saved with a UTF-8 byte-order mark must still tokenize.
             if character.is_ascii_whitespace() || character == '\u{feff}' {
+                if matches!(character, '\n' | '\r') {
+                    self.newline = true;
+                }
                 self.advance();
                 continue;
             }
@@ -977,6 +987,9 @@ impl Lexer<'_> {
                 self.advance();
                 return Ok(());
             }
+            if matches!(character, '\n' | '\r') {
+                self.newline = true;
+            }
             self.advance();
         }
         Err(JsError::syntax("unterminated block comment", start))
@@ -990,7 +1003,11 @@ impl Lexer<'_> {
                 Some(offset),
             ));
         }
-        self.tokens.push(Token { kind, offset });
+        self.tokens.push(Token {
+            kind,
+            offset,
+            after_newline: std::mem::take(&mut self.newline),
+        });
         Ok(())
     }
 

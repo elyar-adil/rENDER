@@ -447,7 +447,10 @@ impl Parser {
             if self.function_depth == 0 {
                 return Err(self.error("return is only valid inside a function"));
             }
-            let value = if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RightBrace) {
+            let value = if self.at(&TokenKind::Semicolon)
+                || self.at(&TokenKind::RightBrace)
+                || self.current().after_newline
+            {
                 None
             } else {
                 Some(self.expression()?)
@@ -490,9 +493,13 @@ impl Parser {
         }
     }
 
-    /// Consume an identifier in `break`/`continue` label position.
+    /// Consume an identifier in `break`/`continue` label position. A line
+    /// terminator ends the statement instead of introducing a label.
     fn take_loop_label(&mut self) -> Option<String> {
         if let TokenKind::Identifier(name) = &self.current().kind {
+            if self.current().after_newline {
+                return None;
+            }
             let name = name.clone();
             self.advance();
             Some(name)
@@ -1322,6 +1329,32 @@ impl Parser {
             // missing global named await.
             self.advance();
             return self.unary();
+        }
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield") {
+            // Generator suspension is also outside the synchronous
+            // interpreter, but modern bundles wrap `yield` in helper-driven
+            // generator bodies that must still parse. The operand (a full
+            // AssignmentExpression per ECMA-262) keeps its side effects; a
+            // bare `yield` followed by a terminator stays an expression.
+            self.advance();
+            let terminated = self.current().after_newline
+                || matches!(
+                    self.current().kind,
+                    TokenKind::Semicolon
+                        | TokenKind::Comma
+                        | TokenKind::RightParen
+                        | TokenKind::RightBracket
+                        | TokenKind::RightBrace
+                        | TokenKind::Colon
+                        | TokenKind::Question
+                        | TokenKind::Dot
+                        | TokenKind::Eof
+                );
+            return if terminated {
+                Ok(Expr::Literal(JsValue::Undefined))
+            } else {
+                self.assignment()
+            };
         }
         let update_operator = if self.take(&TokenKind::PlusPlus) {
             Some(BinaryOp::Add)

@@ -1149,6 +1149,29 @@ impl PageState {
         self.page.document().dom().revision() != revision_before_execution
     }
 
+    /// Derive the committed page title from the document's `<title>` element,
+    /// keeping the URL-based fallback when the document has none.
+    ///
+    /// Returns whether the committed title changed.
+    fn sync_committed_title(&mut self) -> bool {
+        let derived = self.page.document_title().and_then(|title| {
+            let trimmed = title.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            }
+        });
+        let Some(title) = derived else {
+            return false;
+        };
+        if self.navigation.committed().title == title {
+            return false;
+        }
+        self.navigation.committed.title = title;
+        true
+    }
+
     /// Print buffered `console.*` output from the page's script runtime.
     fn drain_console(&mut self) {
         for message in self.page.runtime_mut().take_console_messages() {
@@ -1927,12 +1950,17 @@ impl BrowserApp {
     }
 
     fn install_source(&mut self, id: TabId, source: PageSource, loading: bool) {
-        self.tabs
-            .update(id, source.title.clone(), source.target.display_address());
-        self.tabs.set_loading(id, loading);
+        let fallback_title = source.title.clone();
+        let mut title = fallback_title;
+        let mut address = source.target.display_address();
         if let Some(page) = self.pages.get_mut(&id) {
             page.set_source(source);
+            page.sync_committed_title();
+            title.clone_from(&page.navigation.committed().title);
+            address = page.navigation.committed().target.display_address();
         }
+        self.tabs.update(id, title, address);
+        self.tabs.set_loading(id, loading);
         if id == self.tabs.active_id() {
             self.sync_active_address();
             self.relayout_and_render(true);
@@ -1940,6 +1968,30 @@ impl BrowserApp {
             self.repaint_chrome();
         }
         self.request_redraw();
+    }
+
+    /// Propagate the document's `<title>` (including script-driven updates) to
+    /// the tab label and window title.
+    fn sync_page_title(&mut self, id: TabId) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        if !page.sync_committed_title() {
+            return;
+        }
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!(
+                "render-browser tab title update -> {:?}",
+                page.navigation.committed().title
+            );
+        }
+        let title = page.navigation.committed().title.clone();
+        let address = page.navigation.committed().target.display_address();
+        self.tabs.update(id, title, address);
+        if id == self.tabs.active_id() {
+            self.update_window_title();
+        }
+        self.repaint_chrome();
     }
 
     fn start_external_style_sheets(&mut self, id: TabId, plan: StylesheetFetchPlan) {
@@ -2060,6 +2112,7 @@ impl BrowserApp {
             self.tabs.set_loading(id, true);
         }
 
+        self.sync_page_title(id);
         if loading_complete {
             self.tabs.set_loading(id, false);
         }
@@ -2279,6 +2332,7 @@ impl BrowserApp {
             page.execute_script_batch(preparation)
         };
 
+        self.sync_page_title(id);
         if rerender {
             self.schedule_page_render_for_tab(id);
         }
@@ -2498,6 +2552,7 @@ impl BrowserApp {
             let (_, defaults) = page.run_page_turns();
             default_allowed = defaults.get(&task).copied().unwrap_or(true);
             self.drain_script_navigations(id);
+            self.sync_page_title(id);
         }
         let navigation = hit_node.and_then(|hit_node| {
             let page = self.pages.get(&id)?;
@@ -2701,6 +2756,7 @@ impl BrowserApp {
                 self.schedule_page_render_for_tab(tab);
             }
             self.drain_script_navigations(tab);
+            self.sync_page_title(tab);
             return;
         }
         self.schedule_page_render_for_tab(tab);
@@ -3018,6 +3074,7 @@ impl BrowserApp {
                 self.schedule_page_render_for_tab(id);
             }
             self.drain_script_navigations(id);
+            self.sync_page_title(id);
         }
     }
 
@@ -3334,6 +3391,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         let active = self.tabs.active_id();
         let mut rendered_active = false;
         let mut navigation_candidates = Vec::new();
+        let mut title_candidates = Vec::new();
         for (id, page) in &mut self.pages {
             let revision_before = page.dom_revision;
             let turn_budget = if *id == active {
@@ -3348,7 +3406,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 Ok(_) => {
                     let revision_after = page.page.document().dom().revision().as_u64();
                     page.dom_revision = revision_after;
-                    rendered_active |= *id == active && revision_after != revision_before;
+                    if revision_after != revision_before {
+                        rendered_active |= *id == active;
+                        title_candidates.push(*id);
+                    }
                 }
                 Err(error) => eprintln!("render-browser page pump failed: {error}"),
             }
@@ -3364,6 +3425,9 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         }
         if rendered_active {
             self.schedule_page_render_for_tab(active);
+        }
+        for id in title_candidates {
+            self.sync_page_title(id);
         }
         for id in navigation_candidates {
             self.drain_script_navigations(id);
@@ -4244,6 +4308,79 @@ mod tests {
 
         assert!(first.scroll.offset_y().abs() < f32::EPSILON);
         assert!((second.scroll.offset_y() - 120.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn network_commit_takes_the_title_from_the_parsed_head_title() {
+        let mut page = PageState::new(PageSource {
+            html: "<!doctype html><html><head><meta charset=utf-8>\
+                   <title>百度一下，你就知道</title></head><body></body></html>"
+                .into(),
+            title: "www.baidu.com".into(),
+            target: NavigationTarget::Url(Url::parse("https://www.baidu.com/").expect("page URL")),
+        });
+        assert_eq!(page.navigation.committed().title, "www.baidu.com");
+
+        assert!(page.sync_committed_title());
+
+        assert_eq!(page.navigation.committed().title, "百度一下，你就知道");
+    }
+
+    #[test]
+    fn title_less_page_keeps_the_url_fallback_title() {
+        let mut page = PageState::new(PageSource {
+            html: "<!doctype html><html><body><p>plain</p></body></html>".into(),
+            title: "www.baidu.com".into(),
+            target: NavigationTarget::Url(Url::parse("https://www.baidu.com/").expect("page URL")),
+        });
+
+        assert!(!page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "www.baidu.com");
+    }
+
+    #[test]
+    fn script_assigned_document_title_propagates_to_the_committed_title() {
+        let mut page = PageState::new(PageSource {
+            html: "<!doctype html><html><head><title>Static</title></head>\
+                   <body><script>document.title = 'Script Title';</script></body></html>"
+                .into(),
+            title: "www.baidu.com".into(),
+            target: NavigationTarget::Url(Url::parse("https://www.baidu.com/").expect("page URL")),
+        });
+        page.page
+            .queue_script("document.title = 'Script Title';")
+            .expect("title script should queue");
+
+        let (changed, _) = page.run_page_turns();
+
+        assert!(changed);
+        assert!(page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "Script Title");
+    }
+
+    #[test]
+    fn timer_deferred_document_title_propagates_on_a_later_turn() {
+        let mut page = PageState::new(PageSource {
+            html: "<!doctype html><html><body></body></html>".into(),
+            title: "www.baidu.com".into(),
+            target: NavigationTarget::Url(Url::parse("https://www.baidu.com/").expect("page URL")),
+        });
+        page.page
+            .queue_script("setTimeout(function () { document.title = 'Async Title'; }, 10);")
+            .expect("timer script should queue");
+
+        // The timer has not fired yet, so the title stays at the URL fallback.
+        page.page
+            .pump_at_most_without_render(std::time::Duration::ZERO, 4)
+            .expect("idle pump succeeds");
+        assert!(!page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "www.baidu.com");
+
+        page.page
+            .pump_at_most_without_render(std::time::Duration::from_millis(20), 4)
+            .expect("timer pump succeeds");
+        assert!(page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "Async Title");
     }
 
     #[test]
