@@ -357,6 +357,148 @@ pub(crate) enum NativeFunction {
     CollectionValues,
     CollectionEntries,
     CollectionIteratorNext,
+    TypedArraySet,
+    TypedArraySubarray,
+    TypedArraySlice,
+    TypedArrayFill,
+    TypedArrayIndexOf,
+    TypedArrayJoin,
+    TypedArrayFrom,
+    TypedArrayIncludes,
+    TypedArrayForEach,
+    TypedArrayMap,
+    TypedArrayFilter,
+}
+
+/// One integer or float element type of the ECMAScript typed-array family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedArrayKind {
+    Int8,
+    Uint8,
+    Uint8Clamped,
+    Int16,
+    Uint16,
+    Int32,
+    Uint32,
+    Float32,
+    Float64,
+}
+
+impl TypedArrayKind {
+    pub(crate) const ALL: [Self; 9] = [
+        Self::Int8,
+        Self::Uint8,
+        Self::Uint8Clamped,
+        Self::Int16,
+        Self::Uint16,
+        Self::Int32,
+        Self::Uint32,
+        Self::Float32,
+        Self::Float64,
+    ];
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Int8 => "Int8Array",
+            Self::Uint8 => "Uint8Array",
+            Self::Uint8Clamped => "Uint8ClampedArray",
+            Self::Int16 => "Int16Array",
+            Self::Uint16 => "Uint16Array",
+            Self::Int32 => "Int32Array",
+            Self::Uint32 => "Uint32Array",
+            Self::Float32 => "Float32Array",
+            Self::Float64 => "Float64Array",
+        }
+    }
+
+    pub(crate) const fn element_size(self) -> usize {
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
+            Self::Int16 | Self::Uint16 => 2,
+            Self::Int32 | Self::Uint32 | Self::Float32 => 4,
+            Self::Float64 => 8,
+        }
+    }
+
+    /// Convert a JavaScript Number into one element of this array kind,
+    /// applying the integer-indexed wrapping (`Int8` through `Uint32`),
+    /// clamping (`Uint8Clamped`), or float rounding (`Float32`) rules of
+    /// the ECMA-262 `IntegerIndexedElementSet` operation.
+    pub(crate) fn encode(self, value: f64) -> f64 {
+        match self {
+            Self::Float64 => value,
+            Self::Float32 => {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "Float32Array elements round to IEEE binary32"
+                )]
+                {
+                    f64::from(value as f32)
+                }
+            }
+            Self::Uint8Clamped => Self::clamp_u8(value),
+            Self::Uint8 => Self::wrap_integer(value, 8, false),
+            Self::Int8 => Self::wrap_integer(value, 8, true),
+            Self::Uint16 => Self::wrap_integer(value, 16, false),
+            Self::Int16 => Self::wrap_integer(value, 16, true),
+            Self::Uint32 => Self::wrap_integer(value, 32, false),
+            Self::Int32 => Self::wrap_integer(value, 32, true),
+        }
+    }
+
+    fn wrap_integer(value: f64, bits: u32, signed: bool) -> f64 {
+        if !value.is_finite() {
+            return 0.0;
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "integer-indexed stores truncate toward zero first"
+        )]
+        let truncated = value.trunc();
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "element-type ranges stay far below any precision boundary"
+        )]
+        let modulus = (1_u64 << bits) as f64;
+        let wrapped = truncated.rem_euclid(modulus);
+        if signed && wrapped >= modulus / 2.0 {
+            wrapped - modulus
+        } else {
+            wrapped
+        }
+    }
+
+    fn clamp_u8(value: f64) -> f64 {
+        if value.is_nan() {
+            return 0.0;
+        }
+        if value <= 0.0 {
+            return 0.0;
+        }
+        if value >= 255.0 {
+            return 255.0;
+        }
+        let floor = value.floor();
+        let fraction = value - floor;
+        let half_is_even = (floor / 2.0).fract() == 0.0;
+        match fraction.partial_cmp(&0.5) {
+            Some(std::cmp::Ordering::Less) => floor,
+            Some(std::cmp::Ordering::Equal) if half_is_even => floor,
+            _ => floor + 1.0,
+        }
+    }
+}
+
+/// Shared element storage for typed-array views. Views created by `subarray`
+/// reference the same buffer so mutations stay visible through both views,
+/// matching the shared-ArrayBuffer contract.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TypedBuffer(pub std::rc::Rc<std::cell::RefCell<Vec<f64>>>);
+
+impl PartialEq for TypedBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -476,6 +618,15 @@ pub(crate) enum ObjectHost {
     CollectionIterator {
         values: Vec<JsValue>,
         index: usize,
+    },
+    TypedArrayConstructor(TypedArrayKind),
+    TypedArray {
+        kind: TypedArrayKind,
+        buffer: TypedBuffer,
+        /// Element offset of this view within the shared buffer.
+        start: usize,
+        /// Element count of this view.
+        length: usize,
     },
     UrlConstructor,
     UrlSearchParamsConstructor,
@@ -618,6 +769,7 @@ impl Realm {
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
+        Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::define_global_function(
             &mut objects,
@@ -1200,6 +1352,110 @@ impl Realm {
             );
             objects[global.0].properties.insert(
                 name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(constructor),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+    }
+
+    /// Install the typed-array family (`Int8Array` through `Float64Array`)
+    /// with constructor forms, prototype methods, and `BYTES_PER_ELEMENT`
+    /// constants.
+    fn install_typed_arrays(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        for kind in TypedArrayKind::ALL {
+            let prototype = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(object_prototype),
+                ..JsObject::default()
+            });
+            let methods: &[(&str, NativeFunction)] = &[
+                ("set", NativeFunction::TypedArraySet),
+                ("subarray", NativeFunction::TypedArraySubarray),
+                ("slice", NativeFunction::TypedArraySlice),
+                ("fill", NativeFunction::TypedArrayFill),
+                ("indexOf", NativeFunction::TypedArrayIndexOf),
+                ("includes", NativeFunction::TypedArrayIncludes),
+                ("join", NativeFunction::TypedArrayJoin),
+                ("toString", NativeFunction::TypedArrayJoin),
+                ("forEach", NativeFunction::TypedArrayForEach),
+                ("map", NativeFunction::TypedArrayMap),
+                ("filter", NativeFunction::TypedArrayFilter),
+            ];
+            for &(method_name, function) in methods {
+                let method = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(function),
+                    ..JsObject::default()
+                });
+                objects[prototype.0].properties.insert(
+                    method_name.to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(method)),
+                );
+            }
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "element sizes are tiny integers"
+            )]
+            let bytes_per_element = JsValue::Number(kind.element_size() as f64);
+            objects[prototype.0].properties.insert(
+                "BYTES_PER_ELEMENT".to_owned(),
+                PropertyDescriptor {
+                    value: bytes_per_element.clone(),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+            let constructor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::TypedArrayConstructor(kind),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                "prototype".to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Object(prototype),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+            objects[constructor.0].properties.insert(
+                "BYTES_PER_ELEMENT".to_owned(),
+                PropertyDescriptor {
+                    value: bytes_per_element,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+            let from = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::TypedArrayFrom),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                "from".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(from)),
+            );
+            objects[prototype.0].properties.insert(
+                "constructor".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(constructor)),
+            );
+            objects[global.0].properties.insert(
+                kind.name().to_owned(),
                 PropertyDescriptor {
                     value: JsValue::Object(constructor),
                     writable: true,
@@ -2821,6 +3077,44 @@ impl Realm {
             },
             ..JsObject::default()
         })
+    }
+
+    /// Create one typed-array view object. `length` is an own, non-writable,
+    /// non-enumerable property per the integer-indexed exotic object contract;
+    /// indexed elements are synthesized from the shared buffer on read.
+    pub(crate) fn typed_array(
+        &mut self,
+        kind: TypedArrayKind,
+        buffer: TypedBuffer,
+        start: usize,
+        length: usize,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
+        let object = self.allocate(JsObject {
+            prototype,
+            host: ObjectHost::TypedArray {
+                kind,
+                buffer,
+                start,
+                length,
+            },
+            ..JsObject::default()
+        });
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "typed-array lengths stay far below any precision boundary"
+        )]
+        let length_value = length as f64;
+        self.objects[object.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Number(length_value),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        object
     }
 
     pub(crate) fn collection_iterator(&mut self, values: Vec<JsValue>) -> ObjectId {

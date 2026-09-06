@@ -120,6 +120,8 @@ pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token
         offset: 0,
         tokens: Vec::new(),
         max_tokens: limits.max_tokens,
+        brace_stack: Vec::new(),
+        last_block_close: true,
     }
     .run()
 }
@@ -129,13 +131,21 @@ struct Lexer<'a> {
     offset: usize,
     tokens: Vec<Token>,
     max_tokens: usize,
+    /// Whether each open `{` likely starts a block (statement, function, or
+    /// control-flow body) instead of an object literal. Decides whether the
+    /// matching `}` may be followed by a regex literal.
+    brace_stack: Vec<bool>,
+    /// Whether the most recently closed `{}` was a block.
+    last_block_close: bool,
 }
 
 impl Lexer<'_> {
     #[allow(clippy::too_many_lines)]
     fn run(mut self) -> Result<Vec<Token>, JsError> {
         while let Some(character) = self.peek() {
-            if character.is_ascii_whitespace() {
+            // ECMA-262 WhiteSpace includes <ZWNBSP> (U+FEFF); source files
+            // saved with a UTF-8 byte-order mark must still tokenize.
+            if character.is_ascii_whitespace() || character == '\u{feff}' {
                 self.advance();
                 continue;
             }
@@ -158,8 +168,16 @@ impl Lexer<'_> {
                 ';' => self.single(TokenKind::Semicolon),
                 '(' => self.single(TokenKind::LeftParen),
                 ')' => self.single(TokenKind::RightParen),
-                '{' => self.single(TokenKind::LeftBrace),
-                '}' => self.single(TokenKind::RightBrace),
+                '{' => {
+                    self.advance();
+                    self.enter_brace();
+                    TokenKind::LeftBrace
+                }
+                '}' => {
+                    self.advance();
+                    self.exit_brace();
+                    TokenKind::RightBrace
+                }
                 '[' => self.single(TokenKind::LeftBracket),
                 ']' => self.single(TokenKind::RightBracket),
                 ':' => self.single(TokenKind::Colon),
@@ -279,6 +297,7 @@ impl Lexer<'_> {
     fn regex_allowed(&self) -> bool {
         match self.tokens.last().map(|token| &token.kind) {
             None => true,
+            Some(TokenKind::RightBrace) => self.last_block_close,
             Some(kind) => !matches!(
                 kind,
                 TokenKind::Identifier(_)
@@ -293,11 +312,135 @@ impl Lexer<'_> {
                     | TokenKind::This
                     | TokenKind::RightParen
                     | TokenKind::RightBracket
-                    | TokenKind::RightBrace
                     | TokenKind::PlusPlus
                     | TokenKind::MinusMinus
             ),
         }
+    }
+
+    /// Record one `{` and classify it as a block or object literal opener.
+    fn enter_brace(&mut self) {
+        let is_block = self.brace_opens_block();
+        self.brace_stack.push(is_block);
+    }
+
+    /// Record one `}` and remember whether its `{` opened a block, which
+    /// controls whether a following `/` starts a regex literal (e.g. the
+    /// statement after `return}` in a function body) or division (e.g. the
+    /// numerator after `{a:1}`).
+    fn exit_brace(&mut self) {
+        self.last_block_close = self.brace_stack.pop().unwrap_or(true);
+    }
+
+    /// Classify a `{` from the token immediately before it. Value positions
+    /// (`return {a:1}`, `x = {…}`, `[{}]`) open object literals; statement
+    /// keywords, separators, arrows, and the start of a script open blocks.
+    fn brace_opens_block(&self) -> bool {
+        let Some(last) = self.tokens.last() else {
+            return true;
+        };
+        match last.kind {
+            TokenKind::RightParen => self.paren_opens_block(),
+            TokenKind::Identifier(_)
+            | TokenKind::String(_)
+            | TokenKind::Number(_)
+            | TokenKind::RegexLiteral { .. }
+            | TokenKind::Template(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Null
+            | TokenKind::Undefined
+            | TokenKind::This
+            | TokenKind::Return
+            | TokenKind::Typeof
+            | TokenKind::New
+            | TokenKind::In
+            | TokenKind::Instanceof
+            | TokenKind::Delete
+            | TokenKind::Void
+            | TokenKind::Throw
+            | TokenKind::Dot
+            | TokenKind::Comma
+            | TokenKind::Question
+            | TokenKind::Colon
+            | TokenKind::Equal
+            | TokenKind::Plus
+            | TokenKind::PlusEqual
+            | TokenKind::Minus
+            | TokenKind::MinusEqual
+            | TokenKind::Star
+            | TokenKind::StarEqual
+            | TokenKind::StarStar
+            | TokenKind::Slash
+            | TokenKind::SlashEqual
+            | TokenKind::Percent
+            | TokenKind::PercentEqual
+            | TokenKind::Bang
+            | TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual
+            | TokenKind::LeftShift
+            | TokenKind::LeftShiftEqual
+            | TokenKind::RightShift
+            | TokenKind::RightShiftEqual
+            | TokenKind::UnsignedRightShift
+            | TokenKind::UnsignedRightShiftEqual
+            | TokenKind::Ampersand
+            | TokenKind::AmpersandEqual
+            | TokenKind::AndAnd
+            | TokenKind::Pipe
+            | TokenKind::PipeEqual
+            | TokenKind::OrOr
+            | TokenKind::Caret
+            | TokenKind::CaretEqual
+            | TokenKind::Tilde
+            | TokenKind::RightBracket
+            | TokenKind::RightBrace
+            | TokenKind::LeftParen
+            | TokenKind::LeftBracket
+            | TokenKind::PlusPlus
+            | TokenKind::MinusMinus => false,
+            // Statement keywords, separators, arrows, and braces begin
+            // block-shaped constructs.
+            _ => true,
+        }
+    }
+
+    /// Disambiguate `) {`: it closes a function or control-flow head when the
+    /// token before the matching `(` is such a keyword, and starts an object
+    /// literal otherwise (e.g. `(cond) ? {a:1} : {b:2}` or `(value) {}`).
+    fn paren_opens_block(&self) -> bool {
+        let mut depth = 0_usize;
+        for (reverse_index, token) in self.tokens.iter().rev().enumerate().skip(1) {
+            match token.kind {
+                TokenKind::RightParen => depth += 1,
+                TokenKind::LeftParen => {
+                    if depth == 0 {
+                        let before = self
+                            .tokens
+                            .iter()
+                            .rev()
+                            .nth(reverse_index + 1)
+                            .map(|token| token.kind.clone());
+                        return matches!(
+                            before,
+                            Some(
+                                TokenKind::Function
+                                    | TokenKind::Catch
+                                    | TokenKind::If
+                                    | TokenKind::While
+                                    | TokenKind::For
+                                    | TokenKind::Switch
+                            )
+                        );
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Scan a regex literal body plus flags. `/` inside a character class

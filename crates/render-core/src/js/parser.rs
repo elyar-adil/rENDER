@@ -145,7 +145,9 @@ pub(super) enum Statement {
     },
     Switch {
         expression: Expr,
-        cases: Vec<(Option<Expr>, Vec<Statement>)>,
+        // Each clause may list several test expressions (`case a, b:`); an
+        // empty test list is the `default` clause.
+        cases: Vec<(Vec<Expr>, Vec<Statement>)>,
     },
     While {
         condition: Expr,
@@ -778,13 +780,18 @@ impl Parser {
         let mut cases = Vec::new();
         self.switch_depth = self.switch_depth.saturating_add(1);
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
-            let test = if self.take(&TokenKind::Case) {
-                let test = self.assignment()?;
+            let tests = if self.take(&TokenKind::Case) {
+                // A case label is a full Expression, so comma-separated
+                // alternatives such as `case a, b:` are legal.
+                let mut tests = vec![self.assignment()?];
+                while self.take(&TokenKind::Comma) {
+                    tests.push(self.assignment()?);
+                }
                 self.require(&TokenKind::Colon, "expected ':' after case expression")?;
-                Some(test)
+                tests
             } else if self.take(&TokenKind::Default) {
                 self.require(&TokenKind::Colon, "expected ':' after default")?;
-                None
+                Vec::new()
             } else {
                 return Err(self.error("expected case or default in switch"));
             };
@@ -797,7 +804,7 @@ impl Parser {
                 self.reserve_statement()?;
                 consequent.push(self.statement()?);
             }
-            cases.push((test, consequent));
+            cases.push((tests, consequent));
         }
         self.switch_depth = self.switch_depth.saturating_sub(1);
         self.require(&TokenKind::RightBrace, "expected '}' after switch")?;
@@ -2070,8 +2077,8 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         }
         Statement::Switch { expression, cases } => {
             validate_strict_expression(expression)?;
-            for (test, statements) in cases {
-                if let Some(test) = test {
+            for (tests, statements) in cases {
+                for test in tests {
                     validate_strict_expression(test)?;
                 }
                 validate_strict_statements(statements)?;

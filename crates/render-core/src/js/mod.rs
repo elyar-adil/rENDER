@@ -44,14 +44,17 @@ impl Default for RuntimeLimits {
             // from sites such as qq.com while the remaining budgets keep each
             // script turn finite.
             max_source_bytes: 4 * 1_024 * 1_024,
-            max_tokens: 1_048_576,
+            // Minified production bundles run close to one token per source
+            // byte (3 MiB zhihu bundles emit ~2.6M tokens), so keep the token
+            // budget aligned with the 4 MiB source cap.
+            max_tokens: 4 * 1_024 * 1_024,
             max_statements: 131_072,
             max_execution_steps: 10_000_000,
-            // Production bundles routinely compose several layers of
-            // promise/iterator/polyfill helpers before reaching application
-            // code.  Keep recursion bounded, but leave enough room for that
-            // ordinary synchronous call chain.
-            max_call_depth: 256,
+            // React and friends recurse through several framework layers per
+            // logical render; 4096 frames keeps that well within the 512 MiB
+            // dedicated script stack (~2 KiB of native stack per interpreter
+            // frame) while still bounding runaway recursion.
+            max_call_depth: 4_096,
             max_heap_objects: 131_072,
             max_dom_nodes_created: 16_384,
         }
@@ -134,6 +137,15 @@ impl JsError {
         Self {
             kind: JsErrorKind::Throw,
             message: value.to_js_string(),
+            offset: None,
+            thrown: Some(value),
+        }
+    }
+
+    pub(crate) fn thrown_with_message(value: JsValue, message: impl Into<String>) -> Self {
+        Self {
+            kind: JsErrorKind::Throw,
+            message: message.into(),
             offset: None,
             thrown: Some(value),
         }
