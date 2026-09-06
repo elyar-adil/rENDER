@@ -10,8 +10,9 @@ use crate::layout::{PhysicalPoint, PhysicalRect};
 
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
-    BorderPaint, ClipShape, DisplayCommand, DisplayItem, DisplayItemId, DisplayList,
-    FontInstanceId, GlyphId, GlyphRun, PaintCoordinateSpace,
+    BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
+    DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient,
+    PaintCoordinateSpace,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 
@@ -425,11 +426,55 @@ struct Layer {
     opacity: f32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ClipRegion {
+    rect: PhysicalRect,
+    shapes: [ClipShape; MAX_CLIP_SHAPES],
+    shape_count: usize,
+}
+
+const MAX_CLIP_SHAPES: usize = 16;
+
+impl ClipRegion {
+    const fn rect(rect: PhysicalRect) -> Self {
+        Self {
+            rect,
+            shapes: [ClipShape::Rect(rect); MAX_CLIP_SHAPES],
+            shape_count: 1,
+        }
+    }
+
+    const fn rounded(rect: PhysicalRect, radii: CornerRadii) -> Self {
+        Self {
+            rect,
+            shapes: [
+                ClipShape::RoundedRect { rect, radii },
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+                ClipShape::Rect(rect),
+            ],
+            shape_count: 1,
+        }
+    }
+}
+
 struct RasterState<'a> {
     width: u32,
     height: u32,
     layers: Vec<Layer>,
-    clips: Vec<PhysicalRect>,
+    clips: Vec<ClipRegion>,
     diagnostics: Vec<RasterDiagnostic>,
     viewport_origin: PhysicalPoint,
     control: Option<&'a dyn RasterControl>,
@@ -455,12 +500,12 @@ impl<'a> RasterState<'a> {
                 surface: Surface::new(width, height, background),
                 opacity: 1.0,
             }],
-            clips: vec![PhysicalRect::new(
+            clips: vec![ClipRegion::rect(PhysicalRect::new(
                 0.0,
                 0.0,
                 u32_to_f32(width),
                 u32_to_f32(height),
-            )],
+            ))],
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -486,7 +531,7 @@ impl<'a> RasterState<'a> {
                 surface,
                 opacity: 1.0,
             }],
-            clips: vec![clip],
+            clips: vec![ClipRegion::rect(clip)],
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -516,24 +561,14 @@ impl<'a> RasterState<'a> {
                     self.current_surface(),
                     translate_rect(*rect, offset),
                     *color,
-                    clip,
+                    clip.as_ref(),
                     control,
                 ) {
                     self.cancelled = true;
                 }
             }
             DisplayCommand::Border(border) => self.paint_border(item.id, border, offset),
-            DisplayCommand::PushClip(ClipShape::Rect(rect)) => {
-                self.push_clip(translate_rect(*rect, offset));
-            }
-            DisplayCommand::PushClip(ClipShape::RoundedRect { rect, .. }) => {
-                self.push_clip(translate_rect(*rect, offset));
-                self.diagnostics.push(RasterDiagnostic {
-                    item: item.id,
-                    code: RasterDiagnosticCode::UnsupportedCommand,
-                    message: "rounded clip rasterization is not implemented".to_owned(),
-                });
-            }
+            DisplayCommand::PushClip(shape) => self.push_clip(*shape, offset),
             DisplayCommand::PopClip => self.pop_clip(item.id),
             DisplayCommand::PushStackingContext(context) => self.layers.push(Layer {
                 surface: Surface::new(self.width, self.height, Color::TRANSPARENT),
@@ -550,7 +585,7 @@ impl<'a> RasterState<'a> {
                     self.current_surface(),
                     translate_rect(decoration.rect, offset),
                     decoration.color,
-                    clip,
+                    clip.as_ref(),
                     control,
                 ) {
                     self.cancelled = true;
@@ -565,7 +600,7 @@ impl<'a> RasterState<'a> {
                         decoded,
                         translate_rect(image.destination, offset),
                         image.source,
-                        clip,
+                        clip.as_ref(),
                         control,
                     ) {
                         self.cancelled = true;
@@ -578,10 +613,34 @@ impl<'a> RasterState<'a> {
                     });
                 }
             }
-            DisplayCommand::BoxShadow(_)
-            | DisplayCommand::PushTransform(_)
+            DisplayCommand::LinearGradient(gradient) => {
+                let clip = self.current_clip();
+                let control = self.control;
+                if !paint_linear_gradient(
+                    self.current_surface(),
+                    gradient,
+                    offset,
+                    clip.as_ref(),
+                    control,
+                ) {
+                    self.cancelled = true;
+                }
+            }
+            DisplayCommand::BoxShadow(shadow) => {
+                let clip = self.current_clip();
+                let control = self.control;
+                if !paint_box_shadow(
+                    self.current_surface(),
+                    shadow,
+                    offset,
+                    clip.as_ref(),
+                    control,
+                ) {
+                    self.cancelled = true;
+                }
+            }
+            DisplayCommand::PushTransform(_)
             | DisplayCommand::PopTransform
-            | DisplayCommand::LinearGradient(_)
             | DisplayCommand::RadialGradient(_)
             | DisplayCommand::Canvas { .. } => self.diagnostics.push(RasterDiagnostic {
                 item: item.id,
@@ -615,38 +674,58 @@ impl<'a> RasterState<'a> {
             }
         }
         let rect = translate_rect(border.rect, offset);
-        let edges = [
-            PhysicalRect::new(
-                rect.origin.x,
-                rect.origin.y,
-                rect.size.width,
-                border.widths.top,
-            ),
-            PhysicalRect::new(
-                rect.right() - border.widths.right,
-                rect.origin.y,
-                border.widths.right,
-                rect.size.height,
-            ),
-            PhysicalRect::new(
-                rect.origin.x,
-                rect.bottom() - border.widths.bottom,
-                rect.size.width,
-                border.widths.bottom,
-            ),
-            PhysicalRect::new(
-                rect.origin.x,
-                rect.origin.y,
-                border.widths.left,
-                rect.size.height,
-            ),
-        ];
+        let inner = PhysicalRect::new(
+            rect.origin.x + border.widths.left,
+            rect.origin.y + border.widths.top,
+            (rect.size.width - border.widths.horizontal()).max(0.0),
+            (rect.size.height - border.widths.vertical()).max(0.0),
+        );
+        let inner_radii = inset_radii(
+            border.radii,
+            border.widths.top,
+            border.widths.right,
+            border.widths.bottom,
+            border.widths.left,
+        );
         let clip = self.current_clip();
+        let Some(visible) = intersection(Some(rect), clip.as_ref().map_or(rect, |c| c.rect)) else {
+            return;
+        };
+        let left = floor_to_u32(visible.origin.x);
+        let top = floor_to_u32(visible.origin.y);
+        let right = ceil_to_u32(visible.right().min(u32_to_f32(self.width)));
+        let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(self.height)));
         let control = self.control;
-        for (edge, color) in edges.into_iter().zip(border.colors) {
-            if !fill_rect(self.current_surface(), edge, color, clip, control) {
+        for y in top..bottom {
+            if control.is_some_and(RasterControl::is_cancelled) {
                 self.cancelled = true;
                 return;
+            }
+            for x in left..right {
+                let point = PhysicalPoint {
+                    x: u32_to_f32(x) + 0.5,
+                    y: u32_to_f32(y) + 0.5,
+                };
+                let coverage = clip_coverage(clip.as_ref(), point.x, point.y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let border_coverage =
+                    rounded_ring_coverage(rect, border.radii, inner, inner_radii, point.x, point.y);
+                if border_coverage <= 0.0 {
+                    continue;
+                }
+                let Some(edge) = border_edge_at(rect, border, point) else {
+                    continue;
+                };
+                let color = border.colors[edge];
+                if let Some(index) = self.current_surface().index(x, y) {
+                    self.current_surface().pixels[index] = blend(
+                        self.current_surface().pixels[index],
+                        color,
+                        border_coverage * coverage,
+                    );
+                }
             }
         }
     }
@@ -674,7 +753,7 @@ impl<'a> RasterState<'a> {
                 mask.as_ref(),
                 translate_point(glyph.position, offset),
                 run.color,
-                clip,
+                clip.as_ref(),
                 control,
             ) {
                 self.cancelled = true;
@@ -683,9 +762,17 @@ impl<'a> RasterState<'a> {
         }
     }
 
-    fn push_clip(&mut self, rect: PhysicalRect) {
-        self.clips
-            .push(intersection(self.current_clip(), rect).unwrap_or_default());
+    fn push_clip(&mut self, shape: ClipShape, offset: PhysicalPoint) {
+        let clip = match shape {
+            ClipShape::Rect(rect) => ClipRegion::rect(translate_rect(rect, offset)),
+            ClipShape::RoundedRect { rect, radii } => {
+                ClipRegion::rounded(translate_rect(rect, offset), radii)
+            }
+        };
+        self.clips.push(
+            combine_clip(self.current_clip().as_ref(), &clip)
+                .unwrap_or_else(|| ClipRegion::rect(PhysicalRect::new(0.0, 0.0, 0.0, 0.0))),
+        );
     }
 
     fn pop_clip(&mut self, item: DisplayItemId) {
@@ -728,7 +815,7 @@ impl<'a> RasterState<'a> {
         &mut self.layers.last_mut().expect("root layer").surface
     }
 
-    fn current_clip(&self) -> Option<PhysicalRect> {
+    fn current_clip(&self) -> Option<ClipRegion> {
         self.clips.last().copied()
     }
 
@@ -787,6 +874,455 @@ fn translate_point(point: PhysicalPoint, offset: PhysicalPoint) -> PhysicalPoint
     }
 }
 
+fn inset_radii(radii: CornerRadii, top: f32, right: f32, bottom: f32, left: f32) -> CornerRadii {
+    CornerRadii {
+        top_left: (radii.top_left - top.max(left)).max(0.0),
+        top_right: (radii.top_right - top.max(right)).max(0.0),
+        bottom_right: (radii.bottom_right - bottom.max(right)).max(0.0),
+        bottom_left: (radii.bottom_left - bottom.max(left)).max(0.0),
+    }
+}
+
+fn combine_clip(first: Option<&ClipRegion>, second: &ClipRegion) -> Option<ClipRegion> {
+    let rect = intersection(first.map(|clip| clip.rect), second.rect)?;
+    let mut combined = first
+        .copied()
+        .unwrap_or_else(|| ClipRegion::rect(second.rect));
+    if first.is_none() {
+        combined.shapes[0] = second.shapes[0];
+        combined.shape_count = 1;
+    } else if combined.shape_count < MAX_CLIP_SHAPES {
+        combined.shapes[combined.shape_count] = second.shapes[0];
+        combined.shape_count += 1;
+    }
+    combined.rect = rect;
+    Some(combined)
+}
+
+fn point_in_rounded_rect(rect: PhysicalRect, radii: CornerRadii, point: PhysicalPoint) -> bool {
+    if rect.size.width <= 0.0
+        || rect.size.height <= 0.0
+        || point.x < rect.origin.x
+        || point.y < rect.origin.y
+        || point.x >= rect.right()
+        || point.y >= rect.bottom()
+    {
+        return false;
+    }
+
+    let radii = normalize_radii(radii, rect);
+    let top_left = radii.top_left;
+    let top_right = radii.top_right;
+    let bottom_right = radii.bottom_right;
+    let bottom_left = radii.bottom_left;
+    let (center, radius) = if point.x < rect.origin.x + top_left
+        && point.y < rect.origin.y + top_left
+    {
+        (
+            PhysicalPoint {
+                x: rect.origin.x + top_left,
+                y: rect.origin.y + top_left,
+            },
+            top_left,
+        )
+    } else if point.x >= rect.right() - top_right && point.y < rect.origin.y + top_right {
+        (
+            PhysicalPoint {
+                x: rect.right() - top_right,
+                y: rect.origin.y + top_right,
+            },
+            top_right,
+        )
+    } else if point.x >= rect.right() - bottom_right && point.y >= rect.bottom() - bottom_right {
+        (
+            PhysicalPoint {
+                x: rect.right() - bottom_right,
+                y: rect.bottom() - bottom_right,
+            },
+            bottom_right,
+        )
+    } else if point.x < rect.origin.x + bottom_left && point.y >= rect.bottom() - bottom_left {
+        (
+            PhysicalPoint {
+                x: rect.origin.x + bottom_left,
+                y: rect.bottom() - bottom_left,
+            },
+            bottom_left,
+        )
+    } else {
+        return true;
+    };
+    if radius <= 0.0 {
+        return true;
+    }
+    let distance_x = (point.x - center.x) / radius;
+    let distance_y = (point.y - center.y) / radius;
+    distance_x * distance_x + distance_y * distance_y <= 1.0
+}
+
+fn normalize_radii(mut radii: CornerRadii, rect: PhysicalRect) -> CornerRadii {
+    let mut scale = 1.0_f32;
+    for (sum, available) in [
+        (radii.top_left + radii.top_right, rect.size.width),
+        (radii.bottom_left + radii.bottom_right, rect.size.width),
+        (radii.top_left + radii.bottom_left, rect.size.height),
+        (radii.top_right + radii.bottom_right, rect.size.height),
+    ] {
+        if sum > available && sum > 0.0 {
+            scale = scale.min(available / sum);
+        }
+    }
+    radii.top_left *= scale;
+    radii.top_right *= scale;
+    radii.bottom_right *= scale;
+    radii.bottom_left *= scale;
+    let maximum = (rect.size.width.min(rect.size.height) / 2.0).max(0.0);
+    radii.top_left = radii.top_left.clamp(0.0, maximum);
+    radii.top_right = radii.top_right.clamp(0.0, maximum);
+    radii.bottom_right = radii.bottom_right.clamp(0.0, maximum);
+    radii.bottom_left = radii.bottom_left.clamp(0.0, maximum);
+    radii
+}
+
+fn clip_shape_contains(shape: ClipShape, point: PhysicalPoint) -> bool {
+    match shape {
+        ClipShape::Rect(rect) => point_in_rounded_rect(rect, CornerRadii::default(), point),
+        ClipShape::RoundedRect { rect, radii } => point_in_rounded_rect(rect, radii, point),
+    }
+}
+
+fn clip_coverage(clip: Option<&ClipRegion>, x: f32, y: f32) -> f32 {
+    let Some(clip) = clip else { return 1.0 };
+    let samples = [0.125_f32, 0.375, 0.625, 0.875];
+    let mut covered = 0_u32;
+    for sample_y in samples {
+        for sample_x in samples {
+            let point = PhysicalPoint {
+                x: x.floor() + sample_x,
+                y: y.floor() + sample_y,
+            };
+            if (0..clip.shape_count).all(|index| clip_shape_contains(clip.shapes[index], point)) {
+                covered += 1;
+            }
+        }
+    }
+    u32_to_f32(covered) / 16.0
+}
+
+fn rounded_ring_coverage(
+    outer: PhysicalRect,
+    outer_radii: CornerRadii,
+    inner: PhysicalRect,
+    inner_radii: CornerRadii,
+    x: f32,
+    y: f32,
+) -> f32 {
+    let samples = [0.125_f32, 0.375, 0.625, 0.875];
+    let mut covered = 0_u32;
+    for sample_y in samples {
+        for sample_x in samples {
+            let point = PhysicalPoint {
+                x: x.floor() + sample_x,
+                y: y.floor() + sample_y,
+            };
+            if point_in_rounded_rect(outer, outer_radii, point)
+                && !point_in_rounded_rect(inner, inner_radii, point)
+            {
+                covered += 1;
+            }
+        }
+    }
+    u32_to_f32(covered) / 16.0
+}
+
+fn border_edge_at(rect: PhysicalRect, border: &BorderPaint, point: PhysicalPoint) -> Option<usize> {
+    let distances = [
+        point.y - rect.origin.y,
+        rect.right() - point.x,
+        rect.bottom() - point.y,
+        point.x - rect.origin.x,
+    ];
+    let widths = [
+        border.widths.top,
+        border.widths.right,
+        border.widths.bottom,
+        border.widths.left,
+    ];
+    (0..4)
+        .filter(|&index| {
+            widths[index] > 0.0
+                && matches!(border.styles[index], BorderStyle::Solid)
+                && distances[index] >= 0.0
+        })
+        .min_by(|&first, &second| {
+            let first_ratio = distances[first] / widths[first];
+            let second_ratio = distances[second] / widths[second];
+            first_ratio.total_cmp(&second_ratio)
+        })
+}
+
+fn expanded_rect(rect: PhysicalRect, amount: f32) -> PhysicalRect {
+    PhysicalRect::new(
+        rect.origin.x - amount,
+        rect.origin.y - amount,
+        (rect.size.width + amount * 2.0).max(0.0),
+        (rect.size.height + amount * 2.0).max(0.0),
+    )
+}
+
+fn shifted_rect(rect: PhysicalRect, offset: PhysicalPoint, spread: f32) -> PhysicalRect {
+    PhysicalRect::new(
+        rect.origin.x + offset.x - spread,
+        rect.origin.y + offset.y - spread,
+        (rect.size.width + spread * 2.0).max(0.0),
+        (rect.size.height + spread * 2.0).max(0.0),
+    )
+}
+
+fn shifted_radii(radii: CornerRadii, spread: f32) -> CornerRadii {
+    CornerRadii {
+        top_left: (radii.top_left + spread).max(0.0),
+        top_right: (radii.top_right + spread).max(0.0),
+        bottom_right: (radii.bottom_right + spread).max(0.0),
+        bottom_left: (radii.bottom_left + spread).max(0.0),
+    }
+}
+
+fn distance_to_rect(rect: PhysicalRect, point: PhysicalPoint) -> f32 {
+    let horizontal = if point.x < rect.origin.x {
+        rect.origin.x - point.x
+    } else if point.x > rect.right() {
+        point.x - rect.right()
+    } else {
+        0.0
+    };
+    let vertical = if point.y < rect.origin.y {
+        rect.origin.y - point.y
+    } else if point.y > rect.bottom() {
+        point.y - rect.bottom()
+    } else {
+        0.0
+    };
+    (horizontal * horizontal + vertical * vertical).sqrt()
+}
+
+fn distance_to_rect_edge(rect: PhysicalRect, point: PhysicalPoint) -> f32 {
+    (point.x - rect.origin.x)
+        .min(rect.right() - point.x)
+        .min(point.y - rect.origin.y)
+        .min(rect.bottom() - point.y)
+        .max(0.0)
+}
+
+fn distance_inside_to_rounded_edge(
+    rect: PhysicalRect,
+    radii: CornerRadii,
+    point: PhysicalPoint,
+) -> f32 {
+    if !point_in_rounded_rect(rect, radii, point) {
+        return 0.0;
+    }
+    let radii = normalize_radii(radii, rect);
+    let (center_x, center_y, radius) = if point.x < rect.origin.x + radii.top_left
+        && point.y < rect.origin.y + radii.top_left
+    {
+        (
+            rect.origin.x + radii.top_left,
+            rect.origin.y + radii.top_left,
+            radii.top_left,
+        )
+    } else if point.x >= rect.right() - radii.top_right && point.y < rect.origin.y + radii.top_right
+    {
+        (
+            rect.right() - radii.top_right,
+            rect.origin.y + radii.top_right,
+            radii.top_right,
+        )
+    } else if point.x >= rect.right() - radii.bottom_right
+        && point.y >= rect.bottom() - radii.bottom_right
+    {
+        (
+            rect.right() - radii.bottom_right,
+            rect.bottom() - radii.bottom_right,
+            radii.bottom_right,
+        )
+    } else if point.x < rect.origin.x + radii.bottom_left
+        && point.y >= rect.bottom() - radii.bottom_left
+    {
+        (
+            rect.origin.x + radii.bottom_left,
+            rect.bottom() - radii.bottom_left,
+            radii.bottom_left,
+        )
+    } else {
+        return distance_to_rect_edge(rect, point);
+    };
+    if radius <= 0.0 {
+        distance_to_rect_edge(rect, point)
+    } else {
+        radius - ((point.x - center_x).powi(2) + (point.y - center_y).powi(2)).sqrt()
+    }
+}
+
+fn distance_to_rounded_rect(rect: PhysicalRect, radii: CornerRadii, point: PhysicalPoint) -> f32 {
+    if point_in_rounded_rect(rect, radii, point) {
+        return 0.0;
+    }
+    let radii = normalize_radii(radii, rect);
+    let top_left = radii.top_left;
+    let top_right = radii.top_right;
+    let bottom_right = radii.bottom_right;
+    let bottom_left = radii.bottom_left;
+    let corner = if point.x < rect.origin.x + top_left && point.y < rect.origin.y + top_left {
+        Some((rect.origin.x + top_left, rect.origin.y + top_left, top_left))
+    } else if point.x >= rect.right() - top_right && point.y < rect.origin.y + top_right {
+        Some((
+            rect.right() - top_right,
+            rect.origin.y + top_right,
+            top_right,
+        ))
+    } else if point.x >= rect.right() - bottom_right && point.y >= rect.bottom() - bottom_right {
+        Some((
+            rect.right() - bottom_right,
+            rect.bottom() - bottom_right,
+            bottom_right,
+        ))
+    } else if point.x < rect.origin.x + bottom_left && point.y >= rect.bottom() - bottom_left {
+        Some((
+            rect.origin.x + bottom_left,
+            rect.bottom() - bottom_left,
+            bottom_left,
+        ))
+    } else {
+        None
+    };
+    if let Some((center_x, center_y, radius)) = corner {
+        if radius > 0.0 {
+            return ((point.x - center_x).powi(2) + (point.y - center_y).powi(2)).sqrt() - radius;
+        }
+    }
+    distance_to_rect(rect, point)
+}
+
+struct RoundedShape {
+    rect: PhysicalRect,
+    radii: CornerRadii,
+}
+
+fn box_shadow_alpha(
+    shape: &RoundedShape,
+    shadow: &RoundedShape,
+    blur: f32,
+    inset: bool,
+    point: PhysicalPoint,
+) -> f32 {
+    if inset {
+        if !point_in_rounded_rect(shape.rect, shape.radii, point) || blur <= 0.0 {
+            return 0.0;
+        }
+        return (1.0 - distance_inside_to_rounded_edge(shadow.rect, shadow.radii, point) / blur)
+            .clamp(0.0, 1.0)
+            .powi(2);
+    }
+    let distance = distance_to_rounded_rect(shadow.rect, shadow.radii, point);
+    if distance <= 0.0 {
+        return 0.0;
+    }
+    if blur <= 0.0 {
+        1.0
+    } else {
+        (1.0 - distance / blur).clamp(0.0, 1.0).powi(2)
+    }
+}
+
+fn box_shadow_coverage(
+    shape: &RoundedShape,
+    shadow: &RoundedShape,
+    blur: f32,
+    inset: bool,
+    x: f32,
+    y: f32,
+) -> f32 {
+    let samples = [0.125_f32, 0.375, 0.625, 0.875];
+    let mut alpha = 0.0;
+    for sample_y in samples {
+        for sample_x in samples {
+            alpha += box_shadow_alpha(
+                shape,
+                shadow,
+                blur,
+                inset,
+                PhysicalPoint {
+                    x: x.floor() + sample_x,
+                    y: y.floor() + sample_y,
+                },
+            );
+        }
+    }
+    alpha / 16.0
+}
+
+fn paint_box_shadow(
+    surface: &mut Surface,
+    shadow: &BoxShadowPaint,
+    offset: PhysicalPoint,
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let shape_rect = translate_rect(shadow.rect, offset);
+    let shadow_rect = shifted_rect(shape_rect, shadow.offset, shadow.spread_radius);
+    let shadow_radii = shifted_radii(shadow.radii, shadow.spread_radius);
+    let blur = shadow.blur_radius.max(0.0);
+    let bounds = if shadow.inset {
+        shape_rect
+    } else {
+        expanded_rect(shadow_rect, blur)
+    };
+    let Some(visible) = intersection(Some(bounds), clip.map_or(bounds, |c| c.rect)) else {
+        return true;
+    };
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    let shape = RoundedShape {
+        rect: shape_rect,
+        radii: shadow.radii,
+    };
+    let shadow_shape = RoundedShape {
+        rect: shadow_rect,
+        radii: shadow_radii,
+    };
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        for x in left..right {
+            let point = PhysicalPoint {
+                x: u32_to_f32(x) + 0.5,
+                y: u32_to_f32(y) + 0.5,
+            };
+            let clip_alpha = clip_coverage(clip, point.x, point.y);
+            if clip_alpha <= 0.0 {
+                continue;
+            }
+            let alpha =
+                box_shadow_coverage(&shape, &shadow_shape, blur, shadow.inset, point.x, point.y);
+            if alpha <= 0.0 {
+                continue;
+            }
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(
+                    surface.pixels[index],
+                    shadow.color.with_opacity(alpha * clip_alpha),
+                    1.0,
+                );
+            }
+        }
+    }
+    true
+}
+
 fn finite_non_negative(value: f32) -> f32 {
     if value.is_finite() {
         value.max(0.0)
@@ -799,13 +1335,13 @@ fn fill_rect(
     surface: &mut Surface,
     rect: PhysicalRect,
     color: Color,
-    clip: Option<PhysicalRect>,
+    clip: Option<&ClipRegion>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
     if color.alpha == 0 || rect.size.width <= 0.0 || rect.size.height <= 0.0 {
         return true;
     }
-    let Some(rect) = intersection(Some(rect), clip.unwrap_or(rect)) else {
+    let Some(rect) = intersection(Some(rect), clip.map_or(rect, |c| c.rect)) else {
         return true;
     };
     let left = floor_to_u32(rect.origin.x);
@@ -817,12 +1353,91 @@ fn fill_rect(
             return false;
         }
         for x in left..right {
+            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if coverage <= 0.0 {
+                continue;
+            }
             if let Some(index) = surface.index(x, y) {
-                surface.pixels[index] = blend(surface.pixels[index], color, 1.0);
+                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
             }
         }
     }
     true
+}
+
+fn paint_linear_gradient(
+    surface: &mut Surface,
+    gradient: &LinearGradient,
+    offset: PhysicalPoint,
+    clip: Option<&ClipRegion>,
+    control: Option<&dyn RasterControl>,
+) -> bool {
+    let rect = translate_rect(gradient.rect, offset);
+    let Some(visible) = intersection(Some(rect), clip.map_or(rect, |c| c.rect)) else {
+        return true;
+    };
+    let start = translate_point(gradient.start, offset);
+    let end = translate_point(gradient.end, offset);
+    let direction_x = end.x - start.x;
+    let direction_y = end.y - start.y;
+    let length_squared = direction_x * direction_x + direction_y * direction_y;
+    if length_squared <= f32::EPSILON {
+        return fill_rect(surface, visible, gradient.stops[0].color, clip, control);
+    }
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(surface.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(surface.height)));
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
+            return false;
+        }
+        for x in left..right {
+            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if coverage <= 0.0 {
+                continue;
+            }
+            let point_x = u32_to_f32(x) + 0.5 - start.x;
+            let point_y = u32_to_f32(y) + 0.5 - start.y;
+            let progress =
+                ((point_x * direction_x + point_y * direction_y) / length_squared).clamp(0.0, 1.0);
+            let color = gradient_color(&gradient.stops, progress);
+            if let Some(index) = surface.index(x, y) {
+                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
+            }
+        }
+    }
+    true
+}
+
+fn gradient_color(stops: &[super::display_list::GradientStop], progress: f32) -> Color {
+    let Some(first) = stops.first() else {
+        return Color::TRANSPARENT;
+    };
+    if progress <= first.offset {
+        return first.color;
+    }
+    for pair in stops.windows(2) {
+        let [start, end] = pair else { continue };
+        if progress <= end.offset {
+            let span = (end.offset - start.offset).max(f32::EPSILON);
+            let local = ((progress - start.offset) / span).clamp(0.0, 1.0);
+            return interpolate_color(start.color, end.color, local);
+        }
+    }
+    stops.last().map_or(Color::TRANSPARENT, |stop| stop.color)
+}
+
+fn interpolate_color(start: Color, end: Color, progress: f32) -> Color {
+    let channel = |start: u8, end: u8| {
+        clamped_rounded_u8(f32::from(start) + (f32::from(end) - f32::from(start)) * progress)
+    };
+    Color::rgba(
+        channel(start.red, end.red),
+        channel(start.green, end.green),
+        channel(start.blue, end.blue),
+        channel(start.alpha, end.alpha),
+    )
 }
 
 fn clear_rect(
@@ -856,7 +1471,7 @@ fn paint_glyph(
     mask: &GlyphMask,
     position: PhysicalPoint,
     color: Color,
-    clip: Option<PhysicalRect>,
+    clip: Option<&ClipRegion>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
     for y in 0..mask.height {
@@ -878,14 +1493,15 @@ fn paint_glyph(
             let Some((target_x, target_y)) = glyph_pixel_position(position, mask, x, y) else {
                 continue;
             };
-            let point = PhysicalRect::new(u32_to_f32(target_x), u32_to_f32(target_y), 1.0, 1.0);
-            if clip.is_some_and(|clip| intersection(Some(point), clip).is_none()) {
+            let clip_alpha =
+                clip_coverage(clip, u32_to_f32(target_x) + 0.5, u32_to_f32(target_y) + 0.5);
+            if clip_alpha <= 0.0 {
                 continue;
             }
             if let Some(surface_index) = surface.index(target_x, target_y) {
                 surface.pixels[surface_index] = blend(
                     surface.pixels[surface_index],
-                    color.with_opacity(f32::from(coverage) / 255.0),
+                    color.with_opacity(f32::from(coverage) / 255.0 * clip_alpha),
                     1.0,
                 );
             }
@@ -899,7 +1515,7 @@ fn paint_image(
     image: &crate::image::DecodedImage,
     destination: PhysicalRect,
     source: PhysicalRect,
-    clip: Option<PhysicalRect>,
+    clip: Option<&ClipRegion>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
     if destination.size.width <= 0.0
@@ -909,7 +1525,8 @@ fn paint_image(
     {
         return true;
     }
-    let Some(visible) = intersection(Some(destination), clip.unwrap_or(destination)) else {
+    let Some(visible) = intersection(Some(destination), clip.map_or(destination, |c| c.rect))
+    else {
         return true;
     };
     let left = floor_to_u32(visible.origin.x);
@@ -921,6 +1538,10 @@ fn paint_image(
             return false;
         }
         for x in left..right {
+            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            if coverage <= 0.0 {
+                continue;
+            }
             let unit_x = (u32_to_f32(x) + 0.5 - destination.origin.x) / destination.size.width;
             let unit_y = (u32_to_f32(y) + 0.5 - destination.origin.y) / destination.size.height;
             let source_x = floor_to_u32(source.origin.x + unit_x * source.size.width);
@@ -928,7 +1549,7 @@ fn paint_image(
             if let (Some(color), Some(index)) =
                 (image.pixel(source_x, source_y), surface.index(x, y))
             {
-                surface.pixels[index] = blend(surface.pixels[index], color, 1.0);
+                surface.pixels[index] = blend(surface.pixels[index], color, coverage);
             }
         }
     }
@@ -1044,10 +1665,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::dom::Dom;
-    use crate::layout::{FragmentId, PhysicalRect, PhysicalSize};
+    use crate::layout::{FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FontInstanceId, GlyphId,
-        GlyphInstance, GlyphRun, PaintCoordinateSpace, PaintPhase,
+        BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem, DisplayItemId,
+        DisplayList, FontInstanceId, GlyphId, GlyphInstance, GlyphRun, GradientStop,
+        LinearGradient, PaintCoordinateSpace, PaintPhase,
     };
     use crate::paint::{
         GlyphMask, GlyphMaskProvider, PaintScene, RasterControl, RasterRequest, RetainedFrame,
@@ -1194,6 +1816,138 @@ mod tests {
         let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
         assert_eq!(output.surface.pixel(0, 0), Some(Color::WHITE));
         assert_eq!(output.surface.pixel(1, 1), Some(Color::rgb(255, 127, 127)));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_paints_linear_gradients() {
+        let dom = Dom::new();
+        let rect = PhysicalRect::new(0.0, 0.0, 4.0, 1.0);
+        let gradient = LinearGradient {
+            rect,
+            start: PhysicalPoint { x: 0.0, y: 0.0 },
+            end: PhysicalPoint { x: 4.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: Color::rgb(255, 0, 0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: Color::rgb(0, 0, 255),
+                },
+            ],
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 4.0,
+                height: 1.0,
+            },
+            items: vec![DisplayItem {
+                id: DisplayItemId {
+                    source: None,
+                    fragment_hint: 0,
+                    phase: PaintPhase::Background,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: None,
+                bounds: rect,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::LinearGradient(gradient),
+            }],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        let left = output.surface.pixel(0, 0).expect("left gradient pixel");
+        let right = output.surface.pixel(3, 0).expect("right gradient pixel");
+        assert!(left.red > left.blue);
+        assert!(right.blue > right.red);
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_clips_rounded_boxes_and_paints_shadows() {
+        let dom = Dom::new();
+        let rect = PhysicalRect::new(2.0, 2.0, 6.0, 4.0);
+        let id = |phase, ordinal| DisplayItemId {
+            source: None,
+            fragment_hint: 0,
+            phase,
+            ordinal,
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 12.0,
+                height: 10.0,
+            },
+            items: vec![
+                DisplayItem {
+                    id: id(PaintPhase::BoxShadow, 0),
+                    fragment: FragmentId::from_index(0),
+                    source: None,
+                    bounds: PhysicalRect::new(0.0, 0.0, 12.0, 10.0),
+                    coordinate_space: PaintCoordinateSpace::Document,
+                    command: DisplayCommand::BoxShadow(BoxShadowPaint {
+                        rect,
+                        offset: PhysicalPoint { x: 0.0, y: 1.0 },
+                        blur_radius: 2.0,
+                        spread_radius: 0.0,
+                        color: Color::rgba(0, 0, 0, 128),
+                        inset: false,
+                        radii: CornerRadii {
+                            top_left: 2.0,
+                            top_right: 2.0,
+                            bottom_right: 2.0,
+                            bottom_left: 2.0,
+                        },
+                    }),
+                },
+                DisplayItem {
+                    id: id(PaintPhase::Background, 1),
+                    fragment: FragmentId::from_index(0),
+                    source: None,
+                    bounds: rect,
+                    coordinate_space: PaintCoordinateSpace::Document,
+                    command: DisplayCommand::PushClip(ClipShape::RoundedRect {
+                        rect,
+                        radii: CornerRadii {
+                            top_left: 2.0,
+                            top_right: 2.0,
+                            bottom_right: 2.0,
+                            bottom_left: 2.0,
+                        },
+                    }),
+                },
+                DisplayItem {
+                    id: id(PaintPhase::Background, 2),
+                    fragment: FragmentId::from_index(0),
+                    source: None,
+                    bounds: rect,
+                    coordinate_space: PaintCoordinateSpace::Document,
+                    command: DisplayCommand::SolidRect {
+                        rect,
+                        color: Color::rgb(30, 120, 220),
+                    },
+                },
+                DisplayItem {
+                    id: id(PaintPhase::Background, 3),
+                    fragment: FragmentId::from_index(0),
+                    source: None,
+                    bounds: rect,
+                    coordinate_space: PaintCoordinateSpace::Document,
+                    command: DisplayCommand::PopClip,
+                },
+            ],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+
+        assert_eq!(output.surface.pixel(4, 3), Some(Color::rgb(30, 120, 220)));
+        assert_ne!(output.surface.pixel(2, 2), Some(Color::rgb(30, 120, 220)));
+        assert_ne!(output.surface.pixel(4, 7), Some(Color::WHITE));
         assert!(output.diagnostics.is_empty());
     }
 

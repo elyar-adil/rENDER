@@ -49,6 +49,7 @@ caption { display: table-caption; }
 colgroup { display: table-column-group; }
 col { display: table-column; }
 button, input, select, textarea { display: inline-block; }
+button { text-align: center; }
 input:not([type="hidden" i]) { width: 180px; min-height: 22px; padding-left: 4px; padding-right: 4px; border: 1px solid #888; }
 input[type="hidden" i] { display: none; }
 ruby { display: ruby; }

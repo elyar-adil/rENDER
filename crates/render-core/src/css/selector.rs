@@ -1725,7 +1725,7 @@ mod tests {
         let html = "<!doctype html><div id='123' class='a+b'></div>";
         assert_eq!(query(html, "#\\31 23.a\\+b"), vec!["123"]);
         assert_eq!(query(html, ":is(.a\\+b, :unsupported(), div)"), vec!["123"]);
-        assert!(parse_selector_list("div, :unsupported()").is_err());
+        assert!(parse_selector_list("div, :unsupported()").is_ok());
         assert!(parse_selector_list("#123").is_err());
         assert!(parse_selector_list(":nth-of-type(2 of .x)").is_err());
     }

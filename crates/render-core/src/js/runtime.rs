@@ -1692,7 +1692,7 @@ impl JsRuntime {
             JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
                 return Ok(JsValue::Undefined);
             }
-            value => Self::require_object(&value).map_err(|_| {
+            value @ JsValue::Object(_) => Self::require_object(&value).map_err(|_| {
                 JsError::type_error(format!(
                     "value of callee{callee_label} is undefined or not callable"
                 ))
@@ -1915,6 +1915,13 @@ impl JsRuntime {
             return Ok(left);
         }
         let right = self.evaluate(dom, right)?;
+        // Logical operators return one of their original operands. Applying
+        // ToPrimitive here changes objects such as `globalThis` into
+        // "[object Object]", which breaks feature detection patterns like
+        // `typeof globalThis !== "undefined" && globalThis`.
+        if matches!(operator, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+            return Ok(right);
+        }
         if operator == BinaryOp::Instanceof {
             return self.instanceof(&left, &right).map(JsValue::Boolean);
         }
@@ -3120,7 +3127,7 @@ impl JsRuntime {
                 | NativeFunction::UrlSearchParamsAppend
                 | NativeFunction::UrlSearchParamsToString
                 | NativeFunction::UrlSearchParamsForEach),
-            )) => self.url_search_params_method(receiver.clone(), function, arguments, dom),
+            )) => Ok(self.url_search_params_method(&receiver, function, arguments, dom)),
             Some(ObjectHost::NativeFunction(function)) => {
                 let receiver = match &receiver {
                     JsValue::Object(object) => *object,
@@ -3178,7 +3185,7 @@ impl JsRuntime {
         let parsed = Url::parse(&input)
             .or_else(|_| {
                 base.as_ref()
-                    .ok_or_else(|| url::ParseError::EmptyHost)
+                    .ok_or(url::ParseError::EmptyHost)
                     .and_then(|base| base.join(&input))
             })
             .map_err(|_| JsError::type_error("Invalid URL"))?;
@@ -3271,16 +3278,16 @@ impl JsRuntime {
 
     fn url_search_params_method(
         &mut self,
-        receiver: JsValue,
+        receiver: &JsValue,
         function: NativeFunction,
         arguments: &[JsValue],
         dom: &mut Dom,
-    ) -> Result<JsValue, JsError> {
-        let JsValue::Object(object) = receiver else {
-            return Ok(JsValue::Undefined);
+    ) -> JsValue {
+        let JsValue::Object(object) = *receiver else {
+            return JsValue::Undefined;
         };
         let Some(ObjectHost::UrlSearchParams { mut pairs, owner }) = self.realm.host(object) else {
-            return Ok(JsValue::Undefined);
+            return JsValue::Undefined;
         };
         let key = arguments
             .first()
@@ -3318,7 +3325,7 @@ impl JsRuntime {
                 JsValue::Object(object)
             }
             NativeFunction::UrlSearchParamsForEach => {
-                if let Some(JsValue::Object(callback)) = arguments.get(0) {
+                if let Some(JsValue::Object(callback)) = arguments.first() {
                     for (name, value) in &pairs {
                         let _ = self.call_with_this(
                             dom,
@@ -3369,7 +3376,7 @@ impl JsRuntime {
                 }
             }
         }
-        Ok(result)
+        result
     }
 
     fn function_call(
@@ -3503,16 +3510,6 @@ impl JsRuntime {
             .get(index)
             .cloned()
             .ok_or_else(|| JsError::type_error("function object refers to unknown code"))?;
-        let function_label = format!("(user fn #{index})");
-        if self
-            .call_stack
-            .iter()
-            .filter(|label| label.as_str() == function_label)
-            .count()
-            >= 2
-        {
-            return Ok(JsValue::Undefined);
-        }
         let previous_environment =
             std::mem::replace(&mut self.environment, function.captured_environment);
         let mut call_environment = EnvironmentRecord {
@@ -4107,9 +4104,12 @@ impl JsRuntime {
             | NativeFunction::UrlSearchParamsSet
             | NativeFunction::UrlSearchParamsAppend
             | NativeFunction::UrlSearchParamsToString
-            | NativeFunction::UrlSearchParamsForEach => {
-                self.url_search_params_method(JsValue::Object(receiver), function, arguments, dom)
-            }
+            | NativeFunction::UrlSearchParamsForEach => Ok(self.url_search_params_method(
+                &JsValue::Object(receiver),
+                function,
+                arguments,
+                dom,
+            )),
             NativeFunction::GlobalEscape => {
                 let text = required_argument(arguments, 0, "escape")?.to_js_string();
                 let mut output = String::with_capacity(text.len());
@@ -6094,13 +6094,27 @@ impl JsRuntime {
         Ok(JsValue::String(output))
     }
 
-    /// Read all indexed elements (holes become `undefined`).
+    /// Read all indexed elements (holes become `undefined`). String wrappers
+    /// expose indexed code points through the ordinary object-like array
+    /// method contract even though those properties are virtual.
     fn array_elements(&self, receiver: ObjectId) -> Result<Vec<JsValue>, JsError> {
         let length = self.array_length(receiver)?;
         Ok((0..length)
-            .map(|index| self.realm.get_property(receiver, &index.to_string()))
+            .map(|index| self.array_element(receiver, index))
             .map(|value| value.unwrap_or(JsValue::Undefined))
             .collect())
+    }
+
+    fn array_element(&self, receiver: ObjectId, index: u32) -> Option<JsValue> {
+        self.realm
+            .get_property(receiver, &index.to_string())
+            .or_else(|| match self.realm.host(receiver) {
+                Some(ObjectHost::StringPrimitive(text)) => text
+                    .chars()
+                    .nth(usize::try_from(index).ok()?)
+                    .map(|character| JsValue::String(character.to_string())),
+                _ => None,
+            })
     }
 
     /// Replace the indexed elements of `receiver`, updating its length.
@@ -6616,6 +6630,14 @@ impl JsRuntime {
         let value = self
             .realm
             .get_property(object, "length")
+            .or_else(|| match self.realm.host(object) {
+                Some(ObjectHost::StringPrimitive(text)) =>
+                {
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(JsValue::Number(text.chars().count() as f64))
+                }
+                _ => None,
+            })
             .unwrap_or(JsValue::Undefined);
         let number = to_number(&value)?;
         if number.is_nan() || number <= 0.0 {
@@ -9491,11 +9513,15 @@ mod tests {
                 &mut parsed.dom,
                 r#"
                     var object = { 0: "a", length: "1.9" };
-                    Array.prototype.join.call(object, "-");
+                    var joined = Array.prototype.join.call(object, "-");
+                    var reduced = Array.prototype.reduce.call("es5", function(value, item, index, source) {
+                        return source;
+                    });
+                    [joined, typeof reduced, reduced[0], reduced.length].join("|");
                 "#,
             )
             .expect("generic array methods should normalize length");
-        assert_eq!(outcome.value, JsValue::String("a".to_owned()));
+        assert_eq!(outcome.value, JsValue::String("a|object|e|3".to_owned()));
     }
 
     #[test]
@@ -10097,6 +10123,38 @@ mod tests {
                     .to_owned()
             )
         );
+    }
+
+    #[test]
+    fn global_this_is_available_to_feature_detection() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"
+                    var root = globalThis || self || window;
+                    [typeof globalThis, root === window, "URLSearchParams" in root].join("|");
+                "#,
+            )
+            .expect("globalThis feature detection should execute");
+        assert_eq!(
+            outcome.value,
+            JsValue::String("object|true|true".to_owned())
+        );
+    }
+
+    #[test]
+    fn typeof_missing_bindings_short_circuits_optional_globals() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r#"[typeof define, ("function" == typeof define && define.amd) ? "yes" : "no"].join("|")"#,
+            )
+            .expect("optional global feature detection should execute");
+        assert_eq!(outcome.value, JsValue::String("undefined|no".to_owned()));
     }
 
     #[test]

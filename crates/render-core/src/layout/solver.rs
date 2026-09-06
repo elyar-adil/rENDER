@@ -7,7 +7,7 @@ use crate::css::properties::{
     AlignItems, AutoLengthPercentage, BorderStyle, BorderWidth, BoxSizing, Clear, Display,
     DisplayInside, FlexBasis, FlexDirection, Float, Gap, GridAutoRepeat, GridTemplate, GridTrack,
     GridTrackBreadth, JustifyContent, LengthPercentage, LengthResolutionContext, MaxSize,
-    NumericType, Overflow, Position, Size, TypedPropertyValue,
+    NumericType, Overflow, Position, Size, TextAlign, TypedPropertyValue,
 };
 use crate::dom::{Dom, Node, NodeId, NodeKind};
 use crate::image::ImageResources;
@@ -244,6 +244,7 @@ struct FlexItem {
     shrink: f32,
     base_outer: f32,
     target_outer: f32,
+    min_outer: f32,
     fragment: Option<FragmentId>,
     natural_outer_cross: f32,
     auto_main_before: bool,
@@ -291,9 +292,13 @@ impl Solver<'_> {
         match node.kind {
             FormattingNodeKind::AnonymousBlock
             | FormattingNodeKind::Inline
-            | FormattingNodeKind::Text(_) => {
-                self.layout_anonymous_block(node_id, containing, margin_box_y, depth)
-            }
+            | FormattingNodeKind::Text(_) => self.layout_anonymous_block(
+                node_id,
+                containing,
+                positioning_containing,
+                margin_box_y,
+                depth,
+            ),
             FormattingNodeKind::BlockContainer { context } => {
                 if !matches!(
                     context,
@@ -598,6 +603,7 @@ impl Solver<'_> {
                             self.layout_anonymous_block_with_floats(
                                 child,
                                 PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                                positioned_child_containing,
                                 cursor_y,
                                 depth.saturating_add(1),
                                 &floats,
@@ -692,6 +698,11 @@ impl Solver<'_> {
                 children.push(result.fragment);
             }
         }
+        // Positioned descendants are laid out separately, but their paint
+        // order still follows z-index. Sorting the completed fragments keeps
+        // low-index overlays (such as a decorative border) behind higher
+        // positioned content while preserving source order within a layer.
+        children.sort_by_key(|child| self.fragment_z_index(*child));
         self.set_children(fragment, children);
         if position == Position::Relative {
             self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);
@@ -840,6 +851,7 @@ impl Solver<'_> {
                         track_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    positioning_containing,
                     containing.origin.y,
                     depth,
                 ),
@@ -1069,6 +1081,7 @@ impl Solver<'_> {
                     shrink,
                     base_outer,
                     target_outer: base_outer,
+                    min_outer: 0.0,
                     fragment: None,
                     natural_outer_cross: 0.0,
                     auto_main_before: Self::margin_is_auto(style, before_property),
@@ -1077,6 +1090,36 @@ impl Solver<'_> {
             })
             .collect::<Vec<_>>();
         items.sort_by_key(|item| item.order);
+        for item in &mut items {
+            let node = item.node;
+            let source = item.source;
+            let style = self
+                .formatting
+                .get(node)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source))
+                .cloned();
+            let property = if horizontal {
+                "min-width"
+            } else {
+                "min-height"
+            };
+            let automatic_minimum = style
+                .as_ref()
+                .and_then(|style| style.typed(property))
+                .is_none_or(|value| matches!(value, TypedPropertyValue::Size(Size::Auto)));
+            if automatic_minimum {
+                let intrinsic = self.intrinsic_flex_size(node, horizontal, main_size, 0);
+                item.min_outer = (intrinsic
+                    + self.flex_outer_extras(
+                        style.as_ref(),
+                        horizontal,
+                        containing.size.width,
+                        source,
+                    ))
+                .max(0.0);
+            }
+        }
         let gaps = gap * count_as_f32(items.len().saturating_sub(1));
 
         // An auto-height column first uses natural item heights as its flex
@@ -1152,6 +1195,7 @@ impl Solver<'_> {
                         outer_width,
                         specified_height.unwrap_or(0.0),
                     ),
+                    positioning_containing,
                     containing.origin.y,
                     depth,
                 ),
@@ -1293,8 +1337,9 @@ impl Solver<'_> {
                 .sum::<f32>();
             if scaled > 0.0 {
                 for item in items {
-                    item.target_outer =
-                        (item.base_outer + free * item.shrink * item.base_outer / scaled).max(0.0);
+                    item.target_outer = (item.base_outer
+                        + free * item.shrink * item.base_outer / scaled)
+                        .max(item.min_outer);
                 }
             }
         }
@@ -1319,18 +1364,24 @@ impl Solver<'_> {
                     Some(specified) => {
                         self.flex_basis_content_box(style, specified, horizontal, basis, source)
                     }
-                    None => self.intrinsic_flex_size(node, horizontal, 0),
+                    None => self.intrinsic_flex_size(node, horizontal, basis, 0),
                 }
             }
             Some(TypedPropertyValue::FlexBasis(FlexBasis::Content)) => {
-                self.intrinsic_flex_size(node, horizontal, 0)
+                self.intrinsic_flex_size(node, horizontal, basis, 0)
             }
             _ => 0.0,
         }
         .max(0.0)
     }
 
-    fn intrinsic_flex_size(&self, node: FormattingNodeId, horizontal: bool, depth: usize) -> f32 {
+    fn intrinsic_flex_size(
+        &mut self,
+        node: FormattingNodeId,
+        horizontal: bool,
+        basis: f32,
+        depth: usize,
+    ) -> f32 {
         if depth > self.options.limits.max_depth {
             return 0.0;
         }
@@ -1340,24 +1391,56 @@ impl Solver<'_> {
         if let FormattingNodeKind::Text(text) = &node.kind {
             let style = self.text_style(node.style_source);
             return if horizontal {
-                self.text_measurer.measure(text, style).advance
+                self.intrinsic_text_width(text, node.style_source, style)
             } else if text.chars().all(char::is_whitespace) {
                 0.0
             } else {
                 style.line_height
             };
         }
-        if horizontal {
-            node.children
-                .iter()
-                .map(|child| self.intrinsic_flex_size(*child, true, depth.saturating_add(1)))
-                .sum()
+        let style = node
+            .style_source
+            .and_then(|source| self.styles.get(&source))
+            .cloned();
+        let is_flex = matches!(
+            node.kind,
+            FormattingNodeKind::BlockContainer {
+                context: FormattingContextKind::Flex
+            }
+        );
+        let children = node.children.clone();
+        let content = children
+            .iter()
+            .map(|child| {
+                let child_size =
+                    self.intrinsic_flex_size(*child, horizontal, basis, depth.saturating_add(1));
+                if !is_flex {
+                    return child_size;
+                }
+                let child_node = self.formatting.get(*child);
+                let child_source = child_node.and_then(|node| node.source);
+                let child_style = child_node
+                    .and_then(|node| node.style_source)
+                    .and_then(|source| self.styles.get(&source))
+                    .cloned();
+                child_size
+                    + self.flex_outer_extras(child_style.as_ref(), horizontal, basis, child_source)
+            })
+            .sum::<f32>();
+        let content = if is_flex {
+            content
+                + self.resolve_gap(
+                    style.as_ref(),
+                    if horizontal { "column-gap" } else { "row-gap" },
+                    basis,
+                    node.source,
+                ) * count_as_f32(children.len().saturating_sub(1))
         } else {
-            node.children
-                .iter()
-                .map(|child| self.intrinsic_flex_size(*child, false, depth.saturating_add(1)))
-                .sum()
-        }
+            content
+        };
+        let property = if horizontal { "width" } else { "height" };
+        self.resolve_size(style.as_ref(), property, basis, node.source)
+            .map_or(content, |specified| specified.max(content))
     }
 
     fn flex_outer_extras(
@@ -1448,7 +1531,7 @@ impl Solver<'_> {
             available
         } else {
             self.resolve_size(style, "width", available, source)
-                .unwrap_or_else(|| self.intrinsic_flex_size(node, true, 0))
+                .unwrap_or_else(|| self.intrinsic_flex_size(node, true, available, 0))
                 + extras
         }
     }
@@ -1545,16 +1628,25 @@ impl Solver<'_> {
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         y: f32,
         depth: usize,
     ) -> Option<BlockResult> {
-        self.layout_anonymous_block_with_floats(node_id, containing, y, depth, &[])
+        self.layout_anonymous_block_with_floats(
+            node_id,
+            containing,
+            positioning_containing,
+            y,
+            depth,
+            &[],
+        )
     }
 
     fn layout_anonymous_block_with_floats(
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         y: f32,
         depth: usize,
         floats: &[FloatArea],
@@ -1579,7 +1671,14 @@ impl Solver<'_> {
             // An isolated inline-grid is an atomic inline-level box. The
             // surrounding inline solver does not yet mix atomic boxes and text,
             // but it can preserve the grid formatting context and geometry.
-            return self.layout_block(*inline_root, containing, containing, y, depth, None);
+            return self.layout_block(
+                *inline_root,
+                containing,
+                positioning_containing,
+                y,
+                depth,
+                None,
+            );
         }
         let fragment = self.allocate_fragment(
             node_id,
@@ -1595,6 +1694,8 @@ impl Solver<'_> {
         let (children, height) = self.layout_inline_content(
             &inline_roots,
             PhysicalRect::new(containing.origin.x, y, containing.size.width, 0.0),
+            positioning_containing,
+            self.text_align(node.style_source),
             depth.saturating_add(1),
             floats,
         );
@@ -1610,6 +1711,8 @@ impl Solver<'_> {
         &mut self,
         roots: &[FormattingNodeId],
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        text_align: TextAlign,
         depth: usize,
         floats: &[FloatArea],
     ) -> (Vec<FragmentId>, f32) {
@@ -1682,6 +1785,7 @@ impl Solver<'_> {
                 if let Some((fragment, outer)) = self.layout_atomic_inline(
                     atomic,
                     containing,
+                    positioning_containing,
                     line_x,
                     line_y,
                     depth.saturating_add(1),
@@ -1819,7 +1923,69 @@ impl Solver<'_> {
             current_line_height
         };
         let height = line_y - containing.origin.y + trailing_line_height;
+        self.align_inline_fragments(&fragments, containing, text_align);
         (fragments, height)
+    }
+
+    fn text_align(&self, style_source: Option<NodeId>) -> TextAlign {
+        match style_source.and_then(|source| self.styles.get(&source)) {
+            Some(style) => match style.typed("text-align") {
+                Some(TypedPropertyValue::TextAlign(value)) => *value,
+                _ => TextAlign::Start,
+            },
+            None => TextAlign::Start,
+        }
+    }
+
+    fn align_inline_fragments(
+        &mut self,
+        fragments: &[FragmentId],
+        containing: PhysicalRect,
+        text_align: TextAlign,
+    ) {
+        if matches!(
+            text_align,
+            TextAlign::Start | TextAlign::Left | TextAlign::Justify
+        ) {
+            return;
+        }
+        let mut lines = Vec::<(f32, f32, f32, Vec<FragmentId>)>::new();
+        for fragment_id in fragments {
+            let Some(fragment) = self.fragments.get(
+                usize::try_from(fragment_id.as_u32())
+                    .ok()
+                    .unwrap_or(usize::MAX),
+            ) else {
+                continue;
+            };
+            let rect = fragment.rect;
+            let Some((_, min_x, max_x, line_fragments)) = lines
+                .iter_mut()
+                .find(|(line_y, _, _, _)| (*line_y - rect.origin.y).abs() < 0.5)
+            else {
+                lines.push((
+                    rect.origin.y,
+                    rect.origin.x,
+                    rect.right(),
+                    vec![*fragment_id],
+                ));
+                continue;
+            };
+            *min_x = min_x.min(rect.origin.x);
+            *max_x = max_x.max(rect.right());
+            line_fragments.push(*fragment_id);
+        }
+        for (_, min_x, max_x, line_fragments) in lines {
+            let free = (containing.size.width - (max_x - min_x)).max(0.0);
+            let offset = match text_align {
+                TextAlign::End | TextAlign::Right => free,
+                TextAlign::Center => free / 2.0,
+                TextAlign::Start | TextAlign::Left | TextAlign::Justify => 0.0,
+            };
+            for fragment in line_fragments {
+                self.translate_fragment_subtree(fragment, offset, 0.0);
+            }
+        }
     }
 
     fn collect_inline_content_atoms(
@@ -1846,6 +2012,37 @@ impl Solver<'_> {
         self.text_measurer
             .measure(character.encode_utf8(&mut encoded), style)
             .advance
+    }
+
+    fn intrinsic_text_width(&self, text: &str, source: Option<NodeId>, style: TextStyle) -> f32 {
+        let preserves_whitespace = source
+            .and_then(|source| self.styles.get(&source))
+            .and_then(|style| style.get("white-space"))
+            .is_some_and(|value| {
+                matches!(
+                    value.css_text().to_ascii_lowercase().as_str(),
+                    "pre" | "pre-wrap" | "break-spaces"
+                )
+            });
+        if preserves_whitespace {
+            return self.text_measurer.measure(text, style).advance;
+        }
+        let mut width = 0.0;
+        let mut pending_space = false;
+        let mut has_content = false;
+        for character in text.chars() {
+            if character.is_whitespace() {
+                pending_space |= has_content;
+                continue;
+            }
+            if pending_space {
+                width += self.text_measurer.measure(" ", style).advance;
+                pending_space = false;
+            }
+            width += self.measure_inline_character(character, style);
+            has_content = true;
+        }
+        width
     }
 
     fn text_style(&self, source: Option<NodeId>) -> TextStyle {
@@ -1950,6 +2147,7 @@ impl Solver<'_> {
         &mut self,
         node_id: FormattingNodeId,
         containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
         x: f32,
         y: f32,
         depth: usize,
@@ -1963,7 +2161,7 @@ impl Solver<'_> {
                 containing.size.width,
                 containing.size.height,
             ),
-            containing,
+            positioning_containing,
             y,
             depth,
             Some(content_width),
@@ -2117,7 +2315,7 @@ impl Solver<'_> {
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
             let style = self.text_style(node.style_source);
-            return self.text_measurer.measure(text, style).advance;
+            return self.intrinsic_text_width(text, node.style_source, style);
         }
         if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
             return self.atomic_outer_max_content_width(node_id);
@@ -2456,11 +2654,15 @@ impl Solver<'_> {
     }
 
     fn float_side(&self, node: FormattingNodeId) -> Float {
-        let style = self
-            .formatting
-            .get(node)
-            .and_then(|node| node.style_source)
-            .and_then(|source| self.styles.get(&source));
+        let Some(formatting_node) = self.formatting.get(node) else {
+            return Float::None;
+        };
+        // Anonymous inline wrappers borrow their parent's text style, but
+        // float is not inherited and the wrapper has no box of its own.
+        let Some(source) = formatting_node.source else {
+            return Float::None;
+        };
+        let style = self.styles.get(&source);
         match style.and_then(|style| style.typed("float")) {
             Some(TypedPropertyValue::Float(Float::Left | Float::InlineStart)) => Float::Left,
             Some(TypedPropertyValue::Float(Float::Right | Float::InlineEnd)) => Float::Right,
@@ -2469,10 +2671,13 @@ impl Solver<'_> {
     }
 
     fn cleared_y(&self, node: FormattingNodeId, y: f32, floats: &[FloatArea]) -> f32 {
-        let style = self
-            .formatting
-            .get(node)
-            .and_then(|node| node.style_source)
+        let Some(formatting_node) = self.formatting.get(node) else {
+            return y;
+        };
+        // Anonymous inline wrappers borrow the surrounding text style, but
+        // clear is a box property and must not be inherited by the wrapper.
+        let style = formatting_node
+            .source
             .and_then(|source| self.styles.get(&source));
         let clear = match style.and_then(|style| style.typed("clear")) {
             Some(TypedPropertyValue::Clear(value)) => *value,
@@ -2599,6 +2804,35 @@ impl Solver<'_> {
         usize::try_from(id.as_u32())
             .ok()
             .and_then(|index| self.fragments.get_mut(index))
+    }
+
+    fn fragment_z_index(&self, id: FragmentId) -> i32 {
+        let Some(fragment) = usize::try_from(id.as_u32())
+            .ok()
+            .and_then(|index| self.fragments.get(index))
+        else {
+            return 0;
+        };
+        let own = self
+            .formatting
+            .get(fragment.formatting_node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source))
+            .and_then(|style| style.get("z-index"))
+            .and_then(|value| value.css_text().trim().parse::<i32>().ok())
+            .unwrap_or(0);
+        // A positioned descendant can escape an otherwise unpositioned
+        // wrapper and overlap a later sibling. Carrying the highest descendant
+        // layer upward preserves that ordering until a full stacking-context
+        // tree is available.
+        own.max(
+            fragment
+                .children
+                .iter()
+                .map(|child| self.fragment_z_index(*child))
+                .max()
+                .unwrap_or(0),
+        )
     }
 
     fn source(&self, node: FormattingNodeId) -> Option<NodeId> {
@@ -3009,6 +3243,30 @@ mod tests {
     }
 
     #[test]
+    fn text_align_centers_inline_text_inside_a_fixed_width_box() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><button id=search>go</button></body>",
+            "html, body, button { display:block; margin:0 } #search { width:100px; height:30px; text-align:center }",
+            240.0,
+        );
+        let button = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#search")))
+            .expect("button fragment");
+        let text_node = output.dom.children(find(&output.dom, "#search")).unwrap()[0];
+        let text = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(text_node))
+            .expect("button text fragment");
+        let expected_center = button.rect.origin.x + button.rect.size.width / 2.0;
+        let actual_center = text.rect.origin.x + text.rect.size.width / 2.0;
+        assert!((actual_center - expected_center).abs() < 0.01);
+        assert!(text.rect.origin.x > button.rect.origin.x);
+    }
+
+    #[test]
     fn block_width_resolves_mixed_percentages_box_sizing_and_auto_margins() {
         let (output, _, layout) = pipeline(
             "<!doctype html><body><div id='box'></div></body>",
@@ -3303,6 +3561,37 @@ mod tests {
         );
         assert_eq!(tile.rect.size.width, 72.0);
         assert_eq!(tile.rect.size.height, 42.0);
+    }
+
+    #[test]
+    fn inline_icon_title_and_badge_share_one_line() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><ul><li id=item><a id=title><i id=icon>^</i><span id=text>headline</span></a><span id=badge>hot</span></li></ul></body>",
+            "html, body, ul, li { display:block; margin:0 } #item { width:369px; height:36px; clear:both; white-space:nowrap } #title { display:inline; float:left; max-width:284px; height:36px; line-height:36px } #icon { display:inline-block; width:18px; height:18px; line-height:18px } #text { font-size:16px; line-height:36px } #badge { display:inline-block; margin-left:6px; padding-left:2px; padding-right:2px; height:16px; line-height:16px; font-size:12px }",
+            800.0,
+        );
+        let rect = |selector| {
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                .map(|fragment| fragment.rect)
+        };
+
+        let text = output.dom.children(find(&output.dom, "#text")).unwrap()[0];
+        let text_rect = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(text))
+            .map(|fragment| fragment.rect)
+            .expect("headline text fragment");
+        assert_eq!(rect("#title").unwrap().size.width, 82.0);
+        assert_eq!(rect("#icon").unwrap().origin.x, 0.0);
+        assert_eq!(rect("#icon").unwrap().origin.y, 0.0);
+        assert_eq!(text_rect.origin.x, 18.0);
+        assert_eq!(text_rect.origin.y, 0.0);
+        assert_eq!(rect("#badge").unwrap().origin.x, 88.0);
+        assert_eq!(rect("#badge").unwrap().origin.y, 0.0);
     }
 
     #[test]

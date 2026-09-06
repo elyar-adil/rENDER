@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::{
     BorderStyle, CssColor, ObjectFit, Overflow, Position, TypedPropertyValue, Visibility,
+    parse_typed_property,
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
@@ -536,15 +537,16 @@ impl Builder<'_> {
         }
         let overflow_clip = match (&fragment.kind, style.as_ref()) {
             (FragmentKind::Box(geometry), Some(style)) => {
-                if let Some(rect) = overflow_clip_rect(geometry, style) {
+                if let Some(shape) = overflow_clip_shape(geometry, style) {
+                    let rect = clip_shape_rect(shape);
                     self.push(
                         &fragment,
                         PaintPhase::Content,
                         rect,
                         coordinate_space,
-                        DisplayCommand::PushClip(ClipShape::Rect(rect)),
+                        DisplayCommand::PushClip(shape),
                     );
-                    Some(rect)
+                    Some(())
                 } else {
                     None
                 }
@@ -554,11 +556,11 @@ impl Builder<'_> {
         for child in &fragment.children {
             self.paint_fragment(*child, coordinate_space);
         }
-        if let Some(rect) = overflow_clip {
+        if overflow_clip.is_some() {
             self.push(
                 &fragment,
                 PaintPhase::Content,
-                rect,
+                fragment.rect,
                 coordinate_space,
                 DisplayCommand::PopClip,
             );
@@ -593,25 +595,64 @@ impl Builder<'_> {
         current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
+        let (background_rect, background_space) =
+            self.background_rect(fragment, geometry, coordinate_space);
+        let radii = corner_radii(style, background_rect);
+        for shadow in box_shadows(
+            style,
+            geometry.border_rect(),
+            radii,
+            current_color,
+            self.options.palette,
+        ) {
+            let bounds = shadow_bounds(&shadow);
+            self.push(
+                fragment,
+                PaintPhase::BoxShadow,
+                bounds,
+                coordinate_space,
+                DisplayCommand::BoxShadow(shadow),
+            );
+        }
+        let rounded_background = has_corner_radius(radii);
+        if rounded_background {
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                background_rect,
+                background_space,
+                DisplayCommand::PushClip(ClipShape::RoundedRect {
+                    rect: background_rect,
+                    radii,
+                }),
+            );
+        }
         if let Some(background) = style
             .and_then(|style| typed_color(style, "background-color"))
             .map(|color| self.options.palette.resolve(color, current_color))
             && background.alpha > 0
         {
-            let (rect, background_space) =
-                self.background_rect(fragment, geometry, coordinate_space);
             self.push(
                 fragment,
                 PaintPhase::Background,
-                rect,
+                background_rect,
                 background_space,
                 DisplayCommand::SolidRect {
-                    rect,
+                    rect: background_rect,
                     color: background,
                 },
             );
         }
-        self.paint_background_image(fragment, geometry, style, coordinate_space);
+        self.paint_background_image(fragment, geometry, style, current_color, coordinate_space);
+        if rounded_background {
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                background_rect,
+                background_space,
+                DisplayCommand::PopClip,
+            );
+        }
         let border = border_paint(style, geometry, current_color, self.options.palette);
         if border.widths.horizontal() > 0.0 || border.widths.vertical() > 0.0 {
             self.push(
@@ -630,6 +671,7 @@ impl Builder<'_> {
         fragment: &Fragment,
         geometry: &crate::layout::BoxGeometry,
         style: Option<&ComputedStyle>,
+        current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
         let Some(style) = style else { return };
@@ -637,16 +679,6 @@ impl Builder<'_> {
         else {
             return;
         };
-        let Some(loaded) = fragment.source.and_then(|node| {
-            self.images
-                .and_then(|images| images.get_css_background(node, snapshot))
-        }) else {
-            return;
-        };
-        let (width, height) = loaded.image.intrinsic_size();
-        if width == 0 || height == 0 {
-            return;
-        }
         // The default background-origin is the padding box, while the
         // default background-clip is the border box. Keep those spaces
         // separate so transparent borders can reveal the background image.
@@ -657,6 +689,54 @@ impl Builder<'_> {
             || painting_area.size.width <= 0.0
             || painting_area.size.height <= 0.0
         {
+            return;
+        }
+        let gradient_layers = split_gradient_arguments(snapshot)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| {
+                let area = if index == 0 {
+                    positioning_area
+                } else {
+                    painting_area
+                };
+                parse_linear_gradient(layer, area, self.options.palette, current_color)
+            })
+            .collect::<Vec<_>>();
+        if !gradient_layers.is_empty() {
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                painting_area,
+                coordinate_space,
+                DisplayCommand::PushClip(ClipShape::Rect(painting_area)),
+            );
+            for gradient in gradient_layers.into_iter().rev() {
+                self.push(
+                    fragment,
+                    PaintPhase::Background,
+                    gradient.rect,
+                    coordinate_space,
+                    DisplayCommand::LinearGradient(gradient),
+                );
+            }
+            self.push(
+                fragment,
+                PaintPhase::Background,
+                painting_area,
+                coordinate_space,
+                DisplayCommand::PopClip,
+            );
+            return;
+        }
+        let Some(loaded) = fragment.source.and_then(|node| {
+            self.images
+                .and_then(|images| images.get_css_background(node, snapshot))
+        }) else {
+            return;
+        };
+        let (width, height) = loaded.image.intrinsic_size();
+        if width == 0 || height == 0 {
             return;
         }
         let size = style
@@ -997,10 +1077,10 @@ impl Builder<'_> {
     }
 }
 
-fn overflow_clip_rect(
+fn overflow_clip_shape(
     geometry: &crate::layout::BoxGeometry,
     style: &ComputedStyle,
-) -> Option<PhysicalRect> {
+) -> Option<ClipShape> {
     let clips_x = matches!(
         style.typed("overflow-x"),
         Some(TypedPropertyValue::Overflow(value))
@@ -1012,10 +1092,389 @@ fn overflow_clip_rect(
             if !matches!(value, Overflow::Visible)
     );
     if clips_x || clips_y {
-        Some(geometry.padding_rect())
+        let rect = geometry.padding_rect();
+        let radii = inset_corner_radii(
+            corner_radii(Some(style), geometry.border_rect()),
+            geometry.border.top,
+            geometry.border.right,
+            geometry.border.bottom,
+            geometry.border.left,
+        );
+        Some(if has_corner_radius(radii) {
+            ClipShape::RoundedRect { rect, radii }
+        } else {
+            ClipShape::Rect(rect)
+        })
     } else {
         None
     }
+}
+
+fn clip_shape_rect(shape: ClipShape) -> PhysicalRect {
+    match shape {
+        ClipShape::Rect(rect) | ClipShape::RoundedRect { rect, .. } => rect,
+    }
+}
+
+fn has_corner_radius(radii: CornerRadii) -> bool {
+    radii.top_left > 0.0
+        || radii.top_right > 0.0
+        || radii.bottom_right > 0.0
+        || radii.bottom_left > 0.0
+}
+
+fn inset_corner_radii(
+    radii: CornerRadii,
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+) -> CornerRadii {
+    CornerRadii {
+        top_left: (radii.top_left - top.max(left)).max(0.0),
+        top_right: (radii.top_right - top.max(right)).max(0.0),
+        bottom_right: (radii.bottom_right - bottom.max(right)).max(0.0),
+        bottom_left: (radii.bottom_left - bottom.max(left)).max(0.0),
+    }
+}
+
+fn corner_radii(style: Option<&ComputedStyle>, rect: PhysicalRect) -> CornerRadii {
+    let mut radii = style
+        .and_then(|style| style.get("border-radius"))
+        .and_then(|value| parse_corner_radii(value.css_text(), rect))
+        .unwrap_or_default();
+    for (property, slot) in [
+        ("border-top-left-radius", &mut radii.top_left),
+        ("border-top-right-radius", &mut radii.top_right),
+        ("border-bottom-right-radius", &mut radii.bottom_right),
+        ("border-bottom-left-radius", &mut radii.bottom_left),
+    ] {
+        if let Some(value) = style
+            .and_then(|style| style.get(property))
+            .and_then(|value| {
+                parse_radius_value(
+                    value.css_text().split_ascii_whitespace().next()?,
+                    rect.size.width,
+                )
+            })
+        {
+            *slot = value;
+        }
+    }
+    normalize_corner_radii(radii, rect)
+}
+
+fn parse_corner_radii(value: &str, rect: PhysicalRect) -> Option<CornerRadii> {
+    let (horizontal, vertical) = value
+        .split_once('/')
+        .map_or((value, None), |(a, b)| (a, Some(b)));
+    let horizontal = parse_radius_list(horizontal, rect.size.width)?;
+    let vertical = match vertical {
+        Some(value) => parse_radius_list(value, rect.size.height)?,
+        None => horizontal,
+    };
+    Some(CornerRadii {
+        top_left: f32::midpoint(horizontal[0], vertical[0]),
+        top_right: f32::midpoint(horizontal[1], vertical[1]),
+        bottom_right: f32::midpoint(horizontal[2], vertical[2]),
+        bottom_left: f32::midpoint(horizontal[3], vertical[3]),
+    })
+}
+
+fn parse_radius_list(value: &str, basis: f32) -> Option<[f32; 4]> {
+    let values = value
+        .split_ascii_whitespace()
+        .filter_map(|value| parse_radius_value(value, basis))
+        .collect::<Vec<_>>();
+    let [first, second, third, fourth] = match values.as_slice() {
+        [first] => [*first, *first, *first, *first],
+        [first, second] => [*first, *second, *first, *second],
+        [first, second, third] => [*first, *second, *third, *second],
+        [first, second, third, fourth] => [*first, *second, *third, *fourth],
+        _ => return None,
+    };
+    Some([first, second, third, fourth])
+}
+
+fn parse_radius_value(value: &str, basis: f32) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(value) = value.strip_suffix('%') {
+        return value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .map(|value| (value / 100.0 * basis).max(0.0));
+    }
+    value
+        .strip_suffix("px")
+        .unwrap_or(&value)
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .map(|value| value.max(0.0))
+}
+
+fn normalize_corner_radii(mut radii: CornerRadii, rect: PhysicalRect) -> CornerRadii {
+    let mut scale = 1.0_f32;
+    for (sum, available) in [
+        (radii.top_left + radii.top_right, rect.size.width),
+        (radii.bottom_left + radii.bottom_right, rect.size.width),
+        (radii.top_left + radii.bottom_left, rect.size.height),
+        (radii.top_right + radii.bottom_right, rect.size.height),
+    ] {
+        if sum > available && sum > 0.0 {
+            scale = scale.min(available / sum);
+        }
+    }
+    radii.top_left *= scale;
+    radii.top_right *= scale;
+    radii.bottom_right *= scale;
+    radii.bottom_left *= scale;
+    let max_radius = (rect.size.width.min(rect.size.height) / 2.0).max(0.0);
+    radii.top_left = radii.top_left.min(max_radius);
+    radii.top_right = radii.top_right.min(max_radius);
+    radii.bottom_right = radii.bottom_right.min(max_radius);
+    radii.bottom_left = radii.bottom_left.min(max_radius);
+    radii
+}
+
+fn box_shadows(
+    style: Option<&ComputedStyle>,
+    rect: PhysicalRect,
+    radii: CornerRadii,
+    current_color: Color,
+    palette: SystemPalette,
+) -> Vec<BoxShadowPaint> {
+    let Some(value) = style.and_then(|style| style.get("box-shadow")) else {
+        return Vec::new();
+    };
+    split_gradient_arguments(value.css_text())
+        .into_iter()
+        .filter_map(|shadow| parse_box_shadow(shadow, rect, radii, current_color, palette))
+        .collect()
+}
+
+fn parse_box_shadow(
+    value: &str,
+    rect: PhysicalRect,
+    radii: CornerRadii,
+    current_color: Color,
+    palette: SystemPalette,
+) -> Option<BoxShadowPaint> {
+    if value.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let mut inset = false;
+    let mut color = None;
+    let mut lengths = Vec::new();
+    for token in split_css_whitespace(value) {
+        if token.eq_ignore_ascii_case("inset") {
+            inset = true;
+        } else if color.is_none()
+            && let Some(Ok(TypedPropertyValue::Color(value))) = parse_typed_property("color", token)
+        {
+            color = Some(palette.resolve(value, current_color));
+        } else if let Some(length) = parse_shadow_length(token) {
+            lengths.push(length);
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(BoxShadowPaint {
+        rect,
+        offset: PhysicalPoint {
+            x: lengths[0],
+            y: lengths[1],
+        },
+        blur_radius: lengths.get(2).copied().unwrap_or(0.0),
+        spread_radius: lengths.get(3).copied().unwrap_or(0.0),
+        color: color.unwrap_or(current_color),
+        inset,
+        radii,
+    })
+}
+
+fn split_css_whitespace(value: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start = None;
+    let mut depth = 0_u32;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            character if character.is_whitespace() && depth == 0 => {
+                if let Some(start) = start.take() {
+                    tokens.push(value[start..index].trim());
+                }
+            }
+            _ if start.is_none() => start = Some(index),
+            _ => {}
+        }
+    }
+    if let Some(start) = start {
+        tokens.push(value[start..].trim());
+    }
+    tokens
+}
+
+fn parse_shadow_length(value: &str) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    value
+        .strip_suffix("px")
+        .unwrap_or(&value)
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn shadow_bounds(shadow: &BoxShadowPaint) -> PhysicalRect {
+    if shadow.inset {
+        return shadow.rect;
+    }
+    let expansion = shadow.blur_radius.max(0.0) + shadow.spread_radius.max(0.0);
+    PhysicalRect::new(
+        shadow.rect.origin.x + shadow.offset.x - expansion,
+        shadow.rect.origin.y + shadow.offset.y - expansion,
+        shadow.rect.size.width + expansion * 2.0,
+        shadow.rect.size.height + expansion * 2.0,
+    )
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "gradient stop counts are bounded by display-list limits"
+)]
+fn parse_linear_gradient(
+    value: &str,
+    rect: PhysicalRect,
+    palette: SystemPalette,
+    current_color: Color,
+) -> Option<LinearGradient> {
+    let value = value.trim();
+    let lower = value.to_ascii_lowercase();
+    if !lower.starts_with("linear-gradient(") || !value.ends_with(')') {
+        return None;
+    }
+    let open = value.find('(')?;
+    let arguments = split_gradient_arguments(&value[open + 1..value.len() - 1]);
+    if arguments.len() < 2 {
+        return None;
+    }
+
+    let (angle, first_stop) =
+        parse_gradient_direction(arguments[0]).map_or((180.0, 0), |angle| (angle, 1));
+    let stops = arguments[first_stop..]
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            let (color, offset) = parse_gradient_stop(argument, palette, current_color)?;
+            let default_offset = if arguments.len().saturating_sub(first_stop) <= 1 {
+                0.0
+            } else {
+                index as f32 / (arguments.len() - first_stop - 1) as f32
+            };
+            Some(GradientStop {
+                offset: offset.unwrap_or(default_offset).clamp(0.0, 1.0),
+                color,
+            })
+        })
+        .collect::<Vec<_>>();
+    if stops.len() < 2 {
+        return None;
+    }
+
+    let radians = angle.to_radians();
+    let direction = (radians.sin(), -radians.cos());
+    let half_length = f32::midpoint(
+        direction.0.abs() * rect.size.width,
+        direction.1.abs() * rect.size.height,
+    );
+    let center = PhysicalPoint {
+        x: rect.origin.x + rect.size.width / 2.0,
+        y: rect.origin.y + rect.size.height / 2.0,
+    };
+    Some(LinearGradient {
+        rect,
+        start: PhysicalPoint {
+            x: center.x - direction.0 * half_length,
+            y: center.y - direction.1 * half_length,
+        },
+        end: PhysicalPoint {
+            x: center.x + direction.0 * half_length,
+            y: center.y + direction.1 * half_length,
+        },
+        stops,
+    })
+}
+
+fn split_gradient_arguments(value: &str) -> Vec<&str> {
+    let mut arguments = Vec::new();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quote = None;
+    for (index, character) in value.char_indices() {
+        match (quote, character) {
+            (Some(expected), character) if character == expected => quote = None,
+            (None, '\'' | '"') => quote = Some(character),
+            (None, '(') => depth = depth.saturating_add(1),
+            (None, ')') => depth = depth.saturating_sub(1),
+            (None, ',') if depth == 0 => {
+                arguments.push(value[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    arguments.push(value[start..].trim());
+    arguments
+}
+
+fn parse_gradient_direction(value: &str) -> Option<f32> {
+    let value = value.trim().to_ascii_lowercase();
+    if let Some(degrees) = value.strip_suffix("deg") {
+        return degrees.trim().parse::<f32>().ok();
+    }
+    let value = value.strip_prefix("to ")?;
+    let horizontal = if value.contains("right") {
+        Some(90.0)
+    } else if value.contains("left") {
+        Some(270.0)
+    } else {
+        None
+    };
+    let vertical = if value.contains("bottom") {
+        Some(180.0)
+    } else if value.contains("top") {
+        Some(0.0)
+    } else {
+        None
+    };
+    match (horizontal, vertical) {
+        (Some(horizontal), Some(vertical)) => Some(f32::midpoint(horizontal, vertical)),
+        (Some(horizontal), None) | (None, Some(horizontal)) => Some(horizontal),
+        (None, None) => None,
+    }
+}
+
+fn parse_gradient_stop(
+    value: &str,
+    palette: SystemPalette,
+    current_color: Color,
+) -> Option<(Color, Option<f32>)> {
+    let value = value.trim();
+    let (color_value, offset) = value
+        .rsplit_once(char::is_whitespace)
+        .and_then(|(color, offset)| {
+            let offset = offset.trim().strip_suffix('%')?.parse::<f32>().ok()?;
+            Some((color.trim(), Some(offset / 100.0)))
+        })
+        .unwrap_or((value, None));
+    let typed = parse_typed_property("color", color_value)?.ok()?;
+    let TypedPropertyValue::Color(color) = typed else {
+        return None;
+    };
+    Some((palette.resolve(color, current_color), offset))
 }
 
 #[allow(
@@ -1111,7 +1570,7 @@ fn border_paint(
             style_at("border-bottom-style", BorderStyle::None),
             style_at("border-left-style", BorderStyle::None),
         ],
-        radii: CornerRadii::default(),
+        radii: corner_radii(style, geometry.border_rect()),
     }
 }
 
@@ -1268,6 +1727,100 @@ mod tests {
         }));
         assert!(display.list.items().iter().any(|item| {
             item.source == Some(tile) && matches!(item.command, DisplayCommand::Border(_))
+        }));
+    }
+
+    #[test]
+    fn linear_gradient_background_becomes_a_paint_command() {
+        let output =
+            parse_document("<!doctype html><body><button id=search>百度一下</button></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #search { display:block; width:120px; height:40px; color:white; background:linear-gradient(90deg, #286aff, #9f66ff); }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(display.list.items().iter().any(|item| {
+            matches!(
+                &item.command,
+                DisplayCommand::LinearGradient(gradient)
+                    if gradient.stops.len() == 2
+                        && gradient.rect.size.width > 0.0
+                        && gradient.rect.size.height > 0.0
+            )
+        }));
+    }
+
+    #[test]
+    fn rounded_box_emits_rounded_clip_and_box_shadow() {
+        let output = parse_document("<!doctype html><body><div id=card>card</div></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #card { display:block; width:120px; height:40px; border-radius:12px; background-color:#ffffff; box-shadow:0 4px 12px rgba(0,0,0,.25) }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+
+        assert!(display.diagnostics.is_empty());
+        assert!(display.list.items().iter().any(|item| {
+            matches!(
+                &item.command,
+                DisplayCommand::PushClip(ClipShape::RoundedRect { radii, .. })
+                    if radii.top_left > 0.0
+            )
+        }));
+        assert!(display.list.items().iter().any(|item| {
+            matches!(
+                &item.command,
+                DisplayCommand::BoxShadow(shadow)
+                    if (shadow.blur_radius - 12.0).abs() < f32::EPSILON
+                        && (shadow.offset.y - 4.0).abs() < f32::EPSILON
+                        && shadow.color == Color::rgba(0, 0, 0, 64)
+            )
         }));
     }
 

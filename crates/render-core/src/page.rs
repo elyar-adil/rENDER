@@ -640,12 +640,12 @@ impl Page {
         }
     }
 
-    /// Discover document scripts once and queue supported parser-blocking inline
-    /// classic scripts in DOM tree order.
+    /// Discover document scripts once and queue supported inline scripts in
+    /// browser scheduling order.
     ///
     /// External scripts are deliberately reported rather than fetched here:
-    /// network I/O belongs to the browser resource coordinator. Unsupported
-    /// module types remain available as discovery diagnostics.
+    /// network I/O belongs to the browser resource coordinator. Module scripts
+    /// use deferred scheduling, as required by their script type.
     #[must_use]
     pub fn queue_document_scripts(
         &mut self,
@@ -689,9 +689,26 @@ impl Page {
             };
         }
 
+        let mut parser_blocking = Vec::new();
+        let mut deferred = Vec::new();
+        let mut asynchronous = Vec::new();
+        for script in discovery.scripts {
+            match script.scheduling {
+                ScriptScheduling::ParserBlocking => parser_blocking.push(script),
+                ScriptScheduling::Defer => deferred.push(script),
+                ScriptScheduling::Async => asynchronous.push(script),
+            }
+        }
+        parser_blocking.sort_by_key(|script| script.source_order);
+        deferred.sort_by_key(|script| script.source_order);
+
         let mut queued = Vec::new();
         let mut errors = Vec::new();
-        for script in discovery.scripts {
+        for script in parser_blocking
+            .into_iter()
+            .chain(asynchronous)
+            .chain(deferred)
+        {
             queue_discovered_inline_script(self, script, &mut queued, &mut errors);
         }
         DocumentScriptQueue {
@@ -1175,7 +1192,6 @@ fn queue_discovered_inline_script(
     queued: &mut Vec<TaskId>,
     errors: &mut Vec<DocumentScriptQueueError>,
 ) {
-    debug_assert_eq!(script.scheduling, ScriptScheduling::ParserBlocking);
     let ScriptSource::Inline { source } = script.source else {
         unreachable!("external scripts are rejected before queuing begins");
     };
@@ -1248,7 +1264,7 @@ mod tests {
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::event_loop::{EventLoopLimits, MicrotaskCheckpoint, RenderingDecision};
     use crate::js::RuntimeLimits;
-    use crate::script::{ScriptDiagnosticCode, ScriptDiscoveryLimits, ScriptScheduling};
+    use crate::script::{ScriptDiscoveryLimits, ScriptScheduling};
     use std::time::Duration;
     use url::Url;
 
@@ -1334,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn document_script_queue_reports_unsupported_and_external_work_atomically() {
+    fn document_script_queue_reports_external_work_atomically() {
         let mut page = Page::new(
             "<!doctype html>\
              <script>document.title = 'must-not-run-ahead';</script>\
@@ -1350,19 +1366,54 @@ mod tests {
 
         assert!(queue.queued.is_empty());
         assert_eq!(page.event_loop().pending_task_count(), 0);
-        assert_eq!(
-            queue
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.code)
-                .collect::<Vec<_>>(),
-            [ScriptDiagnosticCode::ModuleUnsupported]
-        );
+        assert!(queue.diagnostics.is_empty());
         assert!(matches!(
             queue.errors.as_slice(),
             [DocumentScriptQueueError::ExternalScriptPending { resolved_url, .. }]
                 if resolved_url.as_str() == "https://example.test/app.js"
         ));
+    }
+
+    #[test]
+    fn document_script_queue_runs_inline_modules_in_deferred_order() {
+        let mut page = Page::new(
+            "<!doctype html><p id=message>before</p>\
+             <script>var order = 'classic';</script>\
+             <script type=module>order += '-module';</script>\
+             <script nomodule>order += '-legacy';</script>\
+             <script defer>order += '-defer';</script>\
+             <script defer>document.getElementById('message').setAttribute('data-order', order);</script>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/path/").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+
+        assert_eq!(queue.queued.len(), 4);
+        assert!(queue.diagnostics.is_empty());
+        assert!(queue.errors.is_empty());
+
+        while page
+            .run_one_turn_reference()
+            .expect("inline script turn renders")
+            .is_some()
+        {}
+
+        let message = element_with_id(page.document().dom(), "message");
+        assert_eq!(
+            page.document().dom().attribute(message, "data-order"),
+            Ok(Some("classic-defer"))
+        );
+
+        page.queue_script("document.getElementById('message').setAttribute('data-order', order);")
+            .expect("post-module assertion fits the page limits");
+        page.run_one_turn_reference()
+            .expect("post-module assertion renders")
+            .expect("post-module assertion is queued");
+        assert_eq!(
+            page.document().dom().attribute(message, "data-order"),
+            Ok(Some("classic-defer-module"))
+        );
     }
 
     #[test]

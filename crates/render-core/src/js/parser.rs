@@ -1064,12 +1064,9 @@ impl Parser {
                     }
                     let parameter =
                         if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
-                            let pattern = match self.binding_pattern() {
-                                Ok(pattern) => pattern,
-                                Err(_) => {
-                                    self.cursor = checkpoint;
-                                    return Ok(None);
-                                }
+                            let Ok(pattern) = self.binding_pattern() else {
+                                self.cursor = checkpoint;
+                                return Ok(None);
                             };
                             let temporary = format!("\0arrow_param_{}", parameters.len());
                             patterns.push((temporary.clone(), pattern));

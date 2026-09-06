@@ -362,8 +362,10 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
 
 fn expand_background_shorthand(value: &str) -> Vec<(String, String)> {
     let lower = value.to_ascii_lowercase();
-    let image =
-        extract_css_url(value).map_or_else(|| "none".to_owned(), |url| format!("url({url})"));
+    let image = extract_css_url(value).map_or_else(
+        || extract_css_gradients(value).unwrap_or_else(|| "none".to_owned()),
+        |url| format!("url({url})"),
+    );
     let color = split_css_components(value)
         .into_iter()
         .find(|component| {
@@ -446,6 +448,35 @@ fn extract_css_url(value: &str) -> Option<&str> {
     let tail = &value[start..];
     let end = tail.find(')')?;
     Some(tail[..end].trim().trim_matches(['\'', '"']))
+}
+
+fn extract_css_gradients(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let mut gradients = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative_start) = lower[search_from..].find("linear-gradient(") {
+        let start = search_from + relative_start;
+        let open = start + "linear-gradient".len();
+        let mut depth = 0_u32;
+        let mut end = None;
+        for (offset, character) in value[open..].char_indices() {
+            match character {
+                '(' => depth = depth.saturating_add(1),
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        end = Some(open + offset + character.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        gradients.push(value[start..end].to_owned());
+        search_from = end;
+    }
+    (!gradients.is_empty()).then(|| gradients.join(","))
 }
 
 fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {

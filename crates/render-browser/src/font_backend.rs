@@ -55,6 +55,7 @@ impl SystemFontBackend {
     }
 
     fn font_for(&self, character: char) -> &Font {
+        let character = fallback_icon_character(character);
         self.fonts
             .iter()
             .find(|font| font.lookup_glyph_index(character) != 0)
@@ -73,6 +74,7 @@ impl TextMeasurer for SystemFontBackend {
             text.chars()
         };
         for character in characters {
+            let character = fallback_icon_character(character);
             let font = self.font_for(character);
             if !text.is_empty() {
                 advance += font.metrics(character, style.font_size).advance_width;
@@ -100,6 +102,7 @@ impl TextShaper for SystemFontBackend {
         let glyphs = text
             .chars()
             .map(|character| {
+                let character = fallback_icon_character(character);
                 let advance = self
                     .font_for(character)
                     .metrics(character, font_size)
@@ -138,7 +141,7 @@ impl GlyphMaskProvider for SystemFontBackend {
         if let Some(mask) = self.glyph_cache.lock().ok()?.get(&key) {
             return Some(Arc::clone(mask));
         }
-        let character = char::from_u32(glyph.0)?;
+        let character = fallback_icon_character(char::from_u32(glyph.0)?);
         let (metrics, coverage) = self.font_for(character).rasterize(character, font_size);
         let mask = Arc::new(GlyphMask {
             width: u32::try_from(metrics.width).ok()?,
@@ -164,6 +167,7 @@ impl TextPainter for SystemFontBackend {
     fn measure(&self, text: &str, size: f32) -> f32 {
         text.chars()
             .map(|character| {
+                let character = fallback_icon_character(character);
                 self.font_for(character)
                     .metrics(character, size)
                     .advance_width
@@ -179,6 +183,7 @@ impl TextPainter for SystemFontBackend {
     fn paint(&self, canvas: &mut Canvas<'_>, text: &str, origin: Point, size: f32, color: u32) {
         let mut x = origin.x;
         for character in text.chars() {
+            let character = fallback_icon_character(character);
             let font = self.font_for(character);
             let (metrics, coverage) = font.rasterize(character, size);
             let ascent = font
@@ -195,6 +200,21 @@ impl TextPainter for SystemFontBackend {
             );
             x += metrics.advance_width;
         }
+    }
+}
+
+/// The sites rendered by the browser commonly use a private-use icon font.
+/// External `@font-face` resources are not part of the native font backend yet,
+/// so keep the small set of common controls legible with local glyphs.
+fn fallback_icon_character(character: char) -> char {
+    match character {
+        '\u{e602}' => '●',
+        '\u{e610}' => '×',
+        '\u{e613}' => '▾',
+        '\u{e619}' => '↻',
+        '\u{e625}' => '!',
+        '\u{e62e}' => '★',
+        _ => character,
     }
 }
 
@@ -226,4 +246,17 @@ fn system_font_candidate_groups() -> Vec<Vec<PathBuf>> {
         PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
     ]);
     vec![primary, cjk, symbols]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fallback_icon_character;
+
+    #[test]
+    fn maps_private_use_site_icons_to_local_glyphs() {
+        assert_eq!(fallback_icon_character('\u{e610}'), '×');
+        assert_eq!(fallback_icon_character('\u{e613}'), '▾');
+        assert_eq!(fallback_icon_character('\u{e619}'), '↻');
+        assert_eq!(fallback_icon_character('A'), 'A');
+    }
 }

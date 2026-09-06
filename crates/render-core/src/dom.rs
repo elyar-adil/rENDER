@@ -20,6 +20,11 @@ impl NodeId {
         self.0
     }
 
+    #[must_use]
+    pub const fn from_u64(value: u64) -> Self {
+        Self(value)
+    }
+
     fn from_index(index: usize) -> Self {
         Self(u64::try_from(index).expect("DOM arena exceeded u64 node capacity"))
     }

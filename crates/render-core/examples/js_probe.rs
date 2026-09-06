@@ -39,6 +39,51 @@ fn run() {
         ),
         ("fn-var", r"function f(){ var y = 1; return y; } f()"),
         (
+            "recursive-declaration",
+            "function factorial(n){ if (n <= 1) { return 1; } return n * factorial(n - 1); } factorial(5)",
+        ),
+        (
+            "recursive-var-binding",
+            "var f2 = function(n){ if (n <= 1) { return 1; } return n * f2(n - 1); }; f2(5)",
+        ),
+        (
+            "one-level-recursion",
+            "function g(n){ if (n <= 1) { return 1; } return g(n - 1); } g(2)",
+        ),
+        (
+            "typeof-recursive-name",
+            "function g(n){ return typeof g; } g(2)",
+        ),
+        (
+            "arith-multiply",
+            "function g(n){ return n * (n - 1); } g(5)",
+        ),
+        ("param-arithmetic", "function g(n){ return n - 1; } g(5)"),
+        (
+            "two-call-recursion",
+            "function g(n){ if (n <= 1) { return 1; } return g(n - 1) * 2; } g(3)",
+        ),
+        (
+            "depth3-no-multiply",
+            "function g(n){ if (n <= 1) { return 1; } return g(n - 1); } g(3)",
+        ),
+        (
+            "depth3-var-then-return",
+            "function g(n){ if (n <= 1) { return 1; } var r = g(n - 1); return r; } g(3)",
+        ),
+        (
+            "depth3-plus-zero",
+            "function g(n){ if (n <= 1) { return 1; } return g(n - 1) + 0; } g(3)",
+        ),
+        (
+            "nested-call-arg",
+            "function id(n){ return n; } function f(n){ return id(id(n)); } f(5)",
+        ),
+        (
+            "g1-with-literal",
+            "function g(n){ if (n <= 1) { return 1; } return g(0); } g(3)",
+        ),
+        (
             "selector-regression",
             r##"const root = document.querySelector("#app");
                const cards = root.querySelectorAll("article.card");

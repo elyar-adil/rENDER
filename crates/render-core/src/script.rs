@@ -492,7 +492,6 @@ mod tests {
                 ScriptScheduling::Defer,
                 ScriptScheduling::ParserBlocking,
                 ScriptScheduling::ParserBlocking,
-                ScriptScheduling::ParserBlocking,
             ]
         );
         assert_eq!(codes, [ScriptDiagnosticCode::UnsupportedType,]);

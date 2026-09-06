@@ -810,6 +810,14 @@ keyword_enum!(AlignItems {
     End => "end",
     Center => "center",
 });
+keyword_enum!(TextAlign {
+    Start => "start",
+    End => "end",
+    Left => "left",
+    Right => "right",
+    Center => "center",
+    Justify => "justify",
+});
 keyword_enum!(BorderStyle {
     None => "none",
     Hidden => "hidden",
@@ -965,6 +973,7 @@ pub enum TypedPropertyValue {
     FlexShrink(f32),
     JustifyContent(JustifyContent),
     AlignItems(AlignItems),
+    TextAlign(TextAlign),
     Order(i32),
     Gap(Gap),
     GridTemplate(GridTemplate),
@@ -1001,6 +1010,7 @@ impl TypedPropertyValue {
             Self::FlexShrink(_) => "flex-shrink",
             Self::JustifyContent(_) => "justify-content",
             Self::AlignItems(_) => "align-items",
+            Self::TextAlign(_) => "text-align",
             Self::Order(_) => "order",
             Self::Gap(_) => "gap",
             Self::GridTemplate(_) => "grid-template",
@@ -1036,6 +1046,7 @@ impl TypedPropertyValue {
             Self::FlexBasis(value) => value.to_css(),
             Self::JustifyContent(value) => value.as_str().to_owned(),
             Self::AlignItems(value) => value.as_str().to_owned(),
+            Self::TextAlign(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
             Self::Gap(value) => value.to_css(),
             Self::GridTemplate(value) => value.to_css(),
@@ -1285,6 +1296,7 @@ pub fn parse_typed_property(
             | "flex-shrink"
             | "justify-content"
             | "align-items"
+            | "text-align"
             | "order"
             | "row-gap"
             | "column-gap"
@@ -1347,6 +1359,7 @@ fn parse_property<'i>(
         "align-items" => {
             parse_keyword(input, AlignItems::parse).map(TypedPropertyValue::AlignItems)
         }
+        "text-align" => parse_keyword(input, TextAlign::parse).map(TypedPropertyValue::TextAlign),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
         "row-gap" | "column-gap" => parse_gap(input).map(TypedPropertyValue::Gap),
         "grid-template-columns" | "grid-template-rows" => {
@@ -1439,6 +1452,7 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
 }
 
 fn parse_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, String> {
+    let start = input.position();
     let location = input.current_source_location();
     let token = input.next()?.clone();
     match token {
@@ -1455,6 +1469,25 @@ fn parse_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Strin
             })
         }
         Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok("none".to_owned()),
+        Token::Function(name) if name.eq_ignore_ascii_case("linear-gradient") => {
+            input.parse_nested_block(|nested| {
+                while nested.next().is_ok() {}
+                Ok(())
+            })?;
+            while input.try_parse(Parser::expect_comma).is_ok() {
+                let next = input.next()?.clone();
+                match next {
+                    Token::Function(name) if name.eq_ignore_ascii_case("linear-gradient") => {
+                        input.parse_nested_block(|nested| {
+                            while nested.next().is_ok() {}
+                            Ok(())
+                        })?;
+                    }
+                    _ => return Err(location.new_custom_error(())),
+                }
+            }
+            Ok(input.slice_from(start).trim().to_owned())
+        }
         _ => Err(location.new_custom_error(())),
     }
 }
@@ -2262,7 +2295,7 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        Display, DisplayInside, DisplayOutside, LengthPercentage, MaxSize, Size,
+        Display, DisplayInside, DisplayOutside, LengthPercentage, MaxSize, Size, TextAlign,
         TypedPropertyValue, parse_typed_property,
     };
 
@@ -2387,6 +2420,20 @@ mod tests {
         assert!(
             parse_typed_property("object-fit", "stretch")
                 .expect("object-fit is supported")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_text_alignment_keywords() {
+        assert_eq!(
+            parse("text-align", "center"),
+            TypedPropertyValue::TextAlign(TextAlign::Center)
+        );
+        assert_eq!(parse("text-align", "right").to_css(), "right");
+        assert!(
+            parse_typed_property("text-align", "middle")
+                .unwrap()
                 .is_err()
         );
     }

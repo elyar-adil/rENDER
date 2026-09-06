@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_plan_is_rejected_before_compilation() {
+    fn stale_plan_is_rebased_before_compilation() {
         let mut document = Document::parse("<script src=old.js></script>");
         let base = Url::parse("https://example.test/index.html").expect("base URL");
         let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
@@ -597,10 +597,11 @@ mod tests {
             prepare_script_batch(&document, &plan, Vec::new(), &RuntimeLimits::default());
 
         assert!(preparation.scripts.is_empty());
+        assert_eq!(preparation.revision, document.dom().revision());
         assert_eq!(preparation.diagnostics.len(), 1);
         assert_eq!(
             preparation.diagnostics[0].code,
-            ScriptResourceDiagnosticCode::StalePlan
+            ScriptResourceDiagnosticCode::MissingBatchResult
         );
     }
 

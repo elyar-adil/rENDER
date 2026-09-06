@@ -769,6 +769,35 @@ fn process_page_render(
             let content_height = output.layout.fragments.scrollable_content_size.height;
             let viewport_height = output.layout.fragments.viewport.height;
             let geometry = geometry_from_layout(&output.layout.fragments);
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                eprintln!(
+                    "render-browser render stylesheets={} computed_styles={} fragments={} diagnostics={{document:{}, style:{}, layout:{}, display:{}, raster:{}}}",
+                    style_sheets.len(),
+                    output.styles.len(),
+                    output.layout.fragments.iter().count(),
+                    output.diagnostics.document.len(),
+                    output.diagnostics.style_sheets.len(),
+                    output.diagnostics.layout.len(),
+                    output.diagnostics.display_list.len(),
+                    output.diagnostics.raster.len(),
+                );
+                for (node, style) in output.styles.iter().take(16) {
+                    eprintln!(
+                        "render-browser style node={:?} display={:?} width={:?} height={:?} properties={}",
+                        node,
+                        style
+                            .get("display")
+                            .map(render_core::css::computed::ComputedValue::css_text),
+                        style
+                            .get("width")
+                            .map(render_core::css::computed::ComputedValue::css_text),
+                        style
+                            .get("height")
+                            .map(render_core::css::computed::ComputedValue::css_text),
+                        style.properties().len(),
+                    );
+                }
+            }
             let display_list = Arc::new(output.display.list);
             let paint_scene = Arc::new(PaintScene::from_shared_display_list(Arc::clone(
                 &display_list,
@@ -844,6 +873,7 @@ struct PageState {
     viewport: WindowSize<u32>,
     display_list: Option<Arc<DisplayList>>,
     paint_scene: Option<Arc<PaintScene>>,
+    geometry: BTreeMap<u64, ElementRect>,
     raster_background: Color,
     scroll: PageScrollState,
     history: SessionHistory,
@@ -948,6 +978,7 @@ impl PageState {
             viewport: WindowSize::new(0, 0),
             display_list: None,
             paint_scene: None,
+            geometry: BTreeMap::new(),
             raster_background: DocumentRenderOptions::default().raster_background,
             scroll: PageScrollState::default(),
             history,
@@ -976,6 +1007,7 @@ impl PageState {
         self.viewport = WindowSize::new(0, 0);
         self.display_list = None;
         self.paint_scene = None;
+        self.geometry.clear();
         self.scroll.reset();
         self.dom_revision = self.page.document().dom().revision().as_u64();
         self.external_styles_generation = 0;
@@ -1410,6 +1442,7 @@ impl BrowserApp {
                 return;
             }
         };
+        log_completed_frame_debug(&frame, completed.identity.tab_id);
         let style_plan = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
@@ -1425,6 +1458,9 @@ impl BrowserApp {
             }
             if let Some(paint_scene) = frame.paint_scene {
                 page.paint_scene = Some(paint_scene);
+            }
+            if let Some(geometry) = frame.geometry.clone() {
+                page.geometry = geometry;
             }
             page.raster_background = frame.raster_background;
             if let Some(styles) = frame.computed_styles {
@@ -1518,6 +1554,7 @@ impl BrowserApp {
                 self.fonts.as_ref(),
             );
         }
+        dump_debug_frame(&self.frame, size);
         self.frame_size = size;
     }
 
@@ -1887,6 +1924,19 @@ impl BrowserApp {
     }
 
     fn start_external_style_sheets(&mut self, id: TabId, plan: StylesheetFetchPlan) {
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!(
+                "render-browser stylesheet plan resources={} diagnostics={}",
+                plan.resources.len(),
+                plan.diagnostics.len()
+            );
+            for resource in &plan.resources {
+                eprintln!(
+                    "render-browser stylesheet request owner={:?} url={}",
+                    resource.key.owner, resource.key.requested_url
+                );
+            }
+        }
         if plan.is_empty() {
             report_stylesheet_diagnostics(&plan.diagnostics);
             let Some(page) = self.pages.get_mut(&id) else {
@@ -2029,6 +2079,18 @@ impl BrowserApp {
             (plan, requests)
         };
         report_image_diagnostics(&plan.diagnostics);
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!(
+                "render-browser image plan resources={}",
+                plan.resources.len()
+            );
+            for resource in plan.resources.iter().take(12) {
+                eprintln!(
+                    "render-browser image request owner={:?} source={:?} url={}",
+                    resource.key.owner, resource.key.source, resource.key.requested_url
+                );
+            }
+        }
         if plan.is_empty() {
             return;
         }
@@ -2222,6 +2284,15 @@ impl BrowserApp {
             ImageLimits::default(),
         );
         report_image_diagnostics(&application.diagnostics);
+        if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+            eprintln!("render-browser image loaded={}", application.loaded.len());
+            for loaded in application.loaded.iter().take(12) {
+                eprintln!(
+                    "render-browser image result owner={:?} source={:?} size={}x{}",
+                    loaded.owner, loaded.source, loaded.width, loaded.height
+                );
+            }
+        }
         for loaded in &application.loaded {
             if matches!(
                 loaded.source,
@@ -2371,7 +2442,7 @@ impl BrowserApp {
             self.repaint_chrome();
             return;
         }
-        if let Some(node) = hit_node
+        if let Some(node) = hit_node.and_then(|node| self.content_editable_node(id, node))
             && let Some(value) = self.content_text_input_value(id, node)
         {
             let mut editor = AddressEditor::new(value);
@@ -2565,20 +2636,38 @@ impl BrowserApp {
         let render_core::dom::NodeKind::Element(element) = dom.node(node)?.kind() else {
             return None;
         };
-        if element.local_name != "input" {
-            return None;
+        match element.local_name.as_str() {
+            "input" => {
+                let input_type = dom.attribute(node, "type").ok().flatten().unwrap_or("text");
+                matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search").then(|| {
+                    dom.attribute(node, "value")
+                        .ok()
+                        .flatten()
+                        .unwrap_or("")
+                        .to_owned()
+                })
+            }
+            "textarea" => Some(descendant_text(dom, node)),
+            _ if is_content_editable(dom, node) => Some(descendant_text(dom, node)),
+            _ => None,
         }
-        let input_type = dom.attribute(node, "type").ok().flatten().unwrap_or("text");
-        if !matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search") {
-            return None;
+    }
+
+    fn content_editable_node(
+        &self,
+        tab: TabId,
+        node: render_core::dom::NodeId,
+    ) -> Option<render_core::dom::NodeId> {
+        let page = self.pages.get(&tab)?;
+        let dom = page.page.document().dom();
+        let mut candidate = Some(node);
+        while let Some(current) = candidate {
+            if self.content_text_input_value(tab, current).is_some() {
+                return Some(current);
+            }
+            candidate = dom.parent(current);
         }
-        Some(
-            dom.attribute(node, "value")
-                .ok()
-                .flatten()
-                .unwrap_or("")
-                .to_owned(),
-        )
+        None
     }
 
     fn sync_content_editor(&mut self) {
@@ -2589,12 +2678,7 @@ impl BrowserApp {
         let node = content.node;
         let value = content.editor.text().to_owned();
         if let Some(page) = self.pages.get_mut(&tab)
-            && page
-                .page
-                .document_mut()
-                .dom_mut()
-                .set_attribute(node, "value", value)
-                .is_ok()
+            && set_content_text_value(page.page.document_mut().dom_mut(), node, &value).is_ok()
             && page.page.queue_input_event(node).is_ok()
         {
             let (rendered, _) = page.run_page_turns();
@@ -2608,7 +2692,30 @@ impl BrowserApp {
     }
 
     fn content_node_at_cursor(&self) -> Option<render_core::dom::NodeId> {
-        let page = self.pages.get(&self.tabs.active_id())?;
+        let id = self.tabs.active_id();
+        let page = self.pages.get(&id)?;
+        let editable = page
+            .geometry
+            .iter()
+            .filter_map(|(raw_node, rect)| {
+                let node = render_core::dom::NodeId::from_u64(*raw_node);
+                self.content_text_input_value(id, node)?;
+                let point = PhysicalPoint {
+                    x: self.cursor.x,
+                    y: self.cursor.y - self.layout.as_ref()?.chrome_height as f32
+                        + page.scroll.offset_y(),
+                };
+                (point.x >= rect.x
+                    && point.x < rect.x + rect.width
+                    && point.y >= rect.y
+                    && point.y < rect.y + rect.height)
+                    .then_some((rect.width * rect.height, node))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, node)| node);
+        if editable.is_some() {
+            return editable;
+        }
         let display_list = page.display_list.as_ref()?;
         hit_test_content_regions(
             display_list.items().iter().map(|item| ContentHitRegion {
@@ -2991,6 +3098,60 @@ impl BrowserApp {
     }
 }
 
+fn is_content_editable(dom: &render_core::dom::Dom, node: render_core::dom::NodeId) -> bool {
+    dom.attribute(node, "contenteditable")
+        .ok()
+        .flatten()
+        .is_some_and(|value| {
+            value.is_empty()
+                || value.eq_ignore_ascii_case("true")
+                || value.eq_ignore_ascii_case("plaintext-only")
+        })
+}
+
+fn descendant_text(dom: &render_core::dom::Dom, root: render_core::dom::NodeId) -> String {
+    let mut output = String::new();
+    let mut pending = dom
+        .children(root)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    while let Some(node) = pending.pop() {
+        if let Some(render_core::dom::NodeKind::Text(text)) =
+            dom.node(node).map(render_core::dom::Node::kind)
+        {
+            output.push_str(text);
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+    }
+    output
+}
+
+fn set_content_text_value(
+    dom: &mut render_core::dom::Dom,
+    node: render_core::dom::NodeId,
+    value: &str,
+) -> Result<(), render_core::dom::DomError> {
+    let kind = dom.node(node).map(render_core::dom::Node::kind);
+    let Some(render_core::dom::NodeKind::Element(element)) = kind else {
+        return Ok(());
+    };
+    if element.local_name == "input" {
+        return dom.set_attribute(node, "value", value);
+    }
+    let children = dom.children(node).unwrap_or_default().to_vec();
+    for child in children {
+        dom.remove_child(node, child)?;
+    }
+    if !value.is_empty() {
+        let text = dom.create_text(value);
+        dom.append_child(node, text)?;
+    }
+    Ok(())
+}
+
 struct ContentTextEditor {
     tab: TabId,
     node: render_core::dom::NodeId,
@@ -3302,6 +3463,71 @@ fn surface_to_softbuffer(surface: &Surface) -> Vec<u32> {
             (u32::from(color.red) << 16) | (u32::from(color.green) << 8) | u32::from(color.blue)
         })
         .collect()
+}
+
+fn log_completed_frame_debug(frame: &PageRenderFrame, tab_id: u64) {
+    if env::var_os("RENDER_DEBUG_FRAME").is_none() {
+        return;
+    }
+    eprintln!(
+        "render-browser frame page={tab_id} pixels={} display_items={} geometry={} content_height={} viewport_height={}",
+        frame.frame.len(),
+        frame
+            .display_list
+            .as_ref()
+            .map_or(0, |list| list.items().len()),
+        frame.geometry.as_ref().map_or(0, BTreeMap::len),
+        frame.content_height,
+        frame.viewport_height,
+    );
+    let Some(display_list) = &frame.display_list else {
+        return;
+    };
+    for item in display_list.items().iter().take(24) {
+        let command = match &item.command {
+            render_core::paint::DisplayCommand::SolidRect { .. } => "solid",
+            render_core::paint::DisplayCommand::Border(_) => "border",
+            render_core::paint::DisplayCommand::BoxShadow(_) => "shadow",
+            render_core::paint::DisplayCommand::PushClip(_) => "push-clip",
+            render_core::paint::DisplayCommand::PopClip => "pop-clip",
+            render_core::paint::DisplayCommand::PushTransform(_) => "push-transform",
+            render_core::paint::DisplayCommand::PopTransform => "pop-transform",
+            render_core::paint::DisplayCommand::GlyphRun(_) => "glyph",
+            render_core::paint::DisplayCommand::TextDecoration(_) => "decoration",
+            render_core::paint::DisplayCommand::Image(_) => "image",
+            render_core::paint::DisplayCommand::LinearGradient(_) => "linear-gradient",
+            render_core::paint::DisplayCommand::RadialGradient(_) => "radial-gradient",
+            render_core::paint::DisplayCommand::Canvas { .. } => "canvas",
+            render_core::paint::DisplayCommand::PushStackingContext(_) => "push-stack",
+            render_core::paint::DisplayCommand::PopStackingContext => "pop-stack",
+        };
+        eprintln!(
+            "render-browser display command={} source={:?} bounds={:?}",
+            command, item.source, item.bounds
+        );
+    }
+}
+
+fn dump_debug_frame(frame: &[u32], size: WindowSize<u32>) {
+    let Some(path) = env::var_os("RENDER_DUMP_FRAME") else {
+        return;
+    };
+    if size.width == 0
+        || size.height == 0
+        || frame.len() != size.width as usize * size.height as usize
+    {
+        return;
+    }
+    let mut ppm = format!("P6\n{} {}\n255\n", size.width, size.height).into_bytes();
+    ppm.reserve(frame.len().saturating_mul(3));
+    for pixel in frame {
+        ppm.extend_from_slice(&[
+            ((pixel >> 16) & 0xff) as u8,
+            ((pixel >> 8) & 0xff) as u8,
+            (pixel & 0xff) as u8,
+        ]);
+    }
+    let _ = fs::write(path, ppm);
 }
 
 fn geometry_from_layout(
