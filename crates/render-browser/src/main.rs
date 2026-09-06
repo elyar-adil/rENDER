@@ -58,8 +58,8 @@ use render_core::layout::{FragmentKind, PhysicalPoint, PhysicalRect, PhysicalSiz
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
 use render_core::page::{Page, PageDomEvent, PageJob};
 use render_core::paint::{
-    Color, CpuRasterizer, DisplayList, PaintCoordinateSpace, PaintScene, RasterControl,
-    RasterRequest, Surface,
+    Color, CpuRasterizer, DisplayCommand, DisplayList, PaintCoordinateSpace, PaintScene,
+    RasterControl, RasterRequest, Surface,
 };
 use render_core::script::{ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling};
 use render_net::{
@@ -212,6 +212,7 @@ struct ContentHitRegion {
     bounds: PhysicalRect,
     source: Option<render_core::dom::NodeId>,
     coordinate_space: PaintCoordinateSpace,
+    hit_testable: bool,
 }
 
 #[allow(
@@ -236,6 +237,9 @@ fn hit_test_content_regions(
         return None;
     }
     regions.rev().find_map(|region| {
+        if !region.hit_testable {
+            return None;
+        }
         let source = region.source?;
         let point = match region.coordinate_space {
             PaintCoordinateSpace::Document => PhysicalPoint {
@@ -250,6 +254,21 @@ fn hit_test_content_regions(
             && point.y < region.bounds.bottom())
         .then_some(source)
     })
+}
+
+/// Structural paint commands (clips, transforms, stacking contexts) carry the
+/// full bounds of the subtree they open, so they would otherwise shadow the
+/// content items painted inside them during a reverse paint-order scan.
+fn is_content_hit_command(command: &DisplayCommand) -> bool {
+    !matches!(
+        command,
+        DisplayCommand::PushClip(_)
+            | DisplayCommand::PopClip
+            | DisplayCommand::PushTransform(_)
+            | DisplayCommand::PopTransform
+            | DisplayCommand::PushStackingContext(_)
+            | DisplayCommand::PopStackingContext
+    )
 }
 
 fn get_content_navigation_target(
@@ -2442,7 +2461,11 @@ impl BrowserApp {
             self.repaint_chrome();
             return;
         }
-        if let Some(node) = hit_node.and_then(|node| self.content_editable_node(id, node))
+        let editable = hit_node.and_then(|node| {
+            self.content_editable_node(id, node)
+                .or_else(|| self.content_wrapper_control(id, node))
+        });
+        if let Some(node) = editable
             && let Some(value) = self.content_text_input_value(id, node)
         {
             let mut editor = AddressEditor::new(value);
@@ -2633,24 +2656,16 @@ impl BrowserApp {
         node: render_core::dom::NodeId,
     ) -> Option<String> {
         let dom = self.pages.get(&tab)?.page.document().dom();
-        let render_core::dom::NodeKind::Element(element) = dom.node(node)?.kind() else {
-            return None;
-        };
-        match element.local_name.as_str() {
-            "input" => {
-                let input_type = dom.attribute(node, "type").ok().flatten().unwrap_or("text");
-                matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search").then(|| {
-                    dom.attribute(node, "value")
-                        .ok()
-                        .flatten()
-                        .unwrap_or("")
-                        .to_owned()
-                })
-            }
-            "textarea" => Some(descendant_text(dom, node)),
-            _ if is_content_editable(dom, node) => Some(descendant_text(dom, node)),
-            _ => None,
-        }
+        content_text_input_value(dom, node)
+    }
+
+    fn content_wrapper_control(
+        &self,
+        tab: TabId,
+        node: render_core::dom::NodeId,
+    ) -> Option<render_core::dom::NodeId> {
+        let page = self.pages.get(&tab)?;
+        content_wrapper_control(page.page.document().dom(), &page.geometry, node)
     }
 
     fn content_editable_node(
@@ -2722,6 +2737,7 @@ impl BrowserApp {
                 bounds: item.bounds,
                 source: item.source,
                 coordinate_space: item.coordinate_space,
+                hit_testable: is_content_hit_command(&item.command),
             }),
             self.cursor,
             self.layout.as_ref()?.chrome_height,
@@ -3107,6 +3123,69 @@ fn is_content_editable(dom: &render_core::dom::Dom, node: render_core::dom::Node
                 || value.eq_ignore_ascii_case("true")
                 || value.eq_ignore_ascii_case("plaintext-only")
         })
+}
+
+fn content_text_input_value(
+    dom: &render_core::dom::Dom,
+    node: render_core::dom::NodeId,
+) -> Option<String> {
+    let render_core::dom::NodeKind::Element(element) = dom.node(node)?.kind() else {
+        return None;
+    };
+    match element.local_name.as_str() {
+        "input" => {
+            // A missing or empty type attribute defaults to "text".
+            let input_type = dom
+                .attribute(node, "type")
+                .ok()
+                .flatten()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("text");
+            matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search").then(|| {
+                dom.attribute(node, "value")
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+        }
+        "textarea" => Some(descendant_text(dom, node)),
+        _ if is_content_editable(dom, node) => Some(descendant_text(dom, node)),
+        _ => None,
+    }
+}
+
+/// Route a click on a painted wrapper (for example a styled search box whose
+/// embedded control paints no content of its own) to the embedded text
+/// control. The control must be the dominant painted area of the wrapper so
+/// page-sized containers never capture clicks meant for surrounding content.
+fn content_wrapper_control(
+    dom: &render_core::dom::Dom,
+    geometry: &BTreeMap<u64, ElementRect>,
+    node: render_core::dom::NodeId,
+) -> Option<render_core::dom::NodeId> {
+    let bounds = geometry.get(&node.as_u64())?;
+    let wrapper_area = bounds.width * bounds.height;
+    if wrapper_area <= 0.0 {
+        return None;
+    }
+    let mut pending = dom.children(node).unwrap_or_default().to_vec();
+    let mut best: Option<(f32, render_core::dom::NodeId)> = None;
+    while let Some(current) = pending.pop() {
+        pending.extend(dom.children(current).unwrap_or_default().iter().copied());
+        if content_text_input_value(dom, current).is_none() {
+            continue;
+        }
+        let Some(rect) = geometry.get(&current.as_u64()) else {
+            continue;
+        };
+        let area = rect.width * rect.height;
+        if best.is_none_or(|(smallest, _)| area < smallest) {
+            best = Some((area, current));
+        }
+    }
+    let (area, control) = best?;
+    (area >= wrapper_area * 0.25).then_some(control)
 }
 
 fn descendant_text(dom: &render_core::dom::Dom, root: render_core::dom::NodeId) -> String {
@@ -3630,7 +3709,7 @@ fn report_image_diagnostics(diagnostics: &[render_browser::images::ImageResource
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
 
     use render_core::dom::NodeKind;
     use render_core::html::parse_document;
@@ -3638,7 +3717,7 @@ mod tests {
     use render_core::layout::{PhysicalPoint, PhysicalRect};
     use render_core::navigation::HistoryEntry;
     use render_core::paint::PaintCoordinateSpace;
-    use render_core::paint::{Color, Surface};
+    use render_core::paint::{ClipShape, Color, DisplayCommand, Surface, Transform2D};
     use render_core::script::ScriptDiscoveryLimits;
     use render_net::{FetchConfig, FetchRequest, HttpTransport, Url};
     use winit::dpi::{PhysicalPosition, PhysicalSize as WindowSize};
@@ -3646,10 +3725,12 @@ mod tests {
     use winit::keyboard::Key;
 
     use super::{
-        ContentHitRegion, FrameDamage, FrameRect, HOME_TITLE, HostPlatform, PageNavigation,
-        PageSource, PageState, address_shortcut, blit_page, get_content_navigation_target,
-        hit_test_content_regions, home_source, network_start_source, primary_modifier_for,
-        source_from_network_response, surface_to_softbuffer, wheel_document_delta_y,
+        ContentHitRegion, ElementRect, FrameDamage, FrameRect, HOME_TITLE, HostPlatform,
+        PageNavigation, PageSource, PageState, address_shortcut, blit_page,
+        content_text_input_value, content_wrapper_control, get_content_navigation_target,
+        hit_test_content_regions, home_source, is_content_hit_command, network_start_source,
+        primary_modifier_for, source_from_network_response, surface_to_softbuffer,
+        wheel_document_delta_y,
     };
     use render_browser::chrome::Point;
     use render_browser::editor::AddressCommand;
@@ -3816,11 +3897,13 @@ mod tests {
                 bounds: PhysicalRect::new(10.0, 140.0, 100.0, 30.0),
                 source: Some(document_source),
                 coordinate_space: PaintCoordinateSpace::Document,
+                hit_testable: true,
             },
             ContentHitRegion {
                 bounds: PhysicalRect::new(10.0, 140.0, 100.0, 30.0),
                 source: Some(top_source),
                 coordinate_space: PaintCoordinateSpace::Document,
+                hit_testable: true,
             },
         ];
 
@@ -3842,6 +3925,184 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn structural_paint_commands_do_not_participate_in_content_hits() {
+        let bounds = PhysicalRect::new(0.0, 0.0, 100.0, 50.0);
+        assert!(is_content_hit_command(&DisplayCommand::SolidRect {
+            rect: bounds,
+            color: Color::rgb(0xff, 0xff, 0xff),
+        }));
+        assert!(!is_content_hit_command(&DisplayCommand::PushClip(
+            ClipShape::Rect(bounds)
+        )));
+        assert!(!is_content_hit_command(&DisplayCommand::PopClip));
+        assert!(!is_content_hit_command(&DisplayCommand::PushTransform(
+            Transform2D::default()
+        )));
+        assert!(!is_content_hit_command(&DisplayCommand::PopTransform));
+        assert!(!is_content_hit_command(&DisplayCommand::PopStackingContext));
+    }
+
+    #[test]
+    fn clip_items_do_not_shadow_painted_content_during_hit_testing() {
+        let mut dom = render_core::dom::Dom::new();
+        let root = dom.create_element("div");
+        let link = dom.create_element("a");
+        // A root-sized clip pair surrounds every content item in paint order;
+        // the reverse scan must land on the link content, not on the clips.
+        let regions = [
+            ContentHitRegion {
+                bounds: PhysicalRect::new(0.0, 0.0, 1_770.0, 1_026.0),
+                source: Some(root),
+                coordinate_space: PaintCoordinateSpace::Document,
+                hit_testable: false,
+            },
+            ContentHitRegion {
+                bounds: PhysicalRect::new(36.0, 30.0, 24.0, 20.0),
+                source: Some(link),
+                coordinate_space: PaintCoordinateSpace::Document,
+                hit_testable: true,
+            },
+            ContentHitRegion {
+                bounds: PhysicalRect::new(0.0, 0.0, 1_770.0, 1_026.0),
+                source: Some(root),
+                coordinate_space: PaintCoordinateSpace::Document,
+                hit_testable: false,
+            },
+        ];
+        assert_eq!(
+            hit_test_content_regions(
+                regions.into_iter(),
+                Point { x: 48.0, y: 100.0 },
+                60,
+                PhysicalPoint { x: 0.0, y: 0.0 },
+            ),
+            Some(link)
+        );
+    }
+
+    #[test]
+    fn text_input_value_defaults_missing_and_empty_type_to_text() {
+        let document = parse_document(
+            "<input id='kw' name='wd' value=''><input id='blank' type='' value='x'>\
+             <input id='hidden' type='hidden' value='h'><input id='search' type='SEARCH' value='s'>\
+             <textarea id='ta'>hi</textarea><div id='plain'>text</div>",
+        );
+        let dom = &document.dom;
+        let find = |id: &str| {
+            let mut pending = vec![dom.document()];
+            while let Some(node) = pending.pop() {
+                if dom.attribute(node, "id").ok().flatten() == Some(id) {
+                    return node;
+                }
+                pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+            }
+            panic!("element {id} should exist");
+        };
+        assert_eq!(
+            content_text_input_value(dom, find("kw")),
+            Some(String::new())
+        );
+        assert_eq!(
+            content_text_input_value(dom, find("blank")),
+            Some("x".to_owned())
+        );
+        assert_eq!(content_text_input_value(dom, find("hidden")), None);
+        assert_eq!(
+            content_text_input_value(dom, find("search")),
+            Some("s".to_owned())
+        );
+        assert_eq!(
+            content_text_input_value(dom, find("ta")),
+            Some("hi".to_owned())
+        );
+        assert_eq!(content_text_input_value(dom, find("plain")), None);
+    }
+
+    #[test]
+    fn wrapper_click_routes_to_dominant_embedded_text_control() {
+        let document =
+            parse_document("<div id='wrap'><textarea id='ta'></textarea><button>go</button></div>");
+        let dom = &document.dom;
+        let find = |id: &str| {
+            let mut pending = vec![dom.document()];
+            while let Some(node) = pending.pop() {
+                if dom.attribute(node, "id").ok().flatten() == Some(id) {
+                    return node;
+                }
+                pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+            }
+            panic!("element {id} should exist");
+        };
+        let wrap = find("wrap");
+        let ta = find("ta");
+        let mut geometry = BTreeMap::new();
+        geometry.insert(
+            wrap.as_u64(),
+            ElementRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+        );
+        geometry.insert(
+            ta.as_u64(),
+            ElementRect {
+                x: 5.0,
+                y: 5.0,
+                width: 90.0,
+                height: 28.0,
+            },
+        );
+        assert_eq!(content_wrapper_control(dom, &geometry, wrap), Some(ta));
+
+        // A control covering only a sliver of the wrapper does not capture it.
+        geometry.insert(
+            ta.as_u64(),
+            ElementRect {
+                x: 5.0,
+                y: 5.0,
+                width: 10.0,
+                height: 10.0,
+            },
+        );
+        assert_eq!(content_wrapper_control(dom, &geometry, wrap), None);
+    }
+
+    #[test]
+    fn wrapper_without_geometry_or_control_stays_unrouted() {
+        let document = parse_document(
+            "<div id='bare'><p>nothing interactive</p></div><div id='hidden-wrap'><textarea id='ta'></textarea></div>",
+        );
+        let dom = &document.dom;
+        let find = |id: &str| {
+            let mut pending = vec![dom.document()];
+            while let Some(node) = pending.pop() {
+                if dom.attribute(node, "id").ok().flatten() == Some(id) {
+                    return node;
+                }
+                pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+            }
+            panic!("element {id} should exist");
+        };
+        let bare = find("bare");
+        let hidden_wrap = find("hidden-wrap");
+        let mut geometry = BTreeMap::new();
+        geometry.insert(
+            bare.as_u64(),
+            ElementRect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 0.0,
+            },
+        );
+        assert_eq!(content_wrapper_control(dom, &geometry, bare), None);
+        // No geometry entry for the wrapper at all.
+        assert_eq!(content_wrapper_control(dom, &geometry, hidden_wrap), None);
     }
 
     #[test]

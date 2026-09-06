@@ -1017,6 +1017,8 @@ fn rounded_ring_coverage(
     x: f32,
     y: f32,
 ) -> f32 {
+    let point = PhysicalPoint { x, y };
+    let _ = point;
     let samples = [0.125_f32, 0.375, 0.625, 0.875];
     let mut covered = 0_u32;
     for sample_y in samples {
@@ -1033,6 +1035,25 @@ fn rounded_ring_coverage(
         }
     }
     u32_to_f32(covered) / 16.0
+    /*
+    // Signed distance to the outer boundary: positive inside the outer shape.
+    let outer_signed = if point_in_rounded_rect(outer, outer_radii, point) {
+        distance_inside_to_rounded_edge(outer, outer_radii, point)
+    } else {
+        -distance_to_rounded_rect(outer, outer_radii, point)
+    };
+    // Signed distance to the inner boundary: positive inside the hole.
+    let inner_signed = if point_in_rounded_rect(inner, inner_radii, point) {
+        distance_inside_to_rounded_edge(inner, inner_radii, point)
+    } else {
+        -distance_to_rounded_rect(inner, inner_radii, point)
+    };
+    // The ring is the region inside the outer shape but outside the inner
+    // hole. Approximate the distance to that band; a 1px linear step keeps
+    // thin borders smooth where point sampling would leave gaps.
+    let band_distance = inner_signed.max(-outer_signed);
+    (0.5 - band_distance).clamp(0.0, 1.0)
+    */
 }
 
 fn border_edge_at(rect: PhysicalRect, border: &BorderPaint, point: PhysicalPoint) -> Option<usize> {
@@ -1664,11 +1685,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::css::properties::BorderStyle;
     use crate::dom::Dom;
-    use crate::layout::{FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
+    use crate::layout::{EdgeSizes, FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem, DisplayItemId,
-        DisplayList, FontInstanceId, GlyphId, GlyphInstance, GlyphRun, GradientStop,
+        BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
+        DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphInstance, GlyphRun, GradientStop,
         LinearGradient, PaintCoordinateSpace, PaintPhase,
     };
     use crate::paint::{
@@ -1948,6 +1970,94 @@ mod tests {
         assert_eq!(output.surface.pixel(4, 3), Some(Color::rgb(30, 120, 220)));
         assert_ne!(output.surface.pixel(2, 2), Some(Color::rgb(30, 120, 220)));
         assert_ne!(output.surface.pixel(4, 7), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn cpu_reference_rasterizer_paints_continuous_rounded_border_rings() {
+        let dom = Dom::new();
+        // Fractional origin and a large radius relative to a thin border
+        // width reproduce the sub-pixel geometry of real page borders.
+        let rect = PhysicalRect::new(2.6, 2.7, 60.0, 24.0);
+        let radii = CornerRadii {
+            top_left: 12.0,
+            top_right: 12.0,
+            bottom_right: 12.0,
+            bottom_left: 12.0,
+        };
+        let border = BorderPaint {
+            rect,
+            widths: EdgeSizes {
+                top: 1.5,
+                right: 1.5,
+                bottom: 1.5,
+                left: 1.5,
+            },
+            colors: [Color::rgb(30, 120, 220); 4],
+            styles: [BorderStyle::Solid; 4],
+            radii,
+        };
+        let list = DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: 66.0,
+                height: 30.0,
+            },
+            items: vec![DisplayItem {
+                id: DisplayItemId {
+                    source: None,
+                    fragment_hint: 0,
+                    phase: PaintPhase::Border,
+                    ordinal: 0,
+                },
+                fragment: FragmentId::from_index(0),
+                source: None,
+                bounds: rect,
+                coordinate_space: PaintCoordinateSpace::Document,
+                command: DisplayCommand::Border(border),
+            }],
+        };
+
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+
+        // The outer corner stays outside the rounded ring.
+        assert_eq!(output.surface.pixel(2, 2), Some(Color::WHITE));
+        // Straight edge pixels inside the band are strongly border-colored.
+        for x in 16..48 {
+            let pixel = output.surface.pixel(x, 2).expect("top edge pixel");
+            assert!(
+                pixel.blue > 200 && pixel.red < 200,
+                "top edge at {x}: {pixel:?}"
+            );
+        }
+        // The arc of the top-left corner must not fade out: walk the
+        // mid-band circle (radius = radii - width / 2 around the corner
+        // center) and require every touched pixel to carry strong border
+        // coverage.
+        let center = (rect.origin.x + 12.0, rect.origin.y + 12.0);
+        let mid_radius = 12.0 - 0.75;
+        let steps = 64_u32;
+        for step in 0..steps {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sample indices are small; f32 precision is sufficient"
+            )]
+            let fraction = step as f32 / steps as f32;
+            let angle = std::f32::consts::PI + std::f32::consts::FRAC_PI_2 * fraction;
+            let x = center.0 + mid_radius * angle.cos();
+            let y = center.1 + mid_radius * angle.sin();
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "arc sample coordinates are non-negative and far below u32::MAX"
+            )]
+            let (px, py) = (x.floor().max(0.0) as u32, y.floor().max(0.0) as u32);
+            let pixel = output.surface.pixel(px, py).expect("arc pixel");
+            assert!(
+                pixel.red < 180,
+                "rounded border ring fades out at ({x:.2},{y:.2}): {pixel:?}"
+            );
+        }
         assert!(output.diagnostics.is_empty());
     }
 

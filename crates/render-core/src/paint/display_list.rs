@@ -701,17 +701,37 @@ impl Builder<'_> {
                     painting_area
                 };
                 parse_linear_gradient(layer, area, self.options.palette, current_color)
+                    .map(|gradient| (index, gradient))
             })
             .collect::<Vec<_>>();
         if !gradient_layers.is_empty() {
-            self.push(
-                fragment,
-                PaintPhase::Background,
-                painting_area,
-                coordinate_space,
-                DisplayCommand::PushClip(ClipShape::Rect(painting_area)),
+            // Each layer is clipped to its own background-clip area. With
+            // rounded corners those areas are rounded too, so a padding-box
+            // layer cannot square off the border ring revealed by a
+            // transparent border.
+            let border_radii = corner_radii(Some(style), painting_area);
+            let padding_radii = inset_corner_radii(
+                border_radii,
+                geometry.border.top,
+                geometry.border.right,
+                geometry.border.bottom,
+                geometry.border.left,
             );
-            for gradient in gradient_layers.into_iter().rev() {
+            let border_clip = background_clip_shape(painting_area, border_radii);
+            let padding_clip = background_clip_shape(positioning_area, padding_radii);
+            for (index, gradient) in gradient_layers.into_iter().rev() {
+                let clip = if index == 0 {
+                    padding_clip
+                } else {
+                    border_clip
+                };
+                self.push(
+                    fragment,
+                    PaintPhase::Background,
+                    painting_area,
+                    coordinate_space,
+                    DisplayCommand::PushClip(clip),
+                );
                 self.push(
                     fragment,
                     PaintPhase::Background,
@@ -719,14 +739,14 @@ impl Builder<'_> {
                     coordinate_space,
                     DisplayCommand::LinearGradient(gradient),
                 );
+                self.push(
+                    fragment,
+                    PaintPhase::Background,
+                    painting_area,
+                    coordinate_space,
+                    DisplayCommand::PopClip,
+                );
             }
-            self.push(
-                fragment,
-                PaintPhase::Background,
-                painting_area,
-                coordinate_space,
-                DisplayCommand::PopClip,
-            );
             return;
         }
         let Some(loaded) = fragment.source.and_then(|node| {
@@ -1121,6 +1141,14 @@ fn has_corner_radius(radii: CornerRadii) -> bool {
         || radii.top_right > 0.0
         || radii.bottom_right > 0.0
         || radii.bottom_left > 0.0
+}
+
+fn background_clip_shape(rect: PhysicalRect, radii: CornerRadii) -> ClipShape {
+    if has_corner_radius(radii) {
+        ClipShape::RoundedRect { rect, radii }
+    } else {
+        ClipShape::Rect(rect)
+    }
 }
 
 fn inset_corner_radii(
@@ -1606,6 +1634,76 @@ mod tests {
         Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
         build_display_list,
     };
+
+    #[test]
+    fn gradient_background_layers_clip_to_their_own_rounded_areas() {
+        let output = parse_document("<!doctype html><body><div id=box></div></body>");
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } #box { display:block; width:80px; height:40px; border:2px solid transparent; border-radius:12px; background:linear-gradient(#ffffff,#ffffff) padding-box, linear-gradient(#3377fe,#ba59ff) border-box }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        let selector = parse_selector_list("#box").unwrap();
+        let box_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+
+        let clips = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(box_node))
+            .filter_map(|item| match &item.command {
+                DisplayCommand::PushClip(ClipShape::RoundedRect { rect, radii }) => {
+                    Some((*rect, *radii))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        // Border-box layer clip: the rounded border rect.
+        assert!(
+            clips.iter().any(|(rect, radii)| {
+                *rect == PhysicalRect::new(0.0, 0.0, 84.0, 44.0)
+                    && (radii.top_left - 12.0).abs() < f32::EPSILON
+            }),
+            "missing rounded border-box clip: {clips:?}"
+        );
+        // Padding-box layer clip: the rounded padding rect with inset radii.
+        assert!(
+            clips.iter().any(|(rect, radii)| {
+                *rect == PhysicalRect::new(2.0, 2.0, 80.0, 40.0)
+                    && (radii.top_left - 10.0).abs() < f32::EPSILON
+            }),
+            "missing rounded padding-box clip: {clips:?}"
+        );
+    }
 
     #[test]
     fn display_list_contains_background_border_glyphs_and_opacity_group() {

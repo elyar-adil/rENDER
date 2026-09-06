@@ -1373,32 +1373,32 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
                 x: -tangent.y,
                 y: tangent.x,
             };
-            let tip = Point {
+            let arc_end = Point {
                 x: end.cos().mul_add(radius, center.x),
                 y: end.sin().mul_add(radius, center.y),
             };
-            let arrow_base = Point {
-                x: (-tangent.x).mul_add(4.0 * scale, tip.x),
-                y: (-tangent.y).mul_add(4.0 * scale, tip.y),
+            // Arrowhead as a closed triangle straddling the arc end: the tip
+            // extends past the arc into the gap so the head reads as an
+            // arrow pointing along the arc direction instead of a nub.
+            let tip = Point {
+                x: tangent.x.mul_add(1.5 * scale, arc_end.x),
+                y: tangent.y.mul_add(1.5 * scale, arc_end.y),
             };
-            canvas.line(
-                tip,
-                Point {
-                    x: arrow_base.x + wing.x * 2.5 * scale,
-                    y: arrow_base.y + wing.y * 2.5 * scale,
-                },
-                line,
-                color,
-            );
-            canvas.line(
-                tip,
-                Point {
-                    x: arrow_base.x - wing.x * 2.5 * scale,
-                    y: arrow_base.y - wing.y * 2.5 * scale,
-                },
-                line,
-                color,
-            );
+            let base = Point {
+                x: tangent.x.mul_add(-3.5 * scale, arc_end.x),
+                y: tangent.y.mul_add(-3.5 * scale, arc_end.y),
+            };
+            let wing_a = Point {
+                x: wing.x.mul_add(3.0 * scale, base.x),
+                y: wing.y.mul_add(3.0 * scale, base.y),
+            };
+            let wing_b = Point {
+                x: wing.x.mul_add(-3.0 * scale, base.x),
+                y: wing.y.mul_add(-3.0 * scale, base.y),
+            };
+            canvas.line(tip, wing_a, line, color);
+            canvas.line(tip, wing_b, line, color);
+            canvas.line(wing_a, wing_b, line, color);
         }
         ToolbarButton::Home => {
             canvas.line(
@@ -1560,9 +1560,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AddressClickTracker, AddressContextMenu, Canvas, ChromeLayout, HitTarget, Point, Rect,
-        TabDrag, TextPainter, TitleBarClickTracker, TitleBarGesture, WindowAction, WindowControl,
-        address_index_at_x, clamp_interval,
+        AddressClickTracker, AddressContextMenu, ButtonGeometry, Canvas, ChromeLayout, HitTarget,
+        Point, Rect, TabDrag, TextPainter, TitleBarClickTracker, TitleBarGesture, ToolbarButton,
+        WindowAction, WindowControl, address_index_at_x, clamp_interval, paint_toolbar_icon,
     };
     use crate::editor::{AddressCommand, AddressEditor};
     use crate::model::{TabIntent, TabModel};
@@ -1610,6 +1610,35 @@ mod tests {
         );
 
         assert_eq!(pixels, [0, 7, 7, 0]);
+    }
+
+    #[test]
+    fn reload_icon_draws_arrowhead_beyond_the_arc_end() {
+        const SIZE: u32 = 32;
+        const BACKGROUND: u32 = 0xFF_FAFAFA;
+        const ICON: u32 = 0xFF_202124;
+        let mut pixels = [BACKGROUND; (SIZE * SIZE) as usize];
+        let mut canvas = Canvas::new(&mut pixels, SIZE, SIZE);
+        paint_toolbar_icon(
+            &mut canvas,
+            ButtonGeometry {
+                button: ToolbarButton::Reload,
+                bounds: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: SIZE as f32,
+                    height: SIZE as f32,
+                },
+            },
+            1.0,
+            ICON,
+        );
+        let colored = |x: u32, y: u32| pixels[(y * SIZE + x) as usize] != BACKGROUND;
+        // The arrowhead tip reaches past the arc end into the arc gap.
+        assert!(colored(22, 13), "missing arrowhead tip beyond the arc");
+        // Both wings of the head are drawn.
+        assert!(colored(17, 11), "missing inward arrowhead wing");
+        assert!(colored(22, 8), "missing outward arrowhead wing");
     }
 
     #[test]

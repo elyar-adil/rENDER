@@ -478,6 +478,34 @@ impl Solver<'_> {
         } else if specified_width.is_none() {
             margin_left.value = 0.0;
             margin_right.value = 0.0;
+        } else if out_of_flow {
+            // CSS 2 §10.3.7: with a definite width, auto margins absorb the
+            // space left by both definite insets; otherwise auto margins are
+            // zero and the auto inset resolves from the constraint equation
+            // (handled by the out-of-flow anchor below). The in-flow
+            // over-constrained margin adjustment must not run here.
+            let definite_insets = left.unwrap_or(0.0) + right.unwrap_or(0.0);
+            let remaining = containing.size.width
+                - definite_insets
+                - content_width
+                - non_content
+                - margin_left.value
+                - margin_right.value;
+            match (margin_left.auto, margin_right.auto) {
+                (true, true) if remaining >= 0.0 => {
+                    margin_left.value = remaining / 2.0;
+                    margin_right.value = remaining / 2.0;
+                }
+                // Equal auto margins would go negative, so the left margin
+                // (ltr) is zeroed and the right margin solves the equation.
+                (true, true) => {
+                    margin_left.value = 0.0;
+                    margin_right.value = remaining;
+                }
+                (true, false) => margin_left.value = remaining,
+                (false, true) => margin_right.value = remaining,
+                _ => {}
+            }
         } else {
             let remaining = containing.size.width
                 - content_width
@@ -1790,6 +1818,15 @@ impl Solver<'_> {
                     line_y,
                     depth.saturating_add(1),
                 ) {
+                    if self.is_out_of_flow(atomic) {
+                        // Out-of-flow boxes do not participate in the line
+                        // box: they neither advance the inline cursor nor
+                        // contribute to the line height, and text alignment
+                        // must not shift them.
+                        fragments.push(fragment);
+                        cursor += 1;
+                        continue;
+                    }
                     if (line_x - line_left).abs() < f32::EPSILON
                         && line_x + outer.size.width > line_right
                     {
@@ -1937,6 +1974,15 @@ impl Solver<'_> {
         }
     }
 
+    fn source_is_out_of_flow(&self, source: Option<NodeId>) -> bool {
+        source.is_some_and(|source| {
+            matches!(
+                position(self.styles.get(&source)),
+                Position::Absolute | Position::Fixed
+            )
+        })
+    }
+
     fn align_inline_fragments(
         &mut self,
         fragments: &[FragmentId],
@@ -1958,6 +2004,9 @@ impl Solver<'_> {
             ) else {
                 continue;
             };
+            if self.source_is_out_of_flow(fragment.source) {
+                continue;
+            }
             let rect = fragment.rect;
             let Some((_, min_x, max_x, line_fragments)) = lines
                 .iter_mut()
@@ -4185,5 +4234,106 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic.code == LayoutDiagnosticCode::FragmentLimit })
         );
+    }
+
+    #[test]
+    fn replaced_block_with_horizontal_auto_margins_centers_in_its_container() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><img id='logo' src='x.png' width='270' height='129'></body>",
+            "html, body { display:block; margin:0 } #logo { display:block; margin:33px auto 0 auto }",
+            1000.0,
+        );
+        let logo = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#logo")))
+            .expect("logo fragment");
+        assert_eq!(logo.rect.origin.x, 365.0);
+    }
+
+    #[test]
+    fn absolute_left_50_percent_with_negative_margin_centers_the_logo() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='head'><img id='logo' src='x.png' width='270' height='129'></div></body>",
+            "html, body, div { display:block; margin:0 } #head { position:relative; width:1000px; height:400px } #logo { position:absolute; bottom:10px; left:50%; margin-left:-135px }",
+            1000.0,
+        );
+        let logo = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#logo")))
+            .expect("logo fragment");
+        assert_eq!(logo.rect.origin.x, 365.0);
+        assert_eq!(logo.rect.origin.y, 400.0 - 10.0 - 129.0);
+    }
+
+    #[test]
+    fn absolute_right_inset_hugs_the_containing_block_right_edge() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='head'><div id='u'><span class='b'></span></div></div></body>",
+            "html, body, div { display:block; margin:0 } #head { position:relative; width:800px; height:40px } #u { position:absolute; right:10px; top:4px } #u .b { display:inline-block; width:70px; height:24px }",
+            800.0,
+        );
+        let u = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#u")))
+            .expect("header fragment");
+        assert_eq!(u.rect.size.width, 70.0);
+        assert_eq!(u.rect.origin.x, 800.0 - 10.0 - 70.0);
+        assert_eq!(u.rect.origin.y, 4.0);
+    }
+
+    #[test]
+    fn fixed_positioning_anchors_to_the_viewport_and_ignores_scrolling() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='side'></div></body>",
+            "html, body, div { display:block; margin:0 } #side { position:fixed; right:24px; bottom:44px; width:44px; height:88px }",
+            800.0,
+        );
+        let side = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#side")))
+            .expect("side widget fragment");
+        assert_eq!(side.rect.origin.x, 800.0 - 24.0 - 44.0);
+        assert_eq!(side.rect.origin.y, 600.0 - 44.0 - 88.0);
+    }
+
+    #[test]
+    fn absolute_replaced_box_is_centered_by_left_and_negative_margin_despite_text_align() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><div id='lg'><img id='logo' src='x.png' width='270' height='129'></div></body>",
+            "html, body, div { display:block; margin:0 } #lg { position:relative; width:800px; text-align:center } #logo { position:absolute; left:50%; bottom:15px; margin-left:-135px }",
+            2560.0,
+        );
+        let logo = layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, "#logo")))
+            .expect("logo fragment");
+        assert_eq!(logo.rect.origin.x, 400.0 - 135.0);
+    }
+
+    #[test]
+    fn inline_block_input_and_submit_wrappers_share_one_full_height_row() {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><body><form id='form'><span class='ipt'><input id='kw'></span><span class='btn'><input id='su'></span></form></body>",
+            "html, body, form, input { display:block; margin:0 } .ipt, .btn { display:inline-block; vertical-align:top } .ipt { width:546px; height:44px } .btn { width:108px; height:44px }",
+            800.0,
+        );
+        let fragment_for = |selector| {
+            layout
+                .fragments
+                .iter()
+                .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+                .expect("wrapper fragment")
+                .rect
+        };
+        let ipt = fragment_for(".ipt");
+        let btn = fragment_for(".btn");
+        assert_eq!(btn.origin.x, ipt.origin.x + 546.0);
+        assert_eq!(btn.origin.y, ipt.origin.y);
+        assert_eq!(btn.size.height, 44.0);
     }
 }

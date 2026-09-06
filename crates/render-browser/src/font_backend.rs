@@ -213,7 +213,7 @@ fn fallback_icon_character(character: char) -> char {
         '\u{e613}' => '▾',
         '\u{e619}' => '↻',
         '\u{e625}' => '!',
-        '\u{e62e}' => '★',
+        '\u{e62e}' => '热',
         _ => character,
     }
 }
@@ -257,6 +257,7 @@ mod tests {
         assert_eq!(fallback_icon_character('\u{e610}'), '×');
         assert_eq!(fallback_icon_character('\u{e613}'), '▾');
         assert_eq!(fallback_icon_character('\u{e619}'), '↻');
+        assert_eq!(fallback_icon_character('\u{e62e}'), '热');
         assert_eq!(fallback_icon_character('A'), 'A');
     }
 }
