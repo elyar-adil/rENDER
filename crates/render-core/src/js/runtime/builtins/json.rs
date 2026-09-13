@@ -369,7 +369,7 @@ impl JsRuntime {
             return Err(JsError::resource("JSON nesting depth exceeded"));
         }
         Ok(match value {
-            JsValue::Undefined => None,
+            JsValue::Undefined | JsValue::Symbol(_) => None,
             JsValue::Null => Some("null".to_owned()),
             JsValue::Boolean(value) => Some(value.to_string()),
             JsValue::Number(value) if value.is_finite() => {

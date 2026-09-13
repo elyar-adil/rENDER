@@ -23,6 +23,7 @@ impl JsValue {
             Self::Boolean(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
             Self::String(value) => !value.is_empty(),
+            Self::Symbol(_) => true,
             Self::Object(_) => true,
         }
     }
@@ -88,6 +89,9 @@ pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
     match value {
         JsValue::Undefined => Ok(f64::NAN),
         JsValue::Null => Ok(0.0),
+        JsValue::Symbol(_) => Err(JsError::type_error(
+            "Cannot convert a Symbol value to a number",
+        )),
         JsValue::Boolean(value) => Ok(u8::from(*value).into()),
         JsValue::Number(value) => Ok(*value),
         JsValue::String(value) => {
@@ -227,6 +231,7 @@ pub(super) fn strict_equal(left: &JsValue, right: &JsValue) -> bool {
         (JsValue::Boolean(left), JsValue::Boolean(right)) => left == right,
         (JsValue::Number(left), JsValue::Number(right)) => number_equal(*left, *right),
         (JsValue::String(left), JsValue::String(right)) => left == right,
+        (JsValue::Symbol(left), JsValue::Symbol(right)) => left == right,
         (JsValue::Object(left), JsValue::Object(right)) => left == right,
         _ => false,
     }

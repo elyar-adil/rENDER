@@ -19,6 +19,7 @@ use crate::dom::DomRevision;
 use crate::dom::NodeId;
 use crate::js::JsError;
 use crate::js::JsErrorKind;
+use crate::js::JsSymbol;
 use crate::js::JsValue;
 use crate::js::ObjectId;
 use crate::js::Realm;
@@ -77,6 +78,8 @@ pub struct JsRuntime {
     console_messages: Vec<ConsoleMessage>,
     window_event_handlers: BTreeMap<String, Vec<ObjectId>>,
     next_symbol_id: u64,
+    /// `Symbol.for` registry: registry key -> symbol id.
+    global_symbol_registry: BTreeMap<String, u64>,
     /// Active JavaScript call frames for stack traces and diagnostics.
     call_stack: Vec<CallFrame>,
     /// Byte offsets where each source line starts, for error positioning.
@@ -149,7 +152,8 @@ impl JsRuntime {
             regexes: Vec::new(),
             console_messages: Vec::new(),
             window_event_handlers: BTreeMap::new(),
-            next_symbol_id: 0,
+            next_symbol_id: crate::js::value::FIRST_DYNAMIC_SYMBOL_ID,
+            global_symbol_registry: BTreeMap::new(),
             call_stack: Vec::new(),
             source_line_starts: Vec::new(),
             random_state: {
@@ -213,6 +217,24 @@ impl JsRuntime {
             .map(|frame| frame.name.clone())
             .collect::<Vec<_>>();
         names.iter().rev().cloned().collect::<Vec<_>>().join(" <- ")
+    }
+
+    /// Allocate a fresh unique symbol; runtime symbols start above the
+    /// well-known id range so identity never collides with bootstrap.
+    pub(super) fn create_symbol(&mut self, description: Option<String>) -> JsSymbol {
+        self.next_symbol_id += 1;
+        JsSymbol::new(self.next_symbol_id, description)
+    }
+
+    /// `Symbol.for(key)`: return the registered symbol or register a new one.
+    pub(super) fn symbol_for(&mut self, key: String) -> JsSymbol {
+        if let Some(id) = self.global_symbol_registry.get(&key) {
+            return JsSymbol::new(*id, Some(key));
+        }
+        self.next_symbol_id += 1;
+        let id = self.next_symbol_id;
+        self.global_symbol_registry.insert(key.clone(), id);
+        JsSymbol::new(id, Some(key))
     }
 
     /// Construct a standard error instance from a global constructor, the

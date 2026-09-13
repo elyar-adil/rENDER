@@ -1536,6 +1536,9 @@ impl JsRuntime {
             JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
                 return Ok(JsValue::Undefined);
             }
+            JsValue::Symbol(_) => {
+                return Ok(JsValue::Undefined);
+            }
             value @ JsValue::Object(_) => Self::require_object(&value).map_err(|_| {
                 JsError::type_error(format!(
                     "value of callee{callee_label} is undefined or not callable"
@@ -1607,7 +1610,7 @@ impl JsRuntime {
                             }
                         }
                     }
-                    JsValue::Boolean(_) | JsValue::Number(_) => {}
+                    JsValue::Boolean(_) | JsValue::Number(_) | JsValue::Symbol(_) => {}
                 }
                 continue;
             }
@@ -1753,6 +1756,7 @@ impl JsRuntime {
                     JsValue::Boolean(_) => "boolean",
                     JsValue::Number(_) => "number",
                     JsValue::String(_) => "string",
+                    JsValue::Symbol(_) => "symbol",
                 }
                 .to_owned(),
             )),
@@ -2492,6 +2496,8 @@ impl JsRuntime {
         }
         let function = match (self.realm.host(object), property) {
             (Some(ObjectHost::Promise(_)), "then") => Some(NativeFunction::PromiseThen),
+            (Some(ObjectHost::SymbolConstructor), "for") => Some(NativeFunction::SymbolFor),
+            (Some(ObjectHost::SymbolConstructor), "keyFor") => Some(NativeFunction::SymbolKeyFor),
             (Some(ObjectHost::Promise(_)), "catch") => Some(NativeFunction::PromiseCatch),
             (_, "addEventListener") if object == self.realm.global_object() => {
                 Some(NativeFunction::WindowAddEventListener)
@@ -2945,45 +2951,19 @@ impl JsRuntime {
             Some(ObjectHost::DateConstructor) => {
                 Ok(JsValue::String(Self::format_date_utc(Self::now_ms())))
             }
-            // `Symbol(desc)` creates a unique opaque object token.
-            Some(ObjectHost::SymbolConstructor) => {
-                let description = arguments
-                    .first()
-                    .filter(|value| !matches!(value, JsValue::Undefined))
-                    .map(JsValue::to_js_string);
-                self.next_symbol_id += 1;
-                let symbol_id = self.next_symbol_id;
-                self.ensure_heap_capacity(1)?;
-                let prototype = self
-                    .realm
-                    .global("Symbol")
-                    .and_then(|value| match value {
-                        JsValue::Object(constructor) => {
-                            self.realm.get_property(constructor, "prototype")
-                        }
-                        _ => None,
-                    })
-                    .and_then(|value| match value {
-                        JsValue::Object(prototype) => Some(prototype),
-                        _ => None,
-                    });
-                let instance = self.realm.create_object(prototype);
-                if let Some(description) = description {
-                    self.realm.set_property(
-                        instance,
-                        "description".to_owned(),
-                        JsValue::String(description),
-                    );
-                }
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "symbol IDs stay far below any precision boundary"
-                )]
-                let id_value = symbol_id as f64;
-                self.realm
-                    .set_property(instance, "@@id".to_owned(), JsValue::Number(id_value));
-                Ok(JsValue::Object(instance))
+            Some(ObjectHost::SymbolInstance(_)) => {
+                Err(JsError::type_error("Symbol wrapper is not callable"))
             }
+            // `Symbol(desc)` creates a unique primitive symbol.
+            Some(ObjectHost::SymbolConstructor) => Ok(JsValue::Symbol(self.create_symbol(
+                arguments.first().and_then(|value| {
+                    if matches!(value, JsValue::Undefined) {
+                        None
+                    } else {
+                        Some(value.to_js_string())
+                    }
+                }),
+            ))),
             Some(ObjectHost::EventConstructor) => {
                 Err(JsError::type_error("Event constructor requires 'new'"))
             }
@@ -3323,6 +3303,7 @@ impl JsRuntime {
                 context.trim_start_matches('.')
             ))),
             JsValue::String(text) => Ok(self.string_wrapper(text.clone())),
+            JsValue::Symbol(symbol) => Ok(self.realm.symbol_instance_wrapper(symbol.clone())),
             JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value)),
             JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
         }

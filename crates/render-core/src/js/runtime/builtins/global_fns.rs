@@ -72,6 +72,31 @@ impl JsRuntime {
                 let node = self.require_node(receiver)?;
                 Ok(self.element_rect_value(node))
             }
+            NativeFunction::SymbolDescription => match self.realm.host(receiver) {
+                Some(ObjectHost::SymbolInstance(symbol)) => Ok(symbol
+                    .description()
+                    .map_or(JsValue::Undefined, |text| JsValue::String(text.to_owned()))),
+                _ => Err(JsError::type_error(
+                    "Symbol.prototype.description requires that 'this' be a Symbol",
+                )),
+            },
+            NativeFunction::SymbolFor => {
+                let key = required_argument(arguments, 0, "Symbol.for")?.to_js_string();
+                Ok(JsValue::Symbol(self.symbol_for(key)))
+            }
+            NativeFunction::SymbolKeyFor => {
+                let value = required_argument(arguments, 0, "Symbol.keyFor")?;
+                let result = match value {
+                    JsValue::Symbol(symbol) => self
+                        .global_symbol_registry
+                        .iter()
+                        .find(|(_, id)| **id == symbol.id())
+                        .map(|(key, _)| JsValue::String(key.clone()))
+                        .unwrap_or(JsValue::Undefined),
+                    _ => JsValue::Undefined,
+                };
+                Ok(result)
+            }
             NativeFunction::ObjectDefineGetter => {
                 self.object_define_accessor(receiver, arguments, true)
             }

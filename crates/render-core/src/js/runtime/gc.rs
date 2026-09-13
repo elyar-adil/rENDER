@@ -136,7 +136,8 @@ pub(super) fn mark_host(
     host: &ObjectHost,
 ) {
     match host {
-        ObjectHost::Ordinary
+        ObjectHost::SymbolInstance(_)
+        | ObjectHost::Ordinary
         | ObjectHost::Array
         | ObjectHost::Document(_)
         | ObjectHost::Node(_)
@@ -394,14 +395,8 @@ impl JsRuntime {
                     prototype,
                 );
             }
-            for value in current.property_values() {
-                mark_value(
-                    self,
-                    &mut marked,
-                    &mut work,
-                    &mut marked_environments,
-                    value,
-                );
+            for id in current.property_object_references() {
+                mark_object(self, &mut marked, &mut work, &mut marked_environments, id);
             }
         }
 

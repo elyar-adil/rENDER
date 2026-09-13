@@ -26,7 +26,68 @@ pub enum JsValue {
     Boolean(bool),
     Number(f64),
     String(String),
+    Symbol(JsSymbol),
     Object(ObjectId),
+}
+
+/// A JavaScript symbol primitive. The description text rides inline so
+/// string conversion stays a pure operation; identity compares `id` alone,
+/// and the description is a function of the id for any given symbol.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JsSymbol {
+    id: u64,
+    description: Option<String>,
+}
+
+/// Symbol ids below this constant are reserved for the well-known symbols
+/// installed during realm bootstrap; runtime symbols start above it.
+pub(crate) const FIRST_DYNAMIC_SYMBOL_ID: u64 = 1_000;
+
+impl JsSymbol {
+    pub(crate) const fn new(id: u64, description: Option<String>) -> Self {
+        Self { id, description }
+    }
+
+    /// The well-known symbol whose registry key is `name` ("@@iterator",
+    /// "@@toStringTag", ...). Descriptions mirror the registry keys.
+    #[must_use]
+    pub(crate) fn well_known(name: &str) -> Self {
+        match name {
+            "@@iterator" => Self::new(1, Some("@@iterator".to_owned())),
+            "@@asyncIterator" => Self::new(2, Some("@@asyncIterator".to_owned())),
+            "@@toStringTag" => Self::new(3, Some("@@toStringTag".to_owned())),
+            "@@toPrimitive" => Self::new(4, Some("@@toPrimitive".to_owned())),
+            "@@hasInstance" => Self::new(5, Some("@@hasInstance".to_owned())),
+            "@@species" => Self::new(6, Some("@@species".to_owned())),
+            "@@isConcatSpreadable" => Self::new(7, Some("@@isConcatSpreadable".to_owned())),
+            "@@unscopables" => Self::new(8, Some("@@unscopables".to_owned())),
+            "@@match" => Self::new(9, Some("@@match".to_owned())),
+            "@@matchAll" => Self::new(10, Some("@@matchAll".to_owned())),
+            "@@replace" => Self::new(11, Some("@@replace".to_owned())),
+            "@@search" => Self::new(12, Some("@@search".to_owned())),
+            "@@split" => Self::new(13, Some("@@split".to_owned())),
+            _ => Self::new(0, None),
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// The canonical string form (`Symbol(description)` / `Symbol()`).
+    #[must_use]
+    pub fn to_display(&self) -> String {
+        match &self.description {
+            Some(description) => format!("Symbol({description})"),
+            None => "Symbol()".to_owned(),
+        }
+    }
 }
 
 impl JsValue {
@@ -39,6 +100,7 @@ impl JsValue {
             Self::Boolean(value) => value.to_string(),
             Self::Number(value) => number_to_string(*value),
             Self::String(value) => value.clone(),
+            Self::Symbol(symbol) => symbol.to_display(),
             Self::Object(_) => "[object Object]".to_owned(),
         }
     }
@@ -334,6 +396,9 @@ pub(crate) enum NativeFunction {
     ObjectPrototypePropertyIsEnumerable,
     ObjectPrototypeToString,
     ObjectDefineGetter,
+    SymbolDescription,
+    SymbolFor,
+    SymbolKeyFor,
     ObjectPreventExtensions,
     ObjectSeal,
     ObjectFreeze,
@@ -593,6 +658,7 @@ pub(crate) enum ObjectHost {
     BooleanConstructor,
     DateConstructor,
     SymbolConstructor,
+    SymbolInstance(JsSymbol),
     ArrayConstructor,
     StringPrimitive(String),
     NumberPrimitive(f64),
@@ -707,8 +773,20 @@ impl JsObject {
     }
 
     /// Own data properties in stable insertion order (`BTreeMap` key order).
-    pub(crate) fn property_values(&self) -> impl Iterator<Item = &JsValue> {
-        self.properties.values().map(|descriptor| &descriptor.value)
+    /// Every object id reachable through this object's properties: data
+    /// values plus accessor getter/setter slots, which the collector must
+    /// treat as strong references just like values.
+    pub(crate) fn property_object_references(&self) -> Vec<ObjectId> {
+        let mut references = Vec::new();
+        for descriptor in self.properties.values() {
+            if descriptor.is_accessor() {
+                references.extend(descriptor.getter);
+                references.extend(descriptor.setter);
+            } else if let JsValue::Object(id) = &descriptor.value {
+                references.push(*id);
+            }
+        }
+        references
     }
 }
 
@@ -726,6 +804,7 @@ pub struct Realm {
     boolean_primitive_prototype: ObjectId,
     regexp_prototype: ObjectId,
     date_prototype: ObjectId,
+    symbol_prototype: ObjectId,
     element_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -827,7 +906,8 @@ impl Realm {
             Self::install_boolean(&mut objects, global, object_prototype, function_prototype);
         let date_prototype =
             Self::install_date(&mut objects, global, object_prototype, function_prototype);
-        Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
+        let symbol_prototype =
+            Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
         Self::install_promise(&mut objects, global);
         let array_prototype =
@@ -1266,6 +1346,7 @@ impl Realm {
             boolean_primitive_prototype,
             regexp_prototype,
             date_prototype,
+            symbol_prototype,
             element_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
@@ -2399,7 +2480,7 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) {
+    ) -> ObjectId {
         let constructor = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(function_prototype),
@@ -2414,6 +2495,7 @@ impl Realm {
         for (name, function) in [
             ("toString", NativeFunction::SymbolToString),
             ("valueOf", NativeFunction::SymbolValueOf),
+            ("[description]", NativeFunction::SymbolDescription),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -2425,10 +2507,25 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
-        // Well-known symbols are emulated as "@@name" string keys: objects
-        // store their `Symbol.toStringTag`-style metadata under these keys and
-        // `Object.prototype.toString` consults them, matching the string-keyed
-        // convention the rest of this engine uses for symbol-keyed behavior.
+        // `Symbol.prototype.description` is a getter-only accessor (spec);
+        // reuse the method object installed above as the getter.
+        if let Some(descriptor) = objects[prototype.0].properties.remove("[description]") {
+            if let JsValue::Object(getter) = descriptor.value {
+                objects[prototype.0].properties.insert(
+                    "description".to_owned(),
+                    PropertyDescriptor {
+                        value: JsValue::Undefined,
+                        writable: false,
+                        getter: Some(getter),
+                        setter: None,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+        // Well-known symbols are real symbol values at fixed ids so engine
+        // internals can key on them without a registry lookup.
         for (name, key) in [
             ("iterator", "@@iterator"),
             ("asyncIterator", "@@asyncIterator"),
@@ -2446,9 +2543,14 @@ impl Realm {
         ] {
             objects[constructor.0].properties.insert(
                 name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(key.to_owned())),
+                PropertyDescriptor::builtin(JsValue::Symbol(JsSymbol::well_known(key))),
             );
         }
+        // `Symbol.prototype[Symbol.toStringTag] === "Symbol"`
+        objects[prototype.0].properties.insert(
+            JsSymbol::well_known("@@toStringTag").id().to_string(),
+            PropertyDescriptor::builtin(JsValue::String("Symbol".to_owned())),
+        );
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
@@ -2471,6 +2573,17 @@ impl Realm {
                 configurable: true,
             },
         );
+        prototype
+    }
+
+    /// A fresh wrapper object hosting a symbol primitive, used when a
+    /// symbol's methods are accessed (`sym.toString()`).
+    pub(crate) fn symbol_instance_wrapper(&mut self, symbol: JsSymbol) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.symbol_prototype),
+            host: ObjectHost::SymbolInstance(symbol),
+            ..JsObject::default()
+        })
     }
 
     fn install_event(

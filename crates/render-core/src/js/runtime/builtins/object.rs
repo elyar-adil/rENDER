@@ -66,17 +66,29 @@ impl JsRuntime {
             NativeFunction::ObjectPrototypeIsPrototypeOf => {
                 Ok(self.object_prototype_is_prototype_of(receiver, arguments))
             }
-            NativeFunction::SymbolToString => {
-                let description = self
-                    .realm
-                    .get_property(receiver, "description")
-                    .map(|value| value.to_js_string())
-                    .unwrap_or_default();
-                Ok(JsValue::String(format!("Symbol({description})")))
-            }
-            NativeFunction::SymbolValueOf | NativeFunction::NumValueOf => {
-                Ok(JsValue::Object(receiver))
-            }
+            NativeFunction::SymbolToString => match self.realm.host(receiver) {
+                Some(ObjectHost::SymbolInstance(symbol)) => {
+                    Ok(JsValue::String(symbol.to_display()))
+                }
+                _ => Err(JsError::type_error(
+                    "Symbol.prototype.toString requires that 'this' be a Symbol",
+                )),
+            },
+            NativeFunction::SymbolDescription => match self.realm.host(receiver) {
+                Some(ObjectHost::SymbolInstance(symbol)) => Ok(symbol
+                    .description()
+                    .map_or(JsValue::Undefined, |text| JsValue::String(text.to_owned()))),
+                _ => Err(JsError::type_error(
+                    "Symbol.prototype.description requires that 'this' be a Symbol",
+                )),
+            },
+            NativeFunction::SymbolValueOf => match self.realm.host(receiver) {
+                Some(ObjectHost::SymbolInstance(symbol)) => Ok(JsValue::Symbol(symbol.clone())),
+                _ => Err(JsError::type_error(
+                    "Symbol.prototype.valueOf requires that 'this' be a Symbol",
+                )),
+            },
+            NativeFunction::NumValueOf => Ok(JsValue::Object(receiver)),
             NativeFunction::NumToFixed => {
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -354,6 +366,7 @@ impl JsRuntime {
         };
         for source in &arguments[1..] {
             match source {
+                JsValue::Symbol(_) => {}
                 JsValue::Object(source) => {
                     let properties = self
                         .realm
@@ -393,7 +406,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let value = required_argument(arguments, 0, kind.function_name())?;
         let properties = match value {
-            JsValue::Undefined | JsValue::Null => Vec::new(),
+            JsValue::Undefined | JsValue::Null | JsValue::Symbol(_) => Vec::new(),
             JsValue::Object(object) => self
                 .realm
                 .enumerable_own_properties(*object)
@@ -458,7 +471,7 @@ impl JsRuntime {
             // shims.  A primitive here has no descriptor fields; accepting it
             // as an empty descriptor keeps the target usable like browsers do
             // for permissive host objects.
-            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
+            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) | JsValue::Symbol(_) => {
                 return Ok(JsValue::Object(object));
             }
             JsValue::Null | JsValue::Undefined => unreachable!(),
@@ -781,6 +794,7 @@ impl JsRuntime {
             JsValue::Boolean(_) => "Boolean",
             JsValue::Number(_) => "Number",
             JsValue::String(_) => "String",
+            JsValue::Symbol(_) => "Symbol",
             JsValue::Object(object) => {
                 return self.object_to_string_tag_for_object(*object);
             }

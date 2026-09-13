@@ -1297,3 +1297,52 @@ fn own_string_keys_enumerate_in_insertion_order() {
         JsValue::String("second,first,third:second,first,third".to_owned())
     );
 }
+
+#[test]
+fn symbols_are_real_primitives_with_spec_identity() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var a = Symbol('x');
+                var b = Symbol('x');
+                results.push(typeof a === 'symbol');
+                results.push(a !== b);
+                results.push(a.description === 'x');
+                results.push(Symbol.for('k') === Symbol.for('k'));
+                results.push(Symbol.keyFor(a) === undefined);
+                var reg = Symbol.for('reg');
+                results.push(Symbol.keyFor(reg) === 'reg');
+                results.push(String(a) === 'Symbol(x)');
+                results.join(',');
+            ",
+        )
+        .expect("symbol probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true,true".to_owned())
+    );
+}
+
+#[test]
+fn new_symbol_throws_and_well_knowns_are_symbol_values() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                try { new Symbol('x'); results.push('no-throw'); }
+                catch (e) { results.push(e instanceof TypeError); }
+                results.push(typeof Symbol.iterator === 'symbol');
+                results.push(Symbol.toStringTag.toString() === 'Symbol(@@toStringTag)');
+                results.join(',');
+            ",
+        )
+        .expect("well-known probe executes");
+    assert_eq!(outcome.value, JsValue::String("true,true,true".to_owned()));
+}
