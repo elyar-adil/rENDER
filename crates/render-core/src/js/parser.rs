@@ -73,6 +73,15 @@ pub(super) enum PropertyKey {
 pub(super) struct ObjectProperty {
     pub key: PropertyKey,
     pub value: Expr,
+    /// Set for `get x()` / `set x(v)` members of an object literal; the
+    /// value is the accessor function expression.
+    pub accessor: Option<ObjectAccessorKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ObjectAccessorKind {
+    Getter,
+    Setter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1814,6 +1823,7 @@ impl Parser {
                     properties.push(ObjectProperty {
                         key: PropertyKey::Spread,
                         value: self.assignment()?,
+                        accessor: None,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -1840,6 +1850,7 @@ impl Parser {
                             parameters,
                             body,
                         },
+                        accessor: None,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -1873,6 +1884,7 @@ impl Parser {
                     properties.push(ObjectProperty {
                         key: PropertyKey::Computed(key),
                         value,
+                        accessor: None,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -1882,13 +1894,23 @@ impl Parser {
                     }
                     continue;
                 }
-                if matches!(
-                    &self.current().kind,
-                    TokenKind::Identifier(name) if name == "get" || name == "set"
-                ) && !matches!(
-                    self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-                    Some(TokenKind::LeftParen | TokenKind::Colon | TokenKind::Comma)
-                ) {
+                let accessor_kind = match &self.current().kind {
+                    TokenKind::Identifier(name)
+                        if (name == "get" || name == "set")
+                            && !matches!(
+                                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                                Some(TokenKind::LeftParen | TokenKind::Colon | TokenKind::Comma)
+                            ) =>
+                    {
+                        if name == "get" {
+                            Some(ObjectAccessorKind::Getter)
+                        } else {
+                            Some(ObjectAccessorKind::Setter)
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(accessor_kind) = accessor_kind {
                     self.advance();
                     let key = self.property_name()?;
                     let (parameters, body) = self.function_tail()?;
@@ -1900,6 +1922,7 @@ impl Parser {
                             parameters,
                             body,
                         },
+                        accessor: Some(accessor_kind),
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -1926,6 +1949,7 @@ impl Parser {
                 properties.push(ObjectProperty {
                     key: PropertyKey::Static(key),
                     value,
+                    accessor: None,
                 });
                 if !self.take(&TokenKind::Comma) {
                     break;

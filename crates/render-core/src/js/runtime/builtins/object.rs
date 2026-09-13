@@ -143,9 +143,82 @@ impl JsRuntime {
                 self.object_to_string_tag_for_object(receiver),
             )),
             NativeFunction::ObjectPrototypeValueOf => Ok(JsValue::Object(receiver)),
+            NativeFunction::ObjectDefineGetter => {
+                self.object_define_accessor(receiver, arguments, true)
+            }
+            NativeFunction::ObjectDefineSetter => {
+                self.object_define_accessor(receiver, arguments, false)
+            }
+            NativeFunction::ObjectLookupGetter => {
+                self.object_lookup_accessor(receiver, arguments, true)
+            }
+            NativeFunction::ObjectLookupSetter => {
+                self.object_lookup_accessor(receiver, arguments, false)
+            }
             NativeFunction::ErrorPrototypeToString => Ok(self.error_to_string(receiver)),
             other => self.dispatch_math_native(dom, other, receiver, arguments),
         }
+    }
+
+    /// Annex-B `__defineGetter__`/`__defineSetter__`: install or extend an
+    /// own accessor descriptor, keeping the opposite slot when present.
+    pub(in crate::js::runtime) fn object_define_accessor(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        getter: bool,
+    ) -> Result<JsValue, JsError> {
+        let key = required_argument(arguments, 0, "__defineAccessor__")?.to_js_string();
+        let function = Self::require_callable_object(
+            required_argument(arguments, 1, "__defineAccessor__")?,
+            &self.realm,
+        )?;
+        let existing = self.realm.own_property(receiver, &key);
+        let (getter_slot, setter_slot) = match (getter, existing) {
+            (true, Some(existing)) => (Some(function), existing.setter),
+            (false, Some(existing)) => (existing.getter, Some(function)),
+            (true, None) => (Some(function), None),
+            (false, None) => (None, Some(function)),
+        };
+        if !self.realm.define_property(
+            receiver,
+            key,
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: getter_slot,
+                setter: setter_slot,
+                enumerable: true,
+                configurable: true,
+            },
+        ) {
+            return Err(JsError::type_error(
+                "cannot redefine non-configurable property",
+            ));
+        }
+        Ok(JsValue::Undefined)
+    }
+
+    /// Annex-B `__lookupGetter__`/`__lookupSetter__`: own accessor slots
+    /// only, `undefined` when absent.
+    pub(in crate::js::runtime) fn object_lookup_accessor(
+        &self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        getter: bool,
+    ) -> Result<JsValue, JsError> {
+        let key = required_argument(arguments, 0, "__lookupAccessor__")?.to_js_string();
+        let slot = match self.realm.own_property(receiver, &key) {
+            Some(descriptor) if descriptor.is_accessor() => {
+                if getter {
+                    descriptor.getter
+                } else {
+                    descriptor.setter
+                }
+            }
+            _ => None,
+        };
+        Ok(slot.map_or(JsValue::Undefined, JsValue::Object))
     }
 }
 

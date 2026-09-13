@@ -23,10 +23,12 @@ use crate::js::JsErrorKind;
 use crate::js::JsObject;
 use crate::js::JsValue;
 use crate::js::ObjectId;
+use crate::js::PropertyDescriptor;
 use crate::js::Realm;
 use crate::js::parser::BinaryOp;
 use crate::js::parser::CatchClause;
 use crate::js::parser::Expr;
+use crate::js::parser::ObjectAccessorKind;
 use crate::js::parser::ObjectProperty;
 use crate::js::parser::PropertyKey;
 use crate::js::parser::Statement;
@@ -1617,6 +1619,44 @@ impl JsRuntime {
                 PropertyKey::Spread => unreachable!("spread property handled above"),
             };
             let value = self.evaluate(dom, &property.value)?;
+            if let Some(accessor) = property.accessor {
+                // `{get x(){}}` / `{set x(v){}}` install accessor slots; a
+                // repeated member of either kind extends the same descriptor.
+                let function = match value {
+                    JsValue::Object(function)
+                        if JsRuntime::is_callable_object(function, &self.realm) =>
+                    {
+                        function
+                    }
+                    _ => return Err(JsError::type_error("object accessor must be a function")),
+                };
+                let existing = self.realm.own_property(object, &key);
+                let (getter, setter) = match (accessor, existing) {
+                    (ObjectAccessorKind::Getter, Some(existing)) => {
+                        (Some(function), existing.setter)
+                    }
+                    (ObjectAccessorKind::Setter, Some(existing)) => {
+                        (existing.getter, Some(function))
+                    }
+                    (ObjectAccessorKind::Getter, None) => (Some(function), None),
+                    (ObjectAccessorKind::Setter, None) => (None, Some(function)),
+                };
+                if !self.realm.define_property(
+                    object,
+                    key,
+                    PropertyDescriptor {
+                        value: JsValue::Undefined,
+                        writable: false,
+                        getter,
+                        setter,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                ) {
+                    return Err(JsError::type_error("could not define object accessor"));
+                }
+                continue;
+            }
             if !self.realm.set_property(object, key, value) {
                 return Err(JsError::type_error("could not define object property"));
             }

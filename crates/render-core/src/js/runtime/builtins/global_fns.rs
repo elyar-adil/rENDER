@@ -72,6 +72,18 @@ impl JsRuntime {
                 let node = self.require_node(receiver)?;
                 Ok(self.element_rect_value(node))
             }
+            NativeFunction::ObjectDefineGetter => {
+                self.object_define_accessor(receiver, arguments, true)
+            }
+            NativeFunction::ObjectDefineSetter => {
+                self.object_define_accessor(receiver, arguments, false)
+            }
+            NativeFunction::ObjectLookupGetter => {
+                self.object_lookup_accessor(receiver, arguments, true)
+            }
+            NativeFunction::ObjectLookupSetter => {
+                self.object_lookup_accessor(receiver, arguments, false)
+            }
             NativeFunction::StrCharAt => self.string_char_at(receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(receiver, arguments),
             NativeFunction::StrIndexOf => self.string_index_of(receiver, arguments, false),

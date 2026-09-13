@@ -352,6 +352,10 @@ pub(crate) enum NativeFunction {
     ObjectPrototypeIsPrototypeOf,
     ObjectPrototypePropertyIsEnumerable,
     ObjectPrototypeToString,
+    ObjectDefineGetter,
+    ObjectDefineSetter,
+    ObjectLookupGetter,
+    ObjectLookupSetter,
     ObjectPrototypeValueOf,
     DateNow,
     DateGetValue,
@@ -1855,6 +1859,10 @@ impl Realm {
                 NativeFunction::ObjectPrototypePropertyIsEnumerable,
             ),
             ("toString", NativeFunction::ObjectPrototypeToString),
+            ("__defineGetter__", NativeFunction::ObjectDefineGetter),
+            ("__defineSetter__", NativeFunction::ObjectDefineSetter),
+            ("__lookupGetter__", NativeFunction::ObjectLookupGetter),
+            ("__lookupSetter__", NativeFunction::ObjectLookupSetter),
             ("valueOf", NativeFunction::ObjectPrototypeValueOf),
         ] {
             let method = ObjectId(objects.len());

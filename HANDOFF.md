@@ -15,6 +15,12 @@
 - set_property 目前不走原型链（value.rs:3006）——setter 语义放 set_value 里做。
 - define_property 校验 get/set 与 value/writable 互斥；getOwnPropertyDescriptor 如实报告；对象字面量 get/set（parser.rs:1791 现在丢弃 accessor 性质）；__defineGetter__ 家族；Object.freeze/seal/preventExtensions + JsObject.extensible；字符串键插入序。
 
+## 封存：性能线 P9（勿启动）
+
+- **启动条件：P1–P8 全部落地、JS 语义完善之后**（用户明确：现在不考虑）。
+- 阶梯：树遍历解释器 → 字节码 VM（预期 3–10 倍，常量池/标识符预解析/密集 dispatch）→ 内联缓存（依赖 P2 属性模型定型，勿提前做）→ copy-and-patch 模板基线 JIT（无投机、无去优化；dynasm-rs 或 CPython 3.13 式模板拼接）。不做类型特化优化编译器（TurboFan 档）。
+- 配套：GC 需把 VM 帧纳入根集；每级挂 render-perf 基准回归门禁。
+
 
 # 交接文档 (2026-09-13)
 

@@ -1220,3 +1220,30 @@ fn accessor_descriptor_with_value_is_rejected() {
         .expect_err("mixed accessor and value descriptor is invalid");
     assert!(error.to_string().contains("Type"), "{error}");
 }
+
+#[test]
+fn object_literal_accessors_and_define_getter_family_agree() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var o = {
+                    inner: 5,
+                    get doubled() { return this.inner * 2; },
+                };
+                var results = [];
+                results.push(o.doubled === 10);
+                __defineGetter__.call(o, 'tripled', function () { return this.inner * 3; });
+                results.push(o.tripled === 15);
+                var report = results.join(',') + ':' + typeof __lookupGetter__.call(o, 'tripled');
+                report;
+            ",
+        )
+        .expect("accessor literal executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true:function".to_owned())
+    );
+}
