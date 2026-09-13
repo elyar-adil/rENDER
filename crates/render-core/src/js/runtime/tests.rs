@@ -1379,3 +1379,50 @@ fn symbol_keyed_properties_round_trip_through_brackets_and_introspection() {
         JsValue::String("true,true,true,true,true,true,true".to_owned())
     );
 }
+
+#[test]
+fn for_of_and_spread_drive_map_set_and_custom_iterators() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var map = new Map();
+                map.set('a', 1); map.set('b', 2);
+                var pairs = [];
+                for (const entry of map) { pairs.push(entry[0] + '=' + entry[1]); }
+                results.push(pairs.join('|') === 'a=1|b=2');
+                var set = new Set();
+                set.add('x'); set.add('y');
+                var seen = [];
+                for (const item of set) { seen.push(item); }
+                results.push(seen.join('') === 'xy');
+                var custom = { count: 3, current: 0, next: function () {
+                    this.current += 1;
+                    return this.current > this.count ? { done: true } : { done: false, value: this.current };
+                } };
+                custom[Symbol.iterator] = function () { return { next: custom.next.bind(custom) }; };
+                var gathered = [];
+                for (const n of custom) { gathered.push(n); }
+                results.push(gathered.join(',') === '1,2,3');
+                function take() { return arguments.length; }
+                var list = ['p', 'q'];
+                results.push(take(...list, 'r') === 3);
+                var fresh = { count: 2, current: 0, next: function () {
+                    this.current += 1;
+                    return this.current > this.count ? { done: true } : { done: false, value: this.current * 10 };
+                } };
+                fresh[Symbol.iterator] = function () { return { next: fresh.next.bind(fresh) }; };
+                var copy = [...seen, ...fresh];
+                results.push(copy.join(',') === 'x,y,10,20');
+                results.join(',');
+            ",
+        )
+        .expect("iterator probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true".to_owned())
+    );
+}

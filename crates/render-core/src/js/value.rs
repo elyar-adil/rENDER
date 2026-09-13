@@ -1552,6 +1552,15 @@ impl Realm {
                     method_name.to_owned(),
                     PropertyDescriptor::builtin(JsValue::Object(method)),
                 );
+                // `map[Symbol.iterator]` aliases `entries`; `set[Symbol.iterator]`
+                // aliases `values`, exactly as the spec installs them.
+                if method_name == (if kind.is_map() { "entries" } else { "values" }) {
+                    let symbol = JsSymbol::well_known("@@iterator");
+                    objects[prototype.0].symbols.insert(
+                        symbol.id(),
+                        (symbol, PropertyDescriptor::builtin(JsValue::Object(method))),
+                    );
+                }
             }
             let constructor = ObjectId(objects.len());
             objects.push(JsObject {

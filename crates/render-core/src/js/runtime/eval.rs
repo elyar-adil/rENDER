@@ -797,28 +797,7 @@ impl JsRuntime {
         body: &Statement,
     ) -> Result<Completion, JsError> {
         let iterable = self.evaluate(dom, iterable)?;
-        let values = match iterable {
-            JsValue::Object(object)
-                if matches!(self.realm.host(object), Some(ObjectHost::Array)) =>
-            {
-                self.array_elements_for(object)
-            }
-            JsValue::String(text) => text
-                .chars()
-                .map(|character| JsValue::String(character.to_string()))
-                .collect(),
-            JsValue::Object(object) => {
-                let length = self
-                    .realm
-                    .get_property(object, "length")
-                    .map(|value| to_number(&value).unwrap_or(0.0).max(0.0) as usize)
-                    .unwrap_or(0);
-                (0..length)
-                    .map(|index| self.get_member(dom, object, &index.to_string()))
-                    .collect::<Result<Vec<_>, _>>()?
-            }
-            _ => Vec::new(),
-        };
+        let values = self.iterate_values(dom, &iterable)?;
         if kind == VariableKind::Var {
             self.create_binding(name, kind, true, JsValue::Undefined)?;
         }
@@ -1194,14 +1173,7 @@ impl JsRuntime {
                 self.assign_destructuring_target(dom, target, value)
             }
             Expr::Array(targets) => {
-                let values = match value {
-                    JsValue::Object(object) => self.array_elements_for(object),
-                    JsValue::String(text) => text
-                        .chars()
-                        .map(|character| JsValue::String(character.to_string()))
-                        .collect(),
-                    _ => return Err(JsError::type_error("value is not iterable")),
-                };
+                let values = self.iterate_values(dom, &value)?;
                 for (index, target) in targets.iter().enumerate() {
                     if matches!(target, Expr::Literal(JsValue::Undefined)) {
                         continue;
@@ -1352,6 +1324,103 @@ impl JsRuntime {
             }
             Some(descriptor) => Ok(descriptor.value),
             None => Ok(JsValue::Undefined),
+        }
+    }
+
+    /// ECMA-262 : call `value[Symbol.iterator]()` and read the
+    /// `next` method. `Ok(None)` when the value exposes no @@iterator.
+    pub(super) fn get_iterator(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<Option<(ObjectId, ObjectId)>, JsError> {
+        let JsValue::Object(target) = value else {
+            return Ok(None);
+        };
+        let method = self.get_symbol_value(dom, *target, &JsSymbol::well_known("@@iterator"))?;
+        let JsValue::Object(method) = method else {
+            return Ok(None);
+        };
+        let result = self.call_with_this(dom, method, &[], value.clone())?;
+        let JsValue::Object(iterator) = result else {
+            return Err(JsError::type_error("iterator result is not an object"));
+        };
+        let next = self.get_member(dom, iterator, "next")?;
+        let JsValue::Object(next) = next else {
+            return Err(JsError::type_error("iterator has no callable 'next'"));
+        };
+        if !Self::is_callable_object(next, &self.realm) {
+            return Err(JsError::type_error("iterator has no callable 'next'"));
+        }
+        Ok(Some((iterator, next)))
+    }
+
+    /// Step an iterator; `Ok(None)` marks exhaustion (`done`).
+    pub(super) fn iterator_next(
+        &mut self,
+        dom: &mut Dom,
+        iterator: ObjectId,
+        next: ObjectId,
+    ) -> Result<Option<JsValue>, JsError> {
+        let result = self.call_with_this(dom, next, &[], JsValue::Object(iterator))?;
+        let JsValue::Object(result) = result else {
+            return Err(JsError::type_error("iterator result is not an object"));
+        };
+        let done = self
+            .realm
+            .get_property(result, "done")
+            .map(|value| value.is_truthy())
+            .unwrap_or(false);
+        if done {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.realm
+                .get_property(result, "value")
+                .unwrap_or(JsValue::Undefined),
+        ))
+    }
+
+    /// Drain any iterable into an eager value list. Arrays and strings use
+    /// the established fast paths; other objects go through the iterator
+    /// protocol, with a length-based fallback for array-likes (typed arrays
+    /// and `arguments` shapes) that predate iterator support.
+    pub(super) fn iterate_values(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<Vec<JsValue>, JsError> {
+        match value {
+            JsValue::Object(object)
+                if matches!(self.realm.host(*object), Some(ObjectHost::Array)) =>
+            {
+                Ok(self.array_elements_for(*object))
+            }
+            JsValue::String(text) => Ok(text
+                .chars()
+                .map(|character| JsValue::String(character.to_string()))
+                .collect()),
+            JsValue::Object(object) => {
+                if let Some((iterator, next)) = self.get_iterator(dom, value)? {
+                    let mut values = Vec::new();
+                    while let Some(step) = self.iterator_next(dom, iterator, next)? {
+                        values.push(step);
+                    }
+                    return Ok(values);
+                }
+                let array_like = self
+                    .realm
+                    .get_property(*object, "length")
+                    .map(|length| to_number(&length).map(|length| length.max(0.0) as usize))
+                    .unwrap_or(Ok(0))?;
+                (0..array_like)
+                    .map(|index| self.get_member(dom, *object, &index.to_string()))
+                    .collect()
+            }
+            JsValue::Null | JsValue::Undefined | JsValue::Symbol(_) => Err(JsError::type_error(
+                format!("{} is not iterable", value.to_js_string()),
+            )),
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -1824,16 +1893,8 @@ impl JsRuntime {
             output.push(self.evaluate(dom, expression)?);
             return Ok(());
         };
-        match self.evaluate(dom, iterable)? {
-            JsValue::Object(object) => output.extend(self.array_elements_for(object)),
-            JsValue::String(text) => {
-                output.extend(
-                    text.chars()
-                        .map(|character| JsValue::String(character.to_string())),
-                );
-            }
-            _ => return Err(JsError::type_error("spread value is not iterable")),
-        }
+        let iterable = self.evaluate(dom, iterable)?;
+        output.extend(self.iterate_values(dom, &iterable)?);
         Ok(())
     }
 
