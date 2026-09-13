@@ -338,7 +338,9 @@ impl JsRuntime {
     ) -> Result<String, JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::StringPrimitive(text)) => Ok(text.clone()),
-            _ => Err(JsError::type_error("incompatible String method receiver")),
+            other => Err(JsError::type_error(format!(
+                "incompatible String method receiver (host {other:?})"
+            ))),
         }
     }
 

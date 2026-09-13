@@ -980,7 +980,21 @@ impl JsRuntime {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let current = self.read_assignment_reference(dom, &reference)?;
                 let right = self.evaluate(dom, value)?;
-                let combined = Self::evaluate_binary_values(*operator, &current, &right)?;
+                // Match the plain binary path: object operands go through
+                // ToPrimitive so `x += value` agrees with `x = x + value`.
+                let combined = match *operator {
+                    BinaryOp::Add
+                    | BinaryOp::Subtract
+                    | BinaryOp::Multiply
+                    | BinaryOp::Divide
+                    | BinaryOp::Remainder
+                    | BinaryOp::Exponentiate => {
+                        let current = self.to_numeric_primitive(dom, current)?;
+                        let right = self.to_numeric_primitive(dom, right)?;
+                        Self::evaluate_binary_values(*operator, &current, &right)?
+                    }
+                    _ => Self::evaluate_binary_values(*operator, &current, &right)?,
+                };
                 self.write_assignment_reference(dom, &reference, combined.clone())?;
                 Ok(combined)
             }
@@ -1191,6 +1205,27 @@ impl JsRuntime {
         dom: &mut Dom,
         value: JsValue,
     ) -> Result<JsValue, JsError> {
+        self.to_primitive_with_hint(dom, value, false)
+    }
+
+    /// ECMA-262 `ToString` for values that may be objects: run `ToPrimitive`
+    /// (string hint) so user-defined `toString`/`valueOf` participate, the
+    /// way real-world code and polyfills (`String(obj)`) expect.
+    pub(super) fn to_string_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<String, JsError> {
+        let primitive = self.to_primitive_with_hint(dom, value.clone(), true)?;
+        Ok(primitive.to_js_string())
+    }
+
+    fn to_primitive_with_hint(
+        &mut self,
+        dom: &mut Dom,
+        value: JsValue,
+        prefer_string: bool,
+    ) -> Result<JsValue, JsError> {
         let JsValue::Object(object) = value else {
             return Ok(value);
         };
@@ -1213,7 +1248,12 @@ impl JsRuntime {
             }
             _ => {}
         }
-        for method in ["valueOf", "toString"] {
+        let method_order: [&str; 2] = if prefer_string {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for method in method_order {
             let Some(JsValue::Object(callable)) = self.realm.get_property(object, method) else {
                 continue;
             };
@@ -2677,11 +2717,10 @@ impl JsRuntime {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
             Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
             Some(ObjectHost::FunctionConstructor) => Ok(JsValue::Undefined),
-            Some(ObjectHost::StringConstructor) => Ok(JsValue::String(
-                arguments
-                    .first()
-                    .map_or_else(String::new, JsValue::to_js_string),
-            )),
+            Some(ObjectHost::StringConstructor) => Ok(JsValue::String(match arguments.first() {
+                None => String::new(),
+                Some(value) => self.to_string_value(dom, value)?,
+            })),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
                 None | Some(JsValue::Undefined) => 0.0,
                 Some(value) => to_number(value)?,
@@ -2839,7 +2878,10 @@ impl JsRuntime {
                 }
                 Ok(JsValue::Undefined)
             }
-            _ => Err(JsError::type_error("value is not callable")),
+            _ => Err(JsError::type_error(format!(
+                "value is not callable (callee host {:?})",
+                self.realm.host(callee)
+            ))),
         };
         self.calls_active = self.calls_active.saturating_sub(1);
         result
@@ -3006,7 +3048,10 @@ impl JsRuntime {
         ) {
             Ok(object)
         } else {
-            Err(JsError::type_error("value is not callable"))
+            Err(JsError::type_error(format!(
+                "value is not callable (callee host {:?})",
+                realm.host(object)
+            )))
         }
     }
 

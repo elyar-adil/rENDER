@@ -38,7 +38,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        match function {
+        let result: Result<JsValue, JsError> = match function {
             NativeFunction::GetElementById => {
                 self.require_document(receiver)?;
                 let id = required_argument(arguments, 0, "getElementById")?.to_js_string();
@@ -293,7 +293,20 @@ impl JsRuntime {
                 }
             }
             other => self.dispatch_events_native(dom, other, receiver, arguments),
-        }
+        };
+        // A receiver mismatch on its own is not actionable; naming the entry
+        // point turns the error into a usable diagnostic for real pages.
+        result.map_err(|error| {
+            let message = error.message();
+            if message.starts_with("incompatible ")
+                && message.ends_with(" method receiver")
+                && !message.contains("entry point")
+            {
+                JsError::type_error(format!("{message} (entry point {function:?})"))
+            } else {
+                error
+            }
+        })
     }
 }
 
@@ -965,7 +978,10 @@ impl JsRuntime {
 
     pub(in crate::js::runtime) fn require_node(&self, object: ObjectId) -> Result<NodeId, JsError> {
         match self.realm.host(object) {
-            Some(ObjectHost::Node(node)) => Ok(node),
+            // Document is a Node in the DOM spec; wrappers host it under its
+            // own variant, and real pages pass `document` to Node-taking
+            // APIs such as `MutationObserver.prototype.observe`.
+            Some(ObjectHost::Node(node) | ObjectHost::Document(node)) => Ok(node),
             _ => Err(JsError::type_error("incompatible Node method receiver")),
         }
     }

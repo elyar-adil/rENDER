@@ -583,6 +583,13 @@ impl JsRuntime {
         &self,
         object: ObjectId,
     ) -> String {
+        // ECMA-262 Object.prototype.toString step 7: a string-valued
+        // `Symbol.toStringTag` (emulated here as the "@@toStringTag" key)
+        // overrides the builtin tag. Real-world polyfills (core-js) probe
+        // this before selecting their fast paths.
+        if let Some(JsValue::String(tag)) = self.realm.get_property(object, "@@toStringTag") {
+            return format!("[object {tag}]");
+        }
         let host_tag = match self.realm.host(object) {
             Some(ObjectHost::Array) => "Array",
             Some(ObjectHost::RegExp(_)) => "RegExp",

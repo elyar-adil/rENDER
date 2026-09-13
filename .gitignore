@@ -71,6 +71,8 @@ target/
 
 # Local browser, screenshot, and standalone acceptance-test artifacts
 .artifacts/
+.diag/
+.zcode/
 artifacts/
 crates/render-core/.artifacts/
 bindings/python/python/render_runtime/*.pdb
