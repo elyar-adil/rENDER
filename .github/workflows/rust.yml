@@ -6,7 +6,11 @@ on:
 
 jobs:
   rust-core:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +19,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Fetch pinned test262
+        shell: bash
         run: tools/fetch-test262.sh
 
       - name: Formatting

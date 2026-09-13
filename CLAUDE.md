@@ -10,7 +10,7 @@ crates/render-core      → engine library: DOM, CSS, JS, layout, painting
   src/html/               HTML5 tokenizer + tree builder
   src/dom.rs              Document/Element/Text tree
   src/css/                stylesheet parsing, selectors, cascade, computed values
-  src/js/                 lexer, parser, interpreter, builtins, event loop
+  src/js/                 lexer, parser, runtime/ (evaluator, gc, builtins per Web API area)
   src/layout/             block/inline/flex/grid/table formatting contexts
   src/paint/              display list construction and CPU rasterization
   src/page.rs             page session: load → style → layout → paint pipeline
@@ -67,9 +67,11 @@ cargo test --workspace
 ```
 
 - `third_party/test262` (pin via `tools/fetch-test262.sh`) drives the JS conformance runner in `crates/render-core/tests/test262.rs`.
-- WPT reftests (`crates/render-core/tests/wpt_reftests.rs`) run against a pinned WPT checkout fetched by `tools/fetch-wpt.ps1`, configured through `RENDER_WPT_*` env vars.
+- WPT reftests (`crates/render-core/tests/wpt_reftests.rs) run against a pinned WPT checkout fetched by `tools/fetch-wpt.ps1, configured through `RENDER_WPT_* env vars.
 
 ## Required checks before finishing any change
+
+Run them all with `tools/check.sh (git bash), or individually:
 
 ```bash
 cargo fmt --all --check
