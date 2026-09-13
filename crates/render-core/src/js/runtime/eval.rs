@@ -51,10 +51,12 @@ use crate::js::runtime::convert::to_int32;
 use crate::js::runtime::convert::to_number;
 use crate::js::runtime::convert::unsigned_shift_right;
 use crate::js::runtime::types::Binding;
+use crate::js::runtime::types::CallFrame;
 use crate::js::runtime::types::EnvironmentRecord;
 use crate::js::runtime::types::GlobalBinding;
 use crate::js::runtime::types::NavigationRequest;
 use crate::js::runtime::types::UserFunction;
+use crate::js::value::ErrorKind;
 use crate::js::value::NativeFunction;
 use crate::js::value::ObjectHost;
 use std::cell::RefCell;
@@ -262,7 +264,7 @@ impl JsRuntime {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
         for (name, parameters, body) in functions {
-            let value = self.create_user_function(parameters, body)?;
+            let value = self.create_function(Some(name), parameters, body, None)?;
             self.initialize_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -324,7 +326,7 @@ impl JsRuntime {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
         for (name, parameters, body) in functions {
-            let value = self.create_user_function(parameters, body)?;
+            let value = self.create_function(Some(name), parameters, body, None)?;
             self.initialize_binding(name, value, VariableKind::Const)?;
         }
         Ok(())
@@ -335,7 +337,7 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
     ) -> Result<JsValue, JsError> {
-        self.create_function(parameters, body, None)
+        self.create_function(None, parameters, body, None)
     }
 
     pub(super) fn create_arrow_function(
@@ -348,11 +350,12 @@ impl JsRuntime {
             .last()
             .cloned()
             .unwrap_or(JsValue::Undefined);
-        self.create_function(parameters, body, Some(lexical_this))
+        self.create_function(None, parameters, body, Some(lexical_this))
     }
 
     pub(super) fn create_function(
         &mut self,
+        name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
         lexical_this: Option<JsValue>,
@@ -361,6 +364,7 @@ impl JsRuntime {
         self.ensure_heap_capacity(if is_arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
         self.functions.push(UserFunction {
+            name: name.map(str::to_owned),
             parameters: parameters.to_vec(),
             body: body.to_vec(),
             captured_environment: self.environment.clone(),
@@ -803,10 +807,22 @@ impl JsRuntime {
             && error.kind() != JsErrorKind::ResourceLimit
             && let Some(catch) = catch
         {
-            let value = error
-                .thrown_value()
-                .cloned()
-                .unwrap_or_else(|| JsValue::String(error.to_string()));
+            // Native engine errors materialize as standard Error instances so
+            // `instanceof TypeError` and `error.stack` behave like a real
+            // engine inside catch blocks.
+            let value = if let Some(value) = error.thrown_value().cloned() {
+                value
+            } else {
+                let message = error.message().to_owned();
+                let kind = match error.kind() {
+                    JsErrorKind::Syntax => ErrorKind::SyntaxError,
+                    JsErrorKind::Reference => ErrorKind::ReferenceError,
+                    JsErrorKind::Type => ErrorKind::TypeError,
+                    JsErrorKind::ResourceLimit => ErrorKind::RangeError,
+                    JsErrorKind::Dom | JsErrorKind::Throw => ErrorKind::Error,
+                };
+                self.construct_standard_error(kind, &message)?
+            };
             let catch_environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
             catch_environment.borrow_mut().bindings.insert(
                 catch.parameter.clone(),
@@ -928,17 +944,11 @@ impl JsRuntime {
             }
             Expr::Member { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
-                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
-                    return Ok(JsValue::Undefined);
-                }
                 let object = self.coerce_member_base(&evaluated, property)?;
                 self.get_member(dom, object, property)
             }
             Expr::ComputedMember { object, property } => {
                 let evaluated = self.evaluate(dom, object)?;
-                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
-                    return Ok(JsValue::Undefined);
-                }
                 let key = self.evaluate(dom, property)?.to_js_string();
                 let object = self.coerce_member_base(&evaluated, &key)?;
                 self.get_member(dom, object, &key)
@@ -1384,7 +1394,7 @@ impl JsRuntime {
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
-            let value = self.create_user_function(parameters, body)?;
+            let value = self.create_function(Some(name), parameters, body, None)?;
             self.initialize_binding(name, value.clone(), VariableKind::Const)?;
             Ok(value)
         })();
@@ -2971,8 +2981,11 @@ impl JsRuntime {
             .push(Rc::new(RefCell::new(call_environment)));
         self.this_stack
             .push(function.lexical_this.clone().unwrap_or(receiver));
-        let label = format!("(user fn #{index})");
-        self.call_stack.push(label);
+        let label = function
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("<anonymous fn #{index}>"));
+        self.call_stack.push(CallFrame { name: label });
         let result = self
             .instantiate_statements(&function.body)
             .and_then(|()| self.evaluate_statements(dom, &function.body));
@@ -2996,7 +3009,9 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        self.call_stack.push(format!("{function:?}"));
+        self.call_stack.push(CallFrame {
+            name: format!("{function:?}"),
+        });
         let result = self.call_native_dispatch(dom, function, receiver, arguments);
         self.call_stack.pop();
         result
@@ -3094,13 +3109,13 @@ impl JsRuntime {
         match value {
             JsValue::Object(object) => Ok(*object),
             JsValue::Null | JsValue::Undefined => Err(JsError::type_error(format!(
-                "cannot access .{context} of {} | stack {:?}",
+                "Cannot read properties of {} (reading '{}')",
                 if matches!(value, JsValue::Null) {
                     "null"
                 } else {
                     "undefined"
                 },
-                self.call_stack
+                context.trim_start_matches('.')
             ))),
             JsValue::String(text) => Ok(self.string_wrapper(text.clone())),
             JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value)),

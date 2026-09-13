@@ -179,7 +179,32 @@ impl JsRuntime {
         let message = arguments
             .first()
             .and_then(|value| (!matches!(value, JsValue::Undefined)).then(|| value.to_js_string()));
-        Ok(JsValue::Object(self.realm.create_error(prototype, message)))
+        let object = self.realm.create_error(prototype, message.clone());
+        // `Error.prototype.stack`: engine-captured at construction, shaped
+        // like a real engine ("TypeError: msg" header + `    at` frames).
+        let stack = {
+            let name = self
+                .realm
+                .get_property(object, "name")
+                .unwrap_or_else(|| JsValue::String("Error".to_owned()))
+                .to_js_string();
+            let header = match &message {
+                Some(text) if !text.is_empty() => format!("{name}: {text}"),
+                _ => name,
+            };
+            format!("{header}{}", self.stack_frame_lines())
+        };
+        self.realm.define_property(
+            object,
+            "stack",
+            PropertyDescriptor {
+                value: JsValue::String(stack),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        Ok(JsValue::Object(object))
     }
 
     pub(in crate::js::runtime) fn error_to_string(&self, receiver: ObjectId) -> JsValue {

@@ -26,6 +26,7 @@ use crate::js::RuntimeLimits;
 use crate::js::ScriptOutcome;
 use crate::js::runtime::convert::required_argument;
 use crate::js::runtime::eval::Completion;
+use crate::js::runtime::types::CallFrame;
 use crate::js::runtime::types::Environment;
 use crate::js::runtime::types::GlobalBinding;
 use crate::js::runtime::types::PromiseRecord;
@@ -76,8 +77,8 @@ pub struct JsRuntime {
     console_messages: Vec<ConsoleMessage>,
     window_event_handlers: BTreeMap<String, Vec<ObjectId>>,
     next_symbol_id: u64,
-    /// Temporary diagnostics ring: active user/native call names.
-    call_stack: Vec<String>,
+    /// Active JavaScript call frames for stack traces and diagnostics.
+    call_stack: Vec<CallFrame>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
@@ -179,11 +180,53 @@ impl JsRuntime {
     /// Drain callbacks registered through `queueMicrotask()` in FIFO order.
     /// The embedding page owns scheduling; the runtime only retains callable
     /// identities from this realm.
-    /// Temporary diagnostics: current JS call stack labels.
+    /// Diagnostics: active call frame labels, innermost last.
     #[doc(hidden)]
     #[must_use]
     pub fn debug_call_stack(&self) -> Vec<String> {
-        self.call_stack.clone()
+        self.call_stack
+            .iter()
+            .map(|frame| frame.name.clone())
+            .collect()
+    }
+
+    /// Innermost-first `    at <frame>` lines for `Error.prototype.stack`.
+    pub(super) fn stack_frame_lines(&self) -> String {
+        let mut lines = String::new();
+        for frame in self.call_stack.iter().rev() {
+            lines.push_str("\n    at ");
+            lines.push_str(&frame.name);
+        }
+        lines
+    }
+
+    /// Render the innermost `limit` frames for compact error trails.
+    pub(super) fn call_frame_trail(&self, limit: usize) -> String {
+        let names = self
+            .call_stack
+            .iter()
+            .rev()
+            .take(limit)
+            .map(|frame| frame.name.clone())
+            .collect::<Vec<_>>();
+        names.iter().rev().cloned().collect::<Vec<_>>().join(" <- ")
+    }
+
+    /// Construct a standard error instance from a global constructor, the
+    /// shared path for thrown-error synthesis and depth-limit `RangeError`s.
+    pub(super) fn construct_standard_error(
+        &mut self,
+        kind: ErrorKind,
+        message: &str,
+    ) -> Result<JsValue, JsError> {
+        let Some(JsValue::Object(constructor)) = self.realm.global(kind.name()) else {
+            return Err(JsError::resource(message.to_owned()));
+        };
+        let argument = JsValue::String(message.to_owned());
+        match self.error_constructor(constructor, kind, &[argument]) {
+            Ok(instance) => Ok(instance),
+            Err(_) => Err(JsError::resource(message.to_owned())),
+        }
     }
 
     pub fn take_pending_microtasks(&mut self) -> Vec<JsMicrotask> {
@@ -451,30 +494,12 @@ impl JsRuntime {
     /// heap cannot admit the error object. The diagnostic trail names the
     /// innermost active frames.
     fn call_depth_exceeded(&mut self) -> JsError {
-        let trail = self
-            .call_stack
-            .iter()
-            .rev()
-            .take(8)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" <- ");
+        let trail = self.call_frame_trail(8);
         let message = format!("Maximum call stack size exceeded (near {trail})");
-        let thrown = match self.realm.global("RangeError") {
-            Some(JsValue::Object(constructor)) => {
-                let argument = JsValue::String(message.clone());
-                match self.error_constructor(constructor, ErrorKind::RangeError, &[argument]) {
-                    Ok(JsValue::Object(instance)) => Some(JsError::thrown_with_message(
-                        JsValue::Object(instance),
-                        message.clone(),
-                    )),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        thrown.unwrap_or_else(|| JsError::resource(message))
+        match self.construct_standard_error(ErrorKind::RangeError, &message) {
+            Ok(instance) => JsError::thrown_with_message(instance, message),
+            Err(_) => JsError::resource(message),
+        }
     }
 
     /// Surface a throw-ready `RangeError` instance with the given message.

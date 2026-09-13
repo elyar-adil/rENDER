@@ -68,10 +68,19 @@ pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub(super) struct UserFunction {
+    pub(super) name: Option<String>,
     pub(super) parameters: Vec<String>,
     pub(super) body: Vec<Statement>,
     pub(super) captured_environment: Vec<Environment>,
     pub(super) lexical_this: Option<JsValue>,
+}
+
+/// One active JavaScript call frame, retained for stack traces and
+/// depth-limit diagnostics. User functions surface their source name;
+/// native entry points surface the Rust variant name.
+#[derive(Clone, Debug)]
+pub(super) struct CallFrame {
+    pub(super) name: String,
 }
 
 #[derive(Clone, Debug)]

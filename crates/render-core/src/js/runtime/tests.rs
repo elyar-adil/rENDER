@@ -1059,3 +1059,71 @@ fn intersection_observer_reports_viewport_entries_and_drives_src_mutation() {
     let outcome = runtime.execute(&mut parsed.dom, "observed").unwrap();
     assert_eq!(outcome.value, JsValue::String("true:1:30".to_owned()));
 }
+
+#[test]
+fn caught_native_errors_materialize_as_standard_error_instances() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var report = '';
+                try { (null).foo; } catch (e) {
+                    report += (e instanceof TypeError) + ':';
+                    report += (e.message === "Cannot read properties of null (reading 'foo')") + ':';
+                    report += typeof e.stack;
+                }
+                report;
+            "#,
+        )
+        .expect("catch executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true:true:string".to_owned())
+    );
+}
+
+#[test]
+fn error_stack_names_active_frames_and_matches_header() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                function outer() {
+                    return new TypeError('boom').stack;
+                }
+                var stack = outer();
+                var ok = stack.indexOf('TypeError: boom') === 0;
+                ok = ok && stack.indexOf('    at outer') !== -1;
+                ok + ':' + stack;
+            ",
+        )
+        .expect("stack capture executes");
+    let JsValue::String(stack) = outcome.value else {
+        panic!("stack should be a string");
+    };
+    let (flag, text) = stack.split_once(':').expect("flag:stack");
+    assert_eq!(flag, "true");
+    assert!(text.contains("TypeError: boom"), "stack: {text}");
+    assert!(text.contains("    at outer"), "stack: {text}");
+}
+
+#[test]
+fn anonymous_frames_get_stable_labels() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var stack = '';
+                (function () { stack = new RangeError('r').stack; })();
+                stack.indexOf('    at <anonymous fn #') !== -1;
+            ",
+        )
+        .expect("anonymous frame executes");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
