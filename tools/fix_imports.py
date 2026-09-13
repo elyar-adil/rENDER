@@ -5,18 +5,21 @@ import subprocess
 import sys
 from pathlib import Path
 
+import argparse
+
 ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "crates/render-core/src/js/runtime"
-
-# name -> defining module (kept in sync with split_runtime.py choices)
-DEF_FILES = {}
-for f in OUT.glob("*.rs") :
-    pass
-
+MODULE_DIR = {
+    "runtime": ROOT / "crates/render-core/src/js/runtime",
+    "solver": ROOT / "crates/render-core/src/layout/solver",
+}
+NAMES_FILE = {
+    "runtime": ROOT / "tools/names.json",
+    "solver": ROOT / "tools/names_solver.json",
+}
 
 def run_check():
     proc = subprocess.run(
-        ["cargo", "check", "-p", "render-core", "--all-targets", "--message-format=json"],
+        ARGS.cargo,
         cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     msgs = []
@@ -55,12 +58,16 @@ def delete_line(path, lineno):
     return False
 
 
-NAME_MAP = json.loads((ROOT / "tools" / "names.json").read_text(encoding="utf-8"))
-
-
 def find_def(name):
     return NAME_MAP.get(name)
 
+
+parser = argparse.ArgumentParser()
+parser.add_argument("module", choices=sorted(MODULE_DIR))
+ARGS = parser.parse_args()
+OUT = MODULE_DIR[ARGS.module]
+NAME_MAP = json.loads(NAMES_FILE[ARGS.module].read_text(encoding="utf-8"))
+ARGS.cargo = ["cargo", "check", "-p", "render-core", "--all-targets", "--message-format=json"]
 
 fixed_total = 0
 for iteration in range(20):
