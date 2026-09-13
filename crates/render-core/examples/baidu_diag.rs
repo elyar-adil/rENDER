@@ -18,10 +18,29 @@ use render_core::html::parse_document;
 use render_core::js::JsRuntime;
 use url::Url;
 
-const BASE_URL: &str = "http://www.baidu.com/";
+const DEFAULT_BASE_URL: &str = "http://www.baidu.com/";
+
+fn base_url() -> Url {
+    let raw = std::env::var("RENDER_DIAG_BASE").unwrap_or_else(|_| DEFAULT_BASE_URL.to_owned());
+    Url::parse(&raw).unwrap_or_else(|_| Url::parse(DEFAULT_BASE_URL).expect("default base URL"))
+}
 const MAX_REPORTED_ERRORS: usize = 40;
 
 fn main() -> ExitCode {
+    // The interpreter and parser recurse deeply on minified real-world
+    // scripts; the default main-thread stack overflows. Mirror the browser
+    // shell and run everything on a dedicated big-stack thread.
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(diag_main)
+        .expect("spawn diag thread");
+    match handle.join() {
+        Ok(code) => code,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn diag_main() -> ExitCode {
     let mut arguments = std::env::args().skip(1);
     let Some(html_path) = arguments.next() else {
         eprintln!("usage: baidu_diag <saved.html> [assets-dir]");
@@ -176,13 +195,13 @@ fn resolve_against_base(reference: &str) -> Option<Url> {
         reference.to_owned()
     };
     Url::options()
-        .base_url(Some(&Url::parse(BASE_URL).ok()?))
+        .base_url(Some(&base_url()))
         .parse(&expanded)
         .ok()
 }
 
 fn run_scripts(dom: &mut render_core::dom::Dom, scripts: &[PendingScript]) {
-    let base = Url::parse(BASE_URL).expect("base URL");
+    let base = base_url();
     let mut runtime = JsRuntime::with_url(dom, &base);
     let mut errors = 0;
     for script in scripts {
