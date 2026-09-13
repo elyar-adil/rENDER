@@ -75,6 +75,33 @@ impl JsRuntime {
             NativeFunction::ObjectDefineGetter => {
                 self.object_define_accessor(receiver, arguments, true)
             }
+            NativeFunction::ObjectPreventExtensions => {
+                let object = self.integrity_target(arguments, "preventExtensions")?;
+                self.realm.prevent_extensions(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectSeal => {
+                let object = self.integrity_target(arguments, "seal")?;
+                self.realm.seal_object(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectFreeze => {
+                let object = self.integrity_target(arguments, "freeze")?;
+                self.realm.freeze_object(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectIsExtensible => {
+                let object = self.integrity_target(arguments, "isExtensible")?;
+                Ok(JsValue::Boolean(self.realm.is_extensible(object)))
+            }
+            NativeFunction::ObjectIsSealed => {
+                let object = self.integrity_target(arguments, "isSealed")?;
+                Ok(JsValue::Boolean(self.realm.is_sealed(object)))
+            }
+            NativeFunction::ObjectIsFrozen => {
+                let object = self.integrity_target(arguments, "isFrozen")?;
+                Ok(JsValue::Boolean(self.realm.is_frozen(object)))
+            }
             NativeFunction::ObjectDefineSetter => {
                 self.object_define_accessor(receiver, arguments, false)
             }

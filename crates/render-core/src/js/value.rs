@@ -89,25 +89,6 @@ pub(crate) fn location_components(url: &Url) -> [(&'static str, String); 9] {
     ]
 }
 
-fn sort_property_names(names: &mut [String]) {
-    names.sort_by(|left, right| {
-        match (
-            left.parse::<u32>()
-                .ok()
-                .filter(|index| index.to_string() == *left),
-            right
-                .parse::<u32>()
-                .ok()
-                .filter(|index| index.to_string() == *right),
-        ) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => left.cmp(right),
-        }
-    });
-}
-
 /// An own property descriptor: either a data property (value slot) or an
 /// accessor property (getter/setter function objects).
 #[derive(Clone, Debug, PartialEq)]
@@ -353,6 +334,12 @@ pub(crate) enum NativeFunction {
     ObjectPrototypePropertyIsEnumerable,
     ObjectPrototypeToString,
     ObjectDefineGetter,
+    ObjectPreventExtensions,
+    ObjectSeal,
+    ObjectFreeze,
+    ObjectIsExtensible,
+    ObjectIsSealed,
+    ObjectIsFrozen,
     ObjectDefineSetter,
     ObjectLookupGetter,
     ObjectLookupSetter,
@@ -683,11 +670,29 @@ pub(crate) struct MutationWatch {
 
 /// An object stored in a realm. Host identity is intentionally private: DOM
 /// wrappers can only be created by the binding layer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct JsObject {
     properties: BTreeMap<String, PropertyDescriptor>,
+    /// String keys in first-insertion order (spec own-key ordering pairs
+    /// this with ascending integer indices). Keys absent from the list
+    /// (bootstrap-installed builtins) enumerate in map order after it.
+    key_order: Vec<String>,
     prototype: Option<ObjectId>,
     pub(crate) host: ObjectHost,
+    /// `Object.preventExtensions` and friends; every object starts extensible.
+    extensible: bool,
+}
+
+impl Default for JsObject {
+    fn default() -> Self {
+        Self {
+            properties: BTreeMap::new(),
+            key_order: Vec::new(),
+            prototype: None,
+            host: ObjectHost::default(),
+            extensible: true,
+        }
+    }
 }
 
 impl JsObject {
@@ -1913,6 +1918,12 @@ impl Realm {
             ),
             ("getPrototypeOf", NativeFunction::ObjectGetPrototypeOf),
             ("hasOwn", NativeFunction::ObjectHasOwn),
+            ("preventExtensions", NativeFunction::ObjectPreventExtensions),
+            ("seal", NativeFunction::ObjectSeal),
+            ("freeze", NativeFunction::ObjectFreeze),
+            ("isExtensible", NativeFunction::ObjectIsExtensible),
+            ("isSealed", NativeFunction::ObjectIsSealed),
+            ("isFrozen", NativeFunction::ObjectIsFrozen),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -2962,8 +2973,89 @@ impl Realm {
         {
             return false;
         }
+        if !target.properties.contains_key(&key) {
+            if !target.extensible {
+                return false;
+            }
+            target.key_order.push(key.clone());
+        }
         target.properties.insert(key, descriptor);
         true
+    }
+
+    /// `Object.preventExtensions`: new own properties are rejected.
+    pub(crate) fn prevent_extensions(&mut self, object: ObjectId) -> bool {
+        let Some(target) = self.objects.get_mut(object.0) else {
+            return false;
+        };
+        target.extensible = false;
+        true
+    }
+
+    /// `Object.seal`: no new properties and every own property becomes
+    /// non-configurable.
+    pub(crate) fn seal_object(&mut self, object: ObjectId) -> bool {
+        if !self.prevent_extensions(object) {
+            return false;
+        }
+        let Some(target) = self.objects.get_mut(object.0) else {
+            return false;
+        };
+        for descriptor in target.properties.values_mut() {
+            descriptor.configurable = false;
+        }
+        true
+    }
+
+    /// `Object.freeze`: seal semantics plus non-writable data values.
+    pub(crate) fn freeze_object(&mut self, object: ObjectId) -> bool {
+        if !self.seal_object(object) {
+            return false;
+        }
+        let Some(target) = self.objects.get_mut(object.0) else {
+            return false;
+        };
+        for descriptor in target.properties.values_mut() {
+            if !descriptor.is_accessor() {
+                descriptor.writable = false;
+            }
+        }
+        true
+    }
+
+    #[must_use]
+    pub(crate) fn is_extensible(&self, object: ObjectId) -> bool {
+        self.objects
+            .get(object.0)
+            .is_some_and(|target| target.extensible)
+    }
+
+    /// Sealed: not extensible and every own property non-configurable.
+    #[must_use]
+    pub(crate) fn is_sealed(&self, object: ObjectId) -> bool {
+        let Some(target) = self.objects.get(object.0) else {
+            return false;
+        };
+        !target.extensible
+            && target
+                .properties
+                .values()
+                .all(|descriptor| !descriptor.configurable)
+    }
+
+    /// Frozen: sealed and every own data property non-writable.
+    #[must_use]
+    pub(crate) fn is_frozen(&self, object: ObjectId) -> bool {
+        if !self.is_sealed(object) {
+            return false;
+        }
+        let Some(target) = self.objects.get(object.0) else {
+            return false;
+        };
+        !target
+            .properties
+            .values()
+            .any(|descriptor| !descriptor.is_accessor() && descriptor.writable)
     }
 
     #[must_use]
@@ -3074,41 +3166,52 @@ impl Realm {
         &self,
         object: ObjectId,
     ) -> Option<Vec<(String, JsValue)>> {
+        let keys = self.own_property_names(object)?;
         let target = self.objects.get(object.0)?;
-        let mut properties = target
-            .properties
-            .iter()
-            .filter(|(_, descriptor)| descriptor.enumerable)
-            .map(|(key, descriptor)| (key.clone(), descriptor.value.clone()))
-            .collect::<Vec<_>>();
-        properties.sort_by(|(left, _), (right, _)| {
-            match (
-                left.parse::<u32>()
-                    .ok()
-                    .filter(|index| index.to_string() == *left),
-                right
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|index| index.to_string() == *right),
-            ) {
-                (Some(left), Some(right)) => left.cmp(&right),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => left.cmp(right),
+        let mut properties = Vec::new();
+        for key in keys {
+            let Some(descriptor) = target.properties.get(&key) else {
+                continue;
+            };
+            if descriptor.enumerable {
+                properties.push((key, descriptor.value.clone()));
             }
-        });
+        }
         Some(properties)
     }
 
     pub(crate) fn own_property_names(&self, object: ObjectId) -> Option<Vec<String>> {
-        let mut names = self
-            .objects
-            .get(object.0)?
+        let target = self.objects.get(object.0)?;
+        let is_index = |key: &str| {
+            key.parse::<u32>()
+                .ok()
+                .filter(|index| index.to_string() == key)
+        };
+        // Integer indices ascend first; the remaining string keys follow
+        // first-insertion order, then any bootstrap keys the order list
+        // does not track.
+        let mut indices = target
             .properties
             .keys()
+            .filter(|key| is_index(key).is_some())
             .cloned()
             .collect::<Vec<_>>();
-        sort_property_names(&mut names);
+        indices.sort_by_key(|key| is_index(key).unwrap_or(0));
+        let ordered = target
+            .key_order
+            .iter()
+            .filter(|key| target.properties.contains_key(*key) && is_index(key).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let untracked = target
+            .properties
+            .keys()
+            .filter(|key| is_index(key).is_none() && !target.key_order.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut names = indices;
+        names.extend(ordered);
+        names.extend(untracked);
         Some(names)
     }
 
@@ -3145,15 +3248,18 @@ impl Realm {
             return false;
         }
         target.properties.remove(key);
+        target.key_order.retain(|ordered| ordered != key);
         true
     }
 
     pub(crate) fn remove_property(&mut self, object: ObjectId, key: &str) -> Option<JsValue> {
-        self.objects
-            .get_mut(object.0)?
-            .properties
-            .remove(key)
-            .map(|descriptor| descriptor.value)
+        let target = self.objects.get_mut(object.0)?;
+        if let Some(removed) = target.properties.remove(key) {
+            target.key_order.retain(|ordered| ordered != key);
+            Some(removed.value)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {
@@ -3166,6 +3272,10 @@ impl Realm {
             }
             property.value = value;
         } else {
+            if !target.extensible {
+                return false;
+            }
+            target.key_order.push(key.clone());
             target
                 .properties
                 .insert(key, PropertyDescriptor::data(value));

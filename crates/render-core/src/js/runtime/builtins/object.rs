@@ -146,6 +146,33 @@ impl JsRuntime {
             NativeFunction::ObjectDefineGetter => {
                 self.object_define_accessor(receiver, arguments, true)
             }
+            NativeFunction::ObjectPreventExtensions => {
+                let object = self.integrity_target(arguments, "preventExtensions")?;
+                self.realm.prevent_extensions(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectSeal => {
+                let object = self.integrity_target(arguments, "seal")?;
+                self.realm.seal_object(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectFreeze => {
+                let object = self.integrity_target(arguments, "freeze")?;
+                self.realm.freeze_object(object);
+                Ok(JsValue::Object(object))
+            }
+            NativeFunction::ObjectIsExtensible => {
+                let object = self.integrity_target(arguments, "isExtensible")?;
+                Ok(JsValue::Boolean(self.realm.is_extensible(object)))
+            }
+            NativeFunction::ObjectIsSealed => {
+                let object = self.integrity_target(arguments, "isSealed")?;
+                Ok(JsValue::Boolean(self.realm.is_sealed(object)))
+            }
+            NativeFunction::ObjectIsFrozen => {
+                let object = self.integrity_target(arguments, "isFrozen")?;
+                Ok(JsValue::Boolean(self.realm.is_frozen(object)))
+            }
             NativeFunction::ObjectDefineSetter => {
                 self.object_define_accessor(receiver, arguments, false)
             }
@@ -219,6 +246,20 @@ impl JsRuntime {
             _ => None,
         };
         Ok(slot.map_or(JsValue::Undefined, JsValue::Object))
+    }
+    /// Normalized first argument of the object-integrity builtins:
+    /// primitives coerce to their wrapper, mirroring `Object(...)`.
+    pub(in crate::js::runtime) fn integrity_target(
+        &mut self,
+        arguments: &[JsValue],
+        name: &str,
+    ) -> Result<ObjectId, JsError> {
+        let value = required_argument(arguments, 0, name)?;
+        match value {
+            JsValue::Object(object) => Ok(*object),
+            JsValue::Null | JsValue::Undefined => Ok(self.realm.global_object()),
+            other => self.coerce_member_base(other, name),
+        }
     }
 }
 

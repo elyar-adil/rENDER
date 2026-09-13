@@ -174,7 +174,7 @@ fn object_reflection_and_assignment_cover_common_runtime_usage() {
                 "#,
             )
             .expect("Object builtins should execute");
-    assert_eq!(outcome.value, JsValue::String("ab12true1".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("ba21true1".to_owned()));
 }
 
 #[test]
@@ -412,7 +412,7 @@ fn property_helper_primordials_can_be_uncurried() {
         .expect("propertyHelper primordial operations should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("a;b;c:hidden,visible:32".to_owned())
+        JsValue::String("a;b;c:visible,hidden:32".to_owned())
     );
 }
 
@@ -940,7 +940,7 @@ fn json_and_date_builtins_cover_real_world_bootstrap_scripts() {
     assert_eq!(
             outcome.value,
             JsValue::String(
-                "{\"items\":[1,true,null],\"name\":\"rENDER\"}|1787488496789|2026|7|23|12|2026-08-23T12:34:56.789Z|1787443200000"
+                "{\"name\":\"rENDER\",\"items\":[1,true,null]}|1787488496789|2026|7|23|12|2026-08-23T12:34:56.789Z|1787443200000"
                     .to_owned()
             )
         );
@@ -1245,5 +1245,55 @@ fn object_literal_accessors_and_define_getter_family_agree() {
     assert_eq!(
         outcome.value,
         JsValue::String("true,true:function".to_owned())
+    );
+}
+
+#[test]
+fn object_integrity_levels_freeze_seal_and_extension_guards() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var report = [];
+                var frozen = Object.freeze({ keep: 1 });
+                report.push(Object.isFrozen(frozen));
+                report.push(Object.isExtensible(frozen) === false);
+                frozen.keep = 2;
+                report.push(frozen.keep === 1);
+                report.push(Object.isSealed(Object.seal({ x: 1 })));
+                var open = Object.preventExtensions({ y: 1 });
+                report.push(Object.isExtensible(open) === false);
+                var grew = false;
+                try { open.z = 1; grew = open.z === 1; } catch (e) { grew = false; }
+                report.push(grew === false);
+                report.join(',');
+            ",
+        )
+        .expect("integrity builtins execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true".to_owned())
+    );
+}
+
+#[test]
+fn own_string_keys_enumerate_in_insertion_order() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var literal = { second: 1, first: 2 };
+                literal.third = 3;
+                Object.getOwnPropertyNames(literal).join(',') + ':' + Object.keys(literal).join(',');
+            ",
+        )
+        .expect("ordering probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("second,first,third:second,first,third".to_owned())
     );
 }

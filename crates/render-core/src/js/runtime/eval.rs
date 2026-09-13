@@ -1352,11 +1352,9 @@ impl JsRuntime {
                 }
                 return Ok(());
             }
-            if !self.realm.set_property(object, key.to_owned(), value) {
-                return Err(JsError::type_error(format!(
-                    "property {key:?} is not writable"
-                )));
-            }
+            // Sloppy-mode [[Set]]: a non-writable data property silently
+            // ignores the write (strict mode would throw).
+            self.realm.set_property(object, key.to_owned(), value);
             return Ok(());
         }
         let inherited = self.realm.get_descriptor(object, key);
