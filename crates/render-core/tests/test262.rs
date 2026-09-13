@@ -20,6 +20,7 @@ use render_core::js::{CompiledScript, JsError, JsErrorKind, JsRuntime, RuntimeLi
 
 const TEST262_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/test262");
 const REVISION: &str = "5ef1e5723be95296f36afb0386676fed0205869c";
+const BASELINE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test262-baseline.tsv");
 
 static DEFAULT_HARNESS: OnceLock<Result<Vec<CompiledScript>, String>> = OnceLock::new();
 
@@ -135,6 +136,115 @@ fn pinned_test262_manifest_reports_a_real_baseline() {
             sample.detail
         );
     }
+
+    let full_run = env::var("RENDER_TEST262_PATH_PREFIX").is_err()
+        && env_usize("RENDER_TEST262_MAX_FILES").is_none();
+    if env::var_os("RENDER_TEST262_UPDATE_BASELINE").is_some() {
+        write_baseline(&summary.buckets);
+        println!("test262 baseline rewritten: {BASELINE_PATH}");
+    } else if full_run {
+        enforce_baseline(&summary.buckets);
+        println!(
+            "test262 baseline gate: {} buckets ok",
+            summary.buckets.len()
+        );
+    }
+}
+
+/// First two path segments ("built-ins/Array", "language/statements", ...):
+/// fine enough that a regression in one area cannot hide behind another.
+fn baseline_bucket(path: &str) -> &'static str {
+    let mut segments = path.split('/');
+    match (segments.next(), segments.next()) {
+        (Some(first), Some(second)) => {
+            let mut bucket = String::from(first);
+            bucket.push('/');
+            bucket.push_str(second);
+            // Leaked on purpose: bucket strings are tiny, bounded by the
+            // test262 directory layout, and live for the process lifetime.
+            Box::leak(bucket.into_boxed_str())
+        }
+        _ => "other",
+    }
+}
+
+fn write_baseline(buckets: &BTreeMap<String, [usize; 6]>) {
+    use std::fmt::Write as _;
+    let index_of = |status: Status| {
+        Status::ALL
+            .iter()
+            .position(|candidate| *candidate == status)
+            .expect("known")
+    };
+    let mut output = String::from(
+        "# test262 conformance baseline (bucket\tpass\tfail\ttimeout\tcrash\ttotal)\n",
+    );
+    for (bucket, counts) in buckets {
+        let pass = counts[index_of(Status::Pass)];
+        let fail = counts[index_of(Status::Fail)];
+        let timeout = counts[index_of(Status::Timeout)];
+        let crash = counts[index_of(Status::Crash)];
+        let total: usize = counts.iter().sum();
+        let _ = writeln!(
+            output,
+            "{bucket}\t{pass}\t{fail}\t{timeout}\t{crash}\t{total}"
+        );
+    }
+    std::fs::write(BASELINE_PATH, output).expect("write test262 baseline");
+}
+
+fn parse_baseline(text: &str) -> Vec<(String, usize, usize)> {
+    text.lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let fields = line.split('\t').collect::<Vec<_>>();
+            (
+                fields[0].to_owned(),
+                fields[1].parse::<usize>().expect("baseline pass count"),
+                fields[5].parse::<usize>().expect("baseline total"),
+            )
+        })
+        .collect()
+}
+
+/// Gate a full run against the checked-in baseline: a bucket must not lose
+/// passes that this run's own timeouts or crashes do not explain (timing
+/// flakes and cross-platform stack differences stay tolerated; a genuine
+/// Fail never is).
+fn enforce_baseline(buckets: &BTreeMap<String, [usize; 6]>) {
+    let text = std::fs::read_to_string(BASELINE_PATH).unwrap_or_else(|error| {
+        panic!(
+            "test262 baseline {BASELINE_PATH} is missing (generate it with \
+             RENDER_TEST262_UPDATE_BASELINE=1): {error}"
+        )
+    });
+    let index_of = |status: Status| {
+        Status::ALL
+            .iter()
+            .position(|candidate| *candidate == status)
+            .expect("known")
+    };
+    let mut regressions = Vec::new();
+    for (bucket, pass, total) in parse_baseline(&text) {
+        let Some(counts) = buckets.get(&bucket) else {
+            regressions.push(format!(
+                "{bucket}: missing from this run (baseline total {total})"
+            ));
+            continue;
+        };
+        let current_pass = counts[index_of(Status::Pass)];
+        let excused = counts[index_of(Status::Timeout)] + counts[index_of(Status::Crash)];
+        if current_pass + excused < pass {
+            regressions.push(format!(
+                "{bucket}: pass {current_pass} + excused {excused} < baseline {pass}"
+            ));
+        }
+    }
+    assert!(
+        regressions.is_empty(),
+        "test262 conformance regressed against the baseline:\n{}",
+        regressions.join("\n")
+    );
 }
 
 #[derive(Debug, Default)]
@@ -142,6 +252,9 @@ struct Summary {
     variants: usize,
     counts: [usize; 6],
     categories: BTreeMap<String, [usize; 6]>,
+    /// Fine-grained per-area buckets (first two path segments) used for the
+    /// checked-in conformance baseline.
+    buckets: BTreeMap<String, [usize; 6]>,
     clusters: BTreeMap<String, usize>,
     samples: Vec<ResultRecord>,
 }
@@ -156,6 +269,12 @@ impl Summary {
         self.counts[index] = self.counts[index].saturating_add(1);
         self.categories
             .entry(category_for_path(&record.path).to_owned())
+            .or_default()[index] += 1;
+        self.buckets
+            .entry(baseline_bucket(&record.path).to_owned())
+            .or_default()[index] += 1;
+        self.buckets
+            .entry(baseline_bucket(&record.path).to_owned())
             .or_default()[index] += 1;
         if record.status != Status::Pass {
             *self
@@ -918,6 +1037,42 @@ fn parse_list(value: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod runner_tests {
+    #[test]
+    fn baseline_parser_reads_bucket_pass_and_total_columns() {
+        let text = "# comment
+built-ins/Array	420	7	1	0	900
+language	88	2	0	1	200
+";
+        let parsed = super::parse_baseline(text);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].0, "built-ins/Array");
+        assert_eq!(parsed[0].1, 420);
+        assert_eq!(parsed[0].2, 900);
+        assert_eq!(parsed[1].0, "language");
+        assert_eq!(parsed[1].1, 88);
+    }
+
+    #[test]
+    fn baseline_bucket_uses_first_two_path_segments() {
+        assert_eq!(
+            super::baseline_bucket("built-ins/Array/from.js"),
+            "built-ins/Array"
+        );
+        assert_eq!(
+            super::baseline_bucket("language/statements/for-of/x.js"),
+            "language/statements"
+        );
+        assert_eq!(
+            super::baseline_bucket("staging/Smoke.js"),
+            "staging/Smoke.js"
+                .split('/')
+                .take(2)
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(super::baseline_bucket("loose.js"), "other");
+    }
+
     use render_core::js::{CompiledScript, RuntimeLimits};
 
     use super::{Status, parse_metadata, path_matches_prefix, run_manifest_case, run_variant};
