@@ -1426,3 +1426,31 @@ fn for_of_and_spread_drive_map_set_and_custom_iterators() {
         JsValue::String("true,true,true,true,true".to_owned())
     );
 }
+
+#[test]
+fn to_primitive_and_has_instance_hooks_participate() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var boxed = { toString: function () { return 'plain'; } };
+                boxed[Symbol.toPrimitive] = function (hint) { return 'prim:' + hint; };
+                results.push(String(boxed) === 'prim:string');
+                results.push(boxed * 1 === 'prim:default' * 1 || typeof (boxed * 1) === 'number');
+                results.push(`${boxed}` === 'prim:default');
+                classLike = function () {};
+                classLike[Symbol.hasInstance] = function (v) { return v === 'member'; };
+                results.push('member' instanceof classLike);
+                results.push(!('other' instanceof classLike));
+                results.join(',');
+            ",
+        )
+        .expect("hook probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true".to_owned())
+    );
+}

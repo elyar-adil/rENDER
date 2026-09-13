@@ -16,6 +16,7 @@
 use crate::dom::Dom;
 use crate::js::JsError;
 use crate::js::JsObject;
+use crate::js::JsSymbol;
 use crate::js::JsValue;
 use crate::js::ObjectId;
 use crate::js::PropertyDescriptor;
@@ -819,10 +820,12 @@ impl JsRuntime {
         object: ObjectId,
     ) -> String {
         // ECMA-262 Object.prototype.toString step 7: a string-valued
-        // `Symbol.toStringTag` (emulated here as the "@@toStringTag" key)
-        // overrides the builtin tag. Real-world polyfills (core-js) probe
-        // this before selecting their fast paths.
-        if let Some(JsValue::String(tag)) = self.realm.get_property(object, "@@toStringTag") {
+        // `Symbol.toStringTag` overrides the builtin tag. Real-world
+        // polyfills (core-js) probe this before selecting their fast paths.
+        let to_string_tag = JsSymbol::well_known("@@toStringTag");
+        if let Some(descriptor) = self.realm.get_symbol_descriptor(object, &to_string_tag)
+            && let JsValue::String(tag) = descriptor.value
+        {
             return format!("[object {tag}]");
         }
         let host_tag = match self.realm.host(object) {

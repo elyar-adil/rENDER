@@ -2564,10 +2564,16 @@ impl Realm {
             );
         }
         // `Symbol.prototype[Symbol.toStringTag] === "Symbol"`
-        objects[prototype.0].properties.insert(
-            JsSymbol::well_known("@@toStringTag").id().to_string(),
-            PropertyDescriptor::builtin(JsValue::String("Symbol".to_owned())),
-        );
+        {
+            let tag = JsSymbol::well_known("@@toStringTag");
+            objects[prototype.0].symbols.insert(
+                tag.id(),
+                (
+                    tag,
+                    PropertyDescriptor::builtin(JsValue::String("Symbol".to_owned())),
+                ),
+            );
+        }
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {

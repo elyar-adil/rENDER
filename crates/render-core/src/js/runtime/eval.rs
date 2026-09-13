@@ -1564,6 +1564,36 @@ impl JsRuntime {
             }
             _ => {}
         }
+        // An exotic `Symbol.toPrimitive` method gets first refusal, called
+        // with the coercion hint; a primitive result short-circuits.
+        let hint = if prefer_string { "string" } else { "default" };
+        let to_primitive_method = self
+            .realm
+            .get_symbol_descriptor(object, &JsSymbol::well_known("@@toPrimitive"))
+            .and_then(|descriptor| {
+                if descriptor.is_accessor() {
+                    descriptor.getter
+                } else {
+                    match descriptor.value {
+                        JsValue::Object(function) => Some(function),
+                        _ => None,
+                    }
+                }
+            });
+        if let Some(method) = to_primitive_method {
+            let invoked = self.call_with_this(
+                dom,
+                method,
+                &[JsValue::String(hint.to_owned())],
+                JsValue::Object(object),
+            )?;
+            if !matches!(invoked, JsValue::Object(_)) {
+                return Ok(invoked);
+            }
+            return Err(JsError::type_error(
+                "Cannot convert object to primitive value",
+            ));
+        }
         let method_order: [&str; 2] = if prefer_string {
             ["toString", "valueOf"]
         } else {
@@ -1950,7 +1980,7 @@ impl JsRuntime {
             return Ok(right);
         }
         if operator == BinaryOp::Instanceof {
-            return self.instanceof(&left, &right).map(JsValue::Boolean);
+            return self.instanceof(dom, &left, &right).map(JsValue::Boolean);
         }
         if operator == BinaryOp::In {
             return self.property_in(&left, &right).map(JsValue::Boolean);
@@ -2031,7 +2061,8 @@ impl JsRuntime {
     }
 
     pub(super) fn instanceof(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         value: &JsValue,
         constructor: &JsValue,
     ) -> Result<bool, JsError> {
@@ -2041,6 +2072,31 @@ impl JsRuntime {
                 "right-hand side of instanceof is not callable: host={:?}",
                 self.realm.host(constructor)
             )));
+        }
+        // `Symbol.hasInstance` overrides the prototype-chain walk.
+        let has_instance_method = self
+            .realm
+            .get_symbol_descriptor(constructor, &JsSymbol::well_known("@@hasInstance"))
+            .and_then(|descriptor| {
+                if descriptor.is_accessor() {
+                    descriptor.getter
+                } else {
+                    match descriptor.value {
+                        JsValue::Object(function) => Some(function),
+                        _ => None,
+                    }
+                }
+            });
+        if let Some(method) =
+            has_instance_method.filter(|method| Self::is_callable_object(*method, &self.realm))
+        {
+            let result = self.call_with_this(
+                dom,
+                method,
+                std::slice::from_ref(value),
+                JsValue::Object(constructor),
+            )?;
+            return Ok(result.is_truthy());
         }
         let prototype = self
             .realm
