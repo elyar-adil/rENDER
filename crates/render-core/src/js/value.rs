@@ -739,6 +739,9 @@ pub(crate) struct MutationWatch {
 #[derive(Clone, Debug)]
 pub struct JsObject {
     properties: BTreeMap<String, PropertyDescriptor>,
+    /// Symbol-keyed properties, keyed by symbol id with the owning symbol
+    /// kept alongside so descriptions survive (`getOwnPropertySymbols`).
+    symbols: BTreeMap<u64, (JsSymbol, PropertyDescriptor)>,
     /// String keys in first-insertion order (spec own-key ordering pairs
     /// this with ascending integer indices). Keys absent from the list
     /// (bootstrap-installed builtins) enumerate in map order after it.
@@ -753,6 +756,7 @@ impl Default for JsObject {
     fn default() -> Self {
         Self {
             properties: BTreeMap::new(),
+            symbols: BTreeMap::new(),
             key_order: Vec::new(),
             prototype: None,
             host: ObjectHost::default(),
@@ -778,7 +782,11 @@ impl JsObject {
     /// treat as strong references just like values.
     pub(crate) fn property_object_references(&self) -> Vec<ObjectId> {
         let mut references = Vec::new();
-        for descriptor in self.properties.values() {
+        for descriptor in self
+            .properties
+            .values()
+            .chain(self.symbols.values().map(|(_, descriptor)| descriptor))
+        {
             if descriptor.is_accessor() {
                 references.extend(descriptor.getter);
                 references.extend(descriptor.setter);
@@ -3117,6 +3125,9 @@ impl Realm {
         for descriptor in target.properties.values_mut() {
             descriptor.configurable = false;
         }
+        for (_, descriptor) in target.symbols.values_mut() {
+            descriptor.configurable = false;
+        }
         true
     }
 
@@ -3129,6 +3140,11 @@ impl Realm {
             return false;
         };
         for descriptor in target.properties.values_mut() {
+            if !descriptor.is_accessor() {
+                descriptor.writable = false;
+            }
+        }
+        for (_, descriptor) in target.symbols.values_mut() {
             if !descriptor.is_accessor() {
                 descriptor.writable = false;
             }
@@ -3153,6 +3169,7 @@ impl Realm {
             && target
                 .properties
                 .values()
+                .chain(target.symbols.values().map(|(_, descriptor)| descriptor))
                 .all(|descriptor| !descriptor.configurable)
     }
 
@@ -3168,6 +3185,7 @@ impl Realm {
         !target
             .properties
             .values()
+            .chain(target.symbols.values().map(|(_, descriptor)| descriptor))
             .any(|descriptor| !descriptor.is_accessor() && descriptor.writable)
     }
 
@@ -3252,6 +3270,94 @@ impl Realm {
 
     pub(crate) fn own_property(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
         self.objects.get(object.0)?.properties.get(key).cloned()
+    }
+
+    pub(crate) fn own_symbol_property(
+        &self,
+        object: ObjectId,
+        symbol: &JsSymbol,
+    ) -> Option<PropertyDescriptor> {
+        self.objects
+            .get(object.0)?
+            .symbols
+            .get(&symbol.id())
+            .map(|(_, descriptor)| descriptor.clone())
+    }
+
+    /// Prototype-chain descriptor lookup for a symbol-keyed property.
+    pub(crate) fn get_symbol_descriptor(
+        &self,
+        object: ObjectId,
+        symbol: &JsSymbol,
+    ) -> Option<PropertyDescriptor> {
+        let mut candidate = Some(object);
+        let mut visited = 0usize;
+        while let Some(id) = candidate {
+            let current = self.objects.get(id.0)?;
+            if let Some((_, descriptor)) = current.symbols.get(&symbol.id()) {
+                return Some(descriptor.clone());
+            }
+            candidate = current.prototype;
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Create or overwrite an own symbol-keyed property, honouring
+    /// non-configurable descriptors and object extensibility.
+    pub(crate) fn define_symbol_property(
+        &mut self,
+        object: ObjectId,
+        symbol: &JsSymbol,
+        descriptor: PropertyDescriptor,
+    ) -> bool {
+        let Some(target) = self.objects.get_mut(object.0) else {
+            return false;
+        };
+        if target
+            .symbols
+            .get(&symbol.id())
+            .is_some_and(|(_, current)| !current.configurable)
+        {
+            return false;
+        }
+        if !target.symbols.contains_key(&symbol.id()) && !target.extensible {
+            return false;
+        }
+        target
+            .symbols
+            .insert(symbol.id(), (symbol.clone(), descriptor));
+        true
+    }
+
+    pub(crate) fn delete_symbol_property(&mut self, object: ObjectId, symbol: &JsSymbol) -> bool {
+        let Some(target) = self.objects.get_mut(object.0) else {
+            return false;
+        };
+        if target
+            .symbols
+            .get(&symbol.id())
+            .is_some_and(|(_, descriptor)| !descriptor.configurable)
+        {
+            return false;
+        }
+        target.symbols.remove(&symbol.id()).is_some()
+    }
+
+    /// Own symbol-keyed property symbols, id order, for
+    /// `Object.getOwnPropertySymbols`.
+    pub(crate) fn own_symbols(&self, object: ObjectId) -> Option<Vec<JsSymbol>> {
+        Some(
+            self.objects
+                .get(object.0)?
+                .symbols
+                .values()
+                .map(|(symbol, _)| symbol.clone())
+                .collect(),
+        )
     }
 
     /// Prototype-chain descriptor lookup (`[[GetOwnProperty]]` along the

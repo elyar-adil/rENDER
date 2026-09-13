@@ -21,6 +21,7 @@ use crate::html::serialize_html_node;
 use crate::js::JsError;
 use crate::js::JsErrorKind;
 use crate::js::JsObject;
+use crate::js::JsSymbol;
 use crate::js::JsValue;
 use crate::js::ObjectId;
 use crate::js::PropertyDescriptor;
@@ -78,6 +79,7 @@ pub(super) enum Completion {
 pub(super) enum AssignmentReference {
     Binding(String),
     Property { object: ObjectId, property: String },
+    SymbolProperty { object: ObjectId, symbol: JsSymbol },
 }
 
 pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
@@ -1047,9 +1049,13 @@ impl JsRuntime {
                 object, property, ..
             } => {
                 let evaluated = self.evaluate(dom, object)?;
-                let key = self.evaluate(dom, property)?.to_js_string();
-                let object = self.coerce_member_base(&evaluated, &key)?;
-                self.get_member(dom, object, &key)
+                let key_value = self.evaluate(dom, property)?;
+                let receiver = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
+                if let JsValue::Symbol(symbol) = &key_value {
+                    return self.get_symbol_value(dom, receiver, symbol);
+                }
+                let key = key_value.to_js_string();
+                self.get_member(dom, receiver, &key)
             }
             Expr::New {
                 constructor,
@@ -1145,11 +1151,15 @@ impl JsRuntime {
                 object, property, ..
             } => {
                 let evaluated = self.evaluate(dom, object)?;
-                let key = self.evaluate(dom, property)?.to_js_string();
-                let object = self.coerce_member_base(&evaluated, &key)?;
+                let key_value = self.evaluate(dom, property)?;
+                let key_text = key_value.to_js_string();
+                let object = self.coerce_member_base(&evaluated, &key_text)?;
+                if let JsValue::Symbol(symbol) = key_value {
+                    return Ok(AssignmentReference::SymbolProperty { object, symbol });
+                }
                 Ok(AssignmentReference::Property {
                     object,
-                    property: key,
+                    property: key_text,
                 })
             }
             _ => Err(JsError::new(
@@ -1257,6 +1267,9 @@ impl JsRuntime {
             AssignmentReference::Property { object, property } => {
                 self.get_member(dom, *object, property)
             }
+            AssignmentReference::SymbolProperty { object, symbol } => {
+                self.get_symbol_value(dom, *object, symbol)
+            }
         }
     }
 
@@ -1271,6 +1284,9 @@ impl JsRuntime {
             AssignmentReference::Property { object, property } => {
                 self.set_member(dom, *object, property, value)
             }
+            AssignmentReference::SymbolProperty { object, symbol } => {
+                self.set_symbol_value(dom, *object, symbol, value)
+            }
         }
     }
 
@@ -1282,12 +1298,17 @@ impl JsRuntime {
         match operand {
             Expr::Member { .. } | Expr::ComputedMember { .. } => {
                 let reference = self.resolve_assignment_reference(dom, operand)?;
-                let AssignmentReference::Property { object, property } = reference else {
-                    unreachable!("member expressions resolve to property references");
-                };
-                Ok(JsValue::Boolean(
-                    self.realm.delete_property(object, &property),
-                ))
+                match reference {
+                    AssignmentReference::Property { object, property } => Ok(JsValue::Boolean(
+                        self.realm.delete_property(object, &property),
+                    )),
+                    AssignmentReference::SymbolProperty { object, symbol } => Ok(JsValue::Boolean(
+                        self.realm.delete_symbol_property(object, &symbol),
+                    )),
+                    AssignmentReference::Binding(_) => {
+                        unreachable!("member expressions resolve to property references");
+                    }
+                }
             }
             Expr::Identifier(_) => Ok(JsValue::Boolean(false)),
             _ => {
@@ -1332,6 +1353,58 @@ impl JsRuntime {
             Some(descriptor) => Ok(descriptor.value),
             None => Ok(JsValue::Undefined),
         }
+    }
+
+    /// [[Get]] for a symbol-keyed property.
+    pub(super) fn get_symbol_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        symbol: &JsSymbol,
+    ) -> Result<JsValue, JsError> {
+        match self.realm.get_symbol_descriptor(object, symbol) {
+            Some(descriptor) if descriptor.is_accessor() => {
+                let Some(getter) = descriptor.getter else {
+                    return Ok(JsValue::Undefined);
+                };
+                self.call_with_this(dom, getter, &[], JsValue::Object(object))
+            }
+            Some(descriptor) => Ok(descriptor.value),
+            None => Ok(JsValue::Undefined),
+        }
+    }
+
+    /// [[Set]] for a symbol-keyed property.
+    pub(super) fn set_symbol_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        symbol: &JsSymbol,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        if let Some(own) = self.realm.own_symbol_property(object, symbol) {
+            if own.is_accessor() {
+                if let Some(setter) = own.setter {
+                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                }
+                return Ok(());
+            }
+            self.realm
+                .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
+            return Ok(());
+        }
+        let inherited = self.realm.get_symbol_descriptor(object, symbol);
+        if let Some(descriptor) =
+            inherited.filter(crate::js::value::PropertyDescriptor::is_accessor)
+        {
+            if let Some(setter) = descriptor.setter {
+                self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+            }
+            return Ok(());
+        }
+        self.realm
+            .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
+        Ok(())
     }
 
     /// ECMA-262 [[Set]] with a receiver distinct from the lookup start
@@ -1614,11 +1687,36 @@ impl JsRuntime {
                 }
                 continue;
             }
-            let key = match &property.key {
-                PropertyKey::Static(key) => key.clone(),
-                PropertyKey::Computed(expression) => self.evaluate(dom, expression)?.to_js_string(),
+            // The key expression evaluates exactly once (spec); a symbol
+            // result installs a symbol-keyed property instead.
+            let key_value = match &property.key {
+                PropertyKey::Static(key) => JsValue::String(key.clone()),
+                PropertyKey::Computed(expression) => self.evaluate(dom, expression)?,
                 PropertyKey::Spread => unreachable!("spread property handled above"),
             };
+            let symbol_key = match &key_value {
+                JsValue::Symbol(symbol) => Some(symbol.clone()),
+                _ => None,
+            };
+            if let Some(symbol) = symbol_key {
+                let value = self.evaluate(dom, &property.value)?;
+                if !self.realm.define_symbol_property(
+                    object,
+                    &symbol,
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value,
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                ) {
+                    return Err(JsError::type_error("could not define symbol property"));
+                }
+                continue;
+            }
+            let key = key_value.to_js_string();
             let value = self.evaluate(dom, &property.value)?;
             if let Some(accessor) = property.accessor {
                 // `{get x(){}}` / `{set x(v){}}` install accessor slots; a
@@ -1840,6 +1938,16 @@ impl JsRuntime {
     /// The `in` operator: property existence on objects, index bounds on
     /// strings.
     pub(super) fn property_in(&self, key: &JsValue, container: &JsValue) -> Result<bool, JsError> {
+        if let JsValue::Symbol(symbol) = key {
+            return match container {
+                JsValue::Object(object) => {
+                    Ok(self.realm.get_symbol_descriptor(*object, symbol).is_some())
+                }
+                _ => Err(JsError::type_error(
+                    "right-hand side of 'in' must be an object",
+                )),
+            };
+        }
         let name = key.to_js_string();
         match container {
             JsValue::Object(object) => {

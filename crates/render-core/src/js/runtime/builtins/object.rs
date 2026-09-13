@@ -38,7 +38,19 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::ObjectGetOwnPropertySymbols => {
-                Ok(JsValue::Object(self.create_array_from_values(&[])?))
+                let object = Self::require_object(required_argument(
+                    arguments,
+                    0,
+                    "Object.getOwnPropertySymbols",
+                )?)?;
+                let symbols = self
+                    .realm
+                    .own_symbols(object)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(JsValue::Symbol)
+                    .collect::<Vec<_>>();
+                Ok(JsValue::Object(self.create_array_from_values(&symbols)?))
             }
             NativeFunction::ObjectAssign => self.object_assign(arguments),
             NativeFunction::ObjectKeys => self.object_entries(arguments, ObjectEntryKind::Keys),

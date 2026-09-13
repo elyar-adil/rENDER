@@ -1346,3 +1346,36 @@ fn new_symbol_throws_and_well_knowns_are_symbol_values() {
         .expect("well-known probe executes");
     assert_eq!(outcome.value, JsValue::String("true,true,true".to_owned()));
 }
+
+#[test]
+fn symbol_keyed_properties_round_trip_through_brackets_and_introspection() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var k = Symbol('k');
+                var o = {};
+                o[k] = 42;
+                var results = [];
+                results.push(o[k] === 42);
+                results.push(Object.getOwnPropertySymbols(o).length === 1);
+                results.push(Object.getOwnPropertySymbols(o)[0] === k);
+                results.push(k in o);
+                results.push(Object.keys(o).length === 0);
+                delete o[k];
+                results.push(o[k] === undefined);
+                var inherited = {};
+                inherited[Symbol.for('tag')] = 'kept';
+                var child = Object.create(inherited);
+                results.push(child[Symbol.for('tag')] === 'kept');
+                results.join(',');
+            ",
+        )
+        .expect("symbol property probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true,true".to_owned())
+    );
+}
