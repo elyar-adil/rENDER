@@ -79,6 +79,8 @@ pub struct JsRuntime {
     next_symbol_id: u64,
     /// Active JavaScript call frames for stack traces and diagnostics.
     call_stack: Vec<CallFrame>,
+    /// Byte offsets where each source line starts, for error positioning.
+    source_line_starts: Vec<usize>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
@@ -149,6 +151,7 @@ impl JsRuntime {
             window_event_handlers: BTreeMap::new(),
             next_symbol_id: 0,
             call_stack: Vec::new(),
+            source_line_starts: Vec::new(),
             random_state: {
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -414,8 +417,22 @@ impl JsRuntime {
     /// Returns a typed syntax/runtime/DOM/resource-limit error. Unsupported
     /// syntax is never silently ignored.
     pub fn execute(&mut self, dom: &mut Dom, source: &str) -> Result<ScriptOutcome, JsError> {
+        self.source_line_starts = build_line_starts(source);
         let script = super::CompiledScript::compile(source, &self.limits)?;
         self.execute_compiled(dom, &script)
+            .map_err(|error| self.position_error(error))
+    }
+
+    /// Resolve an error's byte offset into a line/column pair using the
+    /// source most recently executed in this runtime.
+    fn position_error(&self, mut error: JsError) -> JsError {
+        if error.position().is_none()
+            && let Some(offset) = error.offset()
+            && let Some(position) = resolve_position(&self.source_line_starts, offset)
+        {
+            error = error.at_position(position.0, position.1);
+        }
+        error
     }
 
     /// Run a previously compiled script in this runtime's Realm.
@@ -430,6 +447,7 @@ impl JsRuntime {
         dom: &mut Dom,
         script: &super::CompiledScript,
     ) -> Result<ScriptOutcome, JsError> {
+        self.source_line_starts = build_line_starts(script.source());
         let from_revision = dom.revision();
         // Classic scripts share one realm, so reclaim the previous script's
         // garbage before allocating objects for this one.
@@ -439,15 +457,19 @@ impl JsRuntime {
         self.dom_nodes_created = 0;
         self.this_stack.clear();
         self.environment.clear();
-        self.instantiate_statements(&script.statements)?;
-        let completion = self.evaluate_statements(dom, &script.statements)?;
+        self.instantiate_statements(&script.statements)
+            .map_err(|error| self.position_error(error))?;
+        let completion = self
+            .evaluate_statements(dom, &script.statements)
+            .map_err(|error| self.position_error(error))?;
         self.queue_mutation_deliveries(dom);
         let value = match completion {
             Completion::Normal(value) => value,
             Completion::Return(_) | Completion::Break(_) | Completion::Continue(_) => {
-                return Err(JsError::syntax(
+                return Err(JsError::new(
+                    JsErrorKind::Syntax,
                     "abrupt completion escaped the script body",
-                    0,
+                    None,
                 ));
             }
         };
@@ -551,4 +573,30 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         self.dispatch_dom_native(dom, function, receiver, arguments)
     }
+}
+
+/// Byte offsets where each line of `source` starts (line 1 starts at 0).
+fn build_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0_usize];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            starts.push(index + 1);
+        }
+    }
+    starts
+}
+
+/// Translate a byte offset into a 1-based (line, column) pair.
+fn resolve_position(line_starts: &[usize], offset: usize) -> Option<(usize, usize)> {
+    let mut line = line_starts
+        .binary_search(&offset)
+        .unwrap_or_else(|insertion| insertion.saturating_sub(1));
+    if line >= line_starts.len() {
+        line = line_starts.len().saturating_sub(1);
+    }
+    let line_start = line_starts.get(line)?;
+    if offset < *line_start {
+        return None;
+    }
+    Some((line + 1, offset - line_start + 1))
 }

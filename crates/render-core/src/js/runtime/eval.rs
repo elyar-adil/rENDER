@@ -150,6 +150,7 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
             body,
             catch,
             finally,
+            ..
         } => {
             for statement in body {
                 collect_var_names(statement, names);
@@ -224,7 +225,9 @@ impl JsRuntime {
                 } => {
                     var_names.insert(name.clone());
                 }
-                Statement::VariableList { kind, declarations } => {
+                Statement::VariableList {
+                    kind, declarations, ..
+                } => {
                     for (name, _) in declarations {
                         if *kind == VariableKind::Var {
                             var_names.insert(name.clone());
@@ -240,6 +243,7 @@ impl JsRuntime {
                     name,
                     parameters,
                     body,
+                    ..
                 } => {
                     var_names.insert(name.clone());
                     functions.push((name, parameters, body));
@@ -281,6 +285,7 @@ impl JsRuntime {
                 Statement::VariableList {
                     kind,
                     declarations: variables,
+                    ..
                 } => {
                     for (name, _) in variables {
                         if *kind != VariableKind::Var
@@ -307,6 +312,7 @@ impl JsRuntime {
                     name,
                     parameters,
                     body,
+                    ..
                 } => {
                     if declarations
                         .insert(name.clone(), VariableKind::Const)
@@ -388,6 +394,21 @@ impl JsRuntime {
         statement: &Statement,
     ) -> Result<Completion, JsError> {
         self.consume_step()?;
+        let result = self.evaluate_statement_dispatched(dom, statement);
+        if let Err(error) = &result
+            && error.offset().is_none()
+            && let Some(offset) = statement_offset(statement)
+        {
+            return Err(error.clone().at_offset(offset));
+        }
+        result
+    }
+
+    fn evaluate_statement_dispatched(
+        &mut self,
+        dom: &mut Dom,
+        statement: &Statement,
+    ) -> Result<Completion, JsError> {
         if Self::statement_trace_enabled() {
             let rendered = format!("{statement:?}");
             let truncated: String = rendered.chars().take(1400).collect();
@@ -401,7 +422,9 @@ impl JsRuntime {
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
         }
         match statement {
-            Statement::Variable { kind, name, value } => {
+            Statement::Variable {
+                kind, name, value, ..
+            } => {
                 if *kind == VariableKind::Var && value.is_none() {
                     return Ok(Completion::Normal(JsValue::Undefined));
                 }
@@ -412,7 +435,9 @@ impl JsRuntime {
                 self.initialize_binding(name, value.clone(), *kind)?;
                 Ok(Completion::Normal(value))
             }
-            Statement::VariableList { kind, declarations } => {
+            Statement::VariableList {
+                kind, declarations, ..
+            } => {
                 let mut value = JsValue::Undefined;
                 for (name, expression) in declarations {
                     if let Some(expression) = expression {
@@ -434,17 +459,46 @@ impl JsRuntime {
             }
             Statement::Throw(expression) => {
                 let value = self.evaluate(dom, expression)?;
-                Err(JsError::thrown(value))
+                // Thrown Error instances surface as "Name: message" (what a
+                // real engine prints), not "[object Object]".
+                let mut error = match value {
+                    JsValue::Object(object)
+                        if self.realm.get_property(object, "toString").is_some_and(
+                            |inherited_to_string| {
+                                matches!(
+                                    inherited_to_string,
+                                    JsValue::Object(to_string_fn)
+                                        if self.realm.host(to_string_fn)
+                                            == Some(ObjectHost::NativeFunction(
+                                                NativeFunction::ErrorPrototypeToString
+                                            ))
+                                )
+                            },
+                        ) =>
+                    {
+                        JsError::thrown_with_message(
+                            value,
+                            self.error_to_string(object).to_js_string(),
+                        )
+                    }
+                    value => JsError::thrown(value),
+                };
+                if let Some(offset) = expr_offset(expression) {
+                    error = error.at_offset(offset);
+                }
+                Err(error)
             }
             Statement::Try {
                 body,
                 catch,
                 finally,
+                ..
             } => self.evaluate_try_statement(dom, body, catch.as_ref(), finally.as_deref()),
             Statement::If {
                 condition,
                 consequent,
                 alternate,
+                ..
             } => {
                 if self.evaluate(dom, condition)?.is_truthy() {
                     self.evaluate_statement(dom, consequent)
@@ -454,10 +508,12 @@ impl JsRuntime {
                     Ok(Completion::Normal(JsValue::Undefined))
                 }
             }
-            Statement::Switch { expression, cases } => {
-                self.evaluate_switch_statement(dom, expression, cases)
-            }
-            Statement::While { condition, body } => {
+            Statement::Switch {
+                expression, cases, ..
+            } => self.evaluate_switch_statement(dom, expression, cases),
+            Statement::While {
+                condition, body, ..
+            } => {
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
@@ -476,7 +532,9 @@ impl JsRuntime {
                 }
                 Ok(Completion::Normal(value))
             }
-            Statement::DoWhile { condition, body } => {
+            Statement::DoWhile {
+                condition, body, ..
+            } => {
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
@@ -500,6 +558,7 @@ impl JsRuntime {
                 condition,
                 update,
                 body,
+                ..
             } => self.evaluate_for_statement(
                 dom,
                 initializer.as_deref(),
@@ -512,21 +571,24 @@ impl JsRuntime {
                 name,
                 iterable,
                 body,
+                ..
             } => self.evaluate_for_in_statement(dom, *kind, name, iterable, body),
             Statement::ForOf {
                 kind,
                 name,
                 iterable,
                 body,
+                ..
             } => self.evaluate_for_of_statement(dom, *kind, name, iterable, body),
             Statement::ForInExpr {
                 target,
                 iterable,
                 body,
+                ..
             } => self.evaluate_for_in_expr_statement(dom, target, iterable, body),
             // Labels bind `break label` / `continue label` to this statement;
             // unlabeled control flow binds to the nearest enclosing loop.
-            Statement::Labeled { label, body } => match self.evaluate_statement(dom, body)? {
+            Statement::Labeled { label, body, .. } => match self.evaluate_statement(dom, body)? {
                 Completion::Break(Some(target)) | Completion::Continue(Some(target))
                     if *target == *label =>
                 {
@@ -872,9 +934,27 @@ impl JsRuntime {
         expression: &Expr,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
+        let result = self.evaluate_dispatched(dom, expression);
+        // Position errors at the innermost enclosing node that carries a
+        // span; deeper dispatch layers attach first, so exact throw sites
+        // win over enclosing wrappers.
+        if let Err(error) = &result
+            && error.offset().is_none()
+            && let Some(offset) = expr_offset(expression)
+        {
+            return Err(error.clone().at_offset(offset));
+        }
+        result
+    }
+
+    fn evaluate_dispatched(
+        &mut self,
+        dom: &mut Dom,
+        expression: &Expr,
+    ) -> Result<JsValue, JsError> {
         match expression {
             Expr::Literal(value) => Ok(value.clone()),
-            Expr::RegexLiteral { pattern, flags } => {
+            Expr::RegexLiteral { pattern, flags, .. } => {
                 let object = self.construct_regex(pattern, flags)?;
                 Ok(JsValue::Object(object))
             }
@@ -889,12 +969,17 @@ impl JsRuntime {
                 name,
                 parameters,
                 body,
+                ..
             } => self.evaluate_function_expression(name.as_deref(), parameters, body),
-            Expr::Arrow { parameters, body } => self.create_arrow_function(parameters, body),
+            Expr::Arrow {
+                parameters, body, ..
+            } => self.create_arrow_function(parameters, body),
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
             Expr::Spread(expression) => self.evaluate(dom, expression),
-            Expr::ObjectRest { object, excluded } => {
+            Expr::ObjectRest {
+                object, excluded, ..
+            } => {
                 let value = self.evaluate(dom, object)?;
                 self.create_object_rest(&value, excluded)
                     .map(JsValue::Object)
@@ -902,15 +987,19 @@ impl JsRuntime {
             Expr::Unary {
                 operator: UnaryOp::Delete,
                 operand,
+                ..
             } => self.evaluate_delete(dom, operand),
             // `typeof identifier` never throws for undeclared bindings.
             Expr::Unary {
                 operator: UnaryOp::Typeof,
                 operand,
+                ..
             } if matches!(operand.as_ref(), Expr::Identifier(name) if !self.binding_exists(name)) => {
                 Ok(JsValue::String("undefined".to_owned()))
             }
-            Expr::Unary { operator, operand } => {
+            Expr::Unary {
+                operator, operand, ..
+            } => {
                 let value = self.evaluate(dom, operand)?;
                 self.evaluate_unary(*operator, &value)
             }
@@ -918,11 +1007,13 @@ impl JsRuntime {
                 operator,
                 left,
                 right,
+                ..
             } => self.evaluate_binary(dom, *operator, left, right),
             Expr::Conditional {
                 condition,
                 consequent,
                 alternate,
+                ..
             } => {
                 if self.evaluate(dom, condition)?.is_truthy() {
                     self.evaluate(dom, consequent)
@@ -934,6 +1025,7 @@ impl JsRuntime {
                 target,
                 operator,
                 prefix,
+                ..
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let previous = self.read_assignment_reference(dom, &reference)?;
@@ -942,12 +1034,16 @@ impl JsRuntime {
                 self.write_assignment_reference(dom, &reference, next.clone())?;
                 Ok(if *prefix { next } else { previous })
             }
-            Expr::Member { object, property } => {
+            Expr::Member {
+                object, property, ..
+            } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let object = self.coerce_member_base(&evaluated, property)?;
                 self.get_member(dom, object, property)
             }
-            Expr::ComputedMember { object, property } => {
+            Expr::ComputedMember {
+                object, property, ..
+            } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key = self.evaluate(dom, property)?.to_js_string();
                 let object = self.coerce_member_base(&evaluated, &key)?;
@@ -956,6 +1052,7 @@ impl JsRuntime {
             Expr::New {
                 constructor,
                 arguments,
+                ..
             } => {
                 let evaluated = self.evaluate(dom, constructor)?;
                 if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
@@ -974,7 +1071,9 @@ impl JsRuntime {
                 }
                 self.construct(dom, constructor, &values)
             }
-            Expr::Call { callee, arguments } => self.evaluate_call(dom, callee, arguments),
+            Expr::Call {
+                callee, arguments, ..
+            } => self.evaluate_call(dom, callee, arguments),
             Expr::Sequence(expressions) => {
                 let mut value = JsValue::Undefined;
                 for expression in expressions {
@@ -986,6 +1085,7 @@ impl JsRuntime {
                 target,
                 operator,
                 value,
+                ..
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let current = self.read_assignment_reference(dom, &reference)?;
@@ -1008,7 +1108,7 @@ impl JsRuntime {
                 self.write_assignment_reference(dom, &reference, combined.clone())?;
                 Ok(combined)
             }
-            Expr::Assignment { target, value } => {
+            Expr::Assignment { target, value, .. } => {
                 if matches!(target.as_ref(), Expr::Array(_) | Expr::Object(_)) {
                     let value = self.evaluate(dom, value)?;
                     self.assign_destructuring_target(dom, target, value.clone())?;
@@ -1029,7 +1129,9 @@ impl JsRuntime {
     ) -> Result<AssignmentReference, JsError> {
         match target {
             Expr::Identifier(name) => Ok(AssignmentReference::Binding(name.clone())),
-            Expr::Member { object, property } => {
+            Expr::Member {
+                object, property, ..
+            } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
                     // Keep optional polyfill assignments harmless when their
@@ -1043,7 +1145,9 @@ impl JsRuntime {
                     property: property.clone(),
                 })
             }
-            Expr::ComputedMember { object, property } => {
+            Expr::ComputedMember {
+                object, property, ..
+            } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key = self.evaluate(dom, property)?.to_js_string();
                 let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
@@ -1056,7 +1160,11 @@ impl JsRuntime {
                     property: key,
                 })
             }
-            _ => Err(JsError::syntax("invalid assignment target", 0)),
+            _ => Err(JsError::new(
+                JsErrorKind::Syntax,
+                "invalid assignment target",
+                None,
+            )),
         }
     }
 
@@ -1074,6 +1182,7 @@ impl JsRuntime {
             Expr::Assignment {
                 target,
                 value: default,
+                ..
             } => {
                 let value = if matches!(value, JsValue::Undefined) {
                     self.evaluate(dom, default)?
@@ -1338,7 +1447,9 @@ impl JsRuntime {
             _ => String::new(),
         };
         let (callee_value, receiver) = match callee {
-            Expr::Member { object, property } => {
+            Expr::Member {
+                object, property, ..
+            } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
                     return Ok(JsValue::Undefined);
@@ -1346,7 +1457,9 @@ impl JsRuntime {
                 let object = self.coerce_member_base(&receiver, property)?;
                 (self.get_member(dom, object, property)?, receiver)
             }
-            Expr::ComputedMember { object, property } => {
+            Expr::ComputedMember {
+                object, property, ..
+            } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
                     return Ok(JsValue::Undefined);
@@ -2995,9 +3108,11 @@ impl JsRuntime {
         match result? {
             Completion::Normal(_) => Ok(JsValue::Undefined),
             Completion::Return(value) => Ok(value),
-            Completion::Break(_) | Completion::Continue(_) => {
-                Err(JsError::syntax("loop control escaped a function body", 0))
-            }
+            Completion::Break(_) | Completion::Continue(_) => Err(JsError::new(
+                JsErrorKind::Syntax,
+                "loop control escaped a function body",
+                None,
+            )),
         }
     }
 
@@ -3121,5 +3236,58 @@ impl JsRuntime {
             JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value)),
             JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
         }
+    }
+}
+
+/// Byte offset a parsed expression node carries for diagnostics, when the
+/// variant is a positioned struct variant.
+pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
+    match expression {
+        Expr::RegexLiteral { offset, .. }
+        | Expr::Function { offset, .. }
+        | Expr::Arrow { offset, .. }
+        | Expr::ObjectRest { offset, .. }
+        | Expr::Unary { offset, .. }
+        | Expr::Binary { offset, .. }
+        | Expr::Conditional { offset, .. }
+        | Expr::Update { offset, .. }
+        | Expr::Member { offset, .. }
+        | Expr::ComputedMember { offset, .. }
+        | Expr::New { offset, .. }
+        | Expr::Call { offset, .. }
+        | Expr::Assignment { offset, .. }
+        | Expr::CompoundAssignment { offset, .. } => Some(*offset),
+        Expr::Literal(_)
+        | Expr::This
+        | Expr::Identifier(_)
+        | Expr::Object(_)
+        | Expr::Array(_)
+        | Expr::Spread(_)
+        | Expr::Sequence(_) => None,
+    }
+}
+
+/// Byte offset a parsed statement node carries for diagnostics.
+pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
+    match statement {
+        Statement::Variable { offset, .. }
+        | Statement::VariableList { offset, .. }
+        | Statement::Function { offset, .. }
+        | Statement::Try { offset, .. }
+        | Statement::If { offset, .. }
+        | Statement::Switch { offset, .. }
+        | Statement::While { offset, .. }
+        | Statement::DoWhile { offset, .. }
+        | Statement::For { offset, .. }
+        | Statement::ForIn { offset, .. }
+        | Statement::ForOf { offset, .. }
+        | Statement::ForInExpr { offset, .. }
+        | Statement::Labeled { offset, .. } => Some(*offset),
+        Statement::Return(_)
+        | Statement::Throw(_)
+        | Statement::Break(_)
+        | Statement::Continue(_)
+        | Statement::Block(_)
+        | Statement::Expression(_) => None,
     }
 }

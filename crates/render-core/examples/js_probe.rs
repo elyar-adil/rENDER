@@ -248,7 +248,7 @@ fn run() {
         match target_runtime.execute(&mut target_document.dom, &source) {
             Ok(outcome) => println!("OK   {name}: {:?}", outcome.value),
             Err(error) => {
-                println!("ERR  {name}: {} at {:?}", error.message(), error.offset());
+                println!("ERR  {name}: {error} (offset {:?})", error.offset());
                 if let Some(offset) = error.offset() {
                     let start = offset.saturating_sub(25);
                     let end = (offset + 25).min(source.len());

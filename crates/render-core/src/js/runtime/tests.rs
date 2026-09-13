@@ -1127,3 +1127,31 @@ fn anonymous_frames_get_stable_labels() {
         .expect("anonymous frame executes");
     assert_eq!(outcome.value, JsValue::Boolean(true));
 }
+
+#[test]
+fn runtime_errors_report_source_line_and_column() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let source = "var ok = 1;\nok = 2;\nvar broken = (null).prop;\n";
+    let error = runtime
+        .execute(&mut parsed.dom, source)
+        .expect_err("member read on null throws");
+    // The positioned node is the member access itself (the `.` token).
+    assert_eq!(error.position(), Some((3, 21)));
+    assert!(
+        error.to_string().contains("at line 3, column 21"),
+        "display: {error}"
+    );
+}
+
+#[test]
+fn thrown_values_surface_positions_without_offsets() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let source = "var prepared = true;\nthrow new TypeError('late');\n";
+    let error = runtime
+        .execute(&mut parsed.dom, source)
+        .expect_err("throw escapes");
+    // The throw statement's expression carries a span; position resolves.
+    assert!(error.to_string().contains("line 2"), "display: {error}");
+}

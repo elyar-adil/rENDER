@@ -76,6 +76,7 @@ pub struct JsError {
     kind: JsErrorKind,
     message: String,
     offset: Option<usize>,
+    position: Option<(usize, usize)>,
     thrown: Option<JsValue>,
 }
 
@@ -100,6 +101,30 @@ impl JsError {
         self.thrown.as_ref()
     }
 
+    /// Attach a source offset to an error that does not carry one yet;
+    /// the innermost (first-attached) span wins during unwinding.
+    pub(crate) fn at_offset(mut self, offset: usize) -> Self {
+        if self.offset.is_none() {
+            self.offset = Some(offset);
+        }
+        self
+    }
+
+    /// Resolve a byte offset into a human-readable 1-based line and column.
+    /// Executing runtimes stamp this once when an error escapes, so every
+    /// downstream formatter can show real positions.
+    pub(crate) fn at_position(mut self, line: usize, column: usize) -> Self {
+        if self.position.is_none() {
+            self.position = Some((line, column));
+        }
+        self
+    }
+
+    #[must_use]
+    pub const fn position(&self) -> Option<(usize, usize)> {
+        self.position
+    }
+
     pub(crate) fn new(
         kind: JsErrorKind,
         message: impl Into<String>,
@@ -109,6 +134,7 @@ impl JsError {
             kind,
             message: message.into(),
             offset,
+            position: None,
             thrown: None,
         }
     }
@@ -138,6 +164,7 @@ impl JsError {
             kind: JsErrorKind::Throw,
             message: value.to_js_string(),
             offset: None,
+            position: None,
             thrown: Some(value),
         }
     }
@@ -147,6 +174,7 @@ impl JsError {
             kind: JsErrorKind::Throw,
             message: message.into(),
             offset: None,
+            position: None,
             thrown: Some(value),
         }
     }
@@ -154,15 +182,13 @@ impl JsError {
 
 impl fmt::Display for JsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(offset) = self.offset {
-            write!(
-                formatter,
-                "{:?} at byte {offset}: {}",
-                self.kind, self.message
-            )
-        } else {
-            write!(formatter, "{:?}: {}", self.kind, self.message)
+        write!(formatter, "{:?}: {}", self.kind, self.message)?;
+        if let Some((line, column)) = self.position {
+            write!(formatter, " at line {line}, column {column}")?;
+        } else if let Some(offset) = self.offset {
+            write!(formatter, " at byte {offset}")?;
         }
+        Ok(())
     }
 }
 
@@ -174,6 +200,9 @@ impl Error for JsError {}
 /// the target runtime's independent step, call-depth, heap, and DOM limits.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompiledScript {
+    /// Original source text, retained so runtimes can resolve error
+    /// byte offsets into line/column positions.
+    source: String,
     statements: Vec<Statement>,
 }
 
@@ -187,7 +216,15 @@ impl CompiledScript {
     pub fn compile(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
         let tokens = lexer::tokenize(source, limits)?;
         let statements = parser::parse(tokens, limits)?;
-        Ok(Self { statements })
+        Ok(Self {
+            source: source.to_owned(),
+            statements,
+        })
+    }
+
+    #[must_use]
+    pub fn source(&self) -> &str {
+        &self.source
     }
 }
 

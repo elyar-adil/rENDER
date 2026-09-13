@@ -121,15 +121,18 @@ pub(super) enum Statement {
         kind: VariableKind,
         name: String,
         value: Option<Expr>,
+        offset: usize,
     },
     VariableList {
         kind: VariableKind,
         declarations: Vec<(String, Option<Expr>)>,
+        offset: usize,
     },
     Function {
         name: String,
         parameters: Vec<String>,
         body: Vec<Statement>,
+        offset: usize,
     },
     Return(Option<Expr>),
     Throw(Expr),
@@ -137,52 +140,62 @@ pub(super) enum Statement {
         body: Vec<Statement>,
         catch: Option<CatchClause>,
         finally: Option<Vec<Statement>>,
+        offset: usize,
     },
     If {
         condition: Expr,
         consequent: Box<Statement>,
         alternate: Option<Box<Statement>>,
+        offset: usize,
     },
     Switch {
         expression: Expr,
         // Each clause may list several test expressions (`case a, b:`); an
         // empty test list is the `default` clause.
         cases: Vec<(Vec<Expr>, Vec<Statement>)>,
+        offset: usize,
     },
     While {
         condition: Expr,
         body: Box<Statement>,
+        offset: usize,
     },
     DoWhile {
         condition: Box<Expr>,
         body: Box<Statement>,
+        offset: usize,
     },
     For {
         initializer: Option<Box<Statement>>,
         condition: Option<Expr>,
         update: Option<Expr>,
         body: Box<Statement>,
+        offset: usize,
     },
     ForIn {
         kind: VariableKind,
         name: String,
         iterable: Expr,
         body: Box<Statement>,
+        offset: usize,
     },
     ForOf {
         kind: VariableKind,
         name: String,
         iterable: Expr,
         body: Box<Statement>,
+        offset: usize,
     },
     ForInExpr {
         target: Expr,
         iterable: Expr,
         body: Box<Statement>,
+        offset: usize,
     },
     Labeled {
         label: String,
         body: Box<Statement>,
+        offset: usize,
     },
     Break(Option<String>),
     Continue(Option<String>),
@@ -196,6 +209,7 @@ pub(super) enum Expr {
     RegexLiteral {
         pattern: String,
         flags: String,
+        offset: usize,
     },
     This,
     Identifier(String),
@@ -203,10 +217,12 @@ pub(super) enum Expr {
         name: Option<String>,
         parameters: Vec<String>,
         body: Vec<Statement>,
+        offset: usize,
     },
     Arrow {
         parameters: Vec<String>,
         body: Vec<Statement>,
+        offset: usize,
     },
     Object(Vec<ObjectProperty>),
     Array(Vec<Self>),
@@ -214,50 +230,61 @@ pub(super) enum Expr {
     ObjectRest {
         object: Box<Self>,
         excluded: Vec<String>,
+        offset: usize,
     },
     Unary {
         operator: UnaryOp,
         operand: Box<Self>,
+        offset: usize,
     },
     Binary {
         operator: BinaryOp,
         left: Box<Self>,
         right: Box<Self>,
+        offset: usize,
     },
     Conditional {
         condition: Box<Self>,
         consequent: Box<Self>,
         alternate: Box<Self>,
+        offset: usize,
     },
     Update {
         target: Box<Self>,
         operator: BinaryOp,
         prefix: bool,
+        offset: usize,
     },
     Member {
         object: Box<Self>,
         property: String,
+        offset: usize,
     },
     ComputedMember {
         object: Box<Self>,
         property: Box<Self>,
+        offset: usize,
     },
     New {
         constructor: Box<Self>,
         arguments: Vec<Self>,
+        offset: usize,
     },
     Call {
         callee: Box<Self>,
         arguments: Vec<Self>,
+        offset: usize,
     },
     Assignment {
         target: Box<Self>,
         value: Box<Self>,
+        offset: usize,
     },
     CompoundAssignment {
         target: Box<Self>,
         operator: BinaryOp,
         value: Box<Self>,
+        offset: usize,
     },
     Sequence(Vec<Self>),
 }
@@ -271,6 +298,7 @@ impl Parser {
         Self {
             tokens,
             cursor: 0,
+            previous_offset: 0,
             statement_count: 0,
             max_statements: limits.max_statements,
             function_depth: 0,
@@ -282,6 +310,7 @@ impl Parser {
 }
 
 struct Parser {
+    previous_offset: usize,
     tokens: Vec<Token>,
     cursor: usize,
     statement_count: usize,
@@ -368,6 +397,7 @@ impl Parser {
             let value = self.class_expression_tail(Some(name.clone()))?;
             self.end_statement();
             return Ok(Statement::Variable {
+                offset: self.previous_offset(),
                 kind: VariableKind::Const,
                 name,
                 value: Some(value),
@@ -412,6 +442,7 @@ impl Parser {
             self.advance();
             let body = self.statement()?;
             return Ok(Statement::Labeled {
+                offset: self.previous_offset(),
                 label,
                 body: Box::new(body),
             });
@@ -572,9 +603,18 @@ impl Parser {
         }
         if declarations.len() == 1 {
             let (name, value) = declarations.pop().expect("one declaration exists");
-            Ok(Statement::Variable { kind, name, value })
+            Ok(Statement::Variable {
+                offset: self.previous_offset(),
+                kind,
+                name,
+                value,
+            })
         } else {
-            Ok(Statement::VariableList { kind, declarations })
+            Ok(Statement::VariableList {
+                offset: self.previous_offset(),
+                kind,
+                declarations,
+            })
         }
     }
 
@@ -667,7 +707,9 @@ impl Parser {
                 Self::lower_binding_pattern(
                     *pattern,
                     Expr::Conditional {
+                        offset,
                         condition: Box::new(Expr::Binary {
+                            offset,
                             operator: BinaryOp::StrictEqual,
                             left: Box::new(Expr::Identifier(temporary.clone())),
                             right: Box::new(Expr::Literal(JsValue::Undefined)),
@@ -690,6 +732,7 @@ impl Parser {
                     Self::lower_binding_pattern(
                         pattern,
                         Expr::Member {
+                            offset,
                             object: Box::new(Expr::Identifier(temporary.clone())),
                             property,
                         },
@@ -701,6 +744,7 @@ impl Parser {
                     Self::lower_binding_pattern(
                         *pattern,
                         Expr::ObjectRest {
+                            offset,
                             object: Box::new(Expr::Identifier(temporary)),
                             excluded,
                         },
@@ -718,6 +762,7 @@ impl Parser {
                         Self::lower_binding_pattern(
                             pattern,
                             Expr::Member {
+                                offset,
                                 object: Box::new(Expr::Identifier(temporary.clone())),
                                 property: index.to_string(),
                             },
@@ -730,7 +775,9 @@ impl Parser {
                     Self::lower_binding_pattern(
                         *pattern,
                         Expr::Call {
+                            offset,
                             callee: Box::new(Expr::Member {
+                                offset,
                                 object: Box::new(Expr::Identifier(temporary)),
                                 property: "slice".to_owned(),
                             }),
@@ -750,6 +797,7 @@ impl Parser {
         };
         let (parameters, body) = self.function_tail()?;
         Ok(Statement::Function {
+            offset: self.previous_offset(),
             name,
             parameters,
             body,
@@ -767,6 +815,7 @@ impl Parser {
             None
         };
         Ok(Statement::If {
+            offset: self.previous_offset(),
             condition,
             consequent,
             alternate,
@@ -815,7 +864,11 @@ impl Parser {
         }
         self.switch_depth = self.switch_depth.saturating_sub(1);
         self.require(&TokenKind::RightBrace, "expected '}' after switch")?;
-        Ok(Statement::Switch { expression, cases })
+        Ok(Statement::Switch {
+            offset: self.previous_offset(),
+            expression,
+            cases,
+        })
     }
 
     fn while_statement(&mut self) -> Result<Statement, JsError> {
@@ -826,6 +879,7 @@ impl Parser {
         let body = self.statement();
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(Statement::While {
+            offset: self.previous_offset(),
             condition,
             body: Box::new(body?),
         })
@@ -842,6 +896,7 @@ impl Parser {
         self.require(&TokenKind::RightParen, "expected ')' after while condition")?;
         let _ = self.take(&TokenKind::Semicolon);
         Ok(Statement::DoWhile {
+            offset: self.previous_offset(),
             condition: Box::new(condition),
             body: Box::new(body),
         })
@@ -870,6 +925,7 @@ impl Parser {
                 let body = self.statement();
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 return Ok(Statement::ForIn {
+                    offset: self.previous_offset(),
                     kind,
                     name: match pattern.expect("pattern parsed") {
                         BindingPattern::Identifier(name) => name,
@@ -901,10 +957,15 @@ impl Parser {
                             declaration_start,
                         );
                         let body = Statement::Block(vec![
-                            Statement::VariableList { kind, declarations },
+                            Statement::VariableList {
+                                offset: self.previous_offset(),
+                                kind,
+                                declarations,
+                            },
                             body,
                         ]);
                         return Ok(Statement::ForOf {
+                            offset: self.previous_offset(),
                             kind: VariableKind::Var,
                             name: temporary,
                             iterable,
@@ -913,6 +974,7 @@ impl Parser {
                     }
                 };
                 return Ok(Statement::ForOf {
+                    offset: self.previous_offset(),
                     kind,
                     name,
                     iterable,
@@ -934,6 +996,7 @@ impl Parser {
                 let body = self.statement();
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 return Ok(Statement::ForInExpr {
+                    offset: self.previous_offset(),
                     target: expression,
                     iterable,
                     body: Box::new(body?),
@@ -960,6 +1023,7 @@ impl Parser {
         let body = self.statement();
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(Statement::For {
+            offset: self.previous_offset(),
             initializer,
             condition,
             update,
@@ -995,6 +1059,7 @@ impl Parser {
             return Err(self.error("try requires catch or finally"));
         }
         Ok(Statement::Try {
+            offset: self.previous_offset(),
             body,
             catch,
             finally,
@@ -1140,12 +1205,17 @@ impl Parser {
             body.insert(
                 0,
                 Statement::VariableList {
+                    offset: self.previous_offset(),
                     kind: VariableKind::Var,
                     declarations,
                 },
             );
         }
-        Ok(Some(Expr::Arrow { parameters, body }))
+        Ok(Some(Expr::Arrow {
+            offset: self.previous_offset(),
+            parameters,
+            body,
+        }))
     }
 
     fn assignment_value(
@@ -1157,11 +1227,13 @@ impl Parser {
         let value = self.assignment()?;
         Ok(match operator {
             Some(operator) => Expr::CompoundAssignment {
+                offset: self.previous_offset(),
                 target: Box::new(target),
                 operator,
                 value: Box::new(value),
             },
             None => Expr::Assignment {
+                offset: self.previous_offset(),
                 target: Box::new(target),
                 value: Box::new(value),
             },
@@ -1192,6 +1264,7 @@ impl Parser {
         self.require(&TokenKind::Colon, "expected ':' in conditional expression")?;
         let alternate = self.assignment()?;
         Ok(Expr::Conditional {
+            offset: self.previous_offset(),
             condition: Box::new(condition),
             consequent: Box::new(consequent),
             alternate: Box::new(alternate),
@@ -1297,6 +1370,7 @@ impl Parser {
             return Ok(left);
         }
         Ok(Expr::Binary {
+            offset: self.previous_offset(),
             operator: BinaryOp::Exponentiate,
             left: Box::new(left),
             right: Box::new(self.exponent()?),
@@ -1313,6 +1387,7 @@ impl Parser {
             self.advance();
             let right = next(self)?;
             expression = Expr::Binary {
+                offset: self.previous_offset(),
                 operator: *operator,
                 left: Box::new(expression),
                 right: Box::new(right),
@@ -1367,6 +1442,7 @@ impl Parser {
             let target = self.unary()?;
             self.validate_assignment_target(&target)?;
             return Ok(Expr::Update {
+                offset: self.previous_offset(),
                 target: Box::new(target),
                 operator,
                 prefix: true,
@@ -1391,6 +1467,7 @@ impl Parser {
         };
         if let Some(operator) = operator {
             return Ok(Expr::Unary {
+                offset: self.previous_offset(),
                 operator,
                 operand: Box::new(self.unary()?),
             });
@@ -1403,6 +1480,7 @@ impl Parser {
                 if self.take(&TokenKind::Dot) {
                     let property = self.property_name()?;
                     target = Expr::Member {
+                        offset: self.previous_offset(),
                         object: Box::new(target),
                         property,
                     };
@@ -1413,6 +1491,7 @@ impl Parser {
                         "expected ']' after computed property",
                     )?;
                     target = Expr::ComputedMember {
+                        offset: self.previous_offset(),
                         object: Box::new(target),
                         property: Box::new(property),
                     };
@@ -1426,6 +1505,7 @@ impl Parser {
                 Vec::new()
             };
             let expression = Expr::New {
+                offset: self.previous_offset(),
                 constructor: Box::new(target),
                 arguments,
             };
@@ -1447,6 +1527,7 @@ impl Parser {
         if let Some(operator) = operator {
             self.validate_assignment_target(&expression)?;
             Ok(Expr::Update {
+                offset: self.previous_offset(),
                 target: Box::new(expression),
                 operator,
                 prefix: false,
@@ -1461,6 +1542,7 @@ impl Parser {
             if self.take(&TokenKind::Dot) {
                 let property = self.property_name()?;
                 expression = Expr::Member {
+                    offset: self.previous_offset(),
                     object: Box::new(expression),
                     property,
                 };
@@ -1471,12 +1553,14 @@ impl Parser {
                     "expected ']' after computed property",
                 )?;
                 expression = Expr::ComputedMember {
+                    offset: self.previous_offset(),
                     object: Box::new(expression),
                     property: Box::new(property),
                 };
             } else if self.take(&TokenKind::LeftParen) {
                 let arguments = self.arguments_after_left_paren()?;
                 expression = Expr::Call {
+                    offset: self.previous_offset(),
                     callee: Box::new(expression),
                     arguments,
                 };
@@ -1491,6 +1575,7 @@ impl Parser {
                 };
                 let template = self.template_literal(parts, token.offset)?;
                 expression = Expr::Call {
+                    offset: self.previous_offset(),
                     callee: Box::new(expression),
                     arguments: vec![template],
                 };
@@ -1532,7 +1617,11 @@ impl Parser {
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
-            TokenKind::RegexLiteral { pattern, flags } => Ok(Expr::RegexLiteral { pattern, flags }),
+            TokenKind::RegexLiteral { pattern, flags } => Ok(Expr::RegexLiteral {
+                offset: self.previous_offset(),
+                pattern,
+                flags,
+            }),
             TokenKind::Template(parts) => self.template_literal(parts, token.offset),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
@@ -1594,6 +1683,7 @@ impl Parser {
             return Err(self.error("unterminated class body"));
         }
         Ok(Expr::Function {
+            offset: self.previous_offset(),
             name,
             parameters: Vec::new(),
             body: Vec::new(),
@@ -1624,6 +1714,7 @@ impl Parser {
                 }
             };
             result = Expr::Binary {
+                offset: self.previous_offset(),
                 operator: BinaryOp::Add,
                 left: Box::new(result),
                 right: Box::new(next),
@@ -1642,6 +1733,7 @@ impl Parser {
         };
         let (parameters, body) = self.function_tail()?;
         Ok(Expr::Function {
+            offset: self.previous_offset(),
             name,
             parameters,
             body,
@@ -1743,6 +1835,7 @@ impl Parser {
                     properties.push(ObjectProperty {
                         key: PropertyKey::Static(key.clone()),
                         value: Expr::Function {
+                            offset: self.previous_offset(),
                             name: Some(key),
                             parameters,
                             body,
@@ -1765,6 +1858,7 @@ impl Parser {
                     let value = if self.at(&TokenKind::LeftParen) {
                         let (parameters, body) = self.function_tail()?;
                         Expr::Function {
+                            offset: self.previous_offset(),
                             name: None,
                             parameters,
                             body,
@@ -1801,6 +1895,7 @@ impl Parser {
                     properties.push(ObjectProperty {
                         key: PropertyKey::Static(key.clone()),
                         value: Expr::Function {
+                            offset: self.previous_offset(),
                             name: Some(key),
                             parameters,
                             body,
@@ -1820,6 +1915,7 @@ impl Parser {
                 } else if self.at(&TokenKind::LeftParen) {
                     let (parameters, body) = self.function_tail()?;
                     Expr::Function {
+                        offset: self.previous_offset(),
                         name: Some(key.clone()),
                         parameters,
                         body,
@@ -1936,10 +2032,17 @@ impl Parser {
 
     fn advance(&mut self) -> Token {
         let token = self.current().clone();
+        self.previous_offset = token.offset;
         if !matches!(token.kind, TokenKind::Eof) {
             self.cursor = self.cursor.saturating_add(1);
         }
         token
+    }
+
+    /// Offset of the most recently consumed token: the best cheap position
+    /// for a node constructed after parsing its tokens.
+    fn previous_offset(&self) -> usize {
+        self.previous_offset
     }
 
     fn current(&self) -> &Token {
@@ -2064,7 +2167,9 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         Statement::While { body, .. } | Statement::For { body, .. } => {
             validate_strict_statement(body)
         }
-        Statement::DoWhile { condition, body } => {
+        Statement::DoWhile {
+            condition, body, ..
+        } => {
             validate_strict_expression(condition)?;
             validate_strict_statement(body)
         }
@@ -2103,12 +2208,15 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             target,
             iterable,
             body,
+            ..
         } => {
             validate_strict_expression(target)?;
             validate_strict_expression(iterable)?;
             validate_strict_statement(body)
         }
-        Statement::Switch { expression, cases } => {
+        Statement::Switch {
+            expression, cases, ..
+        } => {
             validate_strict_expression(expression)?;
             for (tests, statements) in cases {
                 for test in tests {
@@ -2122,6 +2230,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             body,
             catch,
             finally,
+            ..
         } => {
             validate_strict_statements(body)?;
             if let Some(catch) = catch {
@@ -2148,7 +2257,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
 
 fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
     match expression {
-        Expr::Assignment { target, value } | Expr::CompoundAssignment { target, value, .. } => {
+        Expr::Assignment { target, value, .. } | Expr::CompoundAssignment { target, value, .. } => {
             if matches!(target.as_ref(), Expr::Identifier(name) if is_strict_reserved_word(name)) {
                 return Err(JsError::syntax(
                     "assignment to a strict mode reserved word",
@@ -2161,7 +2270,9 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         Expr::Function {
             parameters, body, ..
         }
-        | Expr::Arrow { parameters, body } => {
+        | Expr::Arrow {
+            parameters, body, ..
+        } => {
             if parameters.iter().any(|name| is_strict_reserved_word(name)) {
                 return Err(JsError::syntax(
                     "strict mode parameter uses a reserved word",
@@ -2186,6 +2297,7 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         Expr::Unary {
             operator: UnaryOp::Delete,
             operand,
+            ..
         } if matches!(operand.as_ref(), Expr::Identifier(_)) => Err(JsError::syntax(
             "delete of an unqualified identifier is not allowed in strict mode",
             0,
@@ -2199,6 +2311,7 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             condition,
             consequent,
             alternate,
+            ..
         } => {
             validate_strict_expression(condition)?;
             validate_strict_expression(consequent)?;
@@ -2211,17 +2324,21 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(target)
         }
         Expr::Member { object, .. } => validate_strict_expression(object),
-        Expr::ComputedMember { object, property } => {
+        Expr::ComputedMember {
+            object, property, ..
+        } => {
             validate_strict_expression(object)?;
             validate_strict_expression(property)
         }
         Expr::New {
             constructor,
             arguments,
+            ..
         }
         | Expr::Call {
             callee: constructor,
             arguments,
+            ..
         } => {
             validate_strict_expression(constructor)?;
             arguments.iter().try_for_each(validate_strict_expression)
