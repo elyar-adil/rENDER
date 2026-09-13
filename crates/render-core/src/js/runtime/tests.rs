@@ -1155,3 +1155,68 @@ fn thrown_values_surface_positions_without_offsets() {
     // The throw statement's expression carries a span; position resolves.
     assert!(error.to_string().contains("line 2"), "display: {error}");
 }
+
+#[test]
+fn accessor_properties_invoke_getters_and_setters_through_the_chain() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var stored = 0;
+                var recorded = '';
+                var base = {};
+                Object.defineProperty(base, 'size', {
+                    get: function () { return stored * 2; },
+                    set: function (v) { stored = v; recorded += 's'; },
+                    configurable: true,
+                });
+                var child = Object.create(base);
+                child.size = 21;
+                var read = child.size;
+                read + ':' + recorded + ':' + stored;
+            ",
+        )
+        .expect("accessor chain executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("42:s:21".to_owned()),
+        "setter fires on the receiver, getter multiplies stored"
+    );
+}
+
+#[test]
+fn object_get_own_property_descriptor_reports_accessors() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var o = {};
+                Object.defineProperty(o, 'x', { get: function () { return 7; } });
+                var d = Object.getOwnPropertyDescriptor(o, 'x');
+                [typeof d.get, d.set === undefined, d.enumerable, d.configurable === false, 'value' in d].join(',');
+            ",
+        )
+        .expect("descriptor introspection executes");
+    // Spec: attributes omitted from the descriptor default to false.
+    assert_eq!(
+        outcome.value,
+        JsValue::String("function,true,false,true,false".to_owned())
+    );
+}
+
+#[test]
+fn accessor_descriptor_with_value_is_rejected() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let error = runtime
+        .execute(
+            &mut parsed.dom,
+            "Object.defineProperty({}, 'x', { get: function () {}, value: 1 });",
+        )
+        .expect_err("mixed accessor and value descriptor is invalid");
+    assert!(error.to_string().contains("Type"), "{error}");
+}

@@ -108,11 +108,14 @@ fn sort_property_names(names: &mut [String]) {
     });
 }
 
-/// An own data-property descriptor.
+/// An own property descriptor: either a data property (value slot) or an
+/// accessor property (getter/setter function objects).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PropertyDescriptor {
     pub value: JsValue,
     pub writable: bool,
+    pub getter: Option<ObjectId>,
+    pub setter: Option<ObjectId>,
     pub enumerable: bool,
     pub configurable: bool,
 }
@@ -123,6 +126,8 @@ impl PropertyDescriptor {
         Self {
             value,
             writable: true,
+            getter: None,
+            setter: None,
             enumerable: true,
             configurable: true,
         }
@@ -132,9 +137,18 @@ impl PropertyDescriptor {
         Self {
             value,
             writable: true,
+            getter: None,
+            setter: None,
             enumerable: false,
             configurable: true,
         }
+    }
+
+    /// Accessor properties carry function objects in the getter/setter
+    /// slots and never use the value slot.
+    #[must_use]
+    pub const fn is_accessor(&self) -> bool {
+        self.getter.is_some() || self.setter.is_some()
     }
 }
 
@@ -729,6 +743,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "document".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(document),
                 writable: false,
                 enumerable: false,
@@ -743,6 +759,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value,
                     writable: false,
                     enumerable: false,
@@ -761,6 +779,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "queueMicrotask".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(queue_microtask),
                 writable: true,
                 enumerable: false,
@@ -863,6 +883,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "import".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(dynamic_import),
                 writable: true,
                 enumerable: false,
@@ -945,6 +967,8 @@ impl Realm {
         objects[image.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(element_prototype),
                 writable: false,
                 enumerable: false,
@@ -1047,6 +1071,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Image".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(image),
                 writable: true,
                 enumerable: false,
@@ -1086,6 +1112,8 @@ impl Realm {
         objects[intersection_observer.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(intersection_observer_prototype),
                 writable: false,
                 enumerable: false,
@@ -1095,6 +1123,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "IntersectionObserver".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(intersection_observer),
                 writable: true,
                 enumerable: false,
@@ -1127,6 +1157,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "IntersectionObserverEntry".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(entry_constructor),
                 writable: true,
                 enumerable: false,
@@ -1163,6 +1195,8 @@ impl Realm {
         objects[mutation_observer.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(mutation_observer_prototype),
                 writable: false,
                 enumerable: false,
@@ -1172,6 +1206,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "MutationObserver".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(mutation_observer),
                 writable: true,
                 enumerable: false,
@@ -1246,6 +1282,8 @@ impl Realm {
         objects[global.0].properties.insert(
             name.to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(callable),
                 writable: true,
                 enumerable: false,
@@ -1311,6 +1349,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -1336,6 +1376,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(constructor),
                     writable: true,
                     enumerable: false,
@@ -1422,6 +1464,8 @@ impl Realm {
             objects[constructor.0].properties.insert(
                 "prototype".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(prototype),
                     writable: false,
                     enumerable: false,
@@ -1435,6 +1479,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(constructor),
                     writable: true,
                     enumerable: false,
@@ -1447,6 +1493,10 @@ impl Realm {
     /// Install the typed-array family (`Int8Array` through `Float64Array`)
     /// with constructor forms, prototype methods, and `BYTES_PER_ELEMENT`
     /// constants.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bootstrap tables read best as a single listing"
+    )]
     fn install_typed_arrays(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -1492,6 +1542,8 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 "BYTES_PER_ELEMENT".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: bytes_per_element.clone(),
                     writable: false,
                     enumerable: false,
@@ -1507,6 +1559,8 @@ impl Realm {
             objects[constructor.0].properties.insert(
                 "prototype".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(prototype),
                     writable: false,
                     enumerable: false,
@@ -1516,6 +1570,8 @@ impl Realm {
             objects[constructor.0].properties.insert(
                 "BYTES_PER_ELEMENT".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: bytes_per_element,
                     writable: false,
                     enumerable: false,
@@ -1539,6 +1595,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 kind.name().to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(constructor),
                     writable: true,
                     enumerable: false,
@@ -1573,6 +1631,8 @@ impl Realm {
             objects[console.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(method),
                     writable: true,
                     enumerable: false,
@@ -1583,6 +1643,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "console".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(console),
                 writable: true,
                 enumerable: false,
@@ -1665,6 +1727,8 @@ impl Realm {
             objects[owner.0].properties.insert(
                 "location".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(location),
                     writable: false,
                     enumerable: true,
@@ -1676,6 +1740,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(global),
                     writable: false,
                     enumerable: true,
@@ -1717,6 +1783,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "navigator".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(navigator),
                 writable: false,
                 enumerable: false,
@@ -1756,6 +1824,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "performance".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(performance),
                 writable: false,
                 enumerable: false,
@@ -1764,6 +1834,10 @@ impl Realm {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bootstrap tables read best as a single listing"
+    )]
     fn install_object(objects: &mut Vec<JsObject>, global: ObjectId) -> ObjectId {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject::default());
@@ -1791,6 +1865,8 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(method),
                     writable: true,
                     enumerable: false,
@@ -1846,6 +1922,8 @@ impl Realm {
         objects[object.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -1855,6 +1933,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Object".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(object),
                 writable: true,
                 enumerable: false,
@@ -1879,6 +1959,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "String".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(string),
                 writable: true,
                 enumerable: false,
@@ -1944,6 +2026,8 @@ impl Realm {
         objects[string.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2000,6 +2084,8 @@ impl Realm {
             (
                 "lastIndex",
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Number(0.0),
                     writable: true,
                     enumerable: false,
@@ -2014,6 +2100,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2023,6 +2111,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "RegExp".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2058,6 +2148,8 @@ impl Realm {
             objects[constructor.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Number(value),
                     writable: false,
                     enumerable: false,
@@ -2068,6 +2160,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Number".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2103,6 +2197,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(num_proto),
                 writable: false,
                 enumerable: false,
@@ -2128,6 +2224,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Boolean".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2161,6 +2259,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(bool_proto),
                 writable: false,
                 enumerable: false,
@@ -2238,6 +2338,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2261,6 +2363,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Date".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2329,6 +2433,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2338,6 +2444,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Symbol".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2377,6 +2485,8 @@ impl Realm {
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2386,6 +2496,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Event".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(constructor),
                 writable: true,
                 enumerable: false,
@@ -2436,6 +2548,8 @@ impl Realm {
             objects[constructor.0].properties.insert(
                 "prototype".to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(prototype),
                     writable: false,
                     enumerable: false,
@@ -2463,6 +2577,8 @@ impl Realm {
             objects[global.0].properties.insert(
                 kind.name().to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(constructor),
                     writable: true,
                     enumerable: false,
@@ -2497,6 +2613,8 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(method),
                     writable: true,
                     enumerable: false,
@@ -2513,6 +2631,8 @@ impl Realm {
         objects[function.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: false,
                 enumerable: false,
@@ -2522,6 +2642,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Function".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(function),
                 writable: true,
                 enumerable: false,
@@ -2556,6 +2678,8 @@ impl Realm {
             objects[math.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
+                    getter: None,
+                    setter: None,
                     value: JsValue::Object(method),
                     writable: true,
                     enumerable: false,
@@ -2566,6 +2690,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Math".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(math),
                 writable: true,
                 enumerable: false,
@@ -2606,6 +2732,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "JSON".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(json),
                 writable: true,
                 enumerable: false,
@@ -2640,6 +2768,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Promise".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(promise),
                 writable: true,
                 enumerable: false,
@@ -2726,6 +2856,8 @@ impl Realm {
         objects[global.0].properties.insert(
             "Array".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(array),
                 writable: true,
                 enumerable: false,
@@ -2743,16 +2875,6 @@ impl Realm {
     #[must_use]
     pub const fn document_object(&self) -> ObjectId {
         self.document
-    }
-
-    #[must_use]
-    pub(crate) const fn function_prototype(&self) -> ObjectId {
-        self.function_prototype
-    }
-
-    #[must_use]
-    pub(crate) const fn element_prototype(&self) -> ObjectId {
-        self.element_prototype
     }
 
     #[must_use]
@@ -2800,6 +2922,8 @@ impl Realm {
         self.objects[array.0].properties.insert(
             "length".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Number(0.0),
                 writable: true,
                 enumerable: false,
@@ -2915,6 +3039,27 @@ impl Realm {
 
     pub(crate) fn own_property(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
         self.objects.get(object.0)?.properties.get(key).cloned()
+    }
+
+    /// Prototype-chain descriptor lookup (`[[GetOwnProperty]]` along the
+    /// chain): the raw descriptor, accessor slots included. Pure reads that
+    /// must not run user code stay on `get_property`; accessor invocation
+    /// belongs to the runtime's [[Get]]/[[Set]] layer.
+    pub(crate) fn get_descriptor(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
+        let mut candidate = Some(object);
+        let mut visited = 0usize;
+        while let Some(id) = candidate {
+            let current = self.objects.get(id.0)?;
+            if let Some(descriptor) = current.properties.get(key) {
+                return Some(descriptor.clone());
+            }
+            candidate = current.prototype;
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return None;
+            }
+        }
+        None
     }
 
     pub(crate) fn enumerable_own_properties(
@@ -3180,6 +3325,8 @@ impl Realm {
         self.objects[callable.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(prototype),
                 writable: true,
                 enumerable: false,
@@ -3189,6 +3336,8 @@ impl Realm {
         self.objects[prototype.0].properties.insert(
             "constructor".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Object(callable),
                 writable: true,
                 enumerable: false,
@@ -3258,6 +3407,8 @@ impl Realm {
         self.objects[object.0].properties.insert(
             "length".to_owned(),
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::Number(length_value),
                 writable: false,
                 enumerable: false,

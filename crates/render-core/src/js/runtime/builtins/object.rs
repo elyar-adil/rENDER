@@ -198,6 +198,8 @@ impl JsRuntime {
             object,
             "stack",
             PropertyDescriptor {
+                getter: None,
+                setter: None,
                 value: JsValue::String(stack),
                 writable: true,
                 enumerable: false,
@@ -348,38 +350,86 @@ impl JsRuntime {
             JsValue::Null | JsValue::Undefined => unreachable!(),
         };
         let existing = self.realm.own_property(object, &key);
-        let descriptor = PropertyDescriptor {
-            value: self
-                .realm
-                .get_property(descriptor, "value")
-                .or_else(|| existing.as_ref().map(|property| property.value.clone()))
-                .unwrap_or(JsValue::Undefined),
-            writable: self.realm.get_property(descriptor, "writable").map_or_else(
-                || existing.as_ref().is_some_and(|property| property.writable),
+        // Field presence uses own-property checks: per spec, `{get:
+        // undefined}` means "accessor with no getter", not "field absent".
+        let get_field = self
+            .realm
+            .own_property(descriptor, "get")
+            .map(|field| field.value);
+        let set_field = self
+            .realm
+            .own_property(descriptor, "set")
+            .map(|field| field.value);
+        let has_value_field = self.realm.own_property(descriptor, "value").is_some();
+        let has_writable_field = self.realm.own_property(descriptor, "writable").is_some();
+        if (get_field.is_some() || set_field.is_some()) && (has_value_field || has_writable_field) {
+            return Err(JsError::type_error(
+                "Invalid property descriptor: cannot specify accessors together with value or writable",
+            ));
+        }
+        let callable_slot =
+            |field: Option<JsValue>, name: &str| -> Result<Option<ObjectId>, JsError> {
+                match field {
+                    None => Ok(None),
+                    Some(JsValue::Object(function))
+                        if JsRuntime::is_callable_object(function, &self.realm) =>
+                    {
+                        Ok(Some(function))
+                    }
+                    Some(_) => Err(JsError::type_error(format!(
+                        "Property accessor {name:?} must be a function"
+                    ))),
+                }
+            };
+        let getter = callable_slot(get_field, "get")?;
+        let setter = callable_slot(set_field, "set")?;
+        let enumerable = self
+            .realm
+            .get_property(descriptor, "enumerable")
+            .map_or_else(
+                || {
+                    existing
+                        .as_ref()
+                        .is_some_and(|property| property.enumerable)
+                },
                 |value| value.is_truthy(),
-            ),
-            enumerable: self
-                .realm
-                .get_property(descriptor, "enumerable")
-                .map_or_else(
-                    || {
-                        existing
-                            .as_ref()
-                            .is_some_and(|property| property.enumerable)
-                    },
+            );
+        let configurable = self
+            .realm
+            .get_property(descriptor, "configurable")
+            .map_or_else(
+                || {
+                    existing
+                        .as_ref()
+                        .is_some_and(|property| property.configurable)
+                },
+                |value| value.is_truthy(),
+            );
+        let descriptor = if getter.is_some() || setter.is_some() {
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter,
+                setter,
+                enumerable,
+                configurable,
+            }
+        } else {
+            PropertyDescriptor {
+                value: self
+                    .realm
+                    .get_property(descriptor, "value")
+                    .or_else(|| existing.as_ref().map(|property| property.value.clone()))
+                    .unwrap_or(JsValue::Undefined),
+                writable: self.realm.get_property(descriptor, "writable").map_or_else(
+                    || existing.as_ref().is_some_and(|property| property.writable),
                     |value| value.is_truthy(),
                 ),
-            configurable: self
-                .realm
-                .get_property(descriptor, "configurable")
-                .map_or_else(
-                    || {
-                        existing
-                            .as_ref()
-                            .is_some_and(|property| property.configurable)
-                    },
-                    |value| value.is_truthy(),
-                ),
+                getter: None,
+                setter: None,
+                enumerable,
+                configurable,
+            }
         };
         let descriptor_value = descriptor.value.clone();
         if !self.realm.define_property(object, key.clone(), descriptor) {
@@ -439,23 +489,30 @@ impl JsRuntime {
         };
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
-        for (key, value) in [
-            ("value", descriptor.value),
-            ("writable", JsValue::Boolean(descriptor.writable)),
-            ("enumerable", JsValue::Boolean(descriptor.enumerable)),
-            ("configurable", JsValue::Boolean(descriptor.configurable)),
-        ] {
-            self.realm.set_property(result, key.to_owned(), value);
-        }
-        if object == self.realm.element_prototype()
-            && matches!(key.as_str(), "scrollTop" | "scrollLeft")
-        {
+        if descriptor.is_accessor() {
+            for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
+                let value = slot.map_or(JsValue::Undefined, JsValue::Object);
+                self.realm.set_property(result, name.to_owned(), value);
+            }
+        } else {
+            self.realm
+                .set_property(result, "value".to_owned(), descriptor.value);
             self.realm.set_property(
                 result,
-                "set".to_owned(),
-                JsValue::Object(self.realm.function_prototype()),
+                "writable".to_owned(),
+                JsValue::Boolean(descriptor.writable),
             );
         }
+        self.realm.set_property(
+            result,
+            "enumerable".to_owned(),
+            JsValue::Boolean(descriptor.enumerable),
+        );
+        self.realm.set_property(
+            result,
+            "configurable".to_owned(),
+            JsValue::Boolean(descriptor.configurable),
+        );
         Ok(JsValue::Object(result))
     }
 
@@ -475,9 +532,22 @@ impl JsRuntime {
                 continue;
             };
             let descriptor_object = self.realm.create_ordinary_object();
+            if descriptor.is_accessor() {
+                for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
+                    let value = slot.map_or(JsValue::Undefined, JsValue::Object);
+                    self.realm
+                        .set_property(descriptor_object, name.to_owned(), value);
+                }
+            } else {
+                self.realm
+                    .set_property(descriptor_object, "value".to_owned(), descriptor.value);
+                self.realm.set_property(
+                    descriptor_object,
+                    "writable".to_owned(),
+                    JsValue::Boolean(descriptor.writable),
+                );
+            }
             for (name, value) in [
-                ("value", descriptor.value),
-                ("writable", JsValue::Boolean(descriptor.writable)),
                 ("enumerable", JsValue::Boolean(descriptor.enumerable)),
                 ("configurable", JsValue::Boolean(descriptor.configurable)),
             ] {

@@ -1133,13 +1133,7 @@ impl JsRuntime {
                 object, property, ..
             } => {
                 let evaluated = self.evaluate(dom, object)?;
-                let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
-                    // Keep optional polyfill assignments harmless when their
-                    // feature-detected receiver is absent.
-                    self.realm.global_object()
-                } else {
-                    self.coerce_member_base(&evaluated, property)?
-                };
+                let object = self.coerce_member_base(&evaluated, property)?;
                 Ok(AssignmentReference::Property {
                     object,
                     property: property.clone(),
@@ -1150,11 +1144,7 @@ impl JsRuntime {
             } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key = self.evaluate(dom, property)?.to_js_string();
-                let object = if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
-                    self.realm.global_object()
-                } else {
-                    self.coerce_member_base(&evaluated, &key)?
-                };
+                let object = self.coerce_member_base(&evaluated, &key)?;
                 Ok(AssignmentReference::Property {
                     object,
                     property: key,
@@ -1257,7 +1247,7 @@ impl JsRuntime {
 
     pub(super) fn read_assignment_reference(
         &mut self,
-        dom: &Dom,
+        dom: &mut Dom,
         reference: &AssignmentReference,
     ) -> Result<JsValue, JsError> {
         match reference {
@@ -1317,6 +1307,71 @@ impl JsRuntime {
             };
         }
         value.clone()
+    }
+
+    /// ECMA-262 [[Get]]: read a property through the prototype chain,
+    /// invoking accessor getters with `this` bound to the original receiver.
+    /// Ordinary property reads keep using `Realm::get_property` fast paths;
+    /// this entry point is required wherever accessors may exist.
+    pub(super) fn get_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &str,
+    ) -> Result<JsValue, JsError> {
+        match self.realm.get_descriptor(object, key) {
+            Some(descriptor) if descriptor.is_accessor() => {
+                let getter = match descriptor.getter {
+                    Some(getter) => getter,
+                    None => return Ok(JsValue::Undefined),
+                };
+                self.call_with_this(dom, getter, &[], JsValue::Object(object))
+            }
+            Some(descriptor) => Ok(descriptor.value),
+            None => Ok(JsValue::Undefined),
+        }
+    }
+
+    /// ECMA-262 [[Set]] with a receiver distinct from the lookup start
+    /// object: update an own data property, invoke an inherited setter, or
+    /// create a fresh own data property (sloppy mode: a getter-only
+    /// inherited accessor silently ignores the write).
+    pub(super) fn set_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        if let Some(own) = self.realm.own_property(object, key) {
+            if own.is_accessor() {
+                if let Some(setter) = own.setter {
+                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                }
+                return Ok(());
+            }
+            if !self.realm.set_property(object, key.to_owned(), value) {
+                return Err(JsError::type_error(format!(
+                    "property {key:?} is not writable"
+                )));
+            }
+            return Ok(());
+        }
+        let inherited = self.realm.get_descriptor(object, key);
+        if let Some(descriptor) =
+            inherited.filter(crate::js::value::PropertyDescriptor::is_accessor)
+        {
+            if let Some(setter) = descriptor.setter {
+                self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+            }
+            return Ok(());
+        }
+        if !self.realm.set_property(object, key.to_owned(), value) {
+            return Err(JsError::type_error(format!(
+                "property {key:?} is not writable"
+            )));
+        }
+        Ok(())
     }
 
     pub(super) fn to_numeric_primitive(
@@ -1997,14 +2052,17 @@ impl JsRuntime {
     #[allow(clippy::too_many_lines)]
     pub(super) fn get_member(
         &mut self,
-        dom: &Dom,
+        dom: &mut Dom,
         object: ObjectId,
         property: &str,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
         // Own data properties win outright (instance fields such as a
-        // RegExp's `source`).
+        // RegExp's `source`); own accessors run their getter.
         if let Some(descriptor) = self.realm.own_property(object, property) {
+            if descriptor.is_accessor() {
+                return self.get_value(dom, object, property);
+            }
             return Ok(descriptor.value);
         }
         let inherited = self.realm.get_property(object, property);
@@ -2499,11 +2557,10 @@ impl JsRuntime {
             return Ok(JsValue::Object(self.realm.bound_function(function, object)));
         }
         // Inherited prototype members come last so host interfaces keep
-        // precedence over `Object.prototype` fallbacks.
-        if let Some(value) = inherited {
-            return Ok(value);
-        }
-        Ok(JsValue::Undefined)
+        // precedence over `Object.prototype` fallbacks. The pure chain walk
+        // above cannot invoke accessors, so the final read goes through
+        // [[Get]].
+        self.get_value(dom, object, property)
     }
 
     #[allow(
@@ -2686,12 +2743,7 @@ impl JsRuntime {
             }
             _ => {}
         }
-        if !self.realm.set_property(object, property.to_owned(), value) {
-            return Err(JsError::type_error(format!(
-                "property {property:?} is not writable"
-            )));
-        }
-        Ok(())
+        self.set_value(dom, object, property, value)
     }
 
     pub(super) fn construct(
