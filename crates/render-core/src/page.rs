@@ -885,12 +885,42 @@ impl Page {
     ///
     /// Returns a typed scheduler resource-limit error.
     pub fn queue_keydown(&mut self, key: &str) -> Result<TaskId, PageQueueError> {
-        let mut event =
-            PageDomEvent::new(self.document.dom().document(), "keydown").cancelable(true);
+        self.queue_keydown_at(self.document.dom().document(), key)
+    }
+
+    /// Queue a trusted cancelable `keydown` event at a specific page node.
+    ///
+    /// Native text controls use this target so page listeners can implement
+    /// the common Enter-to-submit and autocomplete behaviors. The document
+    /// targeted variant remains available for browser shortcuts and callers
+    /// that do not have a focused node.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_keydown_at(
+        &mut self,
+        target: NodeId,
+        key: &str,
+    ) -> Result<TaskId, PageQueueError> {
+        let mut event = PageDomEvent::new(target, "keydown").cancelable(true);
         event
             .properties
             .push(("key".to_owned(), JsValue::String(key.to_owned())));
         self.queue_dom_event(event)
+    }
+
+    /// Queue a trusted bubbling, cancelable form `submit` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed scheduler resource-limit error.
+    pub fn queue_submit_event(&mut self, form: NodeId) -> Result<TaskId, PageQueueError> {
+        self.queue_dom_event(
+            PageDomEvent::new(form, "submit")
+                .bubbles(true)
+                .cancelable(true),
+        )
     }
 
     /// Advance the virtual clock to `now` and run every ready turn until the

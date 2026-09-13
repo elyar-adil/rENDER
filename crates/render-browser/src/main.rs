@@ -50,23 +50,20 @@ use render_core::document::{
 };
 use render_core::html::{HtmlDecodeOptions, decode_html_bytes};
 use render_core::image::{ImageLimits, ImageResources, ImageSelectionContext, ImageSource};
-use render_core::interaction::{
-    ButtonBehavior, DefaultActionKind, FormMethod, activation_plan, plan_form_submission,
-};
+use render_core::interaction::FormMethod;
 use render_core::js::{ElementRect, JsValue, RuntimeLimits};
-use render_core::layout::{FragmentKind, PhysicalPoint, PhysicalRect, PhysicalSize};
+use render_core::layout::{PhysicalPoint, PhysicalSize};
 use render_core::navigation::{HistoryEntry, NavigationLimits, SessionHistory};
 use render_core::page::{Page, PageDomEvent, PageJob};
 use render_core::paint::{
-    Color, CpuRasterizer, DisplayCommand, DisplayList, PaintCoordinateSpace, PaintScene,
-    RasterControl, RasterRequest, Surface,
+    Color, CpuRasterizer, DisplayList, PaintScene, RasterControl, RasterRequest,
 };
 use render_core::script::{ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling};
 use render_net::{
     CookieJar, FetchConfig, FetchError, FetchRequest, FetchResponse, FetchResult, HttpTransport,
     NetworkWorker, RequestHandle, Url,
 };
-use softbuffer::{Context, Rect as SoftBufferRect, Surface as WindowSurface};
+use softbuffer::{Context, Surface as WindowSurface};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize as WindowSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -74,227 +71,19 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Theme, Window, WindowId};
 
+mod content_interaction;
+mod frame;
+use content_interaction::{content_text_input_value, content_wrapper_control};
+use frame::{
+    FrameDamage, FrameRect, blit_page, copy_frame_regions, geometry_from_layout,
+    surface_to_softbuffer, viewport_dimension,
+};
+
 const INITIAL_WIDTH: u32 = 1_180;
 const INITIAL_HEIGHT: u32 = 780;
 const SCROLL_LINE_PIXELS: f32 = 40.0;
 const ACTIVE_PAGE_TURN_BUDGET: usize = 8;
 const BACKGROUND_PAGE_TURN_BUDGET: usize = 2;
-const MAX_DAMAGE_RECTS: usize = 16;
-const DAMAGE_FULL_THRESHOLD_PERCENT: u64 = 75;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FrameRect {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-}
-
-impl FrameRect {
-    fn right(self) -> u32 {
-        self.x.saturating_add(self.width)
-    }
-
-    fn bottom(self) -> u32 {
-        self.y.saturating_add(self.height)
-    }
-
-    fn area(self) -> u64 {
-        u64::from(self.width) * u64::from(self.height)
-    }
-
-    fn touches_or_overlaps(self, other: Self) -> bool {
-        self.x <= other.right()
-            && other.x <= self.right()
-            && self.y <= other.bottom()
-            && other.y <= self.bottom()
-    }
-
-    fn union(self, other: Self) -> Self {
-        let right = self.right().max(other.right());
-        let bottom = self.bottom().max(other.bottom());
-        Self {
-            x: self.x.min(other.x),
-            y: self.y.min(other.y),
-            width: right.saturating_sub(self.x.min(other.x)),
-            height: bottom.saturating_sub(self.y.min(other.y)),
-        }
-    }
-
-    fn clip(self, width: u32, height: u32) -> Option<Self> {
-        let right = self.right().min(width);
-        let bottom = self.bottom().min(height);
-        (self.x < right && self.y < bottom).then_some(Self {
-            x: self.x,
-            y: self.y,
-            width: right.saturating_sub(self.x),
-            height: bottom.saturating_sub(self.y),
-        })
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct FrameDamage {
-    full: bool,
-    rects: Vec<FrameRect>,
-}
-
-impl FrameDamage {
-    fn mark_full(&mut self) {
-        self.full = true;
-        self.rects.clear();
-    }
-
-    fn mark_rect(&mut self, rect: FrameRect, frame_width: u32, frame_height: u32) {
-        if self.full || frame_width == 0 || frame_height == 0 {
-            return;
-        }
-        let Some(mut merged) = rect.clip(frame_width, frame_height) else {
-            return;
-        };
-        let mut index = 0;
-        while index < self.rects.len() {
-            if self.rects[index].touches_or_overlaps(merged) {
-                merged = self.rects[index].union(merged);
-                self.rects.swap_remove(index);
-            } else {
-                index += 1;
-            }
-        }
-        self.rects.push(merged);
-        let damaged_area = self.rects.iter().map(|item| item.area()).sum::<u64>();
-        let frame_area = u64::from(frame_width) * u64::from(frame_height);
-        if self.rects.len() > MAX_DAMAGE_RECTS
-            || damaged_area.saturating_mul(100)
-                >= frame_area.saturating_mul(DAMAGE_FULL_THRESHOLD_PERCENT)
-        {
-            self.mark_full();
-        }
-    }
-
-    fn take_for_present(&mut self, frame_width: u32, frame_height: u32) -> Vec<SoftBufferRect> {
-        if frame_width == 0 || frame_height == 0 {
-            self.full = false;
-            self.rects.clear();
-            return Vec::new();
-        }
-        if !self.full && self.rects.is_empty() {
-            return Vec::new();
-        }
-        let rects = if self.full || self.rects.is_empty() {
-            vec![SoftBufferRect {
-                x: 0,
-                y: 0,
-                width: NonZeroU32::new(frame_width).expect("frame width is non-zero"),
-                height: NonZeroU32::new(frame_height).expect("frame height is non-zero"),
-            }]
-        } else {
-            self.rects
-                .iter()
-                .filter_map(|rect| {
-                    Some(SoftBufferRect {
-                        x: rect.x,
-                        y: rect.y,
-                        width: NonZeroU32::new(rect.width)?,
-                        height: NonZeroU32::new(rect.height)?,
-                    })
-                })
-                .collect()
-        };
-        self.full = false;
-        self.rects.clear();
-        rects
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ContentHitRegion {
-    bounds: PhysicalRect,
-    source: Option<render_core::dom::NodeId>,
-    coordinate_space: PaintCoordinateSpace,
-    hit_testable: bool,
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "native window dimensions are far below the exact f32 integer range"
-)]
-fn hit_test_content_regions(
-    regions: impl DoubleEndedIterator<Item = ContentHitRegion>,
-    window_point: Point,
-    chrome_height: u32,
-    scroll_offset: PhysicalPoint,
-) -> Option<render_core::dom::NodeId> {
-    let viewport_point = PhysicalPoint {
-        x: window_point.x,
-        y: window_point.y - chrome_height as f32,
-    };
-    if viewport_point.x < 0.0
-        || viewport_point.y < 0.0
-        || !viewport_point.x.is_finite()
-        || !viewport_point.y.is_finite()
-    {
-        return None;
-    }
-    regions.rev().find_map(|region| {
-        if !region.hit_testable {
-            return None;
-        }
-        let source = region.source?;
-        let point = match region.coordinate_space {
-            PaintCoordinateSpace::Document => PhysicalPoint {
-                x: viewport_point.x + scroll_offset.x,
-                y: viewport_point.y + scroll_offset.y,
-            },
-            PaintCoordinateSpace::Viewport => viewport_point,
-        };
-        (point.x >= region.bounds.origin.x
-            && point.x < region.bounds.right()
-            && point.y >= region.bounds.origin.y
-            && point.y < region.bounds.bottom())
-        .then_some(source)
-    })
-}
-
-/// Structural paint commands (clips, transforms, stacking contexts) carry the
-/// full bounds of the subtree they open, so they would otherwise shadow the
-/// content items painted inside them during a reverse paint-order scan.
-fn is_content_hit_command(command: &DisplayCommand) -> bool {
-    !matches!(
-        command,
-        DisplayCommand::PushClip(_)
-            | DisplayCommand::PopClip
-            | DisplayCommand::PushTransform(_)
-            | DisplayCommand::PopTransform
-            | DisplayCommand::PushStackingContext(_)
-            | DisplayCommand::PopStackingContext
-    )
-}
-
-fn get_content_navigation_target(
-    dom: &render_core::dom::Dom,
-    hit_node: render_core::dom::NodeId,
-    document_url: &Url,
-) -> Option<Url> {
-    let mut candidate = Some(hit_node);
-    while let Some(node) = candidate {
-        match activation_plan(dom, node).map(|plan| plan.default_action) {
-            Some(DefaultActionKind::FollowHyperlink { href }) => {
-                return document_url.join(&href).ok();
-            }
-            Some(DefaultActionKind::InvokeButton(ButtonBehavior::Submit))
-                if dom.attribute(node, "disabled").ok().flatten().is_none() =>
-            {
-                let submission = plan_form_submission(dom, node, document_url).ok()?;
-                return (submission.method == FormMethod::Get).then_some(submission.target);
-            }
-            _ => {}
-        }
-        candidate = dom.parent(node);
-    }
-    None
-}
-
 type NativeSurface = WindowSurface<Arc<Window>, Arc<Window>>;
 
 fn main() {
@@ -2554,15 +2343,42 @@ impl BrowserApp {
             self.drain_script_navigations(id);
             self.sync_page_title(id);
         }
-        let navigation = hit_node.and_then(|hit_node| {
-            let page = self.pages.get(&id)?;
-            get_content_navigation_target(
-                page.page.document().dom(),
-                hit_node,
-                &page.navigation.committed().target.history_url(),
-            )
-        });
-        if let Some(url) = navigation.filter(|_| default_allowed) {
+        let submit_allowed = if default_allowed {
+            let form = hit_node.and_then(|node| {
+                let page = self.pages.get(&id)?;
+                content_interaction::submit_form_for_node(page.page.document().dom(), node)
+            });
+            form.is_none_or(|form| {
+                let task = self
+                    .pages
+                    .get_mut(&id)
+                    .and_then(|page| page.page.queue_submit_event(form).ok());
+                let allowed = task.is_none_or(|task| {
+                    self.pages.get_mut(&id).is_some_and(|page| {
+                        let (_, defaults) = page.run_page_turns();
+                        defaults.get(&task).copied().unwrap_or(true)
+                    })
+                });
+                self.drain_script_navigations(id);
+                allowed
+            })
+        } else {
+            false
+        };
+        // Recompute the target after click/submit listeners ran: handlers are
+        // allowed to update the live input value or form action.
+        let navigation = submit_allowed
+            .then_some(hit_node)
+            .flatten()
+            .and_then(|hit_node| {
+                let page = self.pages.get(&id)?;
+                content_interaction::get_content_navigation_target(
+                    page.page.document().dom(),
+                    hit_node,
+                    &page.navigation.committed().target.history_url(),
+                )
+            });
+        if let Some(url) = navigation {
             self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Push);
         }
         self.repaint_chrome();
@@ -2748,7 +2564,12 @@ impl BrowserApp {
         let node = content.node;
         let value = content.editor.text().to_owned();
         if let Some(page) = self.pages.get_mut(&tab)
-            && set_content_text_value(page.page.document_mut().dom_mut(), node, &value).is_ok()
+            && content_interaction::set_content_text_value(
+                page.page.document_mut().dom_mut(),
+                node,
+                &value,
+            )
+            .is_ok()
             && page.page.queue_input_event(node).is_ok()
         {
             let (rendered, _) = page.run_page_turns();
@@ -2787,21 +2608,69 @@ impl BrowserApp {
         if editable.is_some() {
             return editable;
         }
-        let display_list = page.display_list.as_ref()?;
-        hit_test_content_regions(
-            display_list.items().iter().map(|item| ContentHitRegion {
-                bounds: item.bounds,
-                source: item.source,
-                coordinate_space: item.coordinate_space,
-                hit_testable: is_content_hit_command(&item.command),
-            }),
-            self.cursor,
-            self.layout.as_ref()?.chrome_height,
-            PhysicalPoint {
-                x: 0.0,
-                y: page.scroll.offset_y(),
-            },
-        )
+        // Controls can be visually empty (for example an input whose
+        // background is supplied by an unsupported CSS image), so retain a
+        // geometry-based hit target for all HTML interactive elements.
+        let point = PhysicalPoint {
+            x: self.cursor.x,
+            y: self.cursor.y - self.layout.as_ref()?.chrome_height as f32 + page.scroll.offset_y(),
+        };
+        let geometry_hit = page
+            .geometry
+            .iter()
+            .filter_map(|(raw_node, rect)| {
+                let node = render_core::dom::NodeId::from_u64(*raw_node);
+                let interactive =
+                    render_core::interaction::activation_plan(page.page.document().dom(), node)
+                        .is_some()
+                        || content_interaction::is_content_editable(
+                            page.page.document().dom(),
+                            node,
+                        )
+                        || content_interaction::is_clickable_wrapper(
+                            page.page.document().dom(),
+                            node,
+                        );
+                let contains = point.x >= rect.x
+                    && point.x < rect.x + rect.width
+                    && point.y >= rect.y
+                    && point.y < rect.y + rect.height;
+                (interactive && contains && rect.width > 0.0 && rect.height > 0.0)
+                    .then_some((rect.width * rect.height, node))
+            })
+            .min_by(|(left, _), (right, _)| left.total_cmp(right))
+            .map(|(_, node)| node);
+
+        let display_hit = page.display_list.as_ref().and_then(|display_list| {
+            content_interaction::hit_test_content_regions(
+                display_list
+                    .items()
+                    .iter()
+                    .map(|item| content_interaction::ContentHitRegion {
+                        bounds: item.bounds,
+                        source: item.source,
+                        coordinate_space: item.coordinate_space,
+                        hit_testable: content_interaction::is_content_hit_command(&item.command),
+                    }),
+                self.cursor,
+                self.layout.as_ref()?.chrome_height,
+                PhysicalPoint {
+                    x: 0.0,
+                    y: page.scroll.offset_y(),
+                },
+            )
+        });
+        // Prefer the geometry target when paint only exposed an ancestor
+        // background. Otherwise preserve paint order for links and scripted
+        // containers whose event listener lives above the painted node.
+        if let (Some(painted), Some(control)) = (display_hit, geometry_hit)
+            && painted != control
+            && render_core::interaction::activation_plan(page.page.document().dom(), painted)
+                .is_none()
+        {
+            return Some(control);
+        }
+        display_hit.or(geometry_hit)
     }
 
     fn handle_context_menu_press(&mut self) {
@@ -2867,7 +2736,7 @@ impl BrowserApp {
                 .content_node_at_cursor()
                 .and_then(|node| {
                     let page = self.pages.get(&self.tabs.active_id())?;
-                    get_content_navigation_target(
+                    content_interaction::get_content_navigation_target(
                         page.page.document().dom(),
                         node,
                         &page.navigation.committed().target.history_url(),
@@ -3078,6 +2947,10 @@ impl BrowserApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "keyboard editing keeps each native control operation explicit"
+    )]
     fn handle_content_keyboard(&mut self, event: &winit::event::KeyEvent) -> bool {
         if event.state != ElementState::Pressed {
             return true;
@@ -3102,22 +2975,59 @@ impl BrowserApp {
             Key::Named(NamedKey::Enter) => {
                 let tab = content.tab;
                 let node = content.node;
-                let target = self
+                let key_task = self
                     .pages
-                    .get(&tab)
-                    .and_then(|page| {
-                        plan_form_submission(
+                    .get_mut(&tab)
+                    .and_then(|page| page.page.queue_keydown_at(node, "Enter").ok());
+                let key_allowed = key_task.is_none_or(|task| {
+                    self.pages.get_mut(&tab).is_some_and(|page| {
+                        let (_, defaults) = page.run_page_turns();
+                        defaults.get(&task).copied().unwrap_or(true)
+                    })
+                });
+                self.drain_script_navigations(tab);
+                self.content_editor = None;
+                if key_allowed {
+                    let form = self.pages.get(&tab).and_then(|page| {
+                        content_interaction::associated_form_for_node(
                             page.page.document().dom(),
                             node,
-                            &page.navigation.committed().target.history_url(),
                         )
-                        .ok()
-                    })
-                    .filter(|submission| submission.method == FormMethod::Get)
-                    .map(|submission| submission.target);
-                self.content_editor = None;
-                if let Some(url) = target {
-                    self.navigate_target(tab, NavigationTarget::from_url(url), HistoryMode::Push);
+                    });
+                    let submit_allowed = form.is_none_or(|form| {
+                        let task = self
+                            .pages
+                            .get_mut(&tab)
+                            .and_then(|page| page.page.queue_submit_event(form).ok());
+                        task.is_none_or(|task| {
+                            self.pages.get_mut(&tab).is_some_and(|page| {
+                                let (_, defaults) = page.run_page_turns();
+                                defaults.get(&task).copied().unwrap_or(true)
+                            })
+                        })
+                    });
+                    self.drain_script_navigations(tab);
+                    let target = submit_allowed
+                        .then(|| {
+                            self.pages.get(&tab).and_then(|page| {
+                                render_core::interaction::plan_form_submission(
+                                    page.page.document().dom(),
+                                    node,
+                                    &page.navigation.committed().target.history_url(),
+                                )
+                                .ok()
+                            })
+                        })
+                        .flatten()
+                        .filter(|submission| submission.method == FormMethod::Get)
+                        .map(|submission| submission.target);
+                    if let Some(url) = target {
+                        self.navigate_target(
+                            tab,
+                            NavigationTarget::from_url(url),
+                            HistoryMode::Push,
+                        );
+                    }
                 }
                 true
             }
@@ -3169,123 +3079,6 @@ impl BrowserApp {
         eprintln!("render-browser could not {operation}: {error}");
         event_loop.exit();
     }
-}
-
-fn is_content_editable(dom: &render_core::dom::Dom, node: render_core::dom::NodeId) -> bool {
-    dom.attribute(node, "contenteditable")
-        .ok()
-        .flatten()
-        .is_some_and(|value| {
-            value.is_empty()
-                || value.eq_ignore_ascii_case("true")
-                || value.eq_ignore_ascii_case("plaintext-only")
-        })
-}
-
-fn content_text_input_value(
-    dom: &render_core::dom::Dom,
-    node: render_core::dom::NodeId,
-) -> Option<String> {
-    let render_core::dom::NodeKind::Element(element) = dom.node(node)?.kind() else {
-        return None;
-    };
-    match element.local_name.as_str() {
-        "input" => {
-            // A missing or empty type attribute defaults to "text".
-            let input_type = dom
-                .attribute(node, "type")
-                .ok()
-                .flatten()
-                .filter(|value| !value.is_empty())
-                .unwrap_or("text");
-            matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search").then(|| {
-                dom.attribute(node, "value")
-                    .ok()
-                    .flatten()
-                    .unwrap_or("")
-                    .to_owned()
-            })
-        }
-        "textarea" => Some(descendant_text(dom, node)),
-        _ if is_content_editable(dom, node) => Some(descendant_text(dom, node)),
-        _ => None,
-    }
-}
-
-/// Route a click on a painted wrapper (for example a styled search box whose
-/// embedded control paints no content of its own) to the embedded text
-/// control. The control must be the dominant painted area of the wrapper so
-/// page-sized containers never capture clicks meant for surrounding content.
-fn content_wrapper_control(
-    dom: &render_core::dom::Dom,
-    geometry: &BTreeMap<u64, ElementRect>,
-    node: render_core::dom::NodeId,
-) -> Option<render_core::dom::NodeId> {
-    let bounds = geometry.get(&node.as_u64())?;
-    let wrapper_area = bounds.width * bounds.height;
-    if wrapper_area <= 0.0 {
-        return None;
-    }
-    let mut pending = dom.children(node).unwrap_or_default().to_vec();
-    let mut best: Option<(f32, render_core::dom::NodeId)> = None;
-    while let Some(current) = pending.pop() {
-        pending.extend(dom.children(current).unwrap_or_default().iter().copied());
-        if content_text_input_value(dom, current).is_none() {
-            continue;
-        }
-        let Some(rect) = geometry.get(&current.as_u64()) else {
-            continue;
-        };
-        let area = rect.width * rect.height;
-        if best.is_none_or(|(smallest, _)| area < smallest) {
-            best = Some((area, current));
-        }
-    }
-    let (area, control) = best?;
-    (area >= wrapper_area * 0.25).then_some(control)
-}
-
-fn descendant_text(dom: &render_core::dom::Dom, root: render_core::dom::NodeId) -> String {
-    let mut output = String::new();
-    let mut pending = dom
-        .children(root)
-        .unwrap_or_default()
-        .iter()
-        .rev()
-        .copied()
-        .collect::<Vec<_>>();
-    while let Some(node) = pending.pop() {
-        if let Some(render_core::dom::NodeKind::Text(text)) =
-            dom.node(node).map(render_core::dom::Node::kind)
-        {
-            output.push_str(text);
-        }
-        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
-    }
-    output
-}
-
-fn set_content_text_value(
-    dom: &mut render_core::dom::Dom,
-    node: render_core::dom::NodeId,
-    value: &str,
-) -> Result<(), render_core::dom::DomError> {
-    let kind = dom.node(node).map(render_core::dom::Node::kind);
-    let Some(render_core::dom::NodeKind::Element(element)) = kind else {
-        return Ok(());
-    };
-    if element.local_name == "input" {
-        return dom.set_attribute(node, "value", value);
-    }
-    let children = dom.children(node).unwrap_or_default().to_vec();
-    for child in children {
-        dom.remove_child(node, child)?;
-    }
-    if !value.is_empty() {
-        let text = dom.create_text(value);
-        dom.append_child(node, text)?;
-    }
-    Ok(())
 }
 
 struct ContentTextEditor {
@@ -3551,63 +3344,6 @@ const fn theme_from_winit(theme: Theme) -> ChromeTheme {
     }
 }
 
-fn blit_page(
-    destination: &mut [u32],
-    destination_size: WindowSize<u32>,
-    source: &[u32],
-    source_size: WindowSize<u32>,
-    destination_y: u32,
-) {
-    let copy_width = source_size.width.min(destination_size.width) as usize;
-    let copy_height = source_size
-        .height
-        .min(destination_size.height.saturating_sub(destination_y));
-    for row in 0..copy_height {
-        let source_start = row as usize * source_size.width as usize;
-        let destination_start = (row + destination_y) as usize * destination_size.width as usize;
-        destination[destination_start..destination_start + copy_width]
-            .copy_from_slice(&source[source_start..source_start + copy_width]);
-    }
-}
-
-fn copy_frame_regions(
-    destination: &mut [u32],
-    source: &[u32],
-    frame_size: WindowSize<u32>,
-    regions: &[SoftBufferRect],
-) {
-    let frame_width = frame_size.width as usize;
-    for region in regions {
-        let x = region.x as usize;
-        let y = region.y as usize;
-        let width = region.width.get() as usize;
-        let height = region.height.get() as usize;
-        for row in 0..height {
-            let offset = (y + row) * frame_width + x;
-            let end = offset + width;
-            destination[offset..end].copy_from_slice(&source[offset..end]);
-        }
-    }
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "native dimensions are bounded far below f32's exact integer range"
-)]
-fn viewport_dimension(value: u32) -> f32 {
-    value as f32
-}
-
-fn surface_to_softbuffer(surface: &Surface) -> Vec<u32> {
-    surface
-        .pixels()
-        .iter()
-        .map(|color| {
-            (u32::from(color.red) << 16) | (u32::from(color.green) << 8) | u32::from(color.blue)
-        })
-        .collect()
-}
-
 fn log_completed_frame_debug(frame: &PageRenderFrame, tab_id: u64) {
     if env::var_os("RENDER_DEBUG_FRAME").is_none() {
         return;
@@ -3671,28 +3407,6 @@ fn dump_debug_frame(frame: &[u32], size: WindowSize<u32>) {
         ]);
     }
     let _ = fs::write(path, ppm);
-}
-
-fn geometry_from_layout(
-    fragments: &render_core::layout::FragmentTree,
-) -> BTreeMap<u64, ElementRect> {
-    let mut geometry = BTreeMap::new();
-    for fragment in fragments.iter() {
-        let FragmentKind::Box(box_geometry) = &fragment.kind else {
-            continue;
-        };
-        let Some(source) = fragment.source else {
-            continue;
-        };
-        let rect = box_geometry.border_rect();
-        geometry.entry(source.as_u64()).or_insert(ElementRect {
-            x: rect.origin.x,
-            y: rect.origin.y,
-            width: rect.size.width,
-            height: rect.size.height,
-        });
-    }
-    geometry
 }
 
 fn report_stylesheet_diagnostics(diagnostics: &[StylesheetResourceDiagnostic]) {
@@ -3788,11 +3502,15 @@ mod tests {
     use winit::event::MouseScrollDelta;
     use winit::keyboard::Key;
 
+    use super::content_interaction;
+    use super::content_interaction::{
+        ContentHitRegion, associated_form_for_node, content_text_input_value,
+        content_wrapper_control, get_content_navigation_target, hit_test_content_regions,
+        submit_form_for_node,
+    };
     use super::{
-        ContentHitRegion, ElementRect, FrameDamage, FrameRect, HOME_TITLE, HostPlatform,
-        PageNavigation, PageSource, PageState, address_shortcut, blit_page,
-        content_text_input_value, content_wrapper_control, get_content_navigation_target,
-        hit_test_content_regions, home_source, is_content_hit_command, network_start_source,
+        ElementRect, FrameDamage, FrameRect, HOME_TITLE, HostPlatform, PageNavigation, PageSource,
+        PageState, address_shortcut, blit_page, home_source, network_start_source,
         primary_modifier_for, source_from_network_response, surface_to_softbuffer,
         wheel_document_delta_y,
     };
@@ -3972,7 +3690,7 @@ mod tests {
         ];
 
         assert_eq!(
-            hit_test_content_regions(
+            content_interaction::hit_test_content_regions(
                 regions.into_iter(),
                 Point { x: 20.0, y: 90.0 },
                 60,
@@ -3994,19 +3712,27 @@ mod tests {
     #[test]
     fn structural_paint_commands_do_not_participate_in_content_hits() {
         let bounds = PhysicalRect::new(0.0, 0.0, 100.0, 50.0);
-        assert!(is_content_hit_command(&DisplayCommand::SolidRect {
-            rect: bounds,
-            color: Color::rgb(0xff, 0xff, 0xff),
-        }));
-        assert!(!is_content_hit_command(&DisplayCommand::PushClip(
-            ClipShape::Rect(bounds)
-        )));
-        assert!(!is_content_hit_command(&DisplayCommand::PopClip));
-        assert!(!is_content_hit_command(&DisplayCommand::PushTransform(
-            Transform2D::default()
-        )));
-        assert!(!is_content_hit_command(&DisplayCommand::PopTransform));
-        assert!(!is_content_hit_command(&DisplayCommand::PopStackingContext));
+        assert!(content_interaction::is_content_hit_command(
+            &DisplayCommand::SolidRect {
+                rect: bounds,
+                color: Color::rgb(0xff, 0xff, 0xff),
+            }
+        ));
+        assert!(!content_interaction::is_content_hit_command(
+            &DisplayCommand::PushClip(ClipShape::Rect(bounds))
+        ));
+        assert!(!content_interaction::is_content_hit_command(
+            &DisplayCommand::PopClip
+        ));
+        assert!(!content_interaction::is_content_hit_command(
+            &DisplayCommand::PushTransform(Transform2D::default())
+        ));
+        assert!(!content_interaction::is_content_hit_command(
+            &DisplayCommand::PopTransform
+        ));
+        assert!(!content_interaction::is_content_hit_command(
+            &DisplayCommand::PopStackingContext
+        ));
     }
 
     #[test]
@@ -4194,6 +3920,45 @@ mod tests {
         assert_eq!(
             target.as_str(),
             "https://www.baidu.com/s?wd=small+browser&from=render"
+        );
+    }
+
+    #[test]
+    fn submit_and_text_controls_resolve_their_associated_form() {
+        let document = parse_document(
+            "<form id='search'><input id='query' name='wd'><button id='go'><span>Go</span></button></form>",
+        );
+        let dom = &document.dom;
+        let mut pending = vec![dom.document()];
+        let mut query = None;
+        let mut text = None;
+        while let Some(node) = pending.pop() {
+            if dom.attribute(node, "id").ok().flatten() == Some("query") {
+                query = Some(node);
+            }
+            if matches!(
+                dom.node(node).map(render_core::dom::Node::kind),
+                Some(NodeKind::Text(value)) if value == "Go"
+            ) {
+                text = Some(node);
+            }
+            pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+        }
+        let mut forms = vec![dom.document()];
+        let form = loop {
+            let node = forms.pop().expect("form");
+            if dom.attribute(node, "id").ok().flatten() == Some("search") {
+                break node;
+            }
+            forms.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+        };
+        assert_eq!(
+            associated_form_for_node(dom, query.expect("query")),
+            Some(form)
+        );
+        assert_eq!(
+            submit_form_for_node(dom, text.expect("button text")),
+            Some(form)
         );
     }
 

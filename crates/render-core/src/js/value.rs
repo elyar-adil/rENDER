@@ -682,6 +682,11 @@ impl JsObject {
     pub const fn prototype(&self) -> Option<ObjectId> {
         self.prototype
     }
+
+    /// Own data properties in stable insertion order (`BTreeMap` key order).
+    pub(crate) fn property_values(&self) -> impl Iterator<Item = &JsValue> {
+        self.properties.values().map(|descriptor| &descriptor.value)
+    }
 }
 
 /// Global state and object identity for one JavaScript realm.
@@ -702,6 +707,10 @@ pub struct Realm {
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// Number of object slots that became garbage and were swept. Object
+    /// identities are never moved or reused, so a swept slot always reads as
+    /// an empty ordinary object even if some bookkeeping still references it.
+    swept_objects: usize,
 }
 
 impl Realm {
@@ -1216,6 +1225,7 @@ impl Realm {
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
+            swept_objects: 0,
         }
     }
 
@@ -2833,8 +2843,47 @@ impl Realm {
         self.set_property(self.global, key, value)
     }
 
+    /// Number of live (non-swept) object slots. Swept slots are rewritten to
+    /// empty ordinary objects whose identities are never reused.
     pub(crate) fn object_count(&self) -> usize {
-        self.objects.len()
+        self.objects.len().saturating_sub(self.swept_objects)
+    }
+
+    /// Fixed identity roots that must survive every collection: the global
+    /// realm wrappers and every existing DOM/platform wrapper identity.
+    pub(crate) fn gc_identity_roots(&self) -> Vec<ObjectId> {
+        let mut roots = Vec::with_capacity(
+            2 + self.node_wrappers.len()
+                + self.class_list_wrappers.len()
+                + self.style_declaration_wrappers.len(),
+        );
+        roots.push(self.global);
+        roots.push(self.document);
+        roots.extend(self.node_wrappers.values().copied());
+        roots.extend(self.class_list_wrappers.values().copied());
+        roots.extend(self.style_declaration_wrappers.values().copied());
+        roots
+    }
+
+    pub(crate) fn objects(&self) -> &[JsObject] {
+        &self.objects
+    }
+
+    /// Replace every unmarked object slot with an empty tombstone so its
+    /// property storage is released. Live identities never move or reuse, so
+    /// a lingering reference to a swept slot observes an inert object rather
+    /// than corrupted state. Returns the number of reclaimed slots.
+    pub(crate) fn sweep_unmarked(&mut self, marked: &[bool]) -> usize {
+        debug_assert_eq!(marked.len(), self.objects.len());
+        let mut reclaimed = 0usize;
+        for (index, alive) in marked.iter().enumerate() {
+            if !alive {
+                self.objects[index] = JsObject::default();
+                reclaimed = reclaimed.saturating_add(1);
+            }
+        }
+        self.swept_objects = self.swept_objects.saturating_add(reclaimed);
+        reclaimed
     }
 
     pub(crate) fn host(&self, object: ObjectId) -> Option<ObjectHost> {
