@@ -11,10 +11,12 @@ ROOT = Path(__file__).resolve().parent.parent
 MODULE_DIR = {
     "runtime": ROOT / "crates/render-core/src/js/runtime",
     "solver": ROOT / "crates/render-core/src/layout/solver",
+    "main": ROOT / "crates/render-browser/src",
 }
 NAMES_FILE = {
     "runtime": ROOT / "tools/names.json",
     "solver": ROOT / "tools/names_solver.json",
+    "main": ROOT / "tools/names_main.json",
 }
 
 def run_check():
@@ -67,7 +69,8 @@ parser.add_argument("module", choices=sorted(MODULE_DIR))
 ARGS = parser.parse_args()
 OUT = MODULE_DIR[ARGS.module]
 NAME_MAP = json.loads(NAMES_FILE[ARGS.module].read_text(encoding="utf-8"))
-ARGS.cargo = ["cargo", "check", "-p", "render-core", "--all-targets", "--message-format=json"]
+crate_name = "render-core" if ARGS.module != "main" else "render-browser"
+ARGS.cargo = ["cargo", "check", "-p", crate_name, "--all-targets", "--message-format=json"]
 
 fixed_total = 0
 for iteration in range(20):
