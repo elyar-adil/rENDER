@@ -233,7 +233,13 @@ fn enforce_baseline(buckets: &BTreeMap<String, [usize; 6]>) {
             continue;
         };
         let current_pass = counts[index_of(Status::Pass)];
-        let excused = counts[index_of(Status::Timeout)] + counts[index_of(Status::Crash)];
+        let total: usize = counts.iter().sum();
+        // Excuse at most a small fraction of the bucket: crashes and
+        // timeouts may hide worker instability, but a mass-crash cascade
+        // must never silently mask a conformance collapse.
+        let excused = (counts[index_of(Status::Timeout)]
+            + counts[index_of(Status::Crash)])
+        .min(total / 20);
         if current_pass + excused < pass {
             regressions.push(format!(
                 "{bucket}: pass {current_pass} + excused {excused} < baseline {pass}"
