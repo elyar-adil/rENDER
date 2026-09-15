@@ -1,0 +1,131 @@
+rENDER NON-COMMERCIAL LICENSE
+Version 1.0, September 2026
+
+Copyright (c) 2026 Elyar Adil
+
+1. Definitions
+
+"Software" means the source code, documentation, and other material in the
+rENDER repository that is identified by the copyright holder as being covered
+by this license.
+
+"You" means an individual or legal entity exercising rights under this
+license.
+
+"Commercial Purpose" means a purpose intended primarily for commercial
+advantage, monetary compensation, or the direct or indirect generation of
+revenue. Commercial Purpose includes, without limitation, use of the Software
+in a product or service offered for sale, subscription, license, paid access,
+advertising-supported access, or other monetary consideration; use by a
+business or other commercial entity for its ordinary business operations; and
+use of the Software to provide a paid or revenue-generating service to a third
+party.
+
+Commercial Purpose does not include merely receiving voluntary, non-obligatory
+support or donations for an otherwise non-commercial project, provided that
+the Software itself is not offered as part of a paid product or service.
+
+"Non-Commercial Purpose" means any purpose that is not a Commercial Purpose,
+including personal use, education, academic research, experimentation,
+hobbyist projects, and non-commercial open-source projects.
+
+"Derivative Work" means a work based upon the Software, including modified
+versions of the Software.
+
+2. Grant of Rights
+
+Subject to the conditions of this license, the copyright holder grants You a
+worldwide, royalty-free, non-exclusive, non-transferable license to use,
+copy, modify, and create Derivative Works of the Software solely for
+Non-Commercial Purposes.
+
+You may distribute the Software or Derivative Works for Non-Commercial
+Purposes, provided that You:
+
+(a) retain this license and all applicable copyright notices;
+(b) clearly identify material modifications to the Software; and
+(c) do not represent that the copyright holder endorses Your Derivative Work.
+
+3. Commercial Use Prohibited
+
+You may not use, copy, modify, distribute, sublicense, sell, or otherwise
+exploit the Software or any Derivative Work for a Commercial Purpose under
+this license.
+
+In particular, without a separate written commercial license from the
+copyright holder, You may not:
+
+(a) incorporate the Software into a commercial product, browser, application,
+    SDK, library, operating system, or service;
+(b) use the Software to operate a commercial or revenue-generating service,
+    including a hosted rendering or browser service;
+(c) distribute the Software as part of a product or service for which You or
+    another party charges money or receives other commercial compensation; or
+(d) use the Software for the ordinary internal operations of a commercial
+    business.
+
+Nothing in this license grants any right to use the Software for a Commercial
+Purpose. Commercial use may be authorized only by a separate written license
+from the copyright holder.
+
+4. Third-Party Components
+
+This license applies only to material owned by the copyright holder and
+identified as being licensed under this license. Third-party software,
+tests, data, fonts, specifications, and other materials remain subject to
+their own applicable licenses.
+
+In particular, this license does not replace or restrict the license of
+third-party material contained in or obtained for the repository, including
+material under the `third_party/` directory. You must comply with the
+applicable license for each such component.
+
+5. Contributions
+
+Unless a contribution is accompanied by a separate written license from the
+contributor, a contributor grants the copyright holder and recipients of the
+Software the same rights to the contribution as those granted for the
+contributed material under this license.
+
+Contributors represent that they have the right to grant these rights.
+
+6. Termination
+
+Any rights granted under this license terminate automatically if You violate
+its terms. Rights may be reinstated if the violation is cured within thirty
+(30) days after You become aware of the violation, unless the copyright holder
+provides written notice stating otherwise or the violation is not reasonably
+curable.
+
+Upon termination, You must stop exercising the rights granted by this license,
+except that recipients who received the Software or a Derivative Work from You
+before termination and who are themselves in compliance with this license do
+not lose their rights solely because of Your termination.
+
+7. No Trademark License
+
+This license does not grant permission to use the names, logos, trademarks,
+or service marks of the copyright holder or the rENDER project except as
+reasonably necessary to describe the origin of the Software.
+
+8. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+9. No Patent Grant
+
+Except for any rights that cannot lawfully be excluded, no patent license or
+other patent rights are granted by this license. Any patent rights that You
+may require to use the Software are Your responsibility.
+
+10. Commercial Licensing
+
+For commercial use, contact the copyright holder to obtain a separate
+commercial license. The terms, scope, fees, and duration of any commercial
+license are determined by a separate written agreement.
