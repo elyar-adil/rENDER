@@ -146,4 +146,13 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, review expectations, and chang
 
 ## License
 
-Project source is distributed under the terms in [COPYING](COPYING).
+rENDER is distributed under the **rENDER Non-Commercial License 1.0** in
+[`LICENSE`](LICENSE).
+
+The license permits personal, educational, research, experimental, hobbyist,
+and other non-commercial use, including modification and non-commercial
+redistribution. Commercial use requires a separate written license from the
+copyright holder.
+
+Third-party components, including material under `third_party/`, remain under
+their respective licenses and are not relicensed by the rENDER license.
