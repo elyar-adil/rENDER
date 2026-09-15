@@ -426,6 +426,7 @@ fn worker_uses_a_shared_bounded_transfer_pool() {
         NetworkWorkerConfig {
             worker_count: 2,
             queue_capacity: 4,
+            operation_capacity: 4,
         },
     )
     .expect("start bounded worker pool");
@@ -449,39 +450,92 @@ fn worker_uses_a_shared_bounded_transfer_pool() {
 }
 
 #[test]
-fn worker_rejects_excess_operations_without_opening_connections() {
+fn default_config_sizes_the_queue_independently_of_in_flight_permits() {
+    let config = NetworkWorkerConfig::default();
+    assert!(config.operation_capacity >= 16);
+    assert!(
+        config.queue_capacity >= 1024,
+        "the command queue must absorb realistic page bursts"
+    );
+    assert!(
+        config.queue_capacity > config.operation_capacity,
+        "the queue must be larger than the in-flight limit so bursts queue instead of failing"
+    );
+}
+
+#[test]
+fn worker_queues_excess_operations_until_permits_free_up() {
+    let (hit_tx, hit_rx) = mpsc::channel();
+    let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_release = Arc::clone(&release);
     let hits = Arc::new(AtomicUsize::new(0));
     let handler_hits = Arc::clone(&hits);
-    let (base, server) = spawn_server(1, move |_| {
+    let (base, server) = spawn_server(2, move |request| {
         handler_hits.fetch_add(1, Ordering::SeqCst);
-        thread::sleep(Duration::from_millis(60));
-        WireResponse::ok("first")
+        hit_tx.send(()).expect("report request hit");
+        while !server_release.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        WireResponse::ok(request_path(&request).as_bytes().to_vec())
     });
     let worker = NetworkWorker::start_with_config(
         transport(|_| {}),
         NetworkWorkerConfig {
             worker_count: 1,
-            queue_capacity: 1,
+            queue_capacity: 4,
+            operation_capacity: 1,
         },
     )
     .expect("start bounded worker pool");
-    let first = worker.submit(FetchRequest::get(base.join("first").expect("first URL")));
-    let second = worker.submit(FetchRequest::get(base.join("second").expect("second URL")));
 
-    let rejected = second
-        .recv_timeout(Duration::from_millis(100))
-        .expect("excess operation must fail promptly")
-        .expect_err("second operation is rejected");
-    assert_eq!(
-        rejected,
-        FetchError::Transport("network worker queue is full".into())
+    let first = worker.submit(FetchRequest::get(base.join("first").expect("first URL")));
+    hit_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first request starts");
+    let second = worker.submit(FetchRequest::get(base.join("second").expect("second URL")));
+    assert!(
+        matches!(second.try_recv(), Err(mpsc::TryRecvError::Empty)),
+        "an operation parked behind an exhausted permit stays queued, it must not fail"
     );
+
+    release.store(true, Ordering::Release);
     first
         .recv_timeout(Duration::from_secs(1))
         .expect("first operation completes")
         .expect("first request succeeds");
+    let second_result = second
+        .recv_timeout(Duration::from_secs(1))
+        .expect("queued operation completes once a permit frees up");
+    second_result.expect("second request succeeds");
     server.join().expect("server exits");
-    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn default_worker_absorbs_a_burst_of_two_hundred_submissions() {
+    let (base, server) = spawn_server(200, move |request| {
+        thread::sleep(Duration::from_millis(1));
+        WireResponse::ok(request_path(&request).as_bytes().to_vec())
+    });
+    let worker = NetworkWorker::start(transport(|_| {})).expect("start default worker");
+    let handles = (0..200)
+        .map(|index| {
+            worker.submit(FetchRequest::get(
+                base.join(&index.to_string()).expect("burst URL"),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (index, handle) in handles.into_iter().enumerate() {
+        let result = handle
+            .recv_timeout(Duration::from_secs(10))
+            .expect("burst submission completes");
+        let response = result
+            .unwrap_or_else(|error| panic!("burst submission {index} must not fail, got: {error}"));
+        assert!(response.status.is_success());
+        assert_eq!(response.body, format!("/{index}").into_bytes());
+    }
+    server.join().expect("server exits");
 }
 
 #[test]

@@ -19,6 +19,7 @@ use crate::diagnostics::report_stylesheet_diagnostics;
 use crate::fetch_handles::CachedBatchHandle;
 use crate::fetch_handles::CachedFetchResult;
 use crate::fetch_handles::CachedRequestHandle;
+use crate::fetch_handles::CachedRequestState;
 use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
 use crate::frame::blit_page;
@@ -37,6 +38,7 @@ use crate::render_worker::FullPageRenderPayload;
 use crate::render_worker::PageRenderFrame;
 use crate::render_worker::PageRenderPayload;
 use crate::render_worker::PageRenderWorker;
+use render_browser::cache::CacheEpoch;
 use render_browser::cache::CacheLookup;
 use render_browser::cache::HttpCache;
 use render_browser::cache::disk::DiskCacheEvent;
@@ -102,6 +104,7 @@ use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -128,6 +131,18 @@ pub(super) enum HistoryMode {
     Push,
     Current,
 }
+
+/// Total submission attempts, including the first, before a request parked
+/// behind a full network worker queue is allowed to surface the queue-full
+/// error through the normal polling path.
+const QUEUE_FULL_SUBMIT_ATTEMPTS: usize = 8;
+/// First backoff delay for queue-full resubmission; it doubles per attempt.
+const QUEUE_FULL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(5);
+/// Ceiling for the queue-full backoff so the polling thread never stalls long.
+const QUEUE_FULL_RETRY_MAX_DELAY: Duration = Duration::from_millis(200);
+/// Rejection message produced by the render-net worker when its bounded
+/// command queue is full. The two crates share the wording by contract.
+const NETWORK_QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
 
 pub(super) struct BrowserApp {
     pub(super) tabs: TabModel,
@@ -808,10 +823,50 @@ impl BrowserApp {
                     .http_cache
                     .revalidation_request(&request, now)
                     .unwrap_or_else(|| request.clone());
-                let handle = self.network.submit(submitted_request.clone());
-                CachedRequestHandle::pending(submitted_request, epoch, handle)
+                self.submit_with_queue_full_backoff(submitted_request, epoch)
             }
         }
+    }
+
+    /// Submits one request, retrying with bounded exponential backoff when the
+    /// network worker rejects it because its command queue is momentarily full.
+    ///
+    /// Real pages fire dozens of concurrent subresource fetches; a burst like
+    /// that must not turn into hard per-resource failures. Once the worker
+    /// accepts the submission (or the retry budget is spent, leaving the last
+    /// handle to settle through the normal polling path) the handle is returned
+    /// unchanged. Every other immediate outcome, such as a stopped worker, is
+    /// surfaced exactly as the worker produced it.
+    fn submit_with_queue_full_backoff(
+        &mut self,
+        request: FetchRequest,
+        epoch: CacheEpoch,
+    ) -> CachedRequestHandle {
+        let mut delay = QUEUE_FULL_RETRY_INITIAL_DELAY;
+        let mut handle = self.network.submit(request.clone());
+        for _ in 1..QUEUE_FULL_SUBMIT_ATTEMPTS {
+            match handle.try_recv() {
+                Err(TryRecvError::Empty) => {
+                    return CachedRequestHandle::pending(request, epoch, handle);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    unreachable!("submit always answers its handle exactly once")
+                }
+                Ok(Err(FetchError::Transport(message)))
+                    if message == NETWORK_QUEUE_FULL_MESSAGE => {}
+                Ok(result) => {
+                    return CachedRequestHandle {
+                        request,
+                        epoch,
+                        state: CachedRequestState::Ready(Box::new(Some(result))),
+                    };
+                }
+            }
+            thread::sleep(delay);
+            delay = delay.saturating_mul(2).min(QUEUE_FULL_RETRY_MAX_DELAY);
+            handle = self.network.submit(request.clone());
+        }
+        CachedRequestHandle::pending(request, epoch, handle)
     }
 
     pub(super) fn submit_cached_batch(&mut self, requests: Vec<FetchRequest>) -> CachedBatchHandle {

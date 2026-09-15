@@ -14,20 +14,17 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
 const PAUSED_ORIGIN_MESSAGE: &str = "per-origin concurrency policy paused this origin";
 const MISSING_BATCH_RESULT_MESSAGE: &str = "batch worker ended without a result";
+const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 
 type OperationId = u64;
 
 enum Command {
     Fetch {
-        id: OperationId,
-        permit: OperationPermit,
         request: FetchRequest,
         cancel: CancelToken,
         response: Sender<FetchResult>,
     },
     Batch {
-        id: OperationId,
-        permit: OperationPermit,
         requests: Vec<FetchRequest>,
         options: BatchOptions,
         cancel: CancelToken,
@@ -47,6 +44,12 @@ impl Command {
                 let results = requests.iter().map(|_| Err(error.clone())).collect();
                 let _ignored = response.send(results);
             }
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Fetch { cancel, .. } | Self::Batch { cancel, .. } => cancel.is_cancelled(),
         }
     }
 }
@@ -137,16 +140,18 @@ impl JobQueue {
 struct Runtime {
     jobs: Arc<JobQueue>,
     next_operation_id: AtomicU64,
+    queue_capacity: usize,
     operation_capacity: usize,
     operations: AtomicU64,
 }
 
 impl Runtime {
-    fn new(queue_capacity: usize) -> Self {
+    fn new(queue_capacity: usize, operation_capacity: usize) -> Self {
         Self {
             jobs: Arc::new(JobQueue::new(queue_capacity)),
             next_operation_id: AtomicU64::new(1),
-            operation_capacity: queue_capacity,
+            queue_capacity,
+            operation_capacity,
             operations: AtomicU64::new(0),
         }
     }
@@ -192,12 +197,16 @@ impl Drop for OperationPermit {
 ///
 /// The default reserves one logical CPU for the browser/UI thread where the
 /// platform reports more than one CPU, while capping network threads at 16.
-/// Both the command and transfer queues use `queue_capacity` so callers never
-/// create an unbounded backlog behind stalled connections.
+/// `operation_capacity` is the concurrency limit: it bounds how many operations
+/// hold an in-flight permit at once. `queue_capacity` sizes the command and
+/// transfer queues independently and is deliberately much larger, so bursts
+/// above the in-flight limit are absorbed and completed as permits free up
+/// instead of being rejected at the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkWorkerConfig {
     pub worker_count: usize,
     pub queue_capacity: usize,
+    pub operation_capacity: usize,
 }
 
 impl Default for NetworkWorkerConfig {
@@ -207,7 +216,8 @@ impl Default for NetworkWorkerConfig {
             .min(16);
         Self {
             worker_count,
-            queue_capacity: worker_count.saturating_mul(8).clamp(16, 128),
+            queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            operation_capacity: worker_count.saturating_mul(8).clamp(16, 128),
         }
     }
 }
@@ -217,7 +227,6 @@ impl Default for NetworkWorkerConfig {
 #[derive(Clone, Debug)]
 pub struct NetworkWorker {
     events: SyncSender<Event>,
-    runtime: Arc<Runtime>,
 }
 
 impl NetworkWorker {
@@ -253,17 +262,26 @@ impl NetworkWorker {
                 "network worker queue capacity must be non-zero",
             ));
         }
+        if config.operation_capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "network worker operation capacity must be non-zero",
+            ));
+        }
 
         let transport = Arc::new(transport);
-        let runtime = Arc::new(Runtime::new(config.queue_capacity));
+        let runtime = Arc::new(Runtime::new(
+            config.queue_capacity,
+            config.operation_capacity,
+        ));
         let (events, receiver) = mpsc::sync_channel(config.queue_capacity);
-        let dispatcher_jobs = Arc::clone(&runtime.jobs);
+        let dispatcher_runtime = Arc::clone(&runtime);
         thread::Builder::new()
             .name("render-net-dispatch".into())
             .spawn(move || {
                 Dispatcher {
                     receiver,
-                    jobs: dispatcher_jobs,
+                    runtime: dispatcher_runtime,
                 }
                 .run();
             })?;
@@ -288,30 +306,31 @@ impl NetworkWorker {
             }
         }
 
-        Ok(Self { events, runtime })
+        Ok(Self { events })
     }
 
     /// Queues one GET and immediately returns its typed result handle.
+    ///
+    /// The submission is accepted while the command queue has room, even when
+    /// every in-flight permit is taken; it starts once a permit frees up. Only
+    /// a genuinely full queue rejects the command promptly.
     #[must_use]
     pub fn submit(&self, request: FetchRequest) -> RequestHandle<FetchResult> {
         let (response, receiver) = mpsc::channel();
         let cancel = CancelToken::default();
-        let Some(permit) = self.runtime.reserve_operation() else {
-            let _ignored = response.send(Err(FetchError::Transport(QUEUE_FULL_MESSAGE.into())));
-            return RequestHandle { receiver, cancel };
-        };
-        let command = Command::Fetch {
-            id: self.runtime.next_operation_id(),
-            permit,
+        self.enqueue(Command::Fetch {
             request,
             cancel: cancel.clone(),
             response,
-        };
-        self.enqueue(command);
+        });
         RequestHandle { receiver, cancel }
     }
 
     /// Queues an ordered parallel batch and immediately returns its handle.
+    ///
+    /// The batch counts as one in-flight operation regardless of its internal
+    /// concurrency. Like [`NetworkWorker::submit`], it is accepted while the
+    /// command queue has room and only a genuinely full queue rejects it.
     #[must_use]
     pub fn submit_batch(
         &self,
@@ -320,23 +339,12 @@ impl NetworkWorker {
     ) -> RequestHandle<Vec<FetchResult>> {
         let (response, receiver) = mpsc::channel();
         let cancel = CancelToken::default();
-        let Some(permit) = self.runtime.reserve_operation() else {
-            let results = requests
-                .iter()
-                .map(|_| Err(FetchError::Transport(QUEUE_FULL_MESSAGE.into())))
-                .collect();
-            let _ignored = response.send(results);
-            return RequestHandle { receiver, cancel };
-        };
-        let command = Command::Batch {
-            id: self.runtime.next_operation_id(),
-            permit,
+        self.enqueue(Command::Batch {
             requests,
             options,
             cancel: cancel.clone(),
             response,
-        };
-        self.enqueue(command);
+        });
         RequestHandle { receiver, cancel }
     }
 
@@ -589,14 +597,48 @@ enum BatchSchedule {
 struct Scheduler {
     operations: HashMap<OperationId, Operation>,
     ready: VecDeque<OperationId>,
+    waiting: VecDeque<Command>,
 }
 
 impl Scheduler {
-    fn accept(&mut self, command: Command) {
+    /// Admits a freshly submitted command while an in-flight permit is
+    /// available, otherwise parks it until permits free up. The waiting queue
+    /// is bounded by the same capacity as the command channel so a stalled
+    /// worker can never accumulate an unbounded backlog.
+    fn accept(&mut self, runtime: &Arc<Runtime>, command: Command) {
+        if self.waiting.len() >= runtime.queue_capacity {
+            command.reject(FetchError::Transport(QUEUE_FULL_MESSAGE.into()));
+            return;
+        }
+        if self.waiting.is_empty()
+            && let Some(permit) = runtime.reserve_operation()
+        {
+            self.admit(runtime.next_operation_id(), command, permit);
+            return;
+        }
+        self.waiting.push_back(command);
+    }
+
+    /// Admits queued commands in submission order as in-flight permits free up.
+    fn promote_waiting(&mut self, runtime: &Arc<Runtime>) {
+        loop {
+            if self.waiting.is_empty() {
+                return;
+            }
+            let Some(permit) = runtime.reserve_operation() else {
+                return;
+            };
+            let command = self
+                .waiting
+                .pop_front()
+                .expect("waiting queue is non-empty");
+            self.admit(runtime.next_operation_id(), command, permit);
+        }
+    }
+
+    fn admit(&mut self, id: OperationId, command: Command, permit: OperationPermit) {
         match command {
             Command::Fetch {
-                id,
-                permit,
                 request,
                 cancel,
                 response,
@@ -618,8 +660,6 @@ impl Scheduler {
                 self.ready.push_back(id);
             }
             Command::Batch {
-                id,
-                permit,
                 requests,
                 options,
                 cancel,
@@ -660,6 +700,15 @@ impl Scheduler {
             }
         }
         self.ready.retain(|id| self.operations.contains_key(id));
+        let mut waiting = VecDeque::new();
+        for command in self.waiting.drain(..) {
+            if command.is_cancelled() {
+                command.reject(FetchError::Cancelled);
+            } else {
+                waiting.push_back(command);
+            }
+        }
+        self.waiting = waiting;
     }
 
     fn schedule(&mut self, jobs: &JobQueue) -> bool {
@@ -748,33 +797,37 @@ impl Scheduler {
         for (_, operation) in self.operations.drain() {
             operation.stop();
         }
+        for command in self.waiting.drain(..) {
+            command.reject(FetchError::WorkerStopped);
+        }
         self.ready.clear();
     }
 }
 
 struct Dispatcher {
     receiver: Receiver<Event>,
-    jobs: Arc<JobQueue>,
+    runtime: Arc<Runtime>,
 }
 
 impl Dispatcher {
     fn run(self) {
-        let Self { receiver, jobs } = self;
+        let Self { receiver, runtime } = self;
         let mut scheduler = Scheduler::default();
         loop {
             scheduler.cancel_cancelled();
-            if !scheduler.schedule(&jobs) {
+            scheduler.promote_waiting(&runtime);
+            if !scheduler.schedule(&runtime.jobs) {
                 scheduler.stop_all();
-                jobs.close();
+                runtime.jobs.close();
                 return;
             }
             match receiver.recv_timeout(CANCELLATION_POLL_INTERVAL) {
-                Ok(Event::Command(command)) => scheduler.accept(*command),
+                Ok(Event::Command(command)) => scheduler.accept(&runtime, *command),
                 Ok(Event::Completion(completion)) => scheduler.complete(*completion),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
                     scheduler.stop_all();
-                    jobs.close();
+                    runtime.jobs.close();
                     return;
                 }
             }
@@ -814,5 +867,62 @@ impl TransferWorker {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+
+    use super::{Command, QUEUE_FULL_MESSAGE, Runtime, Scheduler};
+    use crate::{CancelToken, FetchError, FetchRequest, FetchResult, Url};
+
+    fn fetch_command(url: Url, response: mpsc::Sender<FetchResult>) -> Command {
+        Command::Fetch {
+            request: FetchRequest::get(url),
+            cancel: CancelToken::default(),
+            response,
+        }
+    }
+
+    #[test]
+    fn scheduler_parks_operations_until_permits_free_and_rejects_only_a_full_queue() {
+        let runtime = Arc::new(Runtime::new(1, 1));
+        let mut scheduler = Scheduler::default();
+        let url = Url::parse("http://render.local/resource").expect("test URL");
+        let (first_tx, _first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (third_tx, third_rx) = mpsc::channel();
+
+        scheduler.accept(&runtime, fetch_command(url.clone(), first_tx));
+        scheduler.accept(&runtime, fetch_command(url.clone(), second_tx));
+        assert!(
+            second_rx.try_recv().is_err(),
+            "a command parked behind an exhausted permit must not be rejected"
+        );
+        scheduler.accept(&runtime, fetch_command(url, third_tx));
+
+        let rejected = third_rx
+            .try_recv()
+            .expect("overflowing command is rejected synchronously");
+        assert_eq!(
+            rejected,
+            Err(FetchError::Transport(QUEUE_FULL_MESSAGE.into()))
+        );
+        assert_eq!(runtime.operations.load(Ordering::Acquire), 1);
+
+        scheduler.operations.clear();
+        scheduler.promote_waiting(&runtime);
+        assert_eq!(
+            runtime.operations.load(Ordering::Acquire),
+            1,
+            "parked command is admitted once a permit frees up"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "admitted command is in progress, not rejected"
+        );
     }
 }
