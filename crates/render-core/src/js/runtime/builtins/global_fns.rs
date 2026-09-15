@@ -80,6 +80,11 @@ impl JsRuntime {
                     "Symbol.prototype.description requires that 'this' be a Symbol",
                 )),
             },
+            NativeFunction::PromiseFinally
+            | NativeFunction::PromiseFinallyPass
+            | NativeFunction::PromiseFinallyReject => {
+                self.dispatch_promise_native(dom, function, receiver, arguments)
+            }
             NativeFunction::SymbolFor => {
                 let key = required_argument(arguments, 0, "Symbol.for")?.to_js_string();
                 Ok(JsValue::Symbol(self.symbol_for(key)))

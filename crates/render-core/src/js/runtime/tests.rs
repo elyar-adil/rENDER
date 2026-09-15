@@ -1454,3 +1454,42 @@ fn to_primitive_and_has_instance_hooks_participate() {
         JsValue::String("true,true,true,true,true".to_owned())
     );
 }
+
+#[test]
+fn promise_prototype_is_real_and_overridable() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                results.push(typeof Promise.prototype.then === 'function');
+                results.push(Promise.prototype.toString() === '[object Promise]');
+                var calls = 0;
+                var original = Promise.prototype.then;
+                Promise.prototype.then = function (a, b) {
+                    calls += 1;
+                    return original.call(this, a, b);
+                };
+                Promise.resolve(5).then(function (v) { results.push(v === 5); });
+                Promise.resolve('x').finally(function () { calls += 10; });
+                'setup-done';
+            ",
+        )
+        .expect("promise prototype probe executes");
+    // Settlement callbacks run at the microtask checkpoint, after the
+    // script; drain pending microtasks before reading the results.
+    for microtask in runtime.take_pending_microtasks() {
+        runtime
+            .invoke_microtask(&mut parsed.dom, microtask)
+            .expect("microtask executes");
+    }
+    let outcome = runtime
+        .execute(&mut parsed.dom, "results.join(',') + ':' + (calls === 11)")
+        .expect("results read executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true:true".to_owned())
+    );
+}

@@ -338,9 +338,14 @@ fn run_parallel(paths: &[String]) -> io::Result<Summary> {
         Duration::from_secs(env_usize("RENDER_TEST262_TIMEOUT_SECS").unwrap_or(30) as u64);
     let run_dir = env::var_os("RENDER_TEST262_RUN_DIR").map_or_else(
         || {
+            // Millisecond-unique: a recycled pid must never resurrect a
+            // stale resume cache and double-count this run's results.
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_millis());
             Path::new(TEST262_ROOT)
                 .join("../../target/test262-runs")
-                .join(format!("run-{}", std::process::id()))
+                .join(format!("run-{unique}"))
         },
         PathBuf::from,
     );
@@ -541,7 +546,10 @@ fn handle_worker_line(
     };
     let path = decode_field(encoded_path);
     if worker.current.as_ref().map(|(current, _)| current) != Some(&path) {
-        return Err(io::Error::other("worker completed an unexpected test path"));
+        // A replaced worker's in-flight line can land after its successor
+        // takes over the id; dropping the stale completion keeps the
+        // coordinator alive (the replacement re-runs that test anyway).
+        return Ok(());
     }
     for record in worker.records.drain(..) {
         write_record(results, &record)?;

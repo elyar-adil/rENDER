@@ -2332,7 +2332,7 @@ impl JsRuntime {
             }
             return Ok(descriptor.value);
         }
-        let inherited = self.realm.get_property(object, property);
+        let inherited_origin = self.realm.get_property_with_origin(object, property);
         if object == self.realm.global_object() {
             let value = match property {
                 "innerWidth" | "outerWidth" => Some(self.viewport.width),
@@ -2700,24 +2700,17 @@ impl JsRuntime {
             }
             _ => {}
         }
-        // Element wrappers have a real shared prototype. Respect overrides
-        // installed on `Element.prototype` before falling back to synthesized
-        // legacy host methods, and preserve method identity across reads.
-        if matches!(self.realm.host(object), Some(ObjectHost::Node(_)))
-            && let Some(value) = inherited.clone()
+        // Precedence for every host: a property found on a real interface
+        // prototype (anything above `Object.prototype`) wins, so pages and
+        // polyfills can override `Promise.prototype.then`,
+        // `Function.prototype.call`, and friends. Only when the chain holds
+        // nothing but `Object.prototype`'s generic members do the synthesized
+        // host methods apply; the final read goes through [[Get]].
+        if inherited_origin
+            .as_ref()
+            .is_some_and(|(_, holder)| *holder != self.realm.object_prototype_id())
         {
-            return Ok(value);
-        }
-        // Arrays expose their standard prototype methods through the shared
-        // prototype object. Keep those methods visible before the synthesized
-        // host dispatch table is consulted (forEach/map/filter are ordinary
-        // inherited functions, not array-specific host properties).
-        if matches!(
-            self.realm.host(object),
-            Some(ObjectHost::Array | ObjectHost::Collection { .. } | ObjectHost::TypedArray { .. })
-        ) && let Some(value) = inherited.clone()
-        {
-            return Ok(value);
+            return self.get_value(dom, object, property);
         }
         let function = match (self.realm.host(object), property) {
             (Some(ObjectHost::Promise(_)), "then") => Some(NativeFunction::PromiseThen),

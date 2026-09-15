@@ -18,6 +18,7 @@ use crate::js::JsError;
 use crate::js::JsValue;
 use crate::js::ObjectId;
 use crate::js::runtime::JsRuntime;
+use crate::js::runtime::convert::required_argument;
 use crate::js::runtime::types::JsMicrotask;
 use crate::js::runtime::types::PromiseReaction;
 use crate::js::runtime::types::PromiseRecord;
@@ -54,6 +55,58 @@ impl JsRuntime {
             NativeFunction::PromiseCatch => {
                 let handler = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 self.perform_promise_then(receiver, &[JsValue::Undefined, handler])
+            }
+            NativeFunction::PromiseFinally => {
+                let Some(callback) = arguments.first().and_then(|value| match value {
+                    JsValue::Object(function)
+                        if JsRuntime::is_callable_object(*function, &self.realm) =>
+                    {
+                        Some(*function)
+                    }
+                    _ => None,
+                }) else {
+                    return self.perform_promise_then(receiver, arguments);
+                };
+                // `p.finally(f)` behaves like
+                // `p.then(v => { f(); return v; }, e => { f(); throw e; })`;
+                // BoundCallable captures `f` ahead of the settlement value.
+                let pass = self.realm.native_object(NativeFunction::PromiseFinallyPass);
+                let rethrow = self
+                    .realm
+                    .native_object(NativeFunction::PromiseFinallyReject);
+                let pass_handler = self.realm.bound_callable(
+                    pass,
+                    JsValue::Undefined,
+                    vec![JsValue::Object(callback)],
+                );
+                let reject_handler = self.realm.bound_callable(
+                    rethrow,
+                    JsValue::Undefined,
+                    vec![JsValue::Object(callback)],
+                );
+                self.perform_promise_then(
+                    receiver,
+                    &[
+                        JsValue::Object(pass_handler),
+                        JsValue::Object(reject_handler),
+                    ],
+                )
+            }
+            NativeFunction::PromiseFinallyPass => {
+                let callback = required_argument(arguments, 0, "finally")?;
+                let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::Object(function) = callback {
+                    self.call_with_this(dom, *function, &[], JsValue::Undefined)?;
+                }
+                Ok(value)
+            }
+            NativeFunction::PromiseFinallyReject => {
+                let callback = required_argument(arguments, 0, "finally")?;
+                let reason = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+                if let JsValue::Object(function) = callback {
+                    self.call_with_this(dom, *function, &[], JsValue::Undefined)?;
+                }
+                Err(JsError::thrown(reason))
             }
             other => self.dispatch_url_native(dom, other, receiver, arguments),
         }

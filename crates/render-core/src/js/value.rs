@@ -317,6 +317,9 @@ pub(crate) enum NativeFunction {
     PromiseResolve,
     PromiseReject,
     PromiseThen,
+    PromiseFinally,
+    PromiseFinallyPass,
+    PromiseFinallyReject,
     PromiseCatch,
     ArrayIsArray,
     ArrayFrom,
@@ -813,6 +816,7 @@ pub struct Realm {
     regexp_prototype: ObjectId,
     date_prototype: ObjectId,
     symbol_prototype: ObjectId,
+    promise_prototype: ObjectId,
     element_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -917,7 +921,8 @@ impl Realm {
         let symbol_prototype =
             Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
-        Self::install_promise(&mut objects, global);
+        let promise_prototype =
+            Self::install_promise(&mut objects, global, object_prototype, function_prototype);
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
@@ -1355,6 +1360,7 @@ impl Realm {
             regexp_prototype,
             date_prototype,
             symbol_prototype,
+            promise_prototype,
             element_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
@@ -2897,12 +2903,54 @@ impl Realm {
         );
     }
 
-    fn install_promise(objects: &mut Vec<JsObject>, global: ObjectId) {
+    fn install_promise(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
         let promise = ObjectId(objects.len());
         objects.push(JsObject {
+            prototype: Some(function_prototype),
             host: ObjectHost::PromiseConstructor,
             ..JsObject::default()
         });
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("then", NativeFunction::PromiseThen),
+            ("catch", NativeFunction::PromiseCatch),
+            ("finally", NativeFunction::PromiseFinally),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(promise)),
+        );
+        objects[promise.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         for (name, function) in [
             ("resolve", NativeFunction::PromiseResolve),
             ("reject", NativeFunction::PromiseReject),
@@ -2920,6 +2968,17 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        // `Promise.prototype[Symbol.toStringTag] === "Promise"`
+        {
+            let tag = JsSymbol::well_known("@@toStringTag");
+            objects[prototype.0].symbols.insert(
+                tag.id(),
+                (
+                    tag,
+                    PropertyDescriptor::builtin(JsValue::String("Promise".to_owned())),
+                ),
+            );
+        }
         objects[global.0].properties.insert(
             "Promise".to_owned(),
             PropertyDescriptor {
@@ -2931,6 +2990,7 @@ impl Realm {
                 configurable: true,
             },
         );
+        prototype
     }
 
     fn install_array(
@@ -3264,6 +3324,30 @@ impl Realm {
         self.objects
             .get_mut(object.0)
             .map(|object| &mut object.host)
+    }
+
+    /// Prototype-chain read that also reports the object the property was
+    /// found on, so member resolution can distinguish a genuine override on
+    /// an interface prototype from `Object.prototype`'s generic members.
+    pub(crate) fn get_property_with_origin(
+        &self,
+        object: ObjectId,
+        key: &str,
+    ) -> Option<(JsValue, ObjectId)> {
+        let mut candidate = Some(object);
+        let mut visited = 0usize;
+        while let Some(id) = candidate {
+            let current = self.objects.get(id.0)?;
+            if let Some(property) = current.properties.get(key) {
+                return Some((property.value.clone(), id));
+            }
+            candidate = current.prototype;
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return None;
+            }
+        }
+        None
     }
 
     pub(crate) fn get_property(&self, object: ObjectId, key: &str) -> Option<JsValue> {
@@ -3699,9 +3783,24 @@ impl Realm {
         callable
     }
 
+    /// A standalone native function object (used to build callables that
+    /// capture per-call state through `bound_callable`).
+    #[must_use]
+    pub(crate) const fn object_prototype_id(&self) -> ObjectId {
+        self.object_prototype
+    }
+
+    pub(crate) fn native_object(&mut self, function: NativeFunction) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::NativeFunction(function),
+            ..JsObject::default()
+        })
+    }
+
     pub(crate) fn promise(&mut self, promise: usize) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.object_prototype),
+            prototype: Some(self.promise_prototype),
             host: ObjectHost::Promise(promise),
             ..JsObject::default()
         })

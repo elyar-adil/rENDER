@@ -228,11 +228,45 @@ fn media_query_matches(query: &str, context: &MatchContext) -> bool {
         .strip_prefix("not ")
         .map_or((false, query.as_str()), |query| (true, query));
     let query = query.strip_prefix("only ").unwrap_or(query);
-    let matches = query
-        .split(" and ")
-        .map(str::trim)
+    let matches = split_media_conjunctions(query)
+        .into_iter()
         .all(|condition| media_condition_matches(condition, context));
     if negated { !matches } else { matches }
+}
+
+/// Split a media query on its `and` conjunctions. Real-world stylesheets
+/// routinely write `(min-width:1560px)and (max-width:2059.9px)` with no
+/// surrounding whitespace, so the identifier must be matched with paren
+/// depth instead of a literal `" and "` split.
+fn split_media_conjunctions(query: &str) -> Vec<&str> {
+    let lowered = query.to_ascii_lowercase();
+    let bytes = lowered.as_bytes();
+    let mut result = Vec::new();
+    let mut depth = 0_u32;
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth = depth.saturating_add(1),
+            b')' => depth = depth.saturating_sub(1),
+            b'a' | b'A' if depth == 0 && lowered[index..].starts_with("and") => {
+                let before = bytes.get(index.wrapping_sub(1));
+                let after = bytes.get(index + 3);
+                let boundary_before = index == 0 || before.is_some_and(u8::is_ascii_whitespace);
+                let boundary_after = after.is_none_or(u8::is_ascii_whitespace);
+                if boundary_before && boundary_after {
+                    result.push(query[start..index].trim());
+                    index += 3;
+                    start = index;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    result.push(query[start..].trim());
+    result
 }
 
 fn media_condition_matches(condition: &str, context: &MatchContext) -> bool {
