@@ -252,8 +252,13 @@ fn split_media_conjunctions(query: &str) -> Vec<&str> {
             b'a' | b'A' if depth == 0 && lowered[index..].starts_with("and") => {
                 let before = bytes.get(index.wrapping_sub(1));
                 let after = bytes.get(index + 3);
-                let boundary_before = index == 0 || before.is_some_and(u8::is_ascii_whitespace);
-                let boundary_after = after.is_none_or(u8::is_ascii_whitespace);
+                // Minified sheets write `)and (` with no whitespace at all;
+                // a preceding `)` or following `(` still reads as a
+                // conjunction.
+                let boundary_before = index == 0
+                    || before.is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b')');
+                let boundary_after =
+                    after.is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'(');
                 if boundary_before && boundary_after {
                     result.push(query[start..index].trim());
                     index += 3;
@@ -781,6 +786,32 @@ mod tests {
                 .get("color")
                 .map(|value| value.value.as_str()),
             Some("red")
+        );
+    }
+
+    #[test]
+    fn minified_conjunction_media_queries_without_spaces_match() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "@media(min-width:1140px)and (max-width:1299.9px){#target{display:grid}}",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext {
+                viewport_width: Some(1180.0),
+                viewport_height: Some(800.0),
+                ..MatchContext::default()
+            },
+        );
+
+        assert_eq!(
+            style.get("display").map(|value| value.value.as_str()),
+            Some("grid")
         );
     }
 
