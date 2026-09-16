@@ -2537,4 +2537,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn grid_gap_legacy_alias_expands_to_row_and_column_gap() {
+        let Some((row, column)) = super::expand_gap_shorthand("20px") else {
+            panic!("single-value grid-gap must expand");
+        };
+        assert_eq!(row, "20px");
+        assert_eq!(column, "20px");
+        let Some((row, column)) = super::expand_gap_shorthand("8px 24px") else {
+            panic!("two-value grid-gap must expand");
+        };
+        assert_eq!(row, "8px");
+        assert_eq!(column, "24px");
+    }
 }

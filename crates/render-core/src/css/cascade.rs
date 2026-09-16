@@ -346,11 +346,22 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
     if name == "border" {
         return expand_border_shorthand(value);
     }
-    if name != "gap" && name != "flex" && name != "overflow" {
+    // `grid-gap` and its longhands are the legacy spellings real sheets
+    // still ship; they expand exactly like their modern counterparts.
+    let gap_alias = name == "gap" || name == "grid-gap";
+    let gap_longhand = match name {
+        "grid-row-gap" => Some("row-gap"),
+        "grid-column-gap" => Some("column-gap"),
+        _ => None,
+    };
+    if let Some(longhand) = gap_longhand {
+        return vec![(longhand.to_owned(), value.to_owned())];
+    }
+    if !gap_alias && name != "flex" && name != "overflow" {
         return vec![(name.to_owned(), value.to_owned())];
     }
     if css_wide_keyword(value).is_some() {
-        let longhands: &[&str] = if name == "gap" {
+        let longhands: &[&str] = if gap_alias {
             &["row-gap", "column-gap"]
         } else if name == "flex" {
             &["flex-grow", "flex-shrink", "flex-basis"]
@@ -363,7 +374,7 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
             .collect();
     }
     match name {
-        "gap" => expand_gap_shorthand(value).map_or_else(
+        "gap" | "grid-gap" => expand_gap_shorthand(value).map_or_else(
             || vec![(name.to_owned(), value.to_owned())],
             |(row, column)| {
                 vec![
