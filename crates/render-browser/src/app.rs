@@ -639,7 +639,7 @@ impl BrowserApp {
     }
 
     pub(super) fn sync_active_address(&mut self) {
-        self.content_editor = None;
+        self.close_content_editor();
         self.editor.set_text(self.tabs.active().address.clone());
         self.editor.set_focused(false);
         if let Some(window) = &self.window {
@@ -702,7 +702,7 @@ impl BrowserApp {
             .as_ref()
             .is_some_and(|editor| editor.tab == id)
         {
-            self.content_editor = None;
+            self.close_content_editor();
         }
         let target_url = target.history_url();
         let Some(page) = self.pages.get_mut(&id) else {
@@ -1439,7 +1439,7 @@ impl BrowserApp {
                 }
             }
             HitTarget::AddressBar => {
-                self.content_editor = None;
+                self.close_content_editor();
                 let index = self.layout.as_ref().map_or(0, |layout| {
                     address_index_at_x(layout, &self.editor, self.cursor.x, self.fonts.as_ref())
                 });
@@ -1464,7 +1464,7 @@ impl BrowserApp {
             }
             HitTarget::Content => self.handle_content_press(),
             HitTarget::Chrome => {
-                self.content_editor = None;
+                self.close_content_editor();
                 self.editor.set_focused(false);
                 if let Some(window) = &self.window {
                     window.set_ime_allowed(false);
@@ -1503,7 +1503,7 @@ impl BrowserApp {
             self.repaint_chrome();
             return;
         }
-        self.content_editor = None;
+        self.close_content_editor();
         if let Some(window) = &self.window {
             window.set_ime_allowed(false);
         }
@@ -1742,22 +1742,47 @@ impl BrowserApp {
         let tab = content.tab;
         let node = content.node;
         let value = content.editor.text().to_owned();
-        if let Some(page) = self.pages.get_mut(&tab)
-            && content_interaction::set_content_text_value(
+        if self.content_text_input_value(tab, node).as_deref() == Some(value.as_str()) {
+            return;
+        }
+        if let Some(page) = self.pages.get_mut(&tab) {
+            let _ = content_interaction::set_content_text_value(
                 page.page.document_mut().dom_mut(),
                 node,
                 &value,
-            )
-            .is_ok()
-            && page.page.queue_input_event(node).is_ok()
-        {
-            let (rendered, _) = page.run_page_turns();
-            if rendered {
-                self.schedule_page_render_for_tab(tab);
-            }
+            );
+            let _ = page.page.queue_input_event(node);
+            page.run_page_turns();
             self.drain_script_navigations(tab);
             self.sync_page_title(tab);
+        }
+        // The committed value mutation lands before `run_page_turns` captures
+        // its revision baseline, so the turn outcome cannot report this change;
+        // repaint unconditionally so typed text stays visible even when no
+        // page script reacted to the `input` event.
+        self.schedule_page_render_for_tab(tab);
+    }
+
+    /// Writes the focused control's visible text (committed text plus any live
+    /// IME composition) into the DOM without firing an `input` event, then
+    /// repaints. Composition updates are display-only until the IME commits.
+    pub(super) fn sync_content_editor_display(&mut self) {
+        let Some(content) = self.content_editor.as_ref() else {
             return;
+        };
+        let tab = content.tab;
+        let node = content.node;
+        let mut display = content.editor.text().to_owned();
+        display.push_str(content.editor.preedit());
+        if self.content_text_input_value(tab, node).as_deref() == Some(display.as_str()) {
+            return;
+        }
+        if let Some(page) = self.pages.get_mut(&tab) {
+            let _ = content_interaction::set_content_text_value(
+                page.page.document_mut().dom_mut(),
+                node,
+                &display,
+            );
         }
         self.schedule_page_render_for_tab(tab);
     }
@@ -2013,11 +2038,11 @@ impl BrowserApp {
         }
     }
 
-    pub(super) fn handle_keyboard(&mut self, event: &winit::event::KeyEvent) {
-        if event.state != ElementState::Pressed {
+    pub(super) fn handle_keyboard(&mut self, key: &RawKeyInput) {
+        if key.state != ElementState::Pressed {
             return;
         }
-        if matches!(event.logical_key, Key::Named(NamedKey::Escape))
+        if matches!(key.logical_key, Key::Named(NamedKey::Escape))
             && self.address_menu.take().is_some()
         {
             self.repaint_chrome();
@@ -2027,7 +2052,7 @@ impl BrowserApp {
         let primary = primary_modifier_active(self.modifiers);
         let shift = self.modifiers.shift_key();
         if primary {
-            if key_character_is(&event.logical_key, "l") {
+            if key_character_is(&key.logical_key, "l") {
                 self.editor.set_focused(true);
                 self.editor.select_all();
                 if let Some(window) = &self.window {
@@ -2036,18 +2061,18 @@ impl BrowserApp {
                 self.repaint_chrome();
                 return;
             }
-            if key_character_is(&event.logical_key, "t") {
+            if key_character_is(&key.logical_key, "t") {
                 self.handle_tab_intent(TabIntent::New);
                 return;
             }
-            if key_character_is(&event.logical_key, "w") {
+            if key_character_is(&key.logical_key, "w") {
                 self.handle_tab_intent(TabIntent::Close(self.tabs.active_id()));
                 return;
             }
             if let Some(command) = self
                 .editor
                 .is_focused()
-                .then(|| address_shortcut(&event.logical_key, shift))
+                .then(|| address_shortcut(&key.logical_key, shift))
                 .flatten()
             {
                 self.editor.execute(command, &mut self.clipboard);
@@ -2055,17 +2080,25 @@ impl BrowserApp {
                 return;
             }
         }
-        if self.content_editor.is_some() && self.handle_content_keyboard(event) {
+        if self.content_editor.is_some() && self.handle_content_keyboard(key) {
             return;
         }
         if !self.editor.is_focused() {
             if menu_was_open {
                 self.repaint_chrome();
             }
-            self.forward_keydown_to_page(event);
+            self.forward_keydown_to_page(key);
             return;
         }
-        match &event.logical_key {
+        let ime_enter_pending = self.editor.take_pending_ime_enter();
+        let composing = !self.editor.preedit().is_empty();
+        match &key.logical_key {
+            Key::Named(NamedKey::Enter) if composing || ime_enter_pending => {
+                // Enter belongs to the IME: it confirms (or just confirmed) a
+                // composition and must not trigger address navigation.
+                self.repaint_chrome();
+                return;
+            }
             Key::Named(NamedKey::Enter) => {
                 match intent_from_address(self.editor.text()) {
                     Ok(intent) => self.emit_navigation(intent),
@@ -2098,7 +2131,11 @@ impl BrowserApp {
             Key::Named(NamedKey::Home) => self.editor.move_home(shift),
             Key::Named(NamedKey::End) => self.editor.move_end(shift),
             Key::Character(_) if !primary && !self.modifiers.alt_key() => {
-                if let Some(value) = &event.text {
+                // Raw keystrokes during a live IME composition are dropped;
+                // the composition commit carries the final text.
+                if let Some(value) = &key.text
+                    && self.editor.preedit().is_empty()
+                {
                     self.editor.insert(value);
                 }
             }
@@ -2109,8 +2146,8 @@ impl BrowserApp {
 
     /// Forward a printable or named key to the page as a trusted `keydown`
     /// event so script can react to the keyboard.
-    pub(super) fn forward_keydown_to_page(&mut self, event: &winit::event::KeyEvent) {
-        let Some(key) = page_key_name(event) else {
+    pub(super) fn forward_keydown_to_page(&mut self, key: &RawKeyInput) {
+        let Some(key) = page_key_name(key) else {
             return;
         };
         let id = self.tabs.active_id();
@@ -2134,13 +2171,13 @@ impl BrowserApp {
         clippy::too_many_lines,
         reason = "keyboard editing keeps each native control operation explicit"
     )]
-    pub(super) fn handle_content_keyboard(&mut self, event: &winit::event::KeyEvent) -> bool {
-        if event.state != ElementState::Pressed {
+    pub(super) fn handle_content_keyboard(&mut self, key: &RawKeyInput) -> bool {
+        if key.state != ElementState::Pressed {
             return true;
         }
         let shift = self.modifiers.shift_key();
         let primary = primary_modifier_active(self.modifiers);
-        if primary && let Some(command) = address_shortcut(&event.logical_key, shift) {
+        if primary && let Some(command) = address_shortcut(&key.logical_key, shift) {
             let changed = self
                 .content_editor
                 .as_mut()
@@ -2154,7 +2191,16 @@ impl BrowserApp {
         let Some(content) = self.content_editor.as_mut() else {
             return false;
         };
-        match &event.logical_key {
+        // Any keypress other than Enter ends the IME commit window; the latch
+        // is only honored by the Enter arm right after a composition commits.
+        let ime_enter_pending = content.editor.take_pending_ime_enter();
+        let composing = !content.editor.preedit().is_empty();
+        match &key.logical_key {
+            Key::Named(NamedKey::Enter) if composing || ime_enter_pending => {
+                // Enter belongs to the IME here: it either confirms the live
+                // composition or just confirmed one, so it must not submit.
+                true
+            }
             Key::Named(NamedKey::Enter) => {
                 let tab = content.tab;
                 let node = content.node;
@@ -2169,7 +2215,7 @@ impl BrowserApp {
                     })
                 });
                 self.drain_script_navigations(tab);
-                self.content_editor = None;
+                self.close_content_editor();
                 if key_allowed {
                     let form = self.pages.get(&tab).and_then(|page| {
                         content_interaction::associated_form_for_node(
@@ -2241,7 +2287,12 @@ impl BrowserApp {
                 true
             }
             Key::Character(_) if !primary && !self.modifiers.alt_key() => {
-                if let Some(value) = &event.text {
+                // While an IME composition is live the platform may still
+                // deliver raw keystrokes; the composition commit carries the
+                // final text, so raw characters must not be double-inserted.
+                if let Some(value) = &key.text
+                    && content.editor.preedit().is_empty()
+                {
                     content.editor.insert(value);
                     self.sync_content_editor();
                 }
@@ -2249,6 +2300,57 @@ impl BrowserApp {
             }
             _ => true,
         }
+    }
+
+    /// Applies a live IME composition update to the focused content control
+    /// so the composition text is visible before the user commits it.
+    pub(super) fn handle_content_preedit(&mut self, preedit: &str) {
+        let Some(content) = self.content_editor.as_mut() else {
+            return;
+        };
+        content.editor.set_preedit(preedit);
+        self.sync_content_editor_display();
+    }
+
+    /// Commits IME text into the focused content control and fires the
+    /// resulting `input` event. The Enter keydown that confirmed the
+    /// composition is latched so it cannot immediately submit the form.
+    pub(super) fn handle_content_ime_commit(&mut self, value: &str) {
+        let Some(content) = self.content_editor.as_mut() else {
+            return;
+        };
+        content.editor.note_ime_composition_end();
+        content.editor.insert(value);
+        self.sync_content_editor();
+        self.repaint_chrome();
+    }
+
+    /// Commits IME text into the focused address field.
+    pub(super) fn handle_address_ime_commit(&mut self, value: &str) {
+        self.editor.note_ime_composition_end();
+        self.editor.insert(value);
+        self.repaint_chrome();
+    }
+
+    /// Drops the focused content control, reverting any uncommitted IME
+    /// composition text so the control keeps only its committed value.
+    pub(super) fn close_content_editor(&mut self) {
+        if let Some(content) = self.content_editor.as_ref()
+            && !content.editor.preedit().is_empty()
+        {
+            let tab = content.tab;
+            let node = content.node;
+            let value = content.editor.text().to_owned();
+            if let Some(page) = self.pages.get_mut(&tab) {
+                let _ = content_interaction::set_content_text_value(
+                    page.page.document_mut().dom_mut(),
+                    node,
+                    &value,
+                );
+            }
+            self.schedule_page_render_for_tab(tab);
+        }
+        self.content_editor = None;
     }
 
     pub(super) fn update_window_title(&self) {
@@ -2327,28 +2429,28 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.address_clicks.reset();
                 self.address_selecting = false;
                 self.address_menu = None;
-                self.content_editor = None;
+                self.close_content_editor();
                 self.left_pointer_down = false;
                 self.drag = None;
                 if let Some(window) = &self.window {
                     window.set_ime_allowed(false);
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => self.handle_keyboard(&event),
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.handle_keyboard(&RawKeyInput::from_event(&event));
+            }
+            WindowEvent::Ime(Ime::Preedit(value, _)) if self.content_editor.is_some() => {
+                self.handle_content_preedit(&value);
+            }
             WindowEvent::Ime(Ime::Preedit(value, _)) if self.editor.is_focused() => {
                 self.editor.set_preedit(value);
                 self.repaint_chrome();
             }
             WindowEvent::Ime(Ime::Commit(value)) if self.content_editor.is_some() => {
-                if let Some(content) = self.content_editor.as_mut() {
-                    content.editor.insert(&value);
-                }
-                self.sync_content_editor();
-                self.repaint_chrome();
+                self.handle_content_ime_commit(&value);
             }
             WindowEvent::Ime(Ime::Commit(value)) if self.editor.is_focused() => {
-                self.editor.insert(&value);
-                self.repaint_chrome();
+                self.handle_address_ime_commit(&value);
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.present() {
@@ -2434,16 +2536,36 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
     }
 }
 
+/// Platform-independent snapshot of a key press, mapped from winit's
+/// [`winit::event::KeyEvent`] at the event-loop boundary. Keeping the
+/// keyboard policy on this type makes it testable without a window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RawKeyInput {
+    pub(super) state: ElementState,
+    pub(super) logical_key: Key,
+    pub(super) text: Option<String>,
+}
+
+impl RawKeyInput {
+    fn from_event(event: &winit::event::KeyEvent) -> Self {
+        Self {
+            state: event.state,
+            logical_key: event.logical_key.clone(),
+            text: event.text.as_ref().map(ToString::to_string),
+        }
+    }
+}
+
 pub(super) fn key_character_is(key: &Key, expected: &str) -> bool {
     matches!(key, Key::Character(value) if value.eq_ignore_ascii_case(expected))
 }
 
-/// Map a winit key event to the DOM `KeyboardEvent.key` string it represents.
-pub(super) fn page_key_name(event: &winit::event::KeyEvent) -> Option<String> {
-    if let Some(text) = &event.text {
-        return Some(text.to_string());
+/// Map a key input to the DOM `KeyboardEvent.key` string it represents.
+pub(super) fn page_key_name(key: &RawKeyInput) -> Option<String> {
+    if let Some(text) = &key.text {
+        return Some(text.clone());
     }
-    let Key::Named(named) = &event.logical_key else {
+    let Key::Named(named) = &key.logical_key else {
         return None;
     };
     let name = match named {

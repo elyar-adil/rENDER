@@ -64,6 +64,9 @@ pub struct AddressEditor {
     anchor: Option<usize>,
     focused: bool,
     preedit: String,
+    /// Set when an IME composition just ended so the Enter keydown that
+    /// confirmed the composition can be swallowed instead of submitted.
+    pending_ime_enter: bool,
     undo: VecDeque<EditSnapshot>,
     redo: VecDeque<EditSnapshot>,
 }
@@ -97,6 +100,19 @@ impl AddressEditor {
     #[must_use]
     pub fn preedit(&self) -> &str {
         &self.preedit
+    }
+
+    /// Records that an IME composition was just committed; the next Enter
+    /// keydown (the one that confirmed the composition) is consumed rather
+    /// than acting as a submit or navigation trigger.
+    pub fn note_ime_composition_end(&mut self) {
+        self.pending_ime_enter = true;
+    }
+
+    /// Takes the pending IME-commit Enter latch, clearing it.
+    #[must_use]
+    pub fn take_pending_ime_enter(&mut self) -> bool {
+        std::mem::take(&mut self.pending_ime_enter)
     }
 
     #[must_use]
@@ -138,6 +154,7 @@ impl AddressEditor {
         self.cursor = self.text.len();
         self.anchor = None;
         self.preedit.clear();
+        self.pending_ime_enter = false;
         self.undo.clear();
         self.redo.clear();
     }
@@ -591,14 +608,27 @@ mod tests {
         assert!(!editor.can_redo());
     }
 
-    #[test]
-    fn control_only_paste_does_not_delete_selection_or_create_history() {
-        let mut editor = AddressEditor::new("keep");
-        editor.select_all();
-        let mut clipboard = MemoryClipboard(Some("\n\r\t".to_owned()));
-        assert!(!editor.execute(AddressCommand::Paste, &mut clipboard));
-        assert_eq!(editor.text(), "keep");
-        assert_eq!(editor.selection(), Some((0, 4)));
-        assert!(!editor.can_undo());
-    }
+#[test]
+fn control_only_paste_does_not_delete_selection_or_create_history() {
+    let mut editor = AddressEditor::new("keep");
+    editor.select_all();
+    let mut clipboard = MemoryClipboard(Some("\n\r\t".to_owned()));
+    assert!(!editor.execute(AddressCommand::Paste, &mut clipboard));
+    assert_eq!(editor.text(), "keep");
+    assert_eq!(editor.selection(), Some((0, 4)));
+    assert!(!editor.can_undo());
+}
+
+#[test]
+fn ime_commit_latch_is_consumed_by_a_single_take() {
+    let mut editor = AddressEditor::new("");
+    assert!(!editor.take_pending_ime_enter());
+    editor.note_ime_composition_end();
+    assert!(editor.take_pending_ime_enter());
+    assert!(!editor.take_pending_ime_enter());
+    // A fresh text resets the latch too.
+    editor.note_ime_composition_end();
+    editor.set_text("next");
+    assert!(!editor.take_pending_ime_enter());
+}
 }

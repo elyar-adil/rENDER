@@ -1,5 +1,9 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
+use render_core::dom::Dom;
+use render_core::dom::NodeId;
 use render_core::dom::NodeKind;
 use render_core::html::parse_document;
 use render_core::js::RuntimeLimits;
@@ -8,12 +12,17 @@ use render_core::navigation::HistoryEntry;
 use render_core::paint::PaintCoordinateSpace;
 use render_core::paint::{ClipShape, Color, DisplayCommand, Surface, Transform2D};
 use render_core::script::ScriptDiscoveryLimits;
+use render_net::NetworkWorker;
 use render_net::{FetchConfig, FetchRequest, HttpTransport, Url};
 use winit::dpi::{PhysicalPosition, PhysicalSize as WindowSize};
+use winit::event::ElementState;
 use winit::event::MouseScrollDelta;
 use winit::keyboard::Key;
+use winit::keyboard::NamedKey;
 
+use crate::app::BrowserApp;
 use crate::app::HostPlatform;
+use crate::app::RawKeyInput;
 use crate::app::address_shortcut;
 use crate::app::primary_modifier_for;
 use crate::app::wheel_document_delta_y;
@@ -32,13 +41,26 @@ use crate::page_source::network_start_source;
 use crate::page_source::source_from_network_response;
 use crate::page_state::PageNavigation;
 use crate::page_state::PageState;
+use crate::render_worker::PageRenderFrame;
+use crate::render_worker::PageRenderPayload;
+use render_browser::worker::RenderJob;
+use render_browser::chrome::ChromeLayout;
+use render_browser::chrome::HitTarget;
 use render_browser::chrome::Point;
 use render_browser::editor::AddressCommand;
+use render_browser::editor::AddressEditor;
+use render_browser::font_backend::SystemFontBackend;
 use render_browser::home::HOME_TITLE;
+use render_browser::model::TabModel;
+use render_browser::model::TabId;
 use render_browser::navigation::NavigationTarget;
 use render_browser::scripts::{
     plan_classic_scripts, plan_unstarted_classic_scripts, prepare_script_batch,
 };
+use render_browser::settings::CacheClearUiState;
+use render_browser::worker::RenderCancellation;
+use render_browser::worker::RenderFailure;
+use render_browser::worker::RenderWorkerOptions;
 use render_core::js::ElementRect;
 
 #[test]
@@ -809,4 +831,239 @@ fn pending_navigation_keeps_committed_page_until_commit() {
         navigation.committed().target,
         render_browser::navigation::NavigationTarget::Url(committed_url)
     );
+}
+
+/// Minimal baidu-like search page: a form whose action is a document-relative
+/// path, a named text input, hidden fields, and a submit button.
+const SEARCH_PAGE_HTML: &str = "<!doctype html><html><body>\
+     <form id='form' action='/s'>\
+       <input type='hidden' name='ie' value='utf-8'>\
+       <span id='wrap'><input id='kw' name='wd' value='' maxlength='255'></span>\
+       <input type='submit' id='su' value='submit'>\
+     </form></body></html>";
+
+fn find_id(dom: &Dom, id: &str) -> NodeId {
+    let mut pending = vec![dom.document()];
+    while let Some(node) = pending.pop() {
+        if dom.attribute(node, "id").ok().flatten() == Some(id) {
+            return node;
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+    }
+    panic!("element {id} should exist");
+}
+
+/// Builds a headless `BrowserApp` (no window, no render side effects) showing
+/// the search page at a `file:` document URL so any submit navigation stays
+/// offline.
+fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
+    let url = Url::parse("file:///rENDER-test-fixtures/page.html").expect("test document URL");
+    let source = PageSource {
+        html: SEARCH_PAGE_HTML.to_owned(),
+        title: "search".to_owned(),
+        target: NavigationTarget::Url(url),
+    };
+    let tabs = TabModel::new(source.title.clone(), source.target.display_address());
+    let active = tabs.active_id();
+    let mut page = PageState::new(source);
+
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))
+        .expect("network worker starts");
+    let render_worker = crate::render_worker::PageRenderWorker::start(
+        RenderWorkerOptions::default(),
+        |_job: RenderJob<PageRenderPayload>,
+         _cancellation: &RenderCancellation|
+         -> Result<PageRenderFrame, RenderFailure> { Err(RenderFailure::Cancelled) },
+        || {},
+    )
+    .expect("render worker starts");
+
+    let mut app = BrowserApp {
+        tabs,
+        pages: HashMap::new(),
+        fonts,
+        render_worker,
+        network,
+        http_cache: render_browser::cache::HttpCache::default(),
+        disk_cache: None,
+        pending_disk_clear: None,
+        cache_clear_state: CacheClearUiState::Ready,
+        editor: AddressEditor::new("file:///rENDER-test-fixtures/page.html"),
+        content_editor: None,
+        clipboard: render_browser::editor::NativeClipboard::default(),
+        window: None,
+        context: None,
+        surface: None,
+        layout: None,
+        frame: Vec::new(),
+        frame_size: WindowSize::new(800, 600),
+        frame_damage: FrameDamage::default(),
+        theme: render_browser::chrome::ChromeTheme::Light,
+        cursor: Point { x: 0.0, y: 0.0 },
+        hot: HitTarget::Chrome,
+        cursor_icon: winit::window::CursorIcon::Default,
+        drag: None,
+        address_selecting: false,
+        address_menu: None,
+        modifiers: winit::keyboard::ModifiersState::default(),
+        title_bar_clicks: render_browser::chrome::TitleBarClickTracker::default(),
+        address_clicks: render_browser::chrome::AddressClickTracker::default(),
+        left_pointer_down: false,
+        started_at: Instant::now(),
+    };
+    app.layout = Some(ChromeLayout::new(800, 600, 1.0, app.tabs.tabs()));
+
+    let kw = {
+        let dom = page.page.document().dom();
+        find_id(dom, "kw")
+    };
+    page.geometry.insert(
+        kw.as_u64(),
+        ElementRect {
+            x: 200.0,
+            y: 150.0,
+            width: 400.0,
+            height: 34.0,
+        },
+    );
+    app.pages.insert(active, page);
+    (app, active, kw)
+}
+
+fn pressed_character(character: &str) -> RawKeyInput {
+    crate::app::RawKeyInput {
+        state: ElementState::Pressed,
+        logical_key: Key::Character(character.into()),
+        text: Some(character.to_owned()),
+    }
+}
+
+fn pressed_named(key: NamedKey) -> RawKeyInput {
+    crate::app::RawKeyInput {
+        state: ElementState::Pressed,
+        logical_key: Key::Named(key),
+        text: None,
+    }
+}
+
+fn committed_value(app: &BrowserApp, tab: TabId, node: NodeId) -> String {
+    app.content_text_input_value(tab, node).unwrap_or_default()
+}
+
+fn click_search_box(app: &mut BrowserApp) {
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.cursor = Point {
+        x: 400.0,
+        y: chrome_height as f32 + 167.0,
+    };
+    app.handle_content_press();
+}
+
+#[test]
+fn clicking_the_search_box_focuses_it_and_typing_renders_the_value() {
+    let (mut app, tab, kw) = headless_search_app();
+    assert!(app.content_editor.is_none());
+    click_search_box(&mut app);
+
+    let content = app.content_editor.as_ref().expect("box gains focus");
+    assert_eq!(content.tab, tab);
+    assert_eq!(content.node, kw);
+
+    // A keystroke must both commit the value and schedule a page render; the
+    // committed mutation happens before the page-turn revision baseline, so
+    // the render has to be scheduled unconditionally.
+    app.handle_keyboard(&pressed_character("a"));
+    assert_eq!(committed_value(&app, tab, kw), "a");
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert!(
+        page.expected_render.is_some(),
+        "typing must schedule a page render"
+    );
+
+    // Backspace removes the character and fires the same pipeline.
+    app.handle_keyboard(&pressed_named(NamedKey::Backspace));
+    assert_eq!(committed_value(&app, tab, kw), "");
+
+    // Enter on the empty box submits the form through the GET pipeline.
+    let history_before = app.pages.get(&tab).expect("page").history.len();
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert!(
+        page.history.len() > history_before,
+        "Enter must push a history entry for the form submission"
+    );
+    assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn ime_preedit_previews_and_commit_lands_in_the_input_value() {
+    let (mut app, tab, kw) = headless_search_app();
+    click_search_box(&mut app);
+
+    app.handle_keyboard(&pressed_character("a"));
+
+    // Live composition text is mirrored into the control so the user can see
+    // it before committing.
+    app.handle_content_preedit("拼");
+    assert_eq!(committed_value(&app, tab, kw), "a拼");
+
+    // Clearing the composition without committing restores the typed value.
+    app.handle_content_preedit("");
+    assert_eq!(committed_value(&app, tab, kw), "a");
+
+    app.handle_content_preedit("拼音");
+    assert_eq!(committed_value(&app, tab, kw), "a拼音");
+
+    // The commit replaces the composition with the final text and fires the
+    // input pipeline.
+    app.handle_content_ime_commit("搜索单词");
+    assert_eq!(committed_value(&app, tab, kw), "a搜索单词");
+    let content = app.content_editor.as_ref().expect("editor stays focused");
+    assert_eq!(content.editor.text(), "a搜索单词");
+    assert!(content.editor.preedit().is_empty());
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert!(
+        page.expected_render.is_some(),
+        "committing composition text must schedule a page render"
+    );
+}
+
+#[test]
+fn enter_confirming_an_ime_composition_does_not_submit_the_form() {
+    let (mut app, tab, _kw) = headless_search_app();
+    click_search_box(&mut app);
+    app.handle_content_preedit("输入");
+    app.handle_content_ime_commit("输入");
+    let history_before = app.pages.get(&tab).expect("page").history.len();
+
+    // The Enter keydown that confirms the composition is latched away.
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    assert!(
+        app.content_editor.is_some(),
+        "composition Enter must keep the editor focused"
+    );
+    assert_eq!(
+        app.pages.get(&tab).expect("page").history.len(),
+        history_before
+    );
+
+    // A second Enter is a real submission.
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert!(page.history.len() > history_before);
+    assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn raw_keystrokes_are_dropped_while_a_composition_is_live() {
+    let (mut app, _tab, _kw) = headless_search_app();
+    click_search_box(&mut app);
+    app.handle_content_preedit("p");
+    // Platforms that deliver text events during composition must not
+    // double-insert; the commit carries the final text.
+    app.handle_keyboard(&pressed_character("p"));
+    let content = app.content_editor.as_ref().expect("editor stays focused");
+    assert_eq!(content.editor.text(), "");
+    assert_eq!(content.editor.preedit(), "p");
 }
