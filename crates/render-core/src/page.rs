@@ -1056,6 +1056,12 @@ impl Page {
         self.runtime.take_pending_fetch_requests()
     }
 
+    /// Whether the runtime still holds undrained `fetch()`/XHR requests.
+    #[must_use]
+    pub fn pending_fetch_queue_empty(&self) -> bool {
+        self.runtime.pending_fetch_queue_empty()
+    }
+
     /// Complete one queued network transfer previously drained from
     /// [`Self::take_pending_fetch_requests`].
     ///

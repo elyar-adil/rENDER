@@ -291,6 +291,13 @@ impl JsRuntime {
     /// Drain network transfers queued by `fetch()`/`XMLHttpRequest` since the
     /// last call. The embedding executes each request on its transport and
     /// completes it by id through [`Self::settle_fetch`].
+    /// Whether any `fetch()`/XHR transfer is still queued for the
+    /// embedding, used to keep the event loop polling.
+    #[must_use]
+    pub fn pending_fetch_queue_empty(&self) -> bool {
+        self.pending_fetch_requests.is_empty()
+    }
+
     pub fn take_pending_fetch_requests(&mut self) -> Vec<PendingFetch> {
         std::mem::take(&mut self.pending_fetch_requests)
     }

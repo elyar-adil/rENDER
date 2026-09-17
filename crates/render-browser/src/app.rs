@@ -92,6 +92,7 @@ use render_core::page::PageDomEvent;
 use render_core::script::ScriptDiscoveryLimits;
 use render_net::FetchError;
 use render_net::FetchRequest;
+use render_core::js::{FetchOutcome, PendingFetch};
 use render_net::FetchResult;
 use render_net::NetworkWorker;
 use render_net::Url;
@@ -151,6 +152,9 @@ pub(super) struct BrowserApp {
     pub(super) render_worker: PageRenderWorker,
     pub(super) network: NetworkWorker,
     pub(super) http_cache: HttpCache,
+    /// In-flight `fetch()`/XHR transfers awaiting completion, keyed by tab
+    /// and the runtime's correlation id.
+    pub(super) pending_fetches: Vec<(TabId, u64, CachedRequestHandle)>,
     pub(super) disk_cache: Option<DiskCacheWorker>,
     pub(super) pending_disk_clear: Option<DiskCacheOperationId>,
     pub(super) cache_clear_state: CacheClearUiState,
@@ -208,6 +212,7 @@ impl BrowserApp {
             render_worker,
             network,
             http_cache: HttpCache::default(),
+            pending_fetches: Vec::new(),
             disk_cache,
             pending_disk_clear: None,
             cache_clear_state: CacheClearUiState::Ready,
@@ -813,6 +818,46 @@ impl BrowserApp {
         self.request_redraw();
     }
 
+    /// Submits one `fetch()`/XHR transfer drained from a page runtime.
+    /// Only GET reaches the transport today; other methods settle with an
+    /// explicit rejection until the transport grows request-body support.
+    pub(super) fn submit_page_fetch(&mut self, tab: TabId, request: PendingFetch) {
+        if request.method != "GET" {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                return;
+            };
+            let outcome = Err(format!(
+                "network: {} requests are not supported by this browser yet",
+                request.method
+            ));
+            let _ = page.page.settle_fetch(request.id, outcome);
+            return;
+        }
+        let Ok(url) = Url::parse(&request.url) else {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                return;
+            };
+            let _ = page
+                .page
+                .settle_fetch(request.id, Err("network: invalid request URL".to_owned()));
+            return;
+        };
+        let mut fetch_request = FetchRequest::get(url.clone());
+        for (name, value) in &request.headers {
+            if name.eq_ignore_ascii_case("accept") {
+                fetch_request = fetch_request.with_accept(value.clone());
+            } else if name.eq_ignore_ascii_case("cookie") {
+                fetch_request = fetch_request.with_cookie(value.clone());
+            }
+        }
+        let fetch_request = match self.pages.get(&tab) {
+            Some(page) => page.cookies.decorate_request(fetch_request),
+            None => fetch_request,
+        };
+        let handle = self.submit_cached_fetch(fetch_request);
+        self.pending_fetches.push((tab, request.id, handle));
+    }
+
     pub(super) fn submit_cached_fetch(&mut self, request: FetchRequest) -> CachedRequestHandle {
         let epoch = self.http_cache.epoch();
         let now = Instant::now();
@@ -1142,6 +1187,7 @@ impl BrowserApp {
         let mut completed_style_sheets = Vec::new();
         let mut completed_scripts = Vec::new();
         let mut completed_images = Vec::new();
+        let mut new_fetches: Vec<(TabId, PendingFetch)> = Vec::new();
         for (id, page) in &mut self.pages {
             if let Some(pending) = page.navigation.pending.as_mut() {
                 match pending.handle.try_recv() {
@@ -1178,6 +1224,47 @@ impl BrowserApp {
                         unreachable!("cache batch handle maps disconnects")
                     }
                 }
+            }
+            for request in page.page.take_pending_fetch_requests() {
+                new_fetches.push((*id, request));
+            }
+        }
+        for (tab, request) in new_fetches {
+            self.submit_page_fetch(tab, request);
+        }
+        for (tab, id, handle) in &mut self.pending_fetches {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                continue;
+            };
+            let outcome = match handle.try_recv() {
+                Ok(result) => match result.result {
+                    Ok(response) => {
+                        let headers = response
+                            .headers
+                            .iter()
+                            .map(|header| {
+                                (
+                                    header.name.clone(),
+                                    String::from_utf8_lossy(&header.value).into_owned(),
+                                )
+                            })
+                            .collect();
+                        Ok(FetchOutcome {
+                            status: response.status.as_u16(),
+                            status_text: String::new(),
+                            headers,
+                            body: response.body.clone(),
+                        })
+                    }
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => {
+                    Err("network worker stopped".to_owned())
+                }
+            };
+            if let Err(error) = page.page.settle_fetch(*id, outcome) {
+                eprintln!("render-browser fetch settlement callback failed: {error}");
             }
         }
         for (id, completion) in completed_documents {
@@ -1366,12 +1453,17 @@ impl BrowserApp {
     }
 
     pub(super) fn has_pending_network(&self) -> bool {
-        self.pages.values().any(|page| {
-            page.navigation.pending.is_some()
-                || page.pending_style_sheets.is_some()
-                || page.pending_scripts.is_some()
-                || page.pending_images.is_some()
-        })
+        !self.pending_fetches.is_empty()
+            || self
+                .pages
+                .values()
+                .any(|page| {
+                    page.navigation.pending.is_some()
+                        || page.pending_style_sheets.is_some()
+                        || page.pending_scripts.is_some()
+                        || page.pending_images.is_some()
+                        || !page.page.pending_fetch_queue_empty()
+                })
     }
 
     pub(super) fn has_pending_script_work(&self) -> bool {
