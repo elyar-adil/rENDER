@@ -152,6 +152,44 @@ pub struct NavigationRequest {
     pub replace: bool,
 }
 
+/// One network transfer (`fetch()` or `XMLHttpRequest`) that script queued.
+///
+/// The runtime never performs I/O; the embedding drains these requests
+/// through [`JsRuntime::take_pending_fetch_requests`], executes them on its
+/// transport, and completes each one by id through
+/// [`JsRuntime::settle_fetch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingFetch {
+    /// Correlation id echoed back to [`JsRuntime::settle_fetch`]. Ids are
+    /// unique per runtime and never reused.
+    pub id: u64,
+    /// Absolute request URL, already resolved against the document base.
+    pub url: String,
+    /// Uppercased request method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Caller-provided request headers in submission order.
+    pub headers: Vec<(String, String)>,
+    /// Request body for methods that carry one.
+    pub body: Option<String>,
+}
+
+/// Completed transfer handed back through [`JsRuntime::settle_fetch`].
+///
+/// HTTP 4xx/5xx responses are successful transfers (matching the `fetch`
+/// contract); the `Err` side of `settle_fetch` is reserved for transport
+/// failures such as DNS, TLS, timeout, or cancellation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchOutcome {
+    /// Numeric HTTP status code, including non-success statuses.
+    pub status: u16,
+    /// Reason phrase exactly as received (may be empty).
+    pub status_text: String,
+    /// Response headers in wire order.
+    pub headers: Vec<(String, String)>,
+    /// Raw response body bytes.
+    pub body: Vec<u8>,
+}
+
 /// A compiled regular expression plus its mutable `lastIndex` state.
 #[derive(Debug)]
 pub(super) struct RegexRecord {

@@ -446,6 +446,14 @@ pub(crate) enum NativeFunction {
     MutationDisconnect,
     MutationTakeRecords,
     ArrayPrototypeToString,
+    GlobalFetch,
+    ResponseText,
+    ResponseJson,
+    ResponseHeadersGet,
+    XhrOpen,
+    XhrSetRequestHeader,
+    XhrSend,
+    XhrGetResponseHeader,
 }
 
 /// One integer or float element type of the ECMAScript typed-array family.
@@ -722,6 +730,55 @@ pub(crate) enum ObjectHost {
         pairs: Vec<(String, String)>,
         owner: Option<ObjectId>,
     },
+    /// The `XMLHttpRequest` constructor object.
+    XmlHttpRequestConstructor,
+    /// One `XMLHttpRequest` instance with its captured request state.
+    XmlHttpRequest(XmlHttpRequestState),
+    /// The `Response` constructor object.
+    ResponseConstructor,
+    /// One settled `fetch` response.
+    Response {
+        status: u16,
+        status_text: String,
+        headers: Vec<(String, String)>,
+        /// Body decoded lossily as UTF-8; `text()` and `json()` read this.
+        body: String,
+    },
+    /// A `response.headers` instance reading through its owning `Response`.
+    ResponseHeaders {
+        owner: ObjectId,
+    },
+}
+
+/// Mutable request state of one `XMLHttpRequest` instance. The classic
+/// subset keeps the request line, caller headers, and the settle-time
+/// response; script-visible fields (`readyState`, `status`, ...) are plain
+/// properties the completion path updates.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct XmlHttpRequestState {
+    /// Uppercased request method. Empty means `open()` has not run yet.
+    pub(super) method: String,
+    /// Absolute request URL resolved against the document base at `open()`.
+    pub(super) url: String,
+    /// Headers accumulated by `setRequestHeader()` before `send()`.
+    pub(super) headers: Vec<(String, String)>,
+    /// `false` only when `open()` received an explicit falsy async flag;
+    /// synchronous sends are rejected.
+    pub(super) async_request: bool,
+    /// `true` once `send()` queued the network request.
+    pub(super) sent: bool,
+    /// Response captured when the embedding settles the transfer.
+    pub(super) response: Option<XhrResponse>,
+}
+
+/// Settle-time response state of one `XMLHttpRequest` instance.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct XhrResponse {
+    pub(super) status: u16,
+    pub(super) status_text: String,
+    pub(super) headers: Vec<(String, String)>,
+    /// Body decoded lossily as UTF-8.
+    pub(super) body: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -928,6 +985,7 @@ impl Realm {
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
+        Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
         Self::define_global_function(
             &mut objects,
             global,
@@ -2896,6 +2954,149 @@ impl Realm {
                 getter: None,
                 setter: None,
                 value: JsValue::Object(json),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
+    /// Installs the network surface: `fetch()`, `Response`, and
+    /// `XMLHttpRequest`.
+    ///
+    /// Transfers are only queued here; the embedding drains
+    /// `take_pending_fetch_requests` and completes each id through
+    /// `settle_fetch`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bootstrap tables read best as a single listing"
+    )]
+    fn install_fetch(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        Self::define_global_function(objects, global, "fetch", NativeFunction::GlobalFetch);
+
+        // `Response` instances materialize when a transfer settles; the
+        // constructor stays callable for feature detection and shims.
+        let response_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("text", NativeFunction::ResponseText),
+            ("json", NativeFunction::ResponseJson),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[response_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let response_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::ResponseConstructor,
+            ..JsObject::default()
+        });
+        objects[response_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(response_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[response_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(response_constructor)),
+        );
+        objects[global.0].properties.insert(
+            "Response".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(response_constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+
+        // Classic-subset `XMLHttpRequest`: open/setRequestHeader/send plus
+        // the readyState constants real bundle code probes for.
+        let xhr_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("open", NativeFunction::XhrOpen),
+            ("setRequestHeader", NativeFunction::XhrSetRequestHeader),
+            ("send", NativeFunction::XhrSend),
+            ("getResponseHeader", NativeFunction::XhrGetResponseHeader),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[xhr_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        for (name, value) in [
+            ("UNSENT", 0.0),
+            ("OPENED", 1.0),
+            ("HEADERS_RECEIVED", 2.0),
+            ("LOADING", 3.0),
+            ("DONE", 4.0),
+        ] {
+            objects[xhr_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(value)),
+            );
+        }
+        let xhr_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::XmlHttpRequestConstructor,
+            ..JsObject::default()
+        });
+        objects[xhr_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(xhr_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[xhr_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(xhr_constructor)),
+        );
+        objects[global.0].properties.insert(
+            "XMLHttpRequest".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(xhr_constructor),
                 writable: true,
                 enumerable: false,
                 configurable: true,

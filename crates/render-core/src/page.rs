@@ -21,8 +21,8 @@ use crate::event_loop::{
 };
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
 use crate::js::{
-    CompiledScript, ElementRect, JsError, JsMicrotask, JsRuntime, JsValue, RuntimeLimits,
-    ScriptOutcome, TimerRequest,
+    CompiledScript, ElementRect, FetchOutcome, JsError, JsMicrotask, JsRuntime, JsValue,
+    PendingFetch, RuntimeLimits, ScriptOutcome, TimerRequest,
 };
 use crate::layout::{FragmentKind, SimpleTextMeasurer};
 use crate::paint::{DisplayListDiff, NoGlyphMasks, ReferenceTextShaper};
@@ -1046,6 +1046,46 @@ impl Page {
     #[must_use]
     pub fn has_pending_immediate_work(&self) -> bool {
         self.event_loop.ready_task_count() > 0 || self.event_loop.pending_microtask_count() > 0
+    }
+
+    /// Drain network transfers queued by `fetch()`/`XMLHttpRequest` since the
+    /// last call. The embedding executes each request on its own transport
+    /// and completes it by id through [`Self::settle_fetch`].
+    #[must_use]
+    pub fn take_pending_fetch_requests(&mut self) -> Vec<PendingFetch> {
+        self.runtime.take_pending_fetch_requests()
+    }
+
+    /// Complete one queued network transfer previously drained from
+    /// [`Self::take_pending_fetch_requests`].
+    ///
+    /// Unknown ids are ignored silently: the page may have navigated between
+    /// queueing and settling. Settlement callbacks (promise reactions and
+    /// XHR completion events) run synchronously here, exactly as a microtask
+    /// cascade would, so the page is never left with stalled microtask state
+    /// between turns.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors thrown inside a settlement callback, except promise
+    /// rejections which stay contained like in ordinary microtask execution.
+    pub fn settle_fetch(
+        &mut self,
+        id: u64,
+        outcome: Result<FetchOutcome, String>,
+    ) -> Result<(), JsError> {
+        self.runtime
+            .settle_fetch(self.document.dom_mut(), id, outcome);
+        loop {
+            let pending = self.runtime.take_pending_microtasks();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for microtask in pending {
+                self.runtime
+                    .invoke_microtask(self.document.dom_mut(), microtask)?;
+            }
+        }
     }
 
     /// Virtual-clock instant of the earliest pending timer, if any.
@@ -2214,5 +2254,51 @@ fn page_url_is_visible_to_scripts_in_the_persistent_realm() {
             .expect("script result")
             .value,
         crate::js::JsValue::String("www.baidu.com/s?wd=rust#result".to_owned())
+    );
+}
+
+#[test]
+fn page_settle_fetch_completes_script_promise_chains() {
+    let url = Url::parse("https://example.test/app").expect("page URL");
+    let mut page = Page::with_url("<!doctype html><p></p>", &url);
+    page.queue_script(
+        r#"
+            var result = "";
+            fetch("/api/session")
+                .then(function (response) { return response.json(); })
+                .then(function (value) { result = value.user; });
+        "#,
+    )
+    .expect("fetch script should queue");
+    page.run_one_turn_reference()
+        .expect("turn should run")
+        .expect("script turn");
+
+    let mut requests = page.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let request = requests.pop().expect("one pending fetch");
+    assert_eq!(request.url, "https://example.test/api/session");
+    assert!(page.take_pending_fetch_requests().is_empty());
+
+    page.settle_fetch(
+        request.id,
+        Ok(crate::js::FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: Vec::new(),
+            body: br#"{"user":"zdy"}"#.to_vec(),
+        }),
+    )
+    .expect("settlement callbacks should run");
+
+    page.queue_script("result;")
+        .expect("result script should queue");
+    let turn = page
+        .run_one_turn_reference()
+        .expect("turn should run")
+        .expect("result turn");
+    assert_eq!(
+        turn.executions[0].result.as_ref().expect("result").value,
+        crate::js::JsValue::String("zdy".to_owned())
     );
 }

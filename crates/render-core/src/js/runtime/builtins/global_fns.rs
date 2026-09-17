@@ -38,6 +38,19 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            // Fetch-domain functions are intercepted at the dispatch head in
+            // `fetch.rs`; these arms exist so a new variant stays a compile
+            // error here instead of a silent runtime gap.
+            NativeFunction::GlobalFetch
+            | NativeFunction::ResponseText
+            | NativeFunction::ResponseJson
+            | NativeFunction::ResponseHeadersGet
+            | NativeFunction::XhrOpen
+            | NativeFunction::XhrSetRequestHeader
+            | NativeFunction::XhrSend
+            | NativeFunction::XhrGetResponseHeader => {
+                self.dispatch_fetch_native(dom, function, receiver, arguments)
+            }
             NativeFunction::AddEventListener => self.add_event_listener(receiver, arguments),
             NativeFunction::RemoveEventListener => self.remove_event_listener(receiver, arguments),
             NativeFunction::DispatchEvent => self.dispatch_event(dom, receiver, arguments),

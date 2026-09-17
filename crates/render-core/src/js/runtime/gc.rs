@@ -173,7 +173,14 @@ pub(super) fn mark_host(
         | ObjectHost::TypedArray { .. }
         | ObjectHost::UrlConstructor
         | ObjectHost::UrlSearchParamsConstructor
-        | ObjectHost::UrlInstance(_) => {}
+        | ObjectHost::UrlInstance(_)
+        | ObjectHost::XmlHttpRequestConstructor
+        | ObjectHost::XmlHttpRequest(_)
+        | ObjectHost::ResponseConstructor
+        | ObjectHost::Response { .. } => {}
+        ObjectHost::ResponseHeaders { owner } => {
+            mark_object(runtime, marked, work, marked_environments, *owner);
+        }
         ObjectHost::BoundFunction { receiver, .. } => {
             mark_object(runtime, marked, work, marked_environments, *receiver);
         }
@@ -304,6 +311,17 @@ impl JsRuntime {
                 &mut work,
                 &mut marked_environments,
                 *observer,
+            );
+        }
+        // Pending network transfers keep their promise or XHR object alive so
+        // a late settle still reaches registered reactions and callbacks.
+        for target in self.pending_fetch_targets.values() {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *target,
             );
         }
         for microtask in &self.pending_microtasks {

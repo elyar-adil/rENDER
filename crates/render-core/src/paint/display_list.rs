@@ -1632,7 +1632,7 @@ mod tests {
 
     use super::{
         Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
-        build_display_list,
+        build_display_list, build_display_list_with_images,
     };
 
     #[test]
@@ -2012,6 +2012,93 @@ mod tests {
             item.command,
             DisplayCommand::PushClip(_) | DisplayCommand::PopClip
         )));
+    }
+
+    #[test]
+    fn scratch_padding_hack_repro() {
+        let output = parse_document(
+            "<!doctype html><body><div id=wrap><picture id=cover><img id=photo src='cover.png'></picture></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } \
+             #wrap { display:block; position:relative; width:298px; padding-top:56.25%; background-color:#f1f2f3; border-radius:6px } \
+             #cover { position:absolute; top:0; left:0; display:inline-block; width:100%; height:100%; overflow:hidden; border-radius:6px; object-fit:cover } \
+             #cover img { display:block; width:100%; height:100%; object-fit:inherit }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let selector = parse_selector_list("#photo").unwrap();
+        let photo = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let mut images = crate::image::ImageResources::default();
+        let key = crate::image::ImageResourceKey {
+            owner: photo,
+            requested_url: url::Url::parse("https://example.test/cover.png").unwrap(),
+            source_snapshot: String::new(),
+            source: crate::image::ImageSource::Element,
+            selection_context: crate::image::ImageSelectionContext::default(),
+        };
+        let decoded = crate::image::DecodedImage::from_pixels(
+            672,
+            378,
+            vec![crate::paint::Color::rgb(255, 0, 0); 672 * 378],
+        )
+        .unwrap();
+        images.insert(key, decoded, crate::image::ImageLimits::default()).unwrap();
+        let display = build_display_list_with_images(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+            Some(&images),
+        );
+        for item in display.list.items() {
+            println!("ITEM source={:?} command={:?} bounds={:?}", item.source, item.command, item.bounds);
+        }
+        let images_drawn = display
+            .list
+            .items()
+            .iter()
+            .filter(|item| matches!(item.command, DisplayCommand::Image(_)))
+            .count();
+        println!("IMAGE COMMANDS: {images_drawn}");
+        for fragment in layout.fragments.iter() {
+            let geometry = match &fragment.kind {
+                crate::layout::FragmentKind::Box(geometry) => format!(
+                    "content={:?} padding={:?}",
+                    geometry.content_rect, geometry.padding
+                ),
+                crate::layout::FragmentKind::Text(text) => format!("text={:?}", text.text),
+            };
+            println!(
+                "FRAG id={:?} source={:?} rect={:?} children={:?} {geometry}",
+                fragment.id, fragment.source, fragment.rect, fragment.children
+            );
+        }
+        for item in display.diagnostics {
+            println!("DIAG {item:?}");
+        }
     }
 
     #[test]

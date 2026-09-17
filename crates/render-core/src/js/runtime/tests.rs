@@ -2,8 +2,24 @@ use std::collections::BTreeMap;
 
 use crate::html::parse_document;
 use crate::js::JsValue;
-use crate::js::{ElementRect, JsRuntime};
+use crate::js::{ElementRect, FetchOutcome, JsRuntime};
 use url::Url;
+
+/// Run every queued microtask (including ones queued by earlier microtasks)
+/// until the runtime has none left.
+fn drain_microtasks(runtime: &mut JsRuntime, dom: &mut crate::dom::Dom) {
+    loop {
+        let pending = runtime.take_pending_microtasks();
+        if pending.is_empty() {
+            return;
+        }
+        for microtask in pending {
+            runtime
+                .invoke_microtask(dom, microtask)
+                .expect("microtask executes");
+        }
+    }
+}
 
 #[test]
 fn location_exposes_normalized_committed_url_components() {
@@ -1492,4 +1508,457 @@ fn promise_prototype_is_real_and_overridable() {
         outcome.value,
         JsValue::String("true,true,true:true".to_owned())
     );
+}
+
+#[test]
+fn temp_diag_mutual_recursion() {
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let Ok(html) = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../.diag/bilibili/page.html"
+            )) else {
+                eprintln!("skipped: saved bilibili page not present");
+                return;
+            };
+            let mut parsed = parse_document(&html);
+            let url = Url::parse("https://www.bilibili.com/").expect("base URL");
+            let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+            let shim = r"
+                globalThis.__dpErr = 'none';
+                var __origDP = Object.defineProperty;
+                Object.defineProperty = function (target, key, desc) {
+                    try {
+                        return __origDP.call(Object, target, key, desc);
+                    } catch (e) {
+                        if (globalThis.__dpErr === 'none') { globalThis.__dpErr = '' + e; }
+                        throw e;
+                    }
+                };
+            ";
+            runtime.execute(&mut parsed.dom, shim).expect("shim");
+            let pre = runtime
+                .execute(
+                    &mut parsed.dom,
+                    r"var n = {}; n[Symbol.toStringTag] = 'z';
+                       [String(n), n[Symbol.toStringTag], Object.prototype.toString.call(n)].join('|');
+                    ",
+                )
+                .map(|o| o.value.to_js_string())
+                .unwrap_or_else(|e| format!("pre failed: {e}"));
+            eprintln!("PRE PROBE: {pre}");
+            let source = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../.diag/bilibili/assets/a001_log-reporter.js"
+            ))
+            .expect("log-reporter source");
+            match runtime.execute(&mut parsed.dom, &source) {
+                Ok(_) => eprintln!("NO ERROR"),
+                Err(error) => {
+                    eprintln!("ERR: {error}");
+                    for index in [668usize, 692] {
+                        let Some(function) = runtime.functions.get(index) else {
+                            eprintln!("fn #{index}: missing");
+                            continue;
+                        };
+                        let body = format!("{:?}", function.body);
+                        let body = if body.len() > 700 {
+                            format!("{}…", &body[..700])
+                        } else {
+                            body
+                        };
+                        eprintln!(
+                            "fn #{index} name={:?} params={:?} body={body}",
+                            function.name, function.parameters
+                        );
+                    }
+                    let report = runtime
+                        .execute(&mut parsed.dom, "globalThis.__dpErr")
+                        .map(|o| o.value.to_js_string())
+                        .unwrap_or_else(|e| format!("report failed: {e}"));
+                    eprintln!("DP ERR: {report}");
+                }
+            }
+        })
+        .expect("spawn");
+    handle.join().expect("join");
+}
+
+#[test]
+fn fetch_queues_exactly_one_pending_request_with_method_headers_and_body() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var promise = fetch("https://example.test/api", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "X-Trace": "7" },
+                    body: "{\"user\":\"zdy\"}"
+                });
+                typeof promise.then;
+            "#,
+        )
+        .expect("fetch call should execute");
+    assert_eq!(outcome.value, JsValue::String("function".to_owned()));
+
+    let mut requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let request = requests.pop().expect("one pending fetch");
+    assert_eq!(request.url, "https://example.test/api");
+    assert_eq!(request.method, "POST");
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Content-Type" && value == "application/json")
+    );
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Trace" && value == "7")
+    );
+    assert_eq!(request.body.as_deref(), Some("{\"user\":\"zdy\"}"));
+
+    // Draining consumed the queue; re-draining stays empty.
+    assert!(runtime.take_pending_fetch_requests().is_empty());
+}
+
+#[test]
+fn fetch_resolves_relative_urls_against_the_document_base() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app/").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(&mut parsed.dom, r#"fetch("api/v1?id=7");"#)
+        .expect("relative fetch should execute");
+    let requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url, "https://example.test/app/api/v1?id=7");
+    assert_eq!(requests[0].method, "GET");
+}
+
+#[test]
+fn settle_fetch_ok_resolves_response_text_through_microtasks() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var result = "";
+                fetch("https://example.test/data")
+                    .then(function (response) {
+                        result += response.status + ":" + response.ok + ":" +
+                            response.statusText + ":" +
+                            response.headers.get("content-type") + ";";
+                        return response.text();
+                    })
+                    .then(function (text) { result += text; });
+            "#,
+        )
+        .expect("fetch chain should execute");
+    let requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let id = requests[0].id;
+
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        id,
+        Ok(FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: vec![("Content-Type".to_owned(), "text/plain".to_owned())],
+            body: b"hello fetch".to_vec(),
+        }),
+    );
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "result")
+        .expect("result read executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("200:true:OK:text/plain;hello fetch".to_owned())
+    );
+    // Settled ids leave no bookkeeping behind.
+    assert!(runtime.take_pending_fetch_requests().is_empty());
+}
+
+#[test]
+fn settle_fetch_error_rejects_and_catch_receives_the_reason() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var reason = "";
+                fetch("https://example.test/data").catch(function (error) {
+                    reason = error.message;
+                });
+            "#,
+        )
+        .expect("fetch chain should execute");
+    let requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let id = requests[0].id;
+
+    // Unknown ids are ignored silently (the page may have navigated).
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        u64::MAX,
+        Ok(FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }),
+    );
+
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        id,
+        Err("host name lookup failed".to_owned()),
+    );
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "reason")
+        .expect("reason read executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("host name lookup failed".to_owned())
+    );
+}
+
+#[test]
+fn xhr_queues_request_and_completes_with_events_status_and_response_text() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r##"
+                var log = "";
+                var xhr = new XMLHttpRequest();
+                xhr.open("POST", "https://example.test/login");
+                xhr.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+                xhr.setRequestHeader("X-Request-Id", "42");
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState === 4) log += "rs" + xhr.status + ":" + xhr.responseText;
+                };
+                xhr.onload = function (event) { log += "load" + (event.target === xhr) + event.type; };
+                xhr.onerror = function () { log += "error"; };
+                xhr.onloadend = function () { log += "|end"; };
+                var headerBeforeSend = xhr.getResponseHeader("X-Session");
+                xhr.send("user=a&pass=b");
+                log + "#" + headerBeforeSend;
+            "##,
+        )
+        .expect("XHR setup should execute");
+    let mut requests = runtime.take_pending_fetch_requests();
+    assert_eq!(requests.len(), 1);
+    let request = requests.pop().expect("one pending fetch");
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.url, "https://example.test/login");
+    assert!(request.headers.iter().any(
+        |(name, value)| name == "Content-Type" && value == "application/x-www-form-urlencoded"
+    ));
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "X-Request-Id" && value == "42")
+    );
+    assert_eq!(request.body.as_deref(), Some("user=a&pass=b"));
+
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        request.id,
+        Ok(FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: vec![("X-Session".to_owned(), "abc".to_owned())],
+            body: b"welcome".to_vec(),
+        }),
+    );
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r##"
+                log + "#" + xhr.getResponseHeader("x-session") + "#" +
+                    xhr.readyState + "," + xhr.status + "," + xhr.statusText;
+            "##,
+        )
+        .expect("XHR result read executes");
+    // readystatechange, load, then loadend, all observing the settled state.
+    assert_eq!(
+        outcome.value,
+        JsValue::String("rs200:welcomeloadtrueload|end#abc#4,200,OK".to_owned())
+    );
+}
+
+#[test]
+fn xhr_transport_failure_fires_error_with_status_zero() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var log = "";
+                var xhr = new XMLHttpRequest();
+                xhr.open("GET", "https://example.test/offline");
+                xhr.onreadystatechange = function () {
+                    if (xhr.readyState === 4) log += "rs" + xhr.status;
+                };
+                xhr.onload = function () { log += "load"; };
+                xhr.onerror = function () { log += "error"; };
+                xhr.send();
+            "#,
+        )
+        .expect("XHR setup should execute");
+    let id = runtime.take_pending_fetch_requests()[0].id;
+    runtime.settle_fetch(&mut parsed.dom, id, Err("request timed out".to_owned()));
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "log + '#' + xhr.status")
+        .expect("XHR log read executes");
+    assert_eq!(outcome.value, JsValue::String("rs0error#0".to_owned()));
+}
+
+#[test]
+fn xhr_synchronous_send_throws_and_queues_nothing() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var report = "";
+                try {
+                    var sync = new XMLHttpRequest();
+                    sync.open("GET", "https://example.test/sync", false);
+                    sync.send();
+                    report = "sent";
+                } catch (error) {
+                    report = error instanceof TypeError ? "TypeError" : "other";
+                }
+                report;
+            "#,
+        )
+        .expect("sync XHR probe should execute");
+    assert_eq!(outcome.value, JsValue::String("TypeError".to_owned()));
+    assert!(runtime.take_pending_fetch_requests().is_empty());
+}
+
+#[test]
+fn response_json_parses_the_body_into_a_readable_object() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var parsed = null;
+                fetch("https://example.test/api")
+                    .then(function (response) { return response.json(); })
+                    .then(function (value) { parsed = value; });
+            "#,
+        )
+        .expect("fetch chain should execute");
+    let id = runtime.take_pending_fetch_requests()[0].id;
+    runtime.settle_fetch(
+        &mut parsed.dom,
+        id,
+        Ok(FetchOutcome {
+            status: 200,
+            status_text: "OK".to_owned(),
+            headers: Vec::new(),
+            body: br#"{"user":"zdy","count":2,"nested":{"ok":true}}"#.to_vec(),
+        }),
+    );
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            "parsed.user + ':' + parsed.count + ':' + parsed.nested.ok",
+        )
+        .expect("parsed read executes");
+    assert_eq!(outcome.value, JsValue::String("zdy:2:true".to_owned()));
+}
+
+#[test]
+fn response_constructor_text_settles_without_a_transfer() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var parts = [];
+                var response = new Response("ready");
+                parts.push(response.status + "," + response.ok);
+                response.text().then(function (text) { parts.push(text); });
+            "#,
+        )
+        .expect("Response construction should execute");
+    assert!(runtime.take_pending_fetch_requests().is_empty());
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "parts.join('#')")
+        .expect("parts read executes");
+    assert_eq!(outcome.value, JsValue::String("200,true#ready".to_owned()));
+}
+
+#[test]
+fn temp_read_5073_state() {
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024 * 1024)
+        .spawn(|| {
+            let Ok(html) = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../.diag/bilibili/page.html"
+            )) else {
+                eprintln!("skipped: saved bilibili page not present");
+                return;
+            };
+            let mut parsed = parse_document(&html);
+            let url = Url::parse("https://www.bilibili.com/").expect("base URL");
+            let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+            let shim = r"
+                globalThis.__dpErr = 'none';
+                var __origDP = Object.defineProperty;
+                Object.defineProperty = function (target, key, desc) {
+                    try { return __origDP.call(Object, target, key, desc); }
+                    catch (e) { throw e; }
+                };
+            ";
+            runtime.execute(&mut parsed.dom, shim).expect("shim");
+            let source = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../.diag/bilibili/assets/a001_patched.js"
+            ))
+            .expect("patched bundle");
+            match runtime.execute(&mut parsed.dom, &source) {
+                Ok(_) => eprintln!("NO ERROR"),
+                Err(error) => eprintln!("ERR: {error}"),
+            }
+            let report = runtime
+                .execute(
+                    &mut parsed.dom,
+                    r#"var t = {}; t[Symbol.toStringTag] = 'z';
+                       [typeof Symbol, typeof Symbol.toStringTag, String(t), String({})].join(' ; ');
+                    "#,
+                )
+                .map(|o| o.value.to_js_string())
+                .unwrap_or_else(|e| format!("report failed: {e}"));
+            eprintln!("5073 STATE: {report}");
+        })
+        .expect("spawn");
+    handle.join().expect("join");
 }

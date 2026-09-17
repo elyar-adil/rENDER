@@ -49,8 +49,8 @@ mod types;
 mod tests;
 
 pub use types::{
-    ConsoleLevel, ConsoleMessage, ElementRect, JsMicrotask, NavigationRequest, TimerEntry,
-    TimerKind, TimerRequest,
+    ConsoleLevel, ConsoleMessage, ElementRect, FetchOutcome, JsMicrotask, NavigationRequest,
+    PendingFetch, TimerEntry, TimerKind, TimerRequest,
 };
 
 /// A realm-owning interpreter instance. DOM wrappers retain stable `NodeId`
@@ -74,6 +74,16 @@ pub struct JsRuntime {
     next_timer_id: u64,
     pending_timer_requests: Vec<TimerRequest>,
     pending_navigations: Vec<NavigationRequest>,
+    /// Network transfers queued by `fetch()`/`XMLHttpRequest`, drained by the
+    /// embedding through [`Self::take_pending_fetch_requests`].
+    pending_fetch_requests: Vec<PendingFetch>,
+    /// Fetch id -> promise record index for promise-returning transfers.
+    /// Removed on settle so re-fetching ids cannot leak entries.
+    pending_fetch_promises: BTreeMap<u64, usize>,
+    /// Fetch id -> object the GC must keep alive until settle (the promise
+    /// object for `fetch()`, the XHR instance for `XMLHttpRequest`).
+    pending_fetch_targets: BTreeMap<u64, ObjectId>,
+    next_fetch_id: u64,
     regexes: Vec<RegexRecord>,
     console_messages: Vec<ConsoleMessage>,
     window_event_handlers: BTreeMap<String, Vec<ObjectId>>,
@@ -149,6 +159,10 @@ impl JsRuntime {
             next_timer_id: 1,
             pending_timer_requests: Vec::new(),
             pending_navigations: Vec::new(),
+            pending_fetch_requests: Vec::new(),
+            pending_fetch_promises: BTreeMap::new(),
+            pending_fetch_targets: BTreeMap::new(),
+            next_fetch_id: 1,
             regexes: Vec::new(),
             console_messages: Vec::new(),
             window_event_handlers: BTreeMap::new(),
@@ -272,6 +286,61 @@ impl JsRuntime {
     /// `href` writes) since the last call. The embedding performs the load.
     pub fn take_pending_navigations(&mut self) -> Vec<NavigationRequest> {
         std::mem::take(&mut self.pending_navigations)
+    }
+
+    /// Drain network transfers queued by `fetch()`/`XMLHttpRequest` since the
+    /// last call. The embedding executes each request on its transport and
+    /// completes it by id through [`Self::settle_fetch`].
+    pub fn take_pending_fetch_requests(&mut self) -> Vec<PendingFetch> {
+        std::mem::take(&mut self.pending_fetch_requests)
+    }
+
+    /// Complete one queued network transfer previously drained from
+    /// [`Self::take_pending_fetch_requests`].
+    ///
+    /// Unknown ids are ignored silently: the page may have navigated between
+    /// queueing and settling. A success resolves the `fetch()` promise with a
+    /// `Response` or completes the `XMLHttpRequest` (readyState 4, status,
+    /// `responseText`, then `readystatechange`/`load` callbacks at the next
+    /// microtask checkpoint); a failure rejects the promise with a
+    /// `TypeError` or fires the `readystatechange`/`error` callbacks.
+    pub fn settle_fetch(&mut self, dom: &mut Dom, id: u64, outcome: Result<FetchOutcome, String>) {
+        // The DOM handle is reserved for future direct event dispatch;
+        // settlement only enqueues microtasks today.
+        let _ = dom;
+        let promise_index = self.pending_fetch_promises.remove(&id);
+        let Some(target) = self.pending_fetch_targets.remove(&id) else {
+            return;
+        };
+        match self.realm.host(target) {
+            Some(ObjectHost::Promise(_)) => {
+                let Some(promise_index) = promise_index else {
+                    return;
+                };
+                match outcome {
+                    Ok(outcome) => match self.build_response_value(&outcome) {
+                        Ok(value) => {
+                            let _ = self.resolve_promise_value(promise_index, &value);
+                        }
+                        Err(error) => {
+                            let reason = error
+                                .thrown_value()
+                                .cloned()
+                                .unwrap_or_else(|| JsValue::String(error.to_string()));
+                            self.reject_promise(promise_index, &reason);
+                        }
+                    },
+                    Err(message) => {
+                        let reason = self
+                            .construct_standard_error(ErrorKind::TypeError, &message)
+                            .unwrap_or_else(|_| JsValue::String(message.clone()));
+                        self.reject_promise(promise_index, &reason);
+                    }
+                }
+            }
+            Some(ObjectHost::XmlHttpRequest(_)) => self.complete_xml_http_request(target, outcome),
+            _ => {}
+        }
     }
 
     /// Install border-box geometry captured from the latest layout pass. Keys
@@ -593,7 +662,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        self.dispatch_dom_native(dom, function, receiver, arguments)
+        self.dispatch_fetch_native(dom, function, receiver, arguments)
     }
 }
 
