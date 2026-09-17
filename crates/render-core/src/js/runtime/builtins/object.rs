@@ -293,8 +293,29 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        if let Some(JsValue::Object(object)) = arguments.first() {
-            return Ok(JsValue::Object(*object));
+        // ECMA-262 Object(value) performs ToObject: primitives box into
+        // their wrapper hosts so brand checks like
+        // `Object(symbol) instanceof Symbol` behave as the spec requires
+        // (core-js gates its whole feature table on this).
+        match arguments.first() {
+            Some(JsValue::Object(object)) => return Ok(JsValue::Object(*object)),
+            Some(JsValue::Symbol(symbol)) => {
+                self.ensure_heap_capacity(1)?;
+                return Ok(JsValue::Object(self.realm.symbol_instance_wrapper(symbol.clone())));
+            }
+            Some(JsValue::String(text)) => {
+                self.ensure_heap_capacity(1)?;
+                return Ok(JsValue::Object(self.realm.string_wrapper(text.clone())));
+            }
+            Some(JsValue::Number(number)) => {
+                self.ensure_heap_capacity(1)?;
+                return Ok(JsValue::Object(self.realm.number_primitive_wrapper(*number)));
+            }
+            Some(JsValue::Boolean(flag)) => {
+                self.ensure_heap_capacity(1)?;
+                return Ok(JsValue::Object(self.realm.boolean_primitive_wrapper(*flag)));
+            }
+            _ => {}
         }
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(self.realm.create_ordinary_object()))

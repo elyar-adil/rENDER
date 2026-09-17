@@ -1533,6 +1533,18 @@ impl JsRuntime {
         value: &JsValue,
     ) -> Result<String, JsError> {
         let primitive = self.to_primitive_with_hint(dom, value.clone(), true)?;
+        if std::env::var_os("RENDER_TRACE_STRING").is_some()
+            && let JsValue::Object(object) = value
+        {
+            let tag = self
+                .realm
+                .get_symbol_descriptor(*object, &JsSymbol::well_known("@@toStringTag"))
+                .map(|descriptor| descriptor.value.to_js_string());
+            eprintln!(
+                "TRACE String(obj) -> {:?} tag={tag:?}",
+                primitive.to_js_string()
+            );
+        }
         Ok(primitive.to_js_string())
     }
 
@@ -1984,6 +1996,26 @@ impl JsRuntime {
         }
         if operator == BinaryOp::In {
             return self.property_in(&left, &right).map(JsValue::Boolean);
+        }
+        // ECMA-262 IsLooselyEqual/IsStrictEqual: equality operators never
+        // coerce their operands through ToPrimitive here — strict equality
+        // compares raw values and loose equality applies the spec algorithm
+        // in abstract_equal. Arithmetic and relational operators below keep
+        // the numeric conversion.
+        match operator {
+            BinaryOp::StrictEqual => {
+                return Ok(JsValue::Boolean(strict_equal(&left, &right)));
+            }
+            BinaryOp::StrictNotEqual => {
+                return Ok(JsValue::Boolean(!strict_equal(&left, &right)));
+            }
+            BinaryOp::Equal => {
+                return Ok(JsValue::Boolean(abstract_equal(&left, &right)?));
+            }
+            BinaryOp::NotEqual => {
+                return Ok(JsValue::Boolean(!abstract_equal(&left, &right)?));
+            }
+            _ => {}
         }
         let left = self.to_numeric_primitive(dom, left)?;
         let right = self.to_numeric_primitive(dom, right)?;
@@ -3078,6 +3110,12 @@ impl JsRuntime {
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            Some(ObjectHost::XmlHttpRequestConstructor) => {
+                self.xml_http_request_constructor(constructor)
+            }
+            Some(ObjectHost::ResponseConstructor) => {
+                self.response_constructor(constructor, arguments)
+            }
             Some(ObjectHost::IntersectionObserverConstructor) => {
                 self.intersection_observer_constructor(constructor, arguments)
             }
@@ -3187,6 +3225,12 @@ impl JsRuntime {
             }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            Some(ObjectHost::XmlHttpRequestConstructor) => Err(JsError::type_error(
+                "XMLHttpRequest constructor requires 'new'",
+            )),
+            Some(ObjectHost::ResponseConstructor) => {
+                Err(JsError::type_error("Response constructor requires 'new'"))
+            }
             Some(ObjectHost::IntersectionObserverConstructor) => Err(JsError::type_error(
                 "IntersectionObserver constructor requires 'new'",
             )),
@@ -3457,10 +3501,33 @@ impl JsRuntime {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
+                    | ObjectHost::ObjectConstructor
+                    | ObjectHost::PromiseConstructor
+                    | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::UrlConstructor
+                    | ObjectHost::UrlSearchParamsConstructor
+                    | ObjectHost::XmlHttpRequestConstructor
+                    | ObjectHost::ResponseConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::TypedArrayConstructor(_)
                     | ObjectHost::ErrorConstructor(_)
+                    | ObjectHost::ObjectConstructor
+                    | ObjectHost::PromiseConstructor
+                    | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::UrlConstructor
+                    | ObjectHost::UrlSearchParamsConstructor
+                    | ObjectHost::SymbolConstructor
+                    | ObjectHost::DateConstructor
+                    | ObjectHost::BooleanConstructor
+                    | ObjectHost::NumberConstructor
+                    | ObjectHost::StringConstructor
+                    | ObjectHost::FunctionConstructor
+                    | ObjectHost::ArrayConstructor
+                    | ObjectHost::RegExpConstructor
+                    | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::ImageConstructor
                     | ObjectHost::PromiseSettler { .. }
             )
         ) {
@@ -3493,6 +3560,13 @@ impl JsRuntime {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
+                    | ObjectHost::ObjectConstructor
+                    | ObjectHost::PromiseConstructor
+                    | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::UrlConstructor
+                    | ObjectHost::UrlSearchParamsConstructor
+                    | ObjectHost::XmlHttpRequestConstructor
+                    | ObjectHost::ResponseConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::TypedArrayConstructor(_)
