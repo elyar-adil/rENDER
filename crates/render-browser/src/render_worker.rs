@@ -120,7 +120,20 @@ pub(super) fn process_page_render(
             } = *full;
             cancellation.check()?;
             let (style_sheets, applied_style_sheets, style_diagnostics) =
-                if let Some((plan, results)) = style_batch {
+                if let Some((mut plan, results)) = style_batch {
+                    // Page scripts mutate the DOM while a large stylesheet is
+                    // in flight, so the plan's revision routinely lags the
+                    // snapshot. Re-plan against the snapshot (which already
+                    // contains those mutations) instead of discarding the
+                    // fetched CSS: this frame then renders styled, and the
+                    // coordinator's next cycle covers any brand-new links.
+                    if plan.revision != document.dom().revision() {
+                        plan = plan_external_style_sheets(
+                            &document,
+                            &base_url,
+                            DocumentRenderOptions::default().document_limits,
+                        );
+                    }
                     let application = apply_stylesheet_batch(&document, &plan, results);
                     (
                         application.style_sheets.clone(),
