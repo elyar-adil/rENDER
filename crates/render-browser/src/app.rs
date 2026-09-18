@@ -86,13 +86,13 @@ use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
 use render_core::interaction::FormMethod;
 use render_core::js::RuntimeLimits;
+use render_core::js::{FetchOutcome, PendingFetch};
 use render_core::layout::PhysicalPoint;
 use render_core::navigation::HistoryEntry;
 use render_core::page::PageDomEvent;
 use render_core::script::ScriptDiscoveryLimits;
 use render_net::FetchError;
 use render_net::FetchRequest;
-use render_core::js::{FetchOutcome, PendingFetch};
 use render_net::FetchResult;
 use render_net::NetworkWorker;
 use render_net::Url;
@@ -821,7 +821,7 @@ impl BrowserApp {
     /// Submits one `fetch()`/XHR transfer drained from a page runtime.
     /// Only GET reaches the transport today; other methods settle with an
     /// explicit rejection until the transport grows request-body support.
-    pub(super) fn submit_page_fetch(&mut self, tab: TabId, request: PendingFetch) {
+    pub(super) fn submit_page_fetch(&mut self, tab: TabId, request: &PendingFetch) {
         if request.method != "GET" {
             let Some(page) = self.pages.get_mut(&tab) else {
                 return;
@@ -1230,42 +1230,11 @@ impl BrowserApp {
             }
         }
         for (tab, request) in new_fetches {
-            self.submit_page_fetch(tab, request);
+            self.submit_page_fetch(tab, &request);
         }
-        for (tab, id, handle) in &mut self.pending_fetches {
-            let Some(page) = self.pages.get_mut(&tab) else {
-                continue;
-            };
-            let outcome = match handle.try_recv() {
-                Ok(result) => match result.result {
-                    Ok(response) => {
-                        let headers = response
-                            .headers
-                            .iter()
-                            .map(|header| {
-                                (
-                                    header.name.clone(),
-                                    String::from_utf8_lossy(&header.value).into_owned(),
-                                )
-                            })
-                            .collect();
-                        Ok(FetchOutcome {
-                            status: response.status.as_u16(),
-                            status_text: String::new(),
-                            headers,
-                            body: response.body.clone(),
-                        })
-                    }
-                    Err(error) => Err(error.to_string()),
-                },
-                Err(TryRecvError::Empty) => continue,
-                Err(TryRecvError::Disconnected) => {
-                    Err("network worker stopped".to_owned())
-                }
-            };
-            if let Err(error) = page.page.settle_fetch(*id, outcome) {
-                eprintln!("render-browser fetch settlement callback failed: {error}");
-            }
+        let settlement_errors = self.poll_pending_fetch_settlements();
+        for error in settlement_errors {
+            eprintln!("render-browser fetch settlement callback failed: {error}");
         }
         for (id, completion) in completed_documents {
             let requested_url = self
@@ -1452,18 +1421,60 @@ impl BrowserApp {
         }
     }
 
+    /// Polls in-flight `fetch()`/XHR transfers and settles their runtimes.
+    /// Returns per-transfer settlement callback errors for the caller to log
+    /// (a throwing callback must not abort the polling loop).
+    fn poll_pending_fetch_settlements(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let mut finished = Vec::new();
+        for (tab, id, handle) in &mut self.pending_fetches {
+            let outcome = match handle.try_recv() {
+                Ok(result) => match result.result {
+                    Ok(response) => {
+                        let headers = response
+                            .headers
+                            .iter()
+                            .map(|header| {
+                                (
+                                    header.name.clone(),
+                                    String::from_utf8_lossy(&header.value).into_owned(),
+                                )
+                            })
+                            .collect();
+                        Ok(FetchOutcome {
+                            status: response.status.as_u16(),
+                            status_text: String::new(),
+                            headers,
+                            body: response.body.clone(),
+                        })
+                    }
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(TryRecvError::Empty) => continue,
+                Err(TryRecvError::Disconnected) => Err("network worker stopped".to_owned()),
+            };
+            let Some(page) = self.pages.get_mut(tab) else {
+                continue;
+            };
+            if let Err(error) = page.page.settle_fetch(*id, outcome) {
+                errors.push(error.to_string());
+            }
+            finished.push((*tab, *id));
+        }
+        self.pending_fetches
+            .retain(|(tab, id, _)| !finished.contains(&(*tab, *id)));
+        errors
+    }
+
     pub(super) fn has_pending_network(&self) -> bool {
         !self.pending_fetches.is_empty()
-            || self
-                .pages
-                .values()
-                .any(|page| {
-                    page.navigation.pending.is_some()
-                        || page.pending_style_sheets.is_some()
-                        || page.pending_scripts.is_some()
-                        || page.pending_images.is_some()
-                        || !page.page.pending_fetch_queue_empty()
-                })
+            || self.pages.values().any(|page| {
+                page.navigation.pending.is_some()
+                    || page.pending_style_sheets.is_some()
+                    || page.pending_scripts.is_some()
+                    || page.pending_images.is_some()
+                    || !page.page.pending_fetch_queue_empty()
+            })
     }
 
     pub(super) fn has_pending_script_work(&self) -> bool {

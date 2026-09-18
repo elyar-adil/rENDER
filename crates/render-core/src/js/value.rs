@@ -648,6 +648,9 @@ pub(crate) enum ObjectHost {
     Document(NodeId),
     Node(NodeId),
     ClassList(NodeId),
+    /// `element.dataset` `DOMStringMap`. Reads and writes map camelCase
+    /// members to `data-*` attributes on the owning element.
+    DataSet(NodeId),
     CssStyleDeclaration(NodeId),
     NativeFunction(NativeFunction),
     BoundFunction {
@@ -878,6 +881,7 @@ pub struct Realm {
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
+    dataset_wrappers: BTreeMap<NodeId, ObjectId>,
     /// Number of object slots that became garbage and were swept. Object
     /// identities are never moved or reused, so a swept slot always reads as
     /// an empty ordinary object even if some bookkeeping still references it.
@@ -1423,6 +1427,7 @@ impl Realm {
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
+            dataset_wrappers: BTreeMap::new(),
             swept_objects: 0,
         }
     }
@@ -3486,13 +3491,15 @@ impl Realm {
         let mut roots = Vec::with_capacity(
             2 + self.node_wrappers.len()
                 + self.class_list_wrappers.len()
-                + self.style_declaration_wrappers.len(),
+                + self.style_declaration_wrappers.len()
+                + self.dataset_wrappers.len(),
         );
         roots.push(self.global);
         roots.push(self.document);
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
+        roots.extend(self.dataset_wrappers.values().copied());
         roots
     }
 
@@ -3838,6 +3845,20 @@ impl Realm {
             ..JsObject::default()
         });
         self.style_declaration_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// Create the cached `element.dataset` `DOMStringMap` wrapper.
+    pub(crate) fn dataset_wrapper(&mut self, node: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.dataset_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(self.object_prototype),
+            host: ObjectHost::DataSet(node),
+            ..JsObject::default()
+        });
+        self.dataset_wrappers.insert(node, wrapper);
         wrapper
     }
 

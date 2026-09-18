@@ -1271,9 +1271,16 @@ impl JsRuntime {
             Expr::Member { .. } | Expr::ComputedMember { .. } => {
                 let reference = self.resolve_assignment_reference(dom, operand)?;
                 match reference {
-                    AssignmentReference::Property { object, property } => Ok(JsValue::Boolean(
-                        self.realm.delete_property(object, &property),
-                    )),
+                    AssignmentReference::Property { object, property } => {
+                        if let Some(ObjectHost::DataSet(node)) = self.realm.host(object) {
+                            return Ok(JsValue::Boolean(JsRuntime::delete_dataset_member(
+                                dom, node, &property,
+                            )?));
+                        }
+                        Ok(JsValue::Boolean(
+                            self.realm.delete_property(object, &property),
+                        ))
+                    }
                     AssignmentReference::SymbolProperty { object, symbol } => Ok(JsValue::Boolean(
                         self.realm.delete_symbol_property(object, &symbol),
                     )),
@@ -2463,6 +2470,10 @@ impl JsRuntime {
                     self.ensure_heap_capacity(1)?;
                     return Ok(JsValue::Object(self.realm.class_list_wrapper(node)));
                 }
+                "dataset" => {
+                    self.ensure_heap_capacity(1)?;
+                    return Ok(JsValue::Object(self.realm.dataset_wrapper(node)));
+                }
                 "style" => {
                     self.ensure_heap_capacity(1)?;
                     return Ok(JsValue::Object(self.realm.style_declaration_wrapper(node)));
@@ -2617,6 +2628,14 @@ impl JsRuntime {
                 }
                 _ => {}
             },
+            Some(ObjectHost::DataSet(node)) => {
+                // DOMStringMap named-property visibility: only members whose
+                // mapped `data-*` attribute exists shadow the ordinary
+                // prototype-chain lookup; everything else falls through.
+                if let Some(value) = JsRuntime::dataset_member_attribute_value(dom, node, property)? {
+                    return Ok(JsValue::String(value));
+                }
+            }
             Some(ObjectHost::CssStyleDeclaration(node)) => {
                 if property == "cssText" {
                     let declarations = Self::inline_declarations(dom, node);
@@ -3013,6 +3032,11 @@ impl JsRuntime {
             }
             Some(ObjectHost::ClassList(node)) if property == "value" => {
                 return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
+            }
+            Some(ObjectHost::DataSet(node)) => {
+                // DOMStringMap writes go straight to the element's `data-*`
+                // attributes (stringified, like the IDL DOMString setter).
+                return JsRuntime::set_dataset_member(dom, node, property, &value);
             }
             // Assignments to primitive string wrappers are silently ignored,
             // mirroring how non-strict engines drop them.
@@ -3512,23 +3536,6 @@ impl JsRuntime {
                     | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::TypedArrayConstructor(_)
                     | ObjectHost::ErrorConstructor(_)
-                    | ObjectHost::ObjectConstructor
-                    | ObjectHost::PromiseConstructor
-                    | ObjectHost::MutationObserverConstructor
-                    | ObjectHost::UrlConstructor
-                    | ObjectHost::UrlSearchParamsConstructor
-                    | ObjectHost::SymbolConstructor
-                    | ObjectHost::DateConstructor
-                    | ObjectHost::BooleanConstructor
-                    | ObjectHost::NumberConstructor
-                    | ObjectHost::StringConstructor
-                    | ObjectHost::FunctionConstructor
-                    | ObjectHost::ArrayConstructor
-                    | ObjectHost::RegExpConstructor
-                    | ObjectHost::EventConstructor
-                    | ObjectHost::DomConstructor
-                    | ObjectHost::ImageConstructor
-                    | ObjectHost::PromiseSettler { .. }
             )
         ) {
             Ok(object)

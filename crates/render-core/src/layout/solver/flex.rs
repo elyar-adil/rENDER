@@ -542,7 +542,18 @@ impl Solver<'_> {
             available
         } else {
             self.resolve_size(style, "width", available, source)
-                .unwrap_or_else(|| self.intrinsic_flex_size(node, true, available, 0))
+                .unwrap_or_else(|| {
+                    // Non-stretch items with an auto cross size use their
+                    // fit-content size: the max-content intrinsic clamped to
+                    // the flex line (CSS Flexbox §9.4.8 uses fit-content;
+                    // the min-content floor is not modeled yet). Without the
+                    // clamp, an auto-width child of a `flex-direction:column;
+                    // align-items:center` container keeps its full
+                    // max-content width and is centered into negative
+                    // coordinates, pushing it off-screen (zhihu signin card).
+                    self.intrinsic_flex_size(node, true, available, 0)
+                        .min((available - extras).max(0.0))
+                })
                 + extras
         }
     }

@@ -1951,9 +1951,9 @@ fn temp_read_5073_state() {
             let report = runtime
                 .execute(
                     &mut parsed.dom,
-                    r#"var t = {}; t[Symbol.toStringTag] = 'z';
+                    r"var t = {}; t[Symbol.toStringTag] = 'z';
                        [typeof Symbol, typeof Symbol.toStringTag, String(t), String({})].join(' ; ');
-                    "#,
+                    ",
                 )
                 .map(|o| o.value.to_js_string())
                 .unwrap_or_else(|e| format!("report failed: {e}"));
@@ -1961,4 +1961,56 @@ fn temp_read_5073_state() {
         })
         .expect("spawn");
     handle.join().expect("join");
+}
+
+#[test]
+fn dataset_setter_writes_through_to_the_data_attribute_and_reads_back() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var script = document.createElement("script");
+                    script.dataset.sentryConfig = "https://sentry.test/42";
+                    [
+                        script.dataset.sentryConfig,
+                        script.getAttribute("data-sentry-config")
+                    ].join("|");
+                "#,
+        )
+        .expect("dataset member write should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("https://sentry.test/42|https://sentry.test/42".to_owned())
+    );
+}
+
+#[test]
+fn dataset_reads_delete_and_missing_members_follow_the_camel_case_mapping() {
+    let mut parsed =
+        parse_document("<!doctype html><p id='probe' data-foo-bar='first' data-num='7'></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var probe = document.getElementById("probe");
+                    var before = [probe.dataset.fooBar, probe.dataset.num, probe.dataset.missing].join("|");
+                    delete probe.dataset.fooBar;
+                    var after = [
+                        probe.dataset.fooBar,
+                        probe.hasAttribute("data-foo-bar"),
+                        probe.getAttribute("data-num")
+                    ].join("|");
+                    before + " / " + after;
+                "#,
+        )
+        .expect("dataset member reads should execute");
+    // Spec: Array.prototype.join renders undefined members as empty
+    // strings, so the missing/deleted reads join as "".
+    assert_eq!(
+        outcome.value,
+        JsValue::String("first|7| / |false|7".to_owned())
+    );
 }

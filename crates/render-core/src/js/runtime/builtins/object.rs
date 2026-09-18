@@ -301,7 +301,9 @@ impl JsRuntime {
             Some(JsValue::Object(object)) => return Ok(JsValue::Object(*object)),
             Some(JsValue::Symbol(symbol)) => {
                 self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(self.realm.symbol_instance_wrapper(symbol.clone())));
+                return Ok(JsValue::Object(
+                    self.realm.symbol_instance_wrapper(symbol.clone()),
+                ));
             }
             Some(JsValue::String(text)) => {
                 self.ensure_heap_capacity(1)?;
@@ -309,7 +311,9 @@ impl JsRuntime {
             }
             Some(JsValue::Number(number)) => {
                 self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(self.realm.number_primitive_wrapper(*number)));
+                return Ok(JsValue::Object(
+                    self.realm.number_primitive_wrapper(*number),
+                ));
             }
             Some(JsValue::Boolean(flag)) => {
                 self.ensure_heap_capacity(1)?;

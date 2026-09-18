@@ -2064,7 +2064,9 @@ mod tests {
             vec![crate::paint::Color::rgb(255, 0, 0); 672 * 378],
         )
         .unwrap();
-        images.insert(key, decoded, crate::image::ImageLimits::default()).unwrap();
+        images
+            .insert(key, decoded, crate::image::ImageLimits::default())
+            .unwrap();
         let display = build_display_list_with_images(
             &layout.fragments,
             &formatting,
@@ -2074,7 +2076,10 @@ mod tests {
             Some(&images),
         );
         for item in display.list.items() {
-            println!("ITEM source={:?} command={:?} bounds={:?}", item.source, item.command, item.bounds);
+            println!(
+                "ITEM source={:?} command={:?} bounds={:?}",
+                item.source, item.command, item.bounds
+            );
         }
         let images_drawn = display
             .list

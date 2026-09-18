@@ -142,6 +142,7 @@ pub(super) fn mark_host(
         | ObjectHost::Document(_)
         | ObjectHost::Node(_)
         | ObjectHost::ClassList(_)
+        | ObjectHost::DataSet(_)
         | ObjectHost::CssStyleDeclaration(_)
         | ObjectHost::NativeFunction(_)
         | ObjectHost::PromiseConstructor

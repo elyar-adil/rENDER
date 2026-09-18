@@ -43,7 +43,6 @@ use crate::page_state::PageNavigation;
 use crate::page_state::PageState;
 use crate::render_worker::PageRenderFrame;
 use crate::render_worker::PageRenderPayload;
-use render_browser::worker::RenderJob;
 use render_browser::chrome::ChromeLayout;
 use render_browser::chrome::HitTarget;
 use render_browser::chrome::Point;
@@ -51,8 +50,8 @@ use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
 use render_browser::font_backend::SystemFontBackend;
 use render_browser::home::HOME_TITLE;
-use render_browser::model::TabModel;
 use render_browser::model::TabId;
+use render_browser::model::TabModel;
 use render_browser::navigation::NavigationTarget;
 use render_browser::scripts::{
     plan_classic_scripts, plan_unstarted_classic_scripts, prepare_script_batch,
@@ -60,6 +59,7 @@ use render_browser::scripts::{
 use render_browser::settings::CacheClearUiState;
 use render_browser::worker::RenderCancellation;
 use render_browser::worker::RenderFailure;
+use render_browser::worker::RenderJob;
 use render_browser::worker::RenderWorkerOptions;
 use render_core::js::ElementRect;
 
@@ -886,6 +886,7 @@ fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
         render_worker,
         network,
         http_cache: render_browser::cache::HttpCache::default(),
+        pending_fetches: Vec::new(),
         disk_cache: None,
         pending_disk_clear: None,
         cache_clear_state: CacheClearUiState::Ready,

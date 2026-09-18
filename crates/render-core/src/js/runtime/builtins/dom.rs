@@ -363,6 +363,26 @@ pub(in crate::js::runtime) fn css_prop_from_member(property: &str) -> String {
     mapped
 }
 
+/// Map a `dataset` member (`sentryConfig`) to its `data-*` attribute name
+/// (`data-sentry-config`) using the `DOMStringMap` camel-case-to-attribute
+/// rule. Empty property names have no attribute representation.
+pub(in crate::js::runtime) fn dataset_attribute_from_member(property: &str) -> Option<String> {
+    if property.is_empty() {
+        return None;
+    }
+    let mut mapped = String::with_capacity(property.len() + 6);
+    mapped.push_str("data-");
+    for character in property.chars() {
+        if character.is_ascii_uppercase() {
+            mapped.push('-');
+            mapped.push(character.to_ascii_lowercase());
+        } else {
+            mapped.push(character);
+        }
+    }
+    Some(mapped)
+}
+
 pub(in crate::js::runtime) fn node_attribute_property(property: &str) -> Option<&str> {
     match property {
         "id" => Some("id"),
@@ -730,6 +750,55 @@ impl JsRuntime {
     ) -> Result<Vec<String>, JsError> {
         let value = dom.attribute(node, "class")?.unwrap_or_default();
         Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
+    }
+
+    /// `dataset.member` read: the value of the mapped `data-*` attribute.
+    ///
+    /// `None` means the member is not visible (no matching attribute, or the
+    /// property name has no `data-*` representation) and the ordinary
+    /// prototype-chain lookup should answer instead.
+    pub(in crate::js::runtime) fn dataset_member_attribute_value(
+        dom: &Dom,
+        node: NodeId,
+        property: &str,
+    ) -> Result<Option<String>, JsError> {
+        let Some(name) = dataset_attribute_from_member(property) else {
+            return Ok(None);
+        };
+        Ok(dom.attribute(node, &name)?.map(str::to_owned))
+    }
+
+    /// `dataset.member = value` write-through: stores a stringified copy in
+    /// the mapped `data-*` attribute so `getAttribute` observes the write.
+    pub(in crate::js::runtime) fn set_dataset_member(
+        dom: &mut Dom,
+        node: NodeId,
+        property: &str,
+        value: &JsValue,
+    ) -> Result<(), JsError> {
+        let Some(name) = dataset_attribute_from_member(property) else {
+            return Err(JsError::dom(format!(
+                "{property:?} is not a valid dataset property name"
+            )));
+        };
+        Ok(dom.set_attribute(node, &name, value.to_js_string())?)
+    }
+
+    /// `delete dataset.member`: removes the mapped `data-*` attribute and
+    /// reports whether it existed.
+    pub(in crate::js::runtime) fn delete_dataset_member(
+        dom: &mut Dom,
+        node: NodeId,
+        property: &str,
+    ) -> Result<bool, JsError> {
+        let Some(name) = dataset_attribute_from_member(property) else {
+            return Ok(false);
+        };
+        if dom.attribute(node, &name)?.is_some() {
+            dom.remove_attribute(node, &name)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(in crate::js::runtime) fn require_class_list(

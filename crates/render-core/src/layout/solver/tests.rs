@@ -1120,3 +1120,74 @@ fn inline_block_input_and_submit_wrappers_share_one_full_height_row() {
     assert_eq!(btn.origin.y, ipt.origin.y);
     assert_eq!(btn.size.height, 44.0);
 }
+
+// Regression test for the zhihu.com signin page: `.SignFlowHomepage-content`
+// is a block-level column flex container with `align-items:center` inside a
+// stretched page shell. Its auto width must fill the containing block (the
+// flex line) instead of growing to max-content, and its narrow login card
+// must be centered on the cross axis.
+#[test]
+fn column_flex_container_fills_containing_block_and_centers_narrow_children() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='home'><div id='content'><div id='card'></div></div></div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #home { display:flex; flex-direction:column; height:600px } \
+         #content { display:flex; flex-direction:column; align-items:center; justify-content:center; flex:1 1; min-height:100% } \
+         #card { width:400px; height:503px }",
+        1770.0,
+    );
+    let fragment_for = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("fragment")
+            .rect
+    };
+    let content = fragment_for("#content");
+    assert_eq!(content.origin.x, 0.0);
+    assert_eq!(content.size.width, 1770.0);
+    let card = fragment_for("#card");
+    assert_eq!(card.size.width, 400.0);
+    assert_eq!(card.origin.x, (1770.0 - 400.0) / 2.0);
+}
+
+// A column flex container with `align-items:center` must center an
+// auto-width (max-content) child on the cross axis, and that child's
+// intrinsic width must be clamped to the container line (fit-content) so
+// the centered item stays inside the containing block instead of
+// overflowing symmetrically off-screen.
+#[test]
+fn column_flex_align_center_clamps_auto_width_item_to_the_flex_line() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='column'><div id='panel'><div id='inner'></div><div id='wide'></div></div></div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #column { display:flex; flex-direction:column; align-items:center; width:800px; height:600px } \
+         #panel { display:flex; flex-direction:column; align-items:center } \
+         #inner { width:200px; height:100px } \
+         #wide { width:2000px; height:10px }",
+        800.0,
+    );
+    let fragment_for = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("fragment")
+            .rect
+    };
+    let panel = fragment_for("#panel");
+    assert!(
+        panel.size.width <= 800.0,
+        "auto-width panel must clamp to the flex line, got {}",
+        panel.size.width
+    );
+    assert!(panel.origin.x >= 0.0, "centered panel must stay on-screen");
+    let inner = fragment_for("#inner");
+    assert_eq!(inner.size.width, 200.0);
+    let expected_x = panel.origin.x + (panel.size.width - 200.0) / 2.0;
+    assert!(
+        (inner.origin.x - expected_x).abs() < 0.5,
+        "inner box must be centered within the panel"
+    );
+}
