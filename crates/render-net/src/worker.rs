@@ -20,7 +20,9 @@ type OperationId = u64;
 
 enum Command {
     Fetch {
-        request: FetchRequest,
+        // Boxed to keep the queued command small; the queue holds one command
+        // per pending submission.
+        request: Box<FetchRequest>,
         cancel: CancelToken,
         response: Sender<FetchResult>,
     },
@@ -319,7 +321,7 @@ impl NetworkWorker {
         let (response, receiver) = mpsc::channel();
         let cancel = CancelToken::default();
         self.enqueue(Command::Fetch {
-            request,
+            request: Box::new(request),
             cancel: cancel.clone(),
             response,
         });
@@ -651,7 +653,7 @@ impl Scheduler {
                     id,
                     Operation::Fetch(FetchOperation {
                         _permit: permit,
-                        request,
+                        request: *request,
                         cancel,
                         response,
                         scheduled: false,
@@ -881,7 +883,7 @@ mod tests {
 
     fn fetch_command(url: Url, response: mpsc::Sender<FetchResult>) -> Command {
         Command::Fetch {
-            request: FetchRequest::get(url),
+            request: Box::new(FetchRequest::get(url)),
             cancel: CancelToken::default(),
             response,
         }

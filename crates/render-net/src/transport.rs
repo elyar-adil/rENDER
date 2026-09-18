@@ -3,7 +3,9 @@ use std::io::Read;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
+    mpsc,
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -144,10 +146,93 @@ impl ByteRange {
     }
 }
 
-/// A normalized HTTP GET request.
+/// HTTP request methods the transport can put on the wire.
+///
+/// The transport normalizes whatever the upper layers supply (navigation,
+/// `fetch()`, XHR) onto one of these methods.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum HttpMethod {
+    /// `GET`, the default for navigation and resource loads.
+    #[default]
+    Get,
+    /// `POST`, used by `fetch()`/XHR submissions.
+    Post,
+    /// `PUT`.
+    Put,
+    /// `DELETE`. May carry a request body per HTTP semantics.
+    Delete,
+    /// `HEAD`, a `GET` without a response body.
+    Head,
+}
+
+impl HttpMethod {
+    /// Parse an uppercase wire token ("GET", "POST", ...) into the method.
+    #[must_use]
+    pub fn from_wire(token: &str) -> Option<Self> {
+        match token {
+            "GET" => Some(Self::Get),
+            "POST" => Some(Self::Post),
+            "PUT" => Some(Self::Put),
+            "DELETE" => Some(Self::Delete),
+            "HEAD" => Some(Self::Head),
+            _ => None,
+        }
+    }
+
+    /// The method token exactly as it appears on the request line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+        }
+    }
+
+    /// Whether the method may carry a request body. `GET` and `HEAD` must not;
+    /// attaching one is rejected with [`FetchError::InvalidRequest`].
+    #[must_use]
+    pub const fn allows_body(self) -> bool {
+        !matches!(self, Self::Get | Self::Head)
+    }
+}
+
+/// Headers the transport owns on the wire and therefore rejects from request
+/// builders.
+///
+/// `Host` follows the request URL, the framing headers (`Content-Length`,
+/// `Transfer-Encoding`, `Connection`) are derived from the body and the
+/// connection lifecycle, and `Cookie` carries redirect-scope rules only the
+/// transport's per-hop cookie machinery may apply (callers use
+/// [`FetchRequest::with_cookie`]).
+const RESERVED_HEADERS: &[&str] = &[
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "cookie",
+];
+
+/// A normalized HTTP request.
+///
+/// The default method is [`HttpMethod::Get`]; callers only need the builders
+/// for anything else. Callers may attach custom `headers` and a request
+/// `body`; headers reserved for the transport ([`RESERVED_HEADERS`]) are
+/// rejected when the request is issued.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FetchRequest {
     pub url: Url,
+    /// Request method, defaulting to [`HttpMethod::Get`].
+    pub method: HttpMethod,
+    /// Extra request headers sent on every hop, verbatim. `Content-Length` is
+    /// derived from `body` automatically; see [`RESERVED_HEADERS`] for the
+    /// headers a caller must not set.
+    pub headers: Vec<(String, String)>,
+    /// Optional request body. Only valid on methods where
+    /// [`HttpMethod::allows_body`] holds.
+    pub body: Option<Vec<u8>>,
     /// Optional request `Accept` value. Browser content negotiation policy
     /// belongs to the caller rather than this transport adapter.
     pub accept: Option<String>,
@@ -162,15 +247,73 @@ pub struct FetchRequest {
 }
 
 impl FetchRequest {
+    /// Creates a request with an explicit method.
     #[must_use]
-    pub const fn get(url: Url) -> Self {
+    pub const fn new(method: HttpMethod, url: Url) -> Self {
         Self {
             url,
+            method,
+            headers: Vec::new(),
+            body: None,
             accept: None,
             cookie: None,
             byte_range: None,
             cache_validators: None,
         }
+    }
+
+    #[must_use]
+    pub const fn get(url: Url) -> Self {
+        Self::new(HttpMethod::Get, url)
+    }
+
+    /// Creates a `POST` request.
+    #[must_use]
+    pub const fn post(url: Url) -> Self {
+        Self::new(HttpMethod::Post, url)
+    }
+
+    /// Creates a `PUT` request.
+    #[must_use]
+    pub const fn put(url: Url) -> Self {
+        Self::new(HttpMethod::Put, url)
+    }
+
+    /// Creates a `DELETE` request.
+    #[must_use]
+    pub const fn delete(url: Url) -> Self {
+        Self::new(HttpMethod::Delete, url)
+    }
+
+    /// Creates a `HEAD` request.
+    #[must_use]
+    pub const fn head(url: Url) -> Self {
+        Self::new(HttpMethod::Head, url)
+    }
+
+    /// Overrides the request method.
+    #[must_use]
+    pub const fn with_method(mut self, method: HttpMethod) -> Self {
+        self.method = method;
+        self
+    }
+
+    /// Adds a custom request header sent on every hop. A header of the same
+    /// name set here replaces the transport-managed equivalents (`Accept`,
+    /// `Range`, conditional validators); reserved headers
+    /// ([`RESERVED_HEADERS`]) are rejected when the request is issued.
+    #[must_use]
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Attaches a request body. Rejected at fetch time for methods where
+    /// [`HttpMethod::allows_body`] does not hold.
+    #[must_use]
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self
     }
 
     #[must_use]
@@ -224,16 +367,18 @@ pub struct FetchConfig {
     pub redirect_limit: u32,
     pub max_body_bytes: usize,
     pub max_header_bytes: usize,
-    /// Per-stage and stall budget, deliberately NOT a whole-transfer cap.
+    /// Per-phase budget, deliberately NOT a whole-transfer cap.
     ///
-    /// Each blocking stage (DNS lookup, connect, sending the request,
-    /// receiving response headers) and each individual body read may take up
-    /// to this long before the transfer fails with [`FetchError::Timeout`].
-    /// A body that keeps making progress may legitimately run longer than
-    /// this budget overall (a CDN stylesheet trickling in over a slow link,
-    /// for example). Such transfers remain bounded by `max_body_bytes`, by a
-    /// minimum average rate of [`MIN_BODY_BYTES_PER_SECOND`] once this budget
-    /// has elapsed, and by this same budget across the whole redirect chain.
+    /// The DNS lookup, the connection, sending the request (headers and
+    /// body), and receiving the response headers each take up to this long
+    /// before the transfer fails with [`FetchError::Timeout`]. The response
+    /// body has no wall clock: a body that keeps making progress may
+    /// legitimately run longer than this budget overall (a CDN stylesheet
+    /// trickling in over a slow link, for example). Such transfers remain
+    /// bounded by `max_body_bytes`, by a per-read idle bound of this budget,
+    /// and by a minimum average rate of [`MIN_BODY_BYTES_PER_SECOND`] once
+    /// this budget has elapsed. The budget is also enforced across the whole
+    /// redirect chain.
     pub timeout: Duration,
     pub user_agent: String,
 }
@@ -286,6 +431,13 @@ pub enum FetchError {
     BodyLimitExceeded { limit: usize },
     InvalidByteRange { start: u64, end: u64 },
     EmptyByteRangeSuffix,
+    /// A caller-supplied header collides with one the transport owns on the
+    /// wire (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
+    /// `Cookie`). The payload is the offending header name as supplied.
+    ReservedHeader(String),
+    /// The request is malformed at the transport layer, for example a body
+    /// attached to a `GET` or `HEAD`.
+    InvalidRequest(String),
     Protocol(String),
     Io(String),
     WorkerStopped,
@@ -318,6 +470,11 @@ impl fmt::Display for FetchError {
             Self::EmptyByteRangeSuffix => {
                 formatter.write_str("byte-range suffix length must be non-zero")
             }
+            Self::ReservedHeader(name) => write!(
+                formatter,
+                "header '{name}' is managed by the transport and cannot be set explicitly"
+            ),
+            Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
             Self::Protocol(message) => write!(formatter, "HTTP protocol error: {message}"),
             Self::Io(message) => write!(formatter, "network I/O error: {message}"),
             Self::WorkerStopped => formatter.write_str("network worker stopped"),
@@ -369,18 +526,24 @@ impl HttpTransport {
             .max_redirects(0)
             .max_redirects_will_error(true)
             .max_response_header_size(config.max_header_bytes)
-            // ureq's `timeout_global` is an end-to-end budget that includes
-            // reading the response body, so a large resource that keeps making
-            // progress would spuriously fail once the budget elapses. Bound
-            // each blocking stage and each body read individually instead; the
-            // remaining overall bounds are enforced by `fetch` (redirect phase)
-            // and `read_bounded_body` (minimum-progress floor).
+            // Split header/body timeout design. There is deliberately no
+            // end-to-end wall clock (`timeout_global`/`timeout_per_call`) and
+            // no `timeout_recv_response`/`timeout_recv_body` either: in ureq
+            // those two are absolute phase budgets whose deadline keeps
+            // ticking into the body read, so any value here would kill large
+            // transfers that keep making progress. Instead the request phases
+            // (resolve, connect, send, and header reception, which stays
+            // bounded by the send-request deadline) each get `config.timeout`,
+            // while the body phase is bounded by `read_bounded_body`: a
+            // per-read idle bound of `config.timeout`, the minimum-progress
+            // floor, and `max_body_bytes`.
             .timeout_global(None)
             .timeout_resolve(Some(config.timeout))
             .timeout_connect(Some(config.timeout))
             .timeout_send_request(Some(config.timeout))
-            .timeout_recv_response(Some(config.timeout))
-            .timeout_recv_body(Some(config.timeout))
+            .timeout_send_body(Some(config.timeout))
+            .timeout_recv_response(None)
+            .timeout_recv_body(None)
             .user_agent(config.user_agent.clone())
             .build();
         Self {
@@ -394,17 +557,19 @@ impl HttpTransport {
         &self.config
     }
 
-    /// Performs one bounded HTTP(S) or `data:` GET.
+    /// Performs one bounded HTTP(S) request or `data:` URL decode.
     ///
     /// # Errors
     ///
     /// Returns a typed [`FetchError`] for cancellation, invalid schemes,
-    /// configured limit violations, TLS verification, and transport failures.
+    /// invalid request construction, configured limit violations, TLS
+    /// verification, and transport failures.
     #[allow(
         clippy::too_many_lines,
         reason = "redirect/cookie/timeout handling reads as one pipeline"
     )]
     pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        validate_request(request)?;
         if request.url.scheme() == "data" {
             return self.fetch_data_url(request, cancel);
         }
@@ -414,6 +579,10 @@ impl HttpTransport {
         }
 
         let mut current_url = request.url.clone();
+        // Redirect method semantics are applied per hop below; the original
+        // request stays untouched.
+        let mut current_method = request.method;
+        let mut hop_body: Option<&[u8]> = request.body.as_deref();
         let mut redirect_chain = vec![request.url.clone()];
         let mut redirects = Vec::new();
         let mut redirect_count = 0;
@@ -430,39 +599,52 @@ impl HttpTransport {
                 return Err(FetchError::Cancelled);
             }
 
-            let mut builder = self.agent.get(current_url.as_str());
-            if let Some(accept) = request.accept.as_deref() {
-                builder = builder.header("Accept", accept);
-            }
-            // The caller-provided Cookie header was computed for the original
-            // URL. Reusing it only on same-origin hops avoids leaking it to a
-            // cross-origin redirect, while cookies the chain itself set flow by
-            // their own domain/path rules either way.
-            let caller_cookie = same_origin(&current_url, &request.url)
-                .then_some(request.cookie.as_deref())
-                .flatten();
-            if let Some(cookie) = combined_cookie_header(
-                caller_cookie,
-                hop_cookies.cookie_header(&current_url).as_deref(),
-            ) {
-                builder = builder.header("Cookie", cookie);
-            }
-            if let Some(byte_range) = request.byte_range {
-                builder = builder.header("Range", &byte_range.header_value());
-            }
-            if redirect_count == 0
-                && same_origin(&current_url, &request.url)
-                && let Some(validators) = request.cache_validators.as_ref()
+            // Custom headers first so the transport-managed fields below
+            // cannot duplicate them; a caller-supplied name wins.
+            let mut hop_headers = request.headers.clone();
             {
-                if let Some(etag) = validators.etag.as_deref() {
-                    builder = builder.header("If-None-Match", etag);
+                let mut managed = |name: &str, value: String| {
+                    if !hop_headers
+                        .iter()
+                        .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+                    {
+                        hop_headers.push((name.to_owned(), value));
+                    }
+                };
+                if let Some(accept) = request.accept.as_deref() {
+                    managed("Accept", accept.to_owned());
                 }
-                if let Some(last_modified) = validators.last_modified.as_deref() {
-                    builder = builder.header("If-Modified-Since", last_modified);
+                // The caller-provided Cookie header was computed for the
+                // original URL. Reusing it only on same-origin hops avoids
+                // leaking it to a cross-origin redirect, while cookies the
+                // chain itself set flow by their own domain/path rules either
+                // way.
+                let caller_cookie = same_origin(&current_url, &request.url)
+                    .then_some(request.cookie.as_deref())
+                    .flatten();
+                if let Some(cookie) = combined_cookie_header(
+                    caller_cookie,
+                    hop_cookies.cookie_header(&current_url).as_deref(),
+                ) {
+                    managed("Cookie", cookie);
+                }
+                if let Some(byte_range) = request.byte_range {
+                    managed("Range", byte_range.header_value());
+                }
+                if redirect_count == 0
+                    && same_origin(&current_url, &request.url)
+                    && let Some(validators) = request.cache_validators.as_ref()
+                {
+                    if let Some(etag) = validators.etag.as_deref() {
+                        managed("If-None-Match", etag.to_owned());
+                    }
+                    if let Some(last_modified) = validators.last_modified.as_deref() {
+                        managed("If-Modified-Since", last_modified.to_owned());
+                    }
                 }
             }
-            let mut response = builder
-                .call()
+            let response = self
+                .send_hop(current_method, &current_url, hop_body, &hop_headers)
                 .map_err(|error| classify_ureq_error(&error, &self.config))?;
 
             if cancel.is_cancelled() {
@@ -493,6 +675,19 @@ impl HttpTransport {
                 if started.elapsed() >= self.config.timeout {
                     return Err(FetchError::Timeout);
                 }
+                // Redirect method semantics (fetch/HTTP): 301 and 302
+                // historically rewrite `POST` to `GET`, and 303 rewrites
+                // `POST` and `PUT`; the body is dropped whenever the method is
+                // rewritten. 307 and 308 preserve both.
+                let rewritten = match status.as_u16() {
+                    301 | 302 => current_method == HttpMethod::Post,
+                    303 => matches!(current_method, HttpMethod::Post | HttpMethod::Put),
+                    _ => false,
+                };
+                if rewritten {
+                    current_method = HttpMethod::Get;
+                    hop_body = None;
+                }
                 let next_url = current_url
                     .join(location.trim())
                     .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
@@ -518,7 +713,14 @@ impl HttpTransport {
                 *last = final_url.clone();
             }
             let content_type = header_text(&headers, "content-type").and_then(parse_content_type);
-            let body = self.read_bounded_body(response.body_mut().as_reader(), cancel)?;
+            let body = self.read_bounded_body(response.into_body().into_reader(), cancel)?;
+            // A `HEAD` response has no body by definition; stray bytes from a
+            // non-conforming origin are drained above but never surfaced.
+            let body = if current_method == HttpMethod::Head {
+                Vec::new()
+            } else {
+                body
+            };
 
             return Ok(FetchResponse {
                 requested_url: request.url.clone(),
@@ -530,6 +732,34 @@ impl HttpTransport {
                 content_type,
                 body,
             });
+        }
+    }
+
+    /// Sends one hop of the request chain through ureq, applying the method
+    /// and the prepared headers. Bodyless methods use `call` (no
+    /// `Content-Length` on the wire); body-carrying methods send the bytes and
+    /// let ureq derive `Content-Length` from the body.
+    fn send_hop(
+        &self,
+        method: HttpMethod,
+        url: &Url,
+        body: Option<&[u8]>,
+        headers: &[(String, String)],
+    ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let uri = url.as_str();
+        match (method, body) {
+            (HttpMethod::Get, _) => decorate(self.agent.get(uri), headers).call(),
+            (HttpMethod::Head, _) => decorate(self.agent.head(uri), headers).call(),
+            (HttpMethod::Delete, None) => decorate(self.agent.delete(uri), headers).call(),
+            // DELETE with a body is legal HTTP but needs ureq's explicit
+            // escape hatch.
+            (HttpMethod::Delete, Some(bytes)) => {
+                decorate(self.agent.delete(uri).force_send_body(), headers).send(bytes)
+            }
+            (HttpMethod::Post, Some(bytes)) => decorate(self.agent.post(uri), headers).send(bytes),
+            (HttpMethod::Post, None) => decorate(self.agent.post(uri), headers).send_empty(),
+            (HttpMethod::Put, Some(bytes)) => decorate(self.agent.put(uri), headers).send(bytes),
+            (HttpMethod::Put, None) => decorate(self.agent.put(uri), headers).send_empty(),
         }
     }
 
@@ -559,42 +789,92 @@ impl HttpTransport {
     ///
     /// There is deliberately no whole-body wall clock: a transfer that keeps
     /// making progress must finish regardless of total duration (a large CDN
-    /// stylesheet over a slow link). Instead, each blocking read is bounded by
-    /// the configured per-read timeout in the agent, and once that budget has
+    /// stylesheet over a slow link). Instead, once the configured budget has
     /// elapsed overall the transfer must average at least
-    /// [`MIN_BODY_BYTES_PER_SECOND`].
+    /// [`MIN_BODY_BYTES_PER_SECOND`], and each individual read may idle at most
+    /// that budget before the transfer fails.
+    ///
+    /// ureq applies no socket deadline during the body phase (its remaining
+    /// timeouts are all absolute phase budgets), so the blocking reader is
+    /// pumped on a dedicated thread and this loop bounds every read via a
+    /// channel receive timeout. A pump left behind on a timeout or
+    /// cancellation stays blocked on its socket until the peer closes the
+    /// connection, then unwinds on its own.
     fn read_bounded_body(
         &self,
-        mut reader: impl Read,
+        reader: impl Read + Send + 'static,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>, FetchError> {
+        let (chunk_tx, chunk_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        let pump = thread::Builder::new()
+            .name("render-net-body-pump".to_owned())
+            .spawn(move || {
+                let mut reader = reader;
+                let mut chunk = [0_u8; 16 * 1024];
+                loop {
+                    match reader.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if chunk_tx
+                                .send(Ok(chunk[..count].to_vec()))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = chunk_tx.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(|error| FetchError::Transport(format!("body pump spawn failed: {error}")))?;
+
         let limit = self.config.max_body_bytes;
         let mut body = Vec::with_capacity(limit.min(64 * 1024));
-        let mut chunk = [0_u8; 16 * 1024];
+        let mut pump = Some(pump);
         let started = Instant::now();
-        loop {
+        let result = loop {
             if cancel.is_cancelled() {
-                return Err(FetchError::Cancelled);
+                break Err(FetchError::Cancelled);
             }
-            let read = reader
-                .read(&mut chunk)
-                .map_err(|error| self.map_body_read_error(&error))?;
-            if read == 0 {
-                return Ok(body);
-            }
+            let chunk = match chunk_rx.recv_timeout(self.config.timeout) {
+                Ok(Ok(chunk)) => chunk,
+                Ok(Err(error)) => break Err(self.map_body_read_error(&error)),
+                // A read that idles past the budget is a stalled transfer; the
+                // minimum-progress floor below covers transfers that trickle.
+                Err(mpsc::RecvTimeoutError::Timeout) => break Err(FetchError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // The pump exited: either a clean EOF or a panic.
+                    break match pump.take().expect("pump handle before disconnect").join() {
+                        Ok(()) => Ok(std::mem::take(&mut body)),
+                        Err(_) => Err(FetchError::Protocol(
+                            "response body reader stopped unexpectedly".into(),
+                        )),
+                    };
+                }
+            };
             let remaining = limit.saturating_sub(body.len());
-            if read > remaining {
-                return Err(FetchError::BodyLimitExceeded { limit });
+            if chunk.len() > remaining {
+                break Err(FetchError::BodyLimitExceeded { limit });
             }
-            body.extend_from_slice(&chunk[..read]);
+            body.extend_from_slice(&chunk);
             let elapsed = started.elapsed();
             if elapsed > self.config.timeout {
                 let elapsed_seconds = usize::try_from(elapsed.as_secs()).unwrap_or(usize::MAX);
                 if body.len() < MIN_BODY_BYTES_PER_SECOND.saturating_mul(elapsed_seconds) {
-                    return Err(FetchError::Timeout);
+                    break Err(FetchError::Timeout);
                 }
             }
+        };
+        // On success the pump has already hit EOF, so joining is instant; on
+        // failure paths the pump may legitimately still be blocked on its
+        // socket and must not be waited on.
+        if result.is_ok() {
+            let _ = pump.take().map(std::thread::JoinHandle::join);
         }
+        result
     }
 
     /// Classifies a failure surfaced by the body reader. ureq wraps its typed
@@ -612,6 +892,35 @@ impl HttpTransport {
         }
         mapped
     }
+}
+
+/// Validates request-level invariants before any I/O: a body only on methods
+/// that can carry one, and no caller-supplied reserved headers.
+fn validate_request(request: &FetchRequest) -> Result<(), FetchError> {
+    if request.body.is_some() && !request.method.allows_body() {
+        return Err(FetchError::InvalidRequest(format!(
+            "{} requests cannot carry a body",
+            request.method.as_str()
+        )));
+    }
+    for (name, _) in &request.headers {
+        if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
+            return Err(FetchError::ReservedHeader(name.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Applies the prepared hop headers to a ureq request builder.
+fn decorate<TBuilder>(
+    builder: ureq::RequestBuilder<TBuilder>,
+    headers: &[(String, String)],
+) -> ureq::RequestBuilder<TBuilder> {
+    headers
+        .iter()
+        .fold(builder, |builder, (name, value)| {
+            builder.header(name.as_str(), value.as_str())
+        })
 }
 
 /// Maps a typed ureq failure onto the transport's error vocabulary.
@@ -871,14 +1180,94 @@ mod tests {
     };
     use url::Url;
 
-    #[test]
-    fn default_user_agent_is_browser_compatible_and_product_identifiable() {
-        let user_agent = FetchConfig::default().user_agent;
-        assert!(user_agent.starts_with("Mozilla/5.0 "));
-        assert!(user_agent.contains("AppleWebKit/537.36"));
-        assert!(user_agent.contains("Chrome/"));
-        assert!(user_agent.contains("rENDER/"));
-    }
+#[test]
+fn default_user_agent_is_browser_compatible_and_product_identifiable() {
+    let user_agent = FetchConfig::default().user_agent;
+    assert!(user_agent.starts_with("Mozilla/5.0 "));
+    assert!(user_agent.contains("AppleWebKit/537.36"));
+    assert!(user_agent.contains("Chrome/"));
+    assert!(user_agent.contains("rENDER/"));
+}
+
+#[test]
+fn http_methods_carry_wire_names_and_body_rules() {
+    use super::HttpMethod;
+
+    assert_eq!(HttpMethod::default(), HttpMethod::Get);
+    assert_eq!(HttpMethod::Get.as_str(), "GET");
+    assert_eq!(HttpMethod::Post.as_str(), "POST");
+    assert_eq!(HttpMethod::Put.as_str(), "PUT");
+    assert_eq!(HttpMethod::Delete.as_str(), "DELETE");
+    assert_eq!(HttpMethod::Head.as_str(), "HEAD");
+    assert!(!HttpMethod::Get.allows_body());
+    assert!(!HttpMethod::Head.allows_body());
+    assert!(HttpMethod::Post.allows_body());
+    assert!(HttpMethod::Put.allows_body());
+    assert!(HttpMethod::Delete.allows_body());
+}
+
+#[test]
+fn rejects_reserved_headers_and_bodyless_method_bodies_before_transport() {
+    use super::HttpMethod;
+
+    // Validation runs before any I/O, so the discard port keeps this test
+    // off the network entirely.
+    let url = Url::parse("http://127.0.0.1:9/rejected").unwrap();
+    let transport = HttpTransport::new(FetchConfig::default());
+    let cancel = CancelToken::default();
+
+    let error = transport
+        .fetch(
+            &FetchRequest::get(url.clone()).with_header("Host", "example.com"),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, FetchError::ReservedHeader("Host".into()));
+
+    let error = transport
+        .fetch(
+            &FetchRequest::post(url.clone()).with_header("Content-Length", "12"),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, FetchError::ReservedHeader("Content-Length".into()));
+
+    let error = transport
+        .fetch(
+            &FetchRequest::get(url.clone())
+                .with_header("TRANSFER-ENCODING", "chunked"),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, FetchError::ReservedHeader("TRANSFER-ENCODING".into()));
+
+    let error = transport
+        .fetch(
+            &FetchRequest::get(url.clone()).with_header("Cookie", "sid=1"),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error, FetchError::ReservedHeader("Cookie".into()));
+
+    let error = transport
+        .fetch(&FetchRequest::get(url.clone()).with_body("x"), &cancel)
+        .unwrap_err();
+    assert_eq!(
+        error,
+        FetchError::InvalidRequest("GET requests cannot carry a body".into())
+    );
+
+    let error = transport
+        .fetch(
+            &FetchRequest::new(HttpMethod::Head, url.clone()).with_body("x"),
+            &cancel,
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        FetchError::InvalidRequest("HEAD requests cannot carry a body".into())
+    );
+}
 
     #[test]
     fn parses_content_type_and_charset_case_insensitively() {

@@ -61,16 +61,7 @@ fn serve(mut stream: TcpStream, handler: &dyn Fn(String) -> WireResponse) {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set local read timeout");
-    let mut request = Vec::new();
-    let mut chunk = [0_u8; 1024];
-    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-        let count = stream.read(&mut chunk).expect("read local request");
-        if count == 0 {
-            break;
-        }
-        request.extend_from_slice(&chunk[..count]);
-    }
-    let request = String::from_utf8_lossy(&request).into_owned();
+    let request = read_request(&mut stream);
     let response = handler(request);
     thread::sleep(response.delay);
     let mut wire = format!(
@@ -97,6 +88,41 @@ fn serve(mut stream: TcpStream, handler: &dyn Fn(String) -> WireResponse) {
             thread::sleep(response.body_chunk_delay);
         }
     }
+}
+
+/// Reads one HTTP request off the wire: the header block, plus the request
+/// body whenever a `Content-Length` announces one, so handlers can assert on
+/// `POST`/`PUT` bodies too.
+fn read_request(stream: &mut TcpStream) -> String {
+    let mut raw = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    while !raw.windows(4).any(|window| window == b"\r\n\r\n") {
+        let count = stream.read(&mut chunk).expect("read local request");
+        if count == 0 {
+            break;
+        }
+        raw.extend_from_slice(&chunk[..count]);
+    }
+    if let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+        let header_end = header_end + 4;
+        let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
+        let content_length = headers.lines().find_map(|line| {
+            line.strip_prefix("content-length:")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+        });
+        if let Some(content_length) = content_length {
+            while raw.len() < header_end + content_length {
+                let count = stream
+                    .read(&mut chunk)
+                    .expect("read local request body");
+                if count == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&chunk[..count]);
+            }
+        }
+    }
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 fn request_path(request: &str) -> &str {
@@ -771,11 +797,11 @@ fn rejects_non_http_schemes_before_transport() {
 }
 
 #[test]
-#[ignore = "split header/body budget enforcement needs the ureq transport rework (queued)"]
 fn slow_but_progressing_bodies_are_not_spuriously_timed_out() {
     // A large resource (like a CDN stylesheet) trickling in steadily: each
     // read returns well within the budget, but the whole transfer outlives it.
-    // The former whole-transfer timeout killed such transfers mid-flight.
+    // There is no whole-transfer timeout to kill it: only per-read idle bounds
+    // and the minimum-progress floor apply to the body phase.
     let body = vec![0xAB_u8; 32 * 1024];
     let expected_len = body.len();
     let (url, server) = spawn_server(1, move |_| {
@@ -898,4 +924,235 @@ fn cancellation_propagates_during_a_slow_body_transfer() {
     server.join().expect("server exits");
 
     assert_eq!(error, FetchError::Cancelled);
+}
+
+#[test]
+fn posts_a_body_with_custom_headers_to_the_local_server() {
+    let seen_request = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_request);
+    let (url, server) = spawn_server(1, move |request| {
+        *captured.lock().expect("capture POST request") = request;
+        let mut response = WireResponse::ok("stored");
+        response
+            .headers
+            .push(("Content-Type".into(), "application/json".into()));
+        response
+    });
+
+    let request = FetchRequest::post(url)
+        .with_header("Content-Type", "application/json")
+        .with_header("X-Request-Marker", "render-net-post")
+        .with_body(r#"{"hello":"world"}"#);
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("POST round-trip");
+    server.join().expect("server exits");
+
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(response.body, b"stored");
+    let wire = seen_request.lock().expect("read POST request");
+    assert!(
+        wire.starts_with("POST / "),
+        "request line must carry the method, got: {wire}"
+    );
+    let lowered = wire.to_ascii_lowercase();
+    assert!(lowered.contains("content-type: application/json"));
+    assert!(lowered.contains("x-request-marker: render-net-post"));
+    assert!(
+        lowered.contains("content-length: 17"),
+        "Content-Length must be derived from the body, got: {wire}"
+    );
+    assert!(
+        lowered.contains("accept-encoding: gzip, br"),
+        "the transport must keep advertising decodable encodings on POST"
+    );
+    assert!(wire.ends_with(r#"{"hello":"world"}"#), "body must arrive: {wire}");
+}
+
+#[test]
+fn put_delete_and_head_reach_the_server_with_the_right_method() {
+    let seen_requests = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&seen_requests);
+    let (base, server) = spawn_server(3, move |request| {
+        captured
+            .lock()
+            .expect("capture requests")
+            .push(request.clone());
+        match request_path(&request) {
+            "/upload" => WireResponse::ok("stored"),
+            "/item" if request.starts_with("DELETE ") => WireResponse::ok("deleted"),
+            // A HEAD response advertises a length but a conforming server
+            // never sends one; serve() writing the bytes anyway exercises the
+            // transport's duty to never surface a HEAD body.
+            "/item" => WireResponse::ok(vec![0x7F; 512]),
+            path => panic!("unexpected path {path}"),
+        }
+    });
+
+    let client = transport(|_| {});
+    let put = client
+        .fetch(
+            &FetchRequest::put(base.join("upload").expect("upload URL"))
+                .with_header("Content-Type", "application/octet-stream")
+                .with_body("binary-payload"),
+            &CancelToken::default(),
+        )
+        .expect("PUT round-trip");
+    let delete = client
+        .fetch(
+            &FetchRequest::delete(base.join("item").expect("item URL")),
+            &CancelToken::default(),
+        )
+        .expect("DELETE round-trip");
+    let head = client
+        .fetch(
+            &FetchRequest::head(base.join("item").expect("item URL")),
+            &CancelToken::default(),
+        )
+        .expect("HEAD round-trip");
+    server.join().expect("server exits");
+
+    assert_eq!(put.body, b"stored");
+    assert_eq!(delete.body, b"deleted");
+    assert_eq!(head.status.as_u16(), 200);
+    assert!(
+        head.body.is_empty(),
+        "a HEAD response must never surface a body"
+    );
+
+    let requests = seen_requests.lock().expect("read requests");
+    assert!(requests[0].starts_with("PUT /upload "), "got: {}", requests[0]);
+    assert!(
+        requests[0].ends_with("binary-payload"),
+        "PUT body must arrive: {}",
+        requests[0]
+    );
+    assert!(
+        requests[1].starts_with("DELETE /item "),
+        "got: {}",
+        requests[1]
+    );
+    assert!(requests[2].starts_with("HEAD /item "), "got: {}", requests[2]);
+}
+
+#[test]
+fn redirect_303_rewrites_a_post_to_get_and_drops_the_body() {
+    let seen_final = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_final);
+    let (base, server) = spawn_server(2, move |request| match request_path(&request) {
+        "/submit" => WireResponse {
+            status: "303 See Other",
+            headers: vec![("Location".into(), "/done".into())],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
+        },
+        "/done" => {
+            *captured.lock().expect("capture final request") = request;
+            WireResponse::ok("done")
+        }
+        path => panic!("unexpected path {path}"),
+    });
+    let request = FetchRequest::post(base.join("submit").expect("submit URL"))
+        .with_header("Content-Type", "application/x-www-form-urlencoded")
+        .with_body("form=1");
+
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("303 redirect completes");
+    server.join().expect("server exits");
+
+    assert_eq!(response.status.as_u16(), 200);
+    assert_eq!(response.body, b"done");
+    let wire = seen_final.lock().expect("read final request");
+    assert!(
+        wire.starts_with("GET /done "),
+        "303 must rewrite POST to GET, got: {wire}"
+    );
+    let lowered = wire.to_ascii_lowercase();
+    assert!(
+        !lowered
+            .lines()
+            .any(|line| line.starts_with("content-length:")),
+        "the POST body must be dropped on 303, got: {wire}"
+    );
+    assert!(
+        !wire.ends_with("form=1"),
+        "no body bytes may repeat after a 303, got: {wire}"
+    );
+    // Response headers other than the body survive the rewrite per spec.
+    assert!(lowered.contains("content-type: application/x-www-form-urlencoded"));
+}
+
+#[test]
+fn redirect_307_preserves_the_post_method_and_body() {
+    let seen_final = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_final);
+    let (base, server) = spawn_server(2, move |request| match request_path(&request) {
+        "/submit" => WireResponse {
+            status: "307 Temporary Redirect",
+            headers: vec![("Location".into(), "/done".into())],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
+        },
+        "/done" => {
+            *captured.lock().expect("capture final request") = request;
+            WireResponse::ok("done")
+        }
+        path => panic!("unexpected path {path}"),
+    });
+    let request = FetchRequest::post(base.join("submit").expect("submit URL")).with_body("form=1");
+
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("307 redirect completes");
+    server.join().expect("server exits");
+
+    assert_eq!(response.body, b"done");
+    let wire = seen_final.lock().expect("read final request");
+    assert!(
+        wire.starts_with("POST /done "),
+        "307 must preserve POST, got: {wire}"
+    );
+    assert!(
+        wire.to_ascii_lowercase().contains("content-length: 6"),
+        "307 must preserve the body, got: {wire}"
+    );
+    assert!(wire.ends_with("form=1"), "body bytes must repeat: {wire}");
+}
+
+#[test]
+fn redirect_302_rewrites_a_post_to_get_like_browsers_do() {
+    let seen_final = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_final);
+    let (base, server) = spawn_server(2, move |request| match request_path(&request) {
+        "/submit" => WireResponse {
+            status: "302 Found",
+            headers: vec![("Location".into(), "/done".into())],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
+        },
+        "/done" => {
+            *captured.lock().expect("capture final request") = request;
+            WireResponse::ok("done")
+        }
+        path => panic!("unexpected path {path}"),
+    });
+    let request = FetchRequest::post(base.join("submit").expect("submit URL")).with_body("form=1");
+
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("302 redirect completes");
+    server.join().expect("server exits");
+
+    assert_eq!(response.body, b"done");
+    assert!(
+        seen_final
+            .lock()
+            .expect("read final request")
+            .starts_with("GET /done "),
+        "302 must rewrite POST to GET"
+    );
 }
