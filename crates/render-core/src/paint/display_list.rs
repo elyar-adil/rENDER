@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::{
-    BorderStyle, CssColor, ObjectFit, Overflow, Position, TypedPropertyValue, Visibility,
-    parse_typed_property,
+    BorderStyle, CssColor, LengthPercentage, ObjectFit, Overflow, Position, Size,
+    TypedPropertyValue, Visibility, parse_typed_property,
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
@@ -444,6 +444,17 @@ pub fn build_display_list_with_images(
     shaper: &dyn TextShaper,
     images: Option<&ImageResources>,
 ) -> DisplayListBuildOutput {
+    let parents = if images.is_some() {
+        let mut parents = BTreeMap::<FragmentId, FragmentId>::new();
+        for fragment in fragments.iter() {
+            for child in &fragment.children {
+                parents.insert(*child, fragment.id);
+            }
+        }
+        parents
+    } else {
+        BTreeMap::new()
+    };
     let mut builder = Builder {
         fragments,
         formatting,
@@ -451,6 +462,7 @@ pub fn build_display_list_with_images(
         options,
         shaper,
         images,
+        parents,
         items: Vec::new(),
         diagnostics: Vec::new(),
         ordinals: BTreeMap::new(),
@@ -475,6 +487,7 @@ struct Builder<'a> {
     options: DisplayListBuilderOptions,
     shaper: &'a dyn TextShaper,
     images: Option<&'a ImageResources>,
+    parents: BTreeMap<FragmentId, FragmentId>,
     items: Vec<DisplayItem>,
     diagnostics: Vec<DisplayListDiagnostic>,
     ordinals: BTreeMap<(Option<NodeId>, PaintPhase), u32>,
@@ -537,7 +550,10 @@ impl Builder<'_> {
         }
         let overflow_clip = match (&fragment.kind, style.as_ref()) {
             (FragmentKind::Box(geometry), Some(style)) => {
-                if let Some(shape) = overflow_clip_shape(geometry, style) {
+                let mut clip_geometry = (*geometry).clone();
+                clip_geometry.content_rect =
+                    self.recovered_content_rect(&fragment, geometry, Some(style));
+                if let Some(shape) = overflow_clip_shape(&clip_geometry, style) {
                     let rect = clip_shape_rect(shape);
                     self.push(
                         &fragment,
@@ -958,16 +974,13 @@ impl Builder<'_> {
         else {
             return;
         };
+        let content = self.recovered_content_rect(fragment, geometry, style);
         let (width, height) = loaded.image.intrinsic_size();
-        if width == 0
-            || height == 0
-            || geometry.content_rect.size.width <= 0.0
-            || geometry.content_rect.size.height <= 0.0
-        {
+        if width == 0 || height == 0 || content.size.width <= 0.0 || content.size.height <= 0.0 {
             return;
         }
         let destination = Self::object_fit_rect(
-            geometry.content_rect,
+            content,
             image_dimension_to_f32(width),
             image_dimension_to_f32(height),
             style
@@ -978,14 +991,14 @@ impl Builder<'_> {
                 })
                 .unwrap_or(ObjectFit::Fill),
         );
-        let clips = destination != geometry.content_rect;
+        let clips = destination != content;
         if clips {
             self.push(
                 fragment,
                 PaintPhase::Content,
-                geometry.content_rect,
+                content,
                 coordinate_space,
-                DisplayCommand::PushClip(ClipShape::Rect(geometry.content_rect)),
+                DisplayCommand::PushClip(ClipShape::Rect(content)),
             );
         }
         self.push(
@@ -1009,11 +1022,89 @@ impl Builder<'_> {
             self.push(
                 fragment,
                 PaintPhase::Content,
-                geometry.content_rect,
+                content,
                 coordinate_space,
                 DisplayCommand::PopClip,
             );
         }
+    }
+
+    /// Recovers a fragment's content box when layout collapsed a percentage
+    /// dimension to zero.
+    ///
+    /// The block solver measures flow and positioned children against
+    /// provisional zero-height containing rects, so percentage sizes in the
+    /// `position:relative` + `padding-top` aspect-ratio wrapper pattern used
+    /// by media cards (and in any statically wrapped chain below them) can
+    /// collapse to a zero-height box before paint. CSS instead resolves those
+    /// percentages against a real containing block: the padding box of the
+    /// nearest positioned ancestor for absolutely positioned boxes and the
+    /// content box of the containing block for in-flow boxes (CSS 2 §10.1).
+    /// Paint restores that axis from the enclosing fragments so replaced
+    /// content such as decoded card covers is not silently dropped. Only a
+    /// bare percentage on the collapsed axis triggers recovery, so explicit
+    /// zero sizes and auto-sized boxes keep their laid-out geometry.
+    fn recovered_content_rect(
+        &self,
+        fragment: &Fragment,
+        geometry: &crate::layout::BoxGeometry,
+        style: Option<&ComputedStyle>,
+    ) -> PhysicalRect {
+        let mut content = geometry.content_rect;
+        if content.size.width > 0.0 && content.size.height > 0.0 {
+            return content;
+        }
+        let positioned = is_positioned(style);
+        let mut ancestor = self.parent_box(fragment.id);
+        while let Some(parent) = ancestor {
+            let FragmentKind::Box(parent_geometry) = &parent.kind else {
+                break;
+            };
+            let containing = if positioned {
+                parent_geometry.padding_rect()
+            } else {
+                parent_geometry.content_rect
+            };
+            let mut recovered = false;
+            if collapses_percentage_size(style, "width")
+                && content.size.width <= 0.0
+                && containing.size.width > 0.0
+            {
+                content.origin.x = containing.origin.x;
+                content.size.width = containing.size.width;
+                recovered = true;
+            }
+            if collapses_percentage_size(style, "height")
+                && content.size.height <= 0.0
+                && containing.size.height > 0.0
+            {
+                content.origin.y = containing.origin.y;
+                content.size.height = containing.size.height;
+                recovered = true;
+            }
+            // In-flow boxes take their basis from the containing block, so a
+            // single level is enough. Absolutely positioned boxes skip static
+            // wrappers until the nearest positioned ancestor (their CSS
+            // containing block) is reached.
+            if recovered
+                || !positioned
+                || is_positioned(
+                    parent
+                        .source
+                        .and_then(|source| self.styles.get(&source)),
+                )
+            {
+                break;
+            }
+            ancestor = self.parent_box(parent.id);
+        }
+        content
+    }
+
+    fn parent_box(&self, fragment_id: FragmentId) -> Option<&Fragment> {
+        self.parents
+            .get(&fragment_id)
+            .and_then(|parent| self.fragments.get(*parent))
     }
 
     fn object_fit_rect(
@@ -1134,6 +1225,26 @@ fn clip_shape_rect(shape: ClipShape) -> PhysicalRect {
     match shape {
         ClipShape::Rect(rect) | ClipShape::RoundedRect { rect, .. } => rect,
     }
+}
+
+/// Whether the computed size is a bare percentage, the only basis the layout
+/// solver can collapse to zero while measuring children.
+fn collapses_percentage_size(style: Option<&ComputedStyle>, property: &str) -> bool {
+    matches!(
+        style.and_then(|style| style.typed(property)),
+        Some(TypedPropertyValue::Size(Size::LengthPercentage(
+            LengthPercentage::Percentage(_),
+        )))
+    )
+}
+
+fn is_positioned(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("position")),
+        Some(TypedPropertyValue::Position(
+            Position::Absolute | Position::Fixed
+        ))
+    )
 }
 
 fn has_corner_radius(radii: CornerRadii) -> bool {
@@ -1623,16 +1734,17 @@ mod tests {
     use crate::css::properties::ObjectFit;
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::css::stylesheet::parse_stylesheet;
+    use crate::dom::NodeId;
     use crate::html::parse_document;
     use crate::layout::{
-        FormattingLimits, LayoutOptions, PhysicalRect, SimpleTextMeasurer, build_formatting_tree,
-        layout_formatting_tree,
+        FormattingLimits, FragmentKind, LayoutOptions, PhysicalRect, SimpleTextMeasurer,
+        build_formatting_tree, layout_formatting_tree,
     };
     use crate::paint::Color;
 
     use super::{
-        Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ReferenceTextShaper,
-        build_display_list, build_display_list_with_images,
+        Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ImagePaint,
+        ReferenceTextShaper, build_display_list, build_display_list_with_images,
     };
 
     #[test]
@@ -2014,16 +2126,202 @@ mod tests {
         )));
     }
 
+    fn decoded_cover_resources(cover: NodeId) -> crate::image::ImageResources {
+        let mut images = crate::image::ImageResources::default();
+        let key = crate::image::ImageResourceKey {
+            owner: cover,
+            requested_url: url::Url::parse("https://example.test/cover.png").unwrap(),
+            source_snapshot: String::new(),
+            source: crate::image::ImageSource::Element,
+            selection_context: crate::image::ImageSelectionContext::default(),
+        };
+        let decoded = crate::image::DecodedImage::from_pixels(
+            672,
+            378,
+            vec![Color::rgb(255, 0, 0); 672 * 378],
+        )
+        .unwrap();
+        images
+            .insert(key, decoded, crate::image::ImageLimits::default())
+            .unwrap();
+        images
+    }
+
+    fn cover_image_paints(
+        display: &crate::paint::DisplayListBuildOutput,
+        cover: NodeId,
+    ) -> Vec<&ImagePaint> {
+        display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(cover))
+            .filter_map(|item| match &item.command {
+                DisplayCommand::Image(paint) => Some(paint),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn scratch_padding_hack_repro() {
+    fn padding_top_hack_wrapper_paints_decoded_absolute_image() {
         let output = parse_document(
-            "<!doctype html><body><div id=wrap><picture id=cover><img id=photo src='cover.png'></picture></div></body>",
+            "<!doctype html><body><div id=wrap><img id=cover src='cover.png'></div></body>",
         );
         let sheet = parse_stylesheet(
             "html, body { display:block; margin:0 } \
-             #wrap { display:block; position:relative; width:298px; padding-top:56.25%; background-color:#f1f2f3; border-radius:6px } \
-             #cover { position:absolute; top:0; left:0; display:inline-block; width:100%; height:100%; overflow:hidden; border-radius:6px; object-fit:cover } \
-             #cover img { display:block; width:100%; height:100%; object-fit:inherit }",
+             #wrap { display:block; position:relative; width:400px; padding-top:56.25%; background-color:#f1f2f3 } \
+             #cover { position:absolute; top:0; left:0; display:block; width:100%; height:100% }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions {
+                viewport: crate::layout::PhysicalSize {
+                    width: 400.0,
+                    height: 300.0,
+                },
+                ..LayoutOptions::default()
+            },
+            &SimpleTextMeasurer,
+        );
+        let selector = parse_selector_list("#cover").unwrap();
+        let cover = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let images = decoded_cover_resources(cover);
+        let display = build_display_list_with_images(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+            Some(&images),
+        );
+        assert!(display.diagnostics.is_empty());
+
+        // The wrapper's padding-top hack gives it a 400x225 padding box while
+        // its content box stays empty; the absolute cover must still draw the
+        // decoded bitmap across that box.
+        let paints = cover_image_paints(&display, cover);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(
+            paints[0].destination,
+            PhysicalRect::new(0.0, 0.0, 400.0, 225.0)
+        );
+        assert!(paints[0].destination.size.width > 0.0);
+        assert!(paints[0].destination.size.height > 0.0);
+        assert_eq!(
+            paints[0].source,
+            PhysicalRect::new(0.0, 0.0, 672.0, 378.0)
+        );
+        assert_eq!(
+            images
+                .get(paints[0].resource)
+                .expect("decoded bitmap stays registered")
+                .intrinsic_size(),
+            (672, 378)
+        );
+    }
+
+    #[test]
+    fn absolute_cover_image_survives_a_static_intermediate_wrapper() {
+        let output = parse_document(
+            "<!doctype html><body><div id=wrap><a id=link><img id=cover src='cover.png'></a></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } \
+             #wrap { display:block; position:relative; width:400px; padding-top:56.25%; background-color:#f1f2f3 } \
+             #link { display:block } \
+             #cover { position:absolute; top:0; left:0; display:block; width:100%; height:100% }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions {
+                viewport: crate::layout::PhysicalSize {
+                    width: 400.0,
+                    height: 300.0,
+                },
+                ..LayoutOptions::default()
+            },
+            &SimpleTextMeasurer,
+        );
+        let selector = parse_selector_list("#cover").unwrap();
+        let cover = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let images = decoded_cover_resources(cover);
+        let display = build_display_list_with_images(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+            Some(&images),
+        );
+        assert!(display.diagnostics.is_empty());
+
+        // The static intermediate collapses, so the absolute cover's laid-out
+        // box is degenerate. Paint must still recover the wrapper's padding
+        // box (the cover's CSS containing block) and draw the bitmap.
+        let paints = cover_image_paints(&display, cover);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(
+            paints[0].destination,
+            PhysicalRect::new(0.0, 0.0, 400.0, 225.0)
+        );
+        assert!(paints[0].destination.size.width > 0.0);
+        assert!(paints[0].destination.size.height > 0.0);
+        assert_eq!(
+            images
+                .get(paints[0].resource)
+                .expect("decoded bitmap stays registered")
+                .intrinsic_size(),
+            (672, 378)
+        );
+    }
+
+    #[test]
+    fn overflow_hidden_picture_over_the_padding_hack_keeps_the_cover_visible() {
+        let output = parse_document(
+            "<!doctype html><body><div id=wrap><picture id=frame><img id=cover src='cover.png'></picture></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } \
+             #wrap { display:block; position:relative; width:298px; padding-top:56.25%; background-color:#f1f2f3 } \
+             #frame { position:absolute; top:0; left:0; display:block; width:100%; height:100%; overflow:hidden } \
+             #cover { display:block; width:100%; height:100% }",
         );
         let styles = compute_document_styles(
             &output.dom,
@@ -2043,30 +2341,21 @@ mod tests {
             LayoutOptions::default(),
             &SimpleTextMeasurer,
         );
-        let selector = parse_selector_list("#photo").unwrap();
-        let photo = select_all(
+        let selector = parse_selector_list("#cover").unwrap();
+        let cover = select_all(
             &output.dom,
             output.dom.document(),
             &selector,
             &MatchContext::default(),
         )[0];
-        let mut images = crate::image::ImageResources::default();
-        let key = crate::image::ImageResourceKey {
-            owner: photo,
-            requested_url: url::Url::parse("https://example.test/cover.png").unwrap(),
-            source_snapshot: String::new(),
-            source: crate::image::ImageSource::Element,
-            selection_context: crate::image::ImageSelectionContext::default(),
-        };
-        let decoded = crate::image::DecodedImage::from_pixels(
-            672,
-            378,
-            vec![crate::paint::Color::rgb(255, 0, 0); 672 * 378],
-        )
-        .unwrap();
-        images
-            .insert(key, decoded, crate::image::ImageLimits::default())
-            .unwrap();
+        let frame_selector = parse_selector_list("#frame").unwrap();
+        let frame = select_all(
+            &output.dom,
+            output.dom.document(),
+            &frame_selector,
+            &MatchContext::default(),
+        )[0];
+        let images = decoded_cover_resources(cover);
         let display = build_display_list_with_images(
             &layout.fragments,
             &formatting,
@@ -2075,35 +2364,117 @@ mod tests {
             &ReferenceTextShaper,
             Some(&images),
         );
-        for item in display.list.items() {
-            println!(
-                "ITEM source={:?} command={:?} bounds={:?}",
-                item.source, item.command, item.bounds
-            );
-        }
-        let images_drawn = display
+        assert!(display.diagnostics.is_empty());
+
+        // 56.25% of the 1280px viewport width is a 720px-tall padding box.
+        let paints = cover_image_paints(&display, cover);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(
+            paints[0].destination,
+            PhysicalRect::new(0.0, 0.0, 298.0, 720.0)
+        );
+        assert!(paints[0].destination.size.width > 0.0);
+        assert!(paints[0].destination.size.height > 0.0);
+        let clips = display
             .list
             .items()
             .iter()
-            .filter(|item| matches!(item.command, DisplayCommand::Image(_)))
-            .count();
-        println!("IMAGE COMMANDS: {images_drawn}");
-        for fragment in layout.fragments.iter() {
-            let geometry = match &fragment.kind {
-                crate::layout::FragmentKind::Box(geometry) => format!(
-                    "content={:?} padding={:?}",
-                    geometry.content_rect, geometry.padding
-                ),
-                crate::layout::FragmentKind::Text(text) => format!("text={:?}", text.text),
-            };
-            println!(
-                "FRAG id={:?} source={:?} rect={:?} children={:?} {geometry}",
-                fragment.id, fragment.source, fragment.rect, fragment.children
-            );
+            .filter(|item| item.source == Some(frame))
+            .filter_map(|item| match &item.command {
+                DisplayCommand::PushClip(ClipShape::Rect(rect)) => Some(*rect),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            clips.contains(&PhysicalRect::new(0.0, 0.0, 298.0, 720.0)),
+            "picture overflow clip must cover the padding box: {clips:?}"
+        );
+    }
+
+    #[test]
+    fn paint_recovers_a_degenerate_percentage_cover_box() {
+        let output = parse_document(
+            "<!doctype html><body><div id=wrap><img id=cover src='cover.png'></div></body>",
+        );
+        let sheet = parse_stylesheet(
+            "html, body { display:block; margin:0 } \
+             #wrap { display:block; position:relative; width:400px; padding-top:56.25%; background-color:#f1f2f3 } \
+             #cover { position:absolute; top:0; left:0; display:block; width:100%; height:100% }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions {
+                viewport: crate::layout::PhysicalSize {
+                    width: 400.0,
+                    height: 300.0,
+                },
+                ..LayoutOptions::default()
+            },
+            &SimpleTextMeasurer,
+        );
+        let selector = parse_selector_list("#cover").unwrap();
+        let cover = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+
+        // Simulate a layout that collapses the cover's percentage height
+        // against the wrapper's empty content box: the cover fragment ends up
+        // degenerate at the bottom edge of the padding box.
+        let mut fragments = layout.fragments.iter().cloned().collect::<Vec<_>>();
+        for fragment in &mut fragments {
+            if fragment.source == Some(cover) {
+                if let FragmentKind::Box(geometry) = &mut fragment.kind {
+                    geometry.content_rect = PhysicalRect::new(0.0, 225.0, 400.0, 0.0);
+                }
+                fragment.rect = PhysicalRect::new(0.0, 225.0, 400.0, 0.0);
+            }
         }
-        for item in display.diagnostics {
-            println!("DIAG {item:?}");
-        }
+        let degraded = crate::layout::FragmentTree::new(
+            layout.fragments.dom_revision,
+            layout.fragments.viewport,
+            layout.fragments.root(),
+            fragments,
+        );
+
+        let images = decoded_cover_resources(cover);
+        let display = build_display_list_with_images(
+            &degraded,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+            Some(&images),
+        );
+        assert!(display.diagnostics.is_empty());
+
+        // Paint restores the wrapper's padding box as the cover's content box
+        // and still emits the bitmap draw.
+        let paints = cover_image_paints(&display, cover);
+        assert_eq!(paints.len(), 1);
+        assert_eq!(
+            paints[0].destination,
+            PhysicalRect::new(0.0, 0.0, 400.0, 225.0)
+        );
+        assert_eq!(
+            paints[0].source,
+            PhysicalRect::new(0.0, 0.0, 672.0, 378.0)
+        );
     }
 
     #[test]
