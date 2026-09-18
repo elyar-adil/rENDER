@@ -203,8 +203,10 @@ pub fn layout_formatting_tree_with_images(
     let mut cursor_y = viewport_rect.origin.y;
     let mut children = Vec::new();
     for child in root_children {
+        // The viewport is the root containing block: its height is definite,
+        // so top-level percentage heights resolve against it (CSS 2 §10.5).
         if let Some(result) =
-            solver.layout_block_like(child, viewport_rect, viewport_rect, cursor_y, 0)
+            solver.layout_block_like(child, viewport_rect, viewport_rect, cursor_y, 0, true)
         {
             cursor_y += result.outer_height;
             children.push(result.fragment);

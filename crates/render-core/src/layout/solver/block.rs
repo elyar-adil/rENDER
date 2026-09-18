@@ -117,6 +117,7 @@ impl Solver<'_> {
         positioning_containing: PhysicalRect,
         margin_box_y: f32,
         depth: usize,
+        containing_height_definite: bool,
     ) -> Option<BlockResult> {
         if depth > self.options.limits.max_depth {
             self.diagnostics.push(LayoutDiagnostic {
@@ -152,30 +153,34 @@ impl Solver<'_> {
                         ),
                     });
                 }
-                self.layout_block(
+                self.layout_block_with_containing_height(
                     node_id,
                     containing,
                     positioning_containing,
                     margin_box_y,
                     depth,
                     None,
+                    containing_height_definite,
                 )
             }
-            FormattingNodeKind::AtomicInline { .. } => self.layout_block(
+            FormattingNodeKind::AtomicInline { .. } => self.layout_block_with_containing_height(
                 node_id,
                 containing,
                 positioning_containing,
                 margin_box_y,
                 depth,
                 None,
+                containing_height_definite,
             ),
             FormattingNodeKind::Root => None,
         }
     }
 
-    // Keep the CSS block constraint algorithm in specification order so each
-    // sizing and auto-margin step remains directly auditable against CSS 2.
-    #[allow(clippy::too_many_lines)]
+    /// Entry point for callers that do not track containing-height
+    /// definiteness (the inline solver's atomic inlines). Their percentage
+    /// heights take the CSS 2 §10.5 conservative default: an auto-height
+    /// inline formatting context is indefinite, so the height computes to
+    /// `auto`.
     pub(super) fn layout_block(
         &mut self,
         node_id: FormattingNodeId,
@@ -184,6 +189,30 @@ impl Solver<'_> {
         margin_box_y: f32,
         depth: usize,
         forced_content_width: Option<f32>,
+    ) -> Option<BlockResult> {
+        self.layout_block_with_containing_height(
+            node_id,
+            containing,
+            positioning_containing,
+            margin_box_y,
+            depth,
+            forced_content_width,
+            false,
+        )
+    }
+
+    // Keep the CSS block constraint algorithm in specification order so each
+    // sizing and auto-margin step remains directly auditable against CSS 2.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub(super) fn layout_block_with_containing_height(
+        &mut self,
+        node_id: FormattingNodeId,
+        containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        margin_box_y: f32,
+        depth: usize,
+        forced_content_width: Option<f32>,
+        containing_height_definite: bool,
     ) -> Option<BlockResult> {
         let node = self.formatting.get(node_id)?.clone();
         let style = node
@@ -198,15 +227,22 @@ impl Solver<'_> {
         }
         let position = position(style);
         let out_of_flow = matches!(position, Position::Absolute | Position::Fixed);
-        let containing = match position {
-            Position::Fixed => PhysicalRect::new(
-                0.0,
-                0.0,
-                self.options.viewport.width,
-                self.options.viewport.height,
+        // An out-of-flow box is never subject to the CSS 2 §10.5
+        // "percentage height computes to auto" rule: its containing block is
+        // the positioning ancestor's padding box (or the viewport), whose
+        // used height is known by the time positioned children are laid out.
+        let (containing, containing_height_definite) = match position {
+            Position::Fixed => (
+                PhysicalRect::new(
+                    0.0,
+                    0.0,
+                    self.options.viewport.width,
+                    self.options.viewport.height,
+                ),
+                true,
             ),
-            Position::Absolute => positioning_containing,
-            _ => containing,
+            Position::Absolute => (positioning_containing, true),
+            _ => (containing, containing_height_definite),
         };
         let margin_box_y = if out_of_flow {
             containing.origin.y
@@ -245,7 +281,15 @@ impl Solver<'_> {
         };
 
         let css_width = self.resolve_size(style, "width", basis, node.source);
-        let css_height = self.resolve_size(style, "height", containing.size.height, node.source);
+        // CSS 2 §10.5: against an indefinite containing height a percentage
+        // height computes to `auto`; it must never resolve against the
+        // tentative 0 used value of a content-sized parent.
+        let css_height = self.resolve_size_against(
+            style,
+            "height",
+            containing_height_definite.then_some(containing.size.height),
+            node.source,
+        );
         let replaced_size = self.replaced_size(node.source, css_width, css_height);
         let specified_width = css_width.or(replaced_size.map(|size| size.width));
         let non_content = padding.horizontal() + border.horizontal();
@@ -395,6 +439,12 @@ impl Solver<'_> {
                     }
                     _ => height,
                 });
+        // A specified (or replaced) content height is definite, so in-flow
+        // children may resolve percentage heights against it; a content-sized
+        // parent is indefinite (CSS 2 §10.5) and only contributes a tentative
+        // 0 basis that children must ignore.
+        let child_containing_height = specified_content_height.unwrap_or(0.0);
+        let child_containing_height_definite = specified_content_height.is_some();
         let top = self.resolve_inset(style, "top", containing.size.height, node.source);
         let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
         let relative_offset = if position == Position::Relative {
@@ -468,7 +518,12 @@ impl Solver<'_> {
                         ) {
                             self.layout_anonymous_block_with_floats(
                                 child,
-                                PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                                PhysicalRect::new(
+                                    content_x,
+                                    content_y,
+                                    content_width,
+                                    child_containing_height,
+                                ),
                                 positioned_child_containing,
                                 cursor_y,
                                 depth.saturating_add(1),
@@ -483,11 +538,12 @@ impl Solver<'_> {
                                     band.0,
                                     content_y,
                                     (band.1 - band.0).max(0.0),
-                                    0.0,
+                                    child_containing_height,
                                 ),
                                 positioned_child_containing,
                                 cursor_y,
                                 depth.saturating_add(1),
+                                child_containing_height_definite,
                             )
                         };
                         if let Some(result) = result {
@@ -497,11 +553,17 @@ impl Solver<'_> {
                     } else if let Some((fragment, area)) = self.layout_float(
                         child,
                         float,
-                        PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                        PhysicalRect::new(
+                            content_x,
+                            content_y,
+                            content_width,
+                            child_containing_height,
+                        ),
                         positioned_child_containing,
                         cursor_y,
                         &floats,
                         depth.saturating_add(1),
+                        child_containing_height_definite,
                     ) {
                         floats.push(area);
                         children.push(fragment);
@@ -538,6 +600,7 @@ impl Solver<'_> {
             style,
             specified_content_height.unwrap_or(auto_height),
             containing.size.height,
+            containing_height_definite,
             node.source,
             padding.vertical() + border.vertical(),
             box_sizing,
@@ -560,6 +623,10 @@ impl Solver<'_> {
                 positioned_child_containing,
                 content_y,
                 depth.saturating_add(1),
+                // Positioned children resolve against used heights: the
+                // final containing rects above are the post-layout padding
+                // box (or viewport), never a tentative content estimate.
+                true,
             ) {
                 children.push(result.fragment);
             }
@@ -663,13 +730,16 @@ impl Solver<'_> {
             // An isolated inline-grid is an atomic inline-level box. The
             // surrounding inline solver does not yet mix atomic boxes and text,
             // but it can preserve the grid formatting context and geometry.
-            return self.layout_block(
+            // Its containing block is the auto-height anonymous wrapper, so
+            // its percentage heights stay indefinite (CSS 2 §10.5).
+            return self.layout_block_with_containing_height(
                 *inline_root,
                 containing,
                 positioning_containing,
                 y,
                 depth,
                 None,
+                false,
             );
         }
         let fragment = self.allocate_fragment(
@@ -768,18 +838,20 @@ impl Solver<'_> {
         mut y: f32,
         floats: &[FloatArea],
         depth: usize,
+        containing_height_definite: bool,
     ) -> Option<(FragmentId, FloatArea)> {
         loop {
             let (left, right) = float_band(floats, y, containing.origin.x, containing.right());
             let available = (right - left).max(0.0);
             let forced_content_width = self.atomic_inline_content_width(node, available);
-            let result = self.layout_block(
+            let result = self.layout_block_with_containing_height(
                 node,
-                PhysicalRect::new(left, containing.origin.y, available, 0.0),
+                PhysicalRect::new(left, containing.origin.y, available, containing.size.height),
                 positioning_containing,
                 y,
                 depth,
                 Some(forced_content_width),
+                containing_height_definite,
             )?;
             let outer = self.fragment_outer_rect(result.fragment)?;
             if outer.size.width <= available || available >= containing.size.width {

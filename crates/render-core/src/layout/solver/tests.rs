@@ -1191,3 +1191,124 @@ fn column_flex_align_center_clamps_auto_width_item_to_the_flex_line() {
         "inner box must be centered within the panel"
     );
 }
+
+// CSS 2 §10.5: a percentage height against an indefinite containing height
+// computes to `auto`. Regression test for the bilibili feed: the
+// `.vui_carousel { height: 100% }` pattern sat inside auto-height wrappers,
+// resolved against a tentative 0-height parent, and reserved a large blank
+// band above the feed. It must size its content instead.
+#[test]
+fn percentage_height_child_of_auto_height_parent_behaves_as_auto() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=wrap><div id=carousel><div id=slide></div></div></div></body>",
+        "html, body, div { display:block; margin:0 } #slide { height:64px } #carousel { height:100% }",
+        400.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("carousel fragment")
+            .rect
+    };
+    // The 100% height computes to auto, so the carousel is exactly as tall
+    // as its content and reserves no extra band.
+    assert_eq!(rect("#carousel").size.height, 64.0);
+    assert_eq!(rect("#carousel").origin.y, 0.0);
+    assert_eq!(rect("#wrap").size.height, 64.0);
+}
+
+// A child of a block with a definite height resolves its percentage height
+// against that height, including through intermediate percentage levels.
+#[test]
+fn percentage_height_child_of_definite_parent_fills_exactly() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=outer><div id=half><div id=leaf></div></div><div id=full></div></div></body>",
+        "html, body, div { display:block; margin:0 } #outer { height:200px } #half { height:50% } #leaf { height:50% } #full { height:100% }",
+        400.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("outer fragment")
+            .rect
+    };
+    assert_eq!(rect("#half").size.height, 100.0);
+    // #leaf resolves against #half's definite resolved height (100px).
+    assert_eq!(rect("#leaf").size.height, 50.0);
+    assert_eq!(rect("#full").size.height, 200.0);
+    // The specified container height wins over the overflowing flow sum.
+    assert_eq!(rect("#outer").size.height, 200.0);
+}
+
+// Flex column items are in-flow boxes: their percentage heights resolve
+// against the container's definite height, and compute to auto (content
+// sizing) when the column container's height is indefinite.
+#[test]
+fn flex_column_child_percentage_height_follows_container_definiteness() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=col><div id=a></div><div id=b></div></div></body>",
+        "html, body, div { display:block; margin:0 } #col { display:flex; flex-direction:column; width:200px; height:300px } #a { height:50% } #b { height:25% }",
+        200.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("flex column item fragment")
+            .rect
+    };
+    assert_eq!(rect("#a").size.height, 150.0);
+    assert_eq!(rect("#b").size.height, 75.0);
+    assert_eq!(rect("#b").origin.y, 150.0);
+
+    let (indefinite_output, _, indefinite) = pipeline(
+        "<!doctype html><body><div id=flow><div id=item><div id=inner></div></div></div></body>",
+        "html, body, div { display:block; margin:0 } #flow { display:flex; flex-direction:column; width:200px } #item { height:100% } #inner { height:40px }",
+        200.0,
+    );
+    let item_rect = |selector| {
+        indefinite
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&indefinite_output.dom, selector)))
+            .expect("auto column item fragment")
+            .rect
+    };
+    // The 100% height computes to auto, so the item hugs its content and
+    // the auto-height column grows to fit it.
+    assert_eq!(item_rect("#item").size.height, 40.0);
+    assert_eq!(item_rect("#flow").size.height, 40.0);
+}
+
+// Percentage paddings always resolve against the containing WIDTH
+// (CSS 2 §10.5), so the classic `padding-top` aspect-ratio box keeps its
+// width-derived size even inside auto-height ancestors. The interaction
+// with this change: a `height: 100%` child inside such a padding-top box
+// still computes to auto, because the padding box trick does not make the
+// parent's height definite — aspect-ratio wrappers that need their content
+// to fill the box must position it absolutely.
+#[test]
+fn padding_top_percentage_boxes_keep_width_based_resolution_under_auto_heights() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=frame><div id=ratio><div id=fill></div></div></div></body>",
+        "html, body, div { display:block; margin:0 } #ratio { padding-top:100% } #fill { height:100% }",
+        240.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("aspect ratio fragment")
+            .rect
+    };
+    assert_eq!(rect("#ratio").size.height, 240.0);
+    assert_eq!(rect("#frame").size.height, 240.0);
+    // The percentage height of the empty fill child computes to auto.
+    assert_eq!(rect("#fill").size.height, 0.0);
+}

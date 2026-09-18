@@ -6,7 +6,6 @@ use crate::css::properties::GridTemplate;
 use crate::css::properties::GridTrack;
 use crate::css::properties::GridTrackBreadth;
 use crate::css::properties::LengthPercentage;
-use crate::css::properties::NumericType;
 use crate::css::properties::Size;
 use crate::css::properties::TypedPropertyValue;
 use crate::dom::NodeId;
@@ -22,6 +21,7 @@ use crate::layout::solver::GridItem;
 use crate::layout::solver::LayoutDiagnostic;
 use crate::layout::solver::LayoutDiagnosticCode;
 use crate::layout::solver::Solver;
+use crate::layout::solver::resolve::length_depends_on_percentage;
 use crate::layout::tree::FormattingNodeId;
 use crate::layout::tree::FormattingNodeKind;
 
@@ -29,17 +29,6 @@ pub(super) fn grid_template(style: Option<&ComputedStyle>, property: &str) -> Gr
     match style.and_then(|style| style.typed(property)) {
         Some(TypedPropertyValue::GridTemplate(template)) => template.clone(),
         _ => GridTemplate::None,
-    }
-}
-
-pub(super) fn grid_length_depends_on_percentage(value: &LengthPercentage) -> bool {
-    match value {
-        LengthPercentage::Percentage(_) => true,
-        LengthPercentage::Calculation(calculation) => matches!(
-            calculation.value_type,
-            NumericType::Percentage | NumericType::LengthPercentage
-        ),
-        LengthPercentage::Zero | LengthPercentage::Length(_) => false,
     }
 }
 
@@ -124,19 +113,24 @@ impl Solver<'_> {
                 item_source,
             );
             let result = match self.formatting.get(node).map(|node| &node.kind) {
-                Some(FormattingNodeKind::BlockContainer { .. }) => self.layout_block(
-                    node,
-                    PhysicalRect::new(
-                        track_x,
+                Some(FormattingNodeKind::BlockContainer { .. }) => self
+                    .layout_block_with_containing_height(
+                        node,
+                        PhysicalRect::new(
+                            track_x,
+                            containing.origin.y,
+                            track_width,
+                            specified_height.unwrap_or(0.0),
+                        ),
+                        positioning_containing,
                         containing.origin.y,
-                        track_width,
-                        specified_height.unwrap_or(0.0),
+                        depth,
+                        Some(forced_content_width),
+                        // Grid items are in-flow: their percentage heights are
+                        // definite only against a definite grid height
+                        // (CSS 2 §10.5).
+                        specified_height.is_some(),
                     ),
-                    positioning_containing,
-                    containing.origin.y,
-                    depth,
-                    Some(forced_content_width),
-                ),
                 _ => self.layout_anonymous_block(
                     node,
                     PhysicalRect::new(
@@ -275,7 +269,7 @@ impl Solver<'_> {
         property: &str,
         source: Option<NodeId>,
     ) -> Option<f32> {
-        if available.is_none() && grid_length_depends_on_percentage(value) {
+        if available.is_none() && length_depends_on_percentage(value) {
             None
         } else {
             Some(

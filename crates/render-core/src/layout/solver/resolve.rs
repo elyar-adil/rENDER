@@ -8,6 +8,7 @@ use crate::css::properties::BoxSizing;
 use crate::css::properties::Gap;
 use crate::css::properties::LengthPercentage;
 use crate::css::properties::LengthResolutionContext;
+use crate::css::properties::NumericType;
 use crate::css::properties::MaxSize;
 use crate::css::properties::Position;
 use crate::css::properties::Size;
@@ -25,6 +26,19 @@ pub(super) fn position(style: Option<&ComputedStyle>) -> Position {
     match style.and_then(|style| style.typed("position")) {
         Some(TypedPropertyValue::Position(position)) => *position,
         _ => Position::Static,
+    }
+}
+
+/// `true` when the used value of `value` depends on the percentage basis and
+/// therefore cannot resolve against an indefinite containing size.
+pub(super) fn length_depends_on_percentage(value: &LengthPercentage) -> bool {
+    match value {
+        LengthPercentage::Percentage(_) => true,
+        LengthPercentage::Calculation(calculation) => matches!(
+            calculation.value_type,
+            NumericType::Percentage | NumericType::LengthPercentage
+        ),
+        LengthPercentage::Zero | LengthPercentage::Length(_) => false,
     }
 }
 
@@ -197,9 +211,32 @@ impl Solver<'_> {
         basis: f32,
         node: Option<NodeId>,
     ) -> Option<f32> {
+        self.resolve_size_against(style, property, Some(basis), node)
+    }
+
+    /// Resolve a sizing property against a possibly indefinite percentage
+    /// basis. `basis == None` models a containing size that depends on
+    /// content: percentage-dependent sizes compute to `auto` (content
+    /// sizing) instead of resolving against a tentative used value
+    /// (CSS 2 §10.5). Definite lengths still resolve. Width call sites
+    /// always pass `Some` because a containing block width never depends
+    /// on content.
+    pub(super) fn resolve_size_against(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        property: &str,
+        basis: Option<f32>,
+        node: Option<NodeId>,
+    ) -> Option<f32> {
         match style.and_then(|style| style.typed(property)) {
             Some(TypedPropertyValue::Size(Size::LengthPercentage(value))) => {
-                Some(self.resolve_length(value, basis, node, property).max(0.0))
+                if basis.is_none() && length_depends_on_percentage(value) {
+                    return None;
+                }
+                Some(
+                    self.resolve_length(value, basis.unwrap_or(0.0), node, property)
+                        .max(0.0),
+                )
             }
             Some(TypedPropertyValue::Size(
                 Size::MinContent | Size::MaxContent | Size::FitContent(_) | Size::Stretch,
@@ -248,11 +285,13 @@ impl Solver<'_> {
         max.map_or(width.max(min), |max| width.max(min).min(max))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn apply_min_max_height(
         &mut self,
         style: Option<&ComputedStyle>,
         height: f32,
         basis: f32,
+        basis_definite: bool,
         node: Option<NodeId>,
         non_content: f32,
         box_sizing: BoxSizing,
@@ -261,14 +300,21 @@ impl Solver<'_> {
             BoxSizing::ContentBox => value.max(0.0),
             BoxSizing::BorderBox => (value - non_content).max(0.0),
         };
+        // CSS 2 §10.7: against an indefinite containing height a percentage
+        // min-height resolves to 0 and a percentage max-height to `none`,
+        // never against a tentative used value.
         let min = match style.and_then(|style| style.typed("min-height")) {
-            Some(TypedPropertyValue::Size(Size::LengthPercentage(value))) => {
+            Some(TypedPropertyValue::Size(Size::LengthPercentage(value)))
+                if basis_definite || !length_depends_on_percentage(value) =>
+            {
                 to_content_height(self.resolve_length(value, basis, node, "min-height"))
             }
             _ => 0.0,
         };
         let max = match style.and_then(|style| style.typed("max-height")) {
-            Some(TypedPropertyValue::MaxSize(MaxSize::Size(Size::LengthPercentage(value)))) => {
+            Some(TypedPropertyValue::MaxSize(MaxSize::Size(Size::LengthPercentage(value))))
+                if basis_definite || !length_depends_on_percentage(value) =>
+            {
                 Some(to_content_height(self.resolve_length(
                     value,
                     basis,

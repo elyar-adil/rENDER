@@ -17,6 +17,7 @@ use crate::layout::solver::Solver;
 use crate::layout::solver::inline::align_offset;
 use crate::layout::solver::inline::justify_offsets;
 use crate::layout::solver::resolve::count_as_f32;
+use crate::layout::solver::resolve::length_depends_on_percentage;
 use crate::layout::tree::FormattingContextKind;
 use crate::layout::tree::FormattingNodeId;
 use crate::layout::tree::FormattingNodeKind;
@@ -54,6 +55,10 @@ impl Solver<'_> {
             specified_height.unwrap_or(0.0)
         };
         let gap = self.resolve_gap(container_style, gap_property, gap_basis, container_source);
+        // The main axis basis is definite when the container has a definite
+        // main size; on the inline axis it always is (containing block
+        // widths never depend on content).
+        let main_axis_definite = horizontal || specified_height.is_some();
         let mut items = children
             .iter()
             .filter_map(|node| {
@@ -74,7 +79,14 @@ impl Solver<'_> {
                     Some(TypedPropertyValue::FlexShrink(value)) => *value,
                     _ => 1.0,
                 };
-                let basis = self.flex_basis(*node, style, horizontal, main_size, source);
+                let basis = self.flex_basis(
+                    *node,
+                    style,
+                    horizontal,
+                    main_size,
+                    main_axis_definite,
+                    source,
+                );
                 let extras =
                     self.flex_outer_extras(style, horizontal, containing.size.width, source);
                 let base_outer = (basis + extras).max(0.0);
@@ -185,19 +197,24 @@ impl Solver<'_> {
                 item.source,
             );
             let result = match self.formatting.get(item.node).map(|node| &node.kind) {
-                Some(FormattingNodeKind::BlockContainer { .. }) => self.layout_block(
-                    item.node,
-                    PhysicalRect::new(
-                        containing.origin.x,
+                Some(FormattingNodeKind::BlockContainer { .. }) => self
+                    .layout_block_with_containing_height(
+                        item.node,
+                        PhysicalRect::new(
+                            containing.origin.x,
+                            containing.origin.y,
+                            outer_width,
+                            specified_height.unwrap_or(0.0),
+                        ),
+                        positioning_containing,
                         containing.origin.y,
-                        outer_width,
-                        specified_height.unwrap_or(0.0),
+                        depth,
+                        Some(forced_content_width),
+                        // Flex items are in-flow: their percentage heights are
+                        // definite only against a definite container height
+                        // (CSS 2 §10.5).
+                        specified_height.is_some(),
                     ),
-                    positioning_containing,
-                    containing.origin.y,
-                    depth,
-                    Some(forced_content_width),
-                ),
                 _ => self.layout_anonymous_block(
                     item.node,
                     PhysicalRect::new(
@@ -362,16 +379,28 @@ impl Solver<'_> {
         style: Option<&ComputedStyle>,
         horizontal: bool,
         basis: f32,
+        basis_definite: bool,
         source: Option<NodeId>,
     ) -> f32 {
+        let basis_value = if basis_definite {
+            Some(basis)
+        } else {
+            None
+        };
         match style.and_then(|style| style.typed("flex-basis")) {
             Some(TypedPropertyValue::FlexBasis(FlexBasis::LengthPercentage(value))) => {
-                let specified = self.resolve_length(value, basis, source, "flex-basis");
-                self.flex_basis_content_box(style, specified, horizontal, basis, source)
+                if !basis_definite && length_depends_on_percentage(value) {
+                    // A percentage flex-basis against an indefinite main size
+                    // resolves as `content` (CSS Flexbox §7.2.2).
+                    self.intrinsic_flex_size(node, horizontal, basis, 0)
+                } else {
+                    let specified = self.resolve_length(value, basis, source, "flex-basis");
+                    self.flex_basis_content_box(style, specified, horizontal, basis, source)
+                }
             }
             Some(TypedPropertyValue::FlexBasis(FlexBasis::Auto)) | None => {
                 let property = if horizontal { "width" } else { "height" };
-                match self.resolve_size(style, property, basis, source) {
+                match self.resolve_size_against(style, property, basis_value, source) {
                     Some(specified) => {
                         self.flex_basis_content_box(style, specified, horizontal, basis, source)
                     }
