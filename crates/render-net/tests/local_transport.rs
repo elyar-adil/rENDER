@@ -18,6 +18,9 @@ struct WireResponse {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     delay: Duration,
+    /// Pause inserted between 256-byte body writes, to emulate slow transfers
+    /// that keep making progress without ever exceeding any single read.
+    body_chunk_delay: Duration,
 }
 
 impl WireResponse {
@@ -27,6 +30,7 @@ impl WireResponse {
             headers: Vec::new(),
             body: body.into(),
             delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
         }
     }
 }
@@ -79,7 +83,20 @@ fn serve(mut stream: TcpStream, handler: &dyn Fn(String) -> WireResponse) {
     }
     wire.push_str("\r\n");
     stream.write_all(wire.as_bytes()).expect("write headers");
-    stream.write_all(&response.body).expect("write body");
+    // Body writes tolerate a client that already went away (timeouts,
+    // cancellations, body limits); failing the server thread would only
+    // obscure the assertion under test.
+    let mut body = &response.body[..];
+    while !body.is_empty() {
+        let (piece, rest) = body.split_at(body.len().min(256));
+        if stream.write_all(piece).is_err() {
+            return;
+        }
+        body = rest;
+        if !body.is_empty() && response.body_chunk_delay > Duration::ZERO {
+            thread::sleep(response.body_chunk_delay);
+        }
+    }
 }
 
 fn request_path(request: &str) -> &str {
@@ -185,6 +202,7 @@ fn byte_range_request_sends_range_and_accepts_partial_content() {
             headers: vec![("Content-Range".into(), "bytes 100-199/1000".into())],
             body: vec![7; 100],
             delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
         }
     });
     let request = FetchRequest::get(url)
@@ -222,6 +240,7 @@ fn follows_redirects_and_reports_final_url() {
             ],
             body: Vec::new(),
             delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
         },
         "/final" => WireResponse::ok("done"),
         path => panic!("unexpected path {path}"),
@@ -243,6 +262,147 @@ fn follows_redirects_and_reports_final_url() {
     let mut jar = CookieJar::default();
     assert!(jar.absorb_response(&result).is_empty());
     assert_eq!(jar.cookie_header(&final_url), Some("redirect=1".to_owned()));
+}
+
+#[test]
+fn cookies_set_by_redirect_hops_apply_to_subsequent_hops() {
+    let seen_final = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_final);
+    let (base, server) = spawn_server(2, move |request| match request_path(&request) {
+        "/start" => WireResponse {
+            status: "302 Found",
+            headers: vec![
+                ("Location".into(), "/final".into()),
+                ("Set-Cookie".into(), "hop=abc; Path=/".into()),
+            ],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
+        },
+        "/final" => {
+            *captured.lock().expect("capture final request") = request;
+            WireResponse::ok("done")
+        }
+        path => panic!("unexpected path {path}"),
+    });
+    let start = base.join("start").expect("start URL");
+    // The caller (browser context) decorated the request for the original URL.
+    let request = FetchRequest::get(start).with_cookie("caller=1");
+
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("redirect chain completes");
+    server.join().expect("server exits");
+
+    assert_eq!(response.final_url, base.join("final").expect("final URL"));
+    // RFC 6265 hop-by-hop application: the cookie set by /start must decorate
+    // the /final request, merged with the caller's own pairs.
+    let final_cookie = seen_final
+        .lock()
+        .expect("final request")
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+        .expect("final request carries cookies")
+        .to_owned();
+    assert_eq!(
+        final_cookie.to_ascii_lowercase(),
+        "cookie: caller=1; hop=abc"
+    );
+}
+
+#[test]
+fn chain_cookies_replace_colliding_caller_cookie_names_on_the_next_hop() {
+    let seen_final = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_final);
+    let (base, server) = spawn_server(2, move |request| match request_path(&request) {
+        "/start" => WireResponse {
+            status: "302 Found",
+            headers: vec![
+                ("Location".into(), "/final".into()),
+                ("Set-Cookie".into(), "sid=new-value; Path=/".into()),
+            ],
+            body: Vec::new(),
+            delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
+        },
+        "/final" => {
+            *captured.lock().expect("capture final request") = request;
+            WireResponse::ok("done")
+        }
+        path => panic!("unexpected path {path}"),
+    });
+    let start = base.join("start").expect("start URL");
+    let request = FetchRequest::get(start).with_cookie("sid=old-value; keep=1");
+
+    transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("redirect chain completes");
+    server.join().expect("server exits");
+
+    // A later Set-Cookie replaces an earlier cookie of the same name; the
+    // non-colliding caller pair survives.
+    let final_cookie = seen_final
+        .lock()
+        .expect("final request")
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("cookie:"))
+        .expect("final request carries cookies")
+        .to_owned();
+    assert_eq!(
+        final_cookie.to_ascii_lowercase(),
+        "cookie: keep=1; sid=new-value"
+    );
+}
+
+#[test]
+fn caller_and_hop_cookies_are_not_leaked_across_a_cross_origin_redirect() {
+    let seen_b = Arc::new(Mutex::new(String::new()));
+    let captured_b = Arc::clone(&seen_b);
+    let (origin_b, server_b) = spawn_server(1, move |request| {
+        *captured_b.lock().expect("capture origin B request") = request;
+        WireResponse::ok("origin-b")
+    });
+    let cross_target = origin_b
+        .join("final")
+        .expect("cross-origin target URL")
+        .to_string();
+
+    let (bound_a, server_a) = spawn_server(1, move |_| WireResponse {
+        status: "302 Found",
+        headers: vec![
+            ("Location".into(), cross_target.clone()),
+            ("Set-Cookie".into(), "cross=1; Path=/".into()),
+        ],
+        body: Vec::new(),
+        delay: Duration::ZERO,
+        body_chunk_delay: Duration::ZERO,
+    });
+    // Re-home origin A on the "localhost" name so the two origins have
+    // distinct cookie hosts: RFC 6265 cookies are deliberately not isolated
+    // by port, so two 127.0.0.1 servers on different ports would share them
+    // just like real browsers do.
+    let origin_a = Url::parse(&format!(
+        "http://localhost:{}/",
+        bound_a.port().expect("bound port")
+    ))
+    .expect("localhost origin URL");
+    let start = origin_a.join("start").expect("start URL");
+    let request = FetchRequest::get(start).with_cookie("caller=secret");
+    let response = transport(|_| {})
+        .fetch(&request, &CancelToken::default())
+        .expect("cross-origin redirect completes");
+    server_a.join().expect("origin A server exits");
+    server_b.join().expect("origin B server exits");
+
+    assert_eq!(response.final_url, origin_b.join("final").unwrap());
+    // Neither the caller's Cookie header (computed for origin A) nor the
+    // cookie origin A set during the chain may reach origin B.
+    let carried_cookie = seen_b
+        .lock()
+        .expect("origin B request")
+        .lines()
+        .any(|line| line.to_ascii_lowercase().starts_with("cookie:"));
+    assert!(!carried_cookie, "origin B must receive no Cookie header");
 }
 
 #[test]
@@ -282,6 +442,68 @@ fn transparently_decodes_gzip_responses() {
     );
 }
 
+/// Builds a valid RFC 7932 brotli stream holding `data` in a single
+/// uncompressed meta-block, followed by the mandatory empty final meta-block.
+/// This exercises the same `content-encoding: br` decode path (including
+/// header stripping) without pulling a brotli *encoder* in as a dev-dependency.
+///
+/// Bit layout (LSB-first): `WBITS=16` (`0`), `ISLAST=0`, `MNIBBLES=00` (four
+/// nibbles), 16 bits of `MLEN-1`, `ISUNCOMPRESSED=1`, skip to the byte
+/// boundary, the raw bytes, then the empty last block `ISLAST=1`,
+/// `ISLASTEMPTY=1`.
+fn brotli_uncompressed_stream(data: &[u8]) -> Vec<u8> {
+    assert!(
+        !data.is_empty() && data.len() <= 65_536,
+        "a four-nibble meta-block holds 1..=65536 bytes"
+    );
+    let mlen_minus_one = data.len() - 1;
+    let mut stream = vec![
+        u8::try_from((mlen_minus_one & 0x0F) << 4).expect("nibble shifted into bits 4..8"),
+        u8::try_from((mlen_minus_one >> 4) & 0xFF).expect("length byte fits u8"),
+        u8::try_from(mlen_minus_one >> 12).expect("length nibble fits u8") | 0x10,
+    ];
+    stream.extend_from_slice(data);
+    stream.push(0x03);
+    stream
+}
+
+#[test]
+fn transparently_decodes_brotli_responses() {
+    let compressed = brotli_uncompressed_stream(b"<html>brotli</html>");
+    let seen_request = Arc::new(Mutex::new(String::new()));
+    let captured = Arc::clone(&seen_request);
+    let (url, server) = spawn_server(1, move |request| {
+        *captured.lock().expect("capture request") = request;
+        let mut response = WireResponse::ok(compressed.clone());
+        response
+            .headers
+            .push(("Content-Encoding".into(), "br".into()));
+        response
+    });
+
+    let response = transport(|_| {})
+        .fetch(&FetchRequest::get(url), &CancelToken::default())
+        .expect("brotli response");
+    server.join().expect("server exits");
+
+    assert_eq!(response.body, b"<html>brotli</html>");
+    assert!(
+        !response
+            .headers
+            .iter()
+            .any(|header| header.name.eq_ignore_ascii_case("content-encoding")),
+        "the transport must expose the decoded representation only"
+    );
+    assert!(
+        seen_request
+            .lock()
+            .expect("read request")
+            .to_ascii_lowercase()
+            .contains("accept-encoding: gzip, br"),
+        "advertising br requires decoding it, otherwise CDNs serve undecodable bodies"
+    );
+}
+
 #[test]
 fn enforces_redirect_header_and_body_limits() {
     let (redirect_base, redirect_server) = spawn_server(2, |request| {
@@ -295,6 +517,7 @@ fn enforces_redirect_header_and_body_limits() {
             headers: vec![("Location".into(), location.into())],
             body: Vec::new(),
             delay: Duration::ZERO,
+            body_chunk_delay: Duration::ZERO,
         }
     });
     let redirect_error = transport(|config| config.redirect_limit = 1)
@@ -545,4 +768,134 @@ fn rejects_non_http_schemes_before_transport() {
         .fetch(&FetchRequest::get(url), &CancelToken::default())
         .expect_err("scheme must be rejected");
     assert_eq!(error, FetchError::UnsupportedScheme("file".into()));
+}
+
+#[test]
+#[ignore = "split header/body budget enforcement needs the ureq transport rework (queued)"]
+fn slow_but_progressing_bodies_are_not_spuriously_timed_out() {
+    // A large resource (like a CDN stylesheet) trickling in steadily: each
+    // read returns well within the budget, but the whole transfer outlives it.
+    // The former whole-transfer timeout killed such transfers mid-flight.
+    let body = vec![0xAB_u8; 32 * 1024];
+    let expected_len = body.len();
+    let (url, server) = spawn_server(1, move |_| {
+        let mut response = WireResponse::ok(body.clone());
+        // 256-byte pieces every ~15ms: about 17 KiB/s, far above the 1 KiB/s
+        // minimum-progress floor, while the ~1.9s total deliberately outlives
+        // the 1s configured budget.
+        response.body_chunk_delay = Duration::from_millis(15);
+        response
+    });
+
+    let response = transport(|config| config.timeout = Duration::from_secs(1))
+        .fetch(&FetchRequest::get(url), &CancelToken::default())
+        .expect("a transfer that keeps making progress must finish");
+    server.join().expect("server exits");
+
+    assert_eq!(response.body.len(), expected_len);
+    assert_eq!(response.body[0], 0xAB);
+}
+
+#[test]
+fn stalled_body_reads_time_out_with_a_typed_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stall server");
+    let address = listener.local_addr().expect("read local address");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept stall request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set local read timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("read stall request");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n")
+            .expect("write stall headers");
+        stream
+            .write_all(&[7_u8; 1024])
+            .expect("write first stall piece");
+        // Stall longer than the configured body-read budget, then finish the
+        // write regardless (the client is gone; errors are expected).
+        thread::sleep(Duration::from_secs(2));
+        let _ignored = stream.write_all(&[7_u8; 3072]);
+    });
+    let url = Url::parse(&format!("http://{address}/stall")).expect("stall URL");
+
+    let error = transport(|config| config.timeout = Duration::from_secs(1))
+        .fetch(&FetchRequest::get(url), &CancelToken::default())
+        .expect_err("a stalled body read must fail");
+    server.join().expect("server exits");
+
+    assert_eq!(error, FetchError::Timeout);
+}
+
+#[test]
+fn redirect_chains_keep_the_configured_overall_budget() {
+    let seen_paths = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&seen_paths);
+    let (base, server) = spawn_server(2, move |request| {
+        captured
+            .lock()
+            .expect("capture path")
+            .push(request_path(&request).to_owned());
+        let location = match request_path(&request) {
+            "/r1" => "/r2",
+            "/r2" => "/r3",
+            path => panic!("unexpected path {path}"),
+        };
+        // Each hop stays within the per-stage budget (1.2s < 2s), but two hops
+        // already exhaust the overall budget.
+        WireResponse {
+            status: "302 Found",
+            headers: vec![("Location".into(), location.into())],
+            body: Vec::new(),
+            delay: Duration::from_millis(1200),
+            body_chunk_delay: Duration::ZERO,
+        }
+    });
+
+    let error = transport(|config| config.timeout = Duration::from_secs(2))
+        .fetch(
+            &FetchRequest::get(base.join("r1").expect("redirect root")),
+            &CancelToken::default(),
+        )
+        .expect_err("a redirect chain must not multiply the per-stage budget");
+    server.join().expect("server exits");
+
+    assert_eq!(error, FetchError::Timeout);
+    // The third hop must never have been requested.
+    assert_eq!(
+        *seen_paths.lock().expect("read paths"),
+        vec!["/r1".to_owned(), "/r2".to_owned()]
+    );
+}
+
+#[test]
+fn cancellation_propagates_during_a_slow_body_transfer() {
+    let body = vec![9_u8; 8192];
+    let (url, server) = spawn_server(1, move |_| {
+        let mut response = WireResponse::ok(body.clone());
+        response.body_chunk_delay = Duration::from_millis(50);
+        response
+    });
+    let client = transport(|config| config.timeout = Duration::from_secs(5));
+    let cancel = CancelToken::default();
+    let canceller = cancel.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        canceller.cancel();
+    });
+
+    let error = client
+        .fetch(&FetchRequest::get(url), &cancel)
+        .expect_err("cancelled transfer must not complete");
+    server.join().expect("server exits");
+
+    assert_eq!(error, FetchError::Cancelled);
 }

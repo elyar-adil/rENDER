@@ -4,11 +4,20 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use ureq::ResponseExt;
 use url::Url;
+
+use crate::CookieJar;
+
+/// Minimum average body throughput once [`FetchConfig::timeout`] has elapsed.
+///
+/// The body transfer has no whole-transfer wall clock (a large resource that
+/// keeps making progress must not spuriously fail), so this floor bounds how
+/// long a connection that only trickles bytes can pin a worker thread.
+const MIN_BODY_BYTES_PER_SECOND: usize = 1024;
 
 /// Cooperative cancellation shared by a request and its caller.
 #[derive(Clone, Debug, Default)]
@@ -215,6 +224,16 @@ pub struct FetchConfig {
     pub redirect_limit: u32,
     pub max_body_bytes: usize,
     pub max_header_bytes: usize,
+    /// Per-stage and stall budget, deliberately NOT a whole-transfer cap.
+    ///
+    /// Each blocking stage (DNS lookup, connect, sending the request,
+    /// receiving response headers) and each individual body read may take up
+    /// to this long before the transfer fails with [`FetchError::Timeout`].
+    /// A body that keeps making progress may legitimately run longer than
+    /// this budget overall (a CDN stylesheet trickling in over a slow link,
+    /// for example). Such transfers remain bounded by `max_body_bytes`, by a
+    /// minimum average rate of [`MIN_BODY_BYTES_PER_SECOND`] once this budget
+    /// has elapsed, and by this same budget across the whole redirect chain.
     pub timeout: Duration,
     pub user_agent: String,
 }
@@ -350,7 +369,18 @@ impl HttpTransport {
             .max_redirects(0)
             .max_redirects_will_error(true)
             .max_response_header_size(config.max_header_bytes)
-            .timeout_global(Some(config.timeout))
+            // ureq's `timeout_global` is an end-to-end budget that includes
+            // reading the response body, so a large resource that keeps making
+            // progress would spuriously fail once the budget elapses. Bound
+            // each blocking stage and each body read individually instead; the
+            // remaining overall bounds are enforced by `fetch` (redirect phase)
+            // and `read_bounded_body` (minimum-progress floor).
+            .timeout_global(None)
+            .timeout_resolve(Some(config.timeout))
+            .timeout_connect(Some(config.timeout))
+            .timeout_send_request(Some(config.timeout))
+            .timeout_recv_response(Some(config.timeout))
+            .timeout_recv_body(Some(config.timeout))
             .user_agent(config.user_agent.clone())
             .build();
         Self {
@@ -370,6 +400,10 @@ impl HttpTransport {
     ///
     /// Returns a typed [`FetchError`] for cancellation, invalid schemes,
     /// configured limit violations, TLS verification, and transport failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "redirect/cookie/timeout handling reads as one pipeline"
+    )]
     pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
         if request.url.scheme() == "data" {
             return self.fetch_data_url(request, cancel);
@@ -383,6 +417,13 @@ impl HttpTransport {
         let mut redirect_chain = vec![request.url.clone()];
         let mut redirects = Vec::new();
         let mut redirect_count = 0;
+        // Cookies set by responses inside this chain. RFC 6265 application is
+        // hop-by-hop: a `Set-Cookie` from an earlier response must decorate the
+        // next request when its domain/path rules match. The jar is per fetch,
+        // so the transport itself stays stateless; the caller's jar still sees
+        // the same cookies via `absorb_response`.
+        let mut hop_cookies = CookieJar::default();
+        let started = Instant::now();
 
         loop {
             if cancel.is_cancelled() {
@@ -393,12 +434,17 @@ impl HttpTransport {
             if let Some(accept) = request.accept.as_deref() {
                 builder = builder.header("Accept", accept);
             }
-            // A caller-provided Cookie header was computed for the original
+            // The caller-provided Cookie header was computed for the original
             // URL. Reusing it only on same-origin hops avoids leaking it to a
-            // cross-origin redirect while retaining normal login redirects.
-            if same_origin(&current_url, &request.url)
-                && let Some(cookie) = request.cookie.as_deref()
-            {
+            // cross-origin redirect, while cookies the chain itself set flow by
+            // their own domain/path rules either way.
+            let caller_cookie = same_origin(&current_url, &request.url)
+                .then_some(request.cookie.as_deref())
+                .flatten();
+            if let Some(cookie) = combined_cookie_header(
+                caller_cookie,
+                hop_cookies.cookie_header(&current_url).as_deref(),
+            ) {
                 builder = builder.header("Cookie", cookie);
             }
             if let Some(byte_range) = request.byte_range {
@@ -415,7 +461,9 @@ impl HttpTransport {
                     builder = builder.header("If-Modified-Since", last_modified);
                 }
             }
-            let mut response = builder.call().map_err(|error| self.map_error(error))?;
+            let mut response = builder
+                .call()
+                .map_err(|error| classify_ureq_error(&error, &self.config))?;
 
             if cancel.is_cancelled() {
                 return Err(FetchError::Cancelled);
@@ -439,10 +487,17 @@ impl HttpTransport {
                         limit: self.config.redirect_limit,
                     });
                 }
+                // Everything except the final body transfer keeps the
+                // configured budget in total; a redirect chain must not multiply
+                // the per-stage timeouts unboundedly.
+                if started.elapsed() >= self.config.timeout {
+                    return Err(FetchError::Timeout);
+                }
                 let next_url = current_url
                     .join(location.trim())
                     .map_err(|error| FetchError::InvalidUrl(error.to_string()))?;
                 validate_scheme(&next_url)?;
+                absorb_hop_set_cookies(&mut hop_cookies, &current_url, &headers);
                 redirects.push(RedirectResponse {
                     url: current_url.clone(),
                     status,
@@ -463,11 +518,7 @@ impl HttpTransport {
                 *last = final_url.clone();
             }
             let content_type = header_text(&headers, "content-type").and_then(parse_content_type);
-            let body = read_bounded_body(
-                response.body_mut().as_reader(),
-                self.config.max_body_bytes,
-                cancel,
-            )?;
+            let body = self.read_bounded_body(response.body_mut().as_reader(), cancel)?;
 
             return Ok(FetchResponse {
                 requested_url: request.url.clone(),
@@ -502,25 +553,136 @@ impl HttpTransport {
         })
     }
 
-    fn map_error(&self, error: ureq::Error) -> FetchError {
-        match error {
-            ureq::Error::TooManyRedirects => FetchError::RedirectLimitExceeded {
-                limit: self.config.redirect_limit,
-            },
-            ureq::Error::LargeResponseHeader(_, _) => FetchError::HeaderLimitExceeded {
-                limit: self.config.max_header_bytes,
-            },
-            ureq::Error::Timeout(_) => FetchError::Timeout,
-            ureq::Error::HostNotFound => FetchError::Dns,
-            ureq::Error::Tls(message) => FetchError::Tls(message.to_owned()),
-            ureq::Error::Rustls(error) => FetchError::Tls(error.to_string()),
-            ureq::Error::TlsRequired => FetchError::Tls("TLS was required but unavailable".into()),
-            ureq::Error::BadUri(message) => FetchError::InvalidUrl(message),
-            ureq::Error::Protocol(error) => FetchError::Protocol(error.to_string()),
-            ureq::Error::Io(error) => map_io_error(&error),
-            other => FetchError::Transport(other.to_string()),
+    /// Reads the response body within [`FetchConfig::max_body_bytes`], keeping
+    /// cooperative cancellation responsive and bounding how long a transfer can
+    /// stall or trickle.
+    ///
+    /// There is deliberately no whole-body wall clock: a transfer that keeps
+    /// making progress must finish regardless of total duration (a large CDN
+    /// stylesheet over a slow link). Instead, each blocking read is bounded by
+    /// the configured per-read timeout in the agent, and once that budget has
+    /// elapsed overall the transfer must average at least
+    /// [`MIN_BODY_BYTES_PER_SECOND`].
+    fn read_bounded_body(
+        &self,
+        mut reader: impl Read,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, FetchError> {
+        let limit = self.config.max_body_bytes;
+        let mut body = Vec::with_capacity(limit.min(64 * 1024));
+        let mut chunk = [0_u8; 16 * 1024];
+        let started = Instant::now();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(FetchError::Cancelled);
+            }
+            let read = reader
+                .read(&mut chunk)
+                .map_err(|error| self.map_body_read_error(&error))?;
+            if read == 0 {
+                return Ok(body);
+            }
+            let remaining = limit.saturating_sub(body.len());
+            if read > remaining {
+                return Err(FetchError::BodyLimitExceeded { limit });
+            }
+            body.extend_from_slice(&chunk[..read]);
+            let elapsed = started.elapsed();
+            if elapsed > self.config.timeout {
+                let elapsed_seconds = usize::try_from(elapsed.as_secs()).unwrap_or(usize::MAX);
+                if body.len() < MIN_BODY_BYTES_PER_SECOND.saturating_mul(elapsed_seconds) {
+                    return Err(FetchError::Timeout);
+                }
+            }
         }
     }
+
+    /// Classifies a failure surfaced by the body reader. ureq wraps its typed
+    /// errors inside `std::io::Error` (decoders pass them through verbatim), so
+    /// a stalled body read is still a [`FetchError::Timeout`], not a generic
+    /// I/O failure.
+    fn map_body_read_error(&self, error: &std::io::Error) -> FetchError {
+        let classified = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ureq::Error>())
+            .map(|error| classify_ureq_error(error, &self.config));
+        let mapped = classified.unwrap_or_else(|| FetchError::Io(error.to_string()));
+        if matches!(mapped, FetchError::Timeout) {
+            eprintln!("[timeout-debug] ureq body read timed out: {error}");
+        }
+        mapped
+    }
+}
+
+/// Maps a typed ureq failure onto the transport's error vocabulary.
+fn classify_ureq_error(error: &ureq::Error, config: &FetchConfig) -> FetchError {
+    match error {
+        ureq::Error::TooManyRedirects => FetchError::RedirectLimitExceeded {
+            limit: config.redirect_limit,
+        },
+        ureq::Error::LargeResponseHeader(_, _) => FetchError::HeaderLimitExceeded {
+            limit: config.max_header_bytes,
+        },
+        ureq::Error::Timeout(_) => FetchError::Timeout,
+        ureq::Error::HostNotFound => FetchError::Dns,
+        ureq::Error::Tls(message) => FetchError::Tls((*message).to_owned()),
+        ureq::Error::Rustls(error) => FetchError::Tls(error.to_string()),
+        ureq::Error::TlsRequired => FetchError::Tls("TLS was required but unavailable".into()),
+        ureq::Error::BadUri(message) => FetchError::InvalidUrl(message.clone()),
+        ureq::Error::Protocol(error) => FetchError::Protocol(error.to_string()),
+        ureq::Error::Io(error) => map_io_error(error),
+        other => FetchError::Transport(other.to_string()),
+    }
+}
+
+/// Absorbs `Set-Cookie` fields from one redirect response into the per-fetch
+/// jar so they decorate the next hop.
+fn absorb_hop_set_cookies(jar: &mut CookieJar, origin: &Url, headers: &[Header]) {
+    for header in headers {
+        if header.name.eq_ignore_ascii_case("set-cookie")
+            && let Ok(value) = std::str::from_utf8(&header.value)
+        {
+            // A single invalid cookie must never break the redirect chain;
+            // rejection details belong to the caller's jar via absorb_response.
+            let _ignored = jar.set_cookie(origin, value);
+        }
+    }
+}
+
+/// Combines the caller-provided `Cookie` header with cookies the redirect chain
+/// set so far, producing the header for the next hop.
+///
+/// Per RFC 6265 a later `Set-Cookie` replaces an earlier cookie with the same
+/// (case-sensitive) name, so the caller's pairs are dropped when the chain set
+/// a cookie of that name. Pair order is otherwise preserved, then followed by
+/// the hop cookies.
+fn combined_cookie_header(caller: Option<&str>, hop: Option<&str>) -> Option<String> {
+    let Some(hop) = hop else {
+        return caller.map(str::to_owned);
+    };
+    let Some(caller) = caller else {
+        return Some(hop.to_owned());
+    };
+    let hop_names = hop
+        .split(';')
+        .filter_map(|pair| pair.split_once('=').map(|(name, _)| name.trim()))
+        .collect::<Vec<_>>();
+    let retained = caller
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split_once('=').map_or(*pair, |(name, _)| name.trim());
+            !hop_names.contains(&name)
+        })
+        .collect::<Vec<_>>();
+    if retained.is_empty() {
+        return Some(hop.to_owned());
+    }
+    let mut combined = retained.join("; ");
+    combined.push_str("; ");
+    combined.push_str(hop);
+    Some(combined)
 }
 
 fn is_redirect_status(status: HttpStatus) -> bool {
@@ -673,31 +835,6 @@ const fn hex_value(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
-    }
-}
-
-fn read_bounded_body(
-    mut reader: impl Read,
-    limit: usize,
-    cancel: &CancelToken,
-) -> Result<Vec<u8>, FetchError> {
-    let mut body = Vec::with_capacity(limit.min(64 * 1024));
-    let mut chunk = [0_u8; 16 * 1024];
-    loop {
-        if cancel.is_cancelled() {
-            return Err(FetchError::Cancelled);
-        }
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|error| FetchError::Io(error.to_string()))?;
-        if read == 0 {
-            return Ok(body);
-        }
-        let remaining = limit.saturating_sub(body.len());
-        if read > remaining {
-            return Err(FetchError::BodyLimitExceeded { limit });
-        }
-        body.extend_from_slice(&chunk[..read]);
     }
 }
 
@@ -859,5 +996,37 @@ mod tests {
         let request = seen_request.lock().unwrap().to_ascii_lowercase();
         assert!(request.contains("if-none-match: \"v1\""));
         assert!(request.contains("if-modified-since: wed, 21 oct 2015 07:28:00 gmt"));
+        // Conditional revalidation must repeat the same content negotiation as
+        // the original request (for example `Vary: Accept-Encoding`), so the
+        // automatically advertised encodings stay identical on every request.
+        assert!(request.contains("accept-encoding: gzip, br"));
+    }
+
+    #[test]
+    fn combines_caller_and_hop_cookies_with_server_values_winning() {
+        use super::combined_cookie_header;
+
+        // Without chain cookies the caller header must stay byte-identical.
+        assert_eq!(
+            combined_cookie_header(Some("a=1; b=2"), None).as_deref(),
+            Some("a=1; b=2")
+        );
+        assert_eq!(combined_cookie_header(None, None), None);
+        // Chain cookies alone.
+        assert_eq!(
+            combined_cookie_header(None, Some("hop=1")).as_deref(),
+            Some("hop=1")
+        );
+        // Merged: caller pairs retained, server-set values win name collisions
+        // (cookie names are case-sensitive per RFC 6265).
+        assert_eq!(
+            combined_cookie_header(Some("a=1; b=2"), Some("b=server; c=3")).as_deref(),
+            Some("a=1; b=server; c=3")
+        );
+        // A caller header fully overridden by the chain.
+        assert_eq!(
+            combined_cookie_header(Some("a=1"), Some("A=server")).as_deref(),
+            Some("a=1; A=server")
+        );
     }
 }
