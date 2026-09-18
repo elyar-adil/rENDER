@@ -608,27 +608,27 @@ mod tests {
         assert!(!editor.can_redo());
     }
 
-#[test]
-fn control_only_paste_does_not_delete_selection_or_create_history() {
-    let mut editor = AddressEditor::new("keep");
-    editor.select_all();
-    let mut clipboard = MemoryClipboard(Some("\n\r\t".to_owned()));
-    assert!(!editor.execute(AddressCommand::Paste, &mut clipboard));
-    assert_eq!(editor.text(), "keep");
-    assert_eq!(editor.selection(), Some((0, 4)));
-    assert!(!editor.can_undo());
-}
+    #[test]
+    fn control_only_paste_does_not_delete_selection_or_create_history() {
+        let mut editor = AddressEditor::new("keep");
+        editor.select_all();
+        let mut clipboard = MemoryClipboard(Some("\n\r\t".to_owned()));
+        assert!(!editor.execute(AddressCommand::Paste, &mut clipboard));
+        assert_eq!(editor.text(), "keep");
+        assert_eq!(editor.selection(), Some((0, 4)));
+        assert!(!editor.can_undo());
+    }
 
-#[test]
-fn ime_commit_latch_is_consumed_by_a_single_take() {
-    let mut editor = AddressEditor::new("");
-    assert!(!editor.take_pending_ime_enter());
-    editor.note_ime_composition_end();
-    assert!(editor.take_pending_ime_enter());
-    assert!(!editor.take_pending_ime_enter());
-    // A fresh text resets the latch too.
-    editor.note_ime_composition_end();
-    editor.set_text("next");
-    assert!(!editor.take_pending_ime_enter());
-}
+    #[test]
+    fn ime_commit_latch_is_consumed_by_a_single_take() {
+        let mut editor = AddressEditor::new("");
+        assert!(!editor.take_pending_ime_enter());
+        editor.note_ime_composition_end();
+        assert!(editor.take_pending_ime_enter());
+        assert!(!editor.take_pending_ime_enter());
+        // A fresh text resets the latch too.
+        editor.note_ime_composition_end();
+        editor.set_text("next");
+        assert!(!editor.take_pending_ime_enter());
+    }
 }
