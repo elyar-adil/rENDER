@@ -10,7 +10,9 @@ pub mod dom {
     pub use render_dom::*;
 }
 pub mod event_loop;
-pub mod html;
+pub mod html {
+    pub use render_html::*;
+}
 pub mod image;
 pub mod interaction;
 pub mod invalidation;

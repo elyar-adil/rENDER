@@ -1,0 +1,12 @@
+[package]
+name = "render-html"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "render_html"
+
+[dependencies]
+render-dom = { path = "../render-dom" }
+encoding_rs = "0.8"
+entities = "1.0.2-rc.1"

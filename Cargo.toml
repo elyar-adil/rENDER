@@ -2,6 +2,7 @@
 members = [
     "crates/render-browser",
     "crates/render-dom",
+    "crates/render-html",
     "crates/render-core",
     "crates/render-net",
 ]

@@ -1,6 +1,6 @@
 //! HTML fragment serialization (`Element.innerHTML` / `outerHTML`).
 
-use crate::dom::{Dom, NodeId, NodeKind};
+use render_dom::{Dom, NodeId, NodeKind};
 
 /// Void elements per the HTML standard: serialized without an end tag and
 /// never descended into.
@@ -57,7 +57,7 @@ fn serialize_node(dom: &Dom, node: NodeId, output: &mut String) {
             }
             if RAW_TEXT_ELEMENTS.contains(&local_name) {
                 if let Some(child) = node_ref.children().first() {
-                    if let Some(NodeKind::Text(data)) = dom.node(*child).map(crate::dom::Node::kind)
+                    if let Some(NodeKind::Text(data)) = dom.node(*child).map(render_dom::Node::kind)
                     {
                         output.push_str(data);
                     }
@@ -121,13 +121,13 @@ fn escape_attribute(value: &str, output: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::html::parse_document;
+    use crate::parse_document;
 
     fn body_of(source: &str) -> (Dom, NodeId) {
         fn find_element_by_name(dom: &Dom, root: NodeId, local_name: &str) -> Option<NodeId> {
             for child in dom.children(root).unwrap_or_default() {
                 if let Some(NodeKind::Element(element)) =
-                    dom.node(*child).map(crate::dom::Node::kind)
+                    dom.node(*child).map(render_dom::Node::kind)
                 {
                     if element.local_name == local_name {
                         return Some(*child);

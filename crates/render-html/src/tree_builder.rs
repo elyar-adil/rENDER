@@ -1,4 +1,4 @@
-use crate::dom::{Dom, Namespace, NodeId, NodeKind};
+use render_dom::{Dom, Namespace, NodeId, NodeKind};
 
 use super::tokenizer::{
     ContentModel, DoctypeToken, HtmlParseError, HtmlParseErrorCode, TagToken, Token, Tokenizer,
@@ -1021,7 +1021,7 @@ impl<'a> TreeBuilder<'a> {
         if let Some(reference) = reference
             && let Some(previous) = self.dom.previous_sibling(reference)
             && let Some(NodeKind::Text(existing)) =
-                self.dom.node(previous).map(crate::dom::Node::kind)
+                self.dom.node(previous).map(render_dom::Node::kind)
         {
             let mut combined = existing.clone();
             combined.push_str(data);
@@ -1339,7 +1339,7 @@ fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
 
 #[cfg(test)]
 mod tests {
-    use crate::dom::{Dom, NodeId, NodeKind};
+    use render_dom::{Dom, NodeId, NodeKind};
 
     use super::{QuirksMode, parse_document};
 
@@ -1371,7 +1371,7 @@ mod tests {
     fn text_content(dom: &Dom, node: NodeId) -> String {
         let mut output = String::new();
         for child in dom.children(node).unwrap_or_default() {
-            match dom.node(*child).map(crate::dom::Node::kind) {
+            match dom.node(*child).map(render_dom::Node::kind) {
                 Some(NodeKind::Text(data)) => output.push_str(data),
                 Some(_) => output.push_str(&text_content(dom, *child)),
                 None => {}
