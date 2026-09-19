@@ -1564,6 +1564,7 @@ dependencies = [
  "render-dom",
  "render-html",
  "render-js",
+ "render-layout",
  "url",
 ]
 
@@ -1598,6 +1599,15 @@ dependencies = [
  "render-dom",
  "render-html",
  "url",
+]
+
+[[package]]
+name = "render-layout"
+version = "0.1.0"
+dependencies = [
+ "render-css",
+ "render-dom",
+ "render-html",
 ]
 
 [[package]]

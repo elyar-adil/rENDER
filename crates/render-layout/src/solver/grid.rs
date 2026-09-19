@@ -1,29 +1,29 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::GridAutoRepeat;
-use crate::css::properties::GridTemplate;
-use crate::css::properties::GridTrack;
-use crate::css::properties::GridTrackBreadth;
-use crate::css::properties::LengthPercentage;
-use crate::css::properties::Size;
-use crate::css::properties::TypedPropertyValue;
-use crate::dom::NodeId;
-use crate::layout::fragment::FragmentId;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::grid::GridLimitError;
-use crate::layout::grid::TrackSizing;
-use crate::layout::grid::automatic_position;
-use crate::layout::grid::expand_auto_repeat;
-use crate::layout::grid::required_rows;
-use crate::layout::grid::size_axis;
-use crate::layout::solver::GridItem;
-use crate::layout::solver::LayoutDiagnostic;
-use crate::layout::solver::LayoutDiagnosticCode;
-use crate::layout::solver::Solver;
-use crate::layout::solver::resolve::length_depends_on_percentage;
-use crate::layout::tree::FormattingNodeId;
-use crate::layout::tree::FormattingNodeKind;
+use crate::fragment::FragmentId;
+use crate::geometry::PhysicalRect;
+use crate::grid::GridLimitError;
+use crate::grid::TrackSizing;
+use crate::grid::automatic_position;
+use crate::grid::expand_auto_repeat;
+use crate::grid::required_rows;
+use crate::grid::size_axis;
+use crate::solver::GridItem;
+use crate::solver::LayoutDiagnostic;
+use crate::solver::LayoutDiagnosticCode;
+use crate::solver::Solver;
+use crate::solver::resolve::length_depends_on_percentage;
+use crate::tree::FormattingNodeId;
+use crate::tree::FormattingNodeKind;
+use render_css::computed::ComputedStyle;
+use render_css::properties::GridAutoRepeat;
+use render_css::properties::GridTemplate;
+use render_css::properties::GridTrack;
+use render_css::properties::GridTrackBreadth;
+use render_css::properties::LengthPercentage;
+use render_css::properties::Size;
+use render_css::properties::TypedPropertyValue;
+use render_dom::NodeId;
 
 pub(super) fn grid_template(style: Option<&ComputedStyle>, property: &str) -> GridTemplate {
     match style.and_then(|style| style.typed(property)) {

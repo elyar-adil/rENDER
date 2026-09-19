@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -23,6 +22,7 @@ use crate::runtime::convert::same_value_zero;
 use crate::value::CollectionKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_collections_native(

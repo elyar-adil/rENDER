@@ -13,8 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
-use render_dom::NodeId;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -22,6 +20,8 @@ use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
+use render_dom::NodeId;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_events_native(

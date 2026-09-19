@@ -1,0 +1,20 @@
+[package]
+name = "render-layout"
+description = "Immutable layout fragments and the deterministic reference layout solver for the rENDER web runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "render_layout"
+
+[dependencies]
+render-dom = { path = "../render-dom" }
+render-css = { path = "../render-css" }
+
+[dev-dependencies]
+render-html = { path = "../render-html" }
+
+[lints]
+workspace = true

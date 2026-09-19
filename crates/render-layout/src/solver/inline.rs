@@ -1,29 +1,29 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
-use crate::css::properties::AlignItems;
-use crate::css::properties::BoxSizing;
-use crate::css::properties::JustifyContent;
-use crate::css::properties::TextAlign;
-use crate::css::properties::TypedPropertyValue;
-use crate::dom::Node;
-use crate::dom::NodeId;
-use crate::dom::NodeKind;
-use crate::layout::fragment::FragmentId;
-use crate::layout::fragment::FragmentKind;
-use crate::layout::fragment::TextFragmentData;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::geometry::PhysicalSize;
-use crate::layout::solver::FloatArea;
-use crate::layout::solver::InlineAtom;
-use crate::layout::solver::LayoutDiagnostic;
-use crate::layout::solver::LayoutDiagnosticCode;
-use crate::layout::solver::Solver;
-use crate::layout::solver::TextRun;
-use crate::layout::solver::TextStyle;
-use crate::layout::solver::block::inline_float_band;
-use crate::layout::solver::resolve::count_as_f32;
-use crate::layout::tree::FormattingNodeId;
-use crate::layout::tree::FormattingNodeKind;
+use crate::fragment::FragmentId;
+use crate::fragment::FragmentKind;
+use crate::fragment::TextFragmentData;
+use crate::geometry::PhysicalRect;
+use crate::geometry::PhysicalSize;
+use crate::solver::FloatArea;
+use crate::solver::InlineAtom;
+use crate::solver::LayoutDiagnostic;
+use crate::solver::LayoutDiagnosticCode;
+use crate::solver::Solver;
+use crate::solver::TextRun;
+use crate::solver::TextStyle;
+use crate::solver::block::inline_float_band;
+use crate::solver::resolve::count_as_f32;
+use crate::tree::FormattingNodeId;
+use crate::tree::FormattingNodeKind;
+use render_css::properties::AlignItems;
+use render_css::properties::BoxSizing;
+use render_css::properties::JustifyContent;
+use render_css::properties::TextAlign;
+use render_css::properties::TypedPropertyValue;
+use render_dom::Node;
+use render_dom::NodeId;
+use render_dom::NodeKind;
 
 #[allow(
     clippy::cast_precision_loss,
@@ -37,7 +37,7 @@ pub(super) fn parse_font_size(value: &str, basis: f32) -> Option<f32> {
     let value = value.trim().to_ascii_lowercase();
     // Absolute-size keywords share the mapping used by the computed-value
     // stage so both interpretations of `font-size` stay consistent.
-    crate::css::properties::absolute_font_size_keyword(&value, basis)
+    render_css::properties::absolute_font_size_keyword(&value, basis)
         .or_else(|| parse_text_length(&value, basis))
 }
 
@@ -769,9 +769,8 @@ impl Solver<'_> {
         let html_height = self.html_image_dimension(source, "height");
         let intrinsic = self
             .images
-            .and_then(|images| images.get_for_node(source))
-            .map(|loaded| {
-                let (width, height) = loaded.image.intrinsic_size();
+            .and_then(|images| images.intrinsic_size_for_node(source))
+            .map(|(width, height)| {
                 (
                     image_dimension_to_f32(width),
                     image_dimension_to_f32(height),

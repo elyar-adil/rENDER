@@ -23,7 +23,6 @@
 //! `JsRuntime::settle_fetch`, which resolves the `fetch()` promise or
 //! completes the XHR instance.
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -38,6 +37,7 @@ use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::XhrResponse;
 use crate::value::XmlHttpRequestState;
+use render_dom::Dom;
 use url::Url;
 
 impl JsRuntime {

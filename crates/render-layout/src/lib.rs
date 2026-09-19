@@ -1,7 +1,7 @@
-//! CSS formatting structures and immutable layout output.
+//! Immutable layout output and the deterministic reference layout solver.
 //!
 //! Observable DOM effects remain ordered on the page coordinator. Rendering
-//! consumes a specific [`crate::dom::DomRevision`] and produces immutable trees
+//! consumes a specific [`render_dom::DomRevision`] and produces immutable trees
 //! whose independent formatting contexts can be scheduled in parallel.
 
 mod fragment;
@@ -18,8 +18,8 @@ pub use geometry::{
     PhysicalSize, WritingMode,
 };
 pub use solver::{
-    LayoutDiagnostic, LayoutDiagnosticCode, LayoutLimits, LayoutOptions, LayoutOutput,
-    SimpleTextMeasurer, TextMeasure, TextMeasurer, TextStyle, layout_formatting_tree,
+    ImageResourceProvider, LayoutDiagnostic, LayoutDiagnosticCode, LayoutLimits, LayoutOptions,
+    LayoutOutput, SimpleTextMeasurer, TextMeasure, TextMeasurer, TextStyle, layout_formatting_tree,
     layout_formatting_tree_with_images,
 };
 pub use tree::{

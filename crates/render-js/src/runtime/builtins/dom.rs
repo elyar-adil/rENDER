@@ -13,13 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_css::selector::MatchContext;
-use render_css::selector::matches_selector_list;
-use render_css::selector::parse_selector_list;
-use render_css::selector::select_all;
-use render_dom::Dom;
-use render_dom::NodeId;
-use render_dom::NodeKind;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -29,6 +22,13 @@ use crate::runtime::convert::to_number;
 use crate::runtime::types::ElementRect;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_css::selector::MatchContext;
+use render_css::selector::matches_selector_list;
+use render_css::selector::parse_selector_list;
+use render_css::selector::select_all;
+use render_dom::Dom;
+use render_dom::NodeId;
+use render_dom::NodeKind;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_dom_native(
@@ -1035,10 +1035,7 @@ impl JsRuntime {
         Ok(())
     }
 
-    pub(in crate::runtime) fn require_document(
-        &self,
-        object: ObjectId,
-    ) -> Result<NodeId, JsError> {
+    pub(in crate::runtime) fn require_document(&self, object: ObjectId) -> Result<NodeId, JsError> {
         match self.realm.host(object) {
             Some(ObjectHost::Document(document)) => Ok(document),
             _ => Err(JsError::type_error("incompatible Document method receiver")),

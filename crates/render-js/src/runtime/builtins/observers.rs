@@ -13,9 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
-use render_dom::MutationKind;
-use render_dom::NodeId;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -26,6 +23,9 @@ use crate::runtime::types::JsMicrotask;
 use crate::value::MutationWatch;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
+use render_dom::MutationKind;
+use render_dom::NodeId;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_observers_native(

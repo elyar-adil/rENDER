@@ -1,15 +1,15 @@
 #![allow(clippy::float_cmp)]
 
-use crate::css::cascade::{CascadeInput, CascadeOrigin};
-use crate::css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
-use crate::css::selector::{MatchContext, parse_selector_list, select_all};
-use crate::css::stylesheet::parse_stylesheet;
-use crate::html::parse_document;
-use crate::layout::PhysicalRect;
-use crate::layout::fragment::FragmentKind;
-use crate::layout::tree::{FormattingLimits, build_formatting_tree};
+use crate::PhysicalRect;
+use crate::fragment::FragmentKind;
+use crate::tree::{FormattingLimits, build_formatting_tree};
+use render_css::cascade::{CascadeInput, CascadeOrigin};
+use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
+use render_css::selector::{MatchContext, parse_selector_list, select_all};
+use render_css::stylesheet::parse_stylesheet;
+use render_html::parse_document;
 
-use crate::layout::solver::{
+use crate::solver::{
     LayoutDiagnosticCode, LayoutLimits, LayoutOptions, SimpleTextMeasurer, layout_formatting_tree,
 };
 
@@ -18,9 +18,9 @@ fn pipeline(
     css: &str,
     width: f32,
 ) -> (
-    crate::html::ParseOutput,
-    std::collections::BTreeMap<crate::dom::NodeId, crate::css::computed::ComputedStyle>,
-    crate::layout::solver::LayoutOutput,
+    render_html::ParseOutput,
+    std::collections::BTreeMap<render_dom::NodeId, render_css::computed::ComputedStyle>,
+    crate::solver::LayoutOutput,
 ) {
     let output = parse_document(html);
     let sheet = parse_stylesheet(css);
@@ -40,7 +40,7 @@ fn pipeline(
         &formatting,
         &styles,
         LayoutOptions {
-            viewport: crate::layout::PhysicalSize {
+            viewport: crate::PhysicalSize {
                 width,
                 height: 600.0,
             },
@@ -51,7 +51,7 @@ fn pipeline(
     (output, styles, layout)
 }
 
-fn find(dom: &crate::dom::Dom, selector: &str) -> crate::dom::NodeId {
+fn find(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
     let selector = parse_selector_list(selector).unwrap();
     select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
 }
@@ -347,7 +347,7 @@ fn inline_blocks_are_atomic_and_preserve_their_box_model_between_text() {
 
     assert_eq!(
         one.rect.size,
-        crate::layout::PhysicalSize {
+        crate::PhysicalSize {
             width: 54.0,
             height: 24.0
         }
@@ -463,8 +463,8 @@ fn inline_lines_avoid_a_float_and_restore_full_width_below_it() {
         .copied()
         .find(|node| {
             matches!(
-                output.dom.node(*node).map(crate::dom::Node::kind),
-                Some(crate::dom::NodeKind::Text(_))
+                output.dom.node(*node).map(render_dom::Node::kind),
+                Some(render_dom::NodeKind::Text(_))
             )
         })
         .expect("body text node");
@@ -503,8 +503,8 @@ fn inline_line_advances_when_opposing_floats_leave_no_space() {
         .copied()
         .find(|node| {
             matches!(
-                output.dom.node(*node).map(crate::dom::Node::kind),
-                Some(crate::dom::NodeKind::Text(_))
+                output.dom.node(*node).map(render_dom::Node::kind),
+                Some(render_dom::NodeKind::Text(_))
             )
         })
         .expect("body text node");
@@ -703,7 +703,7 @@ fn class_mutation_rebuilds_grid_geometry_for_the_new_dom_revision() {
     let sheet = parse_stylesheet(
         "html, body, #grid, #a, #b { display:block; margin:0 } #grid { display:grid; width:200px } #grid.two { grid-template-columns:1fr 1fr } #grid.one { grid-template-columns:1fr } #a, #b { height:20px }",
     );
-    let render = |dom: &crate::dom::Dom| {
+    let render = |dom: &render_dom::Dom| {
         let styles = compute_document_styles(
             dom,
             &[CascadeInput {
@@ -932,7 +932,7 @@ fn class_mutation_rebuilds_flex_geometry_for_the_new_dom_revision() {
     let sheet = parse_stylesheet(
         "html, body, #a, #b { display:block; margin:0 } #flex { display:flex; width:200px; height:200px } #flex.row { flex-direction:row } #flex.column { flex-direction:column } #a, #b { flex-basis:50px }",
     );
-    let render = |dom: &crate::dom::Dom| {
+    let render = |dom: &render_dom::Dom| {
         let styles = compute_document_styles(
             dom,
             &[CascadeInput {
@@ -949,7 +949,7 @@ fn class_mutation_rebuilds_flex_geometry_for_the_new_dom_revision() {
             &formatting,
             &styles,
             LayoutOptions {
-                viewport: crate::layout::PhysicalSize {
+                viewport: crate::PhysicalSize {
                     width: 200.0,
                     height: 200.0,
                 },
@@ -1176,8 +1176,8 @@ fn column_flex_justify_content_positions_items_along_the_vertical_main_axis() {
         let css = css.replace("#col {", &format!("#col {{ justify-content:{justify};"));
         pipeline(html, &css, 200.0)
     };
-    let rect = |layout: &crate::layout::solver::LayoutOutput,
-                output: &crate::html::ParseOutput,
+    let rect = |layout: &crate::solver::LayoutOutput,
+                output: &render_html::ParseOutput,
                 selector: &str| {
         layout
             .fragments
@@ -1479,7 +1479,7 @@ fn font_size_compounds_through_em_inheritance() {
         styles
             .get(&find(&output.dom, "#p"))
             .and_then(|style| style.get("font-size"))
-            .map(crate::css::computed::ComputedValue::css_text),
+            .map(render_css::computed::ComputedValue::css_text),
         Some("32px")
     );
     // The child's `1.5em` compounds against that absolute inherited size.
@@ -1487,7 +1487,7 @@ fn font_size_compounds_through_em_inheritance() {
         styles
             .get(&find(&output.dom, "#c"))
             .and_then(|style| style.get("font-size"))
-            .map(crate::css::computed::ComputedValue::css_text),
+            .map(render_css::computed::ComputedValue::css_text),
         Some("48px")
     );
     // The text laid out inside the span uses the compounded size.

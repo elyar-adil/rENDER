@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -24,6 +23,7 @@ use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_array_native(
@@ -234,10 +234,7 @@ impl JsRuntime {
         Ok(JsValue::Number(f64::from(length)))
     }
 
-    pub(in crate::runtime) fn array_pop(
-        &mut self,
-        receiver: ObjectId,
-    ) -> Result<JsValue, JsError> {
+    pub(in crate::runtime) fn array_pop(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let length = self.array_length(receiver)?;
         if length == 0 {
             return Ok(JsValue::Undefined);

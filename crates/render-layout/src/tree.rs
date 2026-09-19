@@ -2,11 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::{
+use render_css::computed::ComputedStyle;
+use render_css::properties::{
     Display, DisplayBox, DisplayInside, DisplayOutside, Float, TypedPropertyValue,
 };
-use crate::dom::{Dom, DomRevision, NodeId, NodeKind};
+use render_dom::{Dom, DomRevision, NodeId, NodeKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FormattingNodeId(u32);
@@ -383,7 +383,7 @@ impl Builder<'_> {
                 }
                 self.append_dom_children(dom_node, id, Some(dom_node), depth.saturating_add(1));
                 if matches!(
-                    self.dom.node(dom_node).map(crate::dom::Node::kind),
+                    self.dom.node(dom_node).map(render_dom::Node::kind),
                     Some(NodeKind::Element(element))
                         if element.local_name == "input"
                             && !self
@@ -421,7 +421,7 @@ impl Builder<'_> {
 
     fn formatting_kind(&mut self, node: NodeId, display: &Display) -> (FormattingNodeKind, bool) {
         if matches!(
-            self.dom.node(node).map(crate::dom::Node::kind),
+            self.dom.node(node).map(render_dom::Node::kind),
             Some(NodeKind::Element(element)) if element.local_name == "img"
         ) {
             let inline = matches!(
@@ -582,21 +582,21 @@ const fn context_for_inside(inside: DisplayInside) -> FormattingContextKind {
 
 #[cfg(test)]
 mod tests {
-    use crate::css::cascade::{CascadeInput, CascadeOrigin};
-    use crate::css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
-    use crate::css::selector::{MatchContext, parse_selector_list, select_all};
-    use crate::css::stylesheet::parse_stylesheet;
-    use crate::dom::NodeKind;
-    use crate::html::parse_document;
+    use render_css::cascade::{CascadeInput, CascadeOrigin};
+    use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
+    use render_css::selector::{MatchContext, parse_selector_list, select_all};
+    use render_css::stylesheet::parse_stylesheet;
+    use render_dom::NodeKind;
+    use render_html::parse_document;
 
     use super::{
         FormattingContextKind, FormattingLimits, FormattingNodeKind, build_formatting_tree,
     };
 
     fn styles(
-        dom: &crate::dom::Dom,
+        dom: &render_dom::Dom,
         css: &str,
-    ) -> std::collections::BTreeMap<crate::dom::NodeId, crate::css::computed::ComputedStyle> {
+    ) -> std::collections::BTreeMap<render_dom::NodeId, render_css::computed::ComputedStyle> {
         let sheet = parse_stylesheet(css);
         compute_document_styles(
             dom,
@@ -610,7 +610,7 @@ mod tests {
         )
     }
 
-    fn find(dom: &crate::dom::Dom, selector: &str) -> crate::dom::NodeId {
+    fn find(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
         let selector = parse_selector_list(selector).unwrap();
         select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
     }

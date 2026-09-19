@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use render_html::parse_document;
 use crate::JsValue;
 use crate::{ElementRect, FetchOutcome, JsRuntime};
+use render_html::parse_document;
 use url::Url;
 
 /// Run every queued microtask (including ones queued by earlier microtasks)
@@ -759,9 +759,8 @@ fn get_rect_bounds_reports_installed_geometry() {
     let mut parsed = parse_document("<!doctype html><p id='p'>x</p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
     let mut geometry = std::collections::BTreeMap::new();
-    let body =
-        crate::runtime::builtins::dom::find_body_node(&parsed.dom, parsed.dom.document())
-            .expect("body exists");
+    let body = crate::runtime::builtins::dom::find_body_node(&parsed.dom, parsed.dom.document())
+        .expect("body exists");
     let paragraph = parsed.dom.children(body).unwrap_or_default()[0];
     geometry.insert(
         paragraph.as_u64(),

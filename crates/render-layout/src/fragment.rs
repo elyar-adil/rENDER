@@ -1,6 +1,6 @@
 //! Immutable output of formatting-context layout.
 
-use crate::dom::{DomRevision, NodeId};
+use render_dom::{DomRevision, NodeId};
 
 use super::geometry::{EdgeSizes, PhysicalRect, PhysicalSize};
 use super::tree::FormattingNodeId;
@@ -14,7 +14,15 @@ impl FragmentId {
         self.0
     }
 
-    pub(crate) fn from_index(index: usize) -> Self {
+    /// Construct a fragment id from a raw arena index.
+    ///
+    /// Public so the embedder's paint tests can synthesize fragments.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` does not fit in a `u32`.
+    #[must_use]
+    pub fn from_index(index: usize) -> Self {
         Self(u32::try_from(index).expect("fragment arena exceeded u32 capacity"))
     }
 }
@@ -166,7 +174,9 @@ impl FragmentTree {
         }
     }
 
-    pub(crate) fn new(
+    /// Assemble a fragment tree from the solver's flat fragment arena.
+    #[must_use]
+    pub fn new(
         dom_revision: DomRevision,
         viewport: PhysicalSize,
         root: FragmentId,

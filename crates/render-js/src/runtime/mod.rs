@@ -13,10 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
-use render_dom::DomError;
-use render_dom::DomRevision;
-use render_dom::NodeId;
 use crate::JsError;
 use crate::JsErrorKind;
 use crate::JsSymbol;
@@ -37,6 +33,10 @@ use crate::runtime::types::UserFunction;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
+use render_dom::DomError;
+use render_dom::DomRevision;
+use render_dom::NodeId;
 use std::collections::BTreeMap;
 use url::Url;
 

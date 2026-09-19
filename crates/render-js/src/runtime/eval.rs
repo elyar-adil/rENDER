@@ -13,11 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_css::stylesheet::parse_declaration_list;
-use render_dom::Dom;
-use render_dom::NodeKind;
-use render_html::serialize_html_fragment;
-use render_html::serialize_html_node;
 use crate::JsError;
 use crate::JsErrorKind;
 use crate::JsObject;
@@ -64,6 +59,11 @@ use crate::runtime::types::UserFunction;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_css::stylesheet::parse_declaration_list;
+use render_dom::Dom;
+use render_dom::NodeKind;
+use render_html::serialize_html_fragment;
+use render_html::serialize_html_node;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1502,9 +1502,7 @@ impl JsRuntime {
             return Ok(());
         }
         let inherited = self.realm.get_symbol_descriptor(object, symbol);
-        if let Some(descriptor) =
-            inherited.filter(crate::value::PropertyDescriptor::is_accessor)
-        {
+        if let Some(descriptor) = inherited.filter(crate::value::PropertyDescriptor::is_accessor) {
             if let Some(setter) = descriptor.setter {
                 self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
             }
@@ -1539,9 +1537,7 @@ impl JsRuntime {
             return Ok(());
         }
         let inherited = self.realm.get_descriptor(object, key);
-        if let Some(descriptor) =
-            inherited.filter(crate::value::PropertyDescriptor::is_accessor)
-        {
+        if let Some(descriptor) = inherited.filter(crate::value::PropertyDescriptor::is_accessor) {
             if let Some(setter) = descriptor.setter {
                 self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
             }

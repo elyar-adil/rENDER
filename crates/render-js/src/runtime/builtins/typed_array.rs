@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -24,6 +23,7 @@ use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::TypedArrayKind;
 use crate::value::TypedBuffer;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_typed_array_native(
@@ -564,10 +564,7 @@ impl JsRuntime {
 
     /// `ToIndex` for typed-array lengths and offsets: `NaN` clamps to zero and
     /// negative or non-finite values raise a `RangeError`.
-    pub(in crate::runtime) fn typed_index(
-        &mut self,
-        value: &JsValue,
-    ) -> Result<usize, JsError> {
+    pub(in crate::runtime) fn typed_index(&mut self, value: &JsValue) -> Result<usize, JsError> {
         let number = to_number(value)?;
         if number.is_nan() {
             return Ok(0);

@@ -1,26 +1,26 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::AlignItems;
-use crate::css::properties::AutoLengthPercentage;
-use crate::css::properties::BoxSizing;
-use crate::css::properties::FlexBasis;
-use crate::css::properties::FlexDirection;
-use crate::css::properties::JustifyContent;
-use crate::css::properties::Size;
-use crate::css::properties::TypedPropertyValue;
-use crate::dom::NodeId;
-use crate::layout::fragment::FragmentId;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::solver::FlexItem;
-use crate::layout::solver::Solver;
-use crate::layout::solver::inline::align_offset;
-use crate::layout::solver::inline::justify_offsets;
-use crate::layout::solver::resolve::count_as_f32;
-use crate::layout::solver::resolve::length_depends_on_percentage;
-use crate::layout::tree::FormattingContextKind;
-use crate::layout::tree::FormattingNodeId;
-use crate::layout::tree::FormattingNodeKind;
+use crate::fragment::FragmentId;
+use crate::geometry::PhysicalRect;
+use crate::solver::FlexItem;
+use crate::solver::Solver;
+use crate::solver::inline::align_offset;
+use crate::solver::inline::justify_offsets;
+use crate::solver::resolve::count_as_f32;
+use crate::solver::resolve::length_depends_on_percentage;
+use crate::tree::FormattingContextKind;
+use crate::tree::FormattingNodeId;
+use crate::tree::FormattingNodeKind;
+use render_css::computed::ComputedStyle;
+use render_css::properties::AlignItems;
+use render_css::properties::AutoLengthPercentage;
+use render_css::properties::BoxSizing;
+use render_css::properties::FlexBasis;
+use render_css::properties::FlexDirection;
+use render_css::properties::JustifyContent;
+use render_css::properties::Size;
+use render_css::properties::TypedPropertyValue;
+use render_dom::NodeId;
 
 impl Solver<'_> {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

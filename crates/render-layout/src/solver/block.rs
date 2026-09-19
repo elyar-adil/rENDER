@@ -1,29 +1,29 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::BoxSizing;
-use crate::css::properties::Clear;
-use crate::css::properties::Display;
-use crate::css::properties::DisplayInside;
-use crate::css::properties::Float;
-use crate::css::properties::Overflow;
-use crate::css::properties::Position;
-use crate::css::properties::TypedPropertyValue;
-use crate::dom::NodeId;
-use crate::layout::fragment::BoxGeometry;
-use crate::layout::fragment::FragmentId;
-use crate::layout::fragment::FragmentKind;
-use crate::layout::geometry::EdgeSizes;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::solver::BlockResult;
-use crate::layout::solver::FloatArea;
-use crate::layout::solver::LayoutDiagnostic;
-use crate::layout::solver::LayoutDiagnosticCode;
-use crate::layout::solver::Solver;
-use crate::layout::solver::resolve::position;
-use crate::layout::tree::FormattingContextKind;
-use crate::layout::tree::FormattingNodeId;
-use crate::layout::tree::FormattingNodeKind;
+use crate::fragment::BoxGeometry;
+use crate::fragment::FragmentId;
+use crate::fragment::FragmentKind;
+use crate::geometry::EdgeSizes;
+use crate::geometry::PhysicalRect;
+use crate::solver::BlockResult;
+use crate::solver::FloatArea;
+use crate::solver::LayoutDiagnostic;
+use crate::solver::LayoutDiagnosticCode;
+use crate::solver::Solver;
+use crate::solver::resolve::position;
+use crate::tree::FormattingContextKind;
+use crate::tree::FormattingNodeId;
+use crate::tree::FormattingNodeKind;
+use render_css::computed::ComputedStyle;
+use render_css::properties::BoxSizing;
+use render_css::properties::Clear;
+use render_css::properties::Display;
+use render_css::properties::DisplayInside;
+use render_css::properties::Float;
+use render_css::properties::Overflow;
+use render_css::properties::Position;
+use render_css::properties::TypedPropertyValue;
+use render_dom::NodeId;
 
 pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>) -> bool {
     ["overflow-x", "overflow-y"].into_iter().any(|property| {

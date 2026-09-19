@@ -1,27 +1,27 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
 use super::inline::parse_font_size;
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::AutoLengthPercentage;
-use crate::css::properties::BorderStyle;
-use crate::css::properties::BorderWidth;
-use crate::css::properties::BoxSizing;
-use crate::css::properties::Gap;
-use crate::css::properties::LengthPercentage;
-use crate::css::properties::LengthResolutionContext;
-use crate::css::properties::MaxSize;
-use crate::css::properties::NumericType;
-use crate::css::properties::Position;
-use crate::css::properties::Size;
-use crate::css::properties::TypedPropertyValue;
-use crate::dom::NodeId;
-use crate::layout::fragment::FragmentId;
-use crate::layout::fragment::FragmentKind;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::solver::AutoEdge;
-use crate::layout::solver::LayoutDiagnostic;
-use crate::layout::solver::LayoutDiagnosticCode;
-use crate::layout::solver::Solver;
+use crate::fragment::FragmentId;
+use crate::fragment::FragmentKind;
+use crate::geometry::PhysicalRect;
+use crate::solver::AutoEdge;
+use crate::solver::LayoutDiagnostic;
+use crate::solver::LayoutDiagnosticCode;
+use crate::solver::Solver;
+use render_css::computed::ComputedStyle;
+use render_css::properties::AutoLengthPercentage;
+use render_css::properties::BorderStyle;
+use render_css::properties::BorderWidth;
+use render_css::properties::BoxSizing;
+use render_css::properties::Gap;
+use render_css::properties::LengthPercentage;
+use render_css::properties::LengthResolutionContext;
+use render_css::properties::MaxSize;
+use render_css::properties::NumericType;
+use render_css::properties::Position;
+use render_css::properties::Size;
+use render_css::properties::TypedPropertyValue;
+use render_dom::NodeId;
 
 pub(super) fn position(style: Option<&ComputedStyle>) -> Position {
     match style.and_then(|style| style.typed("position")) {

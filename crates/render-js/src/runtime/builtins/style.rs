@@ -13,10 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_css::stylesheet::parse_declaration_list;
-use render_dom::Dom;
-use render_dom::DomError;
-use render_dom::NodeId;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -26,6 +22,10 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_css::stylesheet::parse_declaration_list;
+use render_dom::Dom;
+use render_dom::DomError;
+use render_dom::NodeId;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_style_native(

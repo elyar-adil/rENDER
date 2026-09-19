@@ -13,13 +13,13 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_math_native(

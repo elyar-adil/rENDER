@@ -197,7 +197,7 @@ pub fn cascade_element_with_inline(
     }
 }
 
-pub(crate) fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
+pub fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
     split_media_list(query)
         .into_iter()
         .any(|query| media_query_matches(query, context))

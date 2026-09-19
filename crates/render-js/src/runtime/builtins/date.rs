@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -22,6 +21,7 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_date_native(
@@ -167,9 +167,7 @@ impl JsRuntime {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    pub(in crate::runtime) fn date_components(
-        ms: f64,
-    ) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
+    pub(in crate::runtime) fn date_components(ms: f64) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
         let total_millis = ms.floor() as i64;
         let days = total_millis.div_euclid(86_400_000);
         let day_millis = total_millis.rem_euclid(86_400_000);

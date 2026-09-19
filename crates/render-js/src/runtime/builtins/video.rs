@@ -32,7 +32,6 @@
 //! decode cursor, and `addEventListener` on video elements is not wired
 //! (use the `onloadedmetadata`/`onerror` properties).
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -48,6 +47,7 @@ use crate::value::VideoElementState;
 use crate::value::VideoMedia;
 use crate::value::VideoPlayPromise;
 use crate::video::VideoPipeline;
+use render_dom::Dom;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -534,13 +534,13 @@ fn supports_avc(codecs: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use render_dom::Dom;
-    use render_html::parse_document;
     use crate::JsRuntime;
     use crate::JsValue;
     use crate::runtime::types::FetchOutcome;
     use crate::runtime::types::PendingFetch;
     use crate::video::test_mp4::TestMp4Builder;
+    use render_dom::Dom;
+    use render_html::parse_document;
     use url::Url;
 
     /// A runtime on `https://example.test/watch` with microtask and media

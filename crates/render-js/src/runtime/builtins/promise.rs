@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -24,6 +23,7 @@ use crate::runtime::types::PromiseReaction;
 use crate::runtime::types::PromiseRecord;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_promise_native(

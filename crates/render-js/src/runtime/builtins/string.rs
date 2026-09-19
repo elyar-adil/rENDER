@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -26,6 +25,7 @@ use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::number_to_string;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_string_native(
@@ -552,10 +552,7 @@ impl JsRuntime {
         }))
     }
 
-    pub(in crate::runtime) fn string_trim(
-        &self,
-        receiver: ObjectId,
-    ) -> Result<JsValue, JsError> {
+    pub(in crate::runtime) fn string_trim(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
         Ok(JsValue::String(text.trim().to_owned()))
     }

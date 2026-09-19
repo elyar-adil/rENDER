@@ -13,7 +13,6 @@
     clippy::wrong_self_convention
 )]
 
-use render_dom::Dom;
 use crate::JsError;
 use crate::JsObject;
 use crate::JsSymbol;
@@ -28,6 +27,7 @@ use crate::runtime::types::ObjectEntryKind;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use render_dom::Dom;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_object_native(
@@ -840,10 +840,7 @@ impl JsRuntime {
         format!("[object {builtin}]")
     }
 
-    pub(in crate::runtime) fn object_to_string_tag_for_object(
-        &self,
-        object: ObjectId,
-    ) -> String {
+    pub(in crate::runtime) fn object_to_string_tag_for_object(&self, object: ObjectId) -> String {
         // ECMA-262 Object.prototype.toString step 7: a string-valued
         // `Symbol.toStringTag` overrides the builtin tag. Real-world
         // polyfills (core-js) probe this before selecting their fast paths.

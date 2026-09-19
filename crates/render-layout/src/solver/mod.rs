@@ -1,21 +1,20 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
-use crate::css::computed::ComputedStyle;
-use crate::css::properties::Float;
-use crate::dom::Dom;
-use crate::dom::NodeId;
-use crate::image::ImageResources;
-use crate::layout::fragment::BoxGeometry;
-use crate::layout::fragment::Fragment;
-use crate::layout::fragment::FragmentId;
-use crate::layout::fragment::FragmentKind;
-use crate::layout::fragment::FragmentTree;
-use crate::layout::geometry::EdgeSizes;
-use crate::layout::geometry::PhysicalRect;
-use crate::layout::geometry::PhysicalSize;
-use crate::layout::solver::inline::is_wide_character;
-use crate::layout::tree::FormattingNodeId;
-use crate::layout::tree::FormattingTree;
+use crate::fragment::BoxGeometry;
+use crate::fragment::Fragment;
+use crate::fragment::FragmentId;
+use crate::fragment::FragmentKind;
+use crate::fragment::FragmentTree;
+use crate::geometry::EdgeSizes;
+use crate::geometry::PhysicalRect;
+use crate::geometry::PhysicalSize;
+use crate::solver::inline::is_wide_character;
+use crate::tree::FormattingNodeId;
+use crate::tree::FormattingTree;
+use render_css::computed::ComputedStyle;
+use render_css::properties::Float;
+use render_dom::Dom;
+use render_dom::NodeId;
 use std::collections::BTreeMap;
 
 mod block;
@@ -44,6 +43,17 @@ pub struct TextMeasure {
 /// and parallel-safe as long as the supplied measurer is.
 pub trait TextMeasurer: Sync {
     fn measure(&self, text: &str, style: TextStyle) -> TextMeasure;
+}
+
+/// Read-only view of decoded image resources for replaced-element sizing.
+///
+/// The concrete resource store is owned by the embedder because it shares deep
+/// dependencies with painting and networking, so the reference solver depends
+/// only on this seam.
+pub trait ImageResourceProvider: Sync {
+    /// Intrinsic pixel size of the decoded image currently loaded for `node`.
+    #[must_use]
+    fn intrinsic_size_for_node(&self, node: NodeId) -> Option<(u32, u32)>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -151,18 +161,39 @@ pub fn layout_formatting_tree(
     options: LayoutOptions,
     text_measurer: &dyn TextMeasurer,
 ) -> LayoutOutput {
-    layout_formatting_tree_with_images(dom, formatting, styles, options, text_measurer, None)
+    run_reference_layout(dom, formatting, styles, options, text_measurer, None)
 }
 
 /// Layout with decoded replaced-element resources available for intrinsic sizing.
+///
+/// The provider is generic so embedders can pass their concrete resource store
+/// by reference without naming a trait object.
 #[must_use]
-pub fn layout_formatting_tree_with_images(
+pub fn layout_formatting_tree_with_images<I: ImageResourceProvider>(
     dom: &Dom,
     formatting: &FormattingTree,
     styles: &BTreeMap<NodeId, ComputedStyle>,
     options: LayoutOptions,
     text_measurer: &dyn TextMeasurer,
-    images: Option<&ImageResources>,
+    images: Option<&I>,
+) -> LayoutOutput {
+    run_reference_layout(
+        dom,
+        formatting,
+        styles,
+        options,
+        text_measurer,
+        images.map(|provider| provider as &dyn ImageResourceProvider),
+    )
+}
+
+fn run_reference_layout(
+    dom: &Dom,
+    formatting: &FormattingTree,
+    styles: &BTreeMap<NodeId, ComputedStyle>,
+    options: LayoutOptions,
+    text_measurer: &dyn TextMeasurer,
+    images: Option<&dyn ImageResourceProvider>,
 ) -> LayoutOutput {
     let mut solver = Solver {
         dom,
@@ -231,7 +262,7 @@ struct Solver<'a> {
     styles: &'a BTreeMap<NodeId, ComputedStyle>,
     options: LayoutOptions,
     text_measurer: &'a dyn TextMeasurer,
-    images: Option<&'a ImageResources>,
+    images: Option<&'a dyn ImageResourceProvider>,
     fragments: Vec<Fragment>,
     diagnostics: Vec<LayoutDiagnostic>,
     inline_characters: usize,
