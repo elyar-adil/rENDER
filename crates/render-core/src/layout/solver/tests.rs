@@ -1341,6 +1341,56 @@ fn flex_column_child_percentage_height_follows_container_definiteness() {
     assert_eq!(item_rect("#flow").size.height, 40.0);
 }
 
+// A column flex container with a definite width and height centers a
+// fixed-size child on both axes: `align-items:center` offsets the cross
+// axis (horizontal) by (line width - item width) / 2 and
+// `justify-content:center` starts the main-axis (vertical) cursor at
+// (container height - item height) / 2 (CSS Flexbox §9.5).
+#[test]
+fn column_flex_centering_offsets_child_on_both_axes() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='col'><div id='card'></div></div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #col { display:flex; flex-direction:column; align-items:center; justify-content:center; width:1770px; height:600px } \
+         #card { width:400px; height:503px }",
+        1770.0,
+    );
+    let card = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#card")))
+        .expect("card fragment")
+        .rect;
+    assert_eq!(card.size.width, 400.0);
+    assert_eq!(card.size.height, 503.0);
+    assert_eq!(card.origin.x, (1770.0 - 400.0) / 2.0);
+    assert_eq!(card.origin.y, (600.0 - 503.0) / 2.0);
+}
+
+// `align-items:stretch` with an auto cross size (width) makes a column
+// flex item fill the container's width instead of hugging its content
+// (CSS Flexbox §9.5 cross-axis alignment).
+#[test]
+fn column_flex_stretch_item_fills_the_container_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='col'><div id='item'></div></div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #col { display:flex; flex-direction:column; align-items:stretch; width:800px; height:400px } \
+         #item { height:120px }",
+        800.0,
+    );
+    let item = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#item")))
+        .expect("stretched item fragment")
+        .rect;
+    assert_eq!(item.size.width, 800.0);
+    assert_eq!(item.origin.x, 0.0);
+    assert_eq!(item.size.height, 120.0);
+    assert_eq!(item.origin.y, 0.0);
+}
+
 // Percentage paddings always resolve against the containing WIDTH
 // (CSS 2 §10.5), so the classic `padding-top` aspect-ratio box keeps its
 // width-derived size even inside auto-height ancestors. The interaction
