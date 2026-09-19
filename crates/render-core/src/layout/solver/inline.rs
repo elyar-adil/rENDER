@@ -35,16 +35,10 @@ pub(super) fn image_dimension_to_f32(value: u32) -> f32 {
 
 pub(super) fn parse_font_size(value: &str, basis: f32) -> Option<f32> {
     let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "xx-small" => Some(9.0),
-        "x-small" => Some(10.0),
-        "small" => Some(13.0),
-        "medium" => Some(16.0),
-        "large" => Some(18.0),
-        "x-large" => Some(24.0),
-        "xx-large" => Some(32.0),
-        _ => parse_text_length(&value, basis),
-    }
+    // Absolute-size keywords share the mapping used by the computed-value
+    // stage so both interpretations of `font-size` stay consistent.
+    crate::css::properties::absolute_font_size_keyword(&value, basis)
+        .or_else(|| parse_text_length(&value, basis))
 }
 
 pub(super) fn parse_line_height(value: &str, font_size: f32) -> Option<f32> {

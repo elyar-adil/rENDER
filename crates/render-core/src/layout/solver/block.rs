@@ -482,15 +482,33 @@ impl Solver<'_> {
             .into_iter()
             .partition(|child| !self.is_out_of_flow(*child));
         let (mut children, auto_height) = match context {
-            FormattingContextKind::Flex => self.layout_flex_children(
-                &flow_children,
-                PhysicalRect::new(content_x, content_y, content_width, 0.0),
-                positioned_child_containing,
-                specified_content_height,
-                depth.saturating_add(1),
-                style,
-                node.source,
-            ),
+            FormattingContextKind::Flex => {
+                // A `min-height` resolving against a definite containing
+                // block gives the flex container a definite main size for
+                // `justify-content` distribution (CSS Flexbox §9).
+                let flex_height = specified_content_height.or_else(|| {
+                    self.resolve_size_against(
+                        style,
+                        "min-height",
+                        containing_height_definite.then_some(containing.size.height),
+                        node.source,
+                    )
+                });
+                self.layout_flex_children(
+                    &flow_children,
+                    PhysicalRect::new(
+                        content_x,
+                        content_y,
+                        content_width,
+                        flex_height.unwrap_or(0.0),
+                    ),
+                    positioned_child_containing,
+                    flex_height,
+                    depth.saturating_add(1),
+                    style,
+                    node.source,
+                )
+            }
             FormattingContextKind::Grid => self.layout_grid_children(
                 &flow_children,
                 PhysicalRect::new(content_x, content_y, content_width, 0.0),

@@ -801,6 +801,11 @@ impl CustomResolver<'_> {
     }
 }
 
+/// Absolute pixel size of the default user font (`medium`, 16px). The
+/// computation stage has no viewport-independent root-font override; layout
+/// uses the same default in `LengthResolutionContext`.
+const DEFAULT_ROOT_FONT_SIZE: f32 = 16.0;
+
 /// Resolve token-level computed values for one element.
 #[must_use]
 #[allow(clippy::too_many_lines)] // Kept linear to mirror the ordered CSS computed-value stages.
@@ -976,6 +981,30 @@ pub fn compute_style(
             properties.insert(name.clone(), value);
         }
     }
+    // CSS 2.1 §6.1.1: the computed value of `font-size` is an absolute
+    // length. Absolutizing it here means descendants inherit pixels (so a
+    // child's `em`-based font sizes compound against the parent's real size)
+    // and layout can use this element's stored value as its `em` basis.
+    let parent_font_size = parent
+        .and_then(|style| style.get("font-size"))
+        .and_then(|value| {
+            super::properties::computed_font_size_px(
+                value.css_text(),
+                DEFAULT_ROOT_FONT_SIZE,
+                DEFAULT_ROOT_FONT_SIZE,
+            )
+        })
+        .unwrap_or(DEFAULT_ROOT_FONT_SIZE);
+    if let Some(value) = properties.get("font-size")
+        && let Some(pixels) = super::properties::computed_font_size_px(
+            value.css_text(),
+            parent_font_size,
+            DEFAULT_ROOT_FONT_SIZE,
+        )
+        && let Some(tokens) = tokenize(&format!("{pixels}px"), limits).ok()
+    {
+        properties.insert("font-size".to_owned(), ComputedValue::new(tokens));
+    }
     for (name, value) in cascaded.properties() {
         if name.starts_with("--") || registry.get(name).is_some() {
             continue;
@@ -1137,7 +1166,7 @@ mod tests {
         );
         let mut registry = PropertyRegistry::new();
         registry.define("color", true, "canvastext");
-        registry.define("border-color", false, "currentcolor");
+        registry.define("border-top-color", false, "currentcolor");
         let styles = compute_document_styles(
             &output.dom,
             &[CascadeInput {
@@ -1162,9 +1191,11 @@ mod tests {
             child.get("color").map(super::ComputedValue::css_text),
             Some("red")
         );
+        // The border-color shorthand expands into per-edge longhands, and the
+        // var() fallback resolves against the child's own custom property.
         assert_eq!(
             child
-                .get("border-color")
+                .get("border-top-color")
                 .map(super::ComputedValue::css_text),
             Some("blue")
         );
@@ -1259,6 +1290,77 @@ mod tests {
             Some("blue")
         );
         assert!(child.get("--gone").is_none());
+    }
+
+    #[test]
+    fn font_size_computes_to_an_absolute_length() {
+        let output = parse_document(
+            "<!doctype html><div id='pct'><p id='em-child'></p><span id='plain'></span></div>",
+        );
+        let sheet = parse_stylesheet(
+            "#pct { font-size: 200% } #em-child { font-size: 1.2em } #plain { font-size: large }",
+        );
+        let registry = PropertyRegistry::standard_baseline();
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+
+        // 200% of the 16px default is 32px, and the child's `1.2em` must
+        // compound against that real inherited size (CSS 2.1 §6.1.1).
+        assert_eq!(
+            styles
+                .get(&target_id(&output.dom, "#pct"))
+                .and_then(|style| style.get("font-size"))
+                .map(super::ComputedValue::css_text),
+            Some("32px")
+        );
+        assert_eq!(
+            styles
+                .get(&target_id(&output.dom, "#em-child"))
+                .and_then(|style| style.get("font-size"))
+                .map(super::ComputedValue::css_text),
+            Some("38.4px")
+        );
+        // Absolute-size keywords map to the fixed user-font table.
+        assert_eq!(
+            styles
+                .get(&target_id(&output.dom, "#plain"))
+                .and_then(|style| style.get("font-size"))
+                .map(super::ComputedValue::css_text),
+            Some("18px")
+        );
+    }
+
+    #[test]
+    fn unset_font_size_inherits_the_parent_absolute_length() {
+        let output = parse_document("<!doctype html><div id='p'><span id='c'></span></div>");
+        let sheet = parse_stylesheet("#p { font-size: 25px }");
+        let registry = PropertyRegistry::standard_baseline();
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            styles
+                .get(&target_id(&output.dom, "#c"))
+                .and_then(|style| style.get("font-size"))
+                .map(super::ComputedValue::css_text),
+            Some("25px")
+        );
     }
 
     #[test]

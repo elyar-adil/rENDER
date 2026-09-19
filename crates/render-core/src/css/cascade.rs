@@ -343,11 +343,23 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
     if matches!(name, "margin" | "padding") {
         return expand_box_shorthand(name, value);
     }
-    if name == "border" {
-        return expand_border_shorthand(value);
+    match name {
+        "border" => expand_border_shorthand(value),
+        "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            expand_border_side_shorthand(name, value)
+        }
+        "border-width" | "border-style" | "border-color" => {
+            expand_border_part_shorthand(name, value)
+        }
+        "font" => expand_font_shorthand(value)
+            .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
+        // `grid-gap` and its longhands are the legacy spellings real sheets
+        // still ship; they expand exactly like their modern counterparts.
+        _ => expand_legacy_longhands(name, value),
     }
-    // `grid-gap` and its longhands are the legacy spellings real sheets
-    // still ship; they expand exactly like their modern counterparts.
+}
+
+fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
     let gap_alias = name == "gap" || name == "grid-gap";
     let gap_longhand = match name {
         "grid-row-gap" => Some("row-gap"),
@@ -530,7 +542,9 @@ fn extract_css_gradients(value: &str) -> Option<String> {
 }
 
 fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
-    let values: Vec<&str> = value.split_ascii_whitespace().collect();
+    // Component-aware splitting keeps math functions such as
+    // `margin: calc(50% - 10px) auto` intact.
+    let values: Vec<&str> = split_css_components(value);
     if values.is_empty() || values.len() > 4 {
         return vec![(name.to_owned(), value.to_owned())];
     }
@@ -547,35 +561,179 @@ fn expand_box_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn expand_border_shorthand(value: &str) -> Vec<(String, String)> {
-    let values: Vec<&str> = value.split_ascii_whitespace().collect();
-    let mut result = Vec::new();
-    for token in values {
-        let property =
-            if token.ends_with("px") || token == "thin" || token == "medium" || token == "thick" {
-                "border-width"
-            } else if matches!(
-                token,
-                "none" | "hidden" | "dotted" | "dashed" | "solid" | "double"
-            ) {
-                "border-style"
+/// One component of a `border*` shorthand classified per CSS 2.1 §8.5:
+/// the three value slots are order-independent and at most one of each kind
+/// may appear.
+enum BorderComponent {
+    Width(String),
+    Style(String),
+    Color(String),
+}
+
+fn classify_border_component(token: &str) -> BorderComponent {
+    let lowered = token.to_ascii_lowercase();
+    match lowered.as_str() {
+        "thin" | "medium" | "thick" => BorderComponent::Width(lowered),
+        "none" | "hidden" | "dotted" | "dashed" | "solid" | "double" | "groove" | "ridge"
+        | "inset" | "outset" => BorderComponent::Style(lowered),
+        _ => {
+            if is_border_width_token(&lowered) {
+                BorderComponent::Width(token.to_owned())
             } else {
-                "border-color"
-            };
-        for edge in ["top", "right", "bottom", "left"] {
-            let suffix = match property {
-                "border-width" => "width",
-                "border-style" => "style",
-                _ => "color",
-            };
-            result.push((format!("border-{edge}-{suffix}"), token.to_owned()));
+                BorderComponent::Color(token.to_owned())
+            }
         }
     }
-    if result.is_empty() {
-        vec![("border".to_owned(), value.to_owned())]
-    } else {
-        result
+}
+
+/// `<line-width>` accepts any `<length [0,∞]>`; a bare `0` (the extremely
+/// common `border: 0` reset) and dimensioned lengths both classify as widths.
+/// Colors never begin with a number or sign, so a numeric-leading token can
+/// only be a width.
+fn is_border_width_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit() || matches!(character, '.' | '+' | '-'))
+}
+
+/// Apply classified border components to `result`, keyed by longhand suffix.
+fn push_border_longhands(
+    result: &mut Vec<(String, String)>,
+    prefix: &str,
+    components: &[BorderComponent],
+) {
+    // Per CSS 2.1 §8.5.4 a border shorthand resets every longhand it does
+    // not explicitly specify to its initial value.
+    let mut width = "medium".to_owned();
+    let mut style = "none".to_owned();
+    let mut color = "currentcolor".to_owned();
+    for component in components {
+        match component {
+            BorderComponent::Width(value) => width.clone_from(value),
+            BorderComponent::Style(value) => style.clone_from(value),
+            BorderComponent::Color(value) => color.clone_from(value),
+        }
     }
+    for (suffix, value) in [("width", width), ("style", style), ("color", color)] {
+        result.push((format!("{prefix}-{suffix}"), value));
+    }
+}
+
+fn expand_border_shorthand(value: &str) -> Vec<(String, String)> {
+    let components: Vec<_> = split_css_components(value)
+        .into_iter()
+        .map(classify_border_component)
+        .collect();
+    if components.is_empty() {
+        return vec![("border".to_owned(), value.to_owned())];
+    }
+    let mut result = Vec::new();
+    for edge in ["top", "right", "bottom", "left"] {
+        push_border_longhands(&mut result, &format!("border-{edge}"), &components);
+    }
+    result
+}
+
+fn expand_border_side_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let components: Vec<_> = split_css_components(value)
+        .into_iter()
+        .map(classify_border_component)
+        .collect();
+    if components.is_empty() {
+        return vec![(name.to_owned(), value.to_owned())];
+    }
+    let mut result = Vec::new();
+    push_border_longhands(&mut result, name, &components);
+    result
+}
+
+fn expand_border_part_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    let Some(suffix) = name.strip_prefix("border-") else {
+        return vec![(name.to_owned(), value.to_owned())];
+    };
+    let values: Vec<&str> = split_css_components(value);
+    if values.is_empty() || values.len() > 4 {
+        return vec![(name.to_owned(), value.to_owned())];
+    }
+    let edges = match values.len() {
+        1 => [values[0], values[0], values[0], values[0]],
+        2 => [values[0], values[1], values[0], values[1]],
+        3 => [values[0], values[1], values[2], values[1]],
+        _ => [values[0], values[1], values[2], values[3]],
+    };
+    ["top", "right", "bottom", "left"]
+        .into_iter()
+        .zip(edges)
+        .map(|(edge, value)| (format!("border-{edge}-{suffix}"), value.to_owned()))
+        .collect()
+}
+
+/// The `font` shorthand per CSS Fonts: optional style/variant/weight keywords
+/// in any order, a mandatory size (with optional `/line-height`), and a
+/// mandatory font family.
+fn expand_font_shorthand(value: &str) -> Option<Vec<(String, String)>> {
+    const STYLE_KEYWORDS: [&str; 3] = ["italic", "oblique", "normal"];
+    const VARIANT_KEYWORDS: [&str; 2] = ["normal", "small-caps"];
+    const WEIGHT_KEYWORDS: [&str; 4] = ["normal", "bold", "bolder", "lighter"];
+    let components = split_css_components(value);
+    if components.is_empty() {
+        return None;
+    }
+    let mut style = "normal".to_owned();
+    let mut variant = "normal".to_owned();
+    let mut weight = "normal".to_owned();
+    let mut index = 0;
+    while let Some(component) = components.get(index) {
+        let lowered = component.to_ascii_lowercase();
+        // `normal` is valid in every keyword slot; consume at most one of each.
+        let consumed = match lowered.as_str() {
+            keyword if STYLE_KEYWORDS.contains(&keyword) => {
+                if style != "normal" {
+                    break;
+                }
+                style = lowered;
+                true
+            }
+            keyword if VARIANT_KEYWORDS.contains(&keyword) => {
+                if variant != "normal" {
+                    break;
+                }
+                variant = lowered;
+                true
+            }
+            keyword if WEIGHT_KEYWORDS.contains(&keyword) || lowered.parse::<u32>().is_ok() => {
+                if weight != "normal" {
+                    break;
+                }
+                weight = lowered;
+                true
+            }
+            _ => false,
+        };
+        if !consumed {
+            break;
+        }
+        index += 1;
+    }
+    let size_component = (*components.get(index)?).trim();
+    let (size, line_height) = size_component
+        .split_once('/')
+        .map_or((size_component, "normal"), |(size, height)| {
+            (size, height.trim())
+        });
+    let family = components[index + 1..].join(" ");
+    if size.is_empty() || family.is_empty() {
+        return None;
+    }
+    Some(vec![
+        ("font-style".to_owned(), style),
+        ("font-variant".to_owned(), variant),
+        ("font-weight".to_owned(), weight),
+        ("font-size".to_owned(), size.to_owned()),
+        ("line-height".to_owned(), line_height.to_owned()),
+        ("font-family".to_owned(), family),
+    ])
 }
 
 fn select_cascaded_candidate(mut candidates: Vec<Candidate>) -> Option<CascadedValue> {
@@ -1021,6 +1179,275 @@ mod tests {
                 .get("background-position")
                 .map(|value| value.value.as_str()),
             Some("50% 50%")
+        );
+    }
+
+    #[test]
+    fn border_zero_shorthand_resets_every_border_longhand() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { border-top-width: 4px; border-left-style: solid; border: 0 }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        // CSS 2.1 §8.5.4: `border: 0` (the classic reset) must set the width,
+        // not be misread as a color, and reset the unspecified longhands.
+        assert_eq!(
+            style
+                .get("border-top-width")
+                .map(|value| value.value.as_str()),
+            Some("0")
+        );
+        assert_eq!(
+            style
+                .get("border-top-style")
+                .map(|value| value.value.as_str()),
+            Some("none")
+        );
+        assert_eq!(
+            style
+                .get("border-top-color")
+                .map(|value| value.value.as_str()),
+            Some("currentcolor")
+        );
+        assert_eq!(
+            style
+                .get("border-left-style")
+                .map(|value| value.value.as_str()),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn border_shorthand_classifies_functional_colors_with_spaces() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { border: 1px solid rgba(0, 0, 0, 0.5) }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("border-top-width")
+                .map(|value| value.value.as_str()),
+            Some("1px")
+        );
+        assert_eq!(
+            style
+                .get("border-bottom-style")
+                .map(|value| value.value.as_str()),
+            Some("solid")
+        );
+        assert_eq!(
+            style
+                .get("border-left-color")
+                .map(|value| value.value.as_str()),
+            Some("rgba(0, 0, 0, 0.5)")
+        );
+    }
+
+    #[test]
+    fn border_side_shorthand_expands_only_that_side() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { border-bottom: 1px solid #eee }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("border-bottom-width")
+                .map(|value| value.value.as_str()),
+            Some("1px")
+        );
+        assert_eq!(
+            style
+                .get("border-bottom-style")
+                .map(|value| value.value.as_str()),
+            Some("solid")
+        );
+        assert_eq!(
+            style
+                .get("border-bottom-color")
+                .map(|value| value.value.as_str()),
+            Some("#eee")
+        );
+        assert_eq!(style.get("border-top-width"), None);
+        assert_eq!(style.get("border-top-color"), None);
+    }
+
+    #[test]
+    fn border_part_shorthands_expand_per_edge() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { border-width: 8px 6px; border-style: dashed dashed solid; border-color: transparent }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        // The CSS triangle pattern: unequal widths, per-edge styles, and a
+        // transparent base color that a later longhand overrides.
+        assert_eq!(
+            style
+                .get("border-top-width")
+                .map(|value| value.value.as_str()),
+            Some("8px")
+        );
+        assert_eq!(
+            style
+                .get("border-right-width")
+                .map(|value| value.value.as_str()),
+            Some("6px")
+        );
+        assert_eq!(
+            style
+                .get("border-bottom-width")
+                .map(|value| value.value.as_str()),
+            Some("8px")
+        );
+        assert_eq!(
+            style
+                .get("border-left-width")
+                .map(|value| value.value.as_str()),
+            Some("6px")
+        );
+        assert_eq!(
+            style
+                .get("border-bottom-style")
+                .map(|value| value.value.as_str()),
+            Some("solid")
+        );
+        assert_eq!(
+            style
+                .get("border-top-style")
+                .map(|value| value.value.as_str()),
+            Some("dashed")
+        );
+        assert_eq!(
+            style
+                .get("border-top-color")
+                .map(|value| value.value.as_str()),
+            Some("transparent")
+        );
+    }
+
+    #[test]
+    fn later_border_color_longhand_overrides_the_part_shorthand() {
+        let (dom, target) = document_and_target();
+        let sheet =
+            parse_stylesheet("#target { border-color: transparent; border-bottom-color: #f2f4f7 }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("border-bottom-color")
+                .map(|value| value.value.as_str()),
+            Some("#f2f4f7")
+        );
+        assert_eq!(
+            style
+                .get("border-top-color")
+                .map(|value| value.value.as_str()),
+            Some("transparent")
+        );
+    }
+
+    #[test]
+    fn font_shorthand_expands_weight_size_line_height_and_family() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { font: bold 14px/20px Arial, sans-serif }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style.get("font-weight").map(|value| value.value.as_str()),
+            Some("bold")
+        );
+        assert_eq!(
+            style.get("font-size").map(|value| value.value.as_str()),
+            Some("14px")
+        );
+        assert_eq!(
+            style.get("line-height").map(|value| value.value.as_str()),
+            Some("20px")
+        );
+        assert_eq!(
+            style.get("font-family").map(|value| value.value.as_str()),
+            Some("Arial, sans-serif")
+        );
+    }
+
+    #[test]
+    fn box_shorthand_keeps_calc_components_together() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet("#target { margin: calc(50% - 10px) auto }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style.get("margin-top").map(|value| value.value.as_str()),
+            Some("calc(50% - 10px)")
+        );
+        assert_eq!(
+            style.get("margin-right").map(|value| value.value.as_str()),
+            Some("auto")
+        );
+        assert_eq!(
+            style.get("margin-bottom").map(|value| value.value.as_str()),
+            Some("calc(50% - 10px)")
+        );
+        assert_eq!(
+            style.get("margin-left").map(|value| value.value.as_str()),
+            Some("auto")
         );
     }
 }

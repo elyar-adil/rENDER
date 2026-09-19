@@ -95,6 +95,8 @@ pub struct JsRuntime {
     call_stack: Vec<CallFrame>,
     /// Byte offsets where each source line starts, for error positioning.
     source_line_starts: Vec<usize>,
+    /// JS-visible cookies (`document.cookie`), keyed by name.
+    js_cookie_jar: BTreeMap<String, String>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
@@ -171,6 +173,7 @@ impl JsRuntime {
             global_symbol_registry: BTreeMap::new(),
             call_stack: Vec::new(),
             source_line_starts: Vec::new(),
+            js_cookie_jar: BTreeMap::new(),
             random_state: {
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -292,6 +295,30 @@ impl JsRuntime {
     /// Drain network transfers queued by `fetch()`/`XMLHttpRequest` since the
     /// last call. The embedding executes each request on its transport and
     /// completes it by id through [`Self::settle_fetch`].
+    /// Serialize the JS-visible cookie jar as `document.cookie` does.
+    pub(super) fn js_cookie_jar_serialize(&self) -> String {
+        self.js_cookie_jar
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Store one cookie from a `document.cookie` assignment.
+    pub(super) fn js_cookie_store(&mut self, assignment: &str) {
+        let Some((name, value)) = assignment.split_once('=') else {
+            return;
+        };
+        let name = name.trim().to_owned();
+        // Attribute suffixes (`; Path=/`, `; Secure`, etc.) are stripped.
+        let value = value.split(';').next().unwrap_or("").trim().to_owned();
+        if value.is_empty() {
+            self.js_cookie_jar.remove(&name);
+        } else {
+            self.js_cookie_jar.insert(name, value);
+        }
+    }
+
     /// Whether any `fetch()`/XHR transfer is still queued for the
     /// embedding, used to keep the event loop polling.
     #[must_use]

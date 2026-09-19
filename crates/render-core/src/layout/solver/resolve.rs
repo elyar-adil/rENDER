@@ -1,5 +1,6 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
+use super::inline::parse_font_size;
 use crate::css::computed::ComputedStyle;
 use crate::css::properties::AutoLengthPercentage;
 use crate::css::properties::BorderStyle;
@@ -334,9 +335,18 @@ impl Solver<'_> {
         node: Option<NodeId>,
         property: &str,
     ) -> f32 {
+        // CSS 2.1 §4.3.2: `em` refers to the computed font size of the
+        // element on which the property is set, not the root font. The
+        // computed-value stage stores an absolute font size, so this stays a
+        // cheap parse of the stored pixel value.
+        let font_size = node
+            .and_then(|node| self.styles.get(&node))
+            .and_then(|style| style.get("font-size"))
+            .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
+            .unwrap_or(self.options.root_font_size);
         let context = LengthResolutionContext {
             percentage_basis: Some(basis),
-            font_size: self.options.root_font_size,
+            font_size,
             root_font_size: self.options.root_font_size,
             line_height: self.options.default_line_height,
             root_line_height: self.options.default_line_height,

@@ -1716,6 +1716,57 @@ fn parse_border_width<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, BorderWid
     }
 }
 
+/// Absolute pixel size of the CSS absolute-size font keywords for a default
+/// 16px `medium` user font. Shared by the computed-value and layout stages so
+/// both agree on the mapping (CSS Fonts §4.1.3). The relative keywords
+/// `larger` and `smaller` step one table entry away from the parent size.
+#[must_use]
+pub(crate) fn absolute_font_size_keyword(keyword: &str, parent_font_size: f32) -> Option<f32> {
+    match keyword {
+        "xx-small" => Some(9.0),
+        "x-small" => Some(10.0),
+        "small" => Some(13.0),
+        "medium" => Some(16.0),
+        "large" => Some(18.0),
+        "x-large" => Some(24.0),
+        "xx-large" => Some(32.0),
+        "larger" => Some(parent_font_size * 1.2),
+        "smaller" => Some(parent_font_size / 1.2),
+        _ => None,
+    }
+}
+
+/// Resolve one `font-size` computed value to absolute CSS pixels.
+///
+/// CSS 2.1 §6.1.1 requires the computed value of `font-size` to be an
+/// absolute length: `em` and `%` resolve against the inherited (parent) font
+/// size, `rem` against the root font size. Returns `None` for values outside
+/// the supported grammar; callers keep their previous interpretation then.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // CSS pixels are stored as f32 throughout layout
+pub(crate) fn computed_font_size_px(
+    value: &str,
+    parent_font_size: f32,
+    root_font_size: f32,
+) -> Option<f32> {
+    let lowered = value.trim().to_ascii_lowercase();
+    if let Some(pixels) = absolute_font_size_keyword(&lowered, parent_font_size) {
+        return Some(pixels);
+    }
+    super::resolve_length_expr(
+        &lowered,
+        &super::LengthContext {
+            percentage_base: Some(f64::from(parent_font_size)),
+            em_base: f64::from(parent_font_size),
+            rem_base: f64::from(root_font_size),
+            ..super::LengthContext::default()
+        },
+    )
+    .ok()
+    .map(|pixels| pixels as f32)
+    .filter(|pixels| pixels.is_finite() && *pixels > 0.0)
+}
+
 fn parse_length_percentage<'i>(
     input: &mut Parser<'i, '_>,
     non_negative: bool,

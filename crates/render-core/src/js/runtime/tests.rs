@@ -2180,3 +2180,26 @@ fn uncaught_microtask_errors_dispatch_a_window_error_event() {
         JsValue::String("microtask boom:typed".to_owned())
     );
 }
+
+#[test]
+fn document_cookie_round_trips_and_deletes() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                document.cookie = 'a=1';
+                document.cookie = 'b=hello world';
+                var read1 = document.cookie;
+                document.cookie = 'a=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+                var read2 = document.cookie;
+                read1 + ' | ' + read2;
+            ",
+        )
+        .expect("cookie round trip executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("a=1; b=hello world | b=hello world".to_owned())
+    );
+}

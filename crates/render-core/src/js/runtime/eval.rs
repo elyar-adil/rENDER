@@ -2466,6 +2466,9 @@ impl JsRuntime {
                     };
                 }
                 "readyState" => return Ok(JsValue::String("complete".to_owned())),
+                "cookie" => {
+                    return Ok(JsValue::String(self.js_cookie_jar_serialize()));
+                }
                 // The embedding window is the realm's global object.
                 "defaultView" | "parentWindow" => {
                     return Ok(JsValue::Object(self.realm.global_object()));
@@ -2924,6 +2927,12 @@ impl JsRuntime {
             Some(ObjectHost::Location(url)) => Some(url.clone()),
             _ => None,
         };
+        // `document.cookie = "name=value"`: store in the JS-visible jar.
+        if property == "cookie" && matches!(self.realm.host(object), Some(ObjectHost::Document(_)))
+        {
+            self.js_cookie_store(&value.to_js_string());
+            return Ok(());
+        }
         if let Some(base) = location_base {
             if property == "href" {
                 let target = value.to_js_string();

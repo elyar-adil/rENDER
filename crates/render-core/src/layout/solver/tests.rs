@@ -1147,9 +1147,65 @@ fn column_flex_container_fills_containing_block_and_centers_narrow_children() {
     let content = fragment_for("#content");
     assert_eq!(content.origin.x, 0.0);
     assert_eq!(content.size.width, 1770.0);
+    assert_eq!(content.size.height, 600.0);
     let card = fragment_for("#card");
     assert_eq!(card.size.width, 400.0);
     assert_eq!(card.origin.x, (1770.0 - 400.0) / 2.0);
+    // NOTE: browsers also center the card vertically (justify-content:center
+    // against the post-flexed definite main size of the grown #content item,
+    // CSS Flexbox §4.1). That requires the flexed main size to reach the
+    // nested flex layout through block.rs's specified-content-height, which
+    // currently only reads the `height` property; until block.rs grows a
+    // forced-content-height parameter the card sticks to the top (y = 0).
+    // The horizontal cross-axis centering that keeps the card on-screen is
+    // asserted above and is the behavior this regression covers.
+}
+
+// `justify-content` on a `flex-direction:column` container works on the
+// vertical main axis: with `align-items:center` the item stack is centered
+// on the cross axis too, `center` centers the stack in the definite
+// container height, and `flex-end` pushes it to the bottom edge.
+#[test]
+fn column_flex_justify_content_positions_items_along_the_vertical_main_axis() {
+    let html =
+        "<!doctype html><body><div id='col'><div id='a'></div><div id='b'></div></div></body>";
+    let css = "html, body, #a, #b { display:block; margin:0 } \
+         #col { display:flex; flex-direction:column; align-items:center; width:200px; height:400px } \
+         #a, #b { width:40px; height:50px }";
+    let pipeline_with = |justify: &str| {
+        let css = css.replace("#col {", &format!("#col {{ justify-content:{justify};"));
+        pipeline(html, &css, 200.0)
+    };
+    let rect = |layout: &crate::layout::solver::LayoutOutput,
+                output: &crate::html::ParseOutput,
+                selector: &str| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("column item fragment")
+            .rect
+    };
+
+    let (center_output, _, center) = pipeline_with("center");
+    assert_eq!(
+        rect(&center, &center_output, "#a"),
+        PhysicalRect::new(80.0, 150.0, 40.0, 50.0)
+    );
+    assert_eq!(
+        rect(&center, &center_output, "#b"),
+        PhysicalRect::new(80.0, 200.0, 40.0, 50.0)
+    );
+
+    let (end_output, _, end) = pipeline_with("flex-end");
+    assert_eq!(
+        rect(&end, &end_output, "#a"),
+        PhysicalRect::new(80.0, 300.0, 40.0, 50.0)
+    );
+    assert_eq!(
+        rect(&end, &end_output, "#b"),
+        PhysicalRect::new(80.0, 350.0, 40.0, 50.0)
+    );
 }
 
 // A column flex container with `align-items:center` must center an
@@ -1311,4 +1367,91 @@ fn padding_top_percentage_boxes_keep_width_based_resolution_under_auto_heights()
     assert_eq!(rect("#frame").size.height, 240.0);
     // The percentage height of the empty fill child computes to auto.
     assert_eq!(rect("#fill").size.height, 0.0);
+}
+
+// `border: 0` is the classic reset over a user-agent border. The shorthand
+// must set the border WIDTH (not be misread as a color) and reset style and
+// color, so the used border size becomes zero.
+#[test]
+fn border_zero_shorthand_removes_a_earlier_border() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><input id='q'></body>",
+        "html, body { display:block; margin:0 } input { display:inline-block; width:100px; height:30px; box-sizing:border-box; border:1px solid #888; border-style:solid } #q { border:0 }",
+        400.0,
+    );
+    let input = find(&output.dom, "#q");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(input))
+        .expect("input fragment");
+    let FragmentKind::Box(geometry) = &fragment.kind else {
+        panic!("expected box fragment")
+    };
+    assert_eq!(geometry.border.top, 0.0);
+    assert_eq!(geometry.border.right, 0.0);
+    assert_eq!(geometry.border.bottom, 0.0);
+    assert_eq!(geometry.border.left, 0.0);
+    // Border-box sizing keeps the full 100px as content once borders drop.
+    assert_eq!(geometry.content_rect.size.width, 100.0);
+}
+
+// CSS 2.1 §4.3.2: `em` lengths refer to the element's own computed font
+// size, not the root font size.
+#[test]
+fn em_margins_resolve_against_the_element_font_size() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='t'></div></body>",
+        "html, body, div { display:block; margin:0 } #t { font-size:20px; margin-left:0.5em; width:100px; height:10px }",
+        400.0,
+    );
+    let target = find(&output.dom, "#t");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(target))
+        .expect("target fragment");
+    // 0.5em at the element's 20px font size is 10px.
+    assert_eq!(fragment.rect.origin.x, 10.0);
+}
+
+// A percentage font-size computes to pixels on the parent, and the child's
+// em-based font-size compounds against that absolute inherited size.
+#[test]
+fn font_size_compounds_through_em_inheritance() {
+    let (output, styles, layout) = pipeline(
+        "<!doctype html><body><div id='p'><span id='c'>x</span></div></body>",
+        "html, body, div, span { display:inline; margin:0 } #p { display:block; font-size:200% } #c { font-size:1.5em }",
+        400.0,
+    );
+    // 200% of the 16px default is 32px on the parent.
+    assert_eq!(
+        styles
+            .get(&find(&output.dom, "#p"))
+            .and_then(|style| style.get("font-size"))
+            .map(crate::css::computed::ComputedValue::css_text),
+        Some("32px")
+    );
+    // The child's `1.5em` compounds against that absolute inherited size.
+    assert_eq!(
+        styles
+            .get(&find(&output.dom, "#c"))
+            .and_then(|style| style.get("font-size"))
+            .map(crate::css::computed::ComputedValue::css_text),
+        Some("48px")
+    );
+    // The text laid out inside the span uses the compounded size.
+    let span = find(&output.dom, "#c");
+    let text_node = output.dom.children(span).expect("span text child")[0];
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| {
+            fragment.source == Some(text_node) && matches!(fragment.kind, FragmentKind::Text(_))
+        })
+        .expect("child text fragment");
+    let FragmentKind::Text(text_data) = &fragment.kind else {
+        panic!("expected text fragment")
+    };
+    assert_eq!(text_data.font_size, 48.0);
 }
