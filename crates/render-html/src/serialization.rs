@@ -56,11 +56,10 @@ fn serialize_node(dom: &Dom, node: NodeId, output: &mut String) {
                 return;
             }
             if RAW_TEXT_ELEMENTS.contains(&local_name) {
-                if let Some(child) = node_ref.children().first() {
-                    if let Some(NodeKind::Text(data)) = dom.node(*child).map(render_dom::Node::kind)
-                    {
-                        output.push_str(data);
-                    }
+                if let Some(child) = node_ref.children().first()
+                    && let Some(NodeKind::Text(data)) = dom.node(*child).map(render_dom::Node::kind)
+                {
+                    output.push_str(data);
                 }
             } else {
                 for child in node_ref.children() {
@@ -128,10 +127,9 @@ mod tests {
             for child in dom.children(root).unwrap_or_default() {
                 if let Some(NodeKind::Element(element)) =
                     dom.node(*child).map(render_dom::Node::kind)
+                    && element.local_name == local_name
                 {
-                    if element.local_name == local_name {
-                        return Some(*child);
-                    }
+                    return Some(*child);
                 }
                 if let Some(found) = find_element_by_name(dom, *child, local_name) {
                     return Some(found);

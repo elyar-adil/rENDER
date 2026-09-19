@@ -1576,10 +1576,10 @@ fn parse_display<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Display> {
             return Err(location.new_custom_error(()));
         }
     }
-    if words.len() == 1 {
-        if let Some(value) = parse_single_display(&words[0]) {
-            return Ok(value);
-        }
+    if words.len() == 1
+        && let Some(value) = parse_single_display(&words[0])
+    {
+        return Ok(value);
     }
 
     let mut outside = None;
@@ -1721,7 +1721,7 @@ fn parse_border_width<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, BorderWid
 /// both agree on the mapping (CSS Fonts §4.1.3). The relative keywords
 /// `larger` and `smaller` step one table entry away from the parent size.
 #[must_use]
-pub(crate) fn absolute_font_size_keyword(keyword: &str, parent_font_size: f32) -> Option<f32> {
+pub fn absolute_font_size_keyword(keyword: &str, parent_font_size: f32) -> Option<f32> {
     match keyword {
         "xx-small" => Some(9.0),
         "x-small" => Some(10.0),
@@ -1753,13 +1753,13 @@ pub(crate) fn computed_font_size_px(
     if let Some(pixels) = absolute_font_size_keyword(&lowered, parent_font_size) {
         return Some(pixels);
     }
-    super::length::resolve_length_expr(
+    crate::length::resolve_length_expr(
         &lowered,
-        &super::length::LengthContext {
+        &crate::length::LengthContext {
             percentage_base: Some(f64::from(parent_font_size)),
             em_base: f64::from(parent_font_size),
             rem_base: f64::from(root_font_size),
-            ..super::length::LengthContext::default()
+            ..crate::length::LengthContext::default()
         },
     )
     .ok()
@@ -2498,13 +2498,13 @@ mod tests {
         };
         assert!(
             value
-                .resolve(&super::length::LengthResolutionContext::default())
+                .resolve(&super::LengthResolutionContext::default())
                 .is_err()
         );
-        let context = super::length::LengthResolutionContext {
+        let context = super::LengthResolutionContext {
             percentage_basis: Some(800.0),
             root_font_size: 16.0,
-            ..super::length::LengthResolutionContext::default()
+            ..super::LengthResolutionContext::default()
         };
         assert_eq!(value.resolve(&context), Ok(368.0));
 

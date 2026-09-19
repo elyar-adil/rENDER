@@ -1155,8 +1155,14 @@ fn enter_in_a_formless_control_submits_through_the_page_hidden_form() {
     let history_before = app.pages.get(&tab).expect("page").history.len();
     // The Enter confirming a composition is latched away from submission.
     app.handle_keyboard(&pressed_named(NamedKey::Enter));
-    assert!(app.content_editor.is_some(), "composition Enter stays inert");
-    assert_eq!(app.pages.get(&tab).expect("page").history.len(), history_before);
+    assert!(
+        app.content_editor.is_some(),
+        "composition Enter stays inert"
+    );
+    assert_eq!(
+        app.pages.get(&tab).expect("page").history.len(),
+        history_before
+    );
 
     // A second Enter submits through the page's hidden form.
     app.handle_keyboard(&pressed_named(NamedKey::Enter));
@@ -1177,11 +1183,7 @@ fn enter_in_a_formless_control_submits_through_the_page_hidden_form() {
 fn formless_submit_button_click_carries_the_typed_text() {
     let (mut app, tab, _textarea, _button) = headless_chat_app();
     click_content_at(&mut app, 100.0, 30.0);
-    let focused = app
-        .content_editor
-        .as_ref()
-        .expect("box gains focus")
-        .node;
+    let focused = app.content_editor.as_ref().expect("box gains focus").node;
     app.handle_content_ime_commit("搜索");
     assert_eq!(committed_value(&app, tab, focused), "搜索");
 
@@ -1309,10 +1311,7 @@ fn formless_fallback_resolves_form_syncs_value_and_routes_the_button() {
     let base = Url::parse("file:///rENDER-test-fixtures/page.html").expect("base");
     let target = get_content_navigation_target(dom, button, &base, &rendered)
         .expect("button resolves through the fallback form");
-    assert_eq!(
-        target.as_str(),
-        "file:///s?ie=utf-8&wd=%E4%B8%AD%E6%96%87"
-    );
+    assert_eq!(target.as_str(), "file:///s?ie=utf-8&wd=%E4%B8%AD%E6%96%87");
 
     assert_eq!(
         ancestor_wrapper_control(dom, &geometry, button),

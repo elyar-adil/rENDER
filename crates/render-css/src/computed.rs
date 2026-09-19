@@ -1023,10 +1023,9 @@ pub fn compute_style(
             None => {
                 if let Ok(tokens) = tokenize(&value.value, limits)
                     && let Some(tokens) = resolver.substitute(&tokens, 0)
+                    && let Some(value) = ComputedValue::within_limits(tokens, limits)
                 {
-                    if let Some(value) = ComputedValue::within_limits(tokens, limits) {
-                        properties.insert(name.clone(), value);
-                    }
+                    properties.insert(name.clone(), value);
                 }
             }
         }

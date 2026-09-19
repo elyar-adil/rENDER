@@ -160,13 +160,7 @@ fn form_single_query_control(
             }
             found = Some(node);
         }
-        pending.extend(
-            dom.children(node)
-                .unwrap_or_default()
-                .iter()
-                .rev()
-                .copied(),
-        );
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
     }
     found
 }
@@ -185,10 +179,7 @@ fn is_query_control(dom: &render_core::dom::Dom, node: render_core::dom::NodeId)
                 .flatten()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("text");
-            matches!(
-                input_type.to_ascii_lowercase().as_str(),
-                "text" | "search"
-            )
+            matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search")
         }
         "textarea" => true,
         _ => false,
