@@ -1,0 +1,20 @@
+[package]
+name = "render-js"
+description = "Resource-bounded JavaScript interpreter with direct DOM bindings for the rENDER embeddable web runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "render_js"
+
+[dependencies]
+render-dom = { path = "../render-dom" }
+render-css = { path = "../render-css" }
+render-html = { path = "../render-html" }
+mp4parse = "0.17.0"
+url = "2.5.4"
+
+[lints]
+workspace = true

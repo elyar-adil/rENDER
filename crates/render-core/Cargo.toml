@@ -13,6 +13,7 @@ name = "render_core"
 render-dom = { path = "../render-dom" }
 render-css = { path = "../render-css" }
 render-html = { path = "../render-html" }
+render-js = { path = "../render-js" }
 cssparser = "0.35.0"
 encoding_rs = "0.8.35"
 entities = "1.0.2-rc.1"

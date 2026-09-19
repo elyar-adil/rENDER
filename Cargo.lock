@@ -1563,6 +1563,7 @@ dependencies = [
  "render-css",
  "render-dom",
  "render-html",
+ "render-js",
  "url",
 ]
 
@@ -1586,6 +1587,17 @@ dependencies = [
  "encoding_rs",
  "entities",
  "render-dom",
+]
+
+[[package]]
+name = "render-js"
+version = "0.1.0"
+dependencies = [
+ "mp4parse",
+ "render-css",
+ "render-dom",
+ "render-html",
+ "url",
 ]
 
 [[package]]

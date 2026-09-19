@@ -5,6 +5,7 @@ members = [
     "crates/render-html",
     "crates/render-css",
     "crates/render-core",
+    "crates/render-js",
     "crates/render-net",
 ]
 resolver = "3"
