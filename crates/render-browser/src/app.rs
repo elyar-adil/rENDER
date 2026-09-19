@@ -1056,6 +1056,9 @@ impl BrowserApp {
         }
         self.tabs.set_loading(id, true);
         self.repaint_chrome();
+        // Script discovery and fetching proceed in parallel with the
+        // stylesheet transfer; only execution waits for it.
+        self.start_classic_scripts(id);
     }
 
     pub(super) fn start_classic_scripts(&mut self, id: TabId) {
@@ -1066,7 +1069,21 @@ impl BrowserApp {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
             };
-            if !page.styles_resolved || page.scripts_resolved || page.pending_scripts.is_some() {
+            // Stylesheets block script *execution*, not discovery or
+            // fetching (HTML: "a style sheet that is blocking scripts").
+            // A batch prepared while the first stylesheet batch was still
+            // loading is flushed here, in document order, once it resolves.
+            if page.held_scripts.is_some() {
+                if !page.styles_resolved {
+                    break;
+                }
+                let Some(preparation) = page.held_scripts.take() else {
+                    break;
+                };
+                rerender |= page.execute_script_batch(preparation);
+                continue;
+            }
+            if page.scripts_resolved || page.pending_scripts.is_some() {
                 break;
             }
 
@@ -1107,7 +1124,12 @@ impl BrowserApp {
                     &RuntimeLimits::default(),
                 );
                 report_script_diagnostics(&preparation.diagnostics);
-                rerender |= page.execute_script_batch(preparation);
+                if page.styles_resolved {
+                    rerender |= page.execute_script_batch(preparation);
+                } else {
+                    page.held_scripts = Some(preparation);
+                    break;
+                }
             } else {
                 let requests = plan
                     .requests()
@@ -1362,7 +1384,14 @@ impl BrowserApp {
                 &RuntimeLimits::default(),
             );
             report_script_diagnostics(&preparation.diagnostics);
-            page.execute_script_batch(preparation)
+            if page.styles_resolved {
+                page.execute_script_batch(preparation)
+            } else {
+                // The bodies arrived before the stylesheets did; hold the
+                // batch until the stylesheets resolve.
+                page.held_scripts = Some(preparation);
+                false
+            }
         };
 
         self.sync_page_title(id);

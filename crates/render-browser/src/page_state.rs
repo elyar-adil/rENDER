@@ -48,6 +48,11 @@ pub(super) struct PageState {
     pub(super) pending_style_sheets: Option<PendingStyleSheets>,
     pub(super) scripts_resolved: bool,
     pub(super) pending_scripts: Option<PendingScripts>,
+    /// A prepared script batch that finished while the page's first
+    /// stylesheet batch was still loading. Stylesheets block script
+    /// execution, not fetching, so the batch waits here in document order
+    /// until the stylesheets resolve.
+    pub(super) held_scripts: Option<ScriptBatchPreparation>,
     pub(super) started_scripts: HashSet<render_core::dom::NodeId>,
     pub(super) initial_script_scan_completed: bool,
     pub(super) frame: Vec<u32>,
@@ -145,6 +150,7 @@ impl PageState {
             pending_style_sheets: None,
             scripts_resolved: false,
             pending_scripts: None,
+            held_scripts: None,
             started_scripts: HashSet::new(),
             initial_script_scan_completed: false,
             frame: Vec::new(),
@@ -207,6 +213,7 @@ impl PageState {
         if let Some(pending) = self.pending_scripts.take() {
             pending.handle.cancel();
         }
+        self.held_scripts = None;
     }
 
     pub(super) fn cancel_images(&mut self) {

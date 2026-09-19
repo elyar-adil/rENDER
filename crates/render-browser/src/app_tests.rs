@@ -697,6 +697,83 @@ fn timer_deferred_document_title_propagates_on_a_later_turn() {
 }
 
 #[test]
+fn script_fetches_run_before_stylesheets_and_execution_waits_for_them() {
+    let html = "<!doctype html><html><head><title>Static</title>\
+                   <link rel=\"stylesheet\" href=\"sheet.css\">\
+                   </head><body><script src=\"app.js\"></script></body></html>";
+    let (mut app, tab) = headless_app_with(html);
+
+    // The stylesheet batch is still in flight (`styles_resolved` is false),
+    // yet script discovery and fetching must already proceed.
+    app.start_classic_scripts(tab);
+    let plan = {
+        let page = app.pages.get(&tab).expect("page state exists");
+        assert!(
+            page.pending_scripts.is_some(),
+            "script fetch must start while stylesheets are pending"
+        );
+        assert!(page.held_scripts.is_none());
+        assert!(!page.styles_resolved);
+        page.pending_scripts
+            .as_ref()
+            .expect("pending scripts checked above")
+            .plan
+            .clone()
+    };
+
+    // The script body arrives before the stylesheet does: the batch is held
+    // instead of executed, so no script side effects are visible yet.
+    let response = script_response(&plan, "document.title = 'Fetched Title';");
+    app.finish_classic_scripts(tab, vec![Ok(response)]);
+    {
+        let page = app.pages.get_mut(&tab).expect("page state exists");
+        assert!(
+            page.held_scripts.is_some(),
+            "script execution must wait for the stylesheets"
+        );
+        assert!(!page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "Static");
+    }
+
+    // Once the stylesheets resolve, the held batch executes in order.
+    {
+        let page = app.pages.get_mut(&tab).expect("page state exists");
+        page.cancel_style_sheets();
+        page.styles_resolved = true;
+    }
+    app.start_classic_scripts(tab);
+    {
+        let page = app.pages.get_mut(&tab).expect("page state exists");
+        assert!(page.held_scripts.is_none());
+        // `start_classic_scripts` already synced the title while flushing,
+        // so a further sync reports no change.
+        assert!(!page.sync_committed_title());
+        assert_eq!(page.navigation.committed().title, "Fetched Title");
+    }
+}
+
+/// A 200 `text/javascript` response for the plan's single external script.
+fn script_response(
+    plan: &render_browser::scripts::ScriptFetchPlan,
+    body: &str,
+) -> render_net::FetchResponse {
+    let url = plan.resources[0].request.url.clone();
+    render_net::FetchResponse {
+        requested_url: url.clone(),
+        final_url: url.clone(),
+        redirect_chain: vec![url],
+        redirects: Vec::new(),
+        status: render_net::HttpStatus::from_u16(200),
+        headers: Vec::new(),
+        content_type: Some(render_net::ContentType {
+            media_type: "text/javascript".to_owned(),
+            charset: Some("utf-8".to_owned()),
+        }),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+#[test]
 fn prepared_scripts_mutate_the_persistent_page_document() {
     let mut page = PageState::new(PageSource {
             html: "<p id=message>before</p><script>var prefix = 'after';</script><script>document.getElementById('message').textContent = prefix;</script>".into(),
