@@ -1560,9 +1560,19 @@ dependencies = [
  "entities",
  "image",
  "mp4parse",
+ "render-css",
  "render-dom",
  "render-html",
  "url",
+]
+
+[[package]]
+name = "render-css"
+version = "0.1.0"
+dependencies = [
+ "cssparser",
+ "render-dom",
+ "render-html",
 ]
 
 [[package]]
