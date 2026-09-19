@@ -6,7 +6,9 @@
 
 pub mod css;
 pub mod document;
-pub mod dom;
+pub mod dom {
+    pub use render_dom::*;
+}
 pub mod event_loop;
 pub mod html;
 pub mod image;

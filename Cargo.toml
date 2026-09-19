@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/render-browser",
+    "crates/render-dom",
     "crates/render-core",
     "crates/render-net",
 ]

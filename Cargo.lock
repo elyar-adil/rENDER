@@ -1560,8 +1560,13 @@ dependencies = [
  "entities",
  "image",
  "mp4parse",
+ "render-dom",
  "url",
 ]
+
+[[package]]
+name = "render-dom"
+version = "0.1.0"
 
 [[package]]
 name = "render-net"
