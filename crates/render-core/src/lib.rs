@@ -19,7 +19,9 @@ pub mod html {
 pub mod image;
 pub mod interaction;
 pub mod invalidation;
-pub mod js;
+pub mod js {
+    pub use render_js::*;
+}
 pub use render_layout as layout;
 pub mod media;
 pub mod navigation;
@@ -27,7 +29,7 @@ pub mod page;
 pub mod paint;
 pub mod script;
 pub mod spec;
-pub mod video;
+pub use render_js::video;
 
 // TEMPORARY: `image` remains in render-core because it shares deep
 // dependencies with painting, so layout consumes decoded-image intrinsic

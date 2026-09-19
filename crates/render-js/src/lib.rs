@@ -160,7 +160,10 @@ impl JsError {
         Self::new(JsErrorKind::Dom, message, None)
     }
 
-    pub(crate) fn resource(message: impl Into<String>) -> Self {
+    /// Creates a resource-limit error, as used by embedders reporting
+    /// budget exhaustion around script execution.
+    #[must_use]
+    pub fn resource(message: impl Into<String>) -> Self {
         Self::new(JsErrorKind::ResourceLimit, message, None)
     }
 
