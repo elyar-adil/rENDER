@@ -28,8 +28,9 @@ use crate::app::primary_modifier_for;
 use crate::app::wheel_document_delta_y;
 use crate::content_interaction;
 use crate::content_interaction::{
-    ContentHitRegion, associated_form_for_node, content_text_input_value, content_wrapper_control,
-    get_content_navigation_target, hit_test_content_regions, submit_form_for_node,
+    ContentHitRegion, ancestor_wrapper_control, associated_form_for_node, content_text_input_value,
+    content_wrapper_control, fallback_submit_form, get_content_navigation_target,
+    hit_test_content_regions, submit_form_for_node, sync_submit_control_value,
 };
 use crate::frame::FrameDamage;
 use crate::frame::FrameRect;
@@ -451,10 +452,12 @@ fn submit_descendant_builds_get_navigation_target() {
         }
         pending.extend(dom.children(node).unwrap_or_default().iter().rev());
     };
+    let rendered = |_node: NodeId| false;
     let target = get_content_navigation_target(
         dom,
         hit_node,
         &Url::parse("https://www.baidu.com/").expect("valid base URL"),
+        &rendered,
     )
     .expect("GET submit navigation");
 
@@ -525,10 +528,12 @@ fn get_submission_reads_the_live_text_input_value() {
         .set_attribute(query.expect("query input"), "value", "实时 搜索")
         .expect("live value mutation");
 
+    let rendered = |_node: NodeId| false;
     let target = get_content_navigation_target(
         &document.dom,
         submit.expect("submit button"),
         &Url::parse("https://www.baidu.com/").expect("valid base URL"),
+        &rendered,
     )
     .expect("GET submit navigation");
 
@@ -552,10 +557,12 @@ fn link_descendant_resolves_against_document_url() {
         pending.extend(dom.children(node).unwrap_or_default().iter().rev());
     };
 
+    let rendered = |_node: NodeId| false;
     let target = get_content_navigation_target(
         dom,
         hit_node,
         &Url::parse("https://example.test/current/page").expect("valid base URL"),
+        &rendered,
     )
     .expect("link navigation");
 
@@ -842,6 +849,20 @@ const SEARCH_PAGE_HTML: &str = "<!doctype html><html><body>\
        <input type='submit' id='su' value='submit'>\
      </form></body></html>";
 
+/// Baidu-like page whose visible search box is a script-driven replacement:
+/// a wrapper with a textarea and a submit button outside any form, plus the
+/// classic (unrendered) form as the page's hidden submission channel.
+const CHAT_PAGE_HTML: &str = "<!doctype html><html><body>\
+     <div id='chat'>\
+       <textarea id='chat-textarea' rows='1'></textarea>\
+       <button id='chat-submit'>search</button>\
+     </div>\
+     <form id='form' action='/s'>\
+       <input type='hidden' name='ie' value='utf-8'>\
+       <input id='kw' name='wd' value=''>\
+       <input type='submit' id='su' value='submit'>\
+     </form></body></html>";
+
 fn find_id(dom: &Dom, id: &str) -> NodeId {
     let mut pending = vec![dom.document()];
     while let Some(node) = pending.pop() {
@@ -854,18 +875,17 @@ fn find_id(dom: &Dom, id: &str) -> NodeId {
 }
 
 /// Builds a headless `BrowserApp` (no window, no render side effects) showing
-/// the search page at a `file:` document URL so any submit navigation stays
-/// offline.
-fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
+/// `html` at a `file:` document URL so any submit navigation stays offline.
+fn headless_app_with(html: &str) -> (BrowserApp, TabId) {
     let url = Url::parse("file:///rENDER-test-fixtures/page.html").expect("test document URL");
     let source = PageSource {
-        html: SEARCH_PAGE_HTML.to_owned(),
+        html: html.to_owned(),
         title: "search".to_owned(),
         target: NavigationTarget::Url(url),
     };
     let tabs = TabModel::new(source.title.clone(), source.target.display_address());
     let active = tabs.active_id();
-    let mut page = PageState::new(source);
+    let page = PageState::new(source);
 
     let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
     let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))
@@ -914,11 +934,18 @@ fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
         started_at: Instant::now(),
     };
     app.layout = Some(ChromeLayout::new(800, 600, 1.0, app.tabs.tabs()));
+    app.pages.insert(active, page);
+    (app, active)
+}
 
+fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
+    let (mut app, active) = headless_app_with(SEARCH_PAGE_HTML);
     let kw = {
+        let page = app.pages.get(&active).expect("page");
         let dom = page.page.document().dom();
         find_id(dom, "kw")
     };
+    let page = app.pages.get_mut(&active).expect("page");
     page.geometry.insert(
         kw.as_u64(),
         ElementRect {
@@ -928,8 +955,48 @@ fn headless_search_app() -> (BrowserApp, TabId, NodeId) {
             height: 34.0,
         },
     );
-    app.pages.insert(active, page);
     (app, active, kw)
+}
+
+/// Chat-shaped page with the wrapper, textarea, and submit button rendered;
+/// the classic form deliberately has no geometry (it is unrendered).
+fn headless_chat_app() -> (BrowserApp, TabId, NodeId, NodeId) {
+    headless_chat_app_with_geometry(false)
+}
+
+/// `form_rendered` controls whether the classic form gets a geometry entry.
+fn headless_chat_app_with_geometry(form_rendered: bool) -> (BrowserApp, TabId, NodeId, NodeId) {
+    let (mut app, active) = headless_app_with(CHAT_PAGE_HTML);
+    let (chat, textarea, button, form) = {
+        let page = app.pages.get(&active).expect("page");
+        let dom = page.page.document().dom();
+        (
+            find_id(dom, "chat"),
+            find_id(dom, "chat-textarea"),
+            find_id(dom, "chat-submit"),
+            find_id(dom, "form"),
+        )
+    };
+    let page = app.pages.get_mut(&active).expect("page");
+    let geometry = &mut page.geometry;
+    let mut insert = |node: NodeId, x: f32, y: f32, width: f32, height: f32| {
+        geometry.insert(
+            node.as_u64(),
+            ElementRect {
+                x,
+                y,
+                width,
+                height,
+            },
+        );
+    };
+    insert(chat, 0.0, 0.0, 800.0, 100.0);
+    insert(textarea, 10.0, 10.0, 700.0, 40.0);
+    insert(button, 740.0, 30.0, 50.0, 40.0);
+    if form_rendered {
+        insert(form, 0.0, 200.0, 800.0, 50.0);
+    }
+    (app, active, textarea, button)
 }
 
 fn pressed_character(character: &str) -> RawKeyInput {
@@ -952,13 +1019,17 @@ fn committed_value(app: &BrowserApp, tab: TabId, node: NodeId) -> String {
     app.content_text_input_value(tab, node).unwrap_or_default()
 }
 
-fn click_search_box(app: &mut BrowserApp) {
+fn click_content_at(app: &mut BrowserApp, x: f32, document_y: f32) {
     let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
     app.cursor = Point {
-        x: 400.0,
-        y: chrome_height as f32 + 167.0,
+        x,
+        y: chrome_height as f32 + document_y,
     };
     app.handle_content_press();
+}
+
+fn click_search_box(app: &mut BrowserApp) {
+    click_content_at(app, 400.0, 167.0);
 }
 
 #[test]
@@ -1067,4 +1138,185 @@ fn raw_keystrokes_are_dropped_while_a_composition_is_live() {
     let content = app.content_editor.as_ref().expect("editor stays focused");
     assert_eq!(content.editor.text(), "");
     assert_eq!(content.editor.preedit(), "p");
+}
+
+#[test]
+fn enter_in_a_formless_control_submits_through_the_page_hidden_form() {
+    let (mut app, tab, textarea, _button) = headless_chat_app();
+    click_content_at(&mut app, 100.0, 30.0);
+    let content = app.content_editor.as_ref().expect("box gains focus");
+    assert_eq!(content.tab, tab);
+    assert_eq!(content.node, textarea);
+
+    app.handle_keyboard(&pressed_character("a"));
+    app.handle_content_ime_commit("旅行");
+    assert_eq!(committed_value(&app, tab, textarea), "a旅行");
+
+    let history_before = app.pages.get(&tab).expect("page").history.len();
+    // The Enter confirming a composition is latched away from submission.
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    assert!(app.content_editor.is_some(), "composition Enter stays inert");
+    assert_eq!(app.pages.get(&tab).expect("page").history.len(), history_before);
+
+    // A second Enter submits through the page's hidden form.
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert!(
+        page.history.len() > history_before,
+        "Enter must submit through the page's hidden form"
+    );
+    assert_eq!(
+        page.history.current().url.as_str(),
+        "file:///s?ie=utf-8&wd=a%E6%97%85%E8%A1%8C",
+        "the typed text must ride along as the hidden form's query field"
+    );
+    assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn formless_submit_button_click_carries_the_typed_text() {
+    let (mut app, tab, _textarea, _button) = headless_chat_app();
+    click_content_at(&mut app, 100.0, 30.0);
+    let focused = app
+        .content_editor
+        .as_ref()
+        .expect("box gains focus")
+        .node;
+    app.handle_content_ime_commit("搜索");
+    assert_eq!(committed_value(&app, tab, focused), "搜索");
+
+    // Click the submit button inside the same wrapper.
+    click_content_at(&mut app, 765.0, 50.0);
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert_eq!(
+        page.history.current().url.as_str(),
+        "file:///s?ie=utf-8&wd=%E6%90%9C%E7%B4%A2",
+        "the wrapper's typed text must ride along when the button submits"
+    );
+}
+
+#[test]
+fn formless_submit_without_a_unique_hidden_form_stays_inert() {
+    let ambiguous = "<!doctype html><html><body>\
+         <div id='chat'><textarea id='chat-textarea' rows='1'></textarea>\
+         <button id='chat-submit'>search</button></div>\
+         <form id='one' action='/a'><input id='a' name='q' value=''></form>\
+         <form id='two' action='/b'><input id='b' name='q' value=''></form>\
+         </body></html>";
+    let (mut app, tab, textarea, _button) = {
+        let (mut app, active) = headless_app_with(ambiguous);
+        let (chat, textarea, button) = {
+            let page = app.pages.get(&active).expect("page");
+            let dom = page.page.document().dom();
+            (
+                find_id(dom, "chat"),
+                find_id(dom, "chat-textarea"),
+                find_id(dom, "chat-submit"),
+            )
+        };
+        let page = app.pages.get_mut(&active).expect("page");
+        let mut insert = |node: NodeId, x: f32, y: f32, width: f32, height: f32| {
+            page.geometry.insert(
+                node.as_u64(),
+                ElementRect {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+            );
+        };
+        insert(chat, 0.0, 0.0, 800.0, 100.0);
+        insert(textarea, 10.0, 10.0, 700.0, 40.0);
+        insert(button, 740.0, 30.0, 50.0, 40.0);
+        (app, active, textarea, button)
+    };
+    click_content_at(&mut app, 100.0, 30.0);
+    assert!(app.content_editor.is_some());
+    app.handle_content_ime_commit("词");
+    let history_before = app.pages.get(&tab).expect("page").history.len();
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert_eq!(
+        page.history.len(),
+        history_before,
+        "two candidate forms make the fallback ambiguous, so Enter stays inert"
+    );
+    let _ = textarea;
+}
+
+#[test]
+fn formless_submit_does_not_hijack_a_visible_form() {
+    // The only form on the page is rendered, so it is not a hidden
+    // submission channel and must not be submitted by a form-less control.
+    let (mut app, tab, _textarea, _button) = headless_chat_app_with_geometry(true);
+    click_content_at(&mut app, 100.0, 30.0);
+    app.handle_content_ime_commit("词");
+    let history_before = app.pages.get(&tab).expect("page").history.len();
+    app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    let page = app.pages.get(&tab).expect("page stays open");
+    assert_eq!(page.history.len(), history_before);
+}
+
+#[test]
+fn formless_fallback_resolves_form_syncs_value_and_routes_the_button() {
+    let mut document = parse_document(CHAT_PAGE_HTML);
+    let dom = &mut document.dom;
+    let chat = find_id(dom, "chat");
+    let textarea = find_id(dom, "chat-textarea");
+    let button = find_id(dom, "chat-submit");
+    let form = find_id(dom, "form");
+    let kw = find_id(dom, "kw");
+    let mut geometry = BTreeMap::new();
+    let mut insert = |node: NodeId, x: f32, y: f32, width: f32, height: f32| {
+        geometry.insert(
+            node.as_u64(),
+            ElementRect {
+                x,
+                y,
+                width,
+                height,
+            },
+        );
+    };
+    insert(chat, 0.0, 0.0, 800.0, 100.0);
+    insert(textarea, 10.0, 10.0, 700.0, 40.0);
+    insert(button, 740.0, 30.0, 50.0, 40.0);
+    let rendered = |node: NodeId| geometry.contains_key(&node.as_u64());
+
+    assert_eq!(
+        fallback_submit_form(dom, button, &rendered),
+        Some(form),
+        "the unique unrendered form is the fallback channel"
+    );
+    assert_eq!(
+        fallback_submit_form(dom, button, &|node: NodeId| {
+            let _ = node;
+            true
+        }),
+        None,
+        "a rendered form is not a hidden channel"
+    );
+
+    assert!(dom.append_text(textarea, "中文").is_ok());
+    assert!(sync_submit_control_value(dom, textarea, form));
+    assert_eq!(
+        dom.attribute(kw, "value").ok().flatten(),
+        Some("中文"),
+        "the typed text must land in the hidden form's query field"
+    );
+
+    let base = Url::parse("file:///rENDER-test-fixtures/page.html").expect("base");
+    let target = get_content_navigation_target(dom, button, &base, &rendered)
+        .expect("button resolves through the fallback form");
+    assert_eq!(
+        target.as_str(),
+        "file:///s?ie=utf-8&wd=%E4%B8%AD%E6%96%87"
+    );
+
+    assert_eq!(
+        ancestor_wrapper_control(dom, &geometry, button),
+        Some(textarea),
+        "the button's nearest wrapper routes to the dominant text control"
+    );
 }

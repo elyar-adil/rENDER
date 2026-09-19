@@ -1657,7 +1657,23 @@ impl BrowserApp {
             false
         };
         // Recompute the target after click/submit listeners ran: handlers are
-        // allowed to update the live input value or form action.
+        // allowed to update the live input value or form action. A submit
+        // intent with no associated form falls back to the page's unique
+        // unrendered form, so first mirror the typed text into that form's
+        // query control (the script-driven replacement for `submit`).
+        let rendered = self.content_node_rendered(id);
+        if submit_allowed
+            && let Some(hit_node) = hit_node
+            && let Some(page) = self.pages.get_mut(&id)
+        {
+            let geometry = page.geometry.clone();
+            content_interaction::sync_formless_submit_value(
+                page.page.document_mut().dom_mut(),
+                &geometry,
+                hit_node,
+                &rendered,
+            );
+        }
         let navigation = submit_allowed
             .then_some(hit_node)
             .flatten()
@@ -1667,6 +1683,7 @@ impl BrowserApp {
                     page.page.document().dom(),
                     hit_node,
                     &page.navigation.committed().target.history_url(),
+                    &rendered,
                 )
             });
         if let Some(url) = navigation {
@@ -1828,6 +1845,20 @@ impl BrowserApp {
     ) -> Option<render_core::dom::NodeId> {
         let page = self.pages.get(&tab)?;
         content_wrapper_control(page.page.document().dom(), &page.geometry, node)
+    }
+
+    /// Whether a DOM node produced a laid-out box this frame. Unrendered
+    /// (for example `display:none`) nodes have no geometry entry.
+    pub(super) fn content_node_rendered(
+        &self,
+        tab: TabId,
+    ) -> impl Fn(render_core::dom::NodeId) -> bool + use<> {
+        let geometry = self
+            .pages
+            .get(&tab)
+            .map(|page| page.geometry.clone())
+            .unwrap_or_default();
+        move |node: render_core::dom::NodeId| geometry.contains_key(&node.as_u64())
     }
 
     pub(super) fn content_editable_node(
@@ -2060,6 +2091,7 @@ impl BrowserApp {
                         page.page.document().dom(),
                         node,
                         &page.navigation.committed().target.history_url(),
+                        &|node| page.geometry.contains_key(&node.as_u64()),
                     )
                 })
                 .map_or(CursorIcon::Default, |_| CursorIcon::Pointer),
@@ -2329,12 +2361,35 @@ impl BrowserApp {
                 self.drain_script_navigations(tab);
                 self.close_content_editor();
                 if key_allowed {
-                    let form = self.pages.get(&tab).and_then(|page| {
+                    let mut form = self.pages.get(&tab).and_then(|page| {
                         content_interaction::associated_form_for_node(
                             page.page.document().dom(),
                             node,
                         )
                     });
+                    if form.is_none() {
+                        // The control has no form of its own. Pages whose
+                        // visible search box is script-driven still ship one
+                        // classic unrendered form as the no-script submission
+                        // channel, so submit through that and carry the typed
+                        // text into its query control.
+                        let rendered = self.content_node_rendered(tab);
+                        if let Some(page) = self.pages.get_mut(&tab) {
+                            let fallback = content_interaction::fallback_submit_form(
+                                page.page.document().dom(),
+                                node,
+                                &rendered,
+                            );
+                            if let Some(fallback) = fallback {
+                                content_interaction::sync_submit_control_value(
+                                    page.page.document_mut().dom_mut(),
+                                    node,
+                                    fallback,
+                                );
+                                form = Some(fallback);
+                            }
+                        }
+                    }
                     let submit_allowed = form.is_none_or(|form| {
                         let task = self
                             .pages
@@ -2351,12 +2406,25 @@ impl BrowserApp {
                     let target = submit_allowed
                         .then(|| {
                             self.pages.get(&tab).and_then(|page| {
+                                let dom = page.page.document().dom();
+                                let document_url =
+                                    &page.navigation.committed().target.history_url();
                                 render_core::interaction::plan_form_submission(
-                                    page.page.document().dom(),
+                                    dom,
                                     node,
-                                    &page.navigation.committed().target.history_url(),
+                                    document_url,
                                 )
                                 .ok()
+                                .or_else(|| {
+                                    form.and_then(|form| {
+                                        render_core::interaction::plan_form_submission(
+                                            dom,
+                                            form,
+                                            document_url,
+                                        )
+                                        .ok()
+                                    })
+                                })
                             })
                         })
                         .flatten()
