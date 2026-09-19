@@ -292,7 +292,7 @@ impl JsRuntime {
                     ))
                 }
             }
-            other => self.dispatch_events_native(dom, other, receiver, arguments),
+            other => self.dispatch_video_native(dom, other, receiver, arguments),
         };
         // A receiver mismatch on its own is not actionable; naming the entry
         // point turns the error into a usable diagnostic for real pages.

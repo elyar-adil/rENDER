@@ -382,11 +382,7 @@ impl Solver<'_> {
         basis_definite: bool,
         source: Option<NodeId>,
     ) -> f32 {
-        let basis_value = if basis_definite {
-            Some(basis)
-        } else {
-            None
-        };
+        let basis_value = if basis_definite { Some(basis) } else { None };
         match style.and_then(|style| style.typed("flex-basis")) {
             Some(TypedPropertyValue::FlexBasis(FlexBasis::LengthPercentage(value))) => {
                 if !basis_definite && length_depends_on_percentage(value) {

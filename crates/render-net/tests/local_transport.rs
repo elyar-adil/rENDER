@@ -112,9 +112,7 @@ fn read_request(stream: &mut TcpStream) -> String {
         });
         if let Some(content_length) = content_length {
             while raw.len() < header_end + content_length {
-                let count = stream
-                    .read(&mut chunk)
-                    .expect("read local request body");
+                let count = stream.read(&mut chunk).expect("read local request body");
                 if count == 0 {
                     break;
                 }
@@ -966,7 +964,10 @@ fn posts_a_body_with_custom_headers_to_the_local_server() {
         lowered.contains("accept-encoding: gzip, br"),
         "the transport must keep advertising decodable encodings on POST"
     );
-    assert!(wire.ends_with(r#"{"hello":"world"}"#), "body must arrive: {wire}");
+    assert!(
+        wire.ends_with(r#"{"hello":"world"}"#),
+        "body must arrive: {wire}"
+    );
 }
 
 #[test]
@@ -1021,7 +1022,11 @@ fn put_delete_and_head_reach_the_server_with_the_right_method() {
     );
 
     let requests = seen_requests.lock().expect("read requests");
-    assert!(requests[0].starts_with("PUT /upload "), "got: {}", requests[0]);
+    assert!(
+        requests[0].starts_with("PUT /upload "),
+        "got: {}",
+        requests[0]
+    );
     assert!(
         requests[0].ends_with("binary-payload"),
         "PUT body must arrive: {}",
@@ -1032,7 +1037,11 @@ fn put_delete_and_head_reach_the_server_with_the_right_method() {
         "got: {}",
         requests[1]
     );
-    assert!(requests[2].starts_with("HEAD /item "), "got: {}", requests[2]);
+    assert!(
+        requests[2].starts_with("HEAD /item "),
+        "got: {}",
+        requests[2]
+    );
 }
 
 #[test]

@@ -25,6 +25,7 @@ use crate::js::ObjectId;
 use crate::js::Realm;
 use crate::js::RuntimeLimits;
 use crate::js::ScriptOutcome;
+use crate::js::parser::Statement;
 use crate::js::runtime::convert::required_argument;
 use crate::js::runtime::eval::Completion;
 use crate::js::runtime::types::CallFrame;
@@ -475,7 +476,7 @@ impl JsRuntime {
         self.dom_nodes_created = 0;
         self.this_stack.clear();
         self.environment.clear();
-        match microtask {
+        let outcome = match microtask {
             JsMicrotask::Callback(callback) => self.call(dom, callback, &[]),
             JsMicrotask::IntersectionObserver(observer) => {
                 self.notify_intersection_observer(dom, observer)
@@ -505,6 +506,112 @@ impl JsRuntime {
                 }
                 Ok(JsValue::Undefined)
             }
+        };
+        match outcome {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // An exception escaping a microtask callback is an uncaught
+                // runtime failure, so it fires the same window `error` event
+                // a failing classic script does.
+                if error.kind() != JsErrorKind::ResourceLimit {
+                    self.report_uncaught_error(dom, &error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Dispatch the window `error` event for one uncaught script failure.
+    ///
+    /// The event reuses the ordinary window dispatch path, so listeners
+    /// registered through `window.addEventListener("error", ...)` observe the
+    /// `{message, filename, lineno, colno, error}` payload real engines
+    /// provide: the thrown value is surfaced as a real Error instance when
+    /// one was thrown (or synthesized for typed host errors), and
+    /// line/column come from the source position when known. Failures inside
+    /// error listeners are swallowed so an error handler cannot recurse this
+    /// path; resource-limit aborts carry no script value and dispatch
+    /// nothing.
+    fn report_uncaught_error(&mut self, dom: &mut Dom, error: &JsError) {
+        if error.kind() == JsErrorKind::ResourceLimit {
+            return;
+        }
+        self.steps_remaining = self.limits.max_execution_steps;
+        self.calls_active = 0;
+        self.dom_nodes_created = 0;
+        self.this_stack.clear();
+        self.environment.clear();
+        let prototype = self
+            .realm
+            .global("Event")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            })
+            .and_then(|constructor| {
+                self.realm
+                    .get_property(constructor, "prototype")
+                    .and_then(|value| match value {
+                        JsValue::Object(object) => Some(object),
+                        _ => None,
+                    })
+            });
+        if self.ensure_heap_capacity(1).is_err() {
+            return;
+        }
+        let error_value = match error.thrown_value() {
+            Some(value) => value.clone(),
+            None => self
+                .construct_standard_error(standard_error_kind(error.kind()), error.message())
+                .unwrap_or(JsValue::Undefined),
+        };
+        let message = match &error_value {
+            JsValue::Object(instance) => self
+                .realm
+                .get_property(*instance, "message")
+                .map(|value| value.to_js_string())
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| error.message().to_owned()),
+            _ => error.message().to_owned(),
+        };
+        let event = self.realm.create_object(prototype);
+        for (name, value) in [
+            ("type", JsValue::String("error".to_owned())),
+            ("bubbles", JsValue::Boolean(false)),
+            ("cancelable", JsValue::Boolean(true)),
+            ("defaultPrevented", JsValue::Boolean(false)),
+            ("target", JsValue::Null),
+            ("currentTarget", JsValue::Null),
+            ("message", JsValue::String(message)),
+            ("filename", JsValue::String(self.document_url_string())),
+            (
+                "lineno",
+                JsValue::Number(error.position().map_or(0.0, |(line, _)| line as f64)),
+            ),
+            (
+                "colno",
+                JsValue::Number(error.position().map_or(0.0, |(_, column)| column as f64)),
+            ),
+            ("error", error_value),
+        ] {
+            self.realm.set_property(event, name.to_owned(), value);
+        }
+        // Window-level dispatch: the document is the propagation target and
+        // `window_event_handlers` listeners run last, matching every other
+        // window event this runtime fires. Listener throws are ignored.
+        let _ = self.dispatch_prepared_event(dom, dom.document(), event, "error", false);
+    }
+
+    /// The committed document URL, used as the `filename` field of window
+    /// `error` events. Falls back to the empty string when the location host
+    /// is unavailable.
+    fn document_url_string(&self) -> String {
+        match self.realm.global("location") {
+            Some(JsValue::Object(object)) => match self.realm.host(object) {
+                Some(ObjectHost::Location(url)) => url.to_string(),
+                _ => String::new(),
+            },
+            _ => String::new(),
         }
     }
 
@@ -516,9 +623,15 @@ impl JsRuntime {
     /// syntax is never silently ignored.
     pub fn execute(&mut self, dom: &mut Dom, source: &str) -> Result<ScriptOutcome, JsError> {
         self.source_line_starts = build_line_starts(source);
-        let script = super::CompiledScript::compile(source, &self.limits)?;
+        let script = match super::CompiledScript::compile(source, &self.limits) {
+            Ok(script) => script,
+            Err(error) => {
+                let error = self.position_error(error);
+                self.report_uncaught_error(dom, &error);
+                return Err(error);
+            }
+        };
         self.execute_compiled(dom, &script)
-            .map_err(|error| self.position_error(error))
     }
 
     /// Resolve an error's byte offset into a line/column pair using the
@@ -555,10 +668,26 @@ impl JsRuntime {
         self.dom_nodes_created = 0;
         self.this_stack.clear();
         self.environment.clear();
-        self.instantiate_statements(&script.statements)
+        let outcome = self.run_compiled_script(dom, &script.statements, from_revision);
+        if let Err(error) = &outcome {
+            self.report_uncaught_error(dom, error);
+        }
+        outcome
+    }
+
+    /// Interpret one compiled script body. Errors escaping this body are
+    /// uncaught failures of the whole script; the caller reports them as
+    /// window `error` events after they have been source-positioned.
+    fn run_compiled_script(
+        &mut self,
+        dom: &mut Dom,
+        statements: &[Statement],
+        from_revision: DomRevision,
+    ) -> Result<ScriptOutcome, JsError> {
+        self.instantiate_statements(statements)
             .map_err(|error| self.position_error(error))?;
         let completion = self
-            .evaluate_statements(dom, &script.statements)
+            .evaluate_statements(dom, statements)
             .map_err(|error| self.position_error(error))?;
         self.queue_mutation_deliveries(dom);
         let value = match completion {
@@ -670,6 +799,18 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         self.dispatch_fetch_native(dom, function, receiver, arguments)
+    }
+}
+
+/// Map a runtime error kind onto the global error constructor used to
+/// synthesize the `error` field of window `error` events when no script value
+/// was thrown.
+fn standard_error_kind(kind: JsErrorKind) -> ErrorKind {
+    match kind {
+        JsErrorKind::Syntax => ErrorKind::SyntaxError,
+        JsErrorKind::Reference => ErrorKind::ReferenceError,
+        JsErrorKind::Type => ErrorKind::TypeError,
+        JsErrorKind::Dom | JsErrorKind::Throw | JsErrorKind::ResourceLimit => ErrorKind::Error,
     }
 }
 

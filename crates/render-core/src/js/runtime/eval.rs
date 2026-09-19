@@ -31,6 +31,8 @@ use crate::js::parser::CatchClause;
 use crate::js::parser::Expr;
 use crate::js::parser::ObjectAccessorKind;
 use crate::js::parser::ObjectProperty;
+use crate::js::parser::PARAMETER_DEFAULT_MARKER;
+use crate::js::parser::PARAMETER_REST_MARKER;
 use crate::js::parser::PropertyKey;
 use crate::js::parser::Statement;
 use crate::js::parser::UnaryOp;
@@ -373,19 +375,49 @@ impl JsRuntime {
         let is_arrow = lexical_this.is_some();
         self.ensure_heap_capacity(if is_arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
+        let (parameters, length) = Self::binding_parameters(parameters);
         self.functions.push(UserFunction {
             name: name.map(str::to_owned),
-            parameters: parameters.to_vec(),
+            parameters,
             body: body.to_vec(),
             captured_environment: self.environment.clone(),
             lexical_this,
         });
+        // Spec: the `name` of an anonymous function in progress is the empty
+        // string (anonymous arrows included); `length` counts parameters
+        // before the first default initializer, excluding the rest parameter.
+        let name = name.unwrap_or("");
         let function = if is_arrow {
-            self.realm.arrow_function(function_index)
+            self.realm.arrow_function(function_index, name, length)
         } else {
-            self.realm.user_function(function_index)
+            self.realm.user_function(function_index, name, length)
         };
         Ok(JsValue::Object(function))
+    }
+
+    /// Strip the parser's default/rest parameter markers into plain binding
+    /// names and derive the spec `length`: the parameter count before the
+    /// first default initializer, with the rest parameter excluded. The
+    /// `\0`-prefixed arrow destructuring temporaries pass through untouched.
+    fn binding_parameters(parameters: &[String]) -> (Vec<String>, usize) {
+        let mut names = Vec::with_capacity(parameters.len());
+        let mut length = 0_usize;
+        let mut counting = true;
+        for parameter in parameters {
+            let binding = parameter
+                .strip_prefix(PARAMETER_DEFAULT_MARKER)
+                .or_else(|| parameter.strip_prefix(PARAMETER_REST_MARKER));
+            if let Some(binding) = binding {
+                names.push(binding.to_owned());
+                counting = false;
+            } else {
+                names.push(parameter.clone());
+                if counting {
+                    length += 1;
+                }
+            }
+        }
+        (names, length)
     }
 
     #[allow(
@@ -3134,6 +3166,7 @@ impl JsRuntime {
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            Some(ObjectHost::VideoConstructor) => self.video_constructor(constructor, arguments),
             Some(ObjectHost::XmlHttpRequestConstructor) => {
                 self.xml_http_request_constructor(constructor)
             }
@@ -3249,6 +3282,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
+            // Legacy web compatibility: `Video()` without `new` constructs,
+            // exactly like `Image()`.
+            Some(ObjectHost::VideoConstructor) => self.video_constructor(callee, arguments),
             Some(ObjectHost::XmlHttpRequestConstructor) => Err(JsError::type_error(
                 "XMLHttpRequest constructor requires 'new'",
             )),
@@ -3391,11 +3427,25 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         let bound_receiver = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let bound_arguments = arguments.get(1..).unwrap_or_default().to_vec();
-        Ok(JsValue::Object(self.realm.bound_callable(
-            target,
-            bound_receiver,
-            bound_arguments,
-        )))
+        let bound = self
+            .realm
+            .bound_callable(target, bound_receiver, bound_arguments.clone());
+        // Spec `Function.prototype.bind` metadata: `name` becomes
+        // `"bound " + target.name` and `length` shrinks by the number of
+        // prepended arguments, never below zero.
+        let target_name = self
+            .realm
+            .get_property(target, "name")
+            .map(|value| value.to_js_string())
+            .unwrap_or_default();
+        let target_length = match self.realm.get_property(target, "length") {
+            Some(JsValue::Number(number)) => number.floor().max(0.0) as usize,
+            _ => 0,
+        };
+        let length = target_length.saturating_sub(bound_arguments.len());
+        self.realm
+            .install_function_metadata(bound, &format!("bound {target_name}"), length);
+        Ok(JsValue::Object(bound))
     }
 
     pub(super) fn call_user(
@@ -3525,6 +3575,7 @@ impl JsRuntime {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
+                    | ObjectHost::VideoConstructor
                     | ObjectHost::ObjectConstructor
                     | ObjectHost::PromiseConstructor
                     | ObjectHost::MutationObserverConstructor
@@ -3567,6 +3618,7 @@ impl JsRuntime {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
+                    | ObjectHost::VideoConstructor
                     | ObjectHost::ObjectConstructor
                     | ObjectHost::PromiseConstructor
                     | ObjectHost::MutationObserverConstructor

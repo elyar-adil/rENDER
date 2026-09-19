@@ -17,6 +17,16 @@ pub(super) enum VariableKind {
     Var,
 }
 
+/// Marker prefix flagging a parameter that carried a default initializer.
+/// Neither marker character can appear in a lexer-produced identifier, so the
+/// prefixed names stay unambiguous; [`super::runtime::eval`] strips them when
+/// binding arguments and derives the spec `length` from their positions.
+pub(super) const PARAMETER_DEFAULT_MARKER: char = '\u{2}';
+
+/// Marker prefix flagging a rest parameter (`...rest`), which is always the
+/// final parameter and never counts toward the spec `length`.
+pub(super) const PARAMETER_REST_MARKER: char = '\u{1}';
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum UnaryOp {
     Not,
@@ -1147,7 +1157,7 @@ impl Parser {
                             self.cursor = checkpoint;
                             return Ok(None);
                         };
-                        parameters.push(parameter);
+                        parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                         break;
                     }
                     let parameter =
@@ -1166,10 +1176,15 @@ impl Parser {
                             };
                             parameter
                         };
-                    if self.take(&TokenKind::Equal) {
+                    let has_default = self.take(&TokenKind::Equal);
+                    if has_default {
                         let _ = self.assignment()?;
                     }
-                    parameters.push(parameter);
+                    parameters.push(if has_default {
+                        format!("{PARAMETER_DEFAULT_MARKER}{parameter}")
+                    } else {
+                        parameter
+                    });
                     if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                         break;
                     }
@@ -1761,7 +1776,7 @@ impl Parser {
                     let TokenKind::Identifier(parameter) = self.advance().kind else {
                         return Err(self.error("expected a rest parameter name"));
                     };
-                    parameters.push(parameter);
+                    parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                     break;
                 }
                 // Destructuring parameters are accepted and lowered to their
@@ -1784,14 +1799,19 @@ impl Parser {
                     };
                     bound_names.push(parameter);
                 }
-                if self.take(&TokenKind::Equal) {
+                let has_default = self.take(&TokenKind::Equal);
+                if has_default {
                     let _ = self.assignment()?;
                 }
                 for parameter in bound_names {
                     if parameters.contains(&parameter) {
                         return Err(self.error("duplicate function parameters are not supported"));
                     }
-                    parameters.push(parameter);
+                    parameters.push(if has_default {
+                        format!("{PARAMETER_DEFAULT_MARKER}{parameter}")
+                    } else {
+                        parameter
+                    });
                 }
                 if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;

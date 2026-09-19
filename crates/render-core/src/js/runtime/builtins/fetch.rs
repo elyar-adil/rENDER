@@ -147,7 +147,7 @@ impl JsRuntime {
 
     /// Resolve a request URL string against the document base
     /// (`location.href`); without a base only absolute URLs are accepted.
-    fn resolve_fetch_url(&self, requested: &str) -> Result<Url, String> {
+    pub(in crate::js::runtime) fn resolve_fetch_url(&self, requested: &str) -> Result<Url, String> {
         match self.document_base_url() {
             Some(base) => base.join(requested).map_err(|error| error.to_string()),
             None => Url::parse(requested).map_err(|error| error.to_string()),
@@ -155,7 +155,7 @@ impl JsRuntime {
     }
 
     /// The committed document URL behind the `location` global, if any.
-    fn document_base_url(&self) -> Option<Url> {
+    pub(in crate::js::runtime) fn document_base_url(&self) -> Option<Url> {
         let location = self
             .realm
             .get_property(self.realm.global_object(), "location")?;

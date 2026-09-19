@@ -1,6 +1,7 @@
 //! JavaScript values and the realm-owned object arena.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::num::FpCategory;
 
 use crate::dom::NodeId;
@@ -15,6 +16,13 @@ impl ObjectId {
     #[must_use]
     pub const fn as_usize(self) -> usize {
         self.0
+    }
+
+    /// Rebuild an id from [`Self::as_usize`] output, for host-state
+    /// bookkeeping that scans the realm arena.
+    #[must_use]
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
     }
 }
 
@@ -454,6 +462,10 @@ pub(crate) enum NativeFunction {
     XhrSetRequestHeader,
     XhrSend,
     XhrGetResponseHeader,
+    VideoPlay,
+    VideoPause,
+    VideoLoad,
+    VideoCanPlayType,
 }
 
 /// One integer or float element type of the ECMAScript typed-array family.
@@ -751,6 +763,70 @@ pub(crate) enum ObjectHost {
     ResponseHeaders {
         owner: ObjectId,
     },
+    /// The `Video` (`HTMLVideoElement`) constructor object.
+    VideoConstructor,
+    /// One `HTMLVideoElement` instance with its playback state. Script
+    /// visible fields (`src`, `duration`, ...) are plain properties updated
+    /// in place, mirroring the `XMLHttpRequest` pattern.
+    VideoElement(VideoElementState),
+}
+
+/// Playback machinery of one `HTMLVideoElement` instance.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct VideoElementState {
+    /// Absolute `src` of the currently queued or loaded media, when set.
+    pub(super) resolved_src: Option<Url>,
+    /// Id of the media transfer queued in `pending_fetch_requests` until the
+    /// embedding settles it through `settle_video_fetch`.
+    pub(super) load_id: Option<u64>,
+    /// Bumped whenever a new load starts so stale settlements can be
+    /// recognized and dropped.
+    pub(super) generation: u64,
+    /// Demux/decode pipeline once a media load succeeded.
+    pub(super) media: Option<VideoMedia>,
+    /// `play()` promises awaiting media readiness, resolved (or rejected)
+    /// when the pending load settles. GC roots through `mark_host`.
+    pub(super) pending_play_promises: Vec<VideoPlayPromise>,
+}
+
+/// One `play()` promise awaiting media readiness: the promise record index
+/// used to settle it, and the object id the GC must keep alive until then.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VideoPlayPromise {
+    pub(super) record: usize,
+    pub(super) object: ObjectId,
+}
+
+/// Shared handle to the demux/decode pipeline of a loaded video. Identity
+/// (not content) equality keeps `ObjectHost` comparisons cheap.
+#[derive(Clone)]
+pub(crate) struct VideoMedia(std::rc::Rc<std::cell::RefCell<crate::video::VideoPipeline>>);
+
+impl VideoMedia {
+    pub(super) fn new(pipeline: crate::video::VideoPipeline) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(pipeline)))
+    }
+
+    /// Access the underlying pipeline.
+    #[must_use]
+    pub fn pipeline(&self) -> &std::rc::Rc<std::cell::RefCell<crate::video::VideoPipeline>> {
+        &self.0
+    }
+}
+
+impl fmt::Debug for VideoMedia {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("VideoMedia")
+            .field(&self.0.borrow().track().info)
+            .finish()
+    }
+}
+
+impl PartialEq for VideoMedia {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Mutable request state of one `XMLHttpRequest` instance. The classic
@@ -990,6 +1066,7 @@ impl Realm {
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
+        Self::install_video(&mut objects, global, object_prototype, function_prototype);
         Self::define_global_function(
             &mut objects,
             global,
@@ -1399,6 +1476,7 @@ impl Realm {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::ImageConstructor
+                    | ObjectHost::VideoConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::MutationObserverConstructor
                     | ObjectHost::ErrorConstructor(_)
@@ -3109,6 +3187,76 @@ impl Realm {
         );
     }
 
+    /// Installs the `Video` (`HTMLVideoElement`) surface: a global
+    /// constructor in the `Image`/`XMLHttpRequest` style whose instances
+    /// expose `play`/`pause`/`load`/`canPlayType` and plain playback
+    /// properties.
+    ///
+    /// Media loads queue through the shared network pending queue; the
+    /// embedding drains them with `take_pending_fetch_requests` and completes
+    /// them through `settle_video_fetch`.
+    fn install_video(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let video_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("play", NativeFunction::VideoPlay),
+            ("pause", NativeFunction::VideoPause),
+            ("load", NativeFunction::VideoLoad),
+            ("canPlayType", NativeFunction::VideoCanPlayType),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[video_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let video_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::VideoConstructor,
+            ..JsObject::default()
+        });
+        objects[video_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(video_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[video_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(video_constructor)),
+        );
+        objects[global.0].properties.insert(
+            "Video".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(video_constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     fn install_promise(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -3965,15 +4113,22 @@ impl Realm {
         })
     }
 
-    pub(crate) fn arrow_function(&mut self, function: usize) -> ObjectId {
-        self.allocate(JsObject {
+    pub(crate) fn arrow_function(
+        &mut self,
+        function: usize,
+        name: &str,
+        length: usize,
+    ) -> ObjectId {
+        let object = self.allocate(JsObject {
             prototype: Some(self.function_prototype),
             host: ObjectHost::ArrowFunction(function),
             ..JsObject::default()
-        })
+        });
+        self.install_function_metadata(object, name, length);
+        object
     }
 
-    pub(crate) fn user_function(&mut self, function: usize) -> ObjectId {
+    pub(crate) fn user_function(&mut self, function: usize, name: &str, length: usize) -> ObjectId {
         let prototype = self.create_ordinary_object();
         let callable = self.allocate(JsObject {
             prototype: Some(self.function_prototype),
@@ -4002,7 +4157,39 @@ impl Realm {
                 configurable: true,
             },
         );
+        self.install_function_metadata(callable, name, length);
         callable
+    }
+
+    /// Install the spec `name` and `length` own data properties shared by
+    /// every callable flavor: non-writable, non-enumerable, configurable.
+    pub(crate) fn install_function_metadata(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        length: usize,
+    ) {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "parameter counts stay far below any precision boundary"
+        )]
+        let length = length as f64;
+        for (property, value) in [
+            ("name", JsValue::String(name.to_owned())),
+            ("length", JsValue::Number(length)),
+        ] {
+            self.objects[object.0].properties.insert(
+                property.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
     }
 
     /// A standalone native function object (used to build callables that

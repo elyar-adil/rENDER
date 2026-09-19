@@ -51,6 +51,14 @@ impl JsRuntime {
             | NativeFunction::XhrGetResponseHeader => {
                 self.dispatch_fetch_native(dom, function, receiver, arguments)
             }
+            // Video-domain functions are intercepted right after the DOM
+            // dispatch in `video.rs`; route to it for the same reason.
+            NativeFunction::VideoPlay
+            | NativeFunction::VideoPause
+            | NativeFunction::VideoLoad
+            | NativeFunction::VideoCanPlayType => {
+                self.dispatch_video_native(dom, function, receiver, arguments)
+            }
             NativeFunction::AddEventListener => self.add_event_listener(receiver, arguments),
             NativeFunction::RemoveEventListener => self.remove_event_listener(receiver, arguments),
             NativeFunction::DispatchEvent => self.dispatch_event(dom, receiver, arguments),

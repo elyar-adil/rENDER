@@ -94,6 +94,7 @@ use render_core::script::ScriptDiscoveryLimits;
 use render_net::FetchError;
 use render_net::FetchRequest;
 use render_net::FetchResult;
+use render_net::HttpMethod;
 use render_net::NetworkWorker;
 use render_net::Url;
 use softbuffer::Context;
@@ -819,20 +820,9 @@ impl BrowserApp {
     }
 
     /// Submits one `fetch()`/XHR transfer drained from a page runtime.
-    /// Only GET reaches the transport today; other methods settle with an
-    /// explicit rejection until the transport grows request-body support.
+    /// The transport carries all standard methods with custom headers and
+    /// request bodies.
     pub(super) fn submit_page_fetch(&mut self, tab: TabId, request: &PendingFetch) {
-        if request.method != "GET" {
-            let Some(page) = self.pages.get_mut(&tab) else {
-                return;
-            };
-            let outcome = Err(format!(
-                "network: {} requests are not supported by this browser yet",
-                request.method
-            ));
-            let _ = page.page.settle_fetch(request.id, outcome);
-            return;
-        }
         let Ok(url) = Url::parse(&request.url) else {
             let Some(page) = self.pages.get_mut(&tab) else {
                 return;
@@ -842,13 +832,32 @@ impl BrowserApp {
                 .settle_fetch(request.id, Err("network: invalid request URL".to_owned()));
             return;
         };
-        let mut fetch_request = FetchRequest::get(url.clone());
+        let Some(method) = HttpMethod::from_wire(&request.method) else {
+            let Some(page) = self.pages.get_mut(&tab) else {
+                return;
+            };
+            let _ = page.page.settle_fetch(
+                request.id,
+                Err(format!("network: unknown method {}", request.method)),
+            );
+            return;
+        };
+        let mut fetch_request = FetchRequest::new(method, url.clone());
         for (name, value) in &request.headers {
-            if name.eq_ignore_ascii_case("accept") {
-                fetch_request = fetch_request.with_accept(value.clone());
-            } else if name.eq_ignore_ascii_case("cookie") {
-                fetch_request = fetch_request.with_cookie(value.clone());
+            match name.to_ascii_lowercase().as_str() {
+                "accept" => {
+                    fetch_request = fetch_request.with_accept(value.clone());
+                }
+                "cookie" => {
+                    fetch_request = fetch_request.with_cookie(value.clone());
+                }
+                _ => {
+                    fetch_request = fetch_request.with_header(name.clone(), value.clone());
+                }
             }
+        }
+        if let Some(body) = &request.body {
+            fetch_request = fetch_request.with_body(body.clone().into_bytes());
         }
         let fetch_request = match self.pages.get(&tab) {
             Some(page) => page.cookies.decorate_request(fetch_request),

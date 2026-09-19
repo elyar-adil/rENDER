@@ -20,3 +20,4 @@ pub mod page;
 pub mod paint;
 pub mod script;
 pub mod spec;
+pub mod video;

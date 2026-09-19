@@ -30,3 +30,4 @@ pub(super) mod style;
 pub(super) mod timers;
 pub(super) mod typed_array;
 pub(super) mod url;
+pub(super) mod video;

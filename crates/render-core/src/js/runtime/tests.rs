@@ -2014,3 +2014,169 @@ fn dataset_reads_delete_and_missing_members_follow_the_camel_case_mapping() {
         JsValue::String("first|7| / |false|7".to_owned())
     );
 }
+
+#[test]
+fn user_functions_expose_name_and_length_own_properties() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    function declared(w, x, y = 4, ...z) { return [w, x, y, z].length; }
+                    var anonymous = function (a, b) {};
+                    var arrow = (p, q = 1, ...r) => p;
+                    var arrowDefaultPattern = ({x} = {}) => x;
+                    var results = [
+                        declared.name, declared.length,
+                        anonymous.name, anonymous.length,
+                        arrow.name, arrow.length,
+                        arrowDefaultPattern.length,
+                        typeof (function () {}).name,
+                        declared.hasOwnProperty("name"),
+                        declared.hasOwnProperty("length"),
+                        Object.keys(declared).length
+                    ].join("|");
+                    declared.name = "renamed";
+                    results + "|" + declared.name;
+                "#,
+        )
+        .expect("function metadata probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            // `length` counts parameters before the first default and
+            // excludes the rest parameter; anonymous callables read "".
+            "declared|2||2||1|0|string|true|true|0|declared".to_owned()
+        )
+    );
+}
+
+#[test]
+fn default_and_rest_parameters_still_bind_argument_positions() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    function probe(a, b = 5, ...rest) {
+                        return [a, b, typeof rest].join("|");
+                    }
+                    probe(1, 2, 3, 4) + " / " + probe(7);
+                "#,
+        )
+        .expect("default/rest parameter call should execute");
+    // Default initializers are not applied by this runtime yet (parameters
+    // bind positionally, rest included), so the metadata markers must leave
+    // argument positions unchanged.
+    assert_eq!(
+        outcome.value,
+        // `Array.prototype.join` renders undefined members as "".
+        JsValue::String("1|2|number / 7||undefined".to_owned())
+    );
+}
+
+#[test]
+fn bound_functions_take_the_bound_name_and_shrunk_length() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    function target(a, b, c) {}
+                    var partial = target.bind(null, 1);
+                    var total = target.bind(null);
+                    [partial.name, partial.length, total.name, total.length].join("|");
+                "#,
+        )
+        .expect("bound function metadata probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("bound target|2|bound target|3".to_owned())
+    );
+}
+
+#[test]
+fn uncaught_script_errors_dispatch_a_window_error_event() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app.js").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    window.errors = [];
+                    window.addEventListener("error", function (event) {
+                        window.errors.push([
+                            event.type,
+                            event.message,
+                            event.filename,
+                            event.lineno + ":" + event.colno,
+                            event.error instanceof Error ? "real-error" : "no-error"
+                        ].join("|"));
+                    });
+                "#,
+        )
+        .expect("error listener registration should execute");
+    let error = runtime
+        .execute(&mut parsed.dom, "boom();")
+        .expect_err("uncaught script failure must still surface to the embedder");
+    assert_eq!(error.kind(), crate::js::JsErrorKind::Reference);
+    // `try`/`catch` contains its own throw, so no additional event fires.
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    try { missing(); } catch (error) { window.handled = true; }
+                    [window.errors.length, window.errors[0], window.handled === true].join("|");
+                "#,
+        )
+        .expect("post-error probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "1|error|boom is not defined|https://example.test/app.js|1:1|real-error|true"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn uncaught_microtask_errors_dispatch_a_window_error_event() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    window.failures = [];
+                    window.addEventListener("error", function (event) {
+                        window.failures.push(
+                            event.message + ":" +
+                            (event.error instanceof TypeError ? "typed" : "other")
+                        );
+                    });
+                    queueMicrotask(function () {
+                        throw new TypeError("microtask boom");
+                    });
+                "#,
+        )
+        .expect("microtask scheduling should execute");
+    let pending = runtime.take_pending_microtasks();
+    assert_eq!(pending.len(), 1);
+    // The exception escaping the microtask still propagates to the
+    // embedding, which now also observed the window `error` event.
+    let error = runtime
+        .invoke_microtask(&mut parsed.dom, pending[0].clone())
+        .expect_err("uncaught microtask failure must still surface to the embedder");
+    assert_eq!(error.kind(), crate::js::JsErrorKind::Throw);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "window.failures.join(\";\");")
+        .expect("failure probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("microtask boom:typed".to_owned())
+    );
+}

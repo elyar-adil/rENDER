@@ -426,10 +426,19 @@ pub enum FetchError {
     Dns,
     Timeout,
     Tls(String),
-    RedirectLimitExceeded { limit: u32 },
-    HeaderLimitExceeded { limit: usize },
-    BodyLimitExceeded { limit: usize },
-    InvalidByteRange { start: u64, end: u64 },
+    RedirectLimitExceeded {
+        limit: u32,
+    },
+    HeaderLimitExceeded {
+        limit: usize,
+    },
+    BodyLimitExceeded {
+        limit: usize,
+    },
+    InvalidByteRange {
+        start: u64,
+        end: u64,
+    },
     EmptyByteRangeSuffix,
     /// A caller-supplied header collides with one the transport owns on the
     /// wire (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection`,
@@ -815,10 +824,7 @@ impl HttpTransport {
                     match reader.read(&mut chunk) {
                         Ok(0) => break,
                         Ok(count) => {
-                            if chunk_tx
-                                .send(Ok(chunk[..count].to_vec()))
-                                .is_err()
-                            {
+                            if chunk_tx.send(Ok(chunk[..count].to_vec())).is_err() {
                                 break;
                             }
                         }
@@ -916,11 +922,9 @@ fn decorate<TBuilder>(
     builder: ureq::RequestBuilder<TBuilder>,
     headers: &[(String, String)],
 ) -> ureq::RequestBuilder<TBuilder> {
-    headers
-        .iter()
-        .fold(builder, |builder, (name, value)| {
-            builder.header(name.as_str(), value.as_str())
-        })
+    headers.iter().fold(builder, |builder, (name, value)| {
+        builder.header(name.as_str(), value.as_str())
+    })
 }
 
 /// Maps a typed ureq failure onto the transport's error vocabulary.
@@ -1180,94 +1184,96 @@ mod tests {
     };
     use url::Url;
 
-#[test]
-fn default_user_agent_is_browser_compatible_and_product_identifiable() {
-    let user_agent = FetchConfig::default().user_agent;
-    assert!(user_agent.starts_with("Mozilla/5.0 "));
-    assert!(user_agent.contains("AppleWebKit/537.36"));
-    assert!(user_agent.contains("Chrome/"));
-    assert!(user_agent.contains("rENDER/"));
-}
+    #[test]
+    fn default_user_agent_is_browser_compatible_and_product_identifiable() {
+        let user_agent = FetchConfig::default().user_agent;
+        assert!(user_agent.starts_with("Mozilla/5.0 "));
+        assert!(user_agent.contains("AppleWebKit/537.36"));
+        assert!(user_agent.contains("Chrome/"));
+        assert!(user_agent.contains("rENDER/"));
+    }
 
-#[test]
-fn http_methods_carry_wire_names_and_body_rules() {
-    use super::HttpMethod;
+    #[test]
+    fn http_methods_carry_wire_names_and_body_rules() {
+        use super::HttpMethod;
 
-    assert_eq!(HttpMethod::default(), HttpMethod::Get);
-    assert_eq!(HttpMethod::Get.as_str(), "GET");
-    assert_eq!(HttpMethod::Post.as_str(), "POST");
-    assert_eq!(HttpMethod::Put.as_str(), "PUT");
-    assert_eq!(HttpMethod::Delete.as_str(), "DELETE");
-    assert_eq!(HttpMethod::Head.as_str(), "HEAD");
-    assert!(!HttpMethod::Get.allows_body());
-    assert!(!HttpMethod::Head.allows_body());
-    assert!(HttpMethod::Post.allows_body());
-    assert!(HttpMethod::Put.allows_body());
-    assert!(HttpMethod::Delete.allows_body());
-}
+        assert_eq!(HttpMethod::default(), HttpMethod::Get);
+        assert_eq!(HttpMethod::Get.as_str(), "GET");
+        assert_eq!(HttpMethod::Post.as_str(), "POST");
+        assert_eq!(HttpMethod::Put.as_str(), "PUT");
+        assert_eq!(HttpMethod::Delete.as_str(), "DELETE");
+        assert_eq!(HttpMethod::Head.as_str(), "HEAD");
+        assert!(!HttpMethod::Get.allows_body());
+        assert!(!HttpMethod::Head.allows_body());
+        assert!(HttpMethod::Post.allows_body());
+        assert!(HttpMethod::Put.allows_body());
+        assert!(HttpMethod::Delete.allows_body());
+    }
 
-#[test]
-fn rejects_reserved_headers_and_bodyless_method_bodies_before_transport() {
-    use super::HttpMethod;
+    #[test]
+    fn rejects_reserved_headers_and_bodyless_method_bodies_before_transport() {
+        use super::HttpMethod;
 
-    // Validation runs before any I/O, so the discard port keeps this test
-    // off the network entirely.
-    let url = Url::parse("http://127.0.0.1:9/rejected").unwrap();
-    let transport = HttpTransport::new(FetchConfig::default());
-    let cancel = CancelToken::default();
+        // Validation runs before any I/O, so the discard port keeps this test
+        // off the network entirely.
+        let url = Url::parse("http://127.0.0.1:9/rejected").unwrap();
+        let transport = HttpTransport::new(FetchConfig::default());
+        let cancel = CancelToken::default();
 
-    let error = transport
-        .fetch(
-            &FetchRequest::get(url.clone()).with_header("Host", "example.com"),
-            &cancel,
-        )
-        .unwrap_err();
-    assert_eq!(error, FetchError::ReservedHeader("Host".into()));
+        let error = transport
+            .fetch(
+                &FetchRequest::get(url.clone()).with_header("Host", "example.com"),
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error, FetchError::ReservedHeader("Host".into()));
 
-    let error = transport
-        .fetch(
-            &FetchRequest::post(url.clone()).with_header("Content-Length", "12"),
-            &cancel,
-        )
-        .unwrap_err();
-    assert_eq!(error, FetchError::ReservedHeader("Content-Length".into()));
+        let error = transport
+            .fetch(
+                &FetchRequest::post(url.clone()).with_header("Content-Length", "12"),
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error, FetchError::ReservedHeader("Content-Length".into()));
 
-    let error = transport
-        .fetch(
-            &FetchRequest::get(url.clone())
-                .with_header("TRANSFER-ENCODING", "chunked"),
-            &cancel,
-        )
-        .unwrap_err();
-    assert_eq!(error, FetchError::ReservedHeader("TRANSFER-ENCODING".into()));
+        let error = transport
+            .fetch(
+                &FetchRequest::get(url.clone()).with_header("TRANSFER-ENCODING", "chunked"),
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            FetchError::ReservedHeader("TRANSFER-ENCODING".into())
+        );
 
-    let error = transport
-        .fetch(
-            &FetchRequest::get(url.clone()).with_header("Cookie", "sid=1"),
-            &cancel,
-        )
-        .unwrap_err();
-    assert_eq!(error, FetchError::ReservedHeader("Cookie".into()));
+        let error = transport
+            .fetch(
+                &FetchRequest::get(url.clone()).with_header("Cookie", "sid=1"),
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error, FetchError::ReservedHeader("Cookie".into()));
 
-    let error = transport
-        .fetch(&FetchRequest::get(url.clone()).with_body("x"), &cancel)
-        .unwrap_err();
-    assert_eq!(
-        error,
-        FetchError::InvalidRequest("GET requests cannot carry a body".into())
-    );
+        let error = transport
+            .fetch(&FetchRequest::get(url.clone()).with_body("x"), &cancel)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            FetchError::InvalidRequest("GET requests cannot carry a body".into())
+        );
 
-    let error = transport
-        .fetch(
-            &FetchRequest::new(HttpMethod::Head, url.clone()).with_body("x"),
-            &cancel,
-        )
-        .unwrap_err();
-    assert_eq!(
-        error,
-        FetchError::InvalidRequest("HEAD requests cannot carry a body".into())
-    );
-}
+        let error = transport
+            .fetch(
+                &FetchRequest::new(HttpMethod::Head, url.clone()).with_body("x"),
+                &cancel,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            FetchError::InvalidRequest("HEAD requests cannot carry a body".into())
+        );
+    }
 
     #[test]
     fn parses_content_type_and_charset_case_insensitively() {

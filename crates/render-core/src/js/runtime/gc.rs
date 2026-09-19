@@ -175,10 +175,24 @@ pub(super) fn mark_host(
         | ObjectHost::UrlConstructor
         | ObjectHost::UrlSearchParamsConstructor
         | ObjectHost::UrlInstance(_)
+        | ObjectHost::VideoConstructor
         | ObjectHost::XmlHttpRequestConstructor
         | ObjectHost::XmlHttpRequest(_)
         | ObjectHost::ResponseConstructor
         | ObjectHost::Response { .. } => {}
+        ObjectHost::VideoElement(state) => {
+            // Pending `play()` promises stay reachable until the media load
+            // settles, mirroring the fetch-transfer target roots below.
+            for play_promise in &state.pending_play_promises {
+                mark_object(
+                    runtime,
+                    marked,
+                    work,
+                    marked_environments,
+                    play_promise.object,
+                );
+            }
+        }
         ObjectHost::ResponseHeaders { owner } => {
             mark_object(runtime, marked, work, marked_environments, *owner);
         }

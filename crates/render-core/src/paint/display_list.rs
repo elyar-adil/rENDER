@@ -1088,11 +1088,7 @@ impl Builder<'_> {
             // containing block) is reached.
             if recovered
                 || !positioned
-                || is_positioned(
-                    parent
-                        .source
-                        .and_then(|source| self.styles.get(&source)),
-                )
+                || is_positioned(parent.source.and_then(|source| self.styles.get(&source)))
             {
                 break;
             }
@@ -2226,10 +2222,7 @@ mod tests {
         );
         assert!(paints[0].destination.size.width > 0.0);
         assert!(paints[0].destination.size.height > 0.0);
-        assert_eq!(
-            paints[0].source,
-            PhysicalRect::new(0.0, 0.0, 672.0, 378.0)
-        );
+        assert_eq!(paints[0].source, PhysicalRect::new(0.0, 0.0, 672.0, 378.0));
         assert_eq!(
             images
                 .get(paints[0].resource)
@@ -2471,10 +2464,7 @@ mod tests {
             paints[0].destination,
             PhysicalRect::new(0.0, 0.0, 400.0, 225.0)
         );
-        assert_eq!(
-            paints[0].source,
-            PhysicalRect::new(0.0, 0.0, 672.0, 378.0)
-        );
+        assert_eq!(paints[0].source, PhysicalRect::new(0.0, 0.0, 672.0, 378.0));
     }
 
     #[test]
