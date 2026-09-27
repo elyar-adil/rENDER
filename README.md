@@ -10,7 +10,10 @@ and are readable end to end.
 **As of 2026-09-01.** These are engineering estimates for the browser reaching
 the project's minimum usable scope. They are not WPT, test262, or
 web-compatibility pass rates; `100%` means the currently planned browser scope
-is implemented and covered well enough to maintain.
+is implemented and covered well enough to maintain. They also age quickly - for
+the current, evidence-backed view of what is actually missing, read
+[`docs/visual_fidelity_gaps.md`](docs/visual_fidelity_gaps.md), which records
+capabilities that are parsed but never consumed, or computed and then dropped.
 
 | Component | Completion | Current boundary |
 | --- | ---: | --- |
@@ -19,7 +22,7 @@ is implemented and covered well enough to maintain.
 | CSS syntax, selectors, and cascade | 45% | Common selectors, specificity, inheritance, custom properties, and major value grammars work; full CSS syntax and cascade coverage remain. |
 | Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
-| JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run is 11,628/98,096 variants passed (11.9%). |
+| JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 30,808/98,096 variants (31.4%), recorded 2026-09-20. |
 | Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active, while Fetch/CORS and service workers remain. |
 | Browser shell and interaction | 55% | Native window, tabs, address editing, history, scrolling, links, forms, and DPI-aware painting work; accessibility and broader input remain. |
 | **Overall minimum usable browser** | **42%** | Enough infrastructure exists for iterative real-site compatibility work; this is not a claim of general web compatibility. |
@@ -80,8 +83,13 @@ Run the required checks before finishing any change:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+python tools/check_site_neutrality.py
 cargo test --workspace
 ```
+
+`tools/check_site_neutrality.py` enforces the no-per-site-branches rule
+mechanically, so a capability gap cannot be quietly closed by special-casing a
+host. It runs in CI alongside the other three checks.
 
 Conformance suites:
 
@@ -94,7 +102,14 @@ Conformance suites:
 ## Repository Layout
 
 ```text
-crates/render-core        Engine library: HTML, DOM, CSS, JS, layout, painting
+crates/render-dom         DOM tree, namespaces, revisions, mutation journal
+crates/render-html        HTML5 tokenizer, tree builder, encoding sniffing
+crates/render-css         Stylesheet parsing, selectors, cascade, computed values
+crates/render-layout      CSS formatting structure and solver (block, inline,
+                          flex, grid, table) producing immutable fragments
+crates/render-js          JS lexer, parser, interpreter, Web API builtins
+crates/render-core        Page session pipeline, image decode, display list,
+                          CPU rasterization, interaction, navigation, event loop
 crates/render-net         Bounded HTTP(S) transport (ureq + rustls)
 crates/render-browser     Native desktop shell (winit + softbuffer)
 example/                  Local HTML fixtures for manual testing
@@ -105,14 +120,22 @@ third_party/              Vendored test262 checkout
 
 ## Architecture
 
+The engine crates are strictly layered: `render-dom` knows nothing about CSS,
+`render-css` knows nothing about layout, and `render-layout` knows nothing about
+painting. `render-core` is the only crate that composes them.
+
 1. `render-net` fetches documents and subresources over bounded HTTP(S).
-2. `render-core` parses HTML into a DOM tree.
-3. Stylesheets are parsed, cascaded, and computed into style trees.
-4. The page session executes supported JavaScript against the DOM and keeps
-   timers, promises, and invalidation alive after load.
-5. Layout builds boxes for block, inline, float, flex, grid, table, and
-   positioned flows; painting emits a display list rasterized on the CPU.
-6. `render-browser` presents that surface in a native window with tabs,
+2. `render-html` parses HTML into a `render-dom` tree, in the SVG and MathML
+   namespaces where the document uses foreign content.
+3. `render-css` parses stylesheets, matches selectors, applies the cascade, and
+   resolves computed values.
+4. `render-js` executes supported JavaScript against the DOM and keeps timers,
+   promises, and invalidation alive after load.
+5. `render-layout` builds the CSS formatting structure and lays out block, inline,
+   float, flex, grid, table, and positioned flows into immutable fragments.
+6. `render-core` drives load → style → layout → paint, decodes images, and
+   rasterizes the display list on the CPU.
+7. `render-browser` presents that surface in a native window with tabs,
    navigation, and input handling.
 
 Standards are the authority: WHATWG/CSS/ECMAScript specifications, WPT, and
@@ -130,6 +153,11 @@ Compatibility improves through narrow, test-backed slices:
 Site-specific render adapters and external-browser fallbacks are intentionally
 out of scope. Missing capability should be tracked as generic engine work, not
 patched per site.
+
+A capability that is absent is a TODO to implement, never something to delete,
+stub out, or route around - and a document that describes a retired architecture
+is a defect to rewrite, not to remove. See the "Priority -1" section of
+[`docs/generic-browser-todo.md`](docs/generic-browser-todo.md).
 
 ## Security Model
 

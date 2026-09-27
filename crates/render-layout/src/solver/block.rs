@@ -10,6 +10,7 @@ use crate::solver::FloatArea;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
 use crate::solver::Solver;
+use crate::solver::inline::InlineTextContextSource;
 use crate::solver::resolve::position;
 use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
@@ -26,12 +27,39 @@ use render_css::properties::Position;
 use render_css::properties::TypedPropertyValue;
 use render_dom::NodeId;
 
+use crate::scrollport::ClipMode;
+
 pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>) -> bool {
     ["overflow-x", "overflow-y"].into_iter().any(|property| {
         matches!(
             style.and_then(|style| style.typed(property)),
             Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
         )
+    })
+}
+
+/// CSS Overflow 3 §3.1: what a box does with content that exceeds its padding
+/// box. `None` is `overflow: visible`, which neither clips nor scrolls.
+///
+/// The mode is the whole difference between `hidden` and `auto`: both clip, and
+/// only a scrollable axis produces a scrollport. `hidden` on one axis with
+/// `auto` on the other scrolls, because the axes are independent.
+pub(super) fn overflow_clip_mode(style: Option<&ComputedStyle>) -> Option<ClipMode> {
+    let axis = |property: &str| match style.and_then(|style| style.typed(property)) {
+        Some(TypedPropertyValue::Overflow(value)) => *value,
+        _ => Overflow::Visible,
+    };
+    let (x, y) = (axis("overflow-x"), axis("overflow-y"));
+    if matches!(x, Overflow::Visible) && matches!(y, Overflow::Visible) {
+        return None;
+    }
+    let scrollable = [x, y]
+        .into_iter()
+        .any(|value| matches!(value, Overflow::Auto | Overflow::Scroll));
+    Some(if scrollable {
+        ClipMode::Scrollport
+    } else {
+        ClipMode::Clip
     })
 }
 
@@ -145,6 +173,7 @@ impl Solver<'_> {
                     FormattingContextKind::Block
                         | FormattingContextKind::Flex
                         | FormattingContextKind::Grid
+                        | FormattingContextKind::Table
                 ) {
                     self.diagnostics.push(LayoutDiagnostic {
                         node: node.source,
@@ -256,31 +285,17 @@ impl Solver<'_> {
         let mut margin_right = self.resolve_auto_edge(style, "margin-right", basis, node.source);
         let margin_top = self.resolve_edge(style, "margin-top", basis, node.source);
         let margin_bottom = self.resolve_edge(style, "margin-bottom", basis, node.source);
-        let padding = EdgeSizes {
-            top: self
-                .resolve_edge(style, "padding-top", basis, node.source)
-                .max(0.0),
-            right: self
-                .resolve_edge(style, "padding-right", basis, node.source)
-                .max(0.0),
-            bottom: self
-                .resolve_edge(style, "padding-bottom", basis, node.source)
-                .max(0.0),
-            left: self
-                .resolve_edge(style, "padding-left", basis, node.source)
-                .max(0.0),
-        };
-        let border = EdgeSizes {
-            top: self.resolve_border(style, "border-top-width", basis, node.source),
-            right: self.resolve_border(style, "border-right-width", basis, node.source),
-            bottom: self.resolve_border(style, "border-bottom-width", basis, node.source),
-            left: self.resolve_border(style, "border-left-width", basis, node.source),
-        };
+        let (border, padding) = self.resolve_box_edges(style, basis, node.source);
         let box_sizing = match style.and_then(|style| style.typed("box-sizing")) {
             Some(TypedPropertyValue::BoxSizing(value)) => *value,
             _ => BoxSizing::ContentBox,
         };
 
+        let context = match &node.kind {
+            FormattingNodeKind::BlockContainer { context }
+            | FormattingNodeKind::AtomicInline { context } => *context,
+            _ => FormattingContextKind::Block,
+        };
         let css_width = self.resolve_size(style, "width", basis, node.source);
         // CSS 2 §10.5: against an indefinite containing height a percentage
         // height computes to `auto`; it must never resolve against the
@@ -346,6 +361,15 @@ impl Solver<'_> {
             non_content,
             box_sizing,
         );
+        if context == FormattingContextKind::Table && forced_content_width.is_none() {
+            // CSS 2.1 §17.5.2.2 and §17.5.2.5: a `display: table` box is sized
+            // by the table algorithm, which shrink-to-fits its columns when the
+            // width is `auto` and grows an over-constrained table to fit them.
+            // Resolving it here means the fragment, the containing block of the
+            // table's positioned descendants and its columns all use one width.
+            content_width =
+                self.table_content_width(node_id, style, content_width, specified_width.is_some());
+        }
 
         if forced_content_width.is_some() {
             margin_left.value = if margin_left.auto {
@@ -402,7 +426,13 @@ impl Solver<'_> {
                 }
                 (true, false) if remaining > 0.0 => margin_left.value = remaining,
                 (false, true) if remaining > 0.0 => margin_right.value = remaining,
-                _ => margin_right.value += remaining,
+                // §10.3.7 only solves the equation by adjusting a margin when the
+                // values are over-constrained. With no auto margin and space
+                // left over, the box sits at its start margin and the rest of
+                // the containing block stays empty, so the used margin is the
+                // specified one.
+                _ if remaining < 0.0 => margin_right.value += remaining,
+                _ => {}
             }
         }
 
@@ -496,11 +526,6 @@ impl Solver<'_> {
         } else {
             (0.0, 0.0)
         };
-        let context = match node.kind {
-            FormattingNodeKind::BlockContainer { context }
-            | FormattingNodeKind::AtomicInline { context } => context,
-            _ => FormattingContextKind::Block,
-        };
         let positioned_child_containing = if position == Position::Static {
             // An absolute descendant may cross one or more static wrappers
             // before reaching its positioned ancestor.  During the first
@@ -576,6 +601,15 @@ impl Solver<'_> {
                 depth.saturating_add(1),
                 style,
                 node.source,
+            ),
+            FormattingContextKind::Table => self.layout_table_children(
+                node_id,
+                style,
+                &flow_children,
+                PhysicalRect::new(content_x, content_y, content_width, 0.0),
+                positioned_child_containing,
+                specified_content_height,
+                depth.saturating_add(1),
             ),
             _ => {
                 let mut cursor_y = content_y;
@@ -741,6 +775,20 @@ impl Solver<'_> {
         if position == Position::Relative {
             self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);
         }
+        if position == Position::Sticky {
+            // §4.1: the box keeps the position layout gave it and the consumer
+            // displaces it when it paints, so the only thing layout records is
+            // which boxes are sticky. The constraint is resolved from the
+            // finished tree, once no ancestor can still move this subtree.
+            self.sticky_boxes.push(fragment);
+        }
+        if overflow_clip_mode(style).is_some() {
+            // CSS Overflow 3 §3.1: the box clips, and may be a scrollport. Its
+            // rectangle and range are resolved from the finished tree, because
+            // both need the content to be in its final place and a nested
+            // scrollport stops its content counting towards an outer one.
+            self.clipping_boxes.push((fragment, node.source));
+        }
         if out_of_flow {
             if let Some(outer) = self.fragment_outer_rect(fragment) {
                 let target_x = left.map_or_else(
@@ -773,6 +821,7 @@ impl Solver<'_> {
             } else {
                 margin_top + border.vertical() + padding.vertical() + content_height + margin_bottom
             },
+            flow_height: auto_height,
         })
     }
 
@@ -850,7 +899,15 @@ impl Solver<'_> {
             &inline_roots,
             PhysicalRect::new(containing.origin.x, y, containing.size.width, 0.0),
             positioning_containing,
-            self.text_align(node.style_source),
+            InlineTextContextSource {
+                // An anonymous block borrows its parent's style source, so
+                // `text-indent`, `overflow` and `text-overflow` all resolve on
+                // the element that actually carries them.
+                style_source: node.style_source,
+                // CSS Text 3 §8.1: only the first line of an anonymous block
+                // that is its parent's first child is indented.
+                is_first_child: node.is_first_child,
+            },
             depth.saturating_add(1),
             floats,
         );
@@ -858,6 +915,7 @@ impl Solver<'_> {
         Some(BlockResult {
             fragment,
             outer_height: height,
+            flow_height: height,
         })
     }
 
@@ -871,12 +929,10 @@ impl Solver<'_> {
     }
 
     pub(super) fn is_out_of_flow(&self, node: FormattingNodeId) -> bool {
-        let style = self
-            .formatting
-            .get(node)
-            .and_then(|node| node.style_source)
-            .and_then(|source| self.styles.get(&source));
-        matches!(position(style), Position::Absolute | Position::Fixed)
+        // An anonymous box borrows its parent's text style but has no box of
+        // its own, so `position` is not inherited into it: the out-of-flow test
+        // has to follow the source element, exactly as `float_side` does.
+        self.source_is_out_of_flow(self.formatting.get(node).and_then(|node| node.source))
     }
 
     pub(super) fn float_side(&self, node: FormattingNodeId) -> Float {

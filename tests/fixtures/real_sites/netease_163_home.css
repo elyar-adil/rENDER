@@ -1,0 +1,69 @@
+/*
+ * Deterministic stand-in for the NetEase portal index stylesheet.
+ *
+ * The live portal splits its index styling across two sheets on the same
+ * static origin. The harness serves the same deterministic bytes for every
+ * eligible external slot, so this file stands in for both of them.
+ *
+ * Served in place of:
+ *   https://static.ws.126.net/163/163_index_0f1a2b.css
+ *   https://static.ws.126.net/163/163_index_theme_4c8d90.css
+ *
+ * The side column is stacked under the channel feed rather than floated beside
+ * it, so that document order and vertical order agree. See baidu_home.css.
+ */
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #f8f8f8; color: #222222; font-size: 14px; line-height: 22px; }
+
+.page-head { display: block; width: 100%; height: 96px; background-color: #d6000f; }
+.logo { display: inline-block; width: 110px; height: 32px; margin-top: 12px; margin-left: 20px; }
+.logo img { display: block; width: 110px; height: 32px; }
+.search { display: inline-block; width: 460px; height: 32px; margin-top: 12px; margin-left: 490px; }
+.search input { display: inline-block; width: 360px; height: 32px; }
+.search button { display: inline-block; width: 90px; height: 32px; background-color: #ffffff; color: #d6000f; }
+.channel-nav { display: block; width: 720px; height: 24px; margin-top: 12px; margin-left: 20px; }
+.channel-nav a { display: inline-block; width: 100px; height: 24px; margin-right: 4px; color: #ffffff; font-size: 15px; line-height: 24px; }
+
+.page-main { display: block; width: 1280px; margin-top: 16px; margin-left: 0; }
+.lead-story { display: block; width: 1280px; }
+.lead-title { display: block; width: 620px; height: 32px; margin-top: 0; margin-bottom: 0; font-size: 24px; line-height: 32px; }
+.lead-title a { color: #222222; }
+.lead-abstract { display: block; width: 620px; height: 44px; margin-top: 4px; color: #555555; }
+.lead-meta { display: block; width: 620px; height: 20px; margin-top: 0; color: #999999; font-size: 12px; line-height: 20px; }
+.lead-image { display: block; width: 640px; height: 360px; margin-top: 12px; }
+
+.columns { display: block; width: 1280px; margin-top: 20px; }
+.channels { display: block; width: 880px; }
+.channel { display: block; width: 880px; margin-top: 0; margin-bottom: 20px; padding-top: 12px; padding-bottom: 12px; background-color: #ffffff; }
+.channel-title { display: block; width: 856px; height: 26px; margin-top: 0; margin-bottom: 0; border-bottom-width: 2px; border-bottom-style: solid; border-bottom-color: #d6000f; font-size: 19px; line-height: 26px; }
+.channel-title a { color: #d6000f; }
+.channel-item { display: block; width: 856px; height: 44px; margin-top: 0; }
+.channel-item-tall { height: 124px; }
+.channel-item-figure { height: 230px; }
+.channel-link { display: inline-block; width: 600px; height: 22px; color: #222222; }
+.lazy { display: inline-block; width: 200px; height: 120px; margin-left: 16px; background-color: #eeeeee; }
+.clip { display: inline-block; width: 200px; height: 120px; margin-left: 16px; background-color: #222222; }
+.figure-wide { display: inline-block; width: 400px; height: 225px; margin-left: 40px; }
+
+.rail { display: block; width: 380px; margin-top: 20px; margin-left: 0; }
+.rail-card { display: block; width: 380px; height: 200px; margin-bottom: 20px; padding-top: 12px; padding-bottom: 12px; background-color: #ffffff; }
+.rail-card h2 { display: block; width: 356px; height: 24px; margin-top: 0; margin-bottom: 0; font-size: 17px; line-height: 24px; }
+.rail-nav { display: block; width: 356px; height: 72px; }
+.rail-nav a { display: inline-block; width: 110px; height: 24px; margin-right: 8px; color: #d6000f; }
+.rail-list { display: block; width: 356px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: block; width: 356px; height: 24px; }
+.rail-list a { color: #222222; }
+.qrcode { display: block; width: 140px; height: 140px; }
+.rail-note { display: block; width: 356px; height: 20px; color: #999999; font-size: 12px; line-height: 20px; }
+
+.ranked { display: block; width: 1280px; margin-top: 20px; }
+.ranked h2 { display: block; width: 1280px; height: 28px; margin-top: 0; margin-bottom: 0; font-size: 19px; line-height: 28px; }
+.rank-list { display: block; width: 1280px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rank-item { display: block; width: 1280px; height: 34px; margin-top: 0; margin-bottom: 2px; }
+.rank-no { display: inline-block; width: 40px; height: 34px; color: #999999; }
+.rank-link { display: inline-block; width: 1180px; height: 34px; color: #222222; }
+
+.page-foot { display: block; width: 1280px; height: 40px; margin-top: 40px; color: #999999; font-size: 12px; line-height: 20px; }
+.page-foot a { display: inline-block; width: 180px; height: 20px; margin-right: 10px; }
+.filing-badge { display: inline-block; width: 16px; height: 16px; }

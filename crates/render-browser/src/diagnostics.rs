@@ -39,6 +39,8 @@ pub(super) fn log_completed_frame_debug(frame: &PageRenderFrame, tab_id: u64) {
             render_core::paint::DisplayCommand::PopTransform => "pop-transform",
             render_core::paint::DisplayCommand::GlyphRun(_) => "glyph",
             render_core::paint::DisplayCommand::TextDecoration(_) => "decoration",
+            render_core::paint::DisplayCommand::TextShadow(_) => "text-shadow",
+            render_core::paint::DisplayCommand::ListMarker(_) => "list-marker",
             render_core::paint::DisplayCommand::Image(_) => "image",
             render_core::paint::DisplayCommand::LinearGradient(_) => "linear-gradient",
             render_core::paint::DisplayCommand::RadialGradient(_) => "radial-gradient",

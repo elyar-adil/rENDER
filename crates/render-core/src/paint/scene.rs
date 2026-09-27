@@ -397,6 +397,8 @@ fn classify_item(item: &DisplayItem) -> PaintChunkClassification {
         }
         DisplayCommand::SolidRect { .. }
         | DisplayCommand::TextDecoration(_)
+        | DisplayCommand::TextShadow(_)
+        | DisplayCommand::ListMarker(_)
         | DisplayCommand::Border(_)
         | DisplayCommand::BoxShadow(_)
         | DisplayCommand::GlyphRun(_)

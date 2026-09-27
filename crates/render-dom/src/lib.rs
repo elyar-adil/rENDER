@@ -209,6 +209,25 @@ pub struct ElementData {
     pub namespace: Namespace,
     pub local_name: String,
     pub attributes: Vec<Attribute>,
+    /// The element's template contents, for an HTML `template` element and
+    /// nothing else: the `DocumentFragment` reachable as `template.content`.
+    ///
+    /// The fragment is deliberately **not** a child of the element. It is a
+    /// separate node with no parent, so the contents of a template are not
+    /// connected to the document, are not in document order, and are invisible
+    /// to child traversal, `getElementById`, and selector matching over the
+    /// document. See [`Dom::template_contents`].
+    pub template_contents: Option<NodeId>,
+    /// The form owner the HTML parser associated with this element through the
+    /// form element pointer, and the parent it was created for. `None` for every
+    /// element the parser did not associate that way, which is every element
+    /// whose owner is decided by [`Dom::form_owner`]'s derived rules.
+    ///
+    /// This is deliberately not the form owner itself. Storing the owner would
+    /// mean every rule that can change it has to be re-run on every tree
+    /// mutation; deriving it on read cannot go stale, and this one record is the
+    /// only thing that is not derivable. See [`ParserInsertedFormOwner`].
+    pub parser_inserted_form_owner: Option<ParserInsertedFormOwner>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +235,26 @@ pub struct DocumentTypeData {
     pub name: String,
     pub public_id: String,
     pub system_id: String,
+}
+/// The form owner the HTML parser associated with a form-associated element
+/// through the form element pointer (13.2.4.4), together with the parent the
+/// parser was going to insert the element into.
+///
+/// This is the one part of the form owner that cannot be derived from the
+/// finished tree, because the form the parser points at need not be an ancestor
+/// of the control: the pointer exists so that form controls associate with forms
+/// "in the face of dramatically bad markup" (13.2.4.4). Everything else about
+/// the owner is derived on read by [`Dom::form_owner`], so this record is the
+/// only state the form owner needs, and it is invalidated by reading it: it
+/// applies only while the element is still the child it was created for, which
+/// is exactly when the parser's association is still the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParserInsertedFormOwner {
+    /// The element the parser's form element pointer was set to.
+    pub form: NodeId,
+    /// The intended parent from "the appropriate place for inserting a node",
+    /// which is the element's parent once it has been inserted.
+    pub intended_parent: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -490,11 +529,9 @@ impl Dom {
     }
 
     pub fn create_element(&mut self, local_name: impl Into<String>) -> NodeId {
-        self.allocate(NodeKind::Element(ElementData {
-            namespace: Namespace::Html,
-            local_name: local_name.into().to_ascii_lowercase(),
-            attributes: Vec::new(),
-        }))
+        let local_name = local_name.into().to_ascii_lowercase();
+        let data = self.new_element_data(Namespace::Html, local_name);
+        self.allocate(NodeKind::Element(data))
     }
 
     pub fn create_element_ns(
@@ -502,11 +539,241 @@ impl Dom {
         namespace: Namespace,
         local_name: impl Into<String>,
     ) -> NodeId {
-        self.allocate(NodeKind::Element(ElementData {
-            namespace,
-            local_name: local_name.into(),
-            attributes: Vec::new(),
-        }))
+        let data = self.new_element_data(namespace, local_name.into());
+        self.allocate(NodeKind::Element(data))
+    }
+
+    /// The `DocumentFragment` reachable as `element.content` for an HTML
+    /// `template` element, and `None` for every other node.
+    ///
+    /// The fragment is not a child of the element, so its contents are inert:
+    /// they are not connected to the document, not in document order, and not
+    /// reachable by document traversal, `getElementById`, or selector matching.
+    /// Only code that asks for the contents by element sees them.
+    #[must_use]
+    pub fn template_contents(&self, element: NodeId) -> Option<NodeId> {
+        match self.node(element).map(Node::kind) {
+            Some(NodeKind::Element(data)) => data.template_contents,
+            _ => None,
+        }
+    }
+
+    /// Whether the node is a form-associated element: an HTML `button`,
+    /// `fieldset`, `input`, `object`, `output`, `select`, `textarea`, or `img`
+    /// (4.10.2).
+    ///
+    /// `form` is deliberately absent, as are the elements that are only
+    /// form-associated when they are form-associated custom elements: this DOM
+    /// has no custom element registry, so a custom element is an element with
+    /// whatever local name it was created with and is never form-associated.
+    /// An SVG `input` is an SVG `input`, not an HTML one, so the namespace is
+    /// part of the test.
+    #[must_use]
+    pub fn is_form_associated(&self, node: NodeId) -> bool {
+        matches!(self.element_data(node), Some((Namespace::Html, name))
+        if matches!(
+            name,
+            "button"
+                | "fieldset"
+                | "input"
+                | "object"
+                | "output"
+                | "select"
+                | "textarea"
+                | "img"
+        ))
+    }
+
+    /// Whether the node is a listed element: a form-associated element that
+    /// appears in `form.elements` and `fieldset.elements`, and that therefore
+    /// has a `form` content attribute and a `form` IDL attribute that name an
+    /// explicit form owner (4.10.2).
+    ///
+    /// This is [`Self::is_form_associated`] minus `img`: an `img` is
+    /// form-associated, so it has a form owner and takes part in submission, but
+    /// it is not listed, so the `form` content attribute does not apply to it and
+    /// it is not in `form.elements`.
+    #[must_use]
+    pub fn is_listed_element(&self, node: NodeId) -> bool {
+        self.is_form_associated(node)
+            && !matches!(self.element_data(node), Some((Namespace::Html, "img")))
+    }
+
+    /// Whether the node is a submittable element: one whose value can end up in
+    /// a form's entry list (4.10.2). `fieldset` and `object` are
+    /// form-associated and listed but not submittable, and `img` is neither.
+    #[must_use]
+    pub fn is_submittable_element(&self, node: NodeId) -> bool {
+        matches!(self.element_data(node), Some((Namespace::Html, name))
+            if matches!(name, "button" | "input" | "select" | "textarea"))
+    }
+
+    /// Whether the node is an HTML `form` element.
+    #[must_use]
+    pub fn is_form_element(&self, node: NodeId) -> bool {
+        matches!(self.element_data(node), Some((Namespace::Html, "form")))
+    }
+
+    /// The form owner of a form-associated element, or `None` for an element
+    /// that is not form-associated and for a form-associated element with no
+    /// form (4.10.18.3).
+    ///
+    /// This is the whole of the form owner, and it is **derived on read** from
+    /// the tree and the attributes, so it cannot be stale: there is no owner to
+    /// keep in step with insertions, removals, moves, and attribute changes.
+    /// The three steps are the spec's, in order:
+    ///
+    /// 1. If the HTML parser associated the element with a form through the form
+    ///    element pointer and that association still holds, that is the owner.
+    ///    This is the one case the finished tree cannot express, because the form
+    ///    need not be an ancestor of the element; see
+    ///    [`Self::set_parser_inserted_form_owner`].
+    /// 2. Otherwise, if the element is listed, has a `form` content attribute,
+    ///    and is connected: if the first element in the element's own tree, in
+    ///    tree order, whose ID is that attribute's value is a `form` element, it
+    ///    is the owner — and if nothing has that ID, or the element with that ID
+    ///    is not a `form`, the owner is `None`.
+    ///
+    ///    This step is an `if`/`else` with the next one, not a fallback: a `form`
+    ///    attribute that names nothing is **not** quietly ignored in favour of an
+    ///    ancestor. A control written `<input form="typo">` inside a form has no
+    ///    form owner, which is what tells an author the attribute is wrong.
+    ///
+    /// 3. Otherwise, the nearest ancestor `form` element, and `None` if there is
+    ///    none.
+    ///
+    /// Step 3 is what makes removal correct without a hook: when a `form`
+    /// ancestor is removed, the control is no longer inside it, so the walk from
+    /// the control simply does not reach it and the owner is `None`. It does not
+    /// keep pointing at the detached form, and it does not keep searching past
+    /// the nearest form.
+    #[must_use]
+    pub fn form_owner(&self, node: NodeId) -> Option<NodeId> {
+        if !self.is_form_associated(node) {
+            return None;
+        }
+        if let Some(link) = self.parser_inserted_form_owner(node)
+            && self.parent(node) == Some(link.intended_parent)
+            && self.node(link.form).is_some_and(|form| {
+                matches!(form.kind(), NodeKind::Element(_)) && self.is_in_same_tree(node, link.form)
+            })
+        {
+            return Some(link.form);
+        }
+        if self.is_listed_element(node)
+            && self.is_connected(node)
+            && let Some(id) = self.attribute(node, "form").ok().flatten()
+        {
+            return self
+                .first_element_in_tree_with_id(node, id)
+                .filter(|found| self.is_form_element(*found));
+        }
+        self.nearest_ancestor_form(node)
+    }
+
+    /// Record that the HTML parser associated `element` with `form` through the
+    /// form element pointer, with `intended_parent` as the parent it was
+    /// inserted into (13.2.6.1).
+    ///
+    /// Returns `false` and records nothing when `element` is not a
+    /// form-associated element or `form` is not an element, because the spec
+    /// only allows the association for a form-associated element. Only the HTML
+    /// parser should call this: it is how badly-marked-up form controls end up
+    /// associated with a form that is not their ancestor, and every other owner
+    /// is derived.
+    pub fn set_parser_inserted_form_owner(
+        &mut self,
+        element: NodeId,
+        form: NodeId,
+        intended_parent: NodeId,
+    ) -> bool {
+        if !self.is_form_associated(element) || self.node(form).is_none() {
+            return false;
+        }
+        let Some(data) = self.element_data_mut(element) else {
+            return false;
+        };
+        data.parser_inserted_form_owner = Some(ParserInsertedFormOwner {
+            form,
+            intended_parent,
+        });
+        true
+    }
+
+    /// Forget any parser-inserted form owner on `root` and everything below it,
+    /// leaving the derived rules in charge. The HTML parser does not need this,
+    /// because it creates each element once; it exists so that code which
+    /// reparents a subtree wholesale can drop the associations in it in one call
+    /// instead of relying on [`Self::form_owner`] noticing.
+    pub fn clear_parser_inserted_form_owners(&mut self, root: NodeId) {
+        if let Some(data) = self.element_data_mut(root) {
+            data.parser_inserted_form_owner = None;
+        }
+        for child in self.children(root).unwrap_or_default().to_vec() {
+            self.clear_parser_inserted_form_owners(child);
+        }
+    }
+
+    /// The form owner the HTML parser associated with the node, if any, with no
+    /// check of whether the association still holds. Prefer [`Self::form_owner`].
+    #[must_use]
+    pub fn parser_inserted_form_owner(&self, node: NodeId) -> Option<ParserInsertedFormOwner> {
+        match self.node(node).map(Node::kind) {
+            Some(NodeKind::Element(data)) => data.parser_inserted_form_owner,
+            _ => None,
+        }
+    }
+
+    /// The `elements` of a `form` element: every listed element whose form owner
+    /// is this form element, in tree order, excluding `input` elements whose
+    /// `type` attribute is in the Image Button state, which the standard
+    /// excludes from this particular collection "for historical reasons" (4.10.3).
+    ///
+    /// The collection is rooted at the **form element's root**, not at the form
+    /// element, so a control elsewhere in the tree that names this form with a
+    /// `form` content attribute is in the list. `img` is not a listed element, so
+    /// it is not here even though it has this form owner and is submitted with
+    /// it.
+    #[must_use]
+    pub fn form_owner_elements(&self, form: NodeId) -> Vec<NodeId> {
+        if !self.is_form_element(form) {
+            return Vec::new();
+        }
+        let root = self.tree_root(form);
+        self.listed_elements_within(root)
+            .into_iter()
+            .filter(|element| self.form_owner(*element) == Some(form))
+            .filter(|element| !self.is_image_button(*element))
+            .collect()
+    }
+
+    /// Every listed element at or below `root`, in tree order. This is the
+    /// `fieldset.elements` shape: "an HTMLCollection rooted at the fieldset
+    /// element, whose filter matches listed elements" (4.10.4).
+    ///
+    /// Note that this is a descendant filter, not a form-owner filter. The
+    /// standard roots the collection at the fieldset and filters only on
+    /// listed-ness, so it is the root that scopes it, and a listed descendant
+    /// whose form owner is some other form is still in it.
+    ///
+    /// The current standard has no rule that the descendants of a *disabled*
+    /// fieldset stop being listed; that rule was removed along with the old
+    /// "listed element" definition. Disabling a fieldset therefore does not
+    /// change this list — it changes which elements are barred from constraint
+    /// validation and submission, which is not modelled here.
+    #[must_use]
+    pub fn listed_elements_within(&self, root: NodeId) -> Vec<NodeId> {
+        let mut found = Vec::new();
+        self.collect_listed_elements_within(root, &mut found);
+        found
+    }
+
+    /// Whether two nodes are in the same tree: both connected, or both
+    /// disconnected. This is the DOM's reading of "in the same tree" (13.2.6.1),
+    /// which is what the parser's form-owner association is conditioned on.
+    #[must_use]
+    pub fn is_in_same_tree(&self, left: NodeId, right: NodeId) -> bool {
+        self.is_connected(left) == self.is_connected(right)
     }
 
     pub fn create_text(&mut self, data: impl Into<String>) -> NodeId {
@@ -809,6 +1076,84 @@ impl Dom {
             .map(|attribute| attribute.value.as_str()))
     }
 
+    /// Set a namespaced attribute, as `Element.setAttributeNS` does.
+    ///
+    /// An attribute is identified by the `(namespace, local name)` pair only;
+    /// the prefix is part of the attribute's qualified name and is replaced,
+    /// never used to find an existing attribute. A `None` namespace is the null
+    /// namespace, which is what plain HTML attributes use. Unlike
+    /// [`Self::set_attribute`], `local_name` is never case-folded: only the HTML
+    /// tokenizer lower-cases names, and foreign content carries case-sensitive
+    /// names such as `viewBox`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`] for an unknown node and
+    /// [`DomErrorKind::InvalidNodeType`] when the node is not an element.
+    pub fn set_attribute_ns(
+        &mut self,
+        element: NodeId,
+        namespace: Option<&str>,
+        prefix: Option<&str>,
+        local_name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), DomError> {
+        if !matches!(self.kind(element)?, NodeKind::Element(_)) {
+            return Err(DomError::invalid_node_type("attributes require an element"));
+        }
+        let local_name = local_name.into();
+        let value = value.into();
+        let mutation_name = local_name.clone();
+        let namespace = namespace.map(str::to_owned);
+        let prefix = prefix.map(str::to_owned);
+        let node = self.node_mut(element)?;
+        let NodeKind::Element(data) = &mut node.kind else {
+            unreachable!("element kind was checked")
+        };
+        if let Some(attribute) = data.attributes.iter_mut().find(|attribute| {
+            attribute.namespace == namespace && attribute.local_name == local_name
+        }) {
+            attribute.value = value;
+            attribute.prefix = prefix;
+        } else {
+            data.attributes.push(Attribute {
+                namespace,
+                prefix,
+                local_name,
+                value,
+            });
+        }
+        self.record_mutations([MutationKind::Attribute {
+            target: element,
+            local_name: mutation_name,
+        }]);
+        Ok(())
+    }
+
+    /// Return a namespaced attribute value, as `Element.getAttributeNS` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`] for an unknown node and
+    /// [`DomErrorKind::InvalidNodeType`] when the node is not an element.
+    pub fn attribute_ns(
+        &self,
+        element: NodeId,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Result<Option<&str>, DomError> {
+        let NodeKind::Element(data) = self.kind(element)? else {
+            return Err(DomError::invalid_node_type("attributes require an element"));
+        };
+        Ok(data
+            .attributes
+            .iter()
+            .find(|attribute| {
+                attribute.namespace.as_deref() == namespace && attribute.local_name == local_name
+            })
+            .map(|attribute| attribute.value.as_str()))
+    }
+
     /// Replace character data for a Text, Comment, or `ProcessingInstruction`.
     ///
     /// # Errors
@@ -1000,11 +1345,115 @@ impl Dom {
             }
         }
     }
+
+    /// Create the data for a new element, following the DOM's "creating an
+    /// element" algorithm: "If localName is 'template' and namespace is the
+    /// HTML namespace, then set element's template contents to a new
+    /// DocumentFragment owned by element's node document."
+    ///
+    /// The fragment is allocated before the element, so the element is the node
+    /// that a caller ends up holding. Identifiers are only ever compared, never
+    /// used to imply tree order.
+    fn new_element_data(&mut self, namespace: Namespace, local_name: String) -> ElementData {
+        let template_contents = (namespace == Namespace::Html && local_name == "template")
+            .then(|| self.create_document_fragment());
+        ElementData {
+            namespace,
+            local_name,
+            attributes: Vec::new(),
+            template_contents,
+            parser_inserted_form_owner: None,
+        }
+    }
+
+    /// `(namespace, local name)` for an element, and `None` for every other
+    /// node kind, so the category tests can match on the pair.
+    fn element_data(&self, node: NodeId) -> Option<(&Namespace, &str)> {
+        match self.node(node).map(Node::kind) {
+            Some(NodeKind::Element(data)) => Some((&data.namespace, data.local_name.as_str())),
+            _ => None,
+        }
+    }
+
+    /// A mutable handle on an element's data, and `None` for every other node
+    /// kind.
+    fn element_data_mut(&mut self, node: NodeId) -> Option<&mut ElementData> {
+        match &mut self.node_mut(node).ok()?.kind {
+            NodeKind::Element(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The topmost ancestor of `node`, which is `node` itself if it has no
+    /// parent. For a node in a document this is the document.
+    fn tree_root(&self, node: NodeId) -> NodeId {
+        let mut current = node;
+        while let Some(parent) = self.parent(current) {
+            current = parent;
+        }
+        current
+    }
+
+    /// The nearest ancestor `form` element of `node`, not including `node`
+    /// itself. The walk stops at the first form it reaches, so it never looks
+    /// past a nearer form to a further one.
+    fn nearest_ancestor_form(&self, node: NodeId) -> Option<NodeId> {
+        let mut current = self.parent(node);
+        while let Some(candidate) = current {
+            if self.is_form_element(candidate) {
+                return Some(candidate);
+            }
+            current = self.parent(candidate);
+        }
+        None
+    }
+
+    /// "The first element in `node`'s tree, in tree order, to have an ID that is
+    /// identical to `id`" (4.10.18.3). The search starts at the tree's root, so
+    /// it can reach a form that is not an ancestor of `node`.
+    fn first_element_in_tree_with_id(&self, node: NodeId, id: &str) -> Option<NodeId> {
+        let root = self.tree_root(node);
+        let mut stack = vec![root];
+        while let Some(candidate) = stack.pop() {
+            if self
+                .node(candidate)
+                .is_some_and(|found| matches!(found.kind(), NodeKind::Element(_)))
+                && self.attribute(candidate, "id").ok().flatten() == Some(id)
+            {
+                return Some(candidate);
+            }
+            // Reversed, so that the children come off the stack in tree order.
+            for child in self.children(candidate).unwrap_or_default().iter().rev() {
+                stack.push(*child);
+            }
+        }
+        None
+    }
+
+    fn is_image_button(&self, node: NodeId) -> bool {
+        matches!(self.element_data(node), Some((Namespace::Html, "input")))
+            && self
+                .attribute(node, "type")
+                .ok()
+                .flatten()
+                .is_some_and(|value| value.eq_ignore_ascii_case("image"))
+    }
+
+    fn collect_listed_elements_within(&self, node: NodeId, found: &mut Vec<NodeId>) {
+        if self.is_listed_element(node) {
+            found.push(node);
+        }
+        for child in self.children(node).unwrap_or_default() {
+            self.collect_listed_elements_within(*child, found);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Dom, DomErrorKind, MutationHistoryError, MutationKind, Namespace, NodeKind};
+    use super::{
+        Dom, DomErrorKind, MutationHistoryError, MutationKind, Namespace, NodeId, NodeKind,
+    };
 
     #[test]
     fn node_ids_are_stable_and_never_reused_when_detached() {
@@ -1169,6 +1618,509 @@ mod tests {
             panic!("expected namespaced element");
         };
         assert_eq!(namespaced_data.local_name, "My-Widget");
+    }
+
+    #[test]
+    fn namespaced_attributes_are_keyed_by_namespace_and_local_name() {
+        let mut dom = Dom::new();
+        let element = dom.create_element_ns(Namespace::Svg, "use");
+        dom.set_attribute_ns(element, None, None, "d", "M0 0")
+            .unwrap();
+        dom.set_attribute_ns(
+            element,
+            Some("http://www.w3.org/1999/xlink"),
+            Some("xlink"),
+            "href",
+            "#a",
+        )
+        .unwrap();
+        dom.set_attribute_ns(
+            element,
+            Some("http://www.w3.org/1999/xlink"),
+            Some("xlink"),
+            "href",
+            "#b",
+        )
+        .unwrap();
+        dom.set_attribute_ns(
+            element,
+            Some("http://www.w3.org/2000/xmlns/"),
+            Some("xmlns"),
+            "xlink",
+            "http://www.w3.org/1999/xlink",
+        )
+        .unwrap();
+
+        // The null-namespace and the XLink attribute are distinct even though
+        // their local names differ only by the prefix in the source markup.
+        assert_eq!(dom.attribute(element, "d").unwrap(), Some("M0 0"));
+        assert_eq!(dom.attribute(element, "href").unwrap(), None);
+        assert_eq!(dom.attribute(element, "xlink:href").unwrap(), None);
+        assert_eq!(
+            dom.attribute_ns(element, Some("http://www.w3.org/1999/xlink"), "href")
+                .unwrap(),
+            Some("#b")
+        );
+        assert_eq!(dom.attribute_ns(element, None, "href").unwrap(), None);
+        assert_eq!(
+            dom.attribute_ns(element, Some("http://www.w3.org/2000/xmlns/"), "xlink")
+                .unwrap(),
+            Some("http://www.w3.org/1999/xlink")
+        );
+
+        let NodeKind::Element(data) = dom.node(element).unwrap().kind() else {
+            panic!("expected element");
+        };
+        assert_eq!(data.attributes.len(), 3);
+        assert_eq!(data.attributes[1].prefix.as_deref(), Some("xlink"));
+        assert_eq!(data.attributes[1].local_name, "href");
+    }
+
+    #[test]
+    fn namespaced_attribute_local_names_keep_their_case() {
+        let mut dom = Dom::new();
+        let element = dom.create_element_ns(Namespace::Svg, "svg");
+        dom.set_attribute_ns(element, None, None, "viewBox", "0 0 1 1")
+            .unwrap();
+        assert_eq!(
+            dom.attribute_ns(element, None, "viewBox").unwrap(),
+            Some("0 0 1 1")
+        );
+        assert_eq!(dom.attribute_ns(element, None, "viewbox").unwrap(), None);
+    }
+
+    #[test]
+    fn a_template_element_owns_a_detached_contents_fragment() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let template = dom.create_element("template");
+        dom.append_child(body, template).unwrap();
+        let contents = dom.template_contents(template).expect("template contents");
+        assert!(matches!(
+            dom.node(contents).unwrap().kind(),
+            NodeKind::DocumentFragment
+        ));
+
+        // The contents are not a child of the element: `children` of the
+        // template is empty, which is what keeps the contents out of document
+        // order and out of every document traversal.
+        assert!(dom.children(template).unwrap().is_empty());
+        let child = dom.create_element("tr");
+        dom.append_child(contents, child).unwrap();
+        assert_eq!(dom.children(contents).unwrap(), &[child]);
+        assert!(dom.children(template).unwrap().is_empty());
+        assert_eq!(dom.parent(child), Some(contents));
+
+        // The fragment is not connected to the document, so nothing inside a
+        // template is reachable from the document root.
+        assert!(!dom.is_connected(contents));
+        assert!(!dom.is_connected(child));
+        assert!(dom.is_connected(template));
+    }
+
+    /// Build `outer > inner > control` by hand and return
+    /// `(outer, inner, control)`. Nested `form` elements cannot come out of a
+    /// conforming parser — the parser ignores a second `form` start tag — so the
+    /// nesting rules have to be exercised through the DOM.
+    fn nested_forms() -> (Dom, NodeId, NodeId, NodeId) {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let outer = dom.create_element("form");
+        dom.set_attribute(outer, "id", "outer").unwrap();
+        dom.append_child(body, outer).unwrap();
+        let inner = dom.create_element("form");
+        dom.set_attribute(inner, "id", "inner").unwrap();
+        dom.append_child(outer, inner).unwrap();
+        let control = dom.create_element("input");
+        dom.set_attribute(control, "name", "a").unwrap();
+        dom.append_child(inner, control).unwrap();
+        (dom, outer, inner, control)
+    }
+
+    #[test]
+    fn form_owner_is_the_nearest_ancestor_form_and_the_walk_stops_there() {
+        let (mut dom, outer, inner, control) = nested_forms();
+        // The inner form wins even though the outer form is also an ancestor: the
+        // owner is the *nearest* form, and the walk never looks past it.
+        assert_eq!(dom.form_owner(control), Some(inner));
+        assert_ne!(dom.form_owner(control), Some(outer));
+        // A control with no form ancestor at all has no owner, rather than
+        // reaching one.
+        let body = dom.children(dom.document()).unwrap()[0];
+        let stray = dom.create_element("input");
+        dom.append_child(body, stray).unwrap();
+        assert_eq!(dom.form_owner(stray), None);
+    }
+
+    #[test]
+    fn removing_a_form_ancestor_resets_the_owner_to_null() {
+        let (mut dom, outer, _inner, control) = nested_forms();
+        assert!(dom.form_owner(control).is_some());
+        // Take the inner form, and the control inside it, out of the outer form.
+        dom.remove_child(outer, _inner).unwrap();
+        // The control is still inside the form it was associated with, and that
+        // form is still the nearest ancestor form, so the owner is unchanged:
+        // the form was detached, not removed from the control.
+        assert_eq!(dom.form_owner(control), Some(_inner));
+        // Now take just the control out of the form. The form is no longer an
+        // ancestor, so the owner resets to null. It does not keep pointing at the
+        // detached form.
+        dom.remove_child(_inner, control).unwrap();
+        assert_eq!(dom.form_owner(control), None);
+        // And it does not fall back to a form that used to be further up: the
+        // outer form is still an ancestor of the inner form, but it is no longer
+        // an ancestor of the control.
+        assert!(dom.is_connected(outer));
+    }
+
+    #[test]
+    fn moving_a_control_re_resolves_its_owner_rather_than_keeping_it() {
+        let (mut dom, outer, inner, control) = nested_forms();
+        assert_eq!(dom.form_owner(control), Some(inner));
+        // Move the control up one form. The nearest ancestor form is now the outer
+        // one, so that is the owner: re-resolved, not remembered.
+        dom.append_child(outer, control).unwrap();
+        assert_eq!(dom.form_owner(control), Some(outer));
+    }
+
+    #[test]
+    fn a_form_content_attribute_overrides_the_ancestor_and_survives_being_outside_it() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.set_attribute(form, "id", "f").unwrap();
+        dom.append_child(body, form).unwrap();
+        // The control is outside the form entirely, which is the whole point of
+        // the attribute: it works around the lack of nested `form` support.
+        let control = dom.create_element("input");
+        dom.set_attribute(control, "form", "f").unwrap();
+        dom.append_child(body, control).unwrap();
+        assert_eq!(dom.form_owner(control), Some(form));
+
+        // It also wins over an ancestor, and it is found by ID anywhere in the
+        // element's own tree, not only among ancestors.
+        let wrapper = dom.create_element("div");
+        dom.append_child(body, wrapper).unwrap();
+        dom.append_child(wrapper, control).unwrap();
+        assert_eq!(dom.form_owner(control), Some(form));
+    }
+
+    #[test]
+    fn a_form_content_attribute_that_resolves_to_nothing_leaves_no_owner() {
+        // A `form` attribute naming a missing ID, and one naming an element that
+        // is not a `form`, both leave the control with no owner. Neither falls
+        // back to the enclosing form: the attribute was taken, so the answer is
+        // already determined, and a control with no owner is how an author finds
+        // out the attribute is wrong.
+        for attribute in ["typo", "not-a-form"] {
+            let mut dom = Dom::new();
+            let body = dom.create_element("body");
+            dom.append_child(dom.document(), body).unwrap();
+            let form = dom.create_element("form");
+            dom.set_attribute(form, "id", "f").unwrap();
+            dom.append_child(body, form).unwrap();
+            if attribute == "not-a-form" {
+                let div = dom.create_element("div");
+                dom.set_attribute(div, "id", "not-a-form").unwrap();
+                dom.append_child(body, div).unwrap();
+            }
+            let control = dom.create_element("input");
+            dom.set_attribute(control, "form", attribute).unwrap();
+            dom.append_child(form, control).unwrap();
+            // The control *is* inside the form, and still has no owner.
+            assert_eq!(dom.parent(control), Some(form));
+            assert_eq!(dom.form_owner(control), None, "form={attribute}");
+        }
+    }
+
+    #[test]
+    fn img_is_form_associated_but_not_listed_so_the_form_attribute_does_not_apply() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.set_attribute(form, "id", "f").unwrap();
+        dom.append_child(body, form).unwrap();
+
+        // An `img` is form-associated, so it has an owner, and that owner comes
+        // from the ancestor rule.
+        let inside = dom.create_element("img");
+        dom.append_child(form, inside).unwrap();
+        assert!(dom.is_form_associated(inside));
+        assert!(!dom.is_listed_element(inside));
+        assert_eq!(dom.form_owner(inside), Some(form));
+
+        // It is not listed, so the `form` content attribute is ignored for it:
+        // outside the form with `form="f"`, it still has no owner.
+        let outside = dom.create_element("img");
+        dom.set_attribute(outside, "form", "f").unwrap();
+        dom.append_child(body, outside).unwrap();
+        assert!(dom.is_form_associated(outside));
+        assert_eq!(dom.form_owner(outside), None);
+    }
+
+    #[test]
+    fn form_association_is_by_html_namespace_and_name() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.append_child(body, form).unwrap();
+
+        // Every form-associated element in the standard.
+        for name in [
+            "button", "fieldset", "input", "object", "output", "select", "textarea", "img",
+        ] {
+            let element = dom.create_element(name);
+            dom.append_child(form, element).unwrap();
+            assert!(dom.is_form_associated(element), "{name} is form-associated");
+            assert_eq!(dom.form_owner(element), Some(form), "{name} owner");
+        }
+        // `form` itself is not form-associated: a form has no form owner.
+        assert!(!dom.is_form_associated(form));
+        assert_eq!(dom.form_owner(form), None);
+        // Neither is a non-form element that looks like one.
+        for name in ["div", "label", "form-associated-custom-element"] {
+            let element = dom.create_element(name);
+            dom.append_child(form, element).unwrap();
+            assert!(
+                !dom.is_form_associated(element),
+                "{name} is not form-associated"
+            );
+            assert_eq!(dom.form_owner(element), None, "{name} owner");
+        }
+        // An `input` in the SVG namespace is an SVG element, not an HTML one, so
+        // the category does not apply to it.
+        let svg = dom.create_element_ns(Namespace::Svg, "svg");
+        dom.append_child(body, svg).unwrap();
+        let svg_input = dom.create_element_ns(Namespace::Svg, "input");
+        dom.append_child(svg, svg_input).unwrap();
+        assert!(!dom.is_form_associated(svg_input));
+        assert_eq!(dom.form_owner(svg_input), None);
+    }
+
+    #[test]
+    fn listed_and_submittable_differ_from_form_associated() {
+        let mut dom = Dom::new();
+        for (name, listed, submittable) in [
+            ("button", true, true),
+            ("fieldset", true, false),
+            ("input", true, true),
+            ("object", true, false),
+            ("output", true, false),
+            ("select", true, true),
+            ("textarea", true, true),
+            // Form-associated, but not listed and not submittable.
+            ("img", false, false),
+        ] {
+            let element = dom.create_element(name);
+            assert!(dom.is_form_associated(element), "{name}");
+            assert_eq!(dom.is_listed_element(element), listed, "{name} listed");
+            assert_eq!(
+                dom.is_submittable_element(element),
+                submittable,
+                "{name} submittable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_form_content_attribute_does_not_apply_to_a_disconnected_control() {
+        // The `form` attribute needs the control to be connected. A control in a
+        // template's contents is not, so the attribute is ignored there and the
+        // ancestor rule applies instead — which is what makes a template's
+        // `form=` attribute take effect only once the contents are cloned into
+        // the document.
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.set_attribute(form, "id", "f").unwrap();
+        dom.append_child(body, form).unwrap();
+
+        let template = dom.create_element("template");
+        dom.append_child(body, template).unwrap();
+        let contents = dom.template_contents(template).unwrap();
+
+        // An ancestor form inside the same fragment still counts.
+        let local_form = dom.create_element("form");
+        dom.append_child(contents, local_form).unwrap();
+        let inner = dom.create_element("input");
+        dom.append_child(local_form, inner).unwrap();
+        assert!(!dom.is_connected(inner));
+        assert_eq!(dom.form_owner(inner), Some(local_form));
+
+        // A `form` attribute naming a form in the *document* does not, because
+        // the control is not connected.
+        let detached = dom.create_element("input");
+        dom.set_attribute(detached, "form", "f").unwrap();
+        dom.append_child(contents, detached).unwrap();
+        assert_eq!(dom.form_owner(detached), None);
+    }
+
+    #[test]
+    fn a_parser_inserted_owner_is_ignored_once_the_element_moves() {
+        // The one part of the owner that cannot be derived: the HTML parser can
+        // associate a control with a form that is not its ancestor. It is
+        // recorded, and it applies only while the control is still the child it
+        // was created for.
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.append_child(body, form).unwrap();
+        let cell = dom.create_element("td");
+        dom.append_child(body, cell).unwrap();
+        let control = dom.create_element("input");
+        dom.append_child(cell, control).unwrap();
+
+        // Not an ancestor, so the derived rules alone would find nothing.
+        assert_eq!(dom.form_owner(control), None);
+        assert!(dom.set_parser_inserted_form_owner(control, form, cell));
+        assert_eq!(dom.form_owner(control), Some(form));
+
+        // Move the control: the recorded parent no longer matches, so the
+        // association stops applying and the derived rules answer instead.
+        dom.append_child(form, control).unwrap();
+        assert_eq!(dom.form_owner(control), Some(form));
+        let elsewhere = dom.create_element("div");
+        dom.append_child(body, elsewhere).unwrap();
+        dom.append_child(elsewhere, control).unwrap();
+        assert_eq!(dom.form_owner(control), None);
+    }
+
+    #[test]
+    fn a_parser_inserted_owner_is_refused_for_a_non_form_associated_element() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.append_child(body, form).unwrap();
+        let div = dom.create_element("div");
+        dom.append_child(body, div).unwrap();
+        assert!(!dom.set_parser_inserted_form_owner(div, form, body));
+        assert_eq!(dom.parser_inserted_form_owner(div), None);
+        // And clearing one is possible, so a caller that reparents a subtree can
+        // drop every association in it at once.
+        let control = dom.create_element("input");
+        dom.append_child(div, control).unwrap();
+        assert!(dom.set_parser_inserted_form_owner(control, form, div));
+        assert!(dom.parser_inserted_form_owner(control).is_some());
+        dom.clear_parser_inserted_form_owners(div);
+        assert_eq!(dom.parser_inserted_form_owner(control), None);
+        assert_eq!(dom.form_owner(control), None);
+    }
+
+    #[test]
+    fn form_owner_elements_excludes_images_and_image_buttons() {
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.set_attribute(form, "id", "f").unwrap();
+        dom.append_child(body, form).unwrap();
+        let fieldset = dom.create_element("fieldset");
+        dom.set_attribute(fieldset, "name", "group").unwrap();
+        dom.append_child(form, fieldset).unwrap();
+
+        let mut controls = Vec::new();
+        for (name, type_attribute) in [
+            ("a", None),
+            // An image button is excluded from `form.elements` for historical
+            // reasons, even though it is a listed element and is submitted.
+            ("b", Some("image")),
+            ("c", Some("hidden")),
+        ] {
+            let control = dom.create_element("input");
+            dom.set_attribute(control, "name", name).unwrap();
+            if let Some(value) = type_attribute {
+                dom.set_attribute(control, "type", value).unwrap();
+            }
+            dom.append_child(fieldset, control).unwrap();
+            controls.push(control);
+        }
+        let image = dom.create_element("img");
+        dom.set_attribute(image, "name", "i").unwrap();
+        dom.append_child(form, image).unwrap();
+        // A control outside the form, naming it with a `form` attribute, is in
+        // the collection: it is rooted at the form's *root*, not at the form.
+        let outside = dom.create_element("input");
+        dom.set_attribute(outside, "name", "d").unwrap();
+        dom.set_attribute(outside, "form", "f").unwrap();
+        dom.append_child(body, outside).unwrap();
+        // A control belonging to a different form is not.
+        let other_form = dom.create_element("form");
+        dom.set_attribute(other_form, "id", "g").unwrap();
+        dom.append_child(body, other_form).unwrap();
+        let other_control = dom.create_element("input");
+        dom.set_attribute(other_control, "name", "e").unwrap();
+        dom.append_child(other_form, other_control).unwrap();
+
+        let members = dom.form_owner_elements(form);
+        assert_eq!(
+            members,
+            vec![fieldset, controls[0], controls[2], outside],
+            "the fieldset is itself a listed element, `b` is an image button and `i` is not listed"
+        );
+        // A non-form node has no elements collection.
+        assert!(dom.form_owner_elements(body).is_empty());
+    }
+
+    #[test]
+    fn listed_elements_within_a_fieldset_is_a_descendant_filter() {
+        // `fieldset.elements` is "an HTMLCollection rooted at the fieldset
+        // element, whose filter matches listed elements": it is the root that
+        // scopes the collection, and the filter is only listed-ness. So the
+        // fieldset is in its own collection, an image button is, and an `img` is
+        // not.
+        let mut dom = Dom::new();
+        let body = dom.create_element("body");
+        dom.append_child(dom.document(), body).unwrap();
+        let form = dom.create_element("form");
+        dom.append_child(body, form).unwrap();
+        let fieldset = dom.create_element("fieldset");
+        dom.append_child(form, fieldset).unwrap();
+        let group = dom.create_element("div");
+        dom.append_child(fieldset, group).unwrap();
+        let mut expected = vec![fieldset];
+        for name in ["a", "b"] {
+            let control = dom.create_element("input");
+            dom.set_attribute(control, "name", name).unwrap();
+            dom.append_child(group, control).unwrap();
+            expected.push(control);
+        }
+        let image = dom.create_element("img");
+        dom.append_child(fieldset, image).unwrap();
+        let image_button = dom.create_element("input");
+        dom.set_attribute(image_button, "name", "c").unwrap();
+        dom.set_attribute(image_button, "type", "image").unwrap();
+        dom.append_child(fieldset, image_button).unwrap();
+        expected.push(image_button);
+
+        assert_eq!(dom.listed_elements_within(fieldset), expected);
+        // The collection is rooted at the fieldset, so the form is not in it
+        // even though the form is a listed element and an ancestor.
+        assert!(!dom.listed_elements_within(fieldset).contains(&form));
+        // Disabling a fieldset does not change the list: the current standard has
+        // no rule that the descendants of a disabled fieldset stop being listed.
+        dom.set_attribute(fieldset, "disabled", "").unwrap();
+        assert_eq!(dom.listed_elements_within(fieldset), expected);
+    }
+
+    #[test]
+    fn only_an_html_template_element_has_contents() {
+        let mut dom = Dom::new();
+        let div = dom.create_element("div");
+        let foreign = dom.create_element_ns(Namespace::Svg, "template");
+        let text = dom.create_text("t");
+        let fragment = dom.create_document_fragment();
+        assert!(dom.template_contents(div).is_none());
+        assert!(dom.template_contents(foreign).is_none());
+        assert!(dom.template_contents(text).is_none());
+        assert!(dom.template_contents(fragment).is_none());
     }
 
     #[test]

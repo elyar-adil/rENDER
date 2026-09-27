@@ -1376,6 +1376,610 @@ fn object_integrity_levels_freeze_seal_and_extension_guards() {
 }
 
 #[test]
+fn to_object_boxes_primitives_into_distinct_wrappers() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                results.push(Object.getPrototypeOf('') === String.prototype);
+                results.push(Object.getPrototypeOf(0) === Number.prototype);
+                results.push(Object.getPrototypeOf(false) === Boolean.prototype);
+                results.push(Object.getPrototypeOf(Symbol('s')) === Symbol.prototype);
+                // ToObject does not cache: two boxes are two objects.
+                results.push(Object(1) !== Object(1));
+                results.push(Object.getPrototypeOf(Object(1)) === Number.prototype);
+                // A Number wrapper owns nothing; valueOf/toString live on the
+                // prototype, and `instanceof` works through the same chain.
+                var boxed = Object(1);
+                results.push(Object.getOwnPropertyNames(boxed).length === 0);
+                results.push(Object.getOwnPropertyDescriptor(boxed, 'toString') === undefined);
+                results.push(typeof boxed.toString === 'function' && boxed.toString() === '1');
+                results.push(boxed.valueOf() === 1);
+                results.push(boxed instanceof Number);
+                results.push(Object(1) instanceof Number);
+                // Symbol wrappers too.
+                var sym = Object(Symbol('q'));
+                results.push(typeof sym.toString === 'function' && sym.toString() === 'Symbol(q)');
+                results.push(typeof sym.valueOf() === 'symbol');
+                results.join(',');
+            ",
+        )
+        .expect("ToObject probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,true,true,true,true,true,true,true,true,true,true,true,true,true".to_owned()
+        )
+    );
+}
+
+#[test]
+fn to_object_on_nullish_throws_while_strings_expose_exotic_own_keys() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                results.push(thrown(function () { Object.getPrototypeOf(null); }));
+                results.push(thrown(function () { Object.getPrototypeOf(undefined); }));
+                results.push(thrown(function () { Object.keys(1, 2); }));
+                // A String wrapper's characters and length are own properties
+                // with the spec's attributes.
+                results.push(Object.getOwnPropertyNames('ab').join(','));
+                results.push(Object.keys('ab').join(','));
+                var indexed = Object.getOwnPropertyDescriptor('ab', '0');
+                results.push([indexed.value, indexed.writable, indexed.enumerable, indexed.configurable].join(','));
+                var length = Object.getOwnPropertyDescriptor('ab', 'length');
+                results.push([length.value, length.writable, length.enumerable, length.configurable].join(','));
+                results.push(Object.hasOwn('ab', '0'));
+                results.push('ab'.hasOwnProperty('1'));
+                results.push(Object.values('ab').join(','));
+                // Ordinary properties are still storable, and the virtual
+                // slots reject redefinition.
+                var wrapper = Object('ab');
+                wrapper.tag = 'x';
+                results.push(Object.getOwnPropertyNames(wrapper).join(','));
+                results.push(thrown(function () { Object.defineProperty(wrapper, '0', { value: 'z' }); }));
+                results.push(thrown(function () { Object.defineProperty(wrapper, 'length', { value: 0 }); }));
+                results.push(wrapper[0] + wrapper.length + wrapper.tag);
+                results.join(',');
+            ",
+        )
+        .expect("String exotic probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,true,false,0,1,length,0,1,a,false,true,false,2,false,false,false,true,true,a,b,0,1,tag,length,true,true,a2x"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn object_statics_and_reflect_share_one_to_object() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                // Reflect builtins all start with ToObject (§27.1), so a
+                // primitive target is its wrapper.
+                results.push(Reflect.getPrototypeOf('') === String.prototype);
+                results.push(Reflect.getPrototypeOf(1) === Number.prototype);
+                results.push(Reflect.get(1, 'toFixed') === Number.prototype.toFixed);
+                results.push(Reflect.get(1, 'toFixed').call(1, 2) === '1.00');
+                results.push(Reflect.has('ab', '0'));
+                results.push(Reflect.ownKeys('ab').join(','));
+                results.push(Reflect.isExtensible({}) === true);
+                results.push(Reflect.preventExtensions(Object(1)) === true);
+                results.push(Reflect.apply(Math.max, null, [1, 5, 2]) === 5);
+                results.push(typeof Reflect.setPrototypeOf === 'function');
+                // `Reflect.setPrototypeOf` and the `newTarget` check stay strict.
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                results.push(thrown(function () { Reflect.setPrototypeOf(1, null); }));
+                results.push(thrown(function () { Reflect.construct(function () {}, [], 1); }));
+                // Object statics that ToObject first.
+                results.push(Object.getOwnPropertyDescriptor(1, 'x') === undefined);
+                results.push(Object.hasOwn('', 'length'));
+                results.push(Object.getOwnPropertySymbols(Symbol('a')).length === 0);
+                var frozen = Object.freeze(1);
+                results.push(frozen instanceof Number && Object.isFrozen(frozen));
+                results.push(typeof Object.defineProperty(1, 'x', { value: 1 }));
+                results.push(Object.getOwnPropertyNames(Object.defineProperty(1, 'x', { value: 1 })).join(','));
+                var target = Object.assign(1, { a: 2 });
+                results.push([target instanceof Number, target.a, Object.keys(target).join(',')].join('/'));
+                // Integrity queries on a nullish target.
+                results.push(Object.isFrozen(null));
+                results.push(Object.isSealed(undefined));
+                results.push(thrown(function () { Object.isExtensible(null); }));
+                results.push(thrown(function () { Object.freeze(null); }));
+                // Operations that must keep throwing on non-objects.
+                results.push(thrown(function () { new Proxy(1, {}); }));
+                // `OrdinaryHasInstance` answers false for a primitive left-hand
+                // side rather than throwing, so only a non-object right-hand
+                // side is a TypeError.
+                results.push((1 instanceof Number) === false);
+                results.push(thrown(function () { return 'a' in 5; }));
+                results.push(thrown(function () { return new Set(5); }));
+                results.join(',');
+            ",
+        )
+        .expect("Object/Reflect probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,true,true,true,true,0,1,length,true,true,true,true,true,true,true,true,true,true,object,x,true/2/a,true,true,true,true,true,true,true,true"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn proto_accessor_and_object_literal_proto_set_the_prototype() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var descriptor = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__');
+                results.push(typeof descriptor.get === 'function' && typeof descriptor.set === 'function');
+                results.push([descriptor.enumerable, descriptor.configurable].join(','));
+                results.push(({}).__proto__ === Object.prototype);
+                results.push([].__proto__ === Array.prototype);
+                results.push(''.__proto__ === String.prototype);
+                results.push((5).__proto__ === Number.prototype);
+                results.push(Object.create(null).__proto__ === undefined);
+                // Assignment writes the prototype, and object literals use the
+                // `__proto__: value` special form.
+                var target = { a: 1 };
+                var base = { b: 2 };
+                target.__proto__ = base;
+                results.push([target.a, target.b, Object.getPrototypeOf(target) === base].join(','));
+                results.push(Object.getPrototypeOf({ __proto__: base }) === base);
+                results.push(typeof { __proto__: null }.toString);
+                results.push(Object.getPrototypeOf({ __proto__: null }) === null);
+                results.push(Object.getOwnPropertyNames({ __proto__: base }).join(','));
+                // Every other spelling of `__proto__` is an ordinary own
+                // property: shorthand, method, accessor, and computed key.
+                var __proto__ = 'own';
+                results.push(Object.getOwnPropertyNames({ __proto__ }).join(','));
+                results.push(Object.getOwnPropertyNames({ ['__proto__']: 1 }).join(','));
+                results.push(Object.getOwnPropertyNames({ __proto__() {} }).join(','));
+                results.push(Object.getOwnPropertyNames({ get __proto__() { return 1; } }).join(','));
+                results.join(',');
+            ",
+        )
+        .expect("__proto__ probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,false,true,true,true,true,true,true,1,2,true,true,undefined,true,,__proto__,__proto__,__proto__,__proto__"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn function_prototype_call_and_apply_thread_the_receiver() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                // The borrowed-base idiom: every one of these is how core-js,
+                // jQuery-era helpers and the qq/bilibili bundles reuse a
+                // prototype method on something that is not its receiver type.
+                var owner = { a: 1, b: 2 };
+                results.push(Object.prototype.hasOwnProperty.call(owner, 'a'));
+                results.push(Object.prototype.hasOwnProperty.call(owner, 'zz'));
+                results.push(Object.prototype.hasOwnProperty.call(Object(1), 'toString'));
+                results.push(Object.prototype.hasOwnProperty.call('ab', '1'));
+                results.push(Object.prototype.propertyIsEnumerable.call(owner, 'a'));
+                results.push(String.prototype.indexOf.call('abcdef', 'cd'));
+                results.push(String.prototype.toUpperCase.call('ab'));
+                results.push(Number.prototype.toFixed.call(1.5, 1));
+                results.push(Math.max.call(null, 1, 5, 2));
+                results.push(Array.prototype.join.call({ length: 2, 0: 'p', 1: 'q' }, '-'));
+                results.push(Array.prototype.map.call('abc', function (c) {
+                    return c.toUpperCase();
+                }).join(''));
+                results.push(JSON.stringify.call(null, { a: 1 }));
+                results.push(String.fromCharCode.call(null, 65, 66));
+                // `thisArg` on every `callbackfn`: `map.call(list, render, self)`
+                // is the whole point of a borrowed method.
+                var box = { factor: 2, render: function (n) { return n * this.factor; } };
+                results.push(Array.prototype.map.call([1, 2, 3], box.render, box).join(','));
+                results.push(Array.prototype.filter.call([1, 2, 3, 4], box.isOdd || function (n) {
+                    return n % this.factor === 1;
+                }, box).join(','));
+                var total = 0;
+                Array.prototype.forEach.call([1, 2, 3], function (n) { total += n * this.factor; }, box);
+                results.push(total);
+                results.push(Array.prototype.some.call([1, 2, 3], function (n) {
+                    return n * this.factor === 4;
+                }, box));
+                results.push(Array.prototype.every.call([2, 4], function (n) {
+                    return n % this.factor === 0;
+                }, box));
+                results.push(Array.prototype.findIndex.call([1, 2, 3], function (n) {
+                    return n * this.factor === 4;
+                }, box));
+                results.push(Array.from([1, 2], function (n) { return n * this.factor; }, box).join(','));
+                results.push(new Uint8Array([1, 2]).map(function (n) {
+                    return n * this.factor;
+                }, box).join(','));
+                // `.apply` with an array-like list, and `Reflect.apply` through
+                // the same dispatch.
+                results.push(Math.max.apply(null, [3, 9, 4]));
+                results.push(Math.max.apply(null, { length: 3, 0: 5, 1: 11, 2: 7 }));
+                results.push(String.prototype.indexOf.apply('abcdef', ['c']));
+                results.push(Object.prototype.hasOwnProperty.apply(owner, ['a']));
+                results.push(Reflect.apply(Math.max, null, [1, 5, 2]));
+                results.push(Reflect.apply(function (x) { return this.base + x; }, { base: 40 }, [2]));
+                results.push(Reflect.apply(Object.prototype.hasOwnProperty, owner, ['b']));
+                // `.bind` pre-fills arguments and stays callable and constructable.
+                results.push(String.prototype.indexOf.bind('abcde', 'c')());
+                results.push(Object.prototype.hasOwnProperty.bind(owner)('a'));
+                function Counter(value) { this.value = value; }
+                results.push(new (Counter.bind(null, 8))().value);
+                // `bind` is transparent about constructability: binding a
+                // builtin with no [[Construct]] yields a function `new` still
+                // rejects, so `new (Math.max.bind(null))` is a TypeError rather
+                // than an `object`.
+                results.push(typeof Math.max.bind(null));
+                results.push((function () {
+                    try { new (Math.max.bind(null)); return false; } catch (e) { return e instanceof TypeError; }
+                })());
+                results.join(',');
+            ",
+        )
+        .expect("call/apply probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,false,false,true,true,2,AB,1.5,5,p-q,ABC,{\"a\":1},AB,2,4,6,1,3,12,\
+             true,true,1,2,4,2,4,9,11,2,true,5,42,true,2,true,8,function,true"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn number_to_string_honours_a_radix_and_parse_int_reads_one() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof RangeError; } }
+                results.push((255).toString(16));
+                results.push((255).toString(2));
+                results.push((255).toString(36));
+                results.push((-255).toString(16));
+                results.push((0.5).toString(2));
+                results.push((1.5).toString(2));
+                results.push((0).toString(16));
+                results.push((1e21).toString(10));
+                results.push((0.1).toString(2).slice(0, 10));
+                // Absent or undefined radix means 10; anything else out of range
+                // is a RangeError.
+                results.push((10).toString());
+                results.push((10).toString(undefined));
+                results.push((10).toString(2.9));
+                results.push(thrown(function () { return (10).toString(1); }));
+                results.push(thrown(function () { return (10).toString(37); }));
+                results.push(thrown(function () { return (10).toString('x'); }));
+                results.push((NaN).toString(16) + '/' + String(-Infinity).toString(16));
+                // parseInt's radix argument, which used to be ignored.
+                results.push(parseInt('ff', 16));
+                results.push(parseInt('0x1f'));
+                results.push(parseInt('0x1f', 16));
+                results.push(parseInt('101', 2));
+                results.push(parseInt('  -42px'));
+                results.push(parseInt('zz', 36));
+                results.push(parseInt('12', 1));
+                results.push(String(parseInt('abc')));
+                results.push(String(parseInt('0b11', 2)));
+                results.push(parseInt('9999999999999999', 10));
+                results.push(parseInt('7fffffff', 16));
+                results.join(',');
+            ",
+        )
+        .expect("radix probe executes");
+    assert_eq!(
+        outcome.value,
+        // Every field is the value V8 produces for the probe above; the radix
+        // cases in particular are `0.00011001` (0.1 is
+        // 0.0001100110011... in binary), `1295` (z is digit 35, so 35*36+35),
+        // `NaN` for an out-of-range radix, `0` for `parseInt('0b11', 2)`
+        // (the `0b` prefix is only stripped for radix 16), and `1e16` because
+        // 9999999999999999 is not representable as a double.
+        JsValue::String(
+            "ff,11111111,73,-ff,0.1,1.1,0,1e+21,0.00011001,10,10,1010,\
+             true,true,true,NaN/-Infinity,255,31,31,5,-42,1295,NaN,NaN,0,\
+             10000000000000000,2147483647"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn date_prototype_methods_see_a_primitive_receiver_as_nan() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                // `Date.prototype.getTime.call(5)` has no Date this-value, so
+                // `thisTimeValue` answers NaN rather than a brand error.
+                results.push(Date.prototype.getTime.call(5));
+                results.push(Date.prototype.valueOf.call('x'));
+                results.push(Date.prototype.getFullYear.call(5));
+                results.push(Date.prototype.getTime.call(new Date(7)));
+                results.push(Date.prototype.toString.call(5));
+                // A genuine non-Date object is still a brand error.
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                results.push(thrown(function () { return Date.prototype.getTime.call({}); }));
+                results.join(',');
+            ",
+        )
+        .expect("Date receiver probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("NaN,NaN,NaN,7,Invalid Date,true".to_owned())
+    );
+}
+
+#[test]
+fn string_raw_reads_a_template_object_and_tags_name_their_hosts() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                function tag(value) { return Object.prototype.toString.call(value); }
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                // A tagged template hands the tag a template object: an array
+                // whose indices are the cooked strings and whose `raw` property
+                // is the unprocessed text. The substitutions follow it, so
+                // `String.raw` has something to splice between the literals.
+                function highlight(strings) { return String.raw(strings, '<b>'.length, '</b>'); }
+                results.push(highlight`a${0}b${1}c`);
+                results.push(String.raw({ raw: ['x', 'y'] }, 'Q'));
+                // A substitution is spliced only *between* literals, so a short
+                // argument list appends nothing rather than stringifying a hole,
+                // and an empty `raw` contributes nothing at all.
+                results.push(String.raw({ raw: ['x', 'y'] }));
+                results.push(String.raw({ raw: [] }));
+                // An array-like without `raw` is a TypeError, not a string.
+                results.push(thrown(function () {
+                    return String.raw({ length: 2, 0: 'x', 1: 'y' });
+                }));
+                // The escape is resolved in the index and preserved in `raw`,
+                // which is the whole difference between a template object and
+                // the concatenated string a tag used to receive.
+                results.push(String.raw`a\nb`);
+                results.push(`a\nb`.length);
+                var strings = null;
+                (function (received) { strings = received; return ''; })`p${1}q${2}r`;
+                results.push([strings.length, strings.raw.length, strings[0], strings[2]].join('|'));
+                results.push(tag(strings));
+                results.push([Array.isArray(strings), Array.isArray(strings.raw)].join(','));
+                results.push(Object.getOwnPropertyDescriptor(strings, 'raw').enumerable);
+                // §20.1.3.6: every host the engine models names itself. A
+                // TypeError carries [[ErrorData]] like every other error, so it
+                // tags as `Error`; `Object(null)` and `Object(undefined)` are
+                // ordinary objects, so they tag as `Object`.
+                results.push(tag(new Date(0)));
+                results.push(tag(new Error('x')));
+                results.push(tag(new TypeError('x')));
+                results.push(tag(new Map()));
+                results.push(tag(new Set()));
+                results.push(tag(new Uint8Array(1)));
+                results.push(tag(/re/));
+                results.push(tag(Object(Symbol('s'))));
+                results.push(tag(Object(1)));
+                results.push(tag(Object('s')));
+                results.push(tag(Object(true)));
+                results.push(tag([]));
+                results.push(tag(Object(null)));
+                results.push(tag(Object(undefined)));
+                results.push(tag(function () {}));
+                results.push(tag(Math.max));
+                results.push(tag(new Promise(function () {})));
+                results.join(',');
+            ",
+        )
+        .expect("String.raw probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "a3b</b>c,xQy,xy,,true,a\\nb,3,3|3|p|r,[object Array],true,true,false,\
+[object Date],[object Error],[object Error],[object Map],\
+[object Set],[object Uint8Array],[object RegExp],\
+[object Symbol],[object Number],[object String],[object Boolean],\
+[object Array],[object Object],[object Object],[object Function],\
+[object Function],[object Promise]"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn a_boxed_wrapper_is_pinned_while_only_the_interpreter_frame_holds_it() {
+    let parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    // White-box check of the GC root set: a fresh `ToObject` wrapper has no
+    // script-visible slot, so the collector must treat the interpreter's own
+    // reference as a root. Without the pin the slot is rewritten to a
+    // prototype-less tombstone and the builtin keeps reading a dead object.
+    let wrapper = runtime
+        .to_object(&JsValue::String("ab".to_owned()))
+        .expect("ToObject boxes a string");
+    runtime.collect_garbage();
+    let realm = runtime.realm();
+    assert_eq!(
+        realm.own_property_names(wrapper),
+        Some(vec!["0".to_owned(), "1".to_owned(), "length".to_owned()])
+    );
+    let string_prototype = realm.global("String").and_then(|value| match value {
+        JsValue::Object(constructor) => realm.get_property(constructor, "prototype"),
+        _ => None,
+    });
+    assert_eq!(
+        realm
+            .object(wrapper)
+            .and_then(crate::JsObject::prototype)
+            .map(JsValue::Object),
+        string_prototype
+    );
+    assert_eq!(
+        realm.own_property(wrapper, "1").map(|entry| entry.value),
+        Some(JsValue::String("b".to_owned()))
+    );
+}
+
+#[test]
+fn boxed_wrappers_survive_repeated_collections_during_a_builtin() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    // A heap this small forces `ensure_heap_capacity` to collect constantly,
+    // so every `ToObject` wrapper the builtins create is pinned and released
+    // thousands of times.
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var lost = -1;
+                for (var i = 0; i < 20000; i++) {
+                    var described = Object.getOwnPropertyDescriptors(Object('ab'));
+                    if (Object.keys(described).join(',') !== '0,1,length') { lost = i; break; }
+                    if (Object.getOwnPropertyNames(Object(1)).length !== 0) { lost = i; break; }
+                }
+                results.push(lost);
+                var boxed = Object('ab');
+                for (var j = 0; j < 20000; j++) {
+                    var scratch = Object.getOwnPropertyDescriptor(5, 'toString');
+                }
+                results.push(Object.getPrototypeOf(boxed) === String.prototype);
+                results.push(Object.getOwnPropertyNames(boxed).join(','));
+                results.push(boxed[1]);
+                results.join(',');
+            ",
+        )
+        .expect("collection probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("-1,true,0,1,length,b".to_owned())
+    );
+}
+
+#[test]
+fn string_prototype_symbol_iterator_yields_an_iterator_object() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                // `get-intrinsic` reads getProto(getProto('x'[Symbol.iterator]()))
+                // to snapshot %IteratorPrototype%; an `undefined` answer there
+                // silently empties the whole intrinsic table.
+                results.push(typeof ''[Symbol.iterator] === 'function');
+                results.push(''[Symbol.iterator] === ''.values);
+                var iterator = 'abc'[Symbol.iterator]();
+                results.push(typeof iterator === 'object' && typeof iterator.next === 'function');
+                var first = iterator.next();
+                results.push([first.value, first.done].join(','));
+                var text = '';
+                for (var character of 'xy') { text += character; }
+                results.push(text);
+                var spread = [...'ab'];
+                results.push(spread.join('-'));
+                var chain = Object.getPrototypeOf(Object.getPrototypeOf(iterator));
+                results.push(chain === Object.prototype);
+                results.join(',');
+            ",
+        )
+        .expect("String iterator probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,a,false,xy,a-b,true".to_owned())
+    );
+}
+
+#[test]
+fn web_storage_areas_answer_the_storage_interface() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                results.push(typeof localStorage.getItem === 'function');
+                results.push(localStorage.length);
+                results.push(String(localStorage.getItem('missing')));
+                localStorage.setItem('theme', 'dark');
+                localStorage.setItem('count', 7);
+                results.push(localStorage.length);
+                results.push(localStorage.getItem('theme'));
+                results.push(localStorage.getItem('count'));
+                results.push(localStorage.theme);
+                results.push(Object.keys(localStorage).join(','));
+                results.push(localStorage.key(0) + '/' + localStorage.key(1));
+                results.push(localStorage.key(9));
+                // The two areas are independent, and `clear` empties one.
+                sessionStorage.setItem('only', 'here');
+                results.push([localStorage.length, sessionStorage.length].join(','));
+                localStorage.removeItem('theme');
+                results.push([localStorage.getItem('theme'), localStorage.length].join(','));
+                localStorage.clear();
+                results.push([localStorage.length, sessionStorage.length].join(','));
+                // A numeric slot is a stored entry; `length` is read-only.
+                localStorage[0] = 'zero';
+                results.push([localStorage[0], localStorage.length].join(','));
+                localStorage.length = 99;
+                results.push(localStorage.length);
+                results.push(sessionStorage.getItem('only'));
+                results.join(',');
+            ",
+        )
+        .expect("Web Storage probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "true,0,null,2,dark,7,dark,theme,count,theme/count,,2,1,,1,0,1,zero,1,1,here"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
 fn own_string_keys_enumerate_in_insertion_order() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

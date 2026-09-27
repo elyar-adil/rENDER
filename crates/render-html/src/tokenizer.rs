@@ -9,6 +9,27 @@ pub struct AttributeToken {
     pub value: String,
 }
 
+/// What ended an attribute, which is what decides whether the attribute after it
+/// is missing its separator.
+///
+/// The standard raises `missing-whitespace-between-attributes` in exactly one
+/// state — 13.2.5.39, "after attribute value (quoted)" — and every other state
+/// that can follow an attribute has an explicit case for every character that
+/// could be a separator. So the question is not "is there whitespace in the
+/// stream" but "which state did this attribute leave the tokenizer in".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttributeEnd {
+    /// The attribute's value was quoted, and this is the character after its
+    /// closing quote — the character the "after attribute value (quoted)" state
+    /// consumes. `None` at the end of the input.
+    AfterQuotedValue(Option<char>),
+    /// The attribute had no value, or an unquoted one. Whitespace, `/` and `>`
+    /// all have explicit cases in the state such an attribute leaves the
+    /// tokenizer in, and an unquoted value absorbs every other character, so
+    /// nothing here can make the next attribute look unseparated.
+    AfterPlainValue,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TagToken {
     pub name: String,
@@ -31,6 +52,13 @@ pub enum Token {
     EndTag(TagToken),
     Comment(String),
     Character(String),
+    /// The characters of a CDATA section (13.2.5.69-71). A section is only
+    /// tokenized when the tree builder reports that the adjusted current node is
+    /// not an element in the HTML namespace; in the HTML namespace
+    /// `<![CDATA[` is a `cdata-in-html-content` parse error whose content is
+    /// comment tokens instead. Its characters are inserted as character data by
+    /// the rules for parsing tokens in foreign content.
+    Cdata(String),
     Eof,
 }
 
@@ -41,6 +69,7 @@ pub enum ContentModel {
     RawText,
     ScriptData,
     Plaintext,
+    Cdata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,11 +77,13 @@ pub enum HtmlParseErrorCode {
     AbruptClosingOfEmptyComment,
     AbsenceOfDigitsInNumericCharacterReference,
     CharacterReferenceOutsideUnicodeRange,
+    CdataInHtmlContent,
     ControlCharacterReference,
     DuplicateAttribute,
     EndTagWithAttributes,
     EndTagWithTrailingSolidus,
     EofBeforeTagName,
+    EofInCdata,
     EofInComment,
     EofInDoctype,
     EofInElementThatCanContainOnlyText,
@@ -92,11 +123,13 @@ impl HtmlParseErrorCode {
             Self::CharacterReferenceOutsideUnicodeRange => {
                 "character-reference-outside-unicode-range"
             }
+            Self::CdataInHtmlContent => "cdata-in-html-content",
             Self::ControlCharacterReference => "control-character-reference",
             Self::DuplicateAttribute => "duplicate-attribute",
             Self::EndTagWithAttributes => "end-tag-with-attributes",
             Self::EndTagWithTrailingSolidus => "end-tag-with-trailing-solidus",
             Self::EofBeforeTagName => "eof-before-tag-name",
+            Self::EofInCdata => "eof-in-cdata",
             Self::EofInComment => "eof-in-comment",
             Self::EofInDoctype => "eof-in-doctype",
             Self::EofInElementThatCanContainOnlyText => "eof-in-element-that-can-contain-only-text",
@@ -155,6 +188,8 @@ pub struct Tokenizer<'a> {
     appropriate_end_tag: Option<String>,
     errors: Vec<HtmlParseError>,
     emitted_eof: bool,
+    allow_cdata: bool,
+    pending: Option<Token>,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -167,6 +202,8 @@ impl<'a> Tokenizer<'a> {
             appropriate_end_tag: None,
             errors: Vec::new(),
             emitted_eof: false,
+            allow_cdata: false,
+            pending: None,
         }
     }
 
@@ -190,12 +227,28 @@ impl<'a> Tokenizer<'a> {
         self.appropriate_end_tag = appropriate_end_tag.map(str::to_ascii_lowercase);
     }
 
+    /// Report whether the tree builder's adjusted current node is an element
+    /// outside the HTML namespace.
+    ///
+    /// The "markup declaration open state" (13.2.5.42) only enters the CDATA
+    /// section state under that condition, and the tree builder owns the
+    /// adjusted current node, so it pushes the answer in after every token.
+    pub const fn set_allow_cdata(&mut self, allow_cdata: bool) {
+        self.allow_cdata = allow_cdata;
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Token {
+        // One input position can produce two tokens: `<![CDATA[` in the HTML
+        // namespace is a comment token with the data "[CDATA[" followed by the
+        // bogus comment token for the rest of the declaration (13.2.5.42).
+        if let Some(pending) = self.pending.take() {
+            return pending;
+        }
         if self.emitted_eof {
             return Token::Eof;
         }
-        if self.offset >= self.input.len() {
+        if self.offset >= self.input.len() && self.content_model != ContentModel::Cdata {
             self.emitted_eof = true;
             return Token::Eof;
         }
@@ -205,6 +258,7 @@ impl<'a> Tokenizer<'a> {
                 self.next_text_content_token()
             }
             ContentModel::Plaintext => self.next_plaintext_token(),
+            ContentModel::Cdata => self.next_cdata_token(),
         }
     }
 
@@ -309,13 +363,16 @@ impl<'a> Tokenizer<'a> {
         let less_than_offset = self.offset;
         self.bump_char();
         if self.consume_char('!') {
+            if self.remaining_starts_ascii_case_insensitive("doctype") {
+                self.offset += "doctype".len();
+                return self.consume_doctype();
+            }
             if self.remaining().starts_with("--") {
                 self.offset += 2;
                 return self.consume_comment();
             }
-            if self.remaining_starts_ascii_case_insensitive("doctype") {
-                self.offset += "doctype".len();
-                return self.consume_doctype();
+            if self.remaining_starts_ascii_case_insensitive("[CDATA[") {
+                return self.consume_cdata_start(less_than_offset);
             }
             self.error_at(
                 less_than_offset,
@@ -419,8 +476,12 @@ impl<'a> Tokenizer<'a> {
 
         let mut attributes = Vec::new();
         let mut self_closing = false;
+        // What ended the previous attribute. Only a quoted value can leave the
+        // next attribute missing its separator, so this starts as "no previous
+        // attribute" and the first attribute never reports anything.
+        let mut previous_end = None;
         loop {
-            let had_whitespace = self.skip_ascii_whitespace();
+            let _ = self.skip_ascii_whitespace();
             match self.peek_char() {
                 Some('>') => {
                     self.bump_char();
@@ -439,13 +500,30 @@ impl<'a> Tokenizer<'a> {
                     break;
                 }
                 Some(_) => {
-                    if !had_whitespace && !attributes.is_empty() {
+                    if let Some(AttributeEnd::AfterQuotedValue(Some(character))) = previous_end
+                        && !is_ascii_whitespace(character)
+                        && character != '/'
+                        && character != '>'
+                    {
+                        // "After attribute value (quoted) state" (13.2.5.39):
+                        // "U+0009, U+000A, U+000C, U+0020: Switch to the before
+                        // attribute name state. U+002F: Switch to the self-closing
+                        // start tag state. U+003E: Switch to the data state. Emit
+                        // the current tag token. EOF: This is an eof-in-tag parse
+                        // error. Emit an end-of-file token. Anything else: This is
+                        // a missing-whitespace-between-attributes parse error.
+                        // Reconsume in the before attribute name state."
+                        //
+                        // `self.offset` is the character the state consumes, which
+                        // is the first character of the following attribute's name:
+                        // the error points at the gap, where the separator should
+                        // have been, rather than at the attribute after it.
                         self.error_at(
                             self.offset,
                             HtmlParseErrorCode::MissingWhitespaceBetweenAttributes,
                         );
                     }
-                    let attribute = self.consume_attribute();
+                    let (attribute, end) = self.consume_attribute();
                     if attributes.iter().any(|existing: &AttributeToken| {
                         existing.name.eq_ignore_ascii_case(&attribute.name)
                     }) {
@@ -453,6 +531,7 @@ impl<'a> Tokenizer<'a> {
                     } else {
                         attributes.push(attribute);
                     }
+                    previous_end = Some(end);
                 }
             }
         }
@@ -464,7 +543,16 @@ impl<'a> Tokenizer<'a> {
         })
     }
 
-    fn consume_attribute(&mut self) -> AttributeToken {
+    /// Consume one attribute, and report what ended it.
+    ///
+    /// The second value is the whole point of splitting the return: whether the
+    /// next attribute is missing its separator depends on **how this attribute
+    /// ended**, not on whether whitespace happens to be left in the stream. This
+    /// function skips the whitespace that follows an attribute name — 13.2.5.34
+    /// moves to the after attribute value state on whitespace, which ignores it —
+    /// so by the time the caller looks at the stream the separator is already
+    /// gone and cannot be observed from there.
+    fn consume_attribute(&mut self) -> (AttributeToken, AttributeEnd) {
         let mut name = String::new();
         if self.peek_char() == Some('=') {
             self.error_at(
@@ -495,21 +583,44 @@ impl<'a> Tokenizer<'a> {
             }
         }
         self.skip_ascii_whitespace();
-        let value = if self.consume_char('=') {
+        if self.consume_char('=') {
             self.skip_ascii_whitespace();
-            self.consume_attribute_value()
+            let (value, quoted) = self.consume_attribute_value();
+            let end = if quoted {
+                // A quoted value's closing quote has just been consumed, so the
+                // next input character is the one the "after attribute value
+                // (quoted)" state would consume.
+                AttributeEnd::AfterQuotedValue(self.peek_char())
+            } else {
+                // An unquoted value absorbs everything that is neither ASCII
+                // whitespace nor `>` (13.2.5.38), so the only characters it can
+                // end on are ones for which that state has an explicit case and
+                // reports no error at all.
+                AttributeEnd::AfterPlainValue
+            };
+            (AttributeToken { name, value }, end)
         } else {
-            String::new()
-        };
-        AttributeToken { name, value }
+            // A value-less attribute can only be ended by ASCII whitespace, `/`,
+            // `>`, or `=`, and none of the states reachable from a value-less
+            // attribute reports missing-whitespace-between-attributes. So nothing
+            // about this end can make the next attribute look unseparated, and
+            // the character is not recorded.
+            (
+                AttributeToken {
+                    name,
+                    value: String::new(),
+                },
+                AttributeEnd::AfterPlainValue,
+            )
+        }
     }
 
-    fn consume_attribute_value(&mut self) -> String {
+    fn consume_attribute_value(&mut self) -> (String, bool) {
         let quote = match self.peek_char() {
             Some('"' | '\'') => self.bump_char(),
             Some('>') | None => {
                 self.error_at(self.offset, HtmlParseErrorCode::MissingAttributeValue);
-                return String::new();
+                return (String::new(), false);
             }
             _ => None,
         };
@@ -550,7 +661,7 @@ impl<'a> Tokenizer<'a> {
                 _ => value.push(character),
             }
         }
-        value
+        (value, quote.is_some())
     }
 
     fn consume_comment(&mut self) -> Token {
@@ -588,6 +699,74 @@ impl<'a> Tokenizer<'a> {
         let data = self.input[start..self.offset].replace('\0', "\u{fffd}");
         self.consume_char('>');
         Token::Comment(data)
+    }
+
+    /// "Markup declaration open state": the input starts with `[CDATA[`.
+    ///
+    /// If the tree builder reports that the adjusted current node is not an
+    /// element in the HTML namespace, consume the seven characters and switch
+    /// to the CDATA section state. Otherwise this is a `cdata-in-html-content`
+    /// parse error: emit a comment token with the data `[CDATA[` and reconsume
+    /// the rest of the declaration in the bogus comment state.
+    fn consume_cdata_start(&mut self, less_than_offset: usize) -> Token {
+        self.offset += "[CDATA[".len();
+        if self.allow_cdata {
+            self.content_model = ContentModel::Cdata;
+            return self.next();
+        }
+        self.error_at(less_than_offset, HtmlParseErrorCode::CdataInHtmlContent);
+        self.pending = Some(self.consume_bogus_comment());
+        Token::Comment("[CDATA[".to_owned())
+    }
+
+    /// "CDATA section state" (13.2.5.69) and its bracket and end substates.
+    ///
+    /// Every input character there becomes a character token, so a run up to
+    /// the closing `]]>` is collected into a single token: the tree builder
+    /// inserts all of a character token's characters at the current node
+    /// anyway. U+0000 NULL is emitted as-is because the replacement with
+    /// U+FFFD REPLACEMENT CHARACTER belongs to the rules for parsing tokens in
+    /// foreign content.
+    ///
+    /// The `]]>` delimiter is not character data, and a run of more than two
+    /// U+005D characters yields all but the final two as data, so the run is
+    /// counted rather than scanned for.
+    fn next_cdata_token(&mut self) -> Token {
+        let mut data = String::new();
+        // U+005D characters consumed since the last emitted character, still
+        // owed as character data.
+        let mut owed_brackets = 0_usize;
+        loop {
+            let Some(character) = self.peek_char() else {
+                if data.is_empty() && owed_brackets == 0 {
+                    // "This is an eof-in-cdata parse error. Emit an end-of-file
+                    // token."
+                    self.content_model = ContentModel::Data;
+                    self.error_at(self.offset, HtmlParseErrorCode::EofInCdata);
+                    return self.emit_eof();
+                }
+                // The characters collected so far are a token of their own, so
+                // the end-of-file error is reported by the next call.
+                data.push_str(&"]".repeat(owed_brackets));
+                return Token::Cdata(data);
+            };
+            if character == ']' {
+                self.bump_char();
+                owed_brackets += 1;
+                if owed_brackets >= 2 && self.peek_char() == Some('>') {
+                    // "U+003E GREATER-THAN SIGN: Switch to the data state."
+                    data.push_str(&"]".repeat(owed_brackets - 2));
+                    self.bump_char();
+                    self.content_model = ContentModel::Data;
+                    return Token::Cdata(data);
+                }
+                continue;
+            }
+            data.push_str(&"]".repeat(owed_brackets));
+            owed_brackets = 0;
+            self.bump_char();
+            data.push(character);
+        }
     }
 
     fn consume_doctype(&mut self) -> Token {
@@ -1103,5 +1282,282 @@ mod tests {
         assert_eq!(text, "a<1 b�");
         assert!(errors.contains(&HtmlParseErrorCode::InvalidFirstCharacterOfTagName));
         assert!(errors.contains(&HtmlParseErrorCode::NullCharacterReference));
+    }
+
+    fn tokenize_with_cdata(input: &str) -> (Vec<Token>, Vec<HtmlParseErrorCode>) {
+        let mut tokenizer = Tokenizer::new(input);
+        tokenizer.set_allow_cdata(true);
+        let mut tokens = Vec::new();
+        loop {
+            let token = tokenizer.next();
+            let eof = token == Token::Eof;
+            tokens.push(token);
+            if eof {
+                break;
+            }
+        }
+        let errors = tokenizer.errors().iter().map(|error| error.code).collect();
+        (tokens, errors)
+    }
+
+    #[test]
+    fn a_cdata_section_is_character_data_outside_the_html_namespace() {
+        let (tokens, errors) = tokenize_with_cdata("<text><![CDATA[a<b&c]]>d");
+        assert!(matches!(&tokens[0], Token::StartTag(tag) if tag.name == "text"));
+        assert_eq!(tokens[1], Token::Cdata("a<b&c".to_owned()));
+        // The section ends at the data state, so what follows is ordinary
+        // character data with character references.
+        assert_eq!(tokens[2], Token::Character("d".to_owned()));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn a_cdata_section_in_the_html_namespace_is_two_comments() {
+        let (tokens, errors) = tokenize("<![CDATA[x]]>tail");
+        assert_eq!(tokens[0], Token::Comment("[CDATA[".to_owned()));
+        assert_eq!(tokens[1], Token::Comment("x]]".to_owned()));
+        assert_eq!(tokens[2], Token::Character("tail".to_owned()));
+        assert_eq!(errors, vec![HtmlParseErrorCode::CdataInHtmlContent]);
+    }
+
+    #[test]
+    fn cdata_bracket_runs_follow_the_bracket_and_end_states() {
+        // Two brackets followed by '>' end the section; a surplus bracket in the
+        // run is character data, and a single bracket is not a delimiter. An
+        // unterminated run runs into the end of the input stream.
+        for (input, expected, expected_errors) in [
+            (
+                "<![CDATA[]]>x",
+                vec![
+                    Token::Cdata(String::new()),
+                    Token::Character("x".into()),
+                    Token::Eof,
+                ],
+                vec![],
+            ),
+            (
+                "<![CDATA[]]]>x",
+                vec![
+                    Token::Cdata("]".into()),
+                    Token::Character("x".into()),
+                    Token::Eof,
+                ],
+                vec![],
+            ),
+            (
+                "<![CDATA[]]]]>x",
+                vec![
+                    Token::Cdata("]]".into()),
+                    Token::Character("x".into()),
+                    Token::Eof,
+                ],
+                vec![],
+            ),
+            (
+                "<![CDATA[]]x",
+                vec![Token::Cdata("]]x".into()), Token::Eof],
+                vec![HtmlParseErrorCode::EofInCdata],
+            ),
+            (
+                "<![CDATA[>x",
+                vec![Token::Cdata(">x".into()), Token::Eof],
+                vec![HtmlParseErrorCode::EofInCdata],
+            ),
+        ] {
+            let (tokens, errors) = tokenize_with_cdata(input);
+            assert_eq!(tokens, expected, "{input}");
+            assert_eq!(errors, expected_errors, "{input}");
+        }
+    }
+
+    #[test]
+    fn a_cdata_section_passes_null_through_for_the_tree_builder() {
+        let (tokens, errors) = tokenize_with_cdata("<![CDATA[a\0b]]>");
+        assert_eq!(tokens[0], Token::Cdata("a\0b".to_owned()));
+        // 13.2.5.69: "U+0000 NULL characters are handled in the tree
+        // construction stage", so the tokenizer must not report one here.
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn a_truncated_cdata_section_reports_the_end_of_file() {
+        let (tokens, errors) = tokenize_with_cdata("<![CDATA[ab]]");
+        assert_eq!(tokens[0], Token::Cdata("ab]]".to_owned()));
+        assert_eq!(tokens[1], Token::Eof);
+        assert_eq!(errors, vec![HtmlParseErrorCode::EofInCdata]);
+    }
+    /// The standard raises `missing-whitespace-between-attributes` in exactly one
+    /// state — 13.2.5.39, "after attribute value (quoted)" — so a value-less
+    /// attribute can never be the one that is missing a separator. These are the
+    /// shapes that used to be reported and must not be, including the real-world
+    /// `<script defer src=...>` shape. The attribute lists are asserted too, so
+    /// that suppressing the diagnostic cannot quietly change the parse.
+    #[test]
+    fn a_value_less_attribute_never_reports_a_missing_separator() {
+        for (markup, expected) in [
+            // The rows from the report.
+            ("<script defer src=\"a.js\">", "defer=,src=a.js"),
+            ("<script src=\"a.js\" defer>", "src=a.js,defer="),
+            ("<div a b>", "a=,b="),
+            ("<div a=\"1\" b=\"2\">", "a=1,b=2"),
+            // The rest of the value-less shapes.
+            ("<div a b=\"1\">", "a=,b=1"),
+            ("<div a=\"1\" b>", "a=1,b="),
+            ("<div a=\"1\" b=\"2\" c>", "a=1,b=2,c="),
+            ("<div a b c d>", "a=,b=,c=,d="),
+            // Markup of the kind that is on almost every page.
+            (
+                "<script defer async type=module src=a.js>",
+                "defer=,async=,type=module,src=a.js",
+            ),
+            ("<input disabled required>", "disabled=,required="),
+            (
+                "<img src=a alt=b loading=lazy decoding=async width=10>",
+                "src=a,alt=b,loading=lazy,decoding=async,width=10",
+            ),
+            // A value-less attribute at the end of the tag.
+            ("<div a >", "a="),
+            ("<div a/>", "a="),
+        ] {
+            let (tokens, errors) = tokenize(markup);
+            assert!(
+                !errors.contains(&HtmlParseErrorCode::MissingWhitespaceBetweenAttributes),
+                "{markup} reported a missing separator: {errors:?}"
+            );
+            let Token::StartTag(TagToken { attributes, .. }) = &tokens[0] else {
+                panic!("expected a start tag for {markup}");
+            };
+            let parsed: Vec<String> = attributes
+                .iter()
+                .map(|attribute| format!("{}={}", attribute.name, attribute.value))
+                .collect();
+            assert_eq!(parsed.join(","), expected, "{markup}");
+        }
+    }
+
+    /// The genuine class: a quoted value followed immediately by another
+    /// attribute, which is the standard's own example. Reported once per gap, and
+    /// at the character where the separator should have been — the first character
+    /// of the attribute that follows.
+    #[test]
+    fn a_missing_separator_is_reported_after_a_quoted_value() {
+        for markup in [
+            "<div id=\"foo\"class=\"bar\">",
+            "<div id='foo'class='bar'>",
+            "<div id=\"foo\"class='bar'>",
+        ] {
+            let (_, errors) = tokenize(markup);
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|code| {
+                        **code == HtmlParseErrorCode::MissingWhitespaceBetweenAttributes
+                    })
+                    .count(),
+                1,
+                "{markup}: {errors:?}"
+            );
+        }
+        // Two gaps, two errors, each at its own gap.
+        let mut tokenizer = Tokenizer::new("<div a=\"1\"b=\"2\"c=\"3\">");
+        loop {
+            let token = tokenizer.next();
+            if token == Token::Eof {
+                break;
+            }
+        }
+        let offsets: Vec<usize> = tokenizer
+            .errors()
+            .iter()
+            .filter(|error| error.code == HtmlParseErrorCode::MissingWhitespaceBetweenAttributes)
+            .map(|error| error.offset)
+            .collect();
+        // `<div a="1"` is ten characters, so the first `b` is at 10 and the second
+        // `c` at 15: the offsets are the gaps, not the ends of the attributes
+        // that follow them.
+        assert_eq!(offsets, vec![10, 15]);
+
+        // The parse is unaffected: the parser behaves as if the whitespace were
+        // present.
+        let (tokens, _) = tokenize("<div id=\"foo\"class=\"bar\">");
+        let Token::StartTag(TagToken { attributes, .. }) = &tokens[0] else {
+            panic!("expected a start tag");
+        };
+        let parsed: Vec<String> = attributes
+            .iter()
+            .map(|attribute| format!("{}={}", attribute.name, attribute.value))
+            .collect();
+        assert_eq!(parsed, vec!["id=foo", "class=bar"]);
+    }
+
+    /// The three characters the "after attribute value (quoted)" state has an
+    /// explicit case for are separators, not gaps: ASCII whitespace, `/`, and `>`.
+    /// A quoted value followed by any of them is clean.
+    #[test]
+    fn a_quoted_value_may_be_followed_by_whitespace_a_solidus_or_the_end_of_the_tag() {
+        for markup in [
+            "<div a=\"1\" b=\"2\">",
+            "<div a=\"1\"\tb=\"2\">",
+            "<div a=\"1\"\nb=\"2\">",
+            "<div a=\"1\"\rb=\"2\">",
+            "<div a=\"1\"\u{0c}b=\"2\">",
+            "<div a=\"1\"  b=\"2\">",
+            // A solidus is the self-closing start tag state's business, and `>`
+            // ends the tag.
+            "<div a=\"1\"/>",
+            "<div a=\"1\" b=\"2\"/>",
+            "<div a=\"1\">",
+        ] {
+            let (_, errors) = tokenize(markup);
+            assert!(
+                !errors.contains(&HtmlParseErrorCode::MissingWhitespaceBetweenAttributes),
+                "{markup} reported a missing separator: {errors:?}"
+            );
+        }
+    }
+
+    /// An unquoted value absorbs every character that is neither ASCII whitespace
+    /// nor `>` (13.2.5.38), so a quote inside one cannot leave a gap: it is part
+    /// of the value, and reported there.
+    #[test]
+    fn an_unquoted_value_absorbs_a_quote_so_no_separator_is_missing() {
+        for markup in ["<div a=1\"b\">", "<div a=1'c>", "<div a=x=y>"] {
+            let (_, errors) = tokenize(markup);
+            assert!(
+                !errors.contains(&HtmlParseErrorCode::MissingWhitespaceBetweenAttributes),
+                "{markup} reported a missing separator: {errors:?}"
+            );
+        }
+        // Both quotes are kept in the value, and each is reported there.
+        let (tokens, errors) = tokenize("<div a=1\"b\">");
+        let Token::StartTag(TagToken { attributes, .. }) = &tokens[0] else {
+            panic!("expected a start tag");
+        };
+        assert_eq!(attributes[0].value, "1\"b\"");
+        assert_eq!(
+            errors,
+            vec![
+                HtmlParseErrorCode::UnexpectedCharacterInUnquotedAttributeValue,
+                HtmlParseErrorCode::UnexpectedCharacterInUnquotedAttributeValue
+            ]
+        );
+    }
+
+    /// A solidus after a quoted value belongs to the self-closing start tag state
+    /// (13.2.5.40), which reports `unexpected-solidus-in-tag` and reconsumes in
+    /// the before attribute name state — so it must not also be reported as a
+    /// missing separator.
+    #[test]
+    fn a_solidus_after_a_quoted_value_is_a_solidus_error_not_a_missing_separator() {
+        let (_, errors) = tokenize("<div a=\"1\"/b=\"2\">");
+        assert!(
+            !errors.contains(&HtmlParseErrorCode::MissingWhitespaceBetweenAttributes),
+            "{errors:?}"
+        );
+        assert_eq!(
+            errors,
+            vec![HtmlParseErrorCode::UnexpectedSolidusInTag],
+            "the solidus is the only thing wrong with this markup"
+        );
     }
 }

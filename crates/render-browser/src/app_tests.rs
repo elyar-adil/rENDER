@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -951,6 +953,412 @@ fn image_source_changed_during_fetch_starts_replacement_immediately() {
     );
 }
 
+const RENDER_TEST_VIEWPORT: WindowSize<u32> = WindowSize::new(800, 560);
+
+/// What one submitted render job carried, so a test can assert the pipeline did
+/// not lose a stylesheet batch between submits.
+#[derive(Clone, Debug)]
+struct SubmittedRender {
+    generation: u64,
+    carried_style_batch: bool,
+    /// Whether the job observed that its work was superseded before it
+    /// returned.
+    cancelled: bool,
+}
+
+type RenderLog = Arc<Mutex<Vec<SubmittedRender>>>;
+type RenderGate = Arc<(Mutex<bool>, Condvar)>;
+
+/// A render worker whose first job blocks until the test releases it. Render
+/// ordering therefore no longer depends on timing, which is what makes the
+/// supersession and coalescing contracts testable at all.
+fn gated_render_worker() -> (
+    crate::render_worker::PageRenderWorker,
+    Arc<AtomicUsize>,
+    RenderLog,
+    RenderGate,
+) {
+    let started = Arc::new(AtomicUsize::new(0));
+    let log: RenderLog = Arc::new(Mutex::new(Vec::new()));
+    let gate: RenderGate = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker = crate::render_worker::PageRenderWorker::start(
+        RenderWorkerOptions {
+            queue_capacity: 8,
+            worker_count: 1,
+        },
+        {
+            let started = Arc::clone(&started);
+            let log = Arc::clone(&log);
+            let gate = Arc::clone(&gate);
+            move |job: RenderJob<PageRenderPayload>, cancellation: &RenderCancellation| {
+                let carried_style_batch = match &job.payload {
+                    PageRenderPayload::Full(full) => full.style_batch.is_some(),
+                    PageRenderPayload::RetainedRaster { .. } => false,
+                };
+                // Only the first job is gated: the resubmission under test must
+                // be free to run so the test can observe the outcome.
+                if job.identity.generation == 1 {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, condvar) = &*gate;
+                    let mut released = lock.lock().expect("gate lock");
+                    while !*released {
+                        released = condvar.wait(released).expect("gate wait is not poisoned");
+                    }
+                } else {
+                    started.fetch_add(1, Ordering::SeqCst);
+                }
+                log.lock().expect("render log lock").push(SubmittedRender {
+                    generation: job.identity.generation,
+                    carried_style_batch,
+                    cancelled: cancellation.is_cancelled(),
+                });
+                let width = job.identity.viewport.width;
+                let height = job.identity.viewport.height;
+                let height_css = height as f32;
+                Ok(PageRenderFrame {
+                    frame: vec![0x00ff_ffff; (width * height) as usize],
+                    viewport: WindowSize::new(width, height),
+                    display_list: None,
+                    paint_scene: None,
+                    raster_background: Color::rgb(0xff, 0xff, 0xff),
+                    content_height: height_css,
+                    viewport_height: height_css,
+                    applied_style_sheets: None,
+                    style_plan: None,
+                    style_diagnostics: Vec::new(),
+                    computed_styles: None,
+                    geometry: None,
+                    document_revision: job.identity.dom_revision,
+                })
+            }
+        },
+        || {},
+    )
+    .expect("render worker starts");
+    (worker, started, log, gate)
+}
+
+fn release_first_render(gate: &RenderGate) {
+    let (lock, condvar) = &**gate;
+    let mut released = lock.lock().expect("gate lock");
+    *released = true;
+    condvar.notify_all();
+}
+
+fn wait_for_renders(started: &AtomicUsize, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) < count {
+        assert!(
+            Instant::now() < deadline,
+            "expected {count} render(s), saw {}",
+            started.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+fn submitted_renders(log: &RenderLog) -> Vec<SubmittedRender> {
+    log.lock().expect("render log lock").clone()
+}
+
+/// Polls committed frames until `count` render jobs have returned.
+fn commit_until_logged(app: &mut BrowserApp, log: &RenderLog, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_render_worker();
+        if submitted_renders(log).len() >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} render(s) returned, want {count}",
+            submitted_renders(log).len()
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// Polls committed frames until `count` jobs have run to completion.
+///
+/// A released job finishes on the render worker, so a single poll can observe
+/// nothing; the loop is bounded and fails loudly instead of hanging.
+fn commit_until_renders(app: &mut BrowserApp, started: &AtomicUsize, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_render_worker();
+        if started.load(Ordering::SeqCst) >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "a discarded frame never released the coalesced repaint: {} render(s), want {count}",
+            started.load(Ordering::SeqCst)
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+/// A 200 `text/css` response for one stylesheet slot.
+fn stylesheet_response(
+    resource: &render_browser::resources::StylesheetFetch,
+    body: &str,
+) -> render_net::FetchResponse {
+    render_net::FetchResponse {
+        requested_url: resource.key.requested_url.clone(),
+        final_url: resource.key.requested_url.clone(),
+        redirect_chain: vec![resource.key.requested_url.clone()],
+        redirects: Vec::new(),
+        status: render_net::HttpStatus::from_u16(200),
+        headers: Vec::new(),
+        content_type: Some(render_net::ContentType {
+            media_type: "text/css".to_owned(),
+            charset: Some("utf-8".to_owned()),
+        }),
+        body: body.as_bytes().to_vec(),
+    }
+}
+
+/// Attaches a fetched stylesheet batch the way the network coordinator does, so
+/// the next render carries it.
+fn attach_stylesheet_batch(app: &mut BrowserApp, tab: TabId, css: &str) {
+    let page = app.pages.get_mut(&tab).expect("page state");
+    let base = page.navigation.committed().target.history_url();
+    let plan = plan_external_style_sheets(
+        page.page.document(),
+        &base,
+        render_core::document::DocumentLimits::default(),
+    );
+    let results = plan
+        .resources
+        .iter()
+        .map(|resource| Ok(stylesheet_response(resource, css)))
+        .collect::<Vec<render_net::FetchResult>>();
+    page.style_batch = Some((plan, results));
+    page.external_styles_generation = page.external_styles_generation.saturating_add(1);
+}
+
+fn second_document_source() -> PageSource {
+    PageSource {
+        html: "<main id=host>second</main>".to_owned(),
+        title: "second".to_owned(),
+        target: NavigationTarget::Url(Url::parse("https://example.test/second.html").expect("URL")),
+    }
+}
+
+/// A navigation that commits while a render is running hands the tab to the
+/// new document. The running frame is then discarded, and the repaint request
+/// coalesced behind it must still be honoured: consuming that request only
+/// after a successful commit left the tab frozen on the document it replaced.
+#[test]
+fn superseded_render_still_repaint_the_coalesced_request() {
+    let (worker, started, log, gate) = gated_render_worker();
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (mut app, tab) =
+        headless_app_with_render_worker("<main id=host>first</main>", worker, Arc::clone(&fonts));
+
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+    wait_for_renders(&started, 1);
+
+    app.pages
+        .get_mut(&tab)
+        .expect("page state")
+        .set_source(second_document_source());
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+    {
+        let page = app.pages.get(&tab).expect("page state");
+        assert!(page.render_dirty);
+        assert_eq!(page.render_dirty_viewport, Some(RENDER_TEST_VIEWPORT));
+    }
+
+    release_first_render(&gate);
+    commit_until_renders(&mut app, &started, 2);
+
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    let page = app.pages.get(&tab).expect("page state");
+    assert!(!page.render_dirty);
+    assert_eq!(page.render_dirty_viewport, None);
+    let renders = submitted_renders(&log);
+    assert_eq!(renders.len(), 2);
+    assert_eq!(renders[1].generation, 2);
+}
+
+/// The stylesheet batch a superseded render was carrying must survive the
+/// discard. When it did not, a page whose stylesheet landed during a render
+/// converged on the unstyled document it started with and never repainted.
+#[test]
+fn superseded_render_keeps_the_pending_stylesheet_batch() {
+    let (worker, started, log, gate) = gated_render_worker();
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (mut app, tab) = headless_app_with_render_worker(
+        "<link rel=stylesheet href=a.css>",
+        worker,
+        Arc::clone(&fonts),
+    );
+
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+    wait_for_renders(&started, 1);
+
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.set_source(PageSource {
+            html: "<link rel=stylesheet href=a.css>".to_owned(),
+            title: "styled".to_owned(),
+            target: NavigationTarget::Url(
+                Url::parse("https://example.test/styled.html").expect("styled URL"),
+            ),
+        });
+    }
+    attach_stylesheet_batch(&mut app, tab, "h1 { color: red }");
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+
+    release_first_render(&gate);
+    commit_until_renders(&mut app, &started, 2);
+
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    let renders = submitted_renders(&log);
+    assert!(
+        !renders[0].carried_style_batch,
+        "the first job ran before the batch arrived"
+    );
+    assert!(
+        renders[1].carried_style_batch,
+        "the repaint after the discarded frame lost the stylesheet batch"
+    );
+    assert!(app.pages[&tab].style_batch.is_some());
+}
+
+/// A committed navigation must supersede the frames of the document it
+/// replaces rather than leave them registered with the render worker, and the
+/// repaint the new document needs must still happen even though the cancelled
+/// render never reports a completion.
+#[test]
+fn navigation_while_rendering_supersedes_the_old_frame_and_still_repaints() {
+    let (worker, started, log, gate) = gated_render_worker();
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let (mut app, tab) =
+        headless_app_with_render_worker("<main id=host>first</main>", worker, Arc::clone(&fonts));
+
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+    wait_for_renders(&started, 1);
+
+    app.install_source(tab, second_document_source(), true);
+    // The new document's repaint is coalesced behind the render the navigation
+    // just cancelled.
+    app.schedule_page_render(tab, RENDER_TEST_VIEWPORT, false);
+    {
+        let page = app.pages.get(&tab).expect("page state");
+        assert!(page.render_dirty);
+        assert_eq!(page.render_dirty_viewport, Some(RENDER_TEST_VIEWPORT));
+    }
+
+    release_first_render(&gate);
+    commit_until_logged(&mut app, &log, 1);
+    assert!(
+        app.pages[&tab].expected_render.is_none(),
+        "the superseded frame must not be installable on the new document"
+    );
+
+    // A cancelled render reports nothing, so only the coordinator's recovery can
+    // release the repaint it left behind. The event loop repeats this on every
+    // tick until the worker frees the tab.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) < 2 {
+        app.poll_render_worker();
+        app.recover_unresolved_render_requests();
+        assert!(
+            Instant::now() < deadline,
+            "the repaint left behind by the cancelled render never ran"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    let renders = submitted_renders(&log);
+    assert_eq!(renders.len(), 2);
+    assert!(
+        renders[0].cancelled,
+        "the navigation did not cancel the old frame"
+    );
+    assert!(!renders[1].cancelled);
+    let page = app.pages.get(&tab).expect("page state");
+    assert!(!page.render_dirty);
+    assert_eq!(page.render_dirty_viewport, None);
+}
+
+/// Every completed image batch marks the page dirty, including one that decoded
+/// nothing: skipping those left a page whose images all fail permanently frozen
+/// on its last commit.
+#[test]
+fn completed_image_batch_marks_the_page_dirty_even_when_nothing_decoded() {
+    let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
+    app.start_images(tab);
+    let url = {
+        let page = app.pages.get(&tab).expect("page state");
+        page.pending_images
+            .as_ref()
+            .expect("image request started")
+            .plan
+            .resources[0]
+            .request
+            .url
+            .clone()
+    };
+
+    app.finish_images(
+        tab,
+        vec![Ok(render_net::FetchResponse {
+            requested_url: url.clone(),
+            final_url: url.clone(),
+            redirect_chain: vec![url],
+            redirects: Vec::new(),
+            status: render_net::HttpStatus::from_u16(200),
+            headers: Vec::new(),
+            content_type: Some(render_net::ContentType {
+                media_type: "image/png".to_owned(),
+                charset: None,
+            }),
+            // Not a decodable image: the batch completes with nothing loaded.
+            body: b"not a png".to_vec(),
+        })],
+    );
+
+    let page = app.pages.get(&tab).expect("page state");
+    assert!(
+        page.expected_render.is_some(),
+        "a completed image batch must request a repaint even when it decoded nothing"
+    );
+    assert!(page.pending_images.is_none());
+}
+
+/// A stylesheet blocks script *execution*, not discovery, parsing, or
+/// fetching: an inline body is prepared while the sheet is still in flight and
+/// only its execution waits for the cascade.
+#[test]
+fn inline_script_body_is_prepared_before_stylesheets_and_runs_after() {
+    let html = "<!doctype html><html><head><title>Static</title>\
+                <link rel=\"stylesheet\" href=\"sheet.css\">\
+                </head><body><script>document.title = 'Ran';</script></body></html>";
+    let (mut app, tab) = headless_app_with(html);
+
+    app.start_classic_scripts(tab);
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        assert!(!page.styles_resolved, "the stylesheet is still pending");
+        assert!(
+            page.held_scripts.is_some(),
+            "the inline body must be prepared while the stylesheet loads"
+        );
+        assert!(!page.sync_committed_title());
+    }
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.cancel_style_sheets();
+        page.styles_resolved = true;
+    }
+    app.start_classic_scripts(tab);
+    assert!(app.pages[&tab].held_scripts.is_none());
+    assert_eq!(app.pages[&tab].navigation.committed().title, "Ran");
+}
+
 #[test]
 fn dynamic_stylesheet_merge_keeps_previous_css_and_drops_retargeted_links() {
     let base = Url::parse("https://example.test/page.html").expect("base URL");
@@ -1185,7 +1593,26 @@ fn find_id(dom: &Dom, id: &str) -> NodeId {
 
 /// Builds a headless `BrowserApp` (no window, no render side effects) showing
 /// `html` at a `file:` document URL so any submit navigation stays offline.
-fn headless_app_with(html: &str) -> (BrowserApp, TabId) {
+pub(super) fn headless_app_with(html: &str) -> (BrowserApp, TabId) {
+    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
+    let render_worker = crate::render_worker::PageRenderWorker::start(
+        RenderWorkerOptions::default(),
+        |_job: RenderJob<PageRenderPayload>,
+         _cancellation: &RenderCancellation|
+         -> Result<PageRenderFrame, RenderFailure> { Err(RenderFailure::Cancelled) },
+        || {},
+    )
+    .expect("render worker starts");
+    headless_app_with_render_worker(html, render_worker, fonts)
+}
+
+/// Builds a headless `BrowserApp` driving `render_worker`, so a test can
+/// observe the real submit/commit ordering without a window.
+fn headless_app_with_render_worker(
+    html: &str,
+    render_worker: crate::render_worker::PageRenderWorker,
+    fonts: Arc<SystemFontBackend>,
+) -> (BrowserApp, TabId) {
     let url = Url::parse("file:///rENDER-test-fixtures/page.html").expect("test document URL");
     let source = PageSource {
         html: html.to_owned(),
@@ -1196,17 +1623,8 @@ fn headless_app_with(html: &str) -> (BrowserApp, TabId) {
     let active = tabs.active_id();
     let page = PageState::new(source);
 
-    let fonts = Arc::new(SystemFontBackend::load().expect("system fonts load"));
     let network = NetworkWorker::start(HttpTransport::new(FetchConfig::default()))
         .expect("network worker starts");
-    let render_worker = crate::render_worker::PageRenderWorker::start(
-        RenderWorkerOptions::default(),
-        |_job: RenderJob<PageRenderPayload>,
-         _cancellation: &RenderCancellation|
-         -> Result<PageRenderFrame, RenderFailure> { Err(RenderFailure::Cancelled) },
-        || {},
-    )
-    .expect("render worker starts");
 
     let mut app = BrowserApp {
         tabs,

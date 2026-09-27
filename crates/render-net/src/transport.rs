@@ -13,6 +13,8 @@ use ureq::ResponseExt;
 use url::Url;
 
 use crate::CookieJar;
+use crate::diagnostics::{FetchEvent, FetchObserver, FetchPhase, StderrObserver};
+use crate::{DEFAULT_PER_ORIGIN_CONCURRENCY, ORIGINS_BEFORE_TOTAL_CEILING};
 
 /// Minimum average body throughput once [`FetchConfig::timeout`] has elapsed.
 ///
@@ -380,7 +382,58 @@ pub struct FetchConfig {
     /// this budget has elapsed. The budget is also enforced across the whole
     /// redirect chain.
     pub timeout: Duration,
+    /// Budget for the connect phase only: the TCP connect and, for `https`,
+    /// the TLS handshake over the socket it opened.
+    ///
+    /// This is deliberately much smaller than [`FetchConfig::timeout`] and
+    /// exists because of how ureq 3.3 fails over between addresses. There is no
+    /// happy-eyeballs racing: `TcpConnector` walks the resolved addresses in
+    /// order and hands each one a slice of `timeout_connect` taken from a
+    /// geometric series that sums to the whole budget (curl's fallback
+    /// schedule). The first address therefore receives about two thirds of the
+    /// budget for a dual-stack host and a bit over half for a four-address CDN
+    /// host, and it burns that slice in full when the address is a black hole
+    /// (a filtered AAAA record, a route that silently drops SYNs). With the
+    /// per-request budget used as the connect budget, one unresponsive record
+    /// costs ~16s of a 30s request before the next address is even tried, and
+    /// nothing reports it. A dedicated connect budget caps the worst case at
+    /// itself, which is what makes the failure visible and bounded, while the
+    /// rest of [`FetchConfig::timeout`] stays available to the phases that can
+    /// legitimately need it (a large body trickling in over a slow link).
+    ///
+    /// The TLS handshake shares this budget in ureq, but it runs *after*
+    /// address selection on the socket that connected, so a high-latency link
+    /// is not penalised by the geometric split. A zero value disables the
+    /// bound and lets the connect phase run on [`FetchConfig::timeout`].
+    pub connect_timeout: Duration,
+    /// Idle connections the pool keeps for one origin (scheme, host, port and
+    /// proxy together).
+    ///
+    /// This is the same-origin ceiling that matters once connection reuse works,
+    /// and it is a decision rather than a default: over HTTP/1.1 a page cannot
+    /// have more requests in flight against one origin than this, so keeping
+    /// more idle connections than that would hold sockets that could never be
+    /// reused, and keeping fewer throws away connections the next wave of
+    /// requests would have taken for free. The default is
+    /// [`DEFAULT_PER_ORIGIN_CONCURRENCY`](crate::DEFAULT_PER_ORIGIN_CONCURRENCY),
+    /// the per-origin limit [`BatchOptions`](crate::BatchOptions) also applies,
+    /// so the two cannot drift apart.
+    ///
+    /// Note that this bounds what is *kept*, not what runs: requests in flight
+    /// are not in the pool. Zero keeps no idle connection for an origin, which
+    /// is equivalent to disabling reuse for it.
+    pub idle_connections_per_origin: usize,
+    /// Idle connections the pool keeps in total, across all origins.
+    ///
+    /// A ceiling of one origin's worth would make a page with a CDN on it pay a
+    /// handshake for the CDN's assets, so the default is four origins' worth.
+    /// This is a socket count, not a request count: a connection in flight is
+    /// not held here.
+    pub idle_connections_total: usize,
     pub user_agent: String,
+    /// Where every request's terminal outcome is reported. The default writes
+    /// failures and slow requests to stderr; see [`StderrObserver`].
+    pub observer: Arc<dyn FetchObserver>,
 }
 
 impl Default for FetchConfig {
@@ -390,12 +443,16 @@ impl Default for FetchConfig {
             max_body_bytes: 16 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(5),
+            idle_connections_per_origin: DEFAULT_PER_ORIGIN_CONCURRENCY,
+            idle_connections_total: DEFAULT_PER_ORIGIN_CONCURRENCY * ORIGINS_BEFORE_TOTAL_CEILING,
             user_agent: format!(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
                  AppleWebKit/537.36 (KHTML, like Gecko) \
                  Chrome/120.0.0.0 Safari/537.36 rENDER/{}",
                 env!("CARGO_PKG_VERSION")
             ),
+            observer: Arc::new(StderrObserver::from_environment()),
         }
     }
 }
@@ -447,10 +504,71 @@ pub enum FetchError {
     /// The request is malformed at the transport layer, for example a body
     /// attached to a `GET` or `HEAD`.
     InvalidRequest(String),
+    /// A failure that happened inside a network operation, tagged with the
+    /// [`FetchPhase`] it happened in and the time spent before it surfaced.
+    ///
+    /// This is what makes a stall visible: the wrapped `source` keeps the
+    /// original typed failure, and the phase plus elapsed time say *where* and
+    /// *how long*. `elapsed` is the time from the start of the failing
+    /// operation, which for a hop covers everything ureq does in one call -
+    /// resolve, connect, TLS, send, and response headers - because only ureq
+    /// can see the boundaries between those. Failures raised before any I/O
+    /// (request validation, URL handling, cancellation) and transport policy
+    /// failures stay untagged, since there is no phase to blame.
+    Failed {
+        phase: FetchPhase,
+        elapsed: Duration,
+        source: Box<FetchError>,
+    },
     Protocol(String),
     Io(String),
     WorkerStopped,
     Transport(String),
+}
+
+impl FetchError {
+    /// The transport phase this failure happened in, when it is known.
+    #[must_use]
+    pub const fn phase(&self) -> Option<FetchPhase> {
+        match self {
+            Self::Failed { phase, .. } => Some(*phase),
+            _ => None,
+        }
+    }
+
+    /// How long the failing operation ran before this failure surfaced.
+    #[must_use]
+    pub const fn elapsed(&self) -> Option<Duration> {
+        match self {
+            Self::Failed { elapsed, .. } => Some(*elapsed),
+            _ => None,
+        }
+    }
+
+    /// The original failure with the phase and elapsed time removed, so callers
+    /// that branch on the typed variants do not have to unwrap.
+    #[must_use]
+    pub fn into_inner(self) -> FetchError {
+        match self {
+            Self::Failed { source, .. } => *source,
+            other => other,
+        }
+    }
+
+    /// Tags a failure with the phase it happened in and how long it took.
+    ///
+    /// Cancellation is passed through untouched: it is a caller decision, not a
+    /// transport phase, and callers match on it directly.
+    pub(crate) fn in_phase(self, phase: FetchPhase, elapsed: Duration) -> Self {
+        match self {
+            Self::Cancelled => self,
+            source => Self::Failed {
+                phase,
+                elapsed,
+                source: Box::new(source),
+            },
+        }
+    }
 }
 
 impl fmt::Display for FetchError {
@@ -484,6 +602,15 @@ impl fmt::Display for FetchError {
                 "header '{name}' is managed by the transport and cannot be set explicitly"
             ),
             Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
+            Self::Failed {
+                phase,
+                elapsed,
+                source,
+            } => write!(
+                formatter,
+                "{phase}: {source} after {}ms",
+                elapsed.as_millis()
+            ),
             Self::Protocol(message) => write!(formatter, "HTTP protocol error: {message}"),
             Self::Io(message) => write!(formatter, "network I/O error: {message}"),
             Self::WorkerStopped => formatter.write_str("network worker stopped"),
@@ -492,7 +619,14 @@ impl fmt::Display for FetchError {
     }
 }
 
-impl std::error::Error for FetchError {}
+impl std::error::Error for FetchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Failed { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 pub type FetchResult = Result<FetchResponse, FetchError>;
 
@@ -513,6 +647,10 @@ pub struct RedirectResponse {
 pub struct HttpTransport {
     config: Arc<FetchConfig>,
     agent: ureq::Agent,
+    /// Whether the proxy in use was resolved implicitly from the environment or
+    /// the platform, rather than handed in by a caller. See
+    /// [`HttpTransport::new`].
+    implicit_proxy: bool,
 }
 
 impl fmt::Debug for HttpTransport {
@@ -520,8 +658,16 @@ impl fmt::Debug for HttpTransport {
         formatter
             .debug_struct("HttpTransport")
             .field("config", &self.config)
+            .field("implicit_proxy", &self.implicit_proxy)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether one hop inherits the transport's proxy or must go direct.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HopProxy {
+    Inherit,
+    Direct,
 }
 
 impl HttpTransport {
@@ -529,8 +675,16 @@ impl HttpTransport {
     ///
     /// A proxy resolved from the environment (`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
     /// with `NO_PROXY`) or, on Windows, the system proxy settings applies to
-    /// every request issued through this transport. Local addresses listed in
-    /// `NO_PROXY` and loopback targets bypass the proxy.
+    /// every request issued through this transport, except requests to loopback
+    /// targets.
+    ///
+    /// Loopback is excluded because that is what browsers do by default
+    /// (Chrome's and Firefox's implicit-proxy bypass lists both start with
+    /// `localhost` and the loopback ranges), and because a proxy that cannot
+    /// serve a loopback address costs a whole extra hop per request: a local
+    /// development server or an on-device endpoint is not a remote resource.
+    /// A proxy the caller hands to [`HttpTransport::with_proxy`] is explicit
+    /// policy and is used for every target, loopback included.
     #[must_use]
     pub fn new(config: FetchConfig) -> Self {
         let proxy = ureq::Proxy::try_from_env();
@@ -541,7 +695,11 @@ impl HttpTransport {
                 proxy.port(),
             );
         }
-        Self::with_proxy(config, proxy)
+        let implicit_proxy = proxy.is_some();
+        HttpTransport {
+            implicit_proxy,
+            ..Self::with_proxy(config, proxy)
+        }
     }
 
     /// Creates a transport that routes every request through `proxy` when set.
@@ -564,14 +722,18 @@ impl HttpTransport {
             // those two are absolute phase budgets whose deadline keeps
             // ticking into the body read, so any value here would kill large
             // transfers that keep making progress. Instead the request phases
-            // (resolve, connect, send, and header reception, which stays
-            // bounded by the send-request deadline) each get `config.timeout`,
-            // while the body phase is bounded by `read_bounded_body`: a
-            // per-read idle bound of `config.timeout`, the minimum-progress
-            // floor, and `max_body_bytes`.
+            // (resolve, send, and header reception, which stays bounded by the
+            // send-request deadline) each get `config.timeout`, the connect
+            // phase gets its own smaller `config.connect_timeout` budget (see
+            // that field for why), and the body phase is bounded by
+            // `read_bounded_body`: a per-read idle bound of `config.timeout`,
+            // the minimum-progress floor, and `max_body_bytes`.
             .timeout_global(None)
             .timeout_resolve(Some(config.timeout))
-            .timeout_connect(Some(config.timeout))
+            .timeout_connect(
+                (config.connect_timeout > Duration::ZERO)
+                    .then_some(config.connect_timeout.min(config.timeout)),
+            )
             .timeout_send_request(Some(config.timeout))
             .timeout_send_body(Some(config.timeout))
             .timeout_recv_response(None)
@@ -581,12 +743,21 @@ impl HttpTransport {
             // to its pool. Gzip keeps compression and reliably reuses the
             // connection across the many same-origin assets on real pages.
             .accept_encoding("gzip")
+            // The idle-connection ceilings, set here rather than left to ureq's
+            // defaults (10 total, 3 per host). A per-host default of 3 is below
+            // the per-origin concurrency this crate allows, so on a page that
+            // pulls many assets from one origin - the shape of every stylesheet
+            // corpus - every wave after the first reopens the connections the
+            // pool just discarded. See `FetchConfig::idle_connections_per_origin`.
+            .max_idle_connections(config.idle_connections_total)
+            .max_idle_connections_per_host(config.idle_connections_per_origin)
             .user_agent(config.user_agent.clone())
             .proxy(proxy)
             .build();
         Self {
             config: Arc::new(config),
             agent: agent_config.into(),
+            implicit_proxy: false,
         }
     }
 
@@ -597,16 +768,50 @@ impl HttpTransport {
 
     /// Performs one bounded HTTP(S) request or `data:` URL decode.
     ///
+    /// Every call reaches a terminal outcome: either a [`FetchResponse`], or a
+    /// [`FetchError`] that names the [`FetchPhase`] it failed in and how long it
+    /// had been running. Both are reported to
+    /// [`FetchConfig::observer`](FetchConfig::observer), so a stalled request is
+    /// never silent.
+    ///
     /// # Errors
     ///
     /// Returns a typed [`FetchError`] for cancellation, invalid schemes,
     /// invalid request construction, configured limit violations, TLS
     /// verification, and transport failures.
+    pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+        let started = Instant::now();
+        let outcome = self.fetch_transfer(request, cancel);
+        self.report(request, started, &outcome);
+        outcome
+    }
+
+    /// Reports one request's terminal outcome to the configured observer.
+    fn report(&self, request: &FetchRequest, started: Instant, outcome: &FetchResult) {
+        let elapsed = started.elapsed();
+        let event = match outcome {
+            Ok(response) => FetchEvent::Completed {
+                method: request.method,
+                url: &request.url,
+                status: response.status,
+                body_bytes: response.body.len(),
+                elapsed,
+            },
+            Err(error) => FetchEvent::Failed {
+                method: request.method,
+                url: &request.url,
+                elapsed,
+                error,
+            },
+        };
+        self.config.observer.on_fetch_event(&event);
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "redirect/cookie/timeout handling reads as one pipeline"
     )]
-    pub fn fetch(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
+    fn fetch_transfer(&self, request: &FetchRequest, cancel: &CancelToken) -> FetchResult {
         validate_request(request)?;
         if request.url.scheme() == "data" {
             return self.fetch_data_url(request, cancel);
@@ -681,9 +886,23 @@ impl HttpTransport {
                     }
                 }
             }
+            let hop_started = Instant::now();
             let response = self
                 .send_hop(current_method, &current_url, hop_body, &hop_headers)
-                .map_err(|error| classify_ureq_error(&error, &self.config))?;
+                .map_err(|error| {
+                    let (error, mut phase) = classify_ureq_error(&error, &self.config);
+                    // ureq reports a `SendRequest` timeout against the send-request
+                    // budget, which this transport deliberately also uses to bound
+                    // the wait for the response headers (see the timeout layout in
+                    // `HttpTransport::with_proxy`), so that reason is ambiguous by
+                    // itself. A request without a body writes a few hundred bytes
+                    // and leaves the send phase immediately, so for those the budget
+                    // can only have expired while waiting for the origin to answer.
+                    if hop_body.is_none() && phase == FetchPhase::RequestSend {
+                        phase = FetchPhase::ResponseHeaders;
+                    }
+                    error.in_phase(phase, hop_started.elapsed())
+                })?;
 
             if cancel.is_cancelled() {
                 return Err(FetchError::Cancelled);
@@ -709,9 +928,11 @@ impl HttpTransport {
                 }
                 // Everything except the final body transfer keeps the
                 // configured budget in total; a redirect chain must not multiply
-                // the per-stage timeouts unboundedly.
+                // the per-stage timeouts unboundedly. The redirect response
+                // arrived, so the budget ran out while acting on it.
                 if started.elapsed() >= self.config.timeout {
-                    return Err(FetchError::Timeout);
+                    return Err(FetchError::Timeout
+                        .in_phase(FetchPhase::ResponseHeaders, started.elapsed()));
                 }
                 // Redirect method semantics (fetch/HTTP): 301 and 302
                 // historically rewrite `POST` to `GET`, and 303 rewrites
@@ -785,19 +1006,36 @@ impl HttpTransport {
         headers: &[(String, String)],
     ) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let uri = url.as_str();
+        let proxy = self.hop_proxy(url);
         match (method, body) {
-            (HttpMethod::Get, _) => decorate(self.agent.get(uri), headers).call(),
-            (HttpMethod::Head, _) => decorate(self.agent.head(uri), headers).call(),
-            (HttpMethod::Delete, None) => decorate(self.agent.delete(uri), headers).call(),
+            (HttpMethod::Get, _) => decorate(self.agent.get(uri), headers, proxy).call(),
+            (HttpMethod::Head, _) => decorate(self.agent.head(uri), headers, proxy).call(),
+            (HttpMethod::Delete, None) => decorate(self.agent.delete(uri), headers, proxy).call(),
             // DELETE with a body is legal HTTP but needs ureq's explicit
             // escape hatch.
             (HttpMethod::Delete, Some(bytes)) => {
-                decorate(self.agent.delete(uri).force_send_body(), headers).send(bytes)
+                decorate(self.agent.delete(uri).force_send_body(), headers, proxy).send(bytes)
             }
-            (HttpMethod::Post, Some(bytes)) => decorate(self.agent.post(uri), headers).send(bytes),
-            (HttpMethod::Post, None) => decorate(self.agent.post(uri), headers).send_empty(),
-            (HttpMethod::Put, Some(bytes)) => decorate(self.agent.put(uri), headers).send(bytes),
-            (HttpMethod::Put, None) => decorate(self.agent.put(uri), headers).send_empty(),
+            (HttpMethod::Post, Some(bytes)) => {
+                decorate(self.agent.post(uri), headers, proxy).send(bytes)
+            }
+            (HttpMethod::Post, None) => decorate(self.agent.post(uri), headers, proxy).send_empty(),
+            (HttpMethod::Put, Some(bytes)) => {
+                decorate(self.agent.put(uri), headers, proxy).send(bytes)
+            }
+            (HttpMethod::Put, None) => decorate(self.agent.put(uri), headers, proxy).send_empty(),
+        }
+    }
+
+    /// Whether this hop inherits the transport's proxy or bypasses it.
+    ///
+    /// An implicitly resolved proxy must not capture loopback targets; an
+    /// explicitly configured one always applies.
+    fn hop_proxy(&self, url: &Url) -> HopProxy {
+        if self.implicit_proxy && is_loopback_target(url) {
+            HopProxy::Direct
+        } else {
+            HopProxy::Inherit
         }
     }
 
@@ -909,7 +1147,10 @@ impl HttpTransport {
         if result.is_ok() {
             let _ = pump.take().map(std::thread::JoinHandle::join);
         }
-        result
+        // Every failure from here happened while reading the body, so it is the
+        // one phase this loop can attribute exactly. Cancellation stays
+        // untagged.
+        result.map_err(|error| error.in_phase(FetchPhase::BodyTransfer, started.elapsed()))
     }
 
     /// Classifies a failure surfaced by the body reader. ureq wraps its typed
@@ -917,15 +1158,13 @@ impl HttpTransport {
     /// a stalled body read is still a [`FetchError::Timeout`], not a generic
     /// I/O failure.
     fn map_body_read_error(&self, error: &std::io::Error) -> FetchError {
-        let classified = error
+        error
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<ureq::Error>())
-            .map(|error| classify_ureq_error(error, &self.config));
-        let mapped = classified.unwrap_or_else(|| FetchError::Io(error.to_string()));
-        if matches!(mapped, FetchError::Timeout) {
-            eprintln!("[timeout-debug] ureq body read timed out: {error}");
-        }
-        mapped
+            .map_or_else(
+                || FetchError::Io(error.to_string()),
+                |error| classify_ureq_error(error, &self.config).0,
+            )
     }
 }
 
@@ -946,34 +1185,116 @@ fn validate_request(request: &FetchRequest) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// Applies the prepared hop headers to a ureq request builder.
+/// Applies the prepared hop headers to a ureq request builder, plus a
+/// per-request proxy override when the hop must not use the transport's proxy.
 fn decorate<TBuilder>(
     builder: ureq::RequestBuilder<TBuilder>,
     headers: &[(String, String)],
+    proxy: HopProxy,
 ) -> ureq::RequestBuilder<TBuilder> {
-    headers.iter().fold(builder, |builder, (name, value)| {
+    let builder = headers.iter().fold(builder, |builder, (name, value)| {
         builder.header(name.as_str(), value.as_str())
-    })
+    });
+    match proxy {
+        // A request-level `proxy(None)` is the only way to keep one connection
+        // pool and still reach a loopback target directly: ureq keys pooled
+        // connections by proxy as well as authority, so a direct loopback
+        // connection never collides with a proxied one.
+        HopProxy::Direct => builder.config().proxy(None).build(),
+        HopProxy::Inherit => builder,
+    }
 }
 
-/// Maps a typed ureq failure onto the transport's error vocabulary.
-fn classify_ureq_error(error: &ureq::Error, config: &FetchConfig) -> FetchError {
+/// Whether a URL points at this machine.
+///
+/// Covers the loopback addresses and the `localhost` names RFC 6761 reserves
+/// for them, which is the set browsers exempt from an implicit proxy.
+fn is_loopback_target(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        Some(url::Host::Domain(domain)) => {
+            let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        None => false,
+    }
+}
+
+/// Maps a typed ureq failure onto the transport's error vocabulary and the
+/// transport phase it happened in.
+///
+/// ureq names a phase only for its own timeouts. Every other failure is mapped
+/// from its kind, which is exact for name resolution, TLS, and protocol
+/// failures; a non-timeout socket failure is reported against the connect
+/// phase because that is where the overwhelming majority of them come from
+/// (refused, reset, unreachable, or an address that never answered).
+fn classify_ureq_error(error: &ureq::Error, config: &FetchConfig) -> (FetchError, FetchPhase) {
     match error {
-        ureq::Error::TooManyRedirects => FetchError::RedirectLimitExceeded {
-            limit: config.redirect_limit,
-        },
-        ureq::Error::LargeResponseHeader(_, _) => FetchError::HeaderLimitExceeded {
-            limit: config.max_header_bytes,
-        },
-        ureq::Error::Timeout(_) => FetchError::Timeout,
-        ureq::Error::HostNotFound => FetchError::Dns,
-        ureq::Error::Tls(message) => FetchError::Tls((*message).to_owned()),
-        ureq::Error::Rustls(error) => FetchError::Tls(error.to_string()),
-        ureq::Error::TlsRequired => FetchError::Tls("TLS was required but unavailable".into()),
-        ureq::Error::BadUri(message) => FetchError::InvalidUrl(message.clone()),
-        ureq::Error::Protocol(error) => FetchError::Protocol(error.to_string()),
-        ureq::Error::Io(error) => map_io_error(error),
-        other => FetchError::Transport(other.to_string()),
+        ureq::Error::TooManyRedirects => (
+            FetchError::RedirectLimitExceeded {
+                limit: config.redirect_limit,
+            },
+            FetchPhase::ResponseHeaders,
+        ),
+        ureq::Error::LargeResponseHeader(_, _) => (
+            FetchError::HeaderLimitExceeded {
+                limit: config.max_header_bytes,
+            },
+            FetchPhase::ResponseHeaders,
+        ),
+        ureq::Error::Timeout(reason) => (FetchError::Timeout, phase_of_timeout(*reason)),
+        ureq::Error::HostNotFound => (FetchError::Dns, FetchPhase::Dns),
+        ureq::Error::Tls(message) => (
+            FetchError::Tls((*message).to_owned()),
+            FetchPhase::TlsHandshake,
+        ),
+        ureq::Error::Rustls(error) => {
+            (FetchError::Tls(error.to_string()), FetchPhase::TlsHandshake)
+        }
+        ureq::Error::TlsRequired => (
+            FetchError::Tls("TLS was required but unavailable".into()),
+            FetchPhase::TlsHandshake,
+        ),
+        ureq::Error::ConnectProxyFailed(reason) => (
+            FetchError::Transport(format!("CONNECT proxy failed: {reason}")),
+            FetchPhase::TcpConnect,
+        ),
+        ureq::Error::BadUri(message) => {
+            (FetchError::InvalidUrl(message.clone()), FetchPhase::Request)
+        }
+        ureq::Error::Protocol(error) => (
+            FetchError::Protocol(error.to_string()),
+            FetchPhase::ResponseHeaders,
+        ),
+        ureq::Error::Io(error) => (map_io_error(error), FetchPhase::TcpConnect),
+        // A failure ureq does not attribute to a phase. It is reported against
+        // the request phase rather than guessed at.
+        other => (
+            FetchError::Transport(other.to_string()),
+            FetchPhase::Request,
+        ),
+    }
+}
+
+/// The transport phase whose budget expired, from ureq's own reason.
+fn phase_of_timeout(reason: ureq::Timeout) -> FetchPhase {
+    match reason {
+        ureq::Timeout::Resolve => FetchPhase::Dns,
+        // ureq's connect phase covers opening the connection, including its
+        // per-address fallback and the TLS handshake that follows on the
+        // socket that connected. "tcp connect" is the actionable label: it is
+        // the phase a stalled or filtered address shows up in.
+        ureq::Timeout::Connect => FetchPhase::TcpConnect,
+        ureq::Timeout::SendRequest | ureq::Timeout::SendBody | ureq::Timeout::Await100 => {
+            FetchPhase::RequestSend
+        }
+        ureq::Timeout::RecvResponse => FetchPhase::ResponseHeaders,
+        ureq::Timeout::RecvBody => FetchPhase::BodyTransfer,
+        // This crate never configures the global or per-call budgets
+        // (`timeout_global`/`timeout_per_call` stay unset), so they cannot be
+        // why a request failed; neither can any reason ureq adds later.
+        ureq::Timeout::Global | ureq::Timeout::PerCall | _ => FetchPhase::Request,
     }
 }
 
@@ -1206,12 +1527,208 @@ fn parse_content_type(value: &str) -> Option<ContentType> {
 mod tests {
     use std::io;
     use std::io::{Read as _, Write as _};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::{
-        CancelToken, ContentType, FetchConfig, FetchError, FetchRequest, HttpTransport,
-        map_io_error, normalize_redirect_url, parse_content_type,
+        CancelToken, ContentType, FetchConfig, FetchError, FetchPhase, FetchRequest, HttpTransport,
+        map_io_error, normalize_redirect_url, parse_content_type, phase_of_timeout,
     };
     use url::Url;
+
+    #[test]
+    fn the_idle_ceiling_matches_the_per_origin_concurrency_policy() {
+        // The idle-connection ceiling is derived from the per-origin
+        // concurrency the batch policy applies, so the two must not drift: too
+        // few idle connections and every wave after the first reopens what the
+        // pool just discarded, too many and sockets are held that could never be
+        // reused. Both defaults read the same constant, and this asserts they
+        // still agree through the policy rather than only through the constant.
+        let per_origin = crate::DEFAULT_PER_ORIGIN_CONCURRENCY;
+        let config = FetchConfig::default();
+        assert_eq!(config.idle_connections_per_origin, per_origin);
+        assert_eq!(
+            config.idle_connections_total,
+            per_origin * crate::ORIGINS_BEFORE_TOTAL_CEILING
+        );
+
+        let options = crate::BatchOptions::default();
+        let url = Url::parse("https://cdn.example/assets/sheet.css").expect("test URL");
+        assert_eq!(
+            options
+                .origin_policy
+                .max_concurrency(&crate::Origin::from_url(&url)),
+            per_origin,
+            "the batch's per-origin limit and the pool's idle ceiling must be one decision"
+        );
+        assert!(
+            options.max_concurrency >= per_origin,
+            "a batch window narrower than the per-origin limit would serialise one origin"
+        );
+    }
+
+    #[test]
+    fn expired_phase_budgets_map_onto_transport_phases() {
+        assert_eq!(phase_of_timeout(ureq::Timeout::Resolve), FetchPhase::Dns);
+        assert_eq!(
+            phase_of_timeout(ureq::Timeout::Connect),
+            FetchPhase::TcpConnect
+        );
+        assert_eq!(
+            phase_of_timeout(ureq::Timeout::SendRequest),
+            FetchPhase::RequestSend
+        );
+        assert_eq!(
+            phase_of_timeout(ureq::Timeout::SendBody),
+            FetchPhase::RequestSend
+        );
+        assert_eq!(
+            phase_of_timeout(ureq::Timeout::RecvResponse),
+            FetchPhase::ResponseHeaders
+        );
+        assert_eq!(
+            phase_of_timeout(ureq::Timeout::RecvBody),
+            FetchPhase::BodyTransfer
+        );
+    }
+
+    #[test]
+    fn the_connect_budget_is_a_fraction_of_the_request_budget() {
+        let config = FetchConfig::default();
+        assert!(
+            config.connect_timeout * 4 <= config.timeout,
+            "one unresponsive address must cost well under the whole per-request budget: \
+             connect {}ms of a {}ms request",
+            config.connect_timeout.as_millis(),
+            config.timeout.as_millis()
+        );
+        assert!(
+            config.connect_timeout >= Duration::from_secs(1),
+            "the connect budget still has to cover a TCP connect plus a TLS handshake"
+        );
+    }
+
+    #[test]
+    fn failures_carry_their_phase_and_elapsed_time() {
+        let error =
+            FetchError::Timeout.in_phase(FetchPhase::TcpConnect, Duration::from_millis(2500));
+        assert_eq!(error.phase(), Some(FetchPhase::TcpConnect));
+        assert_eq!(error.elapsed(), Some(Duration::from_millis(2500)));
+        assert_eq!(
+            error.to_string(),
+            "tcp connect: request timed out after 2500ms"
+        );
+        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.into_inner(), FetchError::Timeout);
+
+        // Cancellation is a caller decision, not a phase, and must stay
+        // matchable as-is.
+        let cancelled = FetchError::Cancelled.in_phase(FetchPhase::BodyTransfer, Duration::ZERO);
+        assert_eq!(cancelled, FetchError::Cancelled);
+        assert_eq!(cancelled.phase(), None);
+
+        // A failure raised before any I/O has no phase to blame.
+        assert_eq!(FetchError::Dns.phase(), None);
+        assert_eq!(FetchError::Dns.into_inner(), FetchError::Dns);
+    }
+
+    #[test]
+    fn loopback_targets_are_recognized_for_the_implicit_proxy_bypass() {
+        for url in [
+            "http://127.0.0.1:8080/",
+            "http://127.9.9.9/",
+            "http://[::1]:8080/",
+            "http://localhost:8080/",
+            "http://app.localhost/",
+            "http://LOCALHOST./",
+        ] {
+            assert!(
+                super::is_loopback_target(&Url::parse(url).expect("loopback URL")),
+                "{url} points at this machine"
+            );
+        }
+        for url in [
+            "https://example.com/",
+            "https://notlocalhost.example.com/",
+            "https://localhost.example.com/",
+            "https://192.0.2.1/",
+        ] {
+            assert!(
+                !super::is_loopback_target(&Url::parse(url).expect("remote URL")),
+                "{url} is a remote host"
+            );
+        }
+    }
+
+    /// A proxy that only records that a hop was routed to it.
+    fn spawn_counting_proxy(hits: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind proxy");
+        let address = listener.local_addr().expect("read proxy address");
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        address
+    }
+
+    /// An origin that answers one keep-alive-less response.
+    fn spawn_origin_once() -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind origin");
+        let address = listener.local_addr().expect("read origin address");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 512];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => request.extend_from_slice(&chunk[..count]),
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        address
+    }
+
+    #[test]
+    fn a_loopback_hop_bypasses_a_system_proxy_but_an_explicit_one_is_honored() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let proxy_address = spawn_counting_proxy(Arc::clone(&hits));
+        let origin = spawn_origin_once();
+        let url = Url::parse(&format!("http://{origin}/resource")).expect("origin URL");
+        let proxy = ureq::Proxy::new(&format!("http://{proxy_address}")).expect("proxy");
+        let explicit = HttpTransport::with_proxy(FetchConfig::default(), Some(proxy));
+
+        // Explicit policy: the hop goes to the proxy, which drops it.
+        let _outcome = explicit.fetch(&FetchRequest::get(url.clone()), &CancelToken::default());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a proxy the caller configured applies to every target"
+        );
+
+        // The same agent with a proxy that came from the environment or the
+        // platform: browsers do not route loopback through those, and neither
+        // does this transport.
+        let system = HttpTransport {
+            implicit_proxy: true,
+            ..explicit
+        };
+        system
+            .fetch(&FetchRequest::get(url), &CancelToken::default())
+            .expect("a loopback hop must not depend on a proxy that cannot serve it");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an implicitly resolved proxy must not capture loopback traffic"
+        );
+    }
 
     #[test]
     fn default_user_agent_is_browser_compatible_and_product_identifiable() {

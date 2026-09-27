@@ -119,6 +119,15 @@ pub(super) struct ObjectProperty {
     /// Set for `get x()` / `set x(v)` members of an object literal; the
     /// value is the accessor function expression.
     pub accessor: Option<ObjectAccessorKind>,
+    /// Set for the `{ x }` shorthand form. It is the only member shape that is
+    /// *not* a `PropertyName : AssignmentExpression`, which matters for
+    /// `__proto__`: `{ __proto__: base }` sets the prototype while
+    /// `{ __proto__ }` installs an own data property.
+    pub shorthand: bool,
+    /// Set for the `{ x() {} }` method form, which is likewise not a
+    /// `PropertyName : AssignmentExpression` and so also keeps `__proto__`
+    /// an ordinary own property.
+    pub method: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -378,6 +387,16 @@ pub(super) enum Expr {
     Call {
         callee: Box<Self>,
         arguments: Vec<Self>,
+        offset: usize,
+    },
+    /// `` tag`a${x}b` ``: the tag receives a template object followed by the
+    /// substitution values, so it is not the same call shape as
+    /// `Expr::Call` even though both end in a call.
+    TaggedTemplate {
+        tag: Box<Self>,
+        /// The `(cooked, raw)` pairs, always `substitutions + 1` of them.
+        quasis: Vec<(String, String)>,
+        expressions: Vec<Self>,
         offset: usize,
     },
     Assignment {
@@ -1859,20 +1878,14 @@ impl Parser {
                     arguments,
                 };
             } else if matches!(self.current().kind, TokenKind::Template(_)) {
-                // Tagged templates are represented as a normal call with the
-                // cooked template string. This preserves the common
-                // `String.raw\`...\``/CSS-in-JS path without a separate
-                // template object implementation.
+                // ECMA-262 13.3.11 `TaggedTemplate`: the tag is handed a
+                // template object and the substitution values, not the
+                // concatenated string an untagged template literal produces.
                 let token = self.advance();
                 let TokenKind::Template(parts) = token.kind else {
                     unreachable!("checked above")
                 };
-                let template = self.template_literal(parts, token.offset)?;
-                expression = Expr::Call {
-                    offset: self.previous_offset(),
-                    callee: Box::new(expression),
-                    arguments: vec![template],
-                };
+                expression = self.tagged_template(expression, parts, token.offset)?;
             } else {
                 break;
             }
@@ -2164,6 +2177,9 @@ impl Parser {
         Ok(PropertyKey::Static(self.property_name()?))
     }
 
+    /// An untagged template literal: the chunks and the substituted values are
+    /// concatenated at parse time, because that is all the value of `` `a${x}` ``
+    /// is.
     fn template_literal(
         &mut self,
         parts: Vec<TemplatePart>,
@@ -2172,20 +2188,8 @@ impl Parser {
         let mut result = Expr::Literal(JsValue::String(String::new()));
         for part in parts {
             let next = match part {
-                TemplatePart::String(value) => Expr::Literal(JsValue::String(value)),
-                TemplatePart::Expression(source) => {
-                    let limits = RuntimeLimits::default();
-                    let tokens = tokenize(&source, &limits)?;
-                    let mut parser = Parser::new(tokens, &limits);
-                    let expression = parser.expression()?;
-                    if !parser.at(&TokenKind::Eof) {
-                        return Err(JsError::syntax(
-                            "unexpected token in template interpolation",
-                            offset,
-                        ));
-                    }
-                    expression
-                }
+                TemplatePart::Quasi { cooked, .. } => Expr::Literal(JsValue::String(cooked)),
+                TemplatePart::Expression(source) => self.template_expression(&source, offset)?,
             };
             result = Expr::Binary {
                 offset: self.previous_offset(),
@@ -2195,6 +2199,49 @@ impl Parser {
             };
         }
         Ok(result)
+    }
+
+    /// ECMA-262 13.3.11 `TaggedTemplate`. The quasis and the substitutions are
+    /// kept apart so the runtime can materialise a template object whose indices
+    /// are the cooked strings and whose `raw` property is the unprocessed text.
+    fn tagged_template(
+        &mut self,
+        tag: Expr,
+        parts: Vec<TemplatePart>,
+        offset: usize,
+    ) -> Result<Expr, JsError> {
+        let mut quasis = Vec::new();
+        let mut expressions = Vec::new();
+        for part in parts {
+            match part {
+                TemplatePart::Quasi { cooked, raw } => quasis.push((cooked, raw)),
+                TemplatePart::Expression(source) => {
+                    expressions.push(self.template_expression(&source, offset)?);
+                }
+            }
+        }
+        Ok(Expr::TaggedTemplate {
+            tag: Box::new(tag),
+            quasis,
+            expressions,
+            offset,
+        })
+    }
+
+    /// A `${...}` substitution, re-lexed from the source the template lexer
+    /// captured so it can be parsed as an ordinary expression.
+    fn template_expression(&mut self, source: &str, offset: usize) -> Result<Expr, JsError> {
+        let limits = RuntimeLimits::default();
+        let tokens = tokenize(source, &limits)?;
+        let mut parser = Parser::new(tokens, &limits);
+        let expression = parser.expression()?;
+        if !parser.at(&TokenKind::Eof) {
+            return Err(JsError::syntax(
+                "unexpected token in template interpolation",
+                offset,
+            ));
+        }
+        Ok(expression)
     }
 
     fn function_expression(&mut self) -> Result<Expr, JsError> {
@@ -2308,6 +2355,8 @@ impl Parser {
                         key: PropertyKey::Spread,
                         value: self.assignment()?,
                         accessor: None,
+                        shorthand: false,
+                        method: false,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -2335,6 +2384,8 @@ impl Parser {
                             body,
                         },
                         accessor: None,
+                        shorthand: false,
+                        method: false,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -2369,6 +2420,8 @@ impl Parser {
                         key: PropertyKey::Computed(key),
                         value,
                         accessor: None,
+                        shorthand: false,
+                        method: false,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -2407,6 +2460,8 @@ impl Parser {
                             body,
                         },
                         accessor: Some(accessor_kind),
+                        shorthand: false,
+                        method: false,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -2417,23 +2472,29 @@ impl Parser {
                     continue;
                 }
                 let key = self.property_name()?;
-                let value = if self.take(&TokenKind::Colon) {
-                    self.assignment()?
+                let (value, shorthand, method) = if self.take(&TokenKind::Colon) {
+                    (self.assignment()?, false, false)
                 } else if self.at(&TokenKind::LeftParen) {
                     let (parameters, body) = self.function_tail()?;
-                    Expr::Function {
-                        offset: self.previous_offset(),
-                        name: Some(key.clone()),
-                        parameters,
-                        body,
-                    }
+                    (
+                        Expr::Function {
+                            offset: self.previous_offset(),
+                            name: Some(key.clone()),
+                            parameters,
+                            body,
+                        },
+                        false,
+                        true,
+                    )
                 } else {
-                    Expr::Identifier(key.clone())
+                    (Expr::Identifier(key.clone()), true, false)
                 };
                 properties.push(ObjectProperty {
                     key: PropertyKey::Static(key),
                     value,
                     accessor: None,
+                    shorthand,
+                    method,
                 });
                 if !self.take(&TokenKind::Comma) {
                     break;
@@ -2868,6 +2929,12 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(constructor)?;
             arguments.iter().try_for_each(validate_strict_expression)
         }
+        Expr::TaggedTemplate {
+            tag, expressions, ..
+        } => {
+            validate_strict_expression(tag)?;
+            expressions.iter().try_for_each(validate_strict_expression)
+        }
         Expr::Literal(_) | Expr::RegexLiteral { .. } | Expr::This | Expr::Identifier(_) => Ok(()),
         Expr::Sequence(expressions) => expressions.iter().try_for_each(validate_strict_expression),
         Expr::Class {
@@ -3260,6 +3327,14 @@ fn validate_reserved_expression(
             validate_reserved_expression(constructor, context)?;
             for argument in arguments {
                 validate_reserved_expression(argument, context)?;
+            }
+        }
+        Expr::TaggedTemplate {
+            tag, expressions, ..
+        } => {
+            validate_reserved_expression(tag, context)?;
+            for expression in expressions {
+                validate_reserved_expression(expression, context)?;
             }
         }
         Expr::Assignment { target, value, .. }

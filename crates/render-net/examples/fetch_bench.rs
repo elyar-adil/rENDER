@@ -1,5 +1,9 @@
 //! Scratch latency probe: prints per-request wall time for URLs given on the
 //! command line. Repeat a URL to expose connection pooling behavior.
+//!
+//! Flags: `-v` (ureq logs), `raw` (legacy raw-ureq probe), `--no-proxy`
+//! (bypass an environment/system proxy), `--timeout <ms>`, `--connect <ms>`
+//! (connect-phase budget), `--repeat <n>`.
 
 use std::io::Read;
 use std::time::Instant;
@@ -39,32 +43,63 @@ fn raw_ureq_probe(url: &str) {
             }
         }
         drop(reader);
-        println!("raw-ureq #{round}  {:>9.1?} {bytes} bytes", start.elapsed());
+        println!(
+            "raw-ureq #{round}  {elapsed:>9.1?} {bytes} bytes  {url}",
+            elapsed = start.elapsed()
+        );
     }
 }
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut verbose = false;
+    let mut no_proxy = false;
+    let mut repeat = 1;
+    let mut timeout = None;
+    let mut connect = None;
     let mut urls = Vec::new();
-    for arg in args.by_ref() {
-        if arg == "-v" {
-            verbose = true;
-        } else if arg == "raw" {
-            // Legacy mode marker: treat the rest as raw-ureq probe URLs.
-            for url in args.by_ref() {
-                raw_ureq_probe(&url);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-v" => verbose = true,
+            "--no-proxy" => no_proxy = true,
+            "--timeout" => {
+                let value = args.next().expect("--timeout needs a value");
+                timeout = Some(std::time::Duration::from_millis(
+                    value.parse().expect("milliseconds"),
+                ));
             }
-            return;
-        } else {
-            urls.push(arg);
+            "--connect" => {
+                let value = args.next().expect("--connect needs a value");
+                connect = Some(std::time::Duration::from_millis(
+                    value.parse().expect("milliseconds"),
+                ));
+            }
+            "--repeat" => {
+                let value = args.next().expect("--repeat needs a value");
+                repeat = value.parse().expect("count");
+            }
+            "raw" => {
+                // Legacy mode marker: treat the rest as raw-ureq probe URLs.
+                for url in args.by_ref() {
+                    raw_ureq_probe(&url);
+                }
+                return;
+            }
+            _ => urls.push(arg),
         }
     }
     if verbose {
         let _ = log::set_boxed_logger(Box::new(ScratchLogger));
         log::set_max_level(log::LevelFilter::Debug);
     }
-    let transport = HttpTransport::new(FetchConfig::default());
+    let mut config = FetchConfig::default();
+    config.timeout = timeout.unwrap_or(config.timeout);
+    config.connect_timeout = connect.unwrap_or(config.connect_timeout);
+    let transport = if no_proxy {
+        HttpTransport::with_proxy(config, None)
+    } else {
+        HttpTransport::new(config)
+    };
     let cancel = CancelToken::default();
     for url in &urls {
         let Ok(parsed) = url.parse() else {
@@ -72,12 +107,18 @@ fn main() {
             continue;
         };
         let request = FetchRequest::new(render_net::HttpMethod::Get, parsed);
-        let start = Instant::now();
-        let result = transport.fetch(&request, &cancel);
-        let elapsed = start.elapsed();
-        match result {
-            Ok(response) => println!("{elapsed:>9.1?} {} bytes  {url}", response.body.len()),
-            Err(error) => println!("{elapsed:>9.1?} ERROR {error}  {url}"),
+        for round in 1..=repeat {
+            let start = Instant::now();
+            let result = transport.fetch(&request, &cancel);
+            let elapsed = start.elapsed();
+            match result {
+                Ok(response) => println!(
+                    "#{round} {elapsed:>9.1?} {} bytes  {url}",
+                    response.body.len()
+                ),
+                // The error already names the failing phase and how long it ran.
+                Err(error) => println!("#{round} {elapsed:>9.1?} ERROR {error}  {url}"),
+            }
         }
     }
 }

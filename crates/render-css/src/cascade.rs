@@ -33,9 +33,33 @@ pub struct CascadedValue {
     pub value: String,
     pub important: bool,
     pub origin: CascadeOrigin,
+    /// Whether the document itself supplied this declaration, as opposed to
+    /// the user agent. See [`CascadedValue::is_authored`].
+    pub authored: bool,
     pub layer: Option<LayerName>,
     pub specificity: Specificity,
     pub source_order: u64,
+}
+
+impl CascadedValue {
+    /// Whether a declaration from the document produced this value, rather
+    /// than the user agent's own styling.
+    ///
+    /// `origin` cannot answer this on its own, because HTML's presentational
+    /// hints cascade at the user-agent origin (HTML5 rendering §15.3) yet come
+    /// from markup the document's author wrote. A `<td valign=bottom>` is
+    /// author intent that happens to arrive through the user-agent origin, and
+    /// a consumer asking "did the document ask for this?" should hear yes.
+    ///
+    /// What is deliberately *not* distinguished here is who wrote it: an author
+    /// stylesheet, a `style` attribute and a presentational hint all count, and
+    /// a user-agent stylesheet rule does not. That is the distinction CSS
+    /// Cascade 5 §6.1.1 draws between the UA origin and everything above it,
+    /// and it is the one a "did the document say so" question needs.
+    #[must_use]
+    pub const fn is_authored(&self) -> bool {
+        self.authored
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -151,6 +175,11 @@ pub fn cascade_element_with_origins(
                         value: specified_value,
                         important: declaration.important,
                         origin: source.origin,
+                        // A rule from the user-agent stylesheet is the engine
+                        // styling the document, not the document asking for
+                        // something. Everything else came from a stylesheet the
+                        // document brought with it.
+                        authored: source.origin != CascadeOrigin::UserAgent,
                         layer: rule.layer.clone(),
                         specificity,
                         source_order,
@@ -198,6 +227,13 @@ pub fn cascade_element_with_origins(
                     value: specified_value,
                     important: false,
                     origin: CascadeOrigin::UserAgent,
+                    // A presentational hint is an attribute the document's
+                    // author wrote, so it counts as authored even though it
+                    // cascades at the user-agent origin. Laying it on the UA
+                    // origin is what makes every author rule beat it, which is
+                    // a precedence decision and says nothing about who wanted
+                    // the value.
+                    authored: true,
                     layer: None,
                     specificity: ua_specificity,
                     source_order,
@@ -234,6 +270,8 @@ pub fn cascade_element_with_origins(
                     value: specified_value,
                     important: declaration.important,
                     origin: CascadeOrigin::Author,
+                    // A `style` attribute is the document speaking directly.
+                    authored: true,
                     layer: None,
                     specificity: inline_specificity,
                     source_order,
@@ -257,6 +295,78 @@ pub fn media_query_list_matches(query: &str, context: &MatchContext) -> bool {
     split_media_list(query)
         .into_iter()
         .any(|query| media_query_matches(query, context))
+}
+
+/// Whether every construct in a media query list is one this engine's
+/// evaluator can answer on its own.
+///
+/// This is deliberately *not* a second parse with weaker rules: it is derived
+/// from the same [`media_condition_matches`] the cascade uses, so the two
+/// cannot disagree. A query reporting `true` here is one whose result came
+/// from a real evaluation rather than from the "unknown means false" fallback
+/// of Media Queries 4 §2.1.1.
+///
+/// A consumer that reports a media query as unsupported must use this, or the
+/// engine ends up claiming to lack support for something it evaluates on every
+/// element it styles —which is how a supported feature gets reported as a gap
+/// and sends someone hunting a bug that is not there.
+///
+/// Note the difference from [`media_query_list_matches`]: a feature the engine
+/// knows but cannot answer *right now* (a viewport-dependent `orientation` with
+/// no viewport yet) is still supported syntax, so it is not reported here. An
+/// unsupported *feature* is.
+#[must_use]
+pub fn media_query_list_is_supported(query: &str) -> bool {
+    split_media_list(query)
+        .into_iter()
+        .all(media_query_is_supported)
+}
+
+fn media_query_is_supported(query: &str) -> bool {
+    let query = strip_media_modifiers(query);
+    split_media_conjunctions(&query)
+        .into_iter()
+        .all(|condition| {
+            media_condition_evaluate(condition, &MatchContext::default()).is_supported()
+        })
+}
+
+/// The `not`/`only` prefix stripped, shared by evaluation and the support
+/// check so the two cannot drift.
+fn strip_media_modifiers(query: &str) -> String {
+    let query = query.trim().to_ascii_lowercase();
+    let query = query.strip_prefix("not ").unwrap_or(&query);
+    query.strip_prefix("only ").unwrap_or(query).to_owned()
+}
+
+/// The outcome of evaluating one media condition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaCondition {
+    /// The engine reached a real comparison and knows the answer.
+    Evaluated(bool),
+    /// The condition names a feature or a unit this engine does not implement.
+    /// Media Queries 4 §2.1.1 makes such a query false, so the cascade applies
+    /// the rule as not matching.
+    Unsupported,
+    /// A feature the engine implements, whose value the environment does not
+    /// provide yet: a viewport-dependent feature queried before the viewport
+    /// is known. That is not a capability gap, so it is not reported as one.
+    Unknown,
+}
+
+impl MediaCondition {
+    /// Whether this engine can answer the condition by itself, as opposed to
+    /// falling back to the "unknown means false" rule.
+    const fn is_supported(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+
+    const fn matches(self) -> bool {
+        match self {
+            Self::Evaluated(value) => value,
+            Self::Unsupported | Self::Unknown => false,
+        }
+    }
 }
 
 fn split_media_list(query: &str) -> Vec<&str> {
@@ -286,7 +396,7 @@ fn media_query_matches(query: &str, context: &MatchContext) -> bool {
     let query = query.strip_prefix("only ").unwrap_or(query);
     let matches = split_media_conjunctions(query)
         .into_iter()
-        .all(|condition| media_condition_matches(condition, context));
+        .all(|condition| media_condition_evaluate(condition, context).matches());
     if negated { !matches } else { matches }
 }
 
@@ -330,49 +440,68 @@ fn split_media_conjunctions(query: &str) -> Vec<&str> {
     result
 }
 
-fn media_condition_matches(condition: &str, context: &MatchContext) -> bool {
+/// The one place a media condition is interpreted. Both the cascade's
+/// [`media_query_list_matches`] and the [`media_query_list_is_supported`]
+/// diagnostic read their answer from here, so a query cannot be evaluated one
+/// way and described another.
+fn media_condition_evaluate(condition: &str, context: &MatchContext) -> MediaCondition {
     match condition {
-        "" | "all" | "screen" => return true,
-        "print" | "speech" => return false,
+        "" | "all" | "screen" => return MediaCondition::Evaluated(true),
+        // Known media types this engine does not produce. The engine answers
+        // these correctly, so they are not a capability gap.
+        "print" | "speech" => return MediaCondition::Evaluated(false),
         _ => {}
     }
     let Some(feature) = condition
         .strip_prefix('(')
         .and_then(|value| value.strip_suffix(')'))
     else {
-        return false;
+        return MediaCondition::Unsupported;
     };
+    // A range context such as `(400px <= width <= 700px)` has no colon, and
+    // evaluating one would need the full Media Queries 4 §2.4 grammar.
     let Some((name, value)) = feature.split_once(':') else {
-        return false;
+        return MediaCondition::Unsupported;
     };
     let name = name.trim();
     let value = value.trim();
-    let dimension = match name {
-        "width" | "min-width" | "max-width" => context.viewport_width,
-        "height" | "min-height" | "max-height" => context.viewport_height,
+    let is_horizontal = match name {
+        "width" | "min-width" | "max-width" => true,
+        "height" | "min-height" | "max-height" => false,
         "orientation" => {
             let Some((width, height)) = context.viewport_width.zip(context.viewport_height) else {
-                return false;
+                return MediaCondition::Unknown;
             };
             return match value {
-                "landscape" => width >= height,
-                "portrait" => height > width,
-                _ => false,
+                "landscape" => MediaCondition::Evaluated(width >= height),
+                "portrait" => MediaCondition::Evaluated(height > width),
+                // A known feature asked a question this engine cannot answer.
+                _ => MediaCondition::Unsupported,
             };
         }
-        _ => return false,
+        _ => return MediaCondition::Unsupported,
     };
-    let Some(actual) = dimension else {
-        return false;
-    };
+    // The value's grammar is checked before the environment, so a length this
+    // engine cannot express is reported as unsupported whether or not a
+    // viewport happens to be available. Otherwise the support predicate would
+    // answer "supported" for any length feature simply because no viewport had
+    // been supplied yet.
     let Some(expected) = parse_media_length(value) else {
-        return false;
+        return MediaCondition::Unsupported;
     };
-    match name {
+    let actual = if is_horizontal {
+        context.viewport_width
+    } else {
+        context.viewport_height
+    };
+    let Some(actual) = actual else {
+        return MediaCondition::Unknown;
+    };
+    MediaCondition::Evaluated(match name {
         "min-width" | "min-height" => actual >= expected,
         "max-width" | "max-height" => actual <= expected,
         _ => (actual - expected).abs() < f32::EPSILON,
-    }
+    })
 }
 
 fn parse_media_length(value: &str) -> Option<f32> {
@@ -392,6 +521,20 @@ fn parse_media_length(value: &str) -> Option<f32> {
     None
 }
 
+/// The longhand declarations one authored declaration resolves to.
+///
+/// Shorthand expansion is what lets a page's `text-decoration: none` compete
+/// with a user-agent stylesheet that sets `text-decoration-line` directly, so
+/// the mapping is observable behaviour rather than an internal detail: a
+/// consumer that wants to know what a declaration actually contributes to the
+/// cascade has to be able to ask. Returns a single `(name, value)` pair
+/// unchanged when the property is not a shorthand this engine expands, or when
+/// its value cannot be read as one.
+#[must_use]
+pub fn expand_shorthand(name: &str, value: &str) -> Vec<(String, String)> {
+    expanded_declaration(name, value)
+}
+
 fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
     if name.eq_ignore_ascii_case("background") {
         return expand_background_shorthand(value);
@@ -409,6 +552,7 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
         }
         "font" => expand_font_shorthand(value)
             .unwrap_or_else(|| vec![(name.to_owned(), value.to_owned())]),
+        "text-decoration" => expand_text_decoration_shorthand(value),
         // `grid-gap` and its longhands are the legacy spellings real sheets
         // still ship; they expand exactly like their modern counterparts.
         _ => expand_legacy_longhands(name, value),
@@ -839,6 +983,157 @@ fn expand_font_shorthand(value: &str) -> Option<Vec<(String, String)>> {
     ])
 }
 
+/// The `text-decoration` shorthand. Three grammars are in play and the union
+/// of them is accepted, because real sheets mix all three:
+///
+/// - Text Decoration 4 §2.6, the current one:
+///   `<'text-decoration-line'> || <'text-decoration-thickness'> ||
+///   <'text-decoration-style'> || <'text-decoration-color'>`
+/// - Text Decoration 3 §2.4, the same without `thickness`.
+/// - CSS 2.1 §16.3.1, which is line keywords only:
+///   `none | [ underline || overline || line-through || blink ]`
+///
+/// §2.6 also settles a question the CSS 2.1 form leaves open: "Omitted values
+/// are set to their initial values." So *all four* longhands are always
+/// emitted, and a value that mentions only `underline` also resets style,
+/// colour and thickness to their initials. That is not tidiness, it is the
+/// whole point: the user-agent stylesheet puts `text-decoration-line:
+/// underline` on `a:link`, and an author's `a { text-decoration: none }` only
+/// beats it if the shorthand writes `text-decoration-line: none` explicitly
+/// rather than leaving the UA's value standing.
+///
+/// `none` is a `text-decoration-line` keyword, not an unknown one, so it
+/// expands to `line: none` plus the three initials. It is deliberately *not*
+/// treated as a parse failure: the overwhelmingly common declaration on the
+/// web is `text-decoration: none`, and a value that silently failed to expand
+/// would leave the UA underline in place, which is the bug being fixed here.
+fn expand_text_decoration_shorthand(value: &str) -> Vec<(String, String)> {
+    const LINE_KEYWORDS: [&str; 6] = [
+        "underline",
+        "overline",
+        "line-through",
+        "blink",
+        "spelling-error",
+        "grammar-error",
+    ];
+    const STYLE_KEYWORDS: [&str; 5] = ["solid", "double", "dotted", "dashed", "wavy"];
+    const THICKNESS_KEYWORDS: [&str; 5] = ["auto", "from-font", "thin", "medium", "thick"];
+
+    let components = split_css_components(value);
+    if components.is_empty() {
+        return vec![("text-decoration".to_owned(), value.to_owned())];
+    }
+    let mut line: Option<String> = None;
+    let mut style: Option<String> = None;
+    let mut thickness: Option<String> = None;
+    let mut color: Option<String> = None;
+
+    for component in components {
+        let lowered = component.to_ascii_lowercase();
+        // `none` belongs to the line slot: `text-decoration-style` has no
+        // `none` in any of the three grammars above.
+        if lowered == "none" || LINE_KEYWORDS.contains(&lowered.as_str()) {
+            // The `||` combinator allows each component at most once, and the
+            // line keywords accumulate into a single value.
+            match &mut line {
+                None => {
+                    line = Some(if lowered == "none" {
+                        "none".to_owned()
+                    } else {
+                        lowered
+                    })
+                }
+                Some(existing) if existing == "none" || lowered == "none" => {
+                    return unexpanded(value);
+                }
+                Some(existing) => {
+                    if split_css_components(existing)
+                        .iter()
+                        .any(|part| part.eq_ignore_ascii_case(&lowered))
+                    {
+                        return unexpanded(value);
+                    }
+                    existing.push(' ');
+                    existing.push_str(&lowered);
+                }
+            }
+            continue;
+        }
+        if STYLE_KEYWORDS.contains(&lowered.as_str()) {
+            if style.replace(lowered).is_some() {
+                return unexpanded(value);
+            }
+            continue;
+        }
+        if THICKNESS_KEYWORDS.contains(&lowered.as_str()) {
+            if thickness.replace(lowered).is_some() {
+                return unexpanded(value);
+            }
+            continue;
+        }
+        // A colour is the only remaining possibility. Test it against the real
+        // grammar rather than guessing, so a typo falls through to the
+        // unexpanded form instead of being written into the longhands as a
+        // colour the engine would then fail to understand.
+        if parse_typed_property("text-decoration-color", component)
+            .is_some_and(|result| result.is_ok())
+        {
+            if color.replace(component.to_owned()).is_some() {
+                return unexpanded(value);
+            }
+            continue;
+        }
+        // `<length-percentage>` and `<line-width>` for the thickness slot. A
+        // colour never starts with a digit or a sign, so numeric-leading is
+        // unambiguous. `calc()` and `var()` are not recognised here; they fall
+        // through to the unexpanded form rather than being misfiled.
+        if is_decoration_thickness_token(&lowered) {
+            if thickness.replace(component.to_owned()).is_some() {
+                return unexpanded(value);
+            }
+            continue;
+        }
+        return unexpanded(value);
+    }
+
+    vec![
+        (
+            "text-decoration-line".to_owned(),
+            line.unwrap_or_else(|| "none".to_owned()),
+        ),
+        (
+            "text-decoration-thickness".to_owned(),
+            thickness.unwrap_or_else(|| "auto".to_owned()),
+        ),
+        (
+            "text-decoration-style".to_owned(),
+            style.unwrap_or_else(|| "solid".to_owned()),
+        ),
+        (
+            "text-decoration-color".to_owned(),
+            color.unwrap_or_else(|| "currentcolor".to_owned()),
+        ),
+    ]
+}
+
+/// Leave a declaration that cannot be read as a shorthand under its own name,
+/// so a consumer that still understands the unexpanded form keeps working. A
+/// `text-decoration` that reaches paint unexpanded reads as "no line
+/// keywords", i.e. no decoration, which is what an invalid value becomes at
+/// computed-value time anyway.
+fn unexpanded(value: &str) -> Vec<(String, String)> {
+    vec![("text-decoration".to_owned(), value.to_owned())]
+}
+
+/// A bare number or a dimension: `0`, `2px`, `.5em`, `50%`. Colours and all the
+/// keyword slots are excluded by the caller before this is reached.
+fn is_decoration_thickness_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit() || matches!(character, '.' | '+' | '-'))
+}
+
 fn select_cascaded_candidate(mut candidates: Vec<Candidate>) -> Option<CascadedValue> {
     candidates.sort_by_key(|candidate| Reverse(candidate.priority));
     let mut reverted_origins = HashSet::new();
@@ -945,11 +1240,13 @@ const fn origin_rank(origin: CascadeOrigin, important: bool) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CascadeInput, CascadeOrigin, cascade_element};
+    use super::{
+        CascadeInput, CascadeOrigin, cascade_element, media_query_list_is_supported,
+        media_query_list_matches,
+    };
     use crate::selector::{MatchContext, parse_selector_list, select_all};
     use crate::stylesheet::parse_stylesheet;
     use render_html::parse_document;
-
     fn document_and_target() -> (render_dom::Dom, render_dom::NodeId) {
         let output = parse_document("<!doctype html><div id='target' class='target'></div>");
         let selectors = parse_selector_list("#target").expect("valid test selector");
@@ -1061,6 +1358,140 @@ mod tests {
         );
     }
 
+    /// Resolve the winning `color` for one element in a document.
+    fn winning_color(html: &str, source: &str) -> Option<String> {
+        let output = parse_document(html);
+        let sheet = parse_stylesheet(source);
+        let selectors = parse_selector_list("[data-probe]").expect("valid test selector");
+        let probe = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selectors,
+            &MatchContext::default(),
+        )[0];
+        let style = cascade_element(
+            &output.dom,
+            probe,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        style.get("color").map(|value| value.value.clone())
+    }
+
+    /// CSS Nesting §4's worked example: `&` takes the specificity of the
+    /// *largest* selector in the parent list, not of the one that matched, so
+    /// `#a, b { & c { ... } }` is (1,0,1) and beats `.foo c` at (0,1,1).
+    #[test]
+    fn nesting_selector_takes_the_largest_parent_specificity() {
+        let color = winning_color(
+            "<!doctype html><b class='foo'><c data-probe>x</c></b>",
+            "#a, b { & c { color: blue } } .foo c { color: red }",
+        );
+        assert_eq!(color.as_deref(), Some("blue"));
+    }
+
+    /// CSS Nesting §3.1: a relative selector without `&` implies one, so it
+    /// inherits the parent's specificity. The universal selector contributes
+    /// nothing, so `#target *` is (1,0,0) and the implied `&` is what makes the
+    /// nested rule's `:is(#target) .x`, at (1,1,0), outrank it.
+    #[test]
+    fn a_relative_selector_implies_the_parent_specificity() {
+        let color = winning_color(
+            "<!doctype html><div id='target'><span class='x' data-probe></span></div>",
+            "#target { color: green } #target { .x { color: red } } #target * { color: blue }",
+        );
+        assert_eq!(color.as_deref(), Some("red"));
+    }
+
+    /// CSS Nesting §3.4: `:where(&)` reduces the nesting selector to zero, so
+    /// the nested rule now loses to its parent on specificity even though it
+    /// comes later in source order.
+    #[test]
+    fn where_reduces_the_nesting_selector_to_zero() {
+        let color = winning_color(
+            "<!doctype html><div id='target' data-probe></div>",
+            "#target { color: blue } #target { :where(&) { color: red } }",
+        );
+        assert_eq!(color.as_deref(), Some("blue"));
+    }
+
+    /// CSS Nesting §3.4: a nested rule is considered to come after its parent
+    /// rule, so with equal specificity the nested declaration wins, and a
+    /// declaration written after the nested rule wins over it.
+    #[test]
+    fn nested_rules_come_after_their_parent_in_source_order() {
+        let color = winning_color(
+            "<!doctype html><article data-probe></article>",
+            "article { color: green; & { color: blue } }",
+        );
+        assert_eq!(color.as_deref(), Some("blue"));
+
+        // §3.4's example: the trailing declarations become a nested
+        // declarations rule, which is ordered after the nested style rule.
+        let color = winning_color(
+            "<!doctype html><article data-probe></article>",
+            "article { color: green; & { color: blue } color: red }",
+        );
+        assert_eq!(color.as_deref(), Some("red"));
+    }
+
+    /// CSS Nesting §3.3: a nested `@media` gates the parent selector's
+    /// declarations on the query, and the query is still evaluated.
+    #[test]
+    fn nested_media_rules_are_gated_by_their_query() {
+        let html = "<!doctype html><div class='foo' data-probe></div>";
+        let source = ".foo { @media screen and (min-width: 700px) { color: green } }";
+        let narrow = parse_document(html);
+
+        let sheet = parse_stylesheet(source);
+        let probe = {
+            let selectors = parse_selector_list("[data-probe]").expect("valid test selector");
+            select_all(
+                &narrow.dom,
+                narrow.dom.document(),
+                &selectors,
+                &MatchContext::default(),
+            )[0]
+        };
+        let context = MatchContext {
+            viewport_width: Some(800.0),
+            viewport_height: Some(600.0),
+            ..MatchContext::default()
+        };
+        let style = cascade_element(
+            &narrow.dom,
+            probe,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &context,
+        );
+        assert_eq!(
+            style.get("color").map(|value| value.value.as_str()),
+            Some("green")
+        );
+
+        let wide = MatchContext {
+            viewport_width: Some(400.0),
+            viewport_height: Some(600.0),
+            ..MatchContext::default()
+        };
+        let style = cascade_element(
+            &narrow.dom,
+            probe,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &wide,
+        );
+        assert_eq!(style.get("color"), None);
+    }
+
     #[test]
     fn minified_conjunction_media_queries_without_spaces_match() {
         let (dom, target) = document_and_target();
@@ -1113,6 +1544,79 @@ mod tests {
             style.get("color").map(|value| value.value.as_str()),
             Some("green")
         );
+    }
+
+    /// The predicate exists so that a media query the cascade *does* evaluate
+    /// is never reported as unsupported. These are the forms a real page
+    /// ships, including the minified conjunction with no spaces around `and`.
+    #[test]
+    fn every_media_query_the_cascade_evaluates_reports_as_supported() {
+        for query in [
+            "",
+            "all",
+            "screen",
+            "only screen",
+            "print",
+            "not print",
+            "speech",
+            "(min-width: 768px)",
+            "(max-width: 768px)",
+            "(width: 1024px)",
+            "(min-height: 480px)",
+            "(max-height: 480px)",
+            "(orientation: landscape)",
+            "(orientation: portrait)",
+            "screen and (min-width: 700px)",
+            "(min-width:1560px)and (max-width:2059.9px)",
+            "screen, print",
+            "not screen and (min-width: 400px)",
+        ] {
+            assert!(
+                media_query_list_is_supported(query),
+                "{query:?} is evaluated by the cascade and must not be reported unsupported"
+            );
+        }
+    }
+
+    /// A feature the engine genuinely does not evaluate is reported as
+    /// unsupported, which is what makes the diagnostic worth reading. These
+    /// are the features the corpus gates rules out on.
+    #[test]
+    fn media_features_the_engine_cannot_evaluate_report_as_unsupported() {
+        for query in [
+            "(prefers-reduced-motion: reduce)",
+            "(prefers-color-scheme: dark)",
+            "(min-resolution: 2dppx)",
+            "(device-min-pixel-ratio: 2)",
+            "(color-gamut: p3)",
+            "(min-width: 10vw)",
+            "(400px <= width <= 700px)",
+            "(unknown-feature: 1)",
+            "screen and (hover: hover)",
+        ] {
+            assert!(
+                !media_query_list_is_supported(query),
+                "{query:?} names something the engine does not evaluate"
+            );
+        }
+        // One unsupported conjunct makes the whole list unsupported.
+        assert!(!media_query_list_is_supported(
+            "screen and (min-width: 700px) and (hover: hover)"
+        ));
+    }
+
+    /// A viewport-dependent feature asked before the viewport is known is not a
+    /// capability gap, so it is supported even though it cannot match yet.
+    #[test]
+    fn a_viewport_dependent_feature_is_supported_before_the_viewport_is_known() {
+        assert!(media_query_list_is_supported("(orientation: landscape)"));
+        assert!(media_query_list_is_supported("(min-width: 768px)"));
+        // ... and it still does not match without a viewport, which is what
+        // `media_query_list_matches` reports.
+        assert!(!media_query_list_matches(
+            "(orientation: landscape)",
+            &MatchContext::default()
+        ));
     }
 
     #[test]
@@ -1351,6 +1855,385 @@ mod tests {
         assert_eq!(
             style
                 .get("border-left-style")
+                .map(|value| value.value.as_str()),
+            Some("none")
+        );
+    }
+
+    /// The reported bug: "underlines are everywhere; many pages remove them and
+    /// they still render."
+    ///
+    /// The user-agent stylesheet underlines links (`a:link { text-decoration-
+    /// line: underline }`). A page that writes `a { text-decoration: none }`
+    /// should win, because the author origin outranks the user-agent origin.
+    /// It did not, for two reasons that had to be fixed together: the
+    /// shorthand never expanded, so the author's `none` was stored under the
+    /// literal key `text-decoration` and the longhand was never overridden at
+    /// all; and because the longhand *was* set by the UA sheet, the
+    /// unexpanded fallback could never fire.
+    ///
+    /// The selectors are `#target` rather than `a` so the shared fixture
+    /// matches, but the cascade shape - a user-agent-origin longhand against an
+    /// author-origin shorthand - is the one from the report.
+    #[test]
+    fn an_author_text_decoration_none_beats_the_user_agent_underline() {
+        let (dom, target) = document_and_target();
+        let ua = parse_stylesheet("#target { text-decoration-line: underline }");
+        let author = parse_stylesheet("#target { text-decoration: none }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[
+                CascadeInput {
+                    sheet: &ua,
+                    origin: CascadeOrigin::UserAgent,
+                },
+                CascadeInput {
+                    sheet: &author,
+                    origin: CascadeOrigin::Author,
+                },
+            ],
+            &MatchContext::default(),
+        );
+
+        // The author's rule wins on the longhand, not merely on the shorthand.
+        assert_eq!(
+            style
+                .get("text-decoration-line")
+                .map(|value| value.value.as_str()),
+            Some("none"),
+            "text-decoration: none must expand to text-decoration-line: none so \
+             it can outrank the UA sheet"
+        );
+        // And the longhand is what the declaration was recorded under, so a
+        // consumer reading only the longhand sees the author's intent.
+        assert!(style.get("text-decoration").is_none());
+    }
+
+    /// The same two sheets without an author override must still underline, or
+    /// the test above would pass for a reason that has nothing to do with the
+    /// cascade.
+    #[test]
+    fn the_user_agent_underline_survives_when_the_author_says_nothing() {
+        let (dom, target) = document_and_target();
+        let ua = parse_stylesheet("#target { text-decoration-line: underline }");
+        let author = parse_stylesheet("");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[
+                CascadeInput {
+                    sheet: &ua,
+                    origin: CascadeOrigin::UserAgent,
+                },
+                CascadeInput {
+                    sheet: &author,
+                    origin: CascadeOrigin::Author,
+                },
+            ],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("text-decoration-line")
+                .map(|value| value.value.as_str()),
+            Some("underline")
+        );
+    }
+
+    /// Text Decoration 4 §2.6: "Omitted values are set to their initial
+    /// values." A shorthand that mentions only a line must still reset the
+    /// other three, which is what makes the `none` case above work.
+    #[test]
+    fn text_decoration_none_expands_to_the_line_none_and_three_initials() {
+        let expanded = super::expanded_declaration("text-decoration", "none");
+        assert_eq!(
+            expanded,
+            vec![
+                ("text-decoration-line".to_owned(), "none".to_owned()),
+                ("text-decoration-thickness".to_owned(), "auto".to_owned()),
+                ("text-decoration-style".to_owned(), "solid".to_owned()),
+                (
+                    "text-decoration-color".to_owned(),
+                    "currentcolor".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// Text Decoration 4 §2.6's `||` production, all four slots in one value
+    /// and in an order that differs from the grammar's. `||` permits each slot
+    /// at most once, so a second style keyword would be invalid.
+    #[test]
+    fn text_decoration_expands_all_four_slots_in_any_order() {
+        assert_eq!(
+            super::expanded_declaration("text-decoration", "2px wavy blue underline"),
+            vec![
+                ("text-decoration-line".to_owned(), "underline".to_owned()),
+                ("text-decoration-thickness".to_owned(), "2px".to_owned()),
+                ("text-decoration-style".to_owned(), "wavy".to_owned()),
+                ("text-decoration-color".to_owned(), "blue".to_owned()),
+            ]
+        );
+    }
+
+    /// The `||` in §2.1 means the line keywords accumulate:
+    /// `underline overline` is one legal value, not two declarations.
+    #[test]
+    fn text_decoration_accumulates_multiple_line_keywords() {
+        assert_eq!(
+            super::expanded_declaration("text-decoration", "underline overline"),
+            vec![
+                (
+                    "text-decoration-line".to_owned(),
+                    "underline overline".to_owned()
+                ),
+                ("text-decoration-thickness".to_owned(), "auto".to_owned()),
+                ("text-decoration-style".to_owned(), "solid".to_owned()),
+                (
+                    "text-decoration-color".to_owned(),
+                    "currentcolor".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// Text Decoration 3 §2.4 omits `thickness` from the shorthand, so
+    /// `dotted red line-through` is a valid Level 3 value. It must expand, and
+    /// the omitted thickness must take its Level 4 initial.
+    #[test]
+    fn text_decoration_accepts_the_level_3_three_slot_grammar() {
+        assert_eq!(
+            super::expanded_declaration("text-decoration", "dotted red line-through"),
+            vec![
+                ("text-decoration-line".to_owned(), "line-through".to_owned()),
+                ("text-decoration-thickness".to_owned(), "auto".to_owned()),
+                ("text-decoration-style".to_owned(), "dotted".to_owned()),
+                ("text-decoration-color".to_owned(), "red".to_owned()),
+            ]
+        );
+    }
+
+    /// CSS 2.1 §16.3.1: `none | [ underline || overline || line-through ||
+    /// blink ]`, line keywords only. These are the oldest declarations still in
+    /// circulation and must keep working.
+    #[test]
+    fn text_decoration_accepts_the_css21_line_only_grammar() {
+        assert_eq!(
+            super::expanded_declaration("text-decoration", "blink"),
+            vec![
+                ("text-decoration-line".to_owned(), "blink".to_owned()),
+                ("text-decoration-thickness".to_owned(), "auto".to_owned()),
+                ("text-decoration-style".to_owned(), "solid".to_owned()),
+                (
+                    "text-decoration-color".to_owned(),
+                    "currentcolor".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// A value that is not in any of the three grammars must not be written
+    /// into the longhands as though it were. Leaving the declaration under its
+    /// own name keeps the existing unexpanded consumer working, which reads it
+    /// as "no line keywords" - the same thing an invalid declaration becomes
+    /// at computed-value time.
+    #[test]
+    fn an_unreadable_text_decoration_is_left_unexpanded() {
+        for value in [
+            "bogus",
+            "underline underline",
+            "underline dotted dotted",
+            "underline calc(2px)",
+            "underline 2px 3px",
+        ] {
+            assert_eq!(
+                super::expanded_declaration("text-decoration", value),
+                vec![("text-decoration".to_owned(), value.to_owned())],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// Text Decoration 4 §2.3 makes `currentcolor` a legal
+    /// `text-decoration-color`, so the shorthand must accept it as an explicit
+    /// colour rather than choking on it.
+    #[test]
+    fn text_decoration_color_accepts_currentcolor() {
+        assert_eq!(
+            super::expanded_declaration("text-decoration", "underline currentcolor"),
+            vec![
+                ("text-decoration-line".to_owned(), "underline".to_owned()),
+                ("text-decoration-thickness".to_owned(), "auto".to_owned()),
+                ("text-decoration-style".to_owned(), "solid".to_owned()),
+                (
+                    "text-decoration-color".to_owned(),
+                    "currentcolor".to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// The colour slot must be tested against the real grammar, not guessed,
+    /// so a functional or hash colour keeps its own text instead of being
+    /// misfiled as a thickness.
+    #[test]
+    fn text_decoration_color_keeps_functional_and_hash_colours() {
+        for (value, expected) in [
+            ("underline rgb(1, 2, 3)", "rgb(1, 2, 3)"),
+            ("underline #0f0", "#0f0"),
+            ("underline transparent", "transparent"),
+        ] {
+            let expanded = super::expanded_declaration("text-decoration", value);
+            assert_eq!(
+                expanded
+                    .iter()
+                    .find(|(name, _)| name == "text-decoration-color")
+                    .map(|(_, color)| color.as_str()),
+                Some(expected),
+                "{value:?}"
+            );
+            assert_eq!(
+                expanded
+                    .iter()
+                    .find(|(name, _)| name == "text-decoration-thickness")
+                    .map(|(_, thickness)| thickness.as_str()),
+                Some("auto"),
+                "{value:?}: a colour must not be read as a thickness"
+            );
+        }
+    }
+
+    /// Text Decoration 4 §2: a decoration originates at the element that
+    /// specifies it and propagates *down* the box tree. Nothing propagates
+    /// upward, so a descendant's value cannot switch off an ancestor's
+    /// decoration - CSS 2.1 §16.3.1 says so outright ("The 'text-decoration'
+    /// property on descendant elements cannot have any effect on the decoration
+    /// of the ancestor"), and §2.2/§2.3 restate it for style and colour
+    /// ("affects all decorations originating from this element even if
+    /// descendant boxes specify a different style").
+    ///
+    /// This is pinned because the opposite is a natural mistake, and a
+    /// consumer that treats a descendant's `none` as a switch-off will
+    /// un-underline text that the spec says must stay underlined. The two
+    /// elements keep their own independent values, which is what lets a
+    /// consumer find the ancestor's decoration by looking upward.
+    #[test]
+    fn a_descendants_none_does_not_reach_the_ancestors_decoration() {
+        let output =
+            parse_document("<!doctype html><a id='link' href='#'><span id='inner'>text</span></a>");
+        let sheet = parse_stylesheet(
+            "#link { text-decoration: underline } #inner { text-decoration: none }",
+        );
+        let dom = &output.dom;
+        let link = select_all(
+            dom,
+            dom.document(),
+            &parse_selector_list("#link").expect("valid selector"),
+            &MatchContext::default(),
+        )[0];
+        let inner = select_all(
+            dom,
+            dom.document(),
+            &parse_selector_list("#inner").expect("valid selector"),
+            &MatchContext::default(),
+        )[0];
+        let link_style = cascade_element(
+            dom,
+            link,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        let inner_style = cascade_element(
+            dom,
+            inner,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        // Each element holds its own value, and each authored its own.
+        assert_eq!(
+            link_style
+                .get("text-decoration-line")
+                .map(|value| value.value.as_str()),
+            Some("underline")
+        );
+        assert!(
+            link_style
+                .get("text-decoration-line")
+                .is_some_and(super::CascadedValue::is_authored)
+        );
+        assert_eq!(
+            inner_style
+                .get("text-decoration-line")
+                .map(|value| value.value.as_str()),
+            Some("none")
+        );
+        assert!(
+            inner_style
+                .get("text-decoration-line")
+                .is_some_and(super::CascadedValue::is_authored)
+        );
+        // The ancestor's value is untouched by the descendant's declaration, so
+        // a consumer walking up from the inner span and taking the first
+        // non-`none` line finds `underline` - which is what the spec requires.
+        // It is not switched off, and it is not a missing value either.
+    }
+
+    /// Shorthand expansion happens before the winner is chosen, so a longhand
+    /// written later in the same block must beat the shorthand, exactly as it
+    /// does for `border`.
+    #[test]
+    fn a_text_decoration_longhand_after_the_shorthand_wins() {
+        let (dom, target) = document_and_target();
+        let sheet =
+            parse_stylesheet("#target { text-decoration: underline; text-decoration-line: none }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("text-decoration-line")
+                .map(|value| value.value.as_str()),
+            Some("none")
+        );
+    }
+
+    /// The reverse direction: a shorthand after a longhand must win, or a page
+    /// that only ever sets `text-decoration-line: overline` and then resets
+    /// with `text-decoration: none` would keep the overline.
+    #[test]
+    fn the_text_decoration_shorthand_resets_an_earlier_longhand() {
+        let (dom, target) = document_and_target();
+        let sheet =
+            parse_stylesheet("#target { text-decoration-line: overline; text-decoration: none }");
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+
+        assert_eq!(
+            style
+                .get("text-decoration-line")
                 .map(|value| value.value.as_str()),
             Some("none")
         );

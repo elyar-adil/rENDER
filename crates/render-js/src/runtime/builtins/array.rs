@@ -20,6 +20,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
+use crate::runtime::convert::to_integer_or_infinity;
 use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -50,28 +51,32 @@ impl JsRuntime {
                     required_argument(arguments, 0, "forEach")?,
                     &self.realm,
                 )?;
-                self.array_iterate_with(dom, receiver, callback, false, false)
+                let this_argument = callback_this_argument(arguments);
+                self.array_iterate_with(dom, receiver, callback, &this_argument, false, false)
             }
             NativeFunction::ArrayMap => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "map")?,
                     &self.realm,
                 )?;
-                self.array_iterate_with(dom, receiver, callback, true, false)
+                let this_argument = callback_this_argument(arguments);
+                self.array_iterate_with(dom, receiver, callback, &this_argument, true, false)
             }
             NativeFunction::ArrayFilter => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "filter")?,
                     &self.realm,
                 )?;
-                self.array_iterate_with(dom, receiver, callback, false, true)
+                let this_argument = callback_this_argument(arguments);
+                self.array_iterate_with(dom, receiver, callback, &this_argument, false, true)
             }
             NativeFunction::ArraySome => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "some")?,
                     &self.realm,
                 )?;
-                self.array_some(dom, receiver, callback)
+                let this_argument = callback_this_argument(arguments);
+                self.array_some(dom, receiver, callback, &this_argument)
             }
             NativeFunction::ArrayFind => self.array_find(dom, receiver, arguments, false),
             NativeFunction::ArrayFindIndex => self.array_find(dom, receiver, arguments, true),
@@ -98,6 +103,14 @@ impl JsRuntime {
 pub(in crate::runtime) fn array_index(property: &str) -> Option<u32> {
     let index = property.parse::<u32>().ok()?;
     (index.to_string() == property && index < u32::MAX).then_some(index)
+}
+
+/// The `thisArg` that every `callbackfn` parameter accepts as its second
+/// argument (§23.1.3.x). `Array.prototype.map.call(nodes, render, this)` is how
+/// borrowed-base helpers reuse their own methods, so dropping it silently
+/// breaks each of them.
+pub(in crate::runtime) fn callback_this_argument(arguments: &[JsValue]) -> JsValue {
+    arguments.get(1).cloned().unwrap_or(JsValue::Undefined)
 }
 
 /// Which indexed projection `Array.prototype.keys/values/entries` produces.
@@ -129,18 +142,6 @@ pub(in crate::runtime) fn to_length(value: &JsValue) -> Result<f64, JsError> {
         return Ok(MAX_SAFE_INTEGER);
     }
     Ok(number.trunc().min(MAX_SAFE_INTEGER))
-}
-
-/// `ToIntegerOrInfinity` (§7.1.5).
-fn to_integer_or_infinity(value: &JsValue) -> Result<f64, JsError> {
-    let number = to_number(value)?;
-    if number.is_nan() {
-        return Ok(0.0);
-    }
-    if number.is_infinite() {
-        return Ok(number);
-    }
-    Ok(number.trunc())
 }
 
 /// Property key of an integral `ToLength` index.
@@ -770,6 +771,7 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         callback: ObjectId,
+        this_argument: &JsValue,
         map: bool,
         filter: bool,
     ) -> Result<JsValue, JsError> {
@@ -792,7 +794,7 @@ impl JsRuntime {
                 continue;
             }
             let element = self.indexed_value(dom, receiver, index)?;
-            let keep = self.call(
+            let keep = self.call_with_this(
                 dom,
                 callback,
                 &[
@@ -800,6 +802,7 @@ impl JsRuntime {
                     JsValue::Number(index),
                     JsValue::Object(receiver),
                 ],
+                this_argument.clone(),
             )?;
             if let Some(result) = result {
                 if map {
@@ -828,16 +831,18 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         callback: ObjectId,
+        this_argument: &JsValue,
     ) -> Result<JsValue, JsError> {
         let length = self.array_like_len(dom, receiver)?;
         let mut index = 0.0;
         while index < length {
             if self.has_indexed(receiver, index) {
                 let element = self.indexed_value(dom, receiver, index)?;
-                let matches = self.call(
+                let matches = self.call_with_this(
                     dom,
                     callback,
                     &[element, JsValue::Number(index), JsValue::Object(receiver)],
+                    this_argument.clone(),
                 )?;
                 if matches.is_truthy() {
                     return Ok(JsValue::Boolean(true));
@@ -894,10 +899,16 @@ impl JsRuntime {
             && let JsValue::Object(mapper) = mapper
         {
             let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
+            let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
             for (index, value) in values.iter_mut().enumerate() {
                 #[allow(clippy::cast_precision_loss)]
                 let index_value = JsValue::Number(index as f64);
-                *value = self.call(dom, mapper, &[value.clone(), index_value])?;
+                *value = self.call_with_this(
+                    dom,
+                    mapper,
+                    &[value.clone(), index_value],
+                    this_argument.clone(),
+                )?;
             }
         }
         Ok(JsValue::Object(self.create_array_from_values(&values)?))
@@ -914,12 +925,13 @@ impl JsRuntime {
             required_argument(arguments, 0, "Array.find")?,
             &self.realm,
         )?;
+        let this_argument = callback_this_argument(arguments);
         let length = self.array_like_len(dom, receiver)?;
         let mut index = 0.0;
         while index < length {
             if self.has_indexed(receiver, index) {
                 let value = self.indexed_value(dom, receiver, index)?;
-                let matched = self.call(
+                let matched = self.call_with_this(
                     dom,
                     callback,
                     &[
@@ -927,6 +939,7 @@ impl JsRuntime {
                         JsValue::Number(index),
                         JsValue::Object(receiver),
                     ],
+                    this_argument.clone(),
                 )?;
                 if matched.is_truthy() {
                     return if index_result {
@@ -955,15 +968,17 @@ impl JsRuntime {
             required_argument(arguments, 0, "Array.every")?,
             &self.realm,
         )?;
+        let this_argument = callback_this_argument(arguments);
         let length = self.array_like_len(dom, receiver)?;
         let mut index = 0.0;
         while index < length {
             if self.has_indexed(receiver, index) {
                 let value = self.indexed_value(dom, receiver, index)?;
-                let matched = self.call(
+                let matched = self.call_with_this(
                     dom,
                     callback,
                     &[value, JsValue::Number(index), JsValue::Object(receiver)],
+                    this_argument.clone(),
                 )?;
                 if !matched.is_truthy() {
                     return Ok(JsValue::Boolean(false));

@@ -8,21 +8,53 @@ use std::error::Error;
 use std::fmt;
 
 use cssparser::color::{parse_hash_color, parse_named_color};
-use cssparser::{ParseError, Parser, ParserInput, Token};
+use cssparser::{ParseError, ParseErrorKind, Parser, ParserInput, Token};
 
-type CssResult<'i, T> = Result<T, ParseError<'i, ()>>;
+type CssResult<'i, T> = Result<T, ParseError<'i, ValueError>>;
+
+/// Why a value was rejected. Most rejections carry no more than "invalid", so
+/// the unit payload is the default and a grammar that *can* name the offending
+/// construct says so, which is what makes a rejection debuggable instead of
+/// just a dropped declaration.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValueError {
+    detail: Option<String>,
+}
+
+impl ValueError {
+    fn detail(message: impl Into<String>) -> Self {
+        Self {
+            detail: Some(message.into()),
+        }
+    }
+}
+
+impl From<()> for ValueError {
+    fn from((): ()) -> Self {
+        Self::default()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyParseError {
     property: String,
     line: u32,
     column: u32,
+    /// Why the value was rejected, when the grammar can say. Carried so a
+    /// diagnostic names the construct rather than only the property.
+    detail: Option<String>,
 }
 
 impl PropertyParseError {
     #[must_use]
     pub fn property(&self) -> &str {
         &self.property
+    }
+
+    /// The reason the value was rejected, if the grammar could name one.
+    #[must_use]
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
     }
 }
 
@@ -32,7 +64,11 @@ impl fmt::Display for PropertyParseError {
             formatter,
             "invalid computed value for '{}' at {}:{}",
             self.property, self.line, self.column
-        )
+        )?;
+        if let Some(detail) = &self.detail {
+            write!(formatter, ": {detail}")?;
+        }
+        Ok(())
     }
 }
 
@@ -871,6 +907,125 @@ keyword_enum!(BorderStyle {
     Outset => "outset",
 });
 
+// `text-decoration` is a shorthand over four longhands (Text Decoration 4
+// §2.6), so all four are registered here and can be validated on their own.
+// A doc comment cannot attach to a macro invocation, hence the line comments.
+keyword_enum!(TextDecorationStyle {
+    Solid => "solid",
+    Double => "double",
+    Dotted => "dotted",
+    Dashed => "dashed",
+    Wavy => "wavy",
+});
+// Text Decoration 4 §2.1. `none` is handled by `TextDecorationLine` rather
+// than here, because §2.1 spells it as a value of the whole property and not as
+// one of the combinable keywords.
+keyword_enum!(TextDecorationLineKeyword {
+    Underline => "underline",
+    Overline => "overline",
+    LineThrough => "line-through",
+    Blink => "blink",
+    SpellingError => "spelling-error",
+    GrammarError => "grammar-error",
+});
+
+/// Text Decoration 4 §2.1: `none | [ underline || overline || line-through ||
+/// blink ] | spelling-error | grammar-error`. The `||` combinator means the
+/// line keywords accumulate, so this is a *set* and `parse_keyword` cannot
+/// express it; `underline overline` is a single legal value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TextDecorationLine {
+    None,
+    Lines(Vec<TextDecorationLineKeyword>),
+}
+
+impl TextDecorationLine {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        match self {
+            Self::None => "none".to_owned(),
+            Self::Lines(lines) => lines
+                .iter()
+                .map(|line| line.as_str())
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// Text Decoration 4 §2.4: `auto | from-font | <length-percentage> |
+/// <line-width>`, where `<line-width>` is `thin | medium | thick | <length>`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TextDecorationThickness {
+    Auto,
+    FromFont,
+    Thin,
+    Medium,
+    Thick,
+    Length(LengthPercentage),
+}
+
+impl TextDecorationThickness {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::FromFont => "from-font".to_owned(),
+            Self::Thin => "thin".to_owned(),
+            Self::Medium => "medium".to_owned(),
+            Self::Thick => "thick".to_owned(),
+            Self::Length(length) => length.to_css(),
+        }
+    }
+}
+
+keyword_enum!(BorderCollapse {
+    Separate => "separate",
+    Collapse => "collapse",
+});
+keyword_enum!(TableLayout {
+    Auto => "auto",
+    Fixed => "fixed",
+});
+keyword_enum!(EmptyCells {
+    Show => "show",
+    Hide => "hide",
+});
+// CSS 2.1 §17.4.1 defines `top | bottom`. CSS Writing Modes 3 §6.1 adds the
+// logical pair, which is what a page written today actually uses. A doc comment
+// cannot attach to a macro invocation, hence the line comment.
+keyword_enum!(CaptionSide {
+    Top => "top",
+    Bottom => "bottom",
+    InlineStart => "inline-start",
+    InlineEnd => "inline-end",
+});
+
+/// CSS 2.1 §17.6.1: the half-open `border-spacing` pair. A single length
+/// applies to both axes; the horizontal component is what separates adjacent
+/// columns, the vertical component what separates adjacent rows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BorderSpacing {
+    pub horizontal: LengthPercentage,
+    pub vertical: LengthPercentage,
+}
+
+/// CSS 2.1 §17.5.3 lists the table-cell alignment keywords, and §10.8.3 gives
+/// the same property for inline-level boxes. `Offset` is the `<length>` /
+/// `<percentage>` form, resolved against the line box or the cell height.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VerticalAlign {
+    Baseline,
+    Sub,
+    Super,
+    TextTop,
+    TextBottom,
+    Middle,
+    Top,
+    Bottom,
+    Offset(LengthPercentage),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Size {
     Auto,
@@ -1107,6 +1262,15 @@ pub enum TypedPropertyValue {
     Padding(LengthPercentage),
     BorderWidth(BorderWidth),
     BorderStyle(BorderStyle),
+    BorderSpacing(BorderSpacing),
+    BorderCollapse(BorderCollapse),
+    EmptyCells(EmptyCells),
+    TableLayout(TableLayout),
+    CaptionSide(CaptionSide),
+    VerticalAlign(VerticalAlign),
+    TextDecorationLine(TextDecorationLine),
+    TextDecorationStyle(TextDecorationStyle),
+    TextDecorationThickness(TextDecorationThickness),
     Color(CssColor),
     BackgroundImage(String),
     BackgroundRepeat(String),
@@ -1151,6 +1315,15 @@ impl TypedPropertyValue {
             Self::Padding(_) => "padding",
             Self::BorderWidth(_) => "border-width",
             Self::BorderStyle(_) => "border-style",
+            Self::BorderSpacing(_) => "border-spacing",
+            Self::BorderCollapse(_) => "border-collapse",
+            Self::EmptyCells(_) => "empty-cells",
+            Self::TableLayout(_) => "table-layout",
+            Self::CaptionSide(_) => "caption-side",
+            Self::VerticalAlign(_) => "vertical-align",
+            Self::TextDecorationLine(_) => "text-decoration-line",
+            Self::TextDecorationStyle(_) => "text-decoration-style",
+            Self::TextDecorationThickness(_) => "text-decoration-thickness",
             Self::Color(_) => "color",
             Self::BackgroundImage(_) => "background-image",
             Self::BackgroundRepeat(_) => "background-repeat",
@@ -1196,6 +1369,15 @@ impl TypedPropertyValue {
             Self::Padding(value) => value.to_css(),
             Self::BorderWidth(value) => value.to_css(),
             Self::BorderStyle(value) => value.as_str().to_owned(),
+            Self::BorderSpacing(value) => value.to_css(),
+            Self::BorderCollapse(value) => value.as_str().to_owned(),
+            Self::EmptyCells(value) => value.as_str().to_owned(),
+            Self::TableLayout(value) => value.as_str().to_owned(),
+            Self::CaptionSide(value) => value.as_str().to_owned(),
+            Self::VerticalAlign(value) => value.to_css(),
+            Self::TextDecorationLine(value) => value.to_css(),
+            Self::TextDecorationStyle(value) => value.as_str().to_owned(),
+            Self::TextDecorationThickness(value) => value.to_css(),
             Self::Color(value) => value.to_css(),
             Self::BackgroundImage(value)
             | Self::BackgroundRepeat(value)
@@ -1337,6 +1519,32 @@ impl BorderWidth {
     }
 }
 
+impl BorderSpacing {
+    fn to_css(&self) -> String {
+        if self.horizontal == self.vertical {
+            self.horizontal.to_css()
+        } else {
+            format!("{} {}", self.horizontal.to_css(), self.vertical.to_css())
+        }
+    }
+}
+
+impl VerticalAlign {
+    fn to_css(&self) -> String {
+        match self {
+            Self::Baseline => "baseline".to_owned(),
+            Self::Sub => "sub".to_owned(),
+            Self::Super => "super".to_owned(),
+            Self::TextTop => "text-top".to_owned(),
+            Self::TextBottom => "text-bottom".to_owned(),
+            Self::Middle => "middle".to_owned(),
+            Self::Top => "top".to_owned(),
+            Self::Bottom => "bottom".to_owned(),
+            Self::Offset(value) => value.to_css(),
+        }
+    }
+}
+
 impl FlexBasis {
     fn to_css(&self) -> String {
         match self {
@@ -1466,6 +1674,16 @@ pub fn parse_typed_property(
             | "border-right-color"
             | "border-bottom-color"
             | "border-left-color"
+            | "border-spacing"
+            | "border-collapse"
+            | "empty-cells"
+            | "table-layout"
+            | "caption-side"
+            | "vertical-align"
+            | "text-decoration-line"
+            | "text-decoration-style"
+            | "text-decoration-color"
+            | "text-decoration-thickness"
             | "flex-direction"
             | "flex-wrap"
             | "flex-basis"
@@ -1496,10 +1714,17 @@ pub fn parse_typed_property(
     let mut input = ParserInput::new(css);
     let mut parser = Parser::new(&mut input);
     let parsed = parser.parse_entirely(|input| parse_property(property, input));
-    Some(parsed.map_err(|error| PropertyParseError {
-        property: property.to_owned(),
-        line: error.location.line,
-        column: error.location.column,
+    Some(parsed.map_err(|error| {
+        let detail = match error.kind {
+            ParseErrorKind::Custom(value) => value.detail,
+            ParseErrorKind::Basic(_) => None,
+        };
+        PropertyParseError {
+            property: property.to_owned(),
+            line: error.location.line,
+            column: error.location.column,
+            detail,
+        }
     }))
 }
 
@@ -1523,7 +1748,8 @@ fn parse_property<'i>(
         | "border-top-color"
         | "border-right-color"
         | "border-bottom-color"
-        | "border-left-color" => parse_color(input).map(TypedPropertyValue::Color),
+        | "border-left-color"
+        | "text-decoration-color" => parse_color(input).map(TypedPropertyValue::Color),
         "display" => parse_display(input).map(TypedPropertyValue::Display),
         "position" => parse_keyword(input, Position::parse).map(TypedPropertyValue::Position),
         "float" => parse_keyword(input, Float::parse).map(TypedPropertyValue::Float),
@@ -1582,6 +1808,28 @@ fn parse_property<'i>(
         }
         "border-top-style" | "border-right-style" | "border-bottom-style" | "border-left-style" => {
             parse_keyword(input, BorderStyle::parse).map(TypedPropertyValue::BorderStyle)
+        }
+        "border-collapse" => {
+            parse_keyword(input, BorderCollapse::parse).map(TypedPropertyValue::BorderCollapse)
+        }
+        "empty-cells" => {
+            parse_keyword(input, EmptyCells::parse).map(TypedPropertyValue::EmptyCells)
+        }
+        "table-layout" => {
+            parse_keyword(input, TableLayout::parse).map(TypedPropertyValue::TableLayout)
+        }
+        "caption-side" => {
+            parse_keyword(input, CaptionSide::parse).map(TypedPropertyValue::CaptionSide)
+        }
+        "vertical-align" => parse_vertical_align(input).map(TypedPropertyValue::VerticalAlign),
+        "border-spacing" => parse_border_spacing(input).map(TypedPropertyValue::BorderSpacing),
+        "text-decoration-line" => {
+            parse_text_decoration_line(input).map(TypedPropertyValue::TextDecorationLine)
+        }
+        "text-decoration-style" => parse_keyword(input, TextDecorationStyle::parse)
+            .map(TypedPropertyValue::TextDecorationStyle),
+        "text-decoration-thickness" => {
+            parse_text_decoration_thickness(input).map(TypedPropertyValue::TextDecorationThickness)
         }
         _ => unreachable!("unsupported properties are filtered before parsing"),
     }
@@ -1687,13 +1935,195 @@ fn parse_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
         {
             input.parse_nested_block(parse_rgb_color)
         }
+        // CSS Color 4 §4.3 `hsl()` / §4.4 `hsla()`, including the legacy
+        // comma-separated form of CSS Color 3 §4.2.
+        Token::Function(name)
+            if name.eq_ignore_ascii_case("hsl") || name.eq_ignore_ascii_case("hsla") =>
+        {
+            input.parse_nested_block(parse_hsl_color)
+        }
+        // CSS Color 4 §10.1 `color()`.
+        Token::Function(name) if name.eq_ignore_ascii_case("color") => {
+            input.parse_nested_block(parse_color_function)
+        }
         _ => Err(location.new_custom_error(())),
     }
 }
 
+/// CSS Color 4 §10.1: `color( <colorspace-params> [ / <alpha-value> ]? )`.
+///
+/// The engine paints in sRGB, so a value in another space is converted with
+/// the algorithm of §10.12: undo the source gamma, go to CIE XYZ (D65, no
+/// chromatic adaptation, because sRGB and Display P3 share the D65 white
+/// point), then apply the destination transfer function. The matrices are the
+/// ones in §19's sample code.
+///
+/// Only `srgb`, `srgb-linear` and `display-p3` are accepted. A space this
+/// engine cannot represent is **rejected with a diagnostic naming it**, never
+/// approximated: a silently wrong colour is worse than a missing declaration,
+/// because the page still lays out and only the paint is wrong.
+fn parse_color_function<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let space = input.expect_ident_cloned()?.to_ascii_lowercase();
+    let red = parse_color_component(input)?;
+    let green = parse_color_component(input)?;
+    let blue = parse_color_component(input)?;
+    let alpha = if input
+        .try_parse(|candidate| candidate.expect_delim('/'))
+        .is_ok()
+    {
+        parse_alpha_component(input)?
+    } else {
+        1.0
+    };
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(ValueError::detail(
+            "trailing tokens after the color() components",
+        )));
+    }
+    if !(red.is_finite() && green.is_finite() && blue.is_finite() && alpha.is_finite()) {
+        return Err(location.new_custom_error(()));
+    }
+
+    let srgb = match space.as_str() {
+        // §10.2/§10.3: the components are already sRGB, gamma-encoded for
+        // `srgb` and linear-light for `srgb-linear`.
+        "srgb" => [red, green, blue],
+        "srgb-linear" => [red, green, blue].map(gamma_encode_srgb),
+        // §10.4 and §10.12.
+        "display-p3" => display_p3_to_srgb([red, green, blue]),
+        _ => {
+            return Err(location.new_custom_error(ValueError::detail(format!(
+                "the '{space}' color space is not implemented; only srgb, \
+                 srgb-linear and display-p3 are"
+            ))));
+        }
+    };
+    Ok(CssColor::Srgb {
+        red: rounded_rgb_channel(srgb[0] * 255.0),
+        green: rounded_rgb_channel(srgb[1] * 255.0),
+        blue: rounded_rgb_channel(srgb[2] * 255.0),
+        alpha: alpha.clamp(0.0, 1.0),
+    })
+}
+
+/// CSS Color 4 §4.1.1: a `<predefined-rgb>` component is a `<number>` in
+/// `0.0..1.0` or a `<percentage>` in `0%..100%`, and `none` is a missing
+/// component, which §4.4 says behaves as a zero value "including converting it
+/// to another color space".
+fn parse_color_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let value = match input.next()?.clone() {
+        Token::Number { value, .. } => value,
+        // `unit_value` is already normalized to `0.0..=1.0`.
+        Token::Percentage { unit_value, .. } => unit_value,
+        Token::Ident(value) if value.eq_ignore_ascii_case("none") => 0.0,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
+    }
+}
+
+/// CSS Color 4 §10.12: Display P3 to sRGB.
+///
+/// §14.1.1 names clipping the component values to the displayable range as the
+/// simplest way to bring an out-of-gamut color into an RGB destination, and
+/// clipping on gamma-encoded values is what it describes. Display P3 is wider
+/// than sRGB, so a saturated P3 color really can land outside sRGB here, and
+/// the hue shift that clipping causes is the cost §14.1.2 exists to avoid.
+fn display_p3_to_srgb(rgb: [f32; 3]) -> [f32; 3] {
+    // §19: `lin_P3_to_XYZ`, on linear-light values.
+    const LIN_P3_TO_XYZ: [[f32; 3]; 3] = [
+        [
+            608_311.0 / 1_250_200.0,
+            189_793.0 / 714_400.0,
+            198_249.0 / 1_000_160.0,
+        ],
+        [
+            35_783.0 / 156_275.0,
+            247_089.0 / 357_200.0,
+            198_249.0 / 2_500_400.0,
+        ],
+        [0.0, 32_229.0 / 714_400.0, 5_220_557.0 / 5_000_800.0],
+    ];
+    // §19: `XYZ_to_lin_sRGB`.
+    const XYZ_TO_LIN_SRGB: [[f32; 3]; 3] = [
+        [12_831.0 / 3_959.0, -329.0 / 214.0, -1_974.0 / 3_959.0],
+        [
+            -851_781.0 / 878_810.0,
+            1_648_619.0 / 878_810.0,
+            36_519.0 / 878_810.0,
+        ],
+        [705.0 / 12_673.0, -2_585.0 / 12_673.0, 705.0 / 667.0],
+    ];
+    // `lin_P3` is `lin_sRGB`: Display P3 uses the sRGB transfer function
+    // (§10.4), it is the primaries and the white point that differ.
+    let linear = rgb.map(gamma_decode_srgb);
+    let xyz = multiply_matrix(LIN_P3_TO_XYZ, linear);
+    multiply_matrix(XYZ_TO_LIN_SRGB, xyz).map(|value| gamma_encode_srgb(value).clamp(0.0, 1.0))
+}
+
+fn multiply_matrix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+    [
+        dot(matrix[0], vector),
+        dot(matrix[1], vector),
+        dot(matrix[2], vector),
+    ]
+}
+
+fn dot(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
+/// CSS Color 4 §19's `lin_sRGB`: gamma-encoded value to linear light, extended
+/// to negative values by reflection so an out-of-gamut conversion does not fold
+/// the sign away before the matrices see it.
+fn gamma_decode_srgb(value: f32) -> f32 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let magnitude = value.abs();
+    if magnitude <= 0.040_45 {
+        value / 12.92
+    } else {
+        sign * ((magnitude + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// CSS Color 4 §19's `gam_sRGB`: the inverse transfer function.
+fn gamma_encode_srgb(value: f32) -> f32 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let magnitude = value.abs();
+    if magnitude > 0.003_130_8 {
+        sign * (1.055 * magnitude.powf(1.0 / 2.4) - 0.055)
+    } else {
+        12.92 * value
+    }
+}
+
+/// CSS Backgrounds 3 §3.2: `<bg-image>#`, a comma-separated list. Real sheets
+/// routinely ship `background-image: url(a.svg), none`, so only the first layer
+/// may not be enough to keep the declaration.
 fn parse_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, String> {
     let start = input.position();
+    let mut layers = Vec::new();
+    loop {
+        layers.push(parse_single_background_image(input)?);
+        if input.try_parse(Parser::expect_comma).is_err() {
+            break;
+        }
+        // A trailing comma leaves an empty final layer, which is invalid.
+        if input.is_exhausted() {
+            return Err(input.new_custom_error(()));
+        }
+    }
+    Ok(input.slice_from(start).trim().to_owned())
+}
+
+fn parse_single_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, String> {
     let location = input.current_source_location();
+    let start = input.position();
     let token = input.next()?.clone();
     match token {
         Token::UnquotedUrl(url) => Ok(format!("url({url})")),
@@ -1709,23 +2139,13 @@ fn parse_background_image<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Strin
             })
         }
         Token::Ident(value) if value.eq_ignore_ascii_case("none") => Ok("none".to_owned()),
-        Token::Function(name) if name.eq_ignore_ascii_case("linear-gradient") => {
+        // Every other image function is kept verbatim; painting it is another
+        // subsystem's job, but dropping the whole declaration is not.
+        Token::Function(_) => {
             input.parse_nested_block(|nested| {
                 while nested.next().is_ok() {}
                 Ok(())
             })?;
-            while input.try_parse(Parser::expect_comma).is_ok() {
-                let next = input.next()?.clone();
-                match next {
-                    Token::Function(name) if name.eq_ignore_ascii_case("linear-gradient") => {
-                        input.parse_nested_block(|nested| {
-                            while nested.next().is_ok() {}
-                            Ok(())
-                        })?;
-                    }
-                    _ => return Err(location.new_custom_error(())),
-                }
-            }
             Ok(input.slice_from(start).trim().to_owned())
         }
         _ => Err(location.new_custom_error(())),
@@ -1805,6 +2225,119 @@ fn parse_alpha_component<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
         Token::Percentage { unit_value, .. } => Ok(unit_value),
         _ => Err(location.new_custom_error(())),
     }
+}
+
+/// Parse `hsl()` / `hsla()` and resolve it to sRGB.
+///
+/// CSS Color 4 §4.3 defines the modern space-separated form with a `/` alpha
+/// separator; CSS Color 3 §4.2 defines the legacy comma-separated form that
+/// real stylesheets still ship in bulk, including a bare `.5` alpha. The
+/// computed value of both is the equivalent sRGB color (CSS Color 4 §4.3), so
+/// the conversion happens here instead of adding a second color space to the
+/// paint contract.
+fn parse_hsl_color<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, CssColor> {
+    let location = input.current_source_location();
+    let hue = parse_hue(input)?;
+    let comma_syntax = input.try_parse(Parser::expect_comma).is_ok();
+    let saturation = parse_hsl_percentage(input, comma_syntax)?;
+    if comma_syntax {
+        input.expect_comma()?;
+    }
+    let lightness = parse_hsl_percentage(input, comma_syntax)?;
+    let alpha = if comma_syntax {
+        if input.try_parse(Parser::expect_comma).is_ok() {
+            parse_alpha_component(input)?
+        } else {
+            1.0
+        }
+    } else if input
+        .try_parse(|candidate| candidate.expect_delim('/'))
+        .is_ok()
+    {
+        parse_alpha_component(input)?
+    } else {
+        1.0
+    };
+    if !input.is_exhausted() {
+        return Err(location.new_custom_error(()));
+    }
+    let (red, green, blue) = hsl_to_srgb(hue, saturation, lightness);
+    Ok(CssColor::Srgb {
+        red,
+        green,
+        blue,
+        alpha: alpha.clamp(0.0, 1.0),
+    })
+}
+
+/// CSS Values 4 §5.2: a hue is a `<number>` in degrees or an `<angle>`.
+fn parse_hue<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let degrees = match input.next()?.clone() {
+        Token::Number { value, .. } => value,
+        Token::Dimension { value, unit, .. } => match unit.to_ascii_lowercase().as_str() {
+            "deg" => value,
+            "grad" => value * 0.9,
+            "rad" => value.to_degrees(),
+            "turn" => value * 360.0,
+            _ => return Err(location.new_custom_error(())),
+        },
+        _ => return Err(location.new_custom_error(())),
+    };
+    // Hue is an angle and wraps, but an overflow token is still invalid.
+    if degrees.is_finite() {
+        Ok(degrees)
+    } else {
+        Err(location.new_custom_error(()))
+    }
+}
+
+/// Saturation and lightness are `<percentage>`s in CSS Color 4. The legacy
+/// CSS Color 3 grammar also accepted bare numbers in the 0-100 range, which
+/// minified stylesheets still emit. The result is a `0.0..=1.0` fraction.
+fn parse_hsl_percentage<'i>(input: &mut Parser<'i, '_>, comma_syntax: bool) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let value = match input.next()?.clone() {
+        // `unit_value` is already normalized to `0.0..=1.0`.
+        Token::Percentage { unit_value, .. } => unit_value,
+        Token::Number { value, .. } if comma_syntax => value / 100.0,
+        _ => return Err(location.new_custom_error(())),
+    };
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
+    }
+}
+
+/// CSS Color 4 §12.2 hue-to-rgb conversion, with saturation and lightness as
+/// fractions in `0.0..=1.0`.
+fn hsl_to_srgb(hue_degrees: f32, saturation: f32, lightness: f32) -> (u8, u8, u8) {
+    let saturation = saturation.clamp(0.0, 1.0);
+    let lightness = lightness.clamp(0.0, 1.0);
+    let chroma = (1.0 - (2.0 * lightness - 1.0).abs()) * saturation;
+    // Section 12.2 works in sixths of a turn, offset by the green sector.
+    let turn = hue_degrees.rem_euclid(360.0) / 60.0;
+    let second = chroma * (1.0 - ((turn % 2.0) - 1.0).abs());
+    let (red, green, blue) = if turn < 1.0 {
+        (chroma, second, 0.0)
+    } else if turn < 2.0 {
+        (second, chroma, 0.0)
+    } else if turn < 3.0 {
+        (0.0, chroma, second)
+    } else if turn < 4.0 {
+        (0.0, second, chroma)
+    } else if turn < 5.0 {
+        (second, 0.0, chroma)
+    } else {
+        (chroma, 0.0, second)
+    };
+    let match_value = lightness - chroma / 2.0;
+    (
+        rounded_rgb_channel((red + match_value) * 255.0),
+        rounded_rgb_channel((green + match_value) * 255.0),
+        rounded_rgb_channel((blue + match_value) * 255.0),
+    )
 }
 
 fn parse_display<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Display> {
@@ -1954,6 +2487,94 @@ fn parse_border_width<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, BorderWid
     } else {
         Err(location.new_custom_error(()))
     }
+}
+
+/// CSS 2.1 §17.6.1: `border-spacing: <length>{1,2}`, and the spacing must not
+/// be negative.
+///
+/// The grammar also accepts a `<percentage>`, which CSS 2.1 does not list.
+/// HTML's `cellspacing` presentational hint feeds a percentage straight into
+/// this property (render-core's user-agent declaration builder), and the table
+/// solver already resolves a percentage against the table's used width, so
+/// rejecting it here would drop a declaration the engine can honour.
+fn parse_border_spacing<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, BorderSpacing> {
+    let horizontal = parse_length_percentage(input, true)?;
+    // The one-value form sets both components.
+    let vertical = input
+        .try_parse(parse_length_percentage_non_negative)
+        .unwrap_or_else(|_| horizontal.clone());
+    Ok(BorderSpacing {
+        horizontal,
+        vertical,
+    })
+}
+
+/// Text Decoration 4 §2.1: `none`, or one or more line keywords joined by the
+/// `||` combinator. Duplicates are rejected, because `||` requires each
+/// component to appear at most once and `underline underline` is not a legal
+/// value.
+fn parse_text_decoration_line<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, TextDecorationLine> {
+    let location = input.current_source_location();
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("none"))
+        .is_ok()
+    {
+        return Ok(TextDecorationLine::None);
+    }
+    let mut lines: Vec<TextDecorationLineKeyword> = Vec::new();
+    while let Ok(ident) = input.try_parse(Parser::expect_ident_cloned) {
+        let Some(keyword) = TextDecorationLineKeyword::parse(&ident) else {
+            return Err(location.new_custom_error(()));
+        };
+        if lines.contains(&keyword) {
+            return Err(location.new_custom_error(()));
+        }
+        lines.push(keyword);
+    }
+    // The `||` production needs at least one component, so a bare
+    // `text-decoration-line:` is invalid rather than an empty set.
+    if lines.is_empty() {
+        return Err(location.new_custom_error(()));
+    }
+    Ok(TextDecorationLine::Lines(lines))
+}
+
+/// Text Decoration 4 §2.4: `auto | from-font | <length-percentage> |
+/// <line-width>`, the last being `thin | medium | thick | <length [0,inf]>`.
+fn parse_text_decoration_thickness<'i>(
+    input: &mut Parser<'i, '_>,
+) -> CssResult<'i, TextDecorationThickness> {
+    if let Ok(ident) = input.try_parse(Parser::expect_ident_cloned) {
+        return match ident.to_ascii_lowercase().as_str() {
+            "auto" => Ok(TextDecorationThickness::Auto),
+            "from-font" => Ok(TextDecorationThickness::FromFont),
+            "thin" => Ok(TextDecorationThickness::Thin),
+            "medium" => Ok(TextDecorationThickness::Medium),
+            "thick" => Ok(TextDecorationThickness::Thick),
+            _ => Err(input.new_custom_error(())),
+        };
+    }
+    parse_length_percentage(input, true).map(TextDecorationThickness::Length)
+}
+
+/// CSS 2.1 §17.5.3: the `vertical-align` keywords plus the `<length>` /
+/// `<percentage>` offset form. A `calc()` that cannot yet resolve keeps its
+/// tree, so `vertical-align: calc(1em + 2px)` is not a syntax error.
+fn parse_vertical_align<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, VerticalAlign> {
+    if let Ok(ident) = input.try_parse(Parser::expect_ident_cloned) {
+        return match ident.to_ascii_lowercase().as_str() {
+            "baseline" => Ok(VerticalAlign::Baseline),
+            "sub" => Ok(VerticalAlign::Sub),
+            "super" => Ok(VerticalAlign::Super),
+            "text-top" => Ok(VerticalAlign::TextTop),
+            "text-bottom" => Ok(VerticalAlign::TextBottom),
+            "middle" => Ok(VerticalAlign::Middle),
+            "top" => Ok(VerticalAlign::Top),
+            "bottom" => Ok(VerticalAlign::Bottom),
+            _ => Err(input.new_custom_error(())),
+        };
+    }
+    parse_length_percentage(input, false).map(VerticalAlign::Offset)
 }
 
 /// Absolute pixel size of the CSS absolute-size font keywords for a default
@@ -2334,6 +2955,12 @@ fn transform_origin_keyword(keyword: &str) -> Option<f32> {
         "right" | "bottom" => Some(1.0),
         _ => None,
     }
+}
+
+fn parse_length_percentage_non_negative<'i>(
+    input: &mut Parser<'i, '_>,
+) -> CssResult<'i, LengthPercentage> {
+    parse_length_percentage(input, true)
 }
 
 fn parse_non_negative_number<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
@@ -2965,8 +3592,8 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        AspectRatio, Display, DisplayInside, DisplayOutside, Length, LengthPercentage, LengthUnit,
-        MaxSize, PropertyParseError, Size, TextAlign, TransformFunction, TransformList,
+        AspectRatio, CssColor, Display, DisplayInside, DisplayOutside, Length, LengthPercentage,
+        LengthUnit, MaxSize, PropertyParseError, Size, TextAlign, TransformFunction, TransformList,
         TransformOrigin, TypedPropertyValue, parse_typed_property,
     };
 
@@ -2974,6 +3601,105 @@ mod tests {
         parse_typed_property(name, css)
             .expect("supported property")
             .expect("valid value")
+    }
+
+    fn srgb(css: &str) -> (u8, u8, u8, f32) {
+        match parse("color", css) {
+            TypedPropertyValue::Color(CssColor::Srgb {
+                red,
+                green,
+                blue,
+                alpha,
+            }) => (red, green, blue, alpha),
+            other => panic!("expected an srgb color, got {other:?}"),
+        }
+    }
+
+    /// CSS Color 4 §4.3/§12.2 and the legacy CSS Color 3 §4.2 comma form.
+    #[test]
+    fn parses_hsl_colors_in_both_syntaxes() {
+        assert_eq!(srgb("hsl(0, 0%, 100%)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(0 0% 100%)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(0, 0%, 0%)"), (0, 0, 0, 1.0));
+        // Minified legacy alpha, the shape real sheets ship.
+        assert_eq!(srgb("hsla(0,0%,100%,.5)"), (255, 255, 255, 0.5));
+        assert_eq!(srgb("hsla(0, 0%, 0%, 0.25)"), (0, 0, 0, 0.25));
+        assert_eq!(srgb("hsl(120 100% 50% / 50%)"), (0, 255, 0, 0.5));
+        // Every hue sector, plus angle units and hue wraparound.
+        assert_eq!(srgb("hsl(0, 100%, 50%)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("hsl(60, 100%, 50%)"), (255, 255, 0, 1.0));
+        assert_eq!(srgb("hsl(120, 100%, 50%)"), (0, 255, 0, 1.0));
+        assert_eq!(srgb("hsl(180, 100%, 50%)"), (0, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(240, 100%, 50%)"), (0, 0, 255, 1.0));
+        assert_eq!(srgb("hsl(300, 100%, 50%)"), (255, 0, 255, 1.0));
+        assert_eq!(srgb("hsl(360, 100%, 50%)"), (255, 0, 0, 1.0));
+        // Halfway inside a sector the second channel is interpolated.
+        assert_eq!(srgb("hsl(30, 100%, 50%)"), (255, 128, 0, 1.0));
+        assert_eq!(srgb("hsl(210, 100%, 50%)"), (0, 128, 255, 1.0));
+        assert_eq!(srgb("hsl(480deg 100% 50%)"), (0, 255, 0, 1.0));
+        assert_eq!(srgb("hsl(0.5turn 100% 50%)"), (0, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(200grad 100% 50%)"), (0, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(3.14159rad 100% 50%)"), (0, 255, 255, 1.0));
+        // Out-of-range saturation/lightness clamp; hue is an angle and wraps.
+        assert_eq!(srgb("hsl(-60, 100%, 50%)"), (255, 0, 255, 1.0));
+        assert_eq!(srgb("hsl(0, 200%, 50%)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("hsl(0, 0%, 150%)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("hsl(0, 0%, -50%)"), (0, 0, 0, 1.0));
+        // Percentage alpha clamps, and every hue-relative color function is
+        // out of scope, so it must stay an error rather than a wrong color.
+        assert_eq!(srgb("hsl(0 0% 0% / 200%)"), (0, 0, 0, 1.0));
+        // CSS Color 4 §4.3 keeps `hsla()` as a legacy alias, so a fourth
+        // comma argument is accepted under the `hsl()` name too, as in every
+        // shipping engine.
+        assert_eq!(srgb("hsl(0, 0%, 0%, 0%)"), (0, 0, 0, 0.0));
+        for invalid in [
+            "hsl(0, 0%)",
+            "hsl(0 0% 0% / )",
+            "hsl(0deg, 0%)",
+            "hsl(0, 0px, 0%)",
+            "hsl(red, 0%, 0%)",
+            "hsl(0 0% 0% / 0 0)",
+            "hsl(0 0% 0% ) extra",
+        ] {
+            assert!(
+                parse_typed_property("color", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid} must not parse as a color"
+            );
+        }
+    }
+
+    /// CSS Backgrounds 3 §3.2 `<bg-image>#`.
+    #[test]
+    fn accepts_comma_separated_background_image_layers() {
+        for (value, expected) in [
+            ("url(a.svg)", "url(a.svg)"),
+            ("url(a.svg),none", "url(a.svg),none"),
+            ("none,url(a.svg)", "none,url(a.svg)"),
+            (
+                "url(a.svg),linear-gradient(red,blue)",
+                "url(a.svg),linear-gradient(red,blue)",
+            ),
+            (
+                "linear-gradient(red,blue),url(b.png),none",
+                "linear-gradient(red,blue),url(b.png),none",
+            ),
+        ] {
+            assert_eq!(
+                parse("background-image", value),
+                TypedPropertyValue::BackgroundImage(expected.to_owned()),
+                "{value}"
+            );
+        }
+        for invalid in ["url(a.svg),", ",url(a.svg)", "url(a.svg),,"] {
+            assert!(
+                parse_typed_property("background-image", invalid)
+                    .expect("supported property")
+                    .is_err(),
+                "{invalid} must not parse"
+            );
+        }
     }
 
     fn transform(css: &str) -> TransformList {
@@ -3743,5 +4469,297 @@ mod tests {
                 "unexpectedly accepted {css:?}"
             );
         }
+    }
+
+    /// CSS Color 4 §10.1: the two sRGB spaces are taken as written, and §10.4's
+    /// Display P3 is converted to sRGB by the §10.12 algorithm.
+    #[test]
+    fn parses_color_in_srgb_and_display_p3() {
+        assert_eq!(srgb("color(srgb 1 0 0)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("color(srgb 100% 0% 0% / 50%)"), (255, 0, 0, 0.5));
+        // §4.4: a missing component is a zero, including when converting.
+        assert_eq!(srgb("color(srgb none 0 0)"), (0, 0, 0, 1.0));
+        // The primaries round-trip through the sRGB transfer function.
+        assert_eq!(srgb("color(srgb 0 1 0)"), (0, 255, 0, 1.0));
+        assert_eq!(srgb("color(srgb 0 0 1)"), (0, 0, 255, 1.0));
+        // `srgb-linear` 0.5 is the gamma-encoded 0.735, so ~188.
+        let (red, green, blue, alpha) = srgb("color(srgb-linear 0.5 0 0)");
+        assert_eq!((red, green, blue, alpha), (188, 0, 0, 1.0));
+
+        // The spec's own worked example, §2: a leaf green written in both sRGB
+        // and Display P3 has to convert to the same color. It also proves the
+        // matrices are right rather than merely plausible.
+        assert_eq!(
+            srgb("color(srgb 0.41587 0.50367 0.36664)"),
+            srgb("color(display-p3 0.43313 0.50108 0.3795)")
+        );
+        // Display P3 white is sRGB white, since both share the D65 white point
+        // and §10.12 skips chromatic adaptation when the white points agree.
+        assert_eq!(srgb("color(display-p3 1 1 1)"), (255, 255, 255, 1.0));
+        assert_eq!(srgb("color(display-p3 0 0 0)"), (0, 0, 0, 1.0));
+        // The three saturated colors a real page ships as Display P3. Each is
+        // outside the sRGB gamut, and §14.1.1 clipping takes the red channel to
+        // zero rather than letting it wrap, so these pin the conversion and the
+        // clipping together.
+        assert_eq!(
+            srgb("color(display-p3 .15546 .38118 .86881)"),
+            (0, 99, 230, 1.0)
+        );
+        assert_eq!(
+            srgb("color(display-p3 .25253 .6243 .39945)"),
+            (0, 162, 96, 1.0)
+        );
+        assert_eq!(
+            srgb("color(display-p3 .07412 .21127 .49921)"),
+            (0, 55, 132, 1.0)
+        );
+        // A Display P3 primary is not the sRGB primary of the same name, which
+        // is what would happen if the components were copied instead of
+        // converted; clipping is what brings each back into range.
+        assert_eq!(srgb("color(display-p3 1 0 0)"), (255, 0, 0, 1.0));
+        assert_eq!(srgb("color(display-p3 0 1 0)"), (0, 255, 0, 1.0));
+        assert_eq!(srgb("color(display-p3 0 0 1)"), (0, 0, 255, 1.0));
+        assert_eq!(srgb("color(display-p3 1 1 0)"), (255, 255, 0, 1.0));
+    }
+
+    /// A color space this engine cannot represent is rejected with a diagnostic
+    /// that names it, never approximated into a different color.
+    #[test]
+    fn rejects_color_spaces_the_engine_cannot_represent() {
+        for (css, space) in [
+            ("color(rec2020 1 0 0)", "rec2020"),
+            ("color(a98-rgb 1 0 0)", "a98-rgb"),
+            ("color(prophoto-rgb 1 0 0)", "prophoto-rgb"),
+            ("color(display-p3-linear 1 0 0)", "display-p3-linear"),
+            ("color(xyz 0.1 0.2 0.3)", "xyz"),
+            ("color(xyz-d50 0.1 0.2 0.3)", "xyz-d50"),
+            ("color(rec2020 1 0 0)", "not-a-space"),
+        ] {
+            let error = parse_typed_property("color", css)
+                .expect("supported property")
+                .expect_err("must be rejected");
+            assert_eq!(error.property(), "color");
+            let detail = error.detail().unwrap_or_default();
+            assert!(
+                detail.contains(space) || detail.contains("not implemented"),
+                "{css}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_color_function_values() {
+        for css in [
+            "",
+            "color()",
+            "color(srgb 1 0)",
+            "color(srgb 1 0 0 0)",
+            "color(srgb 1, 0, 0)",
+            "color(srgb 1 0 0 /)",
+            "color(srgb 1 0 0 / 50% 2)",
+        ] {
+            assert!(
+                parse_typed_property("color", css)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {css:?}"
+            );
+        }
+    }
+
+    /// CSS 2.1 §17.6.1: one length sets both components, two lengths set the
+    /// horizontal and vertical ones, and the spacing is never negative.
+    #[test]
+    fn parses_border_spacing_in_both_forms() {
+        assert_eq!(parse("border-spacing", "0").to_css(), "0px");
+        assert_eq!(parse("border-spacing", "2px").to_css(), "2px");
+        assert_eq!(parse("border-spacing", "1px 2px").to_css(), "1px 2px");
+        // A percentage is not in the CSS 2.1 grammar but is what HTML's
+        // `cellspacing` presentational hint produces, and layout resolves it.
+        assert_eq!(parse("border-spacing", "5%").to_css(), "5%");
+        for invalid in ["-1px", "1px -2px", "", "auto", "1px 2px 3px"] {
+            assert!(
+                parse_typed_property("border-spacing", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    /// CSS 2.1 §17.5.3 lists the eight alignment keywords; §10.8.3 adds the
+    /// `<length>`/`<percentage>` offset form.
+    #[test]
+    fn parses_vertical_align_keywords_and_offsets() {
+        for keyword in [
+            "baseline",
+            "sub",
+            "super",
+            "text-top",
+            "text-bottom",
+            "middle",
+            "top",
+            "bottom",
+        ] {
+            assert_eq!(parse("vertical-align", keyword).to_css(), keyword);
+            // Keywords are ASCII case-insensitive per CSS Syntax §3.3.
+            assert_eq!(
+                parse("vertical-align", &keyword.to_ascii_uppercase()).to_css(),
+                keyword
+            );
+        }
+        assert_eq!(parse("vertical-align", "3px").to_css(), "3px");
+        assert_eq!(parse("vertical-align", "50%").to_css(), "50%");
+        assert_eq!(parse("vertical-align", "-2px").to_css(), "-2px");
+        assert_eq!(
+            parse("vertical-align", "calc(1em + 2px)").to_css(),
+            "calc(1em + 2px)"
+        );
+        for invalid in ["", "flex-start", "center", "2"] {
+            assert!(
+                parse_typed_property("vertical-align", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    /// Text Decoration 4 §2.1: `none`, or one or more line keywords combined
+    /// with `||`. The accumulating form is the reason this cannot be a plain
+    /// keyword type.
+    #[test]
+    fn parses_text_decoration_line_as_a_combining_set() {
+        for value in [
+            "none",
+            "underline",
+            "overline",
+            "line-through",
+            "blink",
+            "spelling-error",
+            "grammar-error",
+            "underline overline",
+            "underline line-through blink",
+        ] {
+            assert_eq!(
+                parse("text-decoration-line", value).to_css(),
+                value,
+                "{value}"
+            );
+        }
+        // `||` means each component at most once.
+        for invalid in [
+            "underline underline",
+            "none underline",
+            "underline none",
+            "",
+        ] {
+            assert!(
+                parse_typed_property("text-decoration-line", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid:?}"
+            );
+        }
+    }
+
+    /// Text Decoration 4 §2.2 and §2.4: single keywords, plus the
+    /// `<length-percentage>` and `<line-width>` forms of the thickness.
+    #[test]
+    fn parses_text_decoration_style_and_thickness() {
+        for value in ["solid", "double", "dotted", "dashed", "wavy"] {
+            assert_eq!(
+                parse("text-decoration-style", value).to_css(),
+                value,
+                "{value}"
+            );
+        }
+        assert!(
+            parse_typed_property("text-decoration-style", "underline")
+                .expect("supported")
+                .is_err(),
+            "a line keyword is not a style; it would silently clear the line"
+        );
+
+        // `<length-percentage>` and `<line-width>` normalise, as lengths do
+        // everywhere else in this crate.
+        for (value, expected) in [
+            ("auto", "auto"),
+            ("from-font", "from-font"),
+            ("thin", "thin"),
+            ("medium", "medium"),
+            ("thick", "thick"),
+            ("2px", "2px"),
+            ("0", "0px"),
+            ("50%", "50%"),
+        ] {
+            assert_eq!(
+                parse("text-decoration-thickness", value).to_css(),
+                expected,
+                "{value}"
+            );
+        }
+        assert!(
+            parse_typed_property("text-decoration-thickness", "wavy")
+                .expect("supported")
+                .is_err()
+        );
+    }
+
+    /// Text Decoration 4 §2.3: `<color>` with `currentcolor` as the initial
+    /// value, so the keyword has to be in the grammar.
+    #[test]
+    fn parses_text_decoration_color_including_currentcolor() {
+        assert_eq!(
+            parse("text-decoration-color", "currentcolor").to_css(),
+            "currentcolor"
+        );
+        // A named colour serialises to its rgb() form, as it does for `color`.
+        assert_eq!(
+            parse("text-decoration-color", "red").to_css(),
+            "rgb(255, 0, 0)"
+        );
+        assert!(
+            parse_typed_property("text-decoration-color", "underline")
+                .expect("supported")
+                .is_err()
+        );
+    }
+
+    /// The four keyword-only table properties, so layout never has to
+    /// string-match a computed value.
+    #[test]
+    fn parses_the_keyword_only_table_properties() {
+        let table_keywords: [(&str, &[&str]); 4] = [
+            ("border-collapse", &["separate", "collapse"]),
+            ("table-layout", &["auto", "fixed"]),
+            ("empty-cells", &["show", "hide"]),
+            (
+                "caption-side",
+                &["top", "bottom", "inline-start", "inline-end"],
+            ),
+        ];
+        for (property, values) in table_keywords {
+            for &value in values {
+                assert_eq!(parse(property, value).to_css(), value, "{property}");
+            }
+            assert!(
+                parse_typed_property(property, "inherit")
+                    .expect("supported")
+                    .is_err(),
+                "{property} must not be a bare keyword type; the cascade resolves \
+                 CSS-wide keywords before this stage"
+            );
+        }
+        assert!(
+            parse_typed_property("border-collapse", "collapsed")
+                .expect("supported")
+                .is_err()
+        );
+        assert!(
+            parse_typed_property("caption-side", "inline")
+                .expect("supported")
+                .is_err()
+        );
     }
 }

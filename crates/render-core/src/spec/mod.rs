@@ -75,6 +75,15 @@ pub struct FeatureDefinition {
     pub specification: &'static str,
     pub section: &'static str,
     pub status: SupportStatus,
+    /// Which part of the feature is actually built, and what is not.
+    ///
+    /// This is the field that makes a status mean something. `Partial` on its
+    /// own is not a claim about anything - every subsystem is `Partial` to some
+    /// degree, so a registry of nothing but `Partial` says only that nobody
+    /// looked. A note names the half that works and the half that does not, so
+    /// progress is measurable and a reader can tell "the box-model half of
+    /// table layout" from "nothing at all".
+    pub notes: &'static str,
     pub dependencies: &'static [FeatureId],
     pub tests: &'static [ConformanceTest],
 }
@@ -180,6 +189,9 @@ fn validate_metadata(definition: &FeatureDefinition) -> Result<(), FeatureRegist
     if definition.specification.trim().is_empty() || definition.section.trim().is_empty() {
         return Err(FeatureRegistryError::MissingSpecification(definition.id));
     }
+    if definition.status != SupportStatus::Conformant && definition.notes.trim().is_empty() {
+        return Err(FeatureRegistryError::MissingNotes(definition.id));
+    }
     if definition.status == SupportStatus::Conformant && definition.tests.is_empty() {
         return Err(FeatureRegistryError::ConformantWithoutTests(definition.id));
     }
@@ -222,6 +234,7 @@ pub enum FeatureRegistryError {
     Duplicate(FeatureId),
     InvalidId(FeatureId),
     MissingSpecification(FeatureId),
+    MissingNotes(FeatureId),
     ConformantWithoutTests(FeatureId),
     UnknownDependency {
         feature: FeatureId,
@@ -237,6 +250,12 @@ impl fmt::Display for FeatureRegistryError {
             Self::InvalidId(id) => write!(formatter, "invalid feature ID '{id}'"),
             Self::MissingSpecification(id) => {
                 write!(formatter, "feature '{id}' has no specification section")
+            }
+            Self::MissingNotes(id) => {
+                write!(
+                    formatter,
+                    "feature '{id}' claims no conformance but has no notes"
+                )
             }
             Self::ConformantWithoutTests(id) => {
                 write!(formatter, "conformant feature '{id}' has no test mapping")
@@ -277,6 +296,92 @@ mod tests {
         }));
     }
 
+    /// A status with no note is not a claim, so the registry refuses to build
+    /// without one. This is the invariant that stops the inventory decaying back
+    /// into a list of `Partial`s that says nothing.
+    #[test]
+    fn a_status_without_a_note_is_rejected() {
+        static SILENT: FeatureId = FeatureId::new("css.silent");
+        static FEATURES: &[FeatureDefinition] = &[FeatureDefinition {
+            id: SILENT,
+            family: StandardFamily::Css,
+            specification: "CSS",
+            section: "Something",
+            status: SupportStatus::Partial,
+            notes: "   ",
+            dependencies: &[],
+            tests: TESTS,
+        }];
+        assert_eq!(
+            FeatureRegistry::new(FEATURES).unwrap_err(),
+            FeatureRegistryError::MissingNotes(SILENT)
+        );
+    }
+
+    /// The inventory has to name the gaps the project knows about, or a gap that
+    /// is not registered cannot be tracked and cannot be reported as progress.
+    #[test]
+    fn the_inventory_registers_the_known_gaps() {
+        let registry = FeatureRegistry::current();
+        for expected in [
+            "css.font-face",
+            "css.animations",
+            "css.transitions",
+            "css.pseudo-elements",
+            "css.tables",
+            "css.colors",
+            "css.nesting",
+            "css.media-queries",
+            "css.text-decoration",
+            "svg.inline-rasterization",
+            "media.video-decode",
+            "html.forms",
+            "html.quirks-mode",
+            "html.foreign-content",
+            "html.template-contents",
+            "html.scripting-mode",
+        ] {
+            assert!(
+                registry
+                    .iter()
+                    .any(|feature| feature.id.as_str() == expected),
+                "the inventory has no entry for {expected}"
+            );
+        }
+    }
+
+    /// The status has to distinguish "nothing" from "half of something", and the
+    /// note has to be about this feature rather than a copy of another one.
+    #[test]
+    fn statuses_say_which_half_is_built() {
+        let registry = FeatureRegistry::current();
+        let absent: Vec<&str> = registry
+            .iter()
+            .filter(|feature| feature.status == SupportStatus::Missing)
+            .map(|feature| feature.id.as_str())
+            .collect();
+        assert!(
+            absent.contains(&"css.font-face") && absent.contains(&"css.animations"),
+            "a feature with no implementation at all must say Missing, not Partial: {absent:?}"
+        );
+        let partial: Vec<&str> = registry
+            .iter()
+            .filter(|feature| feature.status == SupportStatus::Partial)
+            .map(|feature| feature.id.as_str())
+            .collect();
+        assert!(
+            partial.contains(&"css.tables") && partial.contains(&"media.video-decode"),
+            "a feature with a working half must say Partial: {partial:?}"
+        );
+        // `fetch.runtime` was the only non-Partial entry before this round and
+        // it underclaimed: `fetch` and `XMLHttpRequest` are implemented.
+        let fetch = registry
+            .iter()
+            .find(|feature| feature.id.as_str() == "fetch.runtime")
+            .expect("fetch is registered");
+        assert_eq!(fetch.status, SupportStatus::Partial);
+    }
+
     #[test]
     fn availability_includes_transitive_dependencies() {
         static FEATURES: &[FeatureDefinition] = &[
@@ -286,6 +391,7 @@ mod tests {
                 specification: "DOM",
                 section: "Trees",
                 status: SupportStatus::Partial,
+                notes: "test fixture",
                 dependencies: &[],
                 tests: TESTS,
             },
@@ -295,6 +401,7 @@ mod tests {
                 specification: "HTML",
                 section: "Tree construction",
                 status: SupportStatus::Partial,
+                notes: "test fixture",
                 dependencies: &[BASE],
                 tests: &[],
             },
@@ -312,6 +419,7 @@ mod tests {
             specification: "HTML",
             section: "Tree construction",
             status: SupportStatus::Partial,
+            notes: "test fixture",
             dependencies: &[UNKNOWN],
             tests: &[],
         }];

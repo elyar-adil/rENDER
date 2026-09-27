@@ -1,8 +1,12 @@
 //! Immutable output of formatting-context layout.
 
+use std::collections::BTreeMap;
+
 use render_dom::{DomRevision, NodeId};
 
 use super::geometry::{EdgeSizes, PhysicalRect, PhysicalSize};
+use super::scrollport::ScrollportGeometry;
+use super::sticky::StickyConstraint;
 use super::tree::FormattingNodeId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,6 +108,13 @@ pub struct FragmentTree {
     pub scrollable_content_size: PhysicalSize,
     root: FragmentId,
     fragments: Vec<Fragment>,
+    /// Sticky boxes and the geometry that constrains them, keyed by fragment.
+    /// Sticky does not move a box during layout (§4.1), so this is the only
+    /// record that the box is sticky at all.
+    sticky: BTreeMap<FragmentId, StickyConstraint>,
+    /// Boxes whose overflow is not `visible`, and what they do with it. A box
+    /// that is absent clips nothing.
+    clips: BTreeMap<FragmentId, ScrollportGeometry>,
 }
 
 impl FragmentTree {
@@ -189,7 +200,54 @@ impl FragmentTree {
             scrollable_content_size,
             root,
             fragments,
+            sticky: BTreeMap::new(),
+            clips: BTreeMap::new(),
         }
+    }
+
+    /// Attach the sticky constraints the solver resolved. Kept apart from
+    /// [`FragmentTree::new`] so the arena, the viewport and the scroll offset
+    /// that callers already pass keep their meaning.
+    #[must_use]
+    pub fn with_sticky_constraints(
+        mut self,
+        sticky: BTreeMap<FragmentId, StickyConstraint>,
+    ) -> Self {
+        self.sticky = sticky;
+        self
+    }
+
+    /// The sticky geometry of a box whose computed `position` is `sticky`.
+    /// Any other fragment has none, so a box that is not sticky is a no-op
+    /// rather than a box that is silently moved.
+    #[must_use]
+    pub fn sticky_constraint(&self, id: FragmentId) -> Option<&StickyConstraint> {
+        self.sticky.get(&id)
+    }
+
+    /// Every sticky box in the document, in fragment order.
+    pub fn sticky_fragments(&self) -> impl Iterator<Item = (FragmentId, &StickyConstraint)> {
+        self.sticky.iter().map(|(id, constraint)| (*id, constraint))
+    }
+
+    /// Attach the scrollport geometry the solver resolved. Kept apart from
+    /// [`FragmentTree::new`] for the same reason as the sticky constraints.
+    #[must_use]
+    pub fn with_scrollports(mut self, clips: BTreeMap<FragmentId, ScrollportGeometry>) -> Self {
+        self.clips = clips;
+        self
+    }
+
+    /// The clipping or scrolling geometry of a box whose `overflow` is not
+    /// `visible`. `None` means the box clips nothing.
+    #[must_use]
+    pub fn scrollport(&self, id: FragmentId) -> Option<&ScrollportGeometry> {
+        self.clips.get(&id)
+    }
+
+    /// Every box that clips or scrolls its overflow, in fragment order.
+    pub fn scrollports(&self) -> impl Iterator<Item = (FragmentId, &ScrollportGeometry)> {
+        self.clips.iter().map(|(id, scrollport)| (*id, scrollport))
     }
 }
 

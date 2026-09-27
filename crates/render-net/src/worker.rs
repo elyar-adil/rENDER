@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::diagnostics::FetchPhase;
 use crate::{
     BatchOptions, CancelToken, FetchError, FetchRequest, FetchResult, HttpTransport, Origin,
 };
@@ -503,6 +504,7 @@ struct BatchOperation {
     active_by_origin: HashMap<Origin, usize>,
     active: usize,
     options: BatchOptions,
+    started: Instant,
     cancel: CancelToken,
     response: Sender<Vec<FetchResult>>,
 }
@@ -523,9 +525,37 @@ impl BatchOperation {
             active_by_origin: HashMap::new(),
             active: 0,
             options,
+            started: Instant::now(),
             cancel,
             response,
         }
+    }
+
+    /// Whether the whole-batch budget has run out. A zero budget disables the
+    /// bound.
+    fn expired(&self, now: Instant) -> bool {
+        self.options.timeout > Duration::ZERO
+            && now.duration_since(self.started) >= self.options.timeout
+    }
+
+    /// Fails every request that has not completed and asks the transfers that
+    /// are still running to stop.
+    ///
+    /// The results are reported immediately rather than waiting for the
+    /// in-flight transfers to notice the cancellation: a batch of stalling
+    /// resources must still produce a terminal outcome for the page, and the
+    /// transfer threads unwind on their own.
+    fn expire(&mut self, now: Instant) {
+        let elapsed = now.duration_since(self.started);
+        for result in &mut self.results {
+            if result.is_none() {
+                *result = Some(Err(
+                    FetchError::Timeout.in_phase(FetchPhase::Queued, elapsed)
+                ));
+            }
+        }
+        self.pending.clear();
+        self.cancel.cancel();
     }
 
     fn next_job(&mut self, operation_id: OperationId) -> BatchSchedule {
@@ -742,6 +772,35 @@ impl Scheduler {
         self.waiting = waiting;
     }
 
+    /// Fails every batch that outlived [`BatchOptions::timeout`].
+    ///
+    /// Without this a batch of resources that all stall never reports anything:
+    /// its handle stays open and the page waits for a result that cannot
+    /// arrive. The dispatcher calls this on every tick, so the budget is
+    /// enforced to within one cancellation-poll interval.
+    fn expire_batches(&mut self, now: Instant) {
+        let expired = self
+            .operations
+            .iter_mut()
+            .filter_map(|(id, operation)| match operation {
+                Operation::Batch(batch) if batch.expired(now) => {
+                    batch.expire(now);
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if expired.is_empty() {
+            return;
+        }
+        for id in &expired {
+            if let Some(Operation::Batch(batch)) = self.operations.remove(id) {
+                batch.finish();
+            }
+        }
+        self.ready.retain(|id| self.operations.contains_key(id));
+    }
+
     fn schedule(&mut self, jobs: &JobQueue) -> bool {
         loop {
             if !jobs.has_capacity() {
@@ -846,6 +905,7 @@ impl Dispatcher {
         let mut scheduler = Scheduler::default();
         loop {
             scheduler.cancel_cancelled();
+            scheduler.expire_batches(Instant::now());
             scheduler.promote_waiting(&runtime);
             if !scheduler.schedule(&runtime.jobs) {
                 scheduler.stop_all();

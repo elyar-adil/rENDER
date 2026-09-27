@@ -13,7 +13,11 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-license = "WTFPL"
+# Must match LICENSE: the rENDER Non-Commercial License 1.0. Do not replace this
+# with a standard identifier - WTFPL would grant commercial use that the LICENSE
+# file and README explicitly withhold, and cargo surfaces this field to every
+# downstream consumer.
+license = "LicenseRef-rENDER-Non-Commercial-1.0"
 rust-version = "1.85"
 version = "0.1.0"
 

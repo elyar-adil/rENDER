@@ -1,0 +1,55 @@
+# Standalone acceptance-harness crate for the real-site fixtures.
+#
+# This crate is deliberately NOT a member of the root workspace. It is invoked as
+#
+#     cargo test --manifest-path tests/real_site_tasks/Cargo.toml
+#
+# Keeping it out of the workspace means it never touches the root `Cargo.lock`,
+# and the empty `[workspace]` table below makes it its own workspace root so
+# cargo does not try to attach it to the one above. The root `.gitignore` already
+# excludes `tests/real_site_tasks/Cargo.lock` for the same reason.
+#
+# Do NOT set CARGO_TARGET_DIR. Note that because this crate is its own workspace
+# root, cargo's default target directory is `tests/real_site_tasks/target/`, not
+# the repository's `target/`. That means the dependency graph is compiled a
+# second time here rather than reused from the engine workspace's build. Sharing
+# the repository directory would need a `.cargo/config.toml` with
+# `build.target-dir = "../../target"`; that is deliberately not done, because it
+# would also put this crate's build lock in the same queue as the engine's.
+# `target/` is matched at any depth by the root `.gitignore`, so the nested
+# directory is not tracked.
+[workspace]
+
+[package]
+name = "render-real-site-tasks"
+description = "Offline real-site acceptance harness for the rENDER engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-rENDER-Non-Commercial-1.0"
+publish = false
+
+[lib]
+name = "real_site_tasks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "real-site-shots"
+path = "src/bin/real_site_shots.rs"
+
+[dependencies]
+render-core = { path = "../../crates/render-core" }
+render-net = { path = "../../crates/render-net" }
+# Only the shot/baseline writer needs an encoder. The comparison path decodes
+# baselines through render-core's own decoder, so nothing else grows a codec.
+image-codec = { package = "image", version = "0.25.8", default-features = false, features = [
+    "png",
+] }
+url = "2.5.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

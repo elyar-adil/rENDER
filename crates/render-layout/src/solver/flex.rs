@@ -790,13 +790,13 @@ impl Solver<'_> {
             return 0.0;
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
-            let style = self.text_style(node.style_source);
+            let style = self.inline_text_style(node.style_source);
             return if horizontal {
                 self.intrinsic_text_width(text, node.style_source, style)
             } else if text.chars().all(char::is_whitespace) {
                 0.0
             } else {
-                style.line_height
+                style.style.line_height
             };
         }
         let style = node
@@ -810,15 +810,14 @@ impl Solver<'_> {
             }
         );
         let children = node.children.clone();
-        let content = children
-            .iter()
-            .map(|child| {
-                let child_size =
-                    self.intrinsic_flex_size(*child, horizontal, basis, depth.saturating_add(1));
-                if !is_flex {
-                    return child_size;
-                }
-                let child_node = self.formatting.get(*child);
+        let mut line: f32 = 0.0;
+        let mut widest: f32 = 0.0;
+        let mut total: f32 = 0.0;
+        for child in children.iter().copied() {
+            let child_size =
+                self.intrinsic_flex_size(child, horizontal, basis, depth.saturating_add(1));
+            let child_size = if is_flex {
+                let child_node = self.formatting.get(child);
                 let child_source = child_node.and_then(|node| node.source);
                 let child_style = child_node
                     .and_then(|node| node.style_source)
@@ -826,8 +825,26 @@ impl Solver<'_> {
                     .cloned();
                 child_size
                     + self.flex_outer_extras(child_style.as_ref(), horizontal, basis, child_source)
-            })
-            .sum::<f32>();
+            } else if horizontal && self.is_forced_break(child) {
+                // CSS 2.1 §10.3.5: the max-content width of an inline sequence
+                // is its widest line, so a forced break ends the run instead of
+                // adding to it.
+                widest = widest.max(line);
+                line = 0.0;
+                0.0
+            } else {
+                child_size
+            };
+            line += child_size;
+            total += child_size;
+        }
+        // A non-flex inline sequence reports the widest of its lines; the flex
+        // case keeps its sum and adds the gap below.
+        let content = if !is_flex && horizontal {
+            widest.max(line)
+        } else {
+            total
+        };
         let content = if is_flex {
             content
                 + self.resolve_gap(

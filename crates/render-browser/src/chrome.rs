@@ -1823,7 +1823,9 @@ pub fn scrollbar_scroll_offset(
     }
     let margin = 2.0 * scale;
     let travel = geometry.track.height - margin * 2.0 - geometry.thumb.height;
-    if !(travel > 0.0) {
+    // A thumb as tall as the track has no travel to map, and a degenerate
+    // geometry must not yield a NaN offset.
+    if travel.is_nan() || travel <= 0.0 {
         return 0.0;
     }
     let thumb_y = pointer_y - grab_offset;
@@ -2392,8 +2394,8 @@ mod scrollbar_tests {
         // clamped to at least 24px.
         // travel = 500 - 2*2(margin) = 496; ratio 500/2000 -> 124px
         assert!((geometry.thumb.height - 124.0).abs() < 0.01);
-        assert_eq!(geometry.thumb.y, geometry.track.y + 2.0);
-        assert_eq!(geometry.thumb.x + geometry.thumb.width, CONTENT.width - 2.0);
+        assert!((geometry.thumb.y - (geometry.track.y + 2.0)).abs() < 0.01);
+        assert!((geometry.thumb.x + geometry.thumb.width - (CONTENT.width - 2.0)).abs() < 0.01);
 
         let bottom = scrollbar_geometry(CONTENT, 2000.0, 500.0, 1500.0, 1.0).expect("scrollbar");
         assert!(

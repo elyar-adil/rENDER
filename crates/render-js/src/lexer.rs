@@ -102,7 +102,14 @@ pub(super) enum TokenKind {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TemplatePart {
-    String(String),
+    /// One template character chunk. `cooked` is the value an untagged template
+    /// literal contributes, with escapes resolved; `raw` is the unprocessed
+    /// source text of the same chunk, which is what a template object's `raw`
+    /// property and therefore `String.raw` hand to a tag function.
+    Quasi {
+        cooked: String,
+        raw: String,
+    },
     Expression(String),
 }
 
@@ -981,6 +988,9 @@ impl Lexer<'_> {
         self.advance();
         let mut parts = Vec::new();
         let mut text = String::new();
+        // Byte offset where the current chunk's source text begins, so its raw
+        // value can be sliced out verbatim once the chunk's end is reached.
+        let mut quasi_start = self.offset;
         loop {
             let Some(character) = self.peek() else {
                 return Err(JsError::syntax("unterminated template literal", start));
@@ -988,15 +998,26 @@ impl Lexer<'_> {
             self.advance();
             match character {
                 '`' => {
-                    parts.push(TemplatePart::String(text));
+                    parts.push(TemplatePart::Quasi {
+                        cooked: text,
+                        raw: self.template_raw_value(quasi_start, self.offset - 1),
+                    });
                     return Ok(TokenKind::Template(parts));
                 }
                 '$' if self.peek() == Some('{') => {
+                    // The quasi's raw value ends *before* the `${`, which is
+                    // why the slice is taken while the offset still points just
+                    // past the `$`.
+                    let raw = self.template_raw_value(quasi_start, self.offset - 1);
                     self.advance();
-                    parts.push(TemplatePart::String(std::mem::take(&mut text)));
+                    parts.push(TemplatePart::Quasi {
+                        cooked: std::mem::take(&mut text),
+                        raw,
+                    });
                     parts.push(TemplatePart::Expression(
                         self.template_interpolation(start)?,
                     ));
+                    quasi_start = self.offset;
                 }
                 '\\' => {
                     let escaped = self.peek().ok_or_else(|| {
@@ -1027,6 +1048,16 @@ impl Lexer<'_> {
                 other => text.push(other),
             }
         }
+    }
+
+    /// ECMA-262 12.9.6 `TRV`: the raw value of a template character sequence,
+    /// with `CR` and `CR LF` folded to `LF` so the raw text agrees with the
+    /// cooked one. Slicing the source rather than re-accumulating characters is
+    /// what keeps `\\n` distinguishable from a line continuation in `raw`.
+    fn template_raw_value(&self, from: usize, to: usize) -> String {
+        self.source[from..to]
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
     }
 
     fn template_interpolation(&mut self, template_start: usize) -> Result<String, JsError> {

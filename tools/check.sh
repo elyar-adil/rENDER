@@ -11,6 +11,12 @@ cargo fmt --all --check
 echo "==> cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
+echo "==> site neutrality gate self-test"
+python tools/check_site_neutrality_test.py
+
+echo "==> site neutrality"
+python tools/check_site_neutrality.py
+
 echo "==> cargo test --workspace"
 cargo test --workspace
 

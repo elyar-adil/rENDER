@@ -4,15 +4,15 @@ use std::collections::BTreeMap;
 
 use crate::css::computed::{ComputedStyle, ComputedValue};
 use crate::css::properties::{
-    BorderStyle, CssColor, LengthPercentage, LengthResolutionContext, ObjectFit, Overflow,
+    BorderStyle, CssColor, Display, LengthPercentage, LengthResolutionContext, ObjectFit, Overflow,
     Position, Size, TransformFunction, TransformList, TransformOrigin, TypedPropertyValue,
     Visibility, parse_typed_property,
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
 use crate::layout::{
-    EdgeSizes, FormattingTree, Fragment, FragmentId, FragmentKind, FragmentTree, PhysicalPoint,
-    PhysicalRect, PhysicalSize,
+    EdgeSizes, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind, FragmentTree,
+    PhysicalPoint, PhysicalRect, PhysicalSize,
 };
 
 use super::color::{Color, SystemPalette};
@@ -76,7 +76,7 @@ impl Transform2D {
     }
 
     /// Composes two matrices with `applied_first` mapping points before
-    /// `self` (i.e. `self ∘ applied_first`).
+    /// `self` (i.e. `self �?applied_first`).
     #[must_use]
     pub fn then(&self, applied_first: &Self) -> Self {
         Self {
@@ -207,12 +207,65 @@ pub enum TextDecorationLine {
     LineThrough,
 }
 
+/// Stroke pattern of a text decoration line (CSS Text Decoration Level 3 §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextDecorationStyle {
+    Solid,
+    Double,
+    Dotted,
+    Dashed,
+    Wavy,
+}
+
+/// One text decoration line over a run of text.
+///
+/// Geometry is resolved where the style is known, not per pixel: `rect` is the
+/// run's horizontal extent with `rect.origin.y` set to the line's top edge in
+/// document space and `rect.size.height` set to the stroke thickness. The
+/// rasterizer turns `line`, `style`, and `thickness` into the individual stroke
+/// rectangles, so a dashed or wavy run stays a single retained item.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextDecoration {
     pub rect: PhysicalRect,
     pub color: Color,
     pub line: TextDecorationLine,
+    pub style: TextDecorationStyle,
     pub thickness: f32,
+}
+
+/// Parameters of one `text-shadow` layer.
+///
+/// A shadow item is emitted immediately before the glyph run it describes and
+/// names it through `run`, so the rasterizer reuses that run's glyph geometry
+/// instead of storing a second copy of it. The shadow paints behind the
+/// glyphs (CSS Text Decoration Level 3 §4.2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextShadowPaint {
+    /// `DisplayItemId::fragment_hint` of the glyph run this shadow belongs to.
+    pub run: u32,
+    pub font: FontInstanceId,
+    pub font_size: f32,
+    pub offset: PhysicalPoint,
+    /// Blur radius; zero paints an unblurred copy of the glyph outlines.
+    pub blur_radius: f32,
+    pub color: Color,
+}
+
+/// Bullet shape of a list marker (CSS Lists Level 3 §3.1). Ordered markers are
+/// text and paint as an ordinary glyph run instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListMarkerShape {
+    Square,
+    Disc,
+    Circle,
+}
+
+/// The bullet painted beside a `display: list-item` box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ListMarkerPaint {
+    pub rect: PhysicalRect,
+    pub color: Color,
+    pub shape: ListMarkerShape,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,6 +319,8 @@ pub enum DisplayCommand {
     PopTransform,
     GlyphRun(GlyphRun),
     TextDecoration(TextDecoration),
+    TextShadow(TextShadowPaint),
+    ListMarker(ListMarkerPaint),
     Image(ImagePaint),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
@@ -530,6 +585,17 @@ pub fn build_display_list_with_images(
     } else {
         BTreeMap::new()
     };
+    // Text decoration propagation and list-marker resolution both walk
+    // formatting ancestors, and `FormattingTree` only stores child links. A
+    // flat arena-indexed parent table answers those walks in one step.
+    let mut formatting_parents = vec![None; formatting.iter().count()];
+    for node in formatting.iter() {
+        for child in &node.children {
+            if let Some(slot) = formatting_parents.get_mut(child.as_u32() as usize) {
+                *slot = Some(node.id);
+            }
+        }
+    }
     let mut builder = Builder {
         fragments,
         formatting,
@@ -538,6 +604,7 @@ pub fn build_display_list_with_images(
         shaper,
         images,
         parents,
+        formatting_parents,
         items: Vec::new(),
         diagnostics: Vec::new(),
         ordinals: BTreeMap::new(),
@@ -563,6 +630,7 @@ struct Builder<'a> {
     shaper: &'a dyn TextShaper,
     images: Option<&'a ImageResources>,
     parents: BTreeMap<FragmentId, FragmentId>,
+    formatting_parents: Vec<Option<FormattingNodeId>>,
     items: Vec<DisplayItem>,
     diagnostics: Vec<DisplayListDiagnostic>,
     ordinals: BTreeMap<(Option<NodeId>, PaintPhase), u32>,
@@ -599,8 +667,8 @@ impl Builder<'_> {
                 Visibility::Hidden | Visibility::Collapse
             ))
         );
-        // A transform groups the whole fragment — background, shadow, text,
-        // image, overflow clip and children — behind one affine matrix the
+        // A transform groups the whole fragment �?background, shadow, text,
+        // image, overflow clip and children �?behind one affine matrix the
         // same way opacity groups it behind an alpha. When both apply, a
         // single stacking context carries them so rasterization only pays
         // for one offscreen group.
@@ -628,7 +696,13 @@ impl Builder<'_> {
                     self.paint_image(&fragment, geometry, style.as_ref(), coordinate_space);
                 }
                 FragmentKind::Text(text) => {
-                    self.paint_text(&fragment, text, current_color, coordinate_space);
+                    self.paint_text(
+                        &fragment,
+                        text,
+                        style.as_ref(),
+                        current_color,
+                        coordinate_space,
+                    );
                 }
             }
         }
@@ -677,7 +751,7 @@ impl Builder<'_> {
     }
 
     /// Resolves the fragment's `transform` property into the affine matrix
-    /// paint applies around the border box (CSS Transforms Level 1 §4–§5).
+    /// paint applies around the border box (CSS Transforms Level 1 §4–�?).
     ///
     /// Percentages inside `translate()` resolve against the border-box width
     /// or height, the same per-axis basis CSS uses. Font-relative units use
@@ -703,7 +777,7 @@ impl Builder<'_> {
         }
         let font_size = style_font_size(style);
         let viewport = self.fragments.viewport;
-        // The first function is the outermost mapping: M = F1 ∘ F2 ∘ … ∘ Fn.
+        // The first function is the outermost mapping: M = F1 �?F2 �?�?�?Fn.
         let mut matrix = Transform2D::default();
         for function in functions {
             matrix = matrix.then(&transform_function_matrix(
@@ -714,7 +788,7 @@ impl Builder<'_> {
             ));
         }
         // transform-origin re-bases the list around a fixed point:
-        // T(origin) ∘ M ∘ T(−origin). It defaults to 50% 50% of the box.
+        // T(origin) �?M �?T(−origin). It defaults to 50% 50% of the box.
         let origin = style
             .typed("transform-origin")
             .and_then(|value| match value {
@@ -833,6 +907,9 @@ impl Builder<'_> {
                 coordinate_space,
                 DisplayCommand::Border(border),
             );
+        }
+        if let Some(style) = style {
+            self.paint_list_marker(fragment, geometry, style, current_color, coordinate_space);
         }
     }
 
@@ -1082,10 +1159,16 @@ impl Builder<'_> {
         }
     }
 
+    /// Paints one text run: its shadow, its glyphs, and its decoration lines.
+    ///
+    /// Order follows CSS Text Decoration Level 3 §4: the shadow paints first so
+    /// it stays behind the glyphs, and the decoration lines follow the glyphs
+    /// so an underline is not erased by the descenders it crosses.
     fn paint_text(
         &mut self,
         fragment: &Fragment,
         text: &crate::layout::TextFragmentData,
+        style: Option<&ComputedStyle>,
         current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
@@ -1105,15 +1188,326 @@ impl Builder<'_> {
                 code: DisplayListDiagnosticCode::GlyphLimit,
                 message: "display-list glyph limit exceeded".to_owned(),
             });
-        } else {
+            return;
+        }
+        for layer in text_shadows(style, current_color, self.options.palette) {
+            let shadow = TextShadowPaint {
+                run: fragment.id.as_u32(),
+                font: run.font,
+                font_size: run.font_size,
+                offset: layer.offset,
+                blur_radius: layer.blur_radius,
+                color: layer.color,
+            };
             self.push(
                 fragment,
-                PaintPhase::Content,
-                fragment.rect,
+                PaintPhase::TextDecoration,
+                text_shadow_bounds(&shadow, fragment.rect),
                 coordinate_space,
-                DisplayCommand::GlyphRun(run),
+                DisplayCommand::TextShadow(shadow),
             );
         }
+        // Resolved before the run is moved into its command so the shaping
+        // result is not cloned for every line of text on the page.
+        let decorations =
+            self.text_decorations(fragment, text.font_size, text.baseline, current_color);
+        self.push(
+            fragment,
+            PaintPhase::Content,
+            fragment.rect,
+            coordinate_space,
+            DisplayCommand::GlyphRun(run),
+        );
+        for decoration in decorations {
+            self.push(
+                fragment,
+                PaintPhase::TextDecoration,
+                decoration.rect,
+                coordinate_space,
+                DisplayCommand::TextDecoration(decoration),
+            );
+        }
+    }
+
+    /// Resolves the decoration lines that apply to a text run.
+    ///
+    /// CSS propagates decorations to descendant inline boxes, so a
+    /// `text-decoration: underline` on a block underlines every run inside it
+    /// (CSS Text Decoration Level 3 §2). The cascade does not implement that
+    /// propagation yet, so paint approximates it by walking formatting
+    /// ancestors and taking the first decoration that specifies a line: for the
+    /// common `a`, `u`, `abbr` and heading cases that is exact, but an
+    /// intermediate inline that sets `text-decoration-line: none` does not yet
+    /// switch the decoration back off. Moving this into render-css is the
+    /// correct fix; the walk then disappears.
+    ///
+    /// Style, colour and thickness come from the run's own element rather than
+    /// the ancestor that supplied the line, which is where the specification
+    /// looks for them.
+    fn text_decorations(
+        &self,
+        fragment: &Fragment,
+        font_size: f32,
+        baseline: f32,
+        current_color: Color,
+    ) -> Vec<TextDecoration> {
+        let Some(lines) = self.inherited_text_decoration(fragment) else {
+            return Vec::new();
+        };
+        let style = self
+            .formatting
+            .get(fragment.formatting_node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        let color = style
+            .and_then(|style| style.get("text-decoration-color"))
+            .and_then(|value| parse_typed_property("color", &value.parseable_css()))
+            .and_then(|value| match value {
+                Ok(TypedPropertyValue::Color(color)) => Some(color),
+                _ => None,
+            })
+            .map_or(current_color, |color| {
+                self.options.palette.resolve(color, current_color)
+            });
+        let line_style = decoration_style(style);
+        let thickness = decoration_thickness(style, font_size);
+        lines
+            .into_iter()
+            .map(|line| TextDecoration {
+                rect: decoration_rect(fragment.rect, line, baseline, font_size, thickness),
+                color,
+                line,
+                style: line_style,
+                thickness,
+            })
+            .collect()
+    }
+
+    /// Walks formatting ancestors for the first element that specifies a
+    /// `text-decoration-line` other than `none`.
+    fn inherited_text_decoration(&self, fragment: &Fragment) -> Option<DecorationLines> {
+        let mut node = self
+            .formatting
+            .get(fragment.formatting_node)
+            .map(|node| node.id);
+        while let Some(current) = node {
+            let source = self
+                .formatting
+                .get(current)
+                .and_then(|node| node.style_source);
+            if let Some(line) = source
+                .and_then(|source| self.styles.get(&source))
+                .and_then(decoration_lines_from_style)
+            {
+                return Some(line);
+            }
+            node = self.formatting_parent(current);
+        }
+        None
+    }
+
+    /// Paints the marker of a `display: list-item` box.
+    ///
+    /// Marker geometry is user-agent defined (CSS Lists Level 3 §3.1): the
+    /// marker box sits outside the principal block box by default and is
+    /// emitted as its own command so paint, not layout, owns its placement.
+    /// `list-style-position: outside` puts the marker to the leading side of
+    /// the content edge; `inside` puts it at the content origin, where the
+    /// principal box's own text follows it.
+    fn paint_list_marker(
+        &mut self,
+        fragment: &Fragment,
+        geometry: &crate::layout::BoxGeometry,
+        style: &ComputedStyle,
+        current_color: Color,
+        coordinate_space: PaintCoordinateSpace,
+    ) {
+        // The marker belongs to the list item's own principal box (CSS 2.1
+        // §12.5). The anonymous block that wraps a list item's inline content
+        // inherits the item's `display: list-item` through its style source,
+        // so the test is on the box's own element: an anonymous box carries no
+        // element, and an element whose `display` was changed away from
+        // `list-item` generates no `::marker` at all.
+        let Some(source) = fragment.source else {
+            return;
+        };
+        if !self.styles.get(&source).is_some_and(is_list_item) {
+            return;
+        }
+        let Some(marker) = self.list_style_type(fragment) else {
+            return;
+        };
+        // The marker shares the list item's first-line baseline, which paint
+        // only learns from the item's first text fragment.
+        let Some(baseline) = self.first_line_baseline(fragment) else {
+            return;
+        };
+        let font_size = style_font_size(style);
+        let color = self.options.palette.resolve(
+            typed_color(style, "color").unwrap_or(CssColor::CurrentColor),
+            current_color,
+        );
+        let inside = self.list_style_position(fragment) == ListStylePosition::Inside;
+        let gap = marker_gap(font_size);
+        match marker {
+            ListMarker::Bullet(shape) => {
+                let size = bullet_size(font_size);
+                let rect = PhysicalRect::new(
+                    marker_origin_x(geometry.content_rect, gap, inside, size),
+                    baseline - font_size * BULLET_ASCENT,
+                    size,
+                    size,
+                );
+                self.push(
+                    fragment,
+                    PaintPhase::Content,
+                    rect,
+                    coordinate_space,
+                    DisplayCommand::ListMarker(ListMarkerPaint { rect, color, shape }),
+                );
+            }
+            ListMarker::Ordered { ordinal, kind } => {
+                // Ordered markers are text, so they shape and paint exactly like
+                // any other run: only their origin differs from the item's.
+                let text = format_list_marker(kind, ordinal);
+                let run = self.shaper.shape(
+                    &text,
+                    font_size,
+                    PhysicalPoint {
+                        x: 0.0,
+                        y: baseline,
+                    },
+                    color,
+                );
+                let width = run_advance(&run);
+                let origin_x = marker_origin_x(geometry.content_rect, gap, inside, width);
+                let run = offset_run(run, origin_x);
+                let rect = PhysicalRect::new(
+                    origin_x,
+                    baseline - font_size * ASCENT_RATIO,
+                    width,
+                    font_size,
+                );
+                self.glyphs = self.glyphs.saturating_add(run.glyphs.len());
+                self.push(
+                    fragment,
+                    PaintPhase::Content,
+                    rect,
+                    coordinate_space,
+                    DisplayCommand::GlyphRun(run),
+                );
+            }
+        }
+    }
+
+    /// The baseline of the first text fragment in a box's subtree, which is the
+    /// first line box's baseline for ordinary flow content.
+    fn first_line_baseline(&self, fragment: &Fragment) -> Option<f32> {
+        self.first_text_baseline(fragment, 0)
+    }
+
+    fn first_text_baseline(&self, fragment: &Fragment, depth: u32) -> Option<f32> {
+        if depth > MARKER_BASELINE_DEPTH {
+            return None;
+        }
+        if let FragmentKind::Text(text) = &fragment.kind {
+            return Some(text.baseline);
+        }
+        fragment.children.iter().find_map(|child| {
+            self.fragments
+                .get(*child)
+                .and_then(|child| self.first_text_baseline(child, depth.saturating_add(1)))
+        })
+    }
+
+    /// Resolves `list-style-type` for a list item, which CSS defines as an
+    /// inherited property. Neither it nor `list-style-position` is a registered
+    /// property yet, so the computed map only carries a value on elements that
+    /// declare one themselves; paint therefore takes the value from the nearest
+    /// formatting ancestor that specifies it, which is what inheritance would
+    /// produce unless an intermediate element resets it. Registering both in
+    /// render-css makes this walk redundant.
+    fn list_style_type(&self, fragment: &Fragment) -> Option<ListMarker> {
+        let kind = self.inherited_style_value(fragment, "list-style-type", ListStyleType::parse)?;
+        let ordinal = self.list_item_ordinal(fragment);
+        Some(match kind {
+            ListStyleType::None => return None,
+            ListStyleType::Bullet(shape) => ListMarker::Bullet(shape),
+            ListStyleType::Ordered(kind) => ListMarker::Ordered { ordinal, kind },
+        })
+    }
+
+    fn list_style_position(&self, fragment: &Fragment) -> ListStylePosition {
+        self.inherited_style_value(fragment, "list-style-position", ListStylePosition::parse)
+            .unwrap_or(ListStylePosition::Outside)
+    }
+
+    /// The one-based position of a list item among the list items that precede
+    /// it in the same list, which is the value its marker renders.
+    ///
+    /// `start`, `reversed` and `value` on `ol`/`li` change the first and
+    /// individual ordinals; those attributes are not visible to paint, which
+    /// has no DOM, so they are not applied yet.
+    fn list_item_ordinal(&self, fragment: &Fragment) -> u32 {
+        let Some(node) = self.formatting.get(fragment.formatting_node) else {
+            return 1;
+        };
+        let Some(parent) = self
+            .formatting_parent(node.id)
+            .and_then(|id| self.formatting.get(id))
+        else {
+            return 1;
+        };
+        let mut ordinal = 1;
+        for sibling in &parent.children {
+            if *sibling == node.id {
+                break;
+            }
+            if self
+                .formatting
+                .get(*sibling)
+                .and_then(|sibling| sibling.style_source)
+                .and_then(|source| self.styles.get(&source))
+                .is_some_and(is_list_item)
+            {
+                ordinal += 1;
+            }
+        }
+        ordinal
+    }
+
+    /// Nearest specified value of a property that is inherited by CSS but not
+    /// registered in the computed-value registry, searched from the run's own
+    /// element outwards.
+    fn inherited_style_value<T>(
+        &self,
+        fragment: &Fragment,
+        property: &str,
+        parse: impl Fn(&str) -> Option<T>,
+    ) -> Option<T> {
+        let mut node = Some(fragment.formatting_node);
+        while let Some(current) = node {
+            let style = self
+                .formatting
+                .get(current)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            if let Some(value) = style
+                .and_then(|style| style.get(property))
+                .and_then(|value| parse(value.css_text()))
+            {
+                return Some(value);
+            }
+            node = self.formatting_parent(current);
+        }
+        None
+    }
+
+    fn formatting_parent(&self, id: FormattingNodeId) -> Option<FormattingNodeId> {
+        self.formatting_parents
+            .get(id.as_u32() as usize)
+            .copied()
+            .flatten()
     }
 
     fn paint_image(
@@ -1947,6 +2341,450 @@ fn typed_color(style: &ComputedStyle, property: &str) -> Option<CssColor> {
     }
 }
 
+// --- text decorations -------------------------------------------------------
+
+/// Distance from the baseline to the alphabetic top of the reference em box,
+/// the same ratio the reference text measurer uses for ascent
+/// (`render-layout`'s `SimpleTextMeasurer`). Line positions are measured from
+/// it because paint has no font metrics beyond the computed font size.
+const ASCENT_RATIO: f32 = 0.8;
+/// A bullet's diameter, as a fraction of the font size.
+const BULLET_RATIO: f32 = 0.25;
+/// A bullet's top edge above the baseline, as a fraction of the font size.
+const BULLET_ASCENT: f32 = 0.75;
+/// The gap between an outside marker and the content edge, as a fraction of
+/// the font size.
+const MARKER_GAP_RATIO: f32 = 0.35;
+/// The smallest marker and gap that stays visible at small font sizes.
+const MARKER_MINIMUM: f32 = 2.0;
+/// How far the marker baseline search descends from a list item's box. Inline
+/// content is a handful of levels deep; the bound keeps a pathological tree
+/// from turning marker placement into a full subtree walk.
+const MARKER_BASELINE_DEPTH: u32 = 16;
+/// An automatic decoration thickness, as a fraction of the font size
+/// (CSS Text Decoration Level 3 §2: the used value is a UA-chosen length).
+const DECORATION_THICKNESS_RATIO: f32 = 0.0625;
+const DECORATION_THICKNESS_MINIMUM: f32 = 1.0;
+/// Where an automatic decoration line sits relative to the baseline. CSS
+/// leaves these to the user agent (CSS Text Decoration Level 3 §4.1); the
+/// values below place the overline at the top of the em box, the underline
+/// just below the baseline, and the line-through near the x-height.
+const OVERLINE_OFFSET: f32 = -0.95;
+const LINE_THROUGH_OFFSET: f32 = -0.28;
+const UNDERLINE_OFFSET: f32 = 0.12;
+
+type DecorationLines = Vec<TextDecorationLine>;
+
+fn decoration_lines_from_style(style: &ComputedStyle) -> Option<DecorationLines> {
+    let raw = style
+        .get("text-decoration-line")
+        .map(ComputedValue::css_text)
+        .or_else(|| {
+            // The `text-decoration` shorthand is not expanded by the cascade
+            // yet (render-css), so a sheet that uses the shorthand stores the
+            // whole declaration under its own name. Read the line component
+            // out of it here rather than leaving real underlines unpainted;
+            // once the shorthand expands, this fallback stops matching.
+            style.get("text-decoration").map(ComputedValue::css_text)
+        })?;
+    let lines = decoration_lines(raw);
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn decoration_lines(value: &str) -> DecorationLines {
+    let mut lines = Vec::new();
+    for token in split_css_whitespace(value) {
+        let line = if token.eq_ignore_ascii_case("underline") {
+            TextDecorationLine::Underline
+        } else if token.eq_ignore_ascii_case("overline") {
+            TextDecorationLine::Overline
+        } else if token.eq_ignore_ascii_case("line-through") {
+            TextDecorationLine::LineThrough
+        } else {
+            continue;
+        };
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn decoration_style(style: Option<&ComputedStyle>) -> TextDecorationStyle {
+    let Some(style) = style else {
+        return TextDecorationStyle::Solid;
+    };
+    let raw = style
+        .get("text-decoration-style")
+        .map(ComputedValue::css_text)
+        .unwrap_or_default();
+    if raw.trim().eq_ignore_ascii_case("double") {
+        TextDecorationStyle::Double
+    } else if raw.trim().eq_ignore_ascii_case("dotted") {
+        TextDecorationStyle::Dotted
+    } else if raw.trim().eq_ignore_ascii_case("dashed") {
+        TextDecorationStyle::Dashed
+    } else if raw.trim().eq_ignore_ascii_case("wavy") {
+        TextDecorationStyle::Wavy
+    } else {
+        TextDecorationStyle::Solid
+    }
+}
+
+/// The stroke thickness for a decoration line. `auto` picks a length from the
+/// font size, which is what CSS leaves to the user agent (CSS Text
+/// Decoration Level 3 §2); an explicit length is used as written, so
+/// `text-decoration-thickness: 0` really does mean no stroke.
+fn decoration_thickness(style: Option<&ComputedStyle>, font_size: f32) -> f32 {
+    if let Some(value) = style
+        .and_then(|style| style.get("text-decoration-thickness"))
+        .map(ComputedValue::css_text)
+        .and_then(|value| parse_shadow_length(value.trim()))
+    {
+        return value.max(0.0);
+    }
+    (font_size * DECORATION_THICKNESS_RATIO).max(DECORATION_THICKNESS_MINIMUM)
+}
+
+/// The stroke rectangle of one decoration line over a text run: the run's
+/// horizontal extent, with the line's own top edge and thickness.
+fn decoration_rect(
+    run: PhysicalRect,
+    line: TextDecorationLine,
+    baseline: f32,
+    font_size: f32,
+    thickness: f32,
+) -> PhysicalRect {
+    let offset = match line {
+        TextDecorationLine::Overline => OVERLINE_OFFSET,
+        TextDecorationLine::LineThrough => LINE_THROUGH_OFFSET,
+        TextDecorationLine::Underline => UNDERLINE_OFFSET,
+    };
+    PhysicalRect::new(
+        run.origin.x,
+        baseline + offset * font_size,
+        run.size.width,
+        thickness,
+    )
+}
+
+/// `text-shadow` layers in paint order: the first layer paints furthest back
+/// (CSS Text Decoration Level 3 §4.2).
+fn text_shadows(
+    style: Option<&ComputedStyle>,
+    current_color: Color,
+    palette: SystemPalette,
+) -> Vec<ShadowLayer> {
+    let Some(value) = style.and_then(|style| style.get("text-shadow")) else {
+        return Vec::new();
+    };
+    let raw = value.css_text();
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let mut layers = Vec::new();
+    for layer in split_gradient_arguments(raw) {
+        if let Some(shadow) = parse_text_shadow(layer, current_color, palette) {
+            layers.push(shadow);
+        }
+    }
+    layers
+}
+
+/// The offset, blur and colour of one `text-shadow` layer, before the run's
+/// own font and geometry are attached.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShadowLayer {
+    offset: PhysicalPoint,
+    blur_radius: f32,
+    color: Color,
+}
+
+fn parse_text_shadow(
+    value: &str,
+    current_color: Color,
+    palette: SystemPalette,
+) -> Option<ShadowLayer> {
+    let mut color = None;
+    let mut lengths = Vec::new();
+    for token in split_css_whitespace(value) {
+        if color.is_none()
+            && let Some(Ok(TypedPropertyValue::Color(parsed))) =
+                parse_typed_property("color", token)
+        {
+            color = Some(palette.resolve(parsed, current_color));
+        } else if let Some(length) = parse_shadow_length(token) {
+            lengths.push(length);
+        }
+    }
+    if lengths.len() < 2 {
+        return None;
+    }
+    Some(ShadowLayer {
+        offset: PhysicalPoint {
+            x: lengths[0],
+            y: lengths[1],
+        },
+        blur_radius: lengths.get(2).copied().unwrap_or(0.0).max(0.0),
+        color: color.unwrap_or(current_color),
+    })
+}
+
+/// The shadow's damage bounds: the run box displaced by the offset and grown
+/// by the blur radius, which is where the rasterized shadow can reach.
+fn text_shadow_bounds(shadow: &TextShadowPaint, run: PhysicalRect) -> PhysicalRect {
+    let blur = shadow.blur_radius;
+    PhysicalRect::new(
+        run.origin.x + shadow.offset.x - blur,
+        run.origin.y + shadow.offset.y - blur,
+        run.size.width + blur * 2.0,
+        run.size.height + blur * 2.0,
+    )
+}
+
+// --- list markers -----------------------------------------------------------
+
+/// The marker a list item renders, once `list-style-type` has been resolved
+/// against the item's position in its list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListMarker {
+    Bullet(ListMarkerShape),
+    Ordered {
+        ordinal: u32,
+        kind: OrderedListStyle,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListStylePosition {
+    Outside,
+    Inside,
+}
+
+/// The `list-style-type` families this engine renders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListStyleType {
+    None,
+    Bullet(ListMarkerShape),
+    Ordered(OrderedListStyle),
+}
+
+/// The ordered marker families named by CSS Lists Level 3 §3.1 that have a
+/// direct textual form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderedListStyle {
+    Decimal,
+    DecimalLeadingZero,
+    LowerAlpha,
+    UpperAlpha,
+    LowerLatin,
+    UpperLatin,
+    LowerRoman,
+    UpperRoman,
+}
+
+impl ListStyleType {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("none") {
+            Some(Self::None)
+        } else if value.eq_ignore_ascii_case("disc") {
+            Some(Self::Bullet(ListMarkerShape::Disc))
+        } else if value.eq_ignore_ascii_case("circle") {
+            Some(Self::Bullet(ListMarkerShape::Circle))
+        } else if value.eq_ignore_ascii_case("square") {
+            Some(Self::Bullet(ListMarkerShape::Square))
+        } else {
+            OrderedListStyle::parse(value).map(Self::Ordered)
+        }
+    }
+}
+
+impl ListStylePosition {
+    fn parse(value: &str) -> Option<Self> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("inside") {
+            Some(Self::Inside)
+        } else if value.eq_ignore_ascii_case("outside") {
+            Some(Self::Outside)
+        } else {
+            None
+        }
+    }
+}
+
+impl OrderedListStyle {
+    fn parse(value: &str) -> Option<Self> {
+        let kind = if value.eq_ignore_ascii_case("decimal") {
+            Self::Decimal
+        } else if value.eq_ignore_ascii_case("decimal-leading-zero") {
+            Self::DecimalLeadingZero
+        } else if value.eq_ignore_ascii_case("lower-alpha") {
+            Self::LowerAlpha
+        } else if value.eq_ignore_ascii_case("upper-alpha") {
+            Self::UpperAlpha
+        } else if value.eq_ignore_ascii_case("lower-latin") {
+            Self::LowerLatin
+        } else if value.eq_ignore_ascii_case("upper-latin") {
+            Self::UpperLatin
+        } else if value.eq_ignore_ascii_case("lower-roman") {
+            Self::LowerRoman
+        } else if value.eq_ignore_ascii_case("upper-roman") {
+            Self::UpperRoman
+        } else {
+            return None;
+        };
+        Some(kind)
+    }
+}
+
+/// True when the element generates a `::marker`, which CSS restricts to
+/// `display: list-item` boxes.
+fn is_list_item(style: &ComputedStyle) -> bool {
+    matches!(
+        style.typed("display"),
+        Some(TypedPropertyValue::Display(Display::Normal {
+            list_item: true,
+            ..
+        }))
+    )
+}
+
+fn bullet_size(font_size: f32) -> f32 {
+    (font_size * BULLET_RATIO).max(MARKER_MINIMUM)
+}
+
+fn marker_gap(font_size: f32) -> f32 {
+    (font_size * MARKER_GAP_RATIO).max(MARKER_MINIMUM)
+}
+
+/// Where the marker box starts relative to the list item's content box.
+/// `outside` places it before the content edge, separated by `gap`; `inside`
+/// places it at the content origin so the item's own text follows it.
+fn marker_origin_x(content: PhysicalRect, gap: f32, inside: bool, width: f32) -> f32 {
+    if inside {
+        content.origin.x
+    } else {
+        content.origin.x - gap - width
+    }
+}
+
+/// Formats an ordinal in its ordered marker family. The `.` suffix is the
+/// default `suff` of the UA counter styles.
+fn format_list_marker(kind: OrderedListStyle, ordinal: u32) -> String {
+    let text = match kind {
+        OrderedListStyle::Decimal => ordinal.to_string(),
+        OrderedListStyle::DecimalLeadingZero => format!("{ordinal:02}"),
+        OrderedListStyle::LowerAlpha | OrderedListStyle::LowerLatin => {
+            alphabetic_marker(ordinal, false)
+        }
+        OrderedListStyle::UpperAlpha | OrderedListStyle::UpperLatin => {
+            alphabetic_marker(ordinal, true)
+        }
+        OrderedListStyle::LowerRoman => roman_marker(ordinal, false),
+        OrderedListStyle::UpperRoman => roman_marker(ordinal, true),
+    };
+    format!("{text}.")
+}
+
+/// The alphabetic series of CSS Lists Level 3 §3.1: `a`..`z`, then `aa`..`zz`,
+/// bijectively base-26.
+///
+/// The *Latin* series is specified as the Latin alphabet, which extends past
+/// the 26 ASCII letters; only the ASCII part is implemented here, so the Latin
+/// families render as their alphabetic counterparts. The Unicode extension is a
+/// follow-up, not a silent difference: an ordinal past 26 already rolls over to
+/// `aa`, which is where the two series agree.
+fn alphabetic_marker(ordinal: u32, upper: bool) -> String {
+    // CSS Lists 3 §3.1: the series repeats `a`..`z`, then `aa`..`zz`,
+    // bijectively base-26, least significant letter first.
+    if ordinal == 0 {
+        return String::new();
+    }
+    let mut index = ordinal - 1;
+    let mut letters: Vec<char> = Vec::new();
+    while {
+        letters.push((b'a' + u8::try_from(index % 26).unwrap_or(0)) as char);
+        index /= 26;
+        index > 0
+    } {}
+    let ordered = if upper {
+        letters
+            .into_iter()
+            .map(|letter| letter.to_ascii_uppercase())
+            .collect::<Vec<_>>()
+    } else {
+        letters
+    };
+    ordered.iter().rev().collect()
+}
+
+fn roman_marker(ordinal: u32, upper: bool) -> String {
+    const VALUES: [(u32, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    // CSS Lists 3 §3.1 defines no roman representation past 3999; the
+    // algorithm below produces empty text there, so the ordinal falls back to
+    // its decimal form rather than an empty marker.
+    if ordinal == 0 || ordinal > 3999 {
+        return ordinal.to_string();
+    }
+    let mut remaining = ordinal;
+    let mut text = String::new();
+    for (value, symbol) in VALUES {
+        while remaining >= value {
+            text.push_str(symbol);
+            remaining -= value;
+        }
+    }
+    if upper {
+        text.to_ascii_uppercase()
+    } else {
+        text
+    }
+}
+
+/// The advance width a shaped run covers, which is the marker box width for an
+/// ordered marker.
+fn run_advance(run: &GlyphRun) -> f32 {
+    run.glyphs.last().map_or(0.0, |glyph| {
+        glyph.position.x + glyph.advance - glyphs_start(run)
+    })
+}
+
+fn glyphs_start(run: &GlyphRun) -> f32 {
+    run.glyphs.first().map_or(0.0, |glyph| glyph.position.x)
+}
+
+fn offset_run(run: GlyphRun, x: f32) -> GlyphRun {
+    GlyphRun {
+        glyphs: run
+            .glyphs
+            .into_iter()
+            .map(|glyph| GlyphInstance {
+                position: PhysicalPoint {
+                    x: glyph.position.x + x,
+                    ..glyph.position
+                },
+                ..glyph
+            })
+            .collect(),
+        ..run
+    }
+}
+
 fn border_paint(
     style: Option<&ComputedStyle>,
     geometry: &crate::layout::BoxGeometry,
@@ -1997,6 +2835,12 @@ const fn is_wide_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Decoration, marker and shadow geometry is resolved from exact font-size
+    // fractions, so the assertions below compare exact values on purpose.
+    #![allow(
+        clippy::float_cmp,
+        reason = "geometry under test is computed from exact font-size fractions"
+    )]
     use crate::css::cascade::{CascadeInput, CascadeOrigin};
     use crate::css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
     use crate::css::properties::ObjectFit;
@@ -2005,15 +2849,17 @@ mod tests {
     use crate::dom::NodeId;
     use crate::html::{ParseOutput, parse_document};
     use crate::layout::{
-        FormattingLimits, FragmentKind, LayoutOptions, PhysicalRect, SimpleTextMeasurer,
-        build_formatting_tree, layout_formatting_tree,
+        FormattingLimits, FragmentKind, LayoutOptions, PhysicalPoint, PhysicalRect,
+        SimpleTextMeasurer, build_formatting_tree, layout_formatting_tree,
     };
     use crate::paint::Color;
 
     use super::{
         Builder, ClipShape, CompositingReason, DisplayCommand, DisplayListBuildOutput,
-        DisplayListBuilderOptions, ImagePaint, ReferenceTextShaper, StackingContext, Transform2D,
-        build_display_list, build_display_list_with_images,
+        DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint, ListMarkerShape,
+        ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
+        TextDecorationStyle, TextShadowPaint, Transform2D, build_display_list,
+        build_display_list_with_images,
     };
 
     #[test]
@@ -2212,7 +3058,7 @@ mod tests {
     #[test]
     fn linear_gradient_background_becomes_a_paint_command() {
         let output =
-            parse_document("<!doctype html><body><button id=search>百度一下</button></body>");
+            parse_document("<!doctype html><body><button id=search>百度一�?/button></body>");
         let sheet = parse_stylesheet(
             "html, body { display:block; margin:0 } #search { display:block; width:120px; height:40px; color:white; background:linear-gradient(90deg, #286aff, #9f66ff); }",
         );
@@ -2967,7 +3813,7 @@ mod tests {
         assert!(!scale.is_translation());
         assert_eq!(scale.apply(4.0, 5.0), (8.0, 15.0));
 
-        // `then` applies its argument first: scale ∘ translation.
+        // `then` applies its argument first: scale �?translation.
         let composed = scale.then(&translation);
         assert_eq!(composed.apply(1.0, 1.0), (12.0, 24.0));
 
@@ -2983,5 +3829,369 @@ mod tests {
             .is_none()
         );
         assert!(Transform2D::default().is_identity());
+    }
+
+    /// Builds a display list from an arbitrary body and one author sheet.
+    fn paint_body(html: &str, css: &str) -> (ParseOutput, DisplayListBuildOutput) {
+        let output = parse_document(&format!("<!doctype html><body>{html}</body>"));
+        let sheet = parse_stylesheet(css);
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(display.diagnostics.is_empty(), "{:?}", display.diagnostics);
+        (output, display)
+    }
+
+    /// The reference shaper maps one glyph per `char`, so a run's text is
+    /// exactly its glyph ids read back as characters.
+    fn run_text(run: &GlyphRun) -> String {
+        run.glyphs
+            .iter()
+            .map(|glyph| char::from_u32(glyph.glyph.0).unwrap_or('\u{fffd}'))
+            .collect()
+    }
+
+    /// Text runs carry the text node as their source, so tests select them by
+    /// their content rather than by an element id.
+    fn text_runs(display: &DisplayListBuildOutput) -> Vec<GlyphRun> {
+        display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::GlyphRun(run) => Some(run.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn decorations(display: &DisplayListBuildOutput) -> Vec<TextDecoration> {
+        display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::TextDecoration(decoration) => Some(*decoration),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn shadows(display: &DisplayListBuildOutput) -> Vec<TextShadowPaint> {
+        display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::TextShadow(shadow) => Some(*shadow),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn markers(display: &DisplayListBuildOutput) -> Vec<ListMarkerPaint> {
+        display
+            .list
+            .items()
+            .iter()
+            .filter_map(|item| match &item.command {
+                DisplayCommand::ListMarker(marker) => Some(*marker),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn marker_labels(display: &DisplayListBuildOutput) -> Vec<String> {
+        text_runs(display)
+            .iter()
+            .map(run_text)
+            .filter(|text| text.ends_with('.'))
+            .collect()
+    }
+
+    #[test]
+    fn underline_paints_one_stroke_spanning_the_run() {
+        let (_, display) = paint_body(
+            "<p id=t>Hi</p>",
+            "html, body { display:block; margin:0 } \
+             #t { display:block; text-decoration-line:underline }",
+        );
+        let runs = text_runs(&display);
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        let found = decorations(&display);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let decoration = found[0];
+        assert_eq!(decoration.line, TextDecorationLine::Underline);
+        assert_eq!(decoration.style, TextDecorationStyle::Solid);
+        assert_eq!(decoration.color, Color::rgb(0, 0, 0));
+        // An automatic thickness at the 16px default font size is one pixel.
+        assert_eq!(decoration.thickness, 1.0);
+        assert_eq!(decoration.rect.size.height, 1.0);
+        // The stroke spans the whole run and sits just below its baseline.
+        let first = runs[0].glyphs.first().expect("run has glyphs");
+        let last = runs[0].glyphs.last().expect("run has glyphs");
+        assert_eq!(decoration.rect.origin.x, first.position.x);
+        assert_eq!(
+            decoration.rect.size.width,
+            last.position.x + last.advance - first.position.x
+        );
+        assert!(
+            decoration.rect.origin.y >= first.position.y,
+            "underline must not cross the baseline: {:?} vs {}",
+            decoration.rect,
+            first.position.y
+        );
+    }
+
+    #[test]
+    fn overline_and_line_through_bracket_the_baseline() {
+        let (_, display) = paint_body(
+            "<p id=t>Hi</p>",
+            "html, body { display:block; margin:0 } \
+             #t { display:block; text-decoration-line:overline line-through }",
+        );
+        let mut found = decorations(&display);
+        found.sort_by_key(|decoration| match decoration.line {
+            TextDecorationLine::Overline => 0,
+            TextDecorationLine::LineThrough => 1,
+            TextDecorationLine::Underline => 2,
+        });
+        assert_eq!(found.len(), 2, "{found:?}");
+        let baseline = text_runs(&display)[0].glyphs[0].position.y;
+        assert_eq!(found[0].line, TextDecorationLine::Overline);
+        assert_eq!(found[1].line, TextDecorationLine::LineThrough);
+        assert!(found[0].rect.origin.y < baseline);
+        assert!(found[1].rect.origin.y < baseline);
+        assert!(found[0].rect.origin.y < found[1].rect.origin.y);
+    }
+
+    #[test]
+    fn decoration_colour_style_and_thickness_come_from_the_element() {
+        let (_, display) = paint_body(
+            "<p id=t>Hi</p>",
+            "html, body { display:block; margin:0 } \
+             #t { display:block; text-decoration-line:underline; \
+                   text-decoration-color:#ff0000; text-decoration-style:dashed; \
+                   text-decoration-thickness:3px }",
+        );
+        let found = decorations(&display);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].color, Color::rgb(255, 0, 0));
+        assert_eq!(found[0].style, TextDecorationStyle::Dashed);
+        assert_eq!(found[0].thickness, 3.0);
+        assert_eq!(found[0].rect.size.height, 3.0);
+    }
+
+    #[test]
+    fn decoration_reaches_runs_inside_descendant_inlines() {
+        // CSS Text Decoration 3 §2: a decoration set on a box is propagated to
+        // every line box it contains. The cascade does not implement that
+        // propagation, so paint walks formatting ancestors; this is the case
+        // that walk exists for.
+        let (_, display) = paint_body(
+            "<p id=p><em><span id=t>Hi</span></em></p>",
+            "html, body, p { display:block; margin:0 } \
+             #p { text-decoration-line:underline }",
+        );
+        let found = decorations(&display);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].line, TextDecorationLine::Underline);
+    }
+
+    #[test]
+    fn an_undecorated_run_paints_no_decoration_or_shadow() {
+        let (_, display) = paint_body(
+            "<p id=t>Hi</p>",
+            "html, body { display:block; margin:0 } #t { display:block }",
+        );
+        assert!(decorations(&display).is_empty());
+        assert!(shadows(&display).is_empty());
+    }
+
+    #[test]
+    fn text_shadow_layers_become_commands_ahead_of_their_run() {
+        let (_, display) = paint_body(
+            "<p id=t>Hi</p>",
+            "html, body { display:block; margin:0 } \
+             #t { display:block; text-shadow:2px 3px 4px #ff0000, 1px 1px #000000 }",
+        );
+        let found = shadows(&display);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].offset, PhysicalPoint { x: 2.0, y: 3.0 });
+        assert_eq!(found[0].blur_radius, 4.0);
+        assert_eq!(found[0].color, Color::rgb(255, 0, 0));
+        assert_eq!(found[1].offset, PhysicalPoint { x: 1.0, y: 1.0 });
+        assert_eq!(found[1].blur_radius, 0.0);
+        assert_eq!(found[1].color, Color::rgb(0, 0, 0));
+
+        // Each shadow is emitted before the run it describes, and its damage
+        // bounds cover the run grown by the blur.
+        let run_index = display
+            .list
+            .items()
+            .iter()
+            .position(|item| matches!(item.command, DisplayCommand::GlyphRun(_)))
+            .expect("run painted");
+        let shadow_indices = display
+            .list
+            .items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item.command, DisplayCommand::TextShadow(_)))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(shadow_indices.len(), 2);
+        for index in shadow_indices {
+            let item = &display.list.items()[index];
+            let DisplayCommand::TextShadow(shadow) = item.command else {
+                unreachable!("filtered to shadows");
+            };
+            assert!(index < run_index, "a shadow must precede its run");
+            assert_eq!(shadow.run, item.id.fragment_hint);
+            assert!(item.bounds.size.width > 0.0 && item.bounds.size.height > 0.0);
+        }
+    }
+
+    #[test]
+    fn unordered_items_paint_a_disc_beside_the_content_edge() {
+        let (_, display) = paint_body(
+            "<ul><li>Hi</li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px; list-style-type:disc } \
+             li { display:list-item }",
+        );
+        let found = markers(&display);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let marker = found[0];
+        assert_eq!(marker.shape, ListMarkerShape::Disc);
+        // A quarter-em bullet at 16px, and clear of the item's own text.
+        assert_eq!(marker.rect.size.width, 4.0);
+        assert_eq!(marker.rect.size.height, 4.0);
+        let text_x = text_runs(&display)[0].glyphs[0].position.x;
+        assert!(
+            marker.rect.right() < text_x,
+            "outside marker must precede the content: {:?} vs {text_x}",
+            marker.rect
+        );
+        assert_eq!(marker.color, Color::rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn ordered_items_paint_their_ordinal() {
+        let (_, display) = paint_body(
+            "<ol><li>one</li><li>two</li><li>three</li></ol>",
+            "html, body { display:block; margin:0 } \
+             ol { display:block; padding-left:40px; list-style-type:decimal } \
+             li { display:list-item }",
+        );
+        assert_eq!(marker_labels(&display), vec!["1.", "2.", "3."]);
+        assert!(markers(&display).is_empty(), "ordered markers are text");
+    }
+
+    #[test]
+    fn ordered_markers_follow_their_family() {
+        let cases = [
+            ("decimal-leading-zero", vec!["01.", "02.", "03."]),
+            ("lower-alpha", vec!["a.", "b.", "c."]),
+            ("upper-alpha", vec!["A.", "B.", "C."]),
+            ("lower-roman", vec!["i.", "ii.", "iii."]),
+            ("upper-roman", vec!["I.", "II.", "III."]),
+            ("lower-latin", vec!["a.", "b.", "c."]),
+            ("upper-latin", vec!["A.", "B.", "C."]),
+        ];
+        for (family, expected) in cases {
+            let (_, display) = paint_body(
+                "<ol><li>a</li><li>b</li><li>c</li></ol>",
+                &format!(
+                    "html, body {{ display:block; margin:0 }} \
+                     ol {{ display:block; padding-left:40px; list-style-type:{family} }} \
+                     li {{ display:list-item }}"
+                ),
+            );
+            assert_eq!(marker_labels(&display), expected, "{family}");
+        }
+    }
+
+    #[test]
+    fn nested_lists_take_their_own_marker_family() {
+        let (_, display) = paint_body(
+            "<ul><li>a<ul><li>x</li></ul></li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px } \
+             li { display:list-item } \
+             ul > li { list-style-type:disc } \
+             ul ul > li { list-style-type:circle }",
+        );
+        let shapes = markers(&display)
+            .iter()
+            .map(|marker| marker.shape)
+            .collect::<Vec<_>>();
+        assert_eq!(shapes, vec![ListMarkerShape::Disc, ListMarkerShape::Circle]);
+    }
+
+    #[test]
+    fn inside_markers_start_at_the_content_edge() {
+        let (_, outside_display) = paint_body(
+            "<ul><li>Hi</li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px; list-style-type:disc } \
+             li { display:list-item }",
+        );
+        let (_, inside_display) = paint_body(
+            "<ul><li>Hi</li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px; list-style-type:disc } \
+             li { display:list-item; list-style-position:inside }",
+        );
+        let outside_marker = markers(&outside_display)[0].rect;
+        let inside_marker = markers(&inside_display)[0].rect;
+        let outside_text = text_runs(&outside_display)[0].glyphs[0].position.x;
+        let inside_text = text_runs(&inside_display)[0].glyphs[0].position.x;
+        assert!(outside_marker.origin.x < outside_text);
+        assert_eq!(inside_marker.origin.x, inside_text);
+    }
+
+    #[test]
+    fn no_marker_is_painted_when_the_item_loses_its_list_display() {
+        let (_, display) = paint_body(
+            "<ul><li>Hi</li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px; list-style-type:disc } \
+             li { display:block }",
+        );
+        assert!(markers(&display).is_empty());
+    }
+
+    #[test]
+    fn list_style_type_none_paints_no_marker() {
+        let (_, display) = paint_body(
+            "<ul><li>Hi</li></ul>",
+            "html, body { display:block; margin:0 } \
+             ul { display:block; padding-left:40px; list-style-type:none } \
+             li { display:list-item }",
+        );
+        assert!(markers(&display).is_empty());
     }
 }

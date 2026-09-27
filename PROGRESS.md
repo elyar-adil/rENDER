@@ -1,61 +1,105 @@
-# 进度记录 — 百度页面支持（2026-08-24）
+# Progress and Current State
 
-## 已完成
+This page is a pointer and a working inventory. It is not the log.
 
-### 栈溢出修复（render-browser/src/main.rs）
-- `main()` 在 512MB 栈的专用线程上启动 `browser_main`（解释器/解析器递归深，默认主线程 1MB 栈不够）。
-- winit 0.30.13 要求：非主线程创建事件循环必须调用 `EventLoopBuilderExtWindows::with_any_thread(true)`（注意不是 `any_thread()`，那是 Window handle 的方法）。
-- 错误处理改为 `Result<(), String>`（`Box<dyn Error>` 不满足线程边界 Send + Sync）。
-- 实测：`cargo run -p render-browser -- https://baidu.com` 正常启动、加载、执行脚本。
+- **`HANDOFF.md`** is the chronological record. Newest section first; each entry records
+  what shipped, what was measured, and what was deliberately left undone.
+- **`docs/visual_fidelity_gaps.md`** is the evidence register. Every capability that is
+  parsed-but-not-consumed, computed-but-dropped, or absent entirely, with a `file:line`
+  citation and, where possible, a count measured over the real stylesheet corpora in
+  `.diag/`. Read this before concluding that a CSS property "is supported".
+- **`docs/generic-browser-todo.md`** is the law, including the rule that a gap gets
+  implemented forward and never removed.
+- **`docs/real_site_acceptance.md`** describes the offline real-site acceptance
+  contract: which structural properties of a real page must hold, with no Internet
+  access.
 
-### JS 引擎（本会话早前完成）
-jQuery 与 ESL AMD 加载器完整执行；baidu_diag 报错从 23 → 10。
-正则引擎（js/regex.rs）、ASI、标签语句、var 提升修复（VariableList）、
-`new A.B.C()` 成员链、原始值包装（Number/Boolean/Symbol/Date）、
-隐式全局、typeof 未声明、数组泛型接收者、大量 DOM API。
+## Verified baseline
 
-## 剩余 10 个脚本错误（诊断日志）
+Measured on the tree as of commit `2bd8e8c`, before the parallel workstream landed:
 
-| 脚本 | 错误 | 状态 |
-|---|---|---|
-| sbase / hotsearch ×2 | `.1 of null` | 待查（agent A 网络错误未完成）|
-| es6-polyfill | `.primitive method receiver of undefined` | 待查（agent B 未完成）|
-| polyfill_9354efa | array length is not a supported integer | ✅ 已定位（见下）|
-| instant_search | `.match of undefined` | 待查 |
-| inline | `.indexOf of undefined` | 待查 |
-| all_async_search / min_super | value is not a constructor | 待查（agent D 未完成）|
-| hectorstatic | `.apply of undefined` | 待查 |
+| Check | Result |
+| --- | --- |
+| `cargo test --workspace` | all targets ok, 0 failed |
+| test262 conformance gate | 9 passed, 484 s |
+| `render-js` unit tests | 195 passed |
+| `render-layout` unit tests | 81 passed, 1 ignored |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 
-## Agent C 调查报告（array length）— 已修复（2026-08-30）
+These numbers are the arbitration baseline. When an agent reports a pass count, check
+it against the crate's own previous count rather than taking the report at face value.
 
-**产生点**：`runtime.rs:4846 array_length()` 严格要求 Number 整数；所有 11 个数组
-原生方法都经它取 length。写入侧 `set_member` 没有 Array+length 分支（存原始值不校验）。
+## Diagnostic tools
 
-**触发点**（polyfill_9354efa.js = es5-shim + tslib）：第 13 行 splice 特性检测
-`Array.prototype.splice.call({}, 0, 0, 1)` —— 普通对象无 length。规范要求
-ToLength(undefined)→0，我们直接抛 TypeError。
+Headless HTML-to-pixels and layout probes. All are `cargo run` targets.
 
-**修法**：
-1. `array_length` 改用 ToLength 语义（to_number→NaN/∞/<0 钳 0，向零截断）。
-2. `set_member` 增加 Array+"length" 分支：非法值拒绝，缩容截断元素。
-3. `construct_dispatch` 与普通调用分派补齐 `ObjectHost::ArrayConstructor`。
-4. `Array()` / `new Array()` 支持空参数、单数字长度、单值和多值构造。
-5. `unshift` 返回新数组长度；新增运行时回归测试覆盖上述行为。
+| Command | What it answers |
+| --- | --- |
+| `cargo run -p render-core --example layout_chain_diag` | computed style and fragment rect for an element's ancestor chain, by class name; supports `URL_SUBSTR=CSS` for multi-file mapping. The single most useful tool when a real page lays out wrongly. |
+| `cargo run -p render-core --example css_probe` | whether one stylesheet takes effect, by progressive-prefix probing |
+| `cargo run -p render-core --example dom_dump` | serialises the DOM back to HTML after scripts have run, so a post-JS DOM can be replayed offline |
+| `cargo run -p render-core --example js_probe -- <file.js>` | JS regression probe set |
+| `cargo run -p render-core --example jquery_bisect` | bisects a script to the first offset that breaks |
+| `cargo run -p render-core --example baidu_diag` | offline page replay against a local `manifest.txt` |
+| `cargo run -p render-core --example hao123_diag` | same, for hao123 |
+| `cargo run -p render-core --example bilibili_layout_diag` | carousel and card geometry probes |
+| `cargo run -p render-js --example qq_bundle_probe` | runs a large production bundle offline and reports the first failure with its byte offset |
+| `cargo run -p render-js --example bilibili_diag` | offline bundle replay with stack traces |
+| `cargo run -p render-css --example css_corpus` | parses every stylesheet in `.diag/**` and reports rules parsed vs dropped |
+| `cargo run -p render-net --example fetch_bench` | transport timing for a URL list |
+| `cargo run -p render-net --example connect_probe` | per-address connect behaviour |
+| `cargo run -p render-browser --bin render-perf -- --fixture all` | headless performance distributions |
 
-## 其他已知问题
+## Debug switches
 
-- 性能修复（2026-08-30）：浏览器事件线程不再同步执行页面布局/栅格化；鼠标移动不再无条件重绘整窗；等待中的 `setInterval` 不再触发 16ms 空转。
+All verified live. These are the supported observability seams; prefer them over adding
+a new print statement.
 
-- data: URI 图片不支持（网络层 UnsupportedScheme），NodeId(476) 反复报错。
-- @font-face/@keyframes/@media 已解析未评估。
-- application/json script type 日志噪音（行为符合规范，可降级日志级别）。
-- `jquery-init-shape` 探针偶发 "maximum call depth exceeded"——深度预算偏紧。
-- 渲染层：搜索框缺失/布局乱（CSS 布局引擎能力不足 + 脚本级联失败）。
+| Variable | Effect |
+| --- | --- |
+| `RENDER_DEBUG_FRAME=1` | per-frame render pipeline diagnostics: stylesheet count, computed style count, fragment count, display item count, content height, and per-image fragment rects |
+| `RENDER_DUMP_FRAME=<path>` | write each frame as a PPM. Convert with `python tools/ppm2png.py <in.ppm> <out.png>` |
+| `RENDER_STAGE_TIMING=1` | per-stage timing during document render |
+| `RENDER_JS_TRACE=1`, `RENDER_JS_DEPTH=1`, `RENDER_JS_BINDINGS=1` | JS execution trace, depth budget, and binding trace |
+| `RENDER_JS_GC=1` | force JS garbage collection reporting |
+| `RENDER_JS_FRAME_OFFSETS=1` | include frame offsets in JS errors |
+| `RENDER_TRACE_STRING=1`, `RENDER_TRACE_NATIVE=1` | narrow JS traces for string and native dispatch |
+| `RENDER_DEBUG_INTRINSIC=1` | intrinsic sizing trace in the inline solver |
+| `RENDER_DIAG_STACK=1` | stack traces in the bilibili replay |
+| `RENDER_DIAG_CAROUSEL=1`, `RENDER_DIAG_CARD=1` | carousel and card probes |
+| `RENDER_DIAG_BASE=<url>` | base URL for the offline page replays |
+| `RENDER_DUMP_INLINE=1` | export failing inline scripts from a replay |
+| `RENDER_DIAG_FRAGMENTS=<n>` | fragment dump limit |
+| `RENDER_PERF_DIAG=1` | extra `render-perf` diagnostics |
+| `RENDER_NET_LOG=1`, `RENDER_NET_SLOW_MS=<n>` | transport request logging and the slow-request threshold |
+| `RENDER_TEST262_*`, `RENDER_WPT_*` | conformance-runner configuration; see `docs/test262.md` and `docs/wpt.md` |
 
-## 工具与环境备忘
+## Claims that were checked and found false
 
-- 离线语料：`%TEMP%\opencode\baidu_http.html`、`baidu_assets\manifest.txt`、`inline_scripts\`。
-- 探针：`cargo run -p render-core --example js_probe -- <file.js>`（512MB 栈线程）。
-- 分割工具：`examples/jquery_bisect.rs`；诊断：`examples/baidu_diag.rs`（RENDER_DUMP_INLINE=1 导出失败的内联脚本）。
-- 调试开关（临时）：RENDER_JS_TRACE / RENDER_JS_DEPTH / RENDER_JS_BINDINGS。
-- Agent C 复现脚本：`%TEMP%\opencode\probe\c\repro_polyfill.js` 等。
+Kept so nobody spends a session re-chasing them. Each was verified against the code, not
+against an older report.
+
+- **Gradients are painted.** `parse_background_image` consumes the nested block only for
+  validation and returns the raw source text via `slice_from(start)`
+  (`crates/render-css/src/properties.rs:1729`); `crates/render-core/src/paint/display_list.rs:929-975`
+  builds real `LinearGradient` and `RadialGradient` commands.
+- **`calc()`, `min()`, `max()`, `clamp()` are supported**
+  (`crates/render-css/src/length.rs:316-323`).
+- **Cascade layers are fully supported**, including `@layer` statements, `@layer` blocks
+  and `revert-layer` (`crates/render-css/src/stylesheet.rs:22-88`, `cascade.rs:879`).
+- **`:is()`, `:where()`, `:not(<list>)` and `:has()` are supported**
+  (`crates/render-css/src/selector.rs:665-668`).
+- **`srcset` is supported**, including `sizes` and both the `w` and `x` descriptors
+  (`crates/render-core/src/image.rs:952-1152`).
+- **`document.cookie` is implemented** - the `document.cookie` accessor and setter in
+  `crates/render-js/src/runtime/eval.rs` (cite the symbol, not a line number: that file
+  is under active edit and the line numbers move every session).
+- **`render-dom` is namespace-ready** (`Namespace`, `ElementData.namespace`,
+  `create_element_ns`, and HTML-only lowercasing at `render-dom/src/lib.rs:192,209,502,726`).
+
+And one that is only half true, so it is easy to get wrong in either direction:
+
+- **Video stops at the bitstream layer.** The MP4 demuxer and the H.264 bitstream work
+  are real - `avcC` parsing, NAL classification, SPS dimension extraction, Annex-B
+  conversion. The entropy decode and reconstruction are not, and the shipped default is
+  still `PlaceholderDecoder`, so no site ever presents a decoded frame.

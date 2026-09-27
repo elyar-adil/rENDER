@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of the NetEase (www.163.com) portal home page shape.
+
+  This fixture deliberately preserves the resource shapes that the live portal
+  is actually built from, because they are the interesting ones:
+
+    * CSS and scripts come from `static.ws.126.net`, referenced by TWO separate
+      <link rel=stylesheet> elements so the harness can prove that two
+      external sheets are discovered, supplied, and cascaded in DOM order.
+    * Images come from `nimg.ws.126.net` and come in three flavours: an eager
+      `src` image, two `srcset` candidate lists (one `w` + `sizes`, one `x`),
+      and `img.lazy` elements that carry `data-src` / `data-original` with no
+      `src` yet - which is exactly how the portal defers below-the-fold art.
+    * Seven channel sections and a 24-entry ranking form the long feed, and the
+      channel links that reach them are ordinary `a href` navigation.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see netease_163_home.css).
+
+  This comment sits AFTER the charset declaration on purpose. The HTML encoding
+  prescan reads only the first 1024 bytes, so a long comment in front of
+  <meta charset> pushes the declaration out of range and the page then
+  legitimately decodes as the windows-1252 fallback. That is correct engine
+  behaviour, and a fixture bug rather than a capability to assert.
+-->
+<title>网易新闻 - 网易</title>
+<meta name="description" content="网易新闻，为您报道最新资讯。">
+<link rel="stylesheet" href="https://static.ws.126.net/163/163_index_0f1a2b.css">
+<link rel="stylesheet" href="https://static.ws.126.net/163/163_index_theme_4c8d90.css">
+<script defer src="https://static.ws.126.net/163/163_index_77a1c3.js"></script>
+</head>
+<body>
+<header class="page-head">
+  <a class="logo" href="https://www.163.com/"><img src="https://nimg.ws.126.net/1/photolists/img_index/logo_news.png" width="110" height="32" alt="网易新闻首页"></a>
+  <form class="search" role="search" action="https://www.163.com/search" method="get">
+    <input type="text" name="q" placeholder="搜索新闻">
+    <button type="submit">搜索</button>
+  </form>
+  <nav class="channel-nav" aria-label="频道导航">
+    <a href="https://news.163.com/">新闻</a>
+    <a href="https://money.163.com/">财经</a>
+    <a href="https://tech.163.com/">科技</a>
+    <a href="https://sports.163.com/">体育</a>
+    <a href="https://edu.163.com/">教育</a>
+    <a href="https://auto.163.com/">汽车</a>
+  </nav>
+</header>
+<main class="page-main">
+  <article class="lead-story">
+    <h1 class="lead-title"><a href="https://www.163.com/news/article/L1.html">渲染管线的五个阶段与它们的失败方式</a></h1>
+    <p class="lead-abstract">从标记解析到像素呈现，每一个阶段都可能悄悄地把已经解析出来的信息丢掉。</p>
+    <img class="lead-image" src="https://nimg.ws.126.net/1/photolists/img_index/lead_render_pipeline.jpg" width="640" height="360" alt="配图：渲染管线的五个阶段">
+    <p class="lead-meta">2026-09-26 · 科技频道</p>
+  </article>
+  <div class="columns">
+    <div class="channels">
+      <section class="channel" id="channel-news">
+        <h2 class="channel-title"><a href="https://news.163.com/">新闻</a></h2>
+        <div class="channel-item channel-item-tall"><a class="channel-link" href="https://www.163.com/news/article/N01.html">城市更新试点名单公布，涉及二十三个片区</a><img class="lazy" data-src="https://nimg.ws.126.net/1/photolists/img_index/news_01.jpg" data-original="https://nimg.ws.126.net/1/photolists/img_index/news_01.jpg" width="200" height="120" alt="城市更新试点现场"></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/news/article/N02.html">跨省医保结算新增门诊病种，报销比例保持不变</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/news/article/N03.html">今冬供暖期提前十天启动，涉及北方七省市</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/news/article/N04.html">铁路春运车票预售期调整为十五天</a></div>
+      </section>
+      <section class="channel" id="channel-money">
+        <h2 class="channel-title"><a href="https://money.163.com/">财经</a></h2>
+        <div class="channel-item channel-item-tall"><a class="channel-link" href="https://www.163.com/money/article/M01.html">制造业采购指数连续三个月位于扩张区间</a><img class="lazy" data-src="https://nimg.ws.126.net/1/photolists/img_index/money_01.jpg" data-original="https://nimg.ws.126.net/1/photolists/img_index/money_01.jpg" width="200" height="120" alt="制造业景气度数据图"></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/money/article/M02.html">离岸人民币汇率日内波动收窄</a></div>
+        <div class="channel-item channel-item-tall"><a class="channel-link" href="https://www.163.com/money/article/M03.html">多家银行下调存款挂牌利率</a>
+          <video class="clip" poster="https://nimg.ws.126.net/1/photolists/img_index/money_03_poster.jpg" width="200" height="120" controls>
+            <source src="https://v.ws.126.net/163/163_index_77a1c3.mp4" type="video/mp4">
+          </video>
+        </div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/money/article/M04.html">新能源汽车渗透率首次超过三成</a></div>
+      </section>
+      <section class="channel" id="channel-tech">
+        <h2 class="channel-title"><a href="https://tech.163.com/">科技</a></h2>
+        <div class="channel-item channel-item-tall"><a class="channel-link" href="https://www.163.com/tech/article/T01.html">新一代浏览器内核在低端机上的首屏耗时下降三成</a><img class="lazy" data-src="https://nimg.ws.126.net/1/photolists/img_index/tech_01.jpg" data-original="https://nimg.ws.126.net/1/photolists/img_index/tech_01.jpg" width="200" height="120" alt="低端机首屏耗时对比"></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/tech/article/T02.html">开源字体项目发布新版权条款</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/tech/article/T03.html">国产生态数据库完成全量迁移</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/tech/article/T04.html">图像编解码标准提案进入公开征求意见</a></div>
+      </section>
+      <section class="channel" id="channel-sports">
+        <h2 class="channel-title"><a href="https://sports.163.com/">体育</a></h2>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/sports/article/S01.html">全国游泳锦标赛女子二百米自由泳决赛观战指南</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/sports/article/S02.html">城市马拉松报名人数创赛事纪录</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/sports/article/S03.html">青年足球联赛小组赛收官</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/sports/article/S04.html">冬季项目选材会在三地同步进行</a></div>
+      </section>
+      <section class="channel" id="channel-edu">
+        <h2 class="channel-title"><a href="https://edu.163.com/">教育</a></h2>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/edu/article/E01.html">中小学课后服务时间统一为每周五天</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/edu/article/E02.html">职业教育专业目录完成本轮调整</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/edu/article/E03.html">高校春季招生简章陆续发布</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/edu/article/E04.html">中小学教材电子版全面开放下载</a></div>
+      </section>
+      <section class="channel" id="channel-auto">
+        <h2 class="channel-title"><a href="https://auto.163.com/">汽车</a></h2>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/auto/article/A01.html">智能驾驶辅助功能标准征求意见稿发布</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/auto/article/A02.html">动力电池回收利用管理办法修订</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/auto/article/A03.html">充电基础设施建设进入县乡全覆盖阶段</a></div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/auto/article/A04.html">秋季车展新车预热陆续展开</a></div>
+      </section>
+      <section class="channel" id="channel-featured">
+        <h2 class="channel-title">图集</h2>
+        <div class="channel-item channel-item-figure">
+          <a class="channel-link" href="https://www.163.com/photo/article/P01.html">图集：城市更新的第一批试点项目</a>
+          <img class="figure-wide" srcset="https://nimg.ws.126.net/1/photolists/img_index/photo_01_320.jpg 320w, https://nimg.ws.126.net/1/photolists/img_index/photo_01_640.jpg 640w, https://nimg.ws.126.net/1/photolists/img_index/photo_01_1280.jpg 1280w" sizes="(max-width: 600px) 100vw, 400px" width="400" height="225" alt="图集：城市更新试点项目实拍">
+        </div>
+        <div class="channel-item channel-item-figure">
+          <a class="channel-link" href="https://www.163.com/photo/article/P02.html">图集：极端天气下的应急保障</a>
+          <img class="figure-wide" srcset="https://nimg.ws.126.net/1/photolists/img_index/photo_02_1x.jpg 1x, https://nimg.ws.126.net/1/photolists/img_index/photo_02_2x.jpg 2x, https://nimg.ws.126.net/1/photolists/img_index/photo_02_3x.jpg 3x" sizes="400px" width="400" height="225" alt="图集：极端天气应急保障现场">
+        </div>
+        <div class="channel-item"><a class="channel-link" href="https://www.163.com/photo/article/P03.html">图集：一座老工业城市的改造样本</a></div>
+      </section>
+    </div>
+    <aside class="rail">
+      <section class="rail-card">
+        <h2>频道导航</h2>
+        <nav class="rail-nav" aria-label="侧栏频道">
+          <a href="https://news.163.com/">新闻</a>
+          <a href="https://money.163.com/">财经</a>
+          <a href="https://tech.163.com/">科技</a>
+          <a href="https://sports.163.com/">体育</a>
+          <a href="https://edu.163.com/">教育</a>
+          <a href="https://auto.163.com/">汽车</a>
+        </nav>
+      </section>
+      <section class="rail-card">
+        <h2>今日热榜</h2>
+        <ol class="rail-list">
+          <li><a href="https://www.163.com/news/article/H01.html">城市更新试点名单公布</a></li>
+          <li><a href="https://www.163.com/money/article/H02.html">离岸人民币汇率波动收窄</a></li>
+          <li><a href="https://www.163.com/tech/article/H03.html">浏览器内核首屏耗时下降</a></li>
+          <li><a href="https://www.163.com/sports/article/H04.html">城市马拉松报名创新高</a></li>
+          <li><a href="https://www.163.com/edu/article/H05.html">课后服务统一为每周五天</a></li>
+          <li><a href="https://www.163.com/auto/article/H06.html">充电设施进入县乡全覆盖</a></li>
+        </ol>
+      </section>
+      <section class="rail-card">
+        <h2>订阅</h2>
+        <img class="qrcode" src="https://nimg.ws.126.net/1/photolists/img_index/163_qrcode.png" width="140" height="140" alt="网易新闻客户端二维码">
+        <p class="rail-note">扫码订阅每日要闻</p>
+      </section>
+    </aside>
+  </div>
+  <section class="ranked">
+    <h2>今日热榜</h2>
+    <ol class="rank-list">
+      <li class="rank-item"><span class="rank-no">01</span><a class="rank-link" href="https://www.163.com/news/article/R01.html">城市更新试点名单公布，涉及二十三个片区</a></li>
+      <li class="rank-item"><span class="rank-no">02</span><a class="rank-link" href="https://www.163.com/money/article/R02.html">离岸人民币汇率日内波动收窄</a></li>
+      <li class="rank-item"><span class="rank-no">03</span><a class="rank-link" href="https://www.163.com/tech/article/R03.html">新一代浏览器内核在低端机上的首屏耗时下降三成</a></li>
+      <li class="rank-item"><span class="rank-no">04</span><a class="rank-link" href="https://www.163.com/sports/article/R04.html">城市马拉松报名人数创赛事纪录</a></li>
+      <li class="rank-item"><span class="rank-no">05</span><a class="rank-link" href="https://www.163.com/edu/article/R05.html">中小学课后服务时间统一为每周五天</a></li>
+      <li class="rank-item"><span class="rank-no">06</span><a class="rank-link" href="https://www.163.com/auto/article/R06.html">充电基础设施建设进入县乡全覆盖阶段</a></li>
+      <li class="rank-item"><span class="rank-no">07</span><a class="rank-link" href="https://www.163.com/news/article/R07.html">铁路春运车票预售期调整为十五天</a></li>
+      <li class="rank-item"><span class="rank-no">08</span><a class="rank-link" href="https://www.163.com/money/article/R08.html">制造业采购指数连续三个月位于扩张区间</a></li>
+      <li class="rank-item"><span class="rank-no">09</span><a class="rank-link" href="https://www.163.com/tech/article/R09.html">开源字体项目发布新版权条款</a></li>
+      <li class="rank-item"><span class="rank-no">10</span><a class="rank-link" href="https://www.163.com/sports/article/R10.html">全国游泳锦标赛女子二百米自由泳决赛观战指南</a></li>
+      <li class="rank-item"><span class="rank-no">11</span><a class="rank-link" href="https://www.163.com/edu/article/R11.html">职业教育专业目录完成本轮调整</a></li>
+      <li class="rank-item"><span class="rank-no">12</span><a class="rank-link" href="https://www.163.com/auto/article/R12.html">智能驾驶辅助功能标准征求意见稿发布</a></li>
+      <li class="rank-item"><span class="rank-no">13</span><a class="rank-link" href="https://www.163.com/news/article/R13.html">国产生态数据库完成全量迁移</a></li>
+      <li class="rank-item"><span class="rank-no">14</span><a class="rank-link" href="https://www.163.com/money/article/R14.html">多家银行下调存款挂牌利率</a></li>
+      <li class="rank-item"><span class="rank-no">15</span><a class="rank-link" href="https://www.163.com/tech/article/R15.html">图像编解码标准提案进入公开征求意见</a></li>
+      <li class="rank-item"><span class="rank-no">16</span><a class="rank-link" href="https://www.163.com/sports/article/R16.html">青年足球联赛小组赛收官</a></li>
+      <li class="rank-item"><span class="rank-no">17</span><a class="rank-link" href="https://www.163.com/edu/article/R17.html">高校春季招生简章陆续发布</a></li>
+      <li class="rank-item"><span class="rank-no">18</span><a class="rank-link" href="https://www.163.com/auto/article/R18.html">动力电池回收利用管理办法修订</a></li>
+      <li class="rank-item"><span class="rank-no">19</span><a class="rank-link" href="https://www.163.com/news/article/R19.html">中小学教材电子版全面开放下载</a></li>
+      <li class="rank-item"><span class="rank-no">20</span><a class="rank-link" href="https://www.163.com/money/article/R20.html">新能源汽车渗透率首次超过三成</a></li>
+      <li class="rank-item"><span class="rank-no">21</span><a class="rank-link" href="https://www.163.com/tech/article/R21.html">国产生态数据库完成全量迁移的技术细节</a></li>
+      <li class="rank-item"><span class="rank-no">22</span><a class="rank-link" href="https://www.163.com/sports/article/R22.html">冬季项目选材会在三地同步进行</a></li>
+      <li class="rank-item"><span class="rank-no">23</span><a class="rank-link" href="https://www.163.com/edu/article/R23.html">中小学教材电子版开放下载的访问方式</a></li>
+      <li class="rank-item"><span class="rank-no">24</span><a class="rank-link" href="https://www.163.com/auto/article/R24.html">秋季车展新车预热陆续展开</a></li>
+    </ol>
+  </section>
+</main>
+<footer class="page-foot">
+  <a href="https://www.163.com/about/">关于网易</a>
+  <a href="https://www.163.com/contact/">联系我们</a>
+  <!-- Inline SVG is how this portal draws its filing badge. It is a foreign
+       content shape, so it is here to be asserted, not to be worked around. -->
+  <svg class="filing-badge" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 2h12v12H2z" fill="none" stroke="currentColor"></path></svg>
+  <a href="https://www.163.com/copyright/">©2026 NetEase</a>
+</footer>
+</body>
+</html>

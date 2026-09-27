@@ -4,6 +4,11 @@ on:
   push:
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+  # Keep the target directory stable so the cache key is stable too.
+  CARGO_TARGET_DIR: target
+
 jobs:
   rust-core:
     strategy:
@@ -22,11 +27,65 @@ jobs:
         shell: bash
         run: tools/fetch-test262.sh
 
+      # The test262 checkout is large and its revision is pinned, so caching it
+      # saves the slowest step in the job.
+      - name: Cache pinned test262 checkout
+        uses: actions/cache@v4
+        with:
+          path: third_party/test262
+          key: test262-${{ runner.os }}-${{ hashFiles('tools/fetch-test262.sh') }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            tests/real_site_tasks -> target
+
       - name: Formatting
         run: cargo fmt --all --check
 
       - name: Lint
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Enforces the "no per-site branches" rule from docs/generic-browser-todo.md
+      # mechanically rather than by review. The self-test runs first so a gate
+      # that has stopped detecting fails loudly instead of passing everything.
+      - name: Site neutrality gate self-test
+        run: python tools/check_site_neutrality_test.py
+
+      - name: Site neutrality
+        run: python tools/check_site_neutrality.py
+
       - name: Test workspace
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+
+      # The real-site acceptance harness is a standalone crate outside the
+      # workspace, so it does not run as part of `cargo test --workspace`. It is
+      # guarded on the manifest existing so that CI stays green while the harness
+      # is being built.
+      - name: Real-site acceptance harness
+        if: runner.os == 'ubuntu-latest' && hashFiles('tests/real_site_tasks/Cargo.toml') != ''
+        run: cargo test --manifest-path tests/real_site_tasks/Cargo.toml --locked
+
+  wpt-reftests:
+    # WPT needs a full checkout that is not vendored, so it runs on its own and is
+    # allowed to skip when the checkout cannot be obtained. A skipped run must
+    # never be reported as a pass.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Fetch pinned WPT checkout
+        shell: pwsh
+        run: tools/fetch-wpt.ps1
+
+      - name: Run WPT reftests
+        env:
+          RENDER_WPT_REFTESTS: "1"
+        run: cargo test -p render-core --test wpt_reftests --locked -- --nocapture

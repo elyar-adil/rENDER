@@ -279,6 +279,55 @@ fn descriptors_are_identical(current: &PropertyDescriptor, next: &PropertyDescri
     current.is_accessor() || same_value(&current.value, &next.value)
 }
 
+/// ECMA-262 §6.1.7 `CanonicalNumericIndexString`: a property key is a
+/// canonical numeric index string when it is the shortest decimal form of a
+/// non-negative integer below 2^32-1.
+fn is_canonical_index(key: &str) -> bool {
+    key.parse::<u32>()
+        .ok()
+        .is_some_and(|index| index.to_string() == key)
+}
+
+/// ECMA-262 §10.4.3.1 `StringGetOwnProperty`: the own slots a String wrapper
+/// exposes for the primitive it hosts. Indexed characters are writable:false,
+/// enumerable:true, configurable:false; `length` is writable:false,
+/// enumerable:false, configurable:false. Ordinary properties are unaffected, so
+/// this is only consulted for keys the object does not already carry.
+fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
+    if key == "length" {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "string lengths stay far below any precision boundary"
+        )]
+        return Some(PropertyDescriptor {
+            value: JsValue::Number(text.chars().count() as f64),
+            writable: false,
+            getter: None,
+            setter: None,
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    let index: u32 = key.parse().ok()?;
+    if index.to_string() != key {
+        return None;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the canonical index form bounds the value at u32::MAX"
+    )]
+    let character = text.chars().nth(index as usize)?;
+    Some(PropertyDescriptor {
+        value: JsValue::String(character.to_string()),
+        writable: false,
+        getter: None,
+        setter: None,
+        enumerable: true,
+        configurable: false,
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     GetElementById,
@@ -381,6 +430,7 @@ pub(crate) enum NativeFunction {
     StrToString,
     StrForEach,
     StrPush,
+    StrIterator,
     ConsoleDebug,
     ConsoleError,
     ConsoleInfo,
@@ -497,6 +547,13 @@ pub(crate) enum NativeFunction {
     SymbolFor,
     SymbolKeyFor,
     ObjectPreventExtensions,
+    ObjectProtoGetter,
+    ObjectProtoSetter,
+    StorageGetItem,
+    StorageSetItem,
+    StorageRemoveItem,
+    StorageClear,
+    StorageKey,
     ObjectSeal,
     ObjectFreeze,
     ObjectIsExtensible,
@@ -571,6 +628,11 @@ pub(crate) enum NativeFunction {
     ReflectGetOwnPropertyDescriptor,
     ReflectDefineProperty,
     ReflectConstruct,
+    ReflectApply,
+    ReflectGetPrototypeOf,
+    ReflectSetPrototypeOf,
+    ReflectIsExtensible,
+    ReflectPreventExtensions,
     ResponseText,
     ResponseJson,
     ResponseHeadersGet,
@@ -746,6 +808,16 @@ impl CollectionKind {
     pub(crate) const fn is_weak(self) -> bool {
         matches!(self, Self::WeakMap | Self::WeakSet)
     }
+
+    /// The ECMA-262 20.1.3.6 builtin tag for an instance of this collection.
+    pub(crate) const fn tag(self) -> &'static str {
+        match self {
+            Self::Map => "Map",
+            Self::WeakMap => "WeakMap",
+            Self::Set => "Set",
+            Self::WeakSet => "WeakSet",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,6 +934,8 @@ pub(crate) enum ObjectHost {
     },
     Location(Url),
     ErrorConstructor(ErrorKind),
+    /// An error instance; the stand-in for the spec's `[[ErrorData]]` slot.
+    ErrorInstance,
     Promise(usize),
     PromiseSettler {
         promise: usize,
@@ -911,6 +985,10 @@ pub(crate) enum ObjectHost {
         pairs: Vec<(String, String)>,
         owner: Option<ObjectId>,
     },
+    /// A Web Storage area (`localStorage`/`sessionStorage`). Its entries are
+    /// the object's own string-keyed properties, so the ordinary own-key
+    /// machinery already provides insertion order and enumeration.
+    Storage,
     /// The `XMLHttpRequest` constructor object.
     XmlHttpRequestConstructor,
     /// One `XMLHttpRequest` instance with its captured request state.
@@ -1180,6 +1258,8 @@ pub struct Realm {
     element_prototype: ObjectId,
     /// `%IteratorPrototype%` carrying the iterator-helper methods.
     iterator_prototype: ObjectId,
+    /// `%Storage.prototype%` shared by `localStorage` and `sessionStorage`.
+    storage_prototype: ObjectId,
     /// `%IteratorHelperPrototype%` shared by helper result objects.
     iterator_helper_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -1330,6 +1410,11 @@ impl Realm {
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         let (iterator_prototype, iterator_helper_prototype) =
             Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
+        let storage_prototype =
+            Self::install_storage(&mut objects, global, object_prototype, function_prototype);
+        for name in ["localStorage", "sessionStorage"] {
+            Self::install_storage_area(&mut objects, global, storage_prototype, name);
+        }
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
@@ -1791,6 +1876,7 @@ impl Realm {
             element_prototype,
             iterator_prototype,
             iterator_helper_prototype,
+            storage_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
@@ -2594,6 +2680,77 @@ impl Realm {
         }
     }
 
+    /// Install one Web Storage area with the `Storage` method set. The area's
+    /// entries are its own properties, so the ordinary own-key machinery gives
+    /// `key(n)` insertion order and `Object.keys` enumeration for free.
+    fn install_storage(
+        objects: &mut Vec<JsObject>,
+        _global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (method, function) in [
+            ("getItem", NativeFunction::StorageGetItem),
+            ("setItem", NativeFunction::StorageSetItem),
+            ("removeItem", NativeFunction::StorageRemoveItem),
+            ("clear", NativeFunction::StorageClear),
+            ("key", NativeFunction::StorageKey),
+        ] {
+            let function_object = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                method.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(function_object)),
+            );
+        }
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor::builtin(JsValue::String("Storage".to_owned())),
+            ),
+        );
+        prototype
+    }
+
+    /// Install one Web Storage area. Its entries are its own properties, so
+    /// `length` is just the own-key count and `key(n)` follows the shared
+    /// insertion order of the ordinary property table.
+    fn install_storage_area(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        storage_prototype: ObjectId,
+        name: &str,
+    ) {
+        let storage = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(storage_prototype),
+            host: ObjectHost::Storage,
+            ..JsObject::default()
+        });
+        objects[global.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(storage),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+    }
+
     fn install_location(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -2870,6 +3027,33 @@ impl Realm {
             host: ObjectHost::ObjectConstructor,
             ..JsObject::default()
         });
+        // Annex B.2.2.1 `Object.prototype.__proto__`: an accessor pair, not a
+        // data property. Frameworks and polyfills read and write it directly
+        // (`node.__proto__[SYMBOL] = value`, `{ __proto__: base }`), and no
+        // engine leaves it undefined.
+        let mut proto_accessor = [None, None];
+        for (slot, function) in proto_accessor.iter_mut().zip([
+            NativeFunction::ObjectProtoGetter,
+            NativeFunction::ObjectProtoSetter,
+        ]) {
+            let accessor = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            *slot = Some(accessor);
+        }
+        objects[prototype.0].properties.insert(
+            "__proto__".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: proto_accessor[0],
+                setter: proto_accessor[1],
+                enumerable: false,
+                configurable: true,
+            },
+        );
         for (name, function) in [
             ("assign", NativeFunction::ObjectAssign),
             ("keys", NativeFunction::ObjectKeys),
@@ -2941,6 +3125,37 @@ impl Realm {
         );
         Self::define_prototype_constructor(objects, prototype, object);
         prototype
+    }
+
+    /// ECMA-262 22.1.3.13 `String.prototype[Symbol.iterator]`, installed as the
+    /// same function object as `String.prototype.values`. Real bundles need it
+    /// for `get-intrinsic`, which reads
+    /// `getProto(getProto("x"[Symbol.iterator]()))` to capture
+    /// `%IteratorPrototype%`; without it the lenient missing-host-call path
+    /// answers `undefined` and the whole intrinsic table is lost.
+    fn install_string_iterator(
+        objects: &mut Vec<JsObject>,
+        prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let iterator = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::StrIterator),
+            ..JsObject::default()
+        });
+        objects[prototype.0].properties.insert(
+            "values".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(iterator)),
+        );
+        let symbol = JsSymbol::well_known("@@iterator");
+        objects[prototype.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol,
+                PropertyDescriptor::builtin(JsValue::Object(iterator)),
+            ),
+        );
     }
 
     fn install_string(
@@ -3022,6 +3237,9 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        // ECMA-262 22.1.3.13 `String.prototype[Symbol.iterator]`: the same
+        // function object as `String.prototype.values`.
+        Self::install_string_iterator(objects, prototype, function_prototype);
         objects[string.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
@@ -4140,6 +4358,14 @@ impl Realm {
             ),
             ("defineProperty", NativeFunction::ReflectDefineProperty),
             ("construct", NativeFunction::ReflectConstruct),
+            ("apply", NativeFunction::ReflectApply),
+            ("getPrototypeOf", NativeFunction::ReflectGetPrototypeOf),
+            ("setPrototypeOf", NativeFunction::ReflectSetPrototypeOf),
+            ("isExtensible", NativeFunction::ReflectIsExtensible),
+            (
+                "preventExtensions",
+                NativeFunction::ReflectPreventExtensions,
+            ),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -4457,7 +4683,14 @@ impl Realm {
         prototype: ObjectId,
         message: Option<String>,
     ) -> ObjectId {
-        let error = self.create_object(Some(prototype));
+        // The `Error` host is the engine's stand-in for the spec's `[[ErrorData]]`
+        // slot, which is what `Object.prototype.toString` reads to answer
+        // `[object Error]` for an error instance rather than `[object Object]`.
+        let error = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::ErrorInstance,
+            ..JsObject::default()
+        });
         if let Some(message) = message {
             self.objects[error.0].properties.insert(
                 "message".to_owned(),
@@ -4501,6 +4734,15 @@ impl Realm {
             return false;
         };
         let key = key.into();
+        // ECMA-262 §10.4.3.2: a String exotic object rejects every
+        // `[[DefineOwnProperty]]` whose key is a canonical numeric index string
+        // or `"length"`; those slots are non-configurable and non-writable, so
+        // the caller's ordinary property machinery reports the failure.
+        if matches!(target.host, ObjectHost::StringPrimitive(_))
+            && (key == "length" || is_canonical_index(&key))
+        {
+            return false;
+        }
         if let Some(current) = target.properties.get(&key) {
             if !current.configurable {
                 // ECMA-262 `ValidateAndApplyPropertyDescriptor`: redefining a
@@ -4758,6 +5000,9 @@ impl Realm {
         // which may all be garbage at collection time; keep them rooted.
         roots.push(self.iterator_prototype);
         roots.push(self.iterator_helper_prototype);
+        // The Storage prototype is only reachable through the two area
+        // objects, whose own keys are the caller's data.
+        roots.push(self.storage_prototype);
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
@@ -4805,6 +5050,9 @@ impl Realm {
         object: ObjectId,
         key: &str,
     ) -> Option<(JsValue, ObjectId)> {
+        if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
+            return Some((descriptor.value, object));
+        }
         let mut candidate = Some(object);
         let mut visited = 0usize;
         while let Some(id) = candidate {
@@ -4821,7 +5069,28 @@ impl Realm {
         None
     }
 
+    /// `[[GetOwnProperty]]` for a String exotic object, consulted by the
+    /// prototype-chain readers so a wrapper's characters and `length` are
+    /// visible without materialising them as real own properties. Returns
+    /// `None` when the object carries an ordinary property of that name, which
+    /// then shadows the exotic slot.
+    fn string_exotic_descriptor(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
+        let target = self.objects.get(object.0)?;
+        // The host discriminant is checked first: these readers sit on the
+        // member-access hot path and almost no object is a String wrapper.
+        let ObjectHost::StringPrimitive(text) = &target.host else {
+            return None;
+        };
+        if target.properties.contains_key(key) {
+            return None;
+        }
+        string_exotic_property(text, key)
+    }
+
     pub(crate) fn get_property(&self, object: ObjectId, key: &str) -> Option<JsValue> {
+        if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
+            return Some(descriptor.value);
+        }
         let mut candidate = Some(object);
         let mut visited = 0usize;
         while let Some(id) = candidate {
@@ -4839,7 +5108,14 @@ impl Realm {
     }
 
     pub(crate) fn own_property(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
-        self.objects.get(object.0)?.properties.get(key).cloned()
+        let target = self.objects.get(object.0)?;
+        if let Some(descriptor) = target.properties.get(key) {
+            return Some(descriptor.clone());
+        }
+        match &target.host {
+            ObjectHost::StringPrimitive(text) => string_exotic_property(text, key),
+            _ => None,
+        }
     }
 
     pub(crate) fn own_symbol_property(
@@ -4934,6 +5210,9 @@ impl Realm {
     /// must not run user code stay on `get_property`; accessor invocation
     /// belongs to the runtime's [[Get]]/[[Set]] layer.
     pub(crate) fn get_descriptor(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
+        if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
+            return Some(descriptor);
+        }
         let mut candidate = Some(object);
         let mut visited = 0usize;
         while let Some(id) = candidate {
@@ -4954,11 +5233,13 @@ impl Realm {
         &self,
         object: ObjectId,
     ) -> Option<Vec<(String, JsValue)>> {
+        // Reading through `own_property` keeps the String exotic object's
+        // virtual indexed characters enumerable alongside real own properties.
+        self.objects.get(object.0)?;
         let keys = self.own_property_names(object)?;
-        let target = self.objects.get(object.0)?;
         let mut properties = Vec::new();
         for key in keys {
-            let Some(descriptor) = target.properties.get(&key) else {
+            let Some(descriptor) = self.own_property(object, &key) else {
                 continue;
             };
             if descriptor.enumerable {
@@ -4984,7 +5265,17 @@ impl Realm {
             .filter(|key| is_index(key).is_some())
             .cloned()
             .collect::<Vec<_>>();
+        if let ObjectHost::StringPrimitive(text) = &target.host {
+            // ECMA-262 §10.4.3: a String exotic object lists its characters as
+            // ascending integer indices ahead of the ordinary string keys.
+            indices.extend(
+                (0..text.chars().count())
+                    .map(|index| index.to_string())
+                    .filter(|key| !target.properties.contains_key(key)),
+            );
+        }
         indices.sort_by_key(|key| is_index(key).unwrap_or(0));
+        indices.dedup();
         let ordered = target
             .key_order
             .iter()
@@ -5000,6 +5291,11 @@ impl Realm {
         let mut names = indices;
         names.extend(ordered);
         names.extend(untracked);
+        if matches!(target.host, ObjectHost::StringPrimitive(_)) {
+            // `length` is the only non-index own key of a String exotic
+            // object, and it sorts last.
+            names.push("length".to_owned());
+        }
         Some(names)
     }
 
@@ -5008,6 +5304,7 @@ impl Realm {
         let mut seen = std::collections::BTreeSet::new();
         let mut candidate = Some(object);
         let mut visited = 0usize;
+        let mut first = true;
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
             for (key, descriptor) in &current.properties {
@@ -5015,6 +5312,17 @@ impl Realm {
                     names.push(key.clone());
                 }
             }
+            // A String exotic object only contributes its enumerable indexed
+            // characters here; `length` is not enumerable.
+            if first && let ObjectHost::StringPrimitive(text) = &current.host {
+                for index in 0..text.chars().count() {
+                    let key = index.to_string();
+                    if !current.properties.contains_key(&key) && seen.insert(key.clone()) {
+                        names.push(key);
+                    }
+                }
+            }
+            first = false;
             candidate = current.prototype;
             visited = visited.saturating_add(1);
             if visited > self.objects.len() {
@@ -5060,6 +5368,14 @@ impl Realm {
             }
             property.value = value;
         } else {
+            // ECMA-262 §10.4.3.2: a String exotic object's characters and
+            // `length` are non-writable own slots, so writing them fails
+            // instead of creating a shadowing data property.
+            if matches!(target.host, ObjectHost::StringPrimitive(_))
+                && (key == "length" || is_canonical_index(&key))
+            {
+                return false;
+            }
             if !target.extensible {
                 return false;
             }
@@ -5311,6 +5627,18 @@ impl Realm {
     #[must_use]
     pub(crate) const fn object_prototype_id(&self) -> ObjectId {
         self.object_prototype
+    }
+
+    /// The intrinsic prototypes `Object.prototype.__proto__` reports for a
+    /// primitive wrapper (Annex B.2.2.1), keyed by the host the wrapper carries.
+    pub(crate) fn intrinsic_prototype_for_host(&self, object: ObjectId) -> Option<ObjectId> {
+        match self.objects.get(object.0)?.host {
+            ObjectHost::StringPrimitive(_) => Some(self.string_prototype),
+            ObjectHost::NumberPrimitive(_) => Some(self.number_primitive_prototype),
+            ObjectHost::BooleanPrimitive(_) => Some(self.boolean_primitive_prototype),
+            ObjectHost::SymbolInstance(_) => Some(self.symbol_prototype),
+            _ => None,
+        }
     }
 
     pub(crate) fn native_object(&mut self, function: NativeFunction) -> ObjectId {

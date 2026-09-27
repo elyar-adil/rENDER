@@ -4,6 +4,9 @@ use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
 
+// This module has its own character-level `Parser`; the tokenizer's is
+// aliased so the nesting-selector substitution can reach it.
+use cssparser::{CowRcStr, ParseError, Parser as CssParser, ParserInput, Token};
 use render_dom::{Dom, ElementData, Namespace, NodeId, NodeKind};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -306,6 +309,143 @@ pub fn parse_selector_list(input: &str) -> Result<SelectorList, SelectorParseErr
     parse_list(input, false)
 }
 
+/// A nested style rule's prelude with its nesting selector already resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedSelectors {
+    /// The absolutized selector text. Every `&` is gone, so a deeper nesting
+    /// level can use this as its own parent and the levels stack.
+    pub css: String,
+    pub selectors: SelectorList,
+}
+
+/// Resolve a nested style rule's `<relative-selector-list>` against the
+/// enclosing style rule's selector text (`CSS Nesting §3.1`).
+///
+/// §4 defines the nesting selector as "the parent style rule's selector,
+/// wrapped in an `:is()` selector", and §4 gives it `:is()`'s specificity: the
+/// largest specificity in the parent list. Substituting `:is(<parent>)` for
+/// every `&` therefore gets both the matching and the specificity right by
+/// reusing the existing `:is()` machinery, and it does not desugar to a
+/// cross product, which is what §4's note about selector explosion is about.
+///
+/// §3.1 also makes a relative selector imply a leading `&`, while a selector
+/// that names `&` itself is absolute and gets no implied one. So `> .bar`
+/// becomes `:is(parent) > .bar`, `& > .bar` becomes the same thing, and
+/// `+ .bar + &` keeps its trailing `&` *and* gains the implied leading one,
+/// exactly as §3.2 requires.
+///
+/// # Errors
+///
+/// Returns [`SelectorParseError`] when the resolved selector list is invalid,
+/// which drops the nested rule and its contents without affecting the parent.
+pub fn parse_nested_selector_list(
+    input: &str,
+    parent: &str,
+) -> Result<NestedSelectors, SelectorParseError> {
+    let nesting = format!(":is({parent})");
+    let mut resolved = String::with_capacity(input.len() + nesting.len());
+    let mut named_nesting = false;
+    let mut source = ParserInput::new(input);
+    let mut parser = CssParser::new(&mut source);
+    substitute_nesting(&mut parser, &nesting, &mut resolved, &mut named_nesting)?;
+    // A selector that names `&` is absolute unless it also starts with a
+    // combinator, in which case §3.1 still implies the leading `&`.
+    let css = if named_nesting && !starts_with_combinator(input) {
+        resolved
+    } else {
+        format!("{nesting} {resolved}")
+    };
+    Ok(NestedSelectors {
+        selectors: parse_selector_list(&css)?,
+        css,
+    })
+}
+
+/// One substitution step, holding no borrow of the parser so the block forms can
+/// recurse into it.
+enum NestingStep<'i> {
+    Replace,
+    Function(CowRcStr<'i>),
+    /// A block that is opaque to selector substitution, still to be consumed.
+    Block,
+    Literal,
+}
+
+fn substitute_nesting<'i, 't>(
+    parser: &mut CssParser<'i, 't>,
+    nesting: &str,
+    output: &mut String,
+    named_nesting: &mut bool,
+) -> Result<(), SelectorParseError> {
+    let mut start = parser.position();
+    while let Ok(token) = parser.next_including_whitespace_and_comments() {
+        let step = match token {
+            Token::Delim('&') => NestingStep::Replace,
+            // A functional pseudo-class takes selector arguments, so a `&`
+            // inside one is still the nesting selector: `:not(&)` is
+            // `:not(:is(parent))`.
+            Token::Function(name) => NestingStep::Function(name.clone()),
+            // An attribute selector's brackets, a string, and a `{}` block are
+            // opaque: a `&` inside them is a literal character, not the
+            // nesting selector.
+            Token::ParenthesisBlock
+            | Token::SquareBracketBlock
+            | Token::CurlyBracketBlock
+            | Token::QuotedString(_)
+            | Token::UnquotedUrl(_)
+            | Token::BadUrl(_) => NestingStep::Block,
+            _ => NestingStep::Literal,
+        };
+        let next = parser.position();
+        match step {
+            NestingStep::Replace => {
+                output.push_str(nesting);
+                *named_nesting = true;
+            }
+            NestingStep::Literal => output.push_str(parser.slice(start..next)),
+            NestingStep::Function(name) => {
+                output.push_str(&name);
+                output.push('(');
+                let recursed: Result<(), ParseError<SelectorParseError>> = parser
+                    .parse_nested_block(|nested| {
+                        substitute_nesting(nested, nesting, output, named_nesting)
+                            .map_err(|error| nested.new_custom_error(error))
+                    });
+                recursed.map_err(|_| {
+                    SelectorParseError::new(0, "unterminated functional pseudo-class")
+                })?;
+                output.push(')');
+            }
+            NestingStep::Block => {
+                let drained: Result<(), ParseError<SelectorParseError>> = parser
+                    .parse_nested_block(|nested| {
+                        while nested.next_including_whitespace_and_comments().is_ok() {}
+                        Ok(())
+                    });
+                drained.map_err(|_| {
+                    SelectorParseError::new(0, "unterminated block in a nested selector")
+                })?;
+                output.push_str(parser.slice(start..parser.position()));
+            }
+        }
+        start = next;
+    }
+    Ok(())
+}
+
+/// Whether a selector list begins with a combinator, which is what makes it
+/// relative (`CSS Selectors 4 §Relative Selectors`).
+fn starts_with_combinator(input: &str) -> bool {
+    let mut rest = input.trim_start();
+    while let Some(after) = rest.strip_prefix("/*") {
+        let Some(end) = after.find("*/") else {
+            return false;
+        };
+        rest = after[end + 2..].trim_start();
+    }
+    rest.starts_with(['>', '+', '~'])
+}
+
 /// Return whether an element matches any selector in a parsed list.
 #[must_use]
 pub fn matches_selector_list(
@@ -518,6 +658,10 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            // A comment between two simple selectors is removed during
+            // preprocessing, so `.a/*c*/.b` is one compound selector rather
+            // than a descendant combinator.
+            self.skip_comments()?;
             match self.peek_char() {
                 Some('#') => {
                     self.bump_char();
@@ -830,22 +974,37 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_whitespace_and_comments(&mut self) -> Result<bool, SelectorParseError> {
-        let start = self.offset;
-        loop {
-            while self.peek_char().is_some_and(is_css_whitespace) {
-                self.bump_char();
-            }
-            if !self.remaining().starts_with("/*") {
-                break;
-            }
+    fn skip_comments(&mut self) -> Result<bool, SelectorParseError> {
+        let mut skipped = false;
+        while self.remaining().starts_with("/*") {
             self.offset += 2;
             let Some(end) = self.remaining().find("*/") else {
                 return Err(self.error("unterminated CSS comment"));
             };
             self.offset += end + 2;
+            skipped = true;
         }
-        Ok(self.offset > start)
+        Ok(skipped)
+    }
+
+    /// Skip comments and whitespace, reporting whether any *whitespace* was
+    /// skipped.
+    ///
+    /// CSS Syntax §4.3.1 removes comments from the token stream while
+    /// preprocessing, so a comment is not a descendant combinator (Selectors 4
+    /// §4.2 defines descendant as an actual `<whitespace>` token) and it does
+    /// not split a compound selector either.
+    fn skip_whitespace_and_comments(&mut self) -> Result<bool, SelectorParseError> {
+        let mut saw_whitespace = false;
+        loop {
+            while self.peek_char().is_some_and(is_css_whitespace) {
+                self.bump_char();
+                saw_whitespace = true;
+            }
+            if !self.skip_comments()? {
+                return Ok(saw_whitespace);
+            }
+        }
     }
 
     fn consume_newline(&mut self) {
@@ -1628,8 +1787,121 @@ mod tests {
     use render_html::parse_document;
 
     use super::{
-        MatchContext, Specificity, matches_selector_list, parse_selector_list, select_all,
+        MatchContext, Specificity, matches_selector_list, matching_specificity,
+        parse_nested_selector_list, parse_selector_list, select_all,
     };
+
+    /// CSS Nesting §3.1: `&` desugars to `:is(<parent>)`, and §3.2's examples
+    /// pin each form the spec spells out.
+    #[test]
+    fn nesting_selectors_resolve_to_an_is_of_the_parent() {
+        let cases = [
+            // `&` on its own.
+            ("&", ".foo", ":is(.foo)"),
+            // In a compound selector, refining the parent's.
+            ("&.bar", ".foo", ":is(.foo).bar"),
+            // With an explicit combinator.
+            ("& > .bar", ".foo", ":is(.foo) > .bar"),
+            ("&:hover", ".foo", ":is(.foo):hover"),
+            // A relative selector implies a leading `&`.
+            ("> .bar", ".foo", ":is(.foo) > .bar"),
+            ("+ .bar", ".foo", ":is(.foo) + .bar"),
+            ("~ .bar", ".foo", ":is(.foo) ~ .bar"),
+            // ... and does so even when it also names `&` later on.
+            ("+ .bar + &", ".foo", ":is(.foo) + .bar + :is(.foo)"),
+            // A descendant selector without `&` is a relative descendant.
+            (".bar", ".foo", ":is(.foo) .bar"),
+            // `&` need not be at the start.
+            (".parent &", ".foo", ".parent :is(.foo)"),
+            (":not(&)", ".foo", ":not(:is(.foo))"),
+            // Doubled `&` matches the parent twice.
+            ("&&", ".foo", ":is(.foo):is(.foo)"),
+            // A parent list stays one `:is()` argument, not a cross product.
+            ("& c", "#a, b", ":is(#a, b) c"),
+        ];
+        for (input, parent, expected) in cases {
+            let resolved = parse_nested_selector_list(input, parent)
+                .unwrap_or_else(|error| panic!("{input}: {error}"));
+            assert_eq!(resolved.css, expected, "{input}");
+            // The resolved text is what a deeper level resolves against, so it
+            // has to be a selector list in its own right.
+            parse_selector_list(&resolved.css)
+                .unwrap_or_else(|error| panic!("{input} resolved to an invalid list: {error}"));
+        }
+    }
+
+    /// CSS Nesting §4: `&` and `:where(&)` take `:is()`'s specificity, and a
+    /// relative selector that implies `&` gets the same treatment.
+    #[test]
+    fn nesting_selectors_take_the_largest_parent_specificity() {
+        let specificity = |nested: &str, parent: &str| {
+            parse_nested_selector_list(nested, parent)
+                .unwrap_or_else(|error| panic!("{nested}: {error}"))
+                .selectors
+                .max_specificity()
+        };
+        // `#a, b`: the largest in the parent list, exactly as `:is()` does.
+        assert_eq!(
+            specificity("&", "#a, b"),
+            Specificity {
+                ids: 1,
+                classes: 0,
+                types: 0
+            }
+        );
+        // `& c` adds the type selector on top of it.
+        assert_eq!(
+            specificity("& c", "#a, b"),
+            Specificity {
+                ids: 1,
+                classes: 0,
+                types: 1
+            }
+        );
+        // An implied `&` counts the same way.
+        assert_eq!(
+            specificity(".c", "#a, b"),
+            Specificity {
+                ids: 1,
+                classes: 1,
+                types: 0
+            }
+        );
+        // `:where()` reduces the nesting selector to zero, as §3.4 requires.
+        assert_eq!(
+            specificity(":where(&)", "#a, b"),
+            Specificity {
+                ids: 0,
+                classes: 0,
+                types: 0
+            }
+        );
+        // Nesting levels stack: the inner `:is()` already holds the outer one.
+        assert_eq!(
+            specificity("&", ":is(#a, b) c"),
+            Specificity {
+                ids: 1,
+                classes: 0,
+                types: 1
+            }
+        );
+    }
+
+    /// Selectors 4 requires a type selector to come first in a compound, so
+    /// `&div` stays invalid, and an attribute selector's `&` is a literal.
+    #[test]
+    fn nesting_selector_boundaries_are_respected() {
+        assert!(parse_nested_selector_list("&div", ".foo").is_err());
+        assert!(parse_nested_selector_list("&.foo", ".foo").is_ok());
+        // A `&` inside an attribute selector or a string is a literal, so the
+        // result keeps it and does not gain an implied `&`.
+        assert_eq!(
+            parse_nested_selector_list("[data-q='&']", ".foo")
+                .expect("valid")
+                .css,
+            ":is(.foo) [data-q='&']"
+        );
+    }
 
     fn query(html: &str, selector: &str) -> Vec<String> {
         let output = parse_document(html);
@@ -1856,5 +2128,210 @@ mod tests {
             &selector,
             &context
         ));
+    }
+
+    /// Selectors 4 §6.4.1 / css-conditional: with no interactive state, a
+    /// dynamic pseudo-class matches nothing. An engine that answered
+    /// `:hover`, `:focus` and `:active` unconditionally would paint every
+    /// hovered-looking stylesheet rule at once.
+    #[test]
+    fn dynamic_pseudos_never_match_without_explicit_state() {
+        let html = "<!doctype html><a id=x href=/ target=_self>t</a><input id=i>";
+        let output = parse_document(html);
+        for selector in [
+            ":hover",
+            ":focus",
+            ":focus-visible",
+            ":active",
+            ":focus-within",
+            ":visited",
+            ":target",
+        ] {
+            let parsed = parse_selector_list(selector).unwrap();
+            for element in [
+                select_all(
+                    &output.dom,
+                    output.dom.document(),
+                    &parse_selector_list("#x").unwrap(),
+                    &MatchContext::default(),
+                )[0],
+                select_all(
+                    &output.dom,
+                    output.dom.document(),
+                    &parse_selector_list("#i").unwrap(),
+                    &MatchContext::default(),
+                )[0],
+            ] {
+                assert!(
+                    !matches_selector_list(&output.dom, element, &parsed, &MatchContext::default()),
+                    "{selector} matched with a default MatchContext"
+                );
+                assert!(
+                    matching_specificity(&output.dom, element, &parsed, &MatchContext::default())
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    /// Selectors 4 §B: the specificity of `:is()`, `:not()` and `:has()` is
+    /// the specificity of the most specific selector in their argument list,
+    /// while `:where()` is always zero. `CompositeSelector::specificity`
+    /// folds each compound, so the pseudo-classes must not add their own
+    /// class-level weight on top.
+    #[test]
+    fn specificity_bearing_pseudo_classes_use_their_argument_list() {
+        let id = Specificity {
+            ids: 1,
+            classes: 0,
+            types: 0,
+        };
+        let class = Specificity {
+            ids: 0,
+            classes: 1,
+            types: 0,
+        };
+        for (selector, expected) in [
+            (":is(#a)", id),
+            (":not(#a)", id),
+            (":is(.a, #b)", id),
+            (":not(.a, #b)", id),
+            (":is(div, .a)", class),
+            (":not(div, .a)", class),
+            // The legacy single-argument spelling still folds in the type.
+            (
+                ":not(div)",
+                Specificity {
+                    ids: 0,
+                    classes: 0,
+                    types: 1,
+                },
+            ),
+            (":where(#a)", Specificity::default()),
+            (":where(div, #a, .b)", Specificity::default()),
+        ] {
+            assert_eq!(
+                parse_selector_list(selector).unwrap().max_specificity(),
+                expected,
+                "{selector}"
+            );
+        }
+        // `:has()` takes the max of its relative-selector list and adds
+        // nothing of its own; `:nth-child(An+B of S)` is a class plus the max
+        // of `S`.
+        assert_eq!(
+            parse_selector_list(":has(> #a)").unwrap().max_specificity(),
+            id
+        );
+        assert_eq!(
+            parse_selector_list(":has(> .a, + #b)")
+                .unwrap()
+                .max_specificity(),
+            id
+        );
+        assert_eq!(
+            parse_selector_list(":nth-child(2 of #a)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 1,
+                classes: 1,
+                types: 0
+            }
+        );
+        assert_eq!(
+            parse_selector_list(":nth-child(2 of .a, #b)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 1,
+                classes: 1,
+                types: 0
+            }
+        );
+    }
+
+    /// Selectors 4 §4.3 attribute grammar: escaped strings, unquoted
+    /// identifiers, and the `i`/`s` flags.
+    #[test]
+    fn attribute_selector_grammar_accepts_the_standard_forms() {
+        let html = "<!doctype html><a id=x data-bc='Yes' lang='ZH-Hans'></a>";
+        // Escaped strings and unquoted identifiers with a case flag.
+        assert_eq!(query(html, r#"[data-bc="Yes" i]"#), vec!["x"]);
+        assert_eq!(query(html, r#"[data-bc="yes" s]"#), Vec::<String>::new());
+        assert_eq!(query(html, "[data-bc=Yes i]"), vec!["x"]);
+        // Dash matching is case-sensitive by default, and the `i` flag makes
+        // it insensitive (Selectors 4 §4.3.1).
+        assert_eq!(query(html, r#"[lang|="ZH"]"#), vec!["x"]);
+        assert_eq!(query(html, r#"[lang|="zh"]"#), Vec::<String>::new());
+        assert_eq!(query(html, r#"[lang|="zh" i]"#), vec!["x"]);
+        assert_eq!(query(html, r#"[lang|="hant"]"#), Vec::<String>::new());
+        // Whitespace and comments are allowed around every component.
+        assert_eq!(query(html, "[ data-bc = 'Yes' i ]"), vec!["x"]);
+        assert_eq!(query(html, "[data-bc/*c*/=/*c*/'Yes'/*c*/i]"), vec!["x"]);
+        for invalid in ["[a=b c]", "[a|]", "[a='unterminated]", "[a=b i s]"] {
+            assert!(
+                parse_selector_list(invalid).is_err(),
+                "{invalid} must not parse"
+            );
+        }
+    }
+
+    /// Selectors 4 §4.2: a combinator is a single token or real whitespace.
+    /// CSS Syntax §4.3.1 deletes comments during preprocessing, so a comment
+    /// is neither a descendant combinator nor a compound-selector separator.
+    #[test]
+    fn comments_never_act_as_combinators() {
+        let html =
+            "<!doctype html><main id=m class='a b'><p id=a class='x y'></p><p id=b></p></main>";
+        // A comment inside a compound selector keeps it one compound.
+        assert_eq!(query(html, "#m.a/*c*/.b"), vec!["m"]);
+        assert_eq!(query(html, "p.x/*c*/.y"), vec!["a"]);
+        assert_eq!(query(html, "main/*c*/#m"), vec!["m"]);
+        assert_eq!(query(html, "main#m/*c*/.a/*c*/.b"), vec!["m"]);
+        // A comment around a real combinator is transparent.
+        assert_eq!(query(html, "main/*c*/>/*c*/p"), vec!["a", "b"]);
+        assert_eq!(query(html, "main /*c*/ p"), vec!["a", "b"]);
+        assert_eq!(query(html, "main /*c*/p"), vec!["a", "b"]);
+        assert_eq!(query(html, "main/*c*/ p"), vec!["a", "b"]);
+        // Without any whitespace there is no combinator at all, so the
+        // selector is invalid and the stylesheet rule that carried it is
+        // dropped rather than silently over-matched.
+        assert!(parse_selector_list("main/*c*/p").is_err());
+        assert_eq!(query(html, "mainp"), Vec::<String>::new());
+        // A leading comment is transparent too.
+        assert_eq!(query(html, "/*c*/#m"), vec!["m"]);
+    }
+
+    /// Selectors 4 §3.9: shadow-DOM pseudo-classes and pseudo-elements are
+    /// valid syntax outside a shadow tree and simply match nothing there.
+    #[test]
+    fn shadow_dom_pseudo_classes_parse_and_match_nothing() {
+        for selector in [
+            ":host",
+            ":host(.a)",
+            ":host(.a, .b)",
+            ":host-context(.a)",
+            ":host-context(.a) .b",
+            "::part(button)",
+            "::slotted(span)",
+            "::cue(.b)",
+            "::marker",
+        ] {
+            let parsed = parse_selector_list(selector)
+                .unwrap_or_else(|error| panic!("{selector} must parse: {error}"));
+            let html = "<!doctype html><span id=x></span>";
+            let output = parse_document(html);
+            let element = select_all(
+                &output.dom,
+                output.dom.document(),
+                &parse_selector_list("#x").unwrap(),
+                &MatchContext::default(),
+            )[0];
+            assert!(
+                !matches_selector_list(&output.dom, element, &parsed, &MatchContext::default()),
+                "{selector} must not match a light-DOM element"
+            );
+        }
     }
 }

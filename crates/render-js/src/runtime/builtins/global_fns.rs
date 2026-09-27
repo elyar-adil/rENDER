@@ -113,8 +113,20 @@ impl JsRuntime {
             | NativeFunction::ReflectOwnKeys
             | NativeFunction::ReflectGetOwnPropertyDescriptor
             | NativeFunction::ReflectDefineProperty
-            | NativeFunction::ReflectConstruct => {
+            | NativeFunction::ReflectConstruct
+            | NativeFunction::ReflectApply
+            | NativeFunction::ReflectGetPrototypeOf
+            | NativeFunction::ReflectSetPrototypeOf
+            | NativeFunction::ReflectIsExtensible
+            | NativeFunction::ReflectPreventExtensions => {
                 self.dispatch_proxy_native(dom, function, receiver, arguments)
+            }
+            NativeFunction::StorageGetItem
+            | NativeFunction::StorageSetItem
+            | NativeFunction::StorageRemoveItem
+            | NativeFunction::StorageClear
+            | NativeFunction::StorageKey => {
+                self.dispatch_storage_native(dom, function, receiver, arguments)
             }
             // Fetch-domain functions are intercepted at the dispatch head in
             // `fetch.rs`; these arms exist so a new variant stays a compile
@@ -220,31 +232,56 @@ impl JsRuntime {
             NativeFunction::ObjectDefineGetter => {
                 self.object_define_accessor(receiver, arguments, true)
             }
+            NativeFunction::ObjectProtoGetter | NativeFunction::ObjectProtoSetter => {
+                self.dispatch_object_native(dom, function, receiver, arguments)
+            }
             NativeFunction::ObjectPreventExtensions => {
-                let object = self.integrity_target(arguments, "preventExtensions")?;
+                let Some(object) = self.integrity_target(arguments, "preventExtensions")? else {
+                    return Err(JsError::type_error(
+                        "Object.preventExtensions called on null or undefined",
+                    ));
+                };
                 self.realm.prevent_extensions(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectSeal => {
-                let object = self.integrity_target(arguments, "seal")?;
+                let Some(object) = self.integrity_target(arguments, "seal")? else {
+                    return Err(JsError::type_error(
+                        "Object.seal called on null or undefined",
+                    ));
+                };
                 self.realm.seal_object(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectFreeze => {
-                let object = self.integrity_target(arguments, "freeze")?;
+                let Some(object) = self.integrity_target(arguments, "freeze")? else {
+                    return Err(JsError::type_error(
+                        "Object.freeze called on null or undefined",
+                    ));
+                };
                 self.realm.freeze_object(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectIsExtensible => {
-                let object = self.integrity_target(arguments, "isExtensible")?;
+                let Some(object) = self.integrity_target(arguments, "isExtensible")? else {
+                    return Err(JsError::type_error(
+                        "Object.isExtensible called on null or undefined",
+                    ));
+                };
                 Ok(JsValue::Boolean(self.realm.is_extensible(object)))
             }
             NativeFunction::ObjectIsSealed => {
-                let object = self.integrity_target(arguments, "isSealed")?;
+                // §20.1.2.13: a non-object target is always sealed.
+                let Some(object) = self.integrity_target(arguments, "isSealed")? else {
+                    return Ok(JsValue::Boolean(true));
+                };
                 Ok(JsValue::Boolean(self.realm.is_sealed(object)))
             }
             NativeFunction::ObjectIsFrozen => {
-                let object = self.integrity_target(arguments, "isFrozen")?;
+                // §20.1.2.14: a non-object target is always frozen.
+                let Some(object) = self.integrity_target(arguments, "isFrozen")? else {
+                    return Ok(JsValue::Boolean(true));
+                };
                 Ok(JsValue::Boolean(self.realm.is_frozen(object)))
             }
             NativeFunction::ObjectDefineSetter => {
@@ -304,6 +341,7 @@ impl JsRuntime {
             NativeFunction::StrPush => Ok(JsValue::Number(
                 self.require_string_receiver(receiver)?.chars().count() as f64,
             )),
+            NativeFunction::StrIterator => self.string_iterator(receiver),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "queueMicrotask")?,
@@ -371,27 +409,13 @@ impl JsRuntime {
                 )))
             }
             NativeFunction::GlobalParseInt => {
+                // ECMA-262 7.1.1.1. The radix argument used to be ignored, so
+                // every `parseInt(hex, 16)` in a bundle came back `NaN`.
                 let text = required_argument(arguments, 0, "parseInt")?.to_js_string();
-                let trimmed = text.trim_start();
-                let (radix, digits) = if let Some(rest) = trimmed.strip_prefix("0x") {
-                    (16u32, rest)
-                } else if let Some(rest) = trimmed.strip_prefix("0X") {
-                    (16, rest)
-                } else {
-                    (10, trimmed)
-                };
-                let end = digits
-                    .chars()
-                    .position(|c| c.to_digit(radix).is_none())
-                    .unwrap_or(digits.len());
-                match i64::from_str_radix(&digits[..end], radix) {
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "parseInt results stay within binary64 precision"
-                    )]
-                    Ok(value) => Ok(JsValue::Number(value as f64)),
-                    Err(_) => Ok(JsValue::Number(f64::NAN)),
-                }
+                Ok(JsValue::Number(crate::runtime::convert::parse_int(
+                    &text,
+                    arguments.get(1),
+                )?))
             }
             NativeFunction::GlobalParseFloat => {
                 let text = required_argument(arguments, 0, "parseFloat")?.to_js_string();

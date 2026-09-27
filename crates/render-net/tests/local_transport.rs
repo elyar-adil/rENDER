@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use flate2::{Compression, write::GzEncoder};
 use render_net::{
-    BatchOptions, ByteRange, CancelToken, CookieJar, FetchConfig, FetchError, FetchRequest,
-    FixedOriginLimit, HttpTransport, NetworkWorker, NetworkWorkerConfig, Url,
+    BatchOptions, ByteRange, CancelToken, CookieJar, FetchConfig, FetchError, FetchPhase,
+    FetchRequest, FixedOriginLimit, HttpTransport, NetworkWorker, NetworkWorkerConfig, Url,
 };
 
 #[derive(Clone, Debug)]
@@ -39,7 +39,21 @@ fn spawn_server(
     expected_connections: usize,
     handler: impl Fn(String) -> WireResponse + Send + Sync + 'static,
 ) -> (Url, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+    spawn_server_on("127.0.0.1", expected_connections, handler)
+}
+
+/// Binds a local test server on a chosen loopback address.
+///
+/// Tests that need a second RFC 6265 origin bind `127.0.0.2`: cookies are keyed
+/// by host and ignore the port, and a literal address keeps the request off
+/// name resolution, which on a machine that filters loopback SYNs would
+/// otherwise spend the connect budget on an address nothing is listening on.
+fn spawn_server_on(
+    bind_address: &str,
+    expected_connections: usize,
+    handler: impl Fn(String) -> WireResponse + Send + Sync + 'static,
+) -> (Url, JoinHandle<()>) {
+    let listener = TcpListener::bind(format!("{bind_address}:0")).expect("bind local test server");
     let address = listener.local_addr().expect("read local address");
     let handler = Arc::new(handler);
     let server = thread::spawn(move || {
@@ -391,7 +405,7 @@ fn caller_and_hop_cookies_are_not_leaked_across_a_cross_origin_redirect() {
         .expect("cross-origin target URL")
         .to_string();
 
-    let (bound_a, server_a) = spawn_server(1, move |_| WireResponse {
+    let (bound_a, server_a) = spawn_server_on("127.0.0.2", 1, move |_| WireResponse {
         status: "302 Found",
         headers: vec![
             ("Location".into(), cross_target.clone()),
@@ -401,15 +415,11 @@ fn caller_and_hop_cookies_are_not_leaked_across_a_cross_origin_redirect() {
         delay: Duration::ZERO,
         body_chunk_delay: Duration::ZERO,
     });
-    // Re-home origin A on the "localhost" name so the two origins have
-    // distinct cookie hosts: RFC 6265 cookies are deliberately not isolated
-    // by port, so two 127.0.0.1 servers on different ports would share them
-    // just like real browsers do.
-    let origin_a = Url::parse(&format!(
-        "http://localhost:{}/",
-        bound_a.port().expect("bound port")
-    ))
-    .expect("localhost origin URL");
+    // Origin A lives on a second loopback address so the two origins have
+    // distinct cookie hosts: RFC 6265 cookies are deliberately not isolated by
+    // port, so two 127.0.0.1 servers on different ports would share them just
+    // like real browsers do.
+    let origin_a = bound_a.clone();
     let start = origin_a.join("start").expect("start URL");
     let request = FetchRequest::get(start).with_cookie("caller=secret");
     let response = transport(|_| {})
@@ -570,14 +580,26 @@ fn enforces_redirect_header_and_body_limits() {
         .fetch(&FetchRequest::get(header_url), &CancelToken::default())
         .expect_err("header limit");
     header_server.join().expect("header server exits");
-    assert_eq!(header_error, FetchError::HeaderLimitExceeded { limit: 128 });
+    assert_eq!(
+        header_error.phase(),
+        Some(FetchPhase::ResponseHeaders),
+        "a limit hit while reading response headers must name that phase"
+    );
+    assert_eq!(
+        header_error.into_inner(),
+        FetchError::HeaderLimitExceeded { limit: 128 }
+    );
 
     let (body_url, body_server) = spawn_server(1, |_| WireResponse::ok("12345"));
     let body_error = transport(|config| config.max_body_bytes = 4)
         .fetch(&FetchRequest::get(body_url), &CancelToken::default())
         .expect_err("body limit");
     body_server.join().expect("body server exits");
-    assert_eq!(body_error, FetchError::BodyLimitExceeded { limit: 4 });
+    assert_eq!(body_error.phase(), Some(FetchPhase::BodyTransfer));
+    assert_eq!(
+        body_error.into_inner(),
+        FetchError::BodyLimitExceeded { limit: 4 }
+    );
 }
 
 #[test]
@@ -590,12 +612,11 @@ fn batch_is_parallel_origin_bounded_and_input_ordered() {
         let now = handler_active.fetch_add(1, Ordering::SeqCst) + 1;
         handler_maximum.fetch_max(now, Ordering::SeqCst);
         let path = request_path(&request).trim_start_matches('/').to_owned();
-        thread::sleep(Duration::from_millis(match path.as_str() {
-            "0" => 80,
-            "1" => 10,
-            "2" => 50,
-            _ => 5,
-        }));
+        // Every response takes the same time, so the two transfers the origin
+        // limit admits are always in flight together. Unequal delays used to
+        // make this assertion depend on the shorter pair finishing before the
+        // next one is even spawned, which a loaded machine can decide.
+        thread::sleep(Duration::from_millis(250));
         handler_active.fetch_sub(1, Ordering::SeqCst);
         WireResponse::ok(path)
     });
@@ -605,6 +626,7 @@ fn batch_is_parallel_origin_bounded_and_input_ordered() {
     let options = BatchOptions {
         max_concurrency: 4,
         origin_policy: Arc::new(FixedOriginLimit(2)),
+        ..BatchOptions::default()
     };
     let results = transport(|_| {}).fetch_batch(requests, &options, &CancelToken::default());
     server.join().expect("server exits");
@@ -638,6 +660,7 @@ fn worker_is_non_blocking_and_batch_cancellation_is_prompt() {
         BatchOptions {
             max_concurrency: 1,
             origin_policy: Arc::new(FixedOriginLimit(1)),
+            ..BatchOptions::default()
         },
     );
     assert!(matches!(handle.try_recv(), Err(mpsc::TryRecvError::Empty)));
@@ -689,6 +712,7 @@ fn worker_uses_a_shared_bounded_transfer_pool() {
             BatchOptions {
                 max_concurrency: 6,
                 origin_policy: Arc::new(FixedOriginLimit(6)),
+                ..BatchOptions::default()
             },
         )
         .recv_timeout(Duration::from_secs(2))
@@ -859,7 +883,8 @@ fn stalled_body_reads_time_out_with_a_typed_error() {
         .expect_err("a stalled body read must fail");
     server.join().expect("server exits");
 
-    assert_eq!(error, FetchError::Timeout);
+    assert_eq!(error.phase(), Some(FetchPhase::BodyTransfer));
+    assert_eq!(error.into_inner(), FetchError::Timeout);
 }
 
 #[test]
@@ -895,7 +920,8 @@ fn redirect_chains_keep_the_configured_overall_budget() {
         .expect_err("a redirect chain must not multiply the per-stage budget");
     server.join().expect("server exits");
 
-    assert_eq!(error, FetchError::Timeout);
+    assert_eq!(error.phase(), Some(FetchPhase::ResponseHeaders));
+    assert_eq!(error.into_inner(), FetchError::Timeout);
     // The third hop must never have been requested.
     assert_eq!(
         *seen_paths.lock().expect("read paths"),

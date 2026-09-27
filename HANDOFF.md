@@ -1,3 +1,206 @@
+# 交接文档 (2026-09-27, 进行中) — 视觉保真专项:UA 样式表 / 字体轴 / 内联 SVG / 文字装饰
+
+本轮主题:用户报告"真实网页效果都非常糟糕,没有网页可以完美渲染"。做法:先用穷举 grep 建立**可验证的证据**（哪些 CSS 属性真的有消费者、哪些值算出来被丢弃),再按文件归属切分并行 agent,避免互相踩踏。
+
+**检查点**:`2bd8e8c`（crates 拆分后续作，78 文件 / +14697 行）。改动前 `cargo test --workspace` 全绿,test262 门禁 9/9 通过(484s),作为仲裁基线。
+
+## 证据文件
+
+`docs/visual_fidelity_gaps.md` —— 本轮所有缺口的 file:line 证据与排序。**先读它,不要重新推导**。
+
+关键结论(全部经代码核实,非报告转述):
+1. **字体轴结构性缺失**（最致命）:`render-layout/src/solver/mod.rs:33` 的 `TextStyle` 只有 `font_size`+`line_height`,**没有 weight/style/family**;`render-browser/src/font_backend.rs:33-43` 每个候选组只加载一个字体就 break,`:57-63` 只按字形覆盖选字体。**粗体物理上不可能,斜体不可能,`font-family` 被忽略。**
+2. **UA 样式表只有 28 行**(`render-core/src/document.rs:36-63`):`h1`-`h6` 只有 `display:block` 无字号字重边距 → 标题和正文一模一样;**完全没有 `a` 规则** → 链接和正文无法区分。
+3. **9 个 paint 属性零消费者**:`text-decoration*` `text-shadow` `list-style*` `text-overflow` `text-indent` `letter-spacing` `text-transform` `filter` `clip-path`。
+4. **`@font-face`/`@keyframes` 解析后直接丢弃**(`render-css/src/stylesheet.rs:552-558`)→ 全站无 webfont、无 CSS 动画。
+5. **内联 SVG 完全没解析**(`render-html` 无任何 foreign content 代码)→ 全站图标消失。但 `render-dom` 命名空间已就绪(`lib.rs:192/209/502`),缺口只在树构造器。
+6. quirks 模式未实现(`document.rs:704`);`<video>` 只有 poster(`PlaceholderDecoder`)。
+
+## 本轮并行 agent 与文件归属(互斥,禁止越界)
+
+| Agent | 归属 | 状态 |
+|---|---|---|
+| TABLE | `render-layout/**` | CSS 2.1 §17 表格布局 —— **四轮全部验收通过**,81→**126** 测试。含 border-collapse 冲突解决、empty-cells、行组 vertical-align、`<col>` 宽度、`table-layout: fixed`。已交接给 TEXT |
+| NET | `render-net/**` | 卡死可观测 + 每地址回退 + 批次有界 —— **已验收** 45→**62**。R2 连接复用 + HTTP/2 评估进行中 |
+| JS | `render-js/**` | ToObject 原始值装箱(qq 主 bundle 根因)—— 进行中 |
+| PIPE | `render-browser/**` | 在线管线"有样式却裸文本"(京东)—— 进行中。**S1 字体轴在等它释放** |
+| UASHEET | `render-core/**` | HTML5 UA 样式表 + text-decoration/text-shadow/list marker —— **代码已落地待正式报告** |
+| FOREIGN | `render-html/**` `render-dom/**` | foreign content + `<template>` 惰性 —— **已验收**(81/16)。R3 活动格式元素列表 + in select 进行中 |
+| DOCS | `docs/**`(4 份) | **已验收**。它报出的 8 条"我的文档错误"里 2 条是误报、1 条行号已漂移,其余已修 |
+| ACCEPT | `tests/**`(新建) | 真实站点验收 harness —— 进行中 |
+| CSS2 | `render-css/**` | 冷启动:表格属性 typed 化 + CSS 嵌套 + `color()` + 媒体查询单一真相源 |
+| TEXT | `render-layout/**` | 冷启动:`text-overflow`/`text-indent`/`letter-spacing`/`text-transform` 四个无消费者属性 |
+
+## 仲裁记录:验收 TABLE 交付时抓到的规范错误
+
+`table.rs:608-621` 注释声称"HTML rendering section 设置了 `table > tr { vertical-align: middle }`"并据此把单元格默认值设为 `middle`。**结论:保持 `Baseline` 默认,但我当时的理由是错的,已更正。**
+
+**更正(由 CORE r2 复核,原记录措辞"这是错的"不准确):** HTML 现行标准
+**§15.3.8 确实写着** `thead, tbody, tfoot, table > tr { vertical-align: middle; } tr, td, th
+{ vertical-align: inherit; }`。所以 TABLE 的引用**不是伪造的**,标准文本存在。我当时把
+"没有浏览器这样做"当成了"标准没有这条",这是**两个不同的命题**——把它记成后者是错的。
+
+**为什么仍然保持 `Baseline`:** 没有任何浏览器的 UA 样式表实现这条,
+`getComputedStyle(td).verticalAlign === "baseline"`,CSS 2.1 §17.5.3 的初始值也是 `baseline`。
+目标一致性的判据是**运行时可观测行为**,而 `getComputedStyle` 必须与浏览器一致;照标准
+文本实现会让 rENDER 成为唯一一个把单元格中置的引擎。
+
+**处置不变,但理由换了:** 这是**一处有记录的、有理由的偏离**,不是"标准不存在"。
+引用可以保留,注释必须写明"标准有此文本,浏览器均未实现,本引擎选择与浏览器一致"。
+UASHEET **不要**加这条 UA 规则。CORE 发现了这个矛盾后**没有自行改回**,只上报——
+这是对的,因为"有记录的偏离"和"假引用"是两种不同的处置,只有 orchestrator 该选。
+返工项:`width:auto` 必须 shrink-to-fit(§17.5.2.2,现为撑满容器)、过约束表必须**撑大**(现为压缩列)、intrinsic 宽度 helper 把 `<br>` 分隔的多行**求和**而非取最大值(影响 table/flex/inline-block 全体消费者)。
+
+## 本轮新挖到的缺口(我自己查的,已进 `docs/visual_fidelity_gaps.md`)
+
+| 编号 | 内容 | 证据 |
+|---|---|---|
+| S10 | **平台 API 缺失**:`localStorage`/`sessionStorage`/`FormData`/`TextEncoder`/`structuredClone`/`AbortController`/`ResizeObserver`/`customElements` 等全缺。**`localStorage` 伤害最大**——大量生产 bundle 和几乎所有统计/反爬脚本启动就读它,缺失即 `ReferenceError` **打死主脚本**,页面在布局引擎再正确也渲染不出东西 | 从 `render-js/src/value.rs` 的 117 个全局对象枚举比对 |
+| S11 | **无嵌套浏览上下文**:`iframe` 无第二个 document、无 `postMessage`、无 `window.open`/`target=_blank` | `render-core/src/document.rs:262,269` 仅出现在元素分类列表 |
+| S12 | **只支持 `rgb()`**:`hsl()`/`oklch()`/`lab()` 全不识别 → 声明被丢弃 | `render-css/src/properties.rs:1685-1689` 只有 rgb/rgba 分支 |
+
+**S12 用真实语料量化**(9 份生产样式表,可复现):
+```powershell
+$files = Get-ChildItem .diag -Recurse -Include *.css -File
+foreach ($f in $files) { $t = Get-Content $f.FullName -Raw
+  "hsl=" + ([regex]::Matches($t,'(?i)hsla?\(')).Count
+  "oklch=" + ([regex]::Matches($t,'(?i)oklch\(')).Count
+  "lab=" + ([regex]::Matches($t,'(?<![A-Za-z0-9_-])lab\(')).Count
+  "rgb=" + ([regex]::Matches($t,'(?i)rgba?\(')).Count }
+```
+共 **358 条声明被丢弃**:`color` 109(文字继承错误色、对比度崩坏)、`background`+`background-color` 89(**完全没背景**)、`box-shadow` 系 90(没阴影)、`border` 系 19、`background-image` 8。
+
+**注意交互**:`background-image` 那 8 条尤其隐蔽——渐变**确实**被渲染(`properties.rs:1729` 用 `slice_from(start)` 保留原始文本,`display_list.rs:929-975` 构建真实的 `LinearGradient`/`RadialGradient`),但色标写成 `hsl()` 时**几何保留、颜色丢弃**,于是渐变以错误色相画出来,而不是不画。绿色到蓝色的品牌渐变用 hsl 写就会渲染成错误色相。
+这条接近纯收益:HSL/HWB/Lab/LCH/OKLab/OKLCH → sRGB 都是短而精确规定的转换,而 paint 侧本来就吃 sRGB 三元组。
+
+**另外两处我自己查证后推翻的旧说法**(避免下一个人再去追):
+- 渐变**不是**没实现。`parse_background_image` 的嵌套块只做消费校验,值用 `slice_from(start)` 原样保留。
+- `calc()`/`min()`/`max()`/`clamp()` **已支持**(`render-css/src/length.rs:316-323`);级联层 `@layer` 也已完整实现,含 `@layer` 语句、块与 `revert-layer`(`stylesheet.rs:22-88`、`cascade.rs:879`)。
+
+## 最高优先级(用户报告,当前所有其他事项让路)
+
+### 下划线到处都是:`text-decoration: none` 被静默忽略
+
+**症状**:页面上到处是下划线,很多页面明确写了去掉下划线却不生效。**这是用户亲自报告的,
+是目前最显眼的缺陷。**
+
+**根因(已从代码逐环确认)**:
+1. UA 表 `a:link { text-decoration-line: underline }` —— 正确,浏览器本来就给链接加下划线。
+2. 页面写 `a { text-decoration: none }`。`render-css/src/cascade.rs:524` 的
+   `expanded_declaration` 只处理 `background` / `margin|padding` / `border*` / `font` /
+   旧 `grid-gap` 长属性 —— **没有 `text-decoration`**。于是作者的 `none` 以字面键名
+   `"text-decoration"` 落库,**`text-decoration-line` 长属性从未被覆盖**。
+3. `render-core/src/paint/display_list.rs:2380` 先读 `text-decoration-line`,拿到 UA 表的
+   `underline`;`:2388` 的 `style.get("text-decoration")` 回退**只在长属性缺失时才触发**,
+   而 UA 表永远提供它。
+
+**后果:全网每一个 `text-decoration: none` 都是死代码。** 锚点、导航、`a:hover` 的
+下划线切换、`abbr`、`h1..h6` 里的 `<a>` 全部照常画线。
+
+**这不是规范解释问题,是纯粹的遗漏。** CSS 2.1 §16.3.1 明确把 `text-decoration` 列为
+`text-decoration-line || text-decoration-color || text-decoration-style` 的简写,CSS
+Text Decoration 3 再加 `-thickness`。修法只有一处:`expanded_declaration` 加一个 case。
+修完之后**绘制层一行都不用改**——长属性正常参与层叠,作者的 `none` 压过 UA 表的 `underline`,
+回退路径自然不再触发。
+
+**第二处(次要,UASHEET 已在代码注释里诚实记录)**
+`display_list.rs:1234-1242`:祖先装饰靠"向上找第一个指定了 line 的祖先"近似,于是**中间
+那个写了 `text-decoration-line: none` 的行内元素无法解除祖先的装饰**。注释里写明了
+正解是把这个传播搬进 render-css、然后删掉这个 walk。这件事必须等简写展开做完再动,
+否则就是在绘制层打补丁掩盖层叠层的缺口。
+
+**归属:render-css。** CSS2 正在跑第三轮(specified-value 查询),它落地后这是它的第一优先。
+
+## 待接线事项(跨 crate,需要归属方处理)
+
+1. **`render-browser` 缺两个穷尽 match 臂(阻塞 `clippy -D warnings`)**。UASHEET 给 `DisplayCommand` 加了 `TextShadow(_)` 和 `ListMarker(_)` 两个变体,`render-browser` 有三处对 `DisplayCommand` 的穷尽匹配需要各加一臂:
+   ```rust
+   DisplayCommand::TextShadow(_) => "text-shadow",
+   DisplayCommand::ListMarker(_) => "marker",
+   ```
+   位置:`crates/render-browser/src/diagnostics.rs:41`、`render_worker.rs:460`、`pipe_diag.rs:174`。`DisplayCommand` 仍是 `Copy`;`content_interaction.rs` 用的是 `!matches!`,**不需要改**(两者都应可命中测试)。归属:PIPE。
+2. **clippy 欠账**:`render-js` 6 条(JS agent 在途:`unnested or-patterns`、多余的按值传参、`&mut Vec` 应为 `&mut [_]`);`render-core/src/image/svg.rs` 3 条(`too_many_lines` ×2、`non_snake_case` ×1,`viewBox_scales_geometry_to_the_viewport`——**这是本会话最开始 `cargo check` 就有的既存 WIP 债,不是任何 agent 造成的**)。两条都卡 `-D warnings`。
+3. **展现提示的 origin 错了**:`render-css/src/cascade.rs:171-208` 把 presentational hints 放在 `CascadeOrigin::UserAgent`,而 HTML §15.2 规定它们属于**作者** origin 且优先于所有作者规则。这导致新 UA 表必须对 `td,th{padding:1px}` 和 `table{border-spacing:2px}` 用 `:where()` 才能不压过 `cellpadding` 的展现提示。**正解在 render-css**,UASHEET 用 `:where()` 绕过并写清了原因——这是正确的临时手段但不是终点。
+4. **S1 字体轴的完整改动面(三次扩充后定稿)**:① `TextStyle` 加 weight/style/family;② `TextFragmentData` 同样要带(`render-layout/src/solver/inline.rs:1034-1043` 只带 text/baseline/font_size,布局之后无法恢复);③ 穿过 `TextMeasurer::measure`、`TextShaper::shape`、`GlyphRun.font`;④ **`render-browser/src/font_backend.rs` 必须按 `(weight, style)` 加载字面**——它现在每组只加载一个、纯按字形覆盖选,所以粗体/斜体物理上不可能;⑤ **`render-core/src/interaction/hit_test.rs:903` 在生产代码里字面量构造 `TextStyle`,必须同步改**。绘制侧已就绪:`GlyphRun.font` 存在且每 run 带 `FontInstanceId`。TEXT 已给出正确扩展模式:**带默认实现的新方法**,让唯一后端实现者零改动继承。
+
+## 协调事故记录(留档,避免下一个人重踩)
+
+0. **我连着两次把任务书投错了 session**(把 CSS 的活投给 TABLE、再投给 NET)。两次都是手抄长 session ID 时抄错。**两次 agent 都自己识破并拒绝了,没有造成任何文件冲突**——TABLE 明确回复"这份任务书不是给我的,我不动我的 crate";NET 更进一步指出 `render-css` 当前有人在改这个活信号。
+   **处置:不再手抄 session ID,冷启动新 agent 并给自包含任务书**(`ses_f1d250579ffea3BgANdyLoA54X` 即 CSS2)。新任务书第 6 条已写入这条规则:**发现别的 agent 的代码进了你的 crate,不要"修"也不要回退,报上来**。
+   教训不止于抄错:一个 agent 在共享工作树里遇到不属于自己的任务书时,**正确行为是拒绝并说明**,而不是"顺手做了"。
+1. **测试二进制栈溢出会留下僵尸进程占住链接器输出**,后续构建报 `LNK1104 ... render_html-*.exe`。处置:`Stop-Process -Name "render_html-*" -Force`;若文件仍被占,把 `target/debug` 下那个陈旧 exe 改名即可释放链接路径,再删掉改名后的副本。注意这些残留进程 `HasExited=True` 且 `taskkill` 报"拒绝访问",那是**已死句柄**的正常表现,不代表还占着文件锁——判断标准是 `target/debug` 下还有没有那个 exe。
+2. **`render-js` 曾在编译不过的状态下被别的 agent 观测到**(JS agent 的在途改动)。任何 agent 报告"某个 crate 编译失败"时,先确认不是别人改到一半——本轮已确认 `cargo check -p render-js` 恢复通过,但残留一条 `value.rs` 的 `unused variable` 警告,**这条会卡 `clippy -D warnings`**,最终门禁要盯。
+3. **agent 推翻任务书是正确行为,不是抗命**。FOREIGN 指出我给的两处规范错误(`xml:base` 不在 11 条调整表内;`xmlns:xlink` 映射到 XMLNS 命名空间而非 XLink)——核对后**它是对的,我错了**。任务书里的规范细节必须被实现者拿规范原文复核,不能当作既定输入。
+   **这条后来扩展成一条更强的规则**:第六轮我给了明确验收标准("`<div a b>` 应该报错")，FOREIGN 查规范后发现**那条标准本身是错的**——13.2.5.34 那个状态对任何情况都不报这个错，而我想保住的那一类错误**根本不存在**（两个无值属性不可能不带空白相邻，因为能结束属性名的每个字符要么是分隔符要么结束标签）。**它按规范做，而不是让代码去迎合我的标准，并且明确说明了分歧。**
+5. **被 agent 修正过的"已验证"数字**:我验收 FOREIGN 第五轮时报的 "116 passed" 里，包含了它自己第四轮留下的一条**空转测试**（`scratch_noscript_probe`，只 `eprintln!` 不断言任何东西）。**真实数字是 115。**它自己发现并删除了。也就是说**我的验收方法本身会为一个什么都不测的测试背书**——最终门禁要专门看这一点。
+4. **两个 agent 的报告要交叉核对,不能各自采信**。CSS agent 说"`@media` 确实被求值",我去读代码才发现存在**两个能力不一致的媒体查询求值器**(S17),其中一个给每个带特性的查询发假警告。单个 agent 的报告是证据,不是结论。
+5. **本机网络环境陷阱(NET agent 实测)**:**这台机器对关闭的 loopback 端口是丢弃 SYN 而非回 RST**,而且 `localhost` 优先解析到 `::1`。所以一个看起来像"服务器卡住"的请求,可能只是一个死地址在烧它的 connect 预算。`crates/render-net/examples/connect_probe.rs` 的 `addr <host:port>` 子命令可以对每个解析出的地址单独计时,`fetch` 子命令打印 elapsed + phase。诊断任何"加载很慢/不动"之前先跑它。
+   **NET 已验收**(`cargo test -p render-net` 45 → **65 全绿**):
+   - **每个请求都有上报的终态**——"样式表解析失败"和"样式表根本没回来"在日志里可区分了:`render-net FAIL GET <url>: tcp connect: request timed out after 5013ms`,以及 `render-net SLOW ... 200 <bytes> bytes in 2036.4ms`。`RENDER_NET_LOG=1` 打开逐请求日志。**这是本轮最实用的单项产出**——之前"静默卡死"和"快速成功"在日志里长得一样。
+   - **连接复用其实一直是好的,之前那个测量值在测 brotli**。`examples/reuse_probe.rs` 起一个计数连接数的本地源站:3 个请求,`gzip` 走 **1 条连接**,`gzip, br` 走 **3 条**。根因是 ureq 3.3 的 brotli reader 到达**解码后**流末尾却没有排空**长度分隔的线上 body**,连接因此永远不回池。`.accept_encoding("gzip")` 早已是修复。这同时解释了旧的"裸 ureq 129ms→230ms"——那个裸探针用的是 ureq 默认 `Accept-Encoding`(含 br)。真实 CDN release 实测 **104.6ms → 20.5ms → 28.0ms**,同源**不同路径** 30.8ms(跨 URL 复用,页面真正需要的),走系统代理 35.1 → 11.7 → 12.7ms。
+   - 留了一个**故意在 ureq 修好时失败**的探针 `advertising_brotli_is_what_breaks_the_pool_in_ureq_3_3`,并在测试里写明届时可以把 `br` 加回 Accept-Encoding。**这个手法值得推广**:把已知的上游缺陷钉成一个会提醒你的信号。
+   - **HTTP/2 明确拒绝**,三条硬冲突:① ureq 3.3 根本没有 h2 开关,没有帧编解码/HPACK/多路复用器;② **冲突是结构性的**——池化 `Connection` 在用期间被移出池、由 `reuse()` 归还,而 `run()` 全程持有 `&mut Connection`,即**一条连接只能有一个在途请求**;多路复用恰好相反;③ 没有 ALPN API,发不出 ALPN 扩展。
+   - **修正我的前提**:这台机器的 curl 是 `Schannel zlib` 且**没开 HTTP2**,所以"curl 第二次 46ms"也是 HTTP/1.1 → HTTP/1.1,和我们说同一种协议。**我原来拿 curl 当 h2 对照是错的。**
+   - 复用连接上的归因已测:服务端在**同一条池化连接**上把第二个请求卡住,测试断言连接数仍为 1、该请求仍以 `response headers` 阶段和独立 elapsed 结束、观察者记录到两个独立事件(一 ok 一 fail)。**池化连接没有自己的 connect 阶段,正是最该证明的那种情况。**
+6. **已知未修(NET,均已报告)**:① `max_idle_connections_per_host` 默认 **3**,对 40 个同源资源的 HTTP/1.1 页面是**很低的 ceiling**;② ureq 的 `Connection::age()` 恒返回 0,所以 `max_idle_age` 永不淘汰。这两条都指向一个待做项:**同源并发上限目前由第三方默认值决定,不是我们选的**。
+7. **CSS2 的嵌套工作当前让工作区编译不过**(`crates/render-css/src/selector.rs` 16 个 + `stylesheet.rs` 11 个错误:`NestedSelectors`、`parse_nested_selector_list`、重复的 `impl AtRuleParser for PropertyParser`、`Parser` 名字冲突)。**这是预期内的在途状态**——NET 正确地没有去"修"它,只上报。八个 agent 并行时看到别的 crate 编译不过,先确认是不是别人改到一半,再决定要不要管。
+
+## 排队中(等 crate 归属释放后开工)
+
+### S1 字体轴 —— 最高价值剩余项,**同时被三个 crate 阻塞**
+
+需要:① `TextStyle` 加 weight/style/family;② `TextFragmentData` 同样要带
+(`render-layout/src/solver/inline.rs:1034-1043` 只带 text/baseline/font_size,布局之后无法恢复);
+③ 穿过 `TextMeasurer::measure` / `TextShaper::shape` / `GlyphRun.font`;④
+**`render-browser/src/font_backend.rs` 必须按 `(weight, style)` 加载字面**——它现在每组只
+加载一个、纯按字形覆盖选,所以粗体/斜体物理上不可能;⑤ **`render-core/src/interaction/hit_test.rs:903`
+在生产代码里字面量构造 `TextStyle`,必须同步改**。绘制侧已就绪:`GlyphRun.font` 存在且每 run
+带 `FontInstanceId`。
+
+**当前阻塞**:`render-layout` 在 CSS2 第四轮手里(下划线 bug + fixture),`render-browser` 在
+PIPE 手里,`render-core` 在 CORE 手里。**三个都被占。**
+
+**不要拆开做**:`CLAUDE.md` 明文"implement features fully or not at all"。只改 `TextStyle`
+不改 `font_backend` 的话编译能过(新字段被忽略)但**行为零变化**,等于交付假特性。
+**扩展模式照 TEXT 的做法**:带默认实现的新方法,让唯一的后端实现者零改动继承正确行为。
+
+- **内联 SVG 栅格化**:CORE 在做。解析半边已完(FOREIGN),栅格化走已有的 `image/svg.rs`,
+  注册为 image resource。**读 `xlink:href` 必须用 `attribute_ns`**,用 `attribute(node,"href")`
+  会静默丢掉每一张链接图片。
+- **S24 form owner**(本轮新发现,无人查过):`render-dom` **完全没有 form owner 概念**,
+  `FormData` 在 render-js 里是孤立数据结构、和任何 form 都没连接。搜索框/登录这条最常用的
+  交互路径底层是空的。FOREIGN 在做 DOM 侧的 owner 关系 + 解析器 form element pointer。
+  `render-js` / `render-browser` 侧消费(`form.elements` / `requestSubmit` / `reset` /
+  `formaction` / 从 form 构造 `FormData`)要等 owner 存在才能开始。
+- S4 `@font-face`(223 块)/`@keyframes`(249 块)评估、S4b `@supports`(93 块无条件应用)、
+  S7 quirks 模式、S11 iframe、S8 视频像素解码、S13 Selection/Range 与滚动容器。
+- S9 `spec/registry.rs` 补登 animation/font-face/pseudo-element/table/inline-svg/video/form 条目。
+
+### 给 CSS agent 的返工清单(下划线修复已在第四轮派发中)
+
+1. **S23 颜色/下划线**:`expanded_declaration` 加 `text-decoration` 分支(两种语法 + `none`),
+   注册四个长属性。**用 `css_corpus` 量化 `.diag/**` 里有多少条 `text-decoration` 简写**——
+   这个数字就是 bug 影响面的量化答案。
+2. S17 的 `render-core` 半边已交给 CORE(它把 `has_unsupported_query` 换成
+   `!media_query_list_is_supported(media)`)。
+3. S21 `hasOwnProperty.call` 归 JSTRIAGE。
+4. 展现提示的 origin 错了(`cascade.rs:171-208` 放在 `CascadeOrigin::UserAgent`,
+   HTML §15.2 规定是**作者** origin 且优先于所有作者规则)——UASHEET 因此被迫对
+   `td,th` 和 `table` 用 `:where()` 绕开。正解在 render-css。
+
+### 给 CSS agent 的返工清单(已备好,等它收工)
+
+1. **S12 颜色函数**(最高优先):`properties.rs:1685-1689` 只认 `rgb/rgba`。补 `hsl/hsla/hwb/lab/lch/oklab/oklch/color()/color-mix()/light-dark()`。9 份真实样式表里 **358 条声明正因此被丢弃**(`color` 109 / `background`+`background-color` 89 / `box-shadow` 系 90 / `border` 系 19 / `background-image` 8),量化命令见上。渐变几何已实现,**色标颜色丢了会画成错误色相**,不是不画。
+2. **表格属性注册为 typed property**:`border-spacing`、`caption-side`、`vertical-align`、`border-collapse`、`table-layout`、`empty-cells` 目前只在 token 级 computed map 里,求解器得用 `ComputedStyle::get(..).css_text()` 读。注册成 typed 是正解。注意 TABLE agent 的测试显式写了 `border-spacing: 0`,所以注册不会打破它。
+3. **修好上一轮量化表**:CSS agent 建的 `render-css/examples/css_corpus.rs` 目前只统计**规则级**丢弃。声明级的丢弃(本节第 1 条那 358 条)不在它的度量里——建议扩展成同时报告"规则丢弃"和"声明丢弃",否则这类缺口永远测不出来。
+4. S6 的 `position: sticky` 有枚举无消费者;`z-index` 只在 block 兄弟间排序,flex/grid 子项不参与,绘制层无感知。
+
+## 法则更新
+
+`docs/generic-browser-todo.md` 新增 **"Priority -1: Gaps Are Implemented Forward, Never Removed"** 明文法则:未实现/无人认领的能力是**待实现的 TODO**,不是可删可绕过的东西;不得删行为、不得用假近似冒充实现、不得特判绕过;**过期文档同样是缺陷**,架构迁移后必须重写而非删除。同时修掉该文件里 `engine.py` 的 Python 残留。
+
+---
+
 # 交接文档 (2026-09-27, 进行中) — 多网站可用性专项:代理/居中/封面/展现属性/背压
 
 本轮主题:用户报告"打开网页看到乱七八糟的文字 + UI 拖拽无动画 + 常用网站没有能完美工作的"。以真实浏览器截图为参照逐站对比,把差异归类为标准缺口逐一向前修复(未回退任何既有代码)。
@@ -37,7 +240,73 @@ B. 视觉裸文本与"stylesheets=3"矛盾 → 需查 render_worker.rs 提交帧
 另:渲染停滞(行 104 后无新渲染)违反"图片完成必重渲"预期,查 finish_images→schedule_page_render 链路(可能与 render_dirty/is_tab_busy 合并逻辑交互:第 87 渲染 commit 时 render_dirty 置 true resubmit 的那帧是否被 drain_latest 丢弃)。
 顺带发现(离线):`.form` 的 `transform:translateX(-50%)` 似未生效(form 左缘 885=109+776 而非居中),按钮 x=1809 超出 1770 视口——transform 对 absolute 定位几何的影响待查。
 
-**进一步证伪(同日)**:新增 `crates/render-core/examples/dom_dump.rs`(页面跑完内联脚本后把 DOM 序列化回 HTML)。用内联脚本执行后的 DOM 离线渲染 + 同 3 个 CSS:search-m 子树依旧完美(form/input/红按钮全在),与原始 DOM 渲染逐像素一致(div 数不变)。**假设 A(内联 JS 改 DOM)证伪**。剩余唯一差异:在线还成功执行了 5 个外链脚本(jquery-1.6.4、wl.js、o2_ua.js+event.js、两个 inline),它们的 DOM 改动(class 注入等)是最后未复现的变量。**下一步明确**:仿 render-js examples/bilibili_diag.rs 写 jd_diag.rs——manifest.txt 映射外链脚本 URL→本地文件,完整回放后序列化 DOM,再离线渲染对比。若回放后仍正常,则问题必在浏览器侧 commit/绘制链路(回到假设 B,重点查 expected_render 竞态:8 次渲染只有 3 帧 commit,大量结果被 drain_latest 丢弃,可能存在"带样式渲染结果被丢弃、裸文本旧帧当最终帧"的直接证据链)。
+**已定案(PIPE r 收尾,`render-browser` 157/0)**——**上面的假设 B 被测量证伪,真正的根因在 `render-css`。**
+
+**测量(真实文档 + 3 张真实样式表,本地 HTTP fixture 走完整浏览器路径):**
+
+```
+浏览器路径(process_page_render,含 re-plan + rematch + merge)
+  unstyled: stylesheets=0 computed_styles=650 fragments=918 items=721 content_height=6234.72
+  styled:   stylesheets=3 computed_styles=651 fragments=492 items=349 content_height=3028
+离线引擎参考(同 DOM + 同 3 表,无浏览器簿记)
+  styled:   items=349 content_height=3028          <-- 完全相同
+```
+
+**从 apply 到 commit 的浏览器侧路径与"把样式表直接交给引擎"逐项等价。**`merge_current_style_sheets`
+没丢任何东西,re-plan/rematch 产出相同的键,3 张表都进了层叠。**不是浏览器的问题。**
+
+**定位结果:`vanished` 从 20 暴涨到 151**(有非 `none` display 却不产生任何盒的块级元素),
+两个类别:
+- **A 类**:`.cate_menu_icon` 命中 `first-screen.chunk.css rule#319 => display: inline-block`,
+  `.loading` 命中 `index.chunk.css rule#1532 => display: block`——**规则命中、值正确,却无盒** → `render-layout`。
+- **B 类**:`.cw-icon` / `.dropdown-layer` / `#J_cart_pop` / `.JS_navCtn.cate_menu` /
+  `.cate_menu_item`——**151 个块级元素,作者样式表本该给出 `display` 却一条都没匹配上** → `render-css`。
+
+**B 类的具体根因已钉死,是规范违反。**每一条 `unexpected token: Semicolon` 都精确落在 legacy star
+hack 之后的 `;` 上,而**那条规则保留了它之前的声明、丢掉了从非法那条开始的全部声明**:
+
+```
+index.chunk.css  1:269395 / 1:269403
+  `.jdmcc-topbar #ttbar-serv .item{display:inline-block;*display:inline;*zoom:1;min-width:50px;…}`
+mall index.css   1:697674 / 1:697711   同一规则,顺序不同
+fingerprint: blocks_keeping_display=1  blocks_that_lost_display=1   (每张表)
+```
+
+三张表共 19 处 star hack。承载 `display:inline-block` 的那条块——**就是让京东顶栏横排的那条规则**——
+丢了它,`<li>` 回落到 UA 的 `list-item`,**页头就竖着堆了。那就是"裸文本"截图。**
+
+CSS Syntax §5.4.2 / §5.4.4:一条不可解析的声明必须**单独丢弃**,解析继续走同一块里的下一条。
+现在一个非法属性名(`*zoom` / `*display`)**把该声明及其之后同一块里的每一条都一起丢掉**,
+然后解析器报 `unexpected end of input` 而不是恢复。位置:`crates/render-css/src/stylesheet.rs`
+的声明列表消费者。**已作为 `render-css` 的下一轮排期**(当前 `render-css` 在跑 at-rule 诊断)。
+
+**方法论教训(本条比上面所有定位都重要):整条时间线都建立在"会被打印的日志"上,而那些日志属于被丢弃的帧。**
+
+`commit_render` 在身份门禁**之前就 return**,并且在消费 `page.render_dirty` **之前** return;
+`log_completed_frame_debug` 又跑在那个门禁**之前**。所以**我们此前读的每一行帧日志,都可能是一帧
+根本没有提交的渲染**。测量必须先确认那帧被 commit 了,否则数字描述的不是最终画面。
+
+**已确认并修复的浏览器侧收敛缺陷:**
+- `PageState::set_source` 清 `expected_render` 时**不取消在飞的渲染作业**,所以一次导航若在渲染
+  期间落地,标签页就**确定性地**冻结在上一个文档上。修法:每条渲染完成路径都要兑现合并后的请求,
+  把 commit 日志移到门禁之后(被丢弃的帧现在记为 `discarding superseded frame`),并记住
+  **请求的**视口(`render_dirty_viewport`)而不是已提交的视口。
+- 第二个更难的孤儿:**被取消的渲染从不报告完成**,所以事件循环永远不会被唤醒。
+  `recover_unresolved_render_requests()`(由 `about_to_wait` 驱动,并把 `render_dirty` 加进唤醒条件)
+  是自愈路径。这是真实浏览器运行里**可复现的页面冻结**。
+- "44 张图、不重渲"这条怀疑:**部分为假,但有一个真实漏洞**。一批结果全部陈旧/全部解码失败/
+已应用过的批次,什么都没解码因而**从不把页面标脏**,于是**一张图都加载失败的页面会冻结在最后一次
+提交上**。现在每个完成的批次都标脏并递增 generation。
+
+**经核对无需改动的(script-fetch 门):**提交 `1c4f6e9` 的说法成立——外链脚本分支**无条件**提交请求,
+不论 `styles_resolved`;只有*执行*才延后,经由 `held_scripts`。内联 body 在样式表在飞时就准备好
+(解析),只有 `execute_script_batch` 等待。这符合 HTML 的"blocking scripts"。
+
+**给 `render-net` 的新发现:响应阶段没有读超时。**`HttpTransport::with_proxy` 把
+`timeout_recv_response(None)` 和 `timeout_recv_body(None)` 都设成无限,所以**连接建立后卡住的传输会
+永久挂起**。本机就是如此:浏览器对 jd.com 的请求经由可用的系统代理(curl 200,193164 B,70 ms)
+处于 Established 且 **80 秒零进展**,而 curl 同路径 70 ms 返回。**这就是这台机器上没有 jd.com 实时信号
+的原因**,也是 PIPE 只能用 curl 抓页面再本地起 HTTP 服务来复现的原因。
 
 ## 下一批(按价值排序)
 

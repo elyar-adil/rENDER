@@ -1,5 +1,18 @@
 # Rust Migration and Product Architecture
 
+> **Status: historical.** The migration this document plans is complete. The engine is
+> eight Rust crates under `crates/` with no Python or Qt component anywhere in the
+> runtime path. Module names below are the *old* Python engine's
+> (`engine.py`, `css/computed.py`, `layout/block.py`, `js/promise.py`, ...) and are kept
+> only to explain why the current architecture looks the way it does.
+>
+> For current truth read `CLAUDE.md` (architecture), `docs/visual_fidelity_gaps.md`
+> (verified capability evidence), `docs/real_site_acceptance.md` (the page contract),
+> and `docs/testing_strategy.md` (the test tiers). Where this document gives a command,
+> trust `tools/check.sh` instead - the command block near the end of this file refers to
+> a `bindings/python/` crate and `tests/*.py` oracles that do not exist in this
+> repository.
+
 ## Product objective
 
 rENDER is becoming a complete, lightweight desktop browser with a self-owned
@@ -214,21 +227,29 @@ complete. Specified, cascaded, computed, used, and actual values remain explicit
 boundaries rather than one mutable style dictionary. JavaScript bindings consume
 the same `NodeId` identity instead of maintaining a parallel tree.
 
-## Local Rust and Python binding checks
+## Local checks
+
+There is no Python binding crate and no Python oracle suite in this repository; that
+part of the original plan was not built. The checks that exist:
 
 ```powershell
-cargo test --workspace
+tools/check.sh
+```
+
+which runs, in order:
+
+```powershell
+cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+python tools/check_site_neutrality_test.py
+python tools/check_site_neutrality.py
+cargo test --workspace
+```
 
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install maturin pytest
-maturin develop --manifest-path bindings/python/Cargo.toml
-python -m pytest -q bindings/python/tests
+Note that `cargo test --workspace` includes the test262 conformance gate, which takes
+about eight minutes and holds the build lock. The offline real-site acceptance harness
+is a separate standalone crate:
 
-# Optional installed Edge/Chromium interoperability comparison
-python tests/html_interop_oracle.py
-python tests/selector_interop_oracle.py
-python tests/cascade_interop_oracle.py
-python tests/computed_interop_oracle.py
+```powershell
+cargo test --manifest-path tests/real_site_tasks/Cargo.toml
 ```

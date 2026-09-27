@@ -82,6 +82,23 @@ impl PropertyRegistry {
             ("visibility", "visible"),
             ("white-space", "normal"),
             ("word-spacing", "normal"),
+            // The CSS 2.1 table properties that *inherit*: `border-spacing`
+            // (§17.6.1), `border-collapse` (§17.6), `empty-cells` (§17.6.2)
+            // and `caption-side` (§17.4.1). The `Inherited` flag is stated in
+            // each property definition and repeated in Appendix F's full
+            // property table, which is the quick place to check it. Appendix F
+            // says of itself that it is informative, not normative, so the
+            // definition section is the citation that carries the requirement
+            // and the table is only a cross-check.
+            //
+            // Registering them also means an unspecified property reports its
+            // initial value to layout instead of `None`, which is what makes
+            // `ComputedStyle::specified` necessary: presence in the computed
+            // map no longer implies an author wrote anything.
+            ("border-spacing", "0px"),
+            ("border-collapse", "separate"),
+            ("empty-cells", "show"),
+            ("caption-side", "top"),
         ] {
             registry.define(name, true, initial);
         }
@@ -152,6 +169,39 @@ impl PropertyRegistry {
             ("aspect-ratio", "auto"),
             ("transform", "none"),
             ("transform-origin", "50% 50%"),
+            // The two that do *not* inherit, so they belong with the ordinary
+            // properties. `table-layout` is CSS 2.1 §17.5.2.1; `vertical-align`
+            // is §10.8.3 for inline-level boxes and §17.5.3 for the table
+            // alignment it also drives, and its definition gives
+            // `Inherited: no`. That matters: inheriting `vertical-align` would
+            // align a cell with its ancestor's cell instead of its own, and
+            // §17.5.3 distributes a *table's* alignment to its row groups
+            // explicitly rather than by inheritance.
+            ("table-layout", "auto"),
+            ("vertical-align", "baseline"),
+            // The four `text-decoration` longhands. `text-decoration` is a
+            // shorthand over exactly these four (Text Decoration 4 §2.6), and
+            // all four are `Inherited: no` - §2.1 says so and adds "but see
+            // prose, above", §2.2, §2.3 and §2.4 say so flatly. CSS 2.1
+            // Appendix F records the shorthand as `no (see prose)` too, and
+            // notes of itself that it is informative rather than normative.
+            //
+            // They do not inherit, and that is not the same as not reaching
+            // descendants: decorations *propagate* down the box tree from the
+            // element that originated them (§2), which is a separate mechanism
+            // from inheritance and is not the registry's business. So a
+            // descendant's value says nothing about the ancestor, and the
+            // ancestor's decoration still paints through the descendant.
+            //
+            // Registering them matters for more than completeness: the
+            // user-agent stylesheet sets `text-decoration-line: underline` on
+            // `a:link`, so an author writing `a { text-decoration: none }` only
+            // wins if the shorthand actually expands into this longhand. Before
+            // it did, that rule was dead on every page.
+            ("text-decoration-line", "none"),
+            ("text-decoration-style", "solid"),
+            ("text-decoration-color", "currentcolor"),
+            ("text-decoration-thickness", "auto"),
         ] {
             registry.define(name, false, initial);
         }
@@ -233,6 +283,10 @@ pub struct ComputedStyle {
     typed_properties: BTreeMap<String, TypedPropertyValue>,
     custom_properties: BTreeMap<String, ComputedValue>,
     invalid_custom_properties: BTreeSet<String>,
+    /// Properties whose value came from a declaration in the document itself,
+    /// as opposed to the initial value, an inherited value, or the user-agent
+    /// stylesheet. See [`ComputedStyle::specified`].
+    specified: BTreeSet<String>,
     diagnostics: Vec<ComputationDiagnostic>,
 }
 
@@ -277,6 +331,58 @@ impl ComputedStyle {
     #[must_use]
     pub fn diagnostics(&self) -> &[ComputationDiagnostic] {
         &self.diagnostics
+    }
+
+    /// Whether a declaration in the document itself set this property on this
+    /// element, as opposed to the value merely being *present*.
+    ///
+    /// [`Self::get`] answers a different question. Because the registry
+    /// installs an initial value for every property it defines, `get` returns
+    /// `Some` for all of them, so "is this property set?" silently means "is
+    /// this property registered?" once a property is registered at all. Code
+    /// that needs to know whether the document said anything cannot use it.
+    ///
+    /// A few real rules depend on the difference. CSS 2.1 §17.5.3 has a
+    /// row group with no `vertical-align` of its own take the table's, which
+    /// is only expressible if "the row group said nothing" is distinguishable
+    /// from "the row group's value happens to be the initial one".
+    ///
+    /// The boundary, which is CSS Cascade 5 §6.1.1's UA-origin boundary:
+    ///
+    /// - An author or user stylesheet rule, or a `style` attribute, counts.
+    ///   The document asked for it.
+    /// - An HTML presentational hint (`bgcolor`, `valign`, `align`, ...) counts.
+    ///   It cascades at the user-agent origin, but it is an attribute the
+    ///   document's author wrote, so it is author intent.
+    /// - A user-agent stylesheet rule does **not** count. The engine styling
+    ///   the document is not the document asking for something. This is the
+    ///   distinction that matters in practice: `sub { vertical-align: sub }` in
+    ///   a UA sheet must not read as the author having aligned anything.
+    /// - An inherited value does **not** count for the descendant. The
+    ///   ancestor's declaration is recorded on the ancestor, so a consumer
+    ///   asking about the descendant still learns that the descendant itself
+    ///   said nothing.
+    /// - The initial value does not count, by definition.
+    ///
+    /// Shorthand expansion needs no special case: `margin: 1px` is expanded
+    /// into its longhands by the cascade before the winner is chosen, so
+    /// `margin-top` is recorded as specified exactly when `margin` was.
+    ///
+    /// `inherit` and the other CSS-wide keywords *do* count, because the
+    /// document wrote them; a consumer that wanted the inherited value can
+    /// read it with `get`. Note that `inherit` on a non-inherited property
+    /// such as `vertical-align` takes the parent's value while still counting
+    /// as specified here, which is the honest reading: the document did say
+    /// something about this element.
+    #[must_use]
+    pub fn specified(&self, property: &str) -> bool {
+        self.specified.contains(property)
+    }
+
+    /// Every property the document set on this element, in name order.
+    #[must_use]
+    pub const fn specified_properties(&self) -> &BTreeSet<String> {
+        &self.specified
     }
 }
 
@@ -962,9 +1068,16 @@ pub fn compute_style(
 
     let mut properties = BTreeMap::new();
     let mut typed_properties = BTreeMap::new();
+    let mut specified = BTreeSet::new();
     for (name, definition) in registry.iter() {
         let mut computed =
             compute_registered_property(name, definition, cascaded, parent, &mut resolver, limits);
+        // Whether the document supplied this property at all, decided before
+        // the grammar check below can discard the value.
+        let authored = cascaded
+            .get(name)
+            .is_some_and(super::cascade::CascadedValue::is_authored);
+        let mut accepted = true;
         if let Some(value) = computed.as_ref()
             && let Some(typed) = parse_typed_property(name, &value.parseable_css())
         {
@@ -978,6 +1091,13 @@ pub fn compute_style(
                         message: format!("{error}; using the unset fallback"),
                     });
                     computed = registered_unset_value(name, definition, parent, limits);
+                    // A value the grammar rejected is not a value the document
+                    // successfully set, so it does not count as specified: the
+                    // element ends up holding the initial or inherited value,
+                    // and a consumer asking "did the document say so?" should
+                    // hear no. Reporting yes here would reintroduce exactly the
+                    // confusion this query exists to remove.
+                    accepted = false;
                     if let Some(fallback) = computed.as_ref()
                         && let Some(Ok(value)) =
                             parse_typed_property(name, &fallback.parseable_css())
@@ -989,6 +1109,9 @@ pub fn compute_style(
         }
         if let Some(value) = computed {
             properties.insert(name.clone(), value);
+        }
+        if authored && accepted {
+            specified.insert(name.clone());
         }
     }
     // CSS 2.1 §6.1.1: the computed value of `font-size` is an absolute
@@ -1024,6 +1147,9 @@ pub fn compute_style(
                 if let Some(parent_value) = parent.and_then(|style| style.properties.get(name)) {
                     properties.insert(name.clone(), parent_value.clone());
                 }
+                if value.is_authored() {
+                    specified.insert(name.clone());
+                }
             }
             Some(_) => resolver.diagnostics.push(ComputationDiagnostic {
                 property: Some(name.clone()),
@@ -1037,6 +1163,9 @@ pub fn compute_style(
                 {
                     properties.insert(name.clone(), value);
                 }
+                if value.is_authored() {
+                    specified.insert(name.clone());
+                }
             }
         }
     }
@@ -1048,6 +1177,7 @@ pub fn compute_style(
         typed_properties,
         custom_properties,
         invalid_custom_properties: invalid,
+        specified,
         diagnostics,
     }
 }
@@ -1170,9 +1300,14 @@ pub fn compute_document_styles_with_hints(
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputationLimits, PropertyRegistry, compute_document_styles, compute_style};
+    use super::{
+        ComputationLimits, PropertyRegistry, compute_document_styles,
+        compute_document_styles_with_hints, compute_style,
+    };
     use crate::cascade::{CascadeInput, CascadeOrigin, cascade_element};
-    use crate::properties::TypedPropertyValue;
+    use crate::properties::{
+        BorderSpacing, Length, LengthPercentage, LengthUnit, TypedPropertyValue,
+    };
     use crate::selector::{MatchContext, parse_selector_list, select_all};
     use crate::stylesheet::parse_stylesheet;
     use render_html::parse_document;
@@ -1468,5 +1603,438 @@ mod tests {
             style.get("visibility").map(super::ComputedValue::css_text),
             Some("hidden")
         );
+    }
+
+    /// The table solver reads these six properties from
+    /// `ComputedStyle::get(..).css_text()` and compares the text itself, so
+    /// registering them must not change the text a specified declaration
+    /// produces. It also must give an unspecified element the CSS 2.1
+    /// Appendix G initial value rather than `None`, because every one of those
+    /// call sites treats a missing value as the initial value anyway.
+    #[test]
+    fn table_properties_are_typed_and_report_css21_initial_values() {
+        let output = parse_document(
+            "<!doctype html><table id='t'><caption>c</caption><tr id='row'>\
+             <td id='cell'>x</td></tr></table><div id='plain'></div>",
+        );
+        let sheet = parse_stylesheet(
+            "table { display: table } \
+             #t { table-layout: fixed; border-spacing: 3px 5px; vertical-align: middle } \
+             #row { border-collapse: collapse; empty-cells: hide; caption-side: bottom }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let table = &styles[&target_id(&output.dom, "#t")];
+
+        assert_eq!(
+            table
+                .get("border-spacing")
+                .map(super::ComputedValue::css_text),
+            Some("3px 5px")
+        );
+        for (selector, properties) in [
+            (
+                "#t",
+                [
+                    ("border-spacing", "3px 5px"),
+                    ("table-layout", "fixed"),
+                    ("vertical-align", "middle"),
+                ],
+            ),
+            (
+                "#row",
+                [
+                    ("border-collapse", "collapse"),
+                    ("empty-cells", "hide"),
+                    ("caption-side", "bottom"),
+                ],
+            ),
+        ] {
+            let style = &styles[&target_id(&output.dom, selector)];
+            for (property, expected) in properties {
+                assert_eq!(
+                    style.get(property).map(super::ComputedValue::css_text),
+                    Some(expected),
+                    "{selector} {property}"
+                );
+                assert!(
+                    style.typed(property).is_some(),
+                    "{property} must be a typed value"
+                );
+            }
+        }
+        assert_eq!(
+            table.typed("border-spacing"),
+            Some(&TypedPropertyValue::BorderSpacing(BorderSpacing {
+                horizontal: LengthPercentage::Length(Length {
+                    value: 3.0,
+                    unit: LengthUnit::Px,
+                }),
+                vertical: LengthPercentage::Length(Length {
+                    value: 5.0,
+                    unit: LengthUnit::Px,
+                }),
+            }))
+        );
+
+        // An element that specifies none of them reports each initial value, so
+        // a consumer that compared against the initial keyword still agrees.
+        let plain = &styles[&target_id(&output.dom, "#plain")];
+        for (property, expected) in [
+            ("border-spacing", "0px"),
+            ("border-collapse", "separate"),
+            ("empty-cells", "show"),
+            ("caption-side", "top"),
+            ("table-layout", "auto"),
+            ("vertical-align", "baseline"),
+        ] {
+            assert_eq!(
+                plain.get(property).map(super::ComputedValue::css_text),
+                Some(expected),
+                "{property}"
+            );
+        }
+
+        // CSS 2.1 Appendix G: `border-collapse`, `border-spacing`, `empty-cells`
+        // and `caption-side` inherit, while §17.5.2.1 `table-layout` and
+        // §10.8.3 `vertical-align` do not. Inheriting `vertical-align` would
+        // align a cell with its ancestor's cell instead of its own.
+        let cell = &styles[&target_id(&output.dom, "#cell")];
+        assert_eq!(
+            cell.get("border-collapse")
+                .map(super::ComputedValue::css_text),
+            Some("collapse")
+        );
+        assert_eq!(
+            cell.get("empty-cells").map(super::ComputedValue::css_text),
+            Some("hide")
+        );
+        assert_eq!(
+            cell.get("vertical-align")
+                .map(super::ComputedValue::css_text),
+            Some("baseline")
+        );
+        assert_eq!(
+            cell.get("table-layout").map(super::ComputedValue::css_text),
+            Some("auto")
+        );
+    }
+
+    /// The sweep claim: registering a property gives every element the initial
+    /// value, so a consumer that compared the *text* against a non-initial
+    /// keyword is unaffected, while one that only asked "is it there?" is not.
+    /// This pins the initial value each table property now reports, because
+    /// that text is what the solver's keyword comparisons see.
+    #[test]
+    fn registering_a_property_only_changes_what_unset_elements_report() {
+        let output =
+            parse_document("<!doctype html><table id='t'><tr><td id='c'>x</td></tr></table>");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let cell = &styles[&target_id(&output.dom, "#c")];
+
+        // Every one of these is the CSS 2.1 initial value, so a comparison
+        // against `fixed`/`collapse`/`hide`/`bottom` is still false exactly as
+        // it was when the property was unregistered and `get` returned `None`.
+        for (property, expected) in [
+            ("table-layout", "auto"),
+            ("border-collapse", "separate"),
+            ("empty-cells", "show"),
+            ("caption-side", "top"),
+            ("border-spacing", "0px"),
+            ("vertical-align", "baseline"),
+        ] {
+            assert_eq!(
+                cell.get(property).map(super::ComputedValue::css_text),
+                Some(expected),
+                "{property}"
+            );
+            assert!(
+                !cell.specified(property),
+                "{property} must not be specified"
+            );
+        }
+    }
+
+    /// `ComputedStyle::get` reports a value for every registered property, so
+    /// `specified` is the only way to ask whether the document actually set
+    /// one. These pin each boundary the doc comment states.
+    #[test]
+    fn specified_separates_document_declarations_from_initial_values() {
+        let output = parse_document(
+            "<!doctype html><div id='author' style='color: red'></div>\
+             <div id='plain'></div><div id='child'></div>",
+        );
+        let sheet = parse_stylesheet("#author { display: block }");
+        let mut registry = PropertyRegistry::new();
+        // `color` is inherited, `display` is not, which makes the two
+        // inheritance rules distinguishable below.
+        registry.define("color", true, "canvastext");
+        registry.define("display", false, "inline");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let author = &styles[&target_id(&output.dom, "#author")];
+        let plain = &styles[&target_id(&output.dom, "#plain")];
+
+        // A `style` attribute counts: the document said so directly.
+        assert!(author.specified("color"));
+        // An author rule counts.
+        assert!(author.specified("display"));
+        // Nothing set either, so neither is specified, even though `get`
+        // reports a value for both because the registry supplies the initial.
+        assert!(!plain.specified("color"));
+        assert!(!plain.specified("display"));
+        assert_eq!(
+            plain.get("color").map(super::ComputedValue::css_text),
+            Some("canvastext"),
+            "get must still report the initial value; that is the whole reason \
+             `specified` exists"
+        );
+    }
+
+    /// A user-agent stylesheet rule is the engine styling the document, not
+    /// the document asking for something. This is the boundary that keeps
+    /// `sub { vertical-align: sub }` from reading as author intent.
+    #[test]
+    fn a_user_agent_rule_is_not_specified() {
+        let output = parse_document("<!doctype html><div id='x'></div>");
+        let ua = parse_stylesheet("#x { color: red }");
+        let author = parse_stylesheet("");
+        let registry = PropertyRegistry::new();
+        let mut registry = registry;
+        registry.define("color", true, "canvastext");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[
+                CascadeInput {
+                    sheet: &ua,
+                    origin: CascadeOrigin::UserAgent,
+                },
+                CascadeInput {
+                    sheet: &author,
+                    origin: CascadeOrigin::Author,
+                },
+            ],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&target_id(&output.dom, "#x")];
+
+        // The value is there...
+        assert_eq!(
+            style.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        // ... but the document did not ask for it.
+        assert!(!style.specified("color"));
+    }
+
+    /// HTML presentational hints cascade at the user-agent origin but are
+    /// attributes the document's author wrote, so they count as specified.
+    /// This is the case `CascadeOrigin` alone cannot express.
+    #[test]
+    fn a_presentational_hint_counts_as_specified() {
+        let output = parse_document("<!doctype html><div id='x'></div>");
+        let registry = PropertyRegistry::new();
+        let mut registry = registry;
+        registry.define("color", true, "canvastext");
+        let styles = compute_document_styles_with_hints(
+            &output.dom,
+            &[],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+            &|_| {
+                vec![crate::stylesheet::Declaration {
+                    name: "color".to_owned(),
+                    value: "red".to_owned(),
+                    important: false,
+                }]
+            },
+        );
+        let style = &styles[&target_id(&output.dom, "#x")];
+
+        assert_eq!(
+            style.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert!(style.specified("color"));
+    }
+
+    /// An inherited value belongs to the ancestor. A consumer asking about the
+    /// descendant must still learn that the descendant said nothing itself,
+    /// which is exactly the row-group case in CSS 2.1 §17.5.3.
+    #[test]
+    fn an_inherited_value_is_specified_only_on_the_ancestor() {
+        let output = parse_document("<!doctype html><div id='p'><span id='c'></span></div>");
+        let sheet = parse_stylesheet("#p { color: red }");
+        let mut registry = PropertyRegistry::new();
+        registry.define("color", true, "canvastext");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let parent = &styles[&target_id(&output.dom, "#p")];
+        let child = &styles[&target_id(&output.dom, "#c")];
+
+        assert!(parent.specified("color"));
+        // The child holds the same computed value...
+        assert_eq!(
+            child.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        // ... but did not set it.
+        assert!(!child.specified("color"));
+    }
+
+    /// `inherit` was written by the document, so it counts even though the
+    /// value it produces came from the parent.
+    #[test]
+    fn inherit_counts_as_specified_because_the_document_wrote_it() {
+        let output = parse_document("<!doctype html><div id='p'><span id='c'></span></div>");
+        let sheet = parse_stylesheet("#p { color: red } #c { color: inherit }");
+        let mut registry = PropertyRegistry::new();
+        registry.define("color", true, "canvastext");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let child = &styles[&target_id(&output.dom, "#c")];
+
+        assert_eq!(
+            child.get("color").map(super::ComputedValue::css_text),
+            Some("red")
+        );
+        assert!(child.specified("color"));
+    }
+
+    /// Shorthand expansion needs no special case: the cascade expands before
+    /// choosing a winner, so a longhand set by a shorthand is specified.
+    #[test]
+    fn a_longhand_set_by_a_shorthand_is_specified() {
+        let output = parse_document("<!doctype html><div id='x' style='margin: 4px'></div>");
+        let mut registry = PropertyRegistry::new();
+        registry.define("margin-top", false, "0px");
+        registry.define("margin-left", false, "0px");
+        let styles = compute_document_styles_with_hints(
+            &output.dom,
+            &[],
+            &registry,
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+            &|_| Vec::new(),
+        );
+        let style = &styles[&target_id(&output.dom, "#x")];
+
+        assert!(style.specified("margin-top"));
+        assert!(style.specified("margin-left"));
+        assert_eq!(
+            style.get("margin-top").map(super::ComputedValue::css_text),
+            Some("4px")
+        );
+    }
+
+    /// A value the grammar rejected did not successfully set the property, so
+    /// the element ends up holding the initial value and the query must say
+    /// no. Reporting yes would reintroduce the exact confusion the query
+    /// removes.
+    #[test]
+    fn a_value_the_grammar_rejected_is_not_specified() {
+        let output = parse_document("<!doctype html><div id='x'></div>");
+        let sheet = parse_stylesheet("#x { vertical-align: center }");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let style = &styles[&target_id(&output.dom, "#x")];
+
+        assert_eq!(
+            style
+                .get("vertical-align")
+                .map(super::ComputedValue::css_text),
+            Some("baseline")
+        );
+        assert!(!style.specified("vertical-align"));
+    }
+
+    /// CSS 2.1 §17.5.3: an invalid `vertical-align` is dropped, and the
+    /// computed value falls back to the initial one rather than cascading a
+    /// string the solver would have to interpret.
+    #[test]
+    fn an_invalid_table_property_falls_back_to_its_initial_value() {
+        let output = parse_document("<!doctype html><table id='t'></table>");
+        let sheet = parse_stylesheet(
+            "#t { vertical-align: center; border-collapse: collapsed; border-spacing: -1px }",
+        );
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let table = &styles[&target_id(&output.dom, "#t")];
+
+        for (property, expected) in [
+            ("vertical-align", "baseline"),
+            ("border-collapse", "separate"),
+            ("border-spacing", "0px"),
+        ] {
+            assert_eq!(
+                table.get(property).map(super::ComputedValue::css_text),
+                Some(expected),
+                "{property}"
+            );
+            assert!(
+                table
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.property.as_deref() == Some(property)),
+                "{property} must report why it was dropped"
+            );
+        }
     }
 }

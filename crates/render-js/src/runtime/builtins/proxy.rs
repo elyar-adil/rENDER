@@ -1,6 +1,7 @@
 //! Proxy and Reflect support used by modern application runtimes.
 
 use crate::JsError;
+use crate::JsObject;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
@@ -21,21 +22,24 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            // Every `Reflect.*` builtin but `Reflect.construct`'s `newTarget`
+            // check begins with `ToObject` (§27.1), so a primitive target
+            // becomes its wrapper rather than throwing.
             NativeFunction::ReflectGet => {
-                let target = Self::require_object(required_argument(arguments, 0, "Reflect.get")?)?;
+                let target = self.to_object(required_argument(arguments, 0, "Reflect.get")?)?;
                 let key = required_argument(arguments, 1, "Reflect.get")?.to_js_string();
                 let receiver = arguments.get(2).cloned().unwrap_or(JsValue::Object(target));
                 self.reflect_get(dom, target, &key, receiver)
             }
             NativeFunction::ReflectSet => {
-                let target = Self::require_object(required_argument(arguments, 0, "Reflect.set")?)?;
+                let target = self.to_object(required_argument(arguments, 0, "Reflect.set")?)?;
                 let key = required_argument(arguments, 1, "Reflect.set")?.to_js_string();
                 let value = required_argument(arguments, 2, "Reflect.set")?.clone();
                 self.set_member(dom, target, &key, value)?;
                 Ok(JsValue::Boolean(true))
             }
             NativeFunction::ReflectHas => {
-                let target = Self::require_object(required_argument(arguments, 0, "Reflect.has")?)?;
+                let target = self.to_object(required_argument(arguments, 0, "Reflect.has")?)?;
                 let key = required_argument(arguments, 1, "Reflect.has")?.to_js_string();
                 Ok(JsValue::Boolean(self.property_in_value(
                     dom,
@@ -44,19 +48,15 @@ impl JsRuntime {
                 )?))
             }
             NativeFunction::ReflectDeleteProperty => {
-                let target = Self::require_object(required_argument(
-                    arguments,
-                    0,
-                    "Reflect.deleteProperty",
-                )?)?;
+                let target =
+                    self.to_object(required_argument(arguments, 0, "Reflect.deleteProperty")?)?;
                 let key = required_argument(arguments, 1, "Reflect.deleteProperty")?.to_js_string();
                 Ok(JsValue::Boolean(
                     self.delete_property_value(dom, target, &key)?,
                 ))
             }
             NativeFunction::ReflectOwnKeys => {
-                let target =
-                    Self::require_object(required_argument(arguments, 0, "Reflect.ownKeys")?)?;
+                let target = self.to_object(required_argument(arguments, 0, "Reflect.ownKeys")?)?;
                 let keys = self
                     .proxy_own_keys(dom, target)?
                     .into_iter()
@@ -65,7 +65,7 @@ impl JsRuntime {
                 Ok(JsValue::Object(self.create_array_from_values(&keys)?))
             }
             NativeFunction::ReflectGetOwnPropertyDescriptor => {
-                let target = Self::require_object(required_argument(
+                let target = self.to_object(required_argument(
                     arguments,
                     0,
                     "Reflect.getOwnPropertyDescriptor",
@@ -75,11 +75,8 @@ impl JsRuntime {
                 self.reflect_get_own_property_descriptor(target, &key)
             }
             NativeFunction::ReflectDefineProperty => {
-                let target = Self::require_object(required_argument(
-                    arguments,
-                    0,
-                    "Reflect.defineProperty",
-                )?)?;
+                let target =
+                    self.to_object(required_argument(arguments, 0, "Reflect.defineProperty")?)?;
                 let key = required_argument(arguments, 1, "Reflect.defineProperty")?.to_js_string();
                 let descriptor = required_argument(arguments, 2, "Reflect.defineProperty")?;
                 let descriptor = self.property_descriptor_from_value(descriptor)?;
@@ -88,6 +85,60 @@ impl JsRuntime {
                 ))
             }
             NativeFunction::ReflectConstruct => self.reflect_construct(dom, arguments),
+            NativeFunction::ReflectApply => {
+                let target = self.to_object(required_argument(arguments, 0, "Reflect.apply")?)?;
+                if !Self::is_callable_object(target, &self.realm) {
+                    return Err(JsError::type_error("Reflect.apply target is not callable"));
+                }
+                let this_argument = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+                let list = required_argument(arguments, 2, "Reflect.apply")?;
+                let values = self.create_list_from_array_like(dom, list)?;
+                self.call_with_this(dom, target, &values, this_argument)
+            }
+            NativeFunction::ReflectGetPrototypeOf => {
+                // §27.1.7: `ToObject` first, so a primitive reports its
+                // wrapper's prototype and only `null`/`undefined` throw.
+                let target =
+                    self.to_object(required_argument(arguments, 0, "Reflect.getPrototypeOf")?)?;
+                Ok(self
+                    .realm
+                    .object(target)
+                    .and_then(JsObject::prototype)
+                    .map_or(JsValue::Null, JsValue::Object))
+            }
+            NativeFunction::ReflectSetPrototypeOf => {
+                // §27.1.13 requires an Object target (no `ToObject`); the
+                // engine's own prototype machinery rejects an illegal change.
+                let target = Self::require_object(required_argument(
+                    arguments,
+                    0,
+                    "Reflect.setPrototypeOf",
+                )?)?;
+                let prototype = match required_argument(arguments, 1, "Reflect.setPrototypeOf")? {
+                    JsValue::Object(object) => Some(*object),
+                    JsValue::Null => None,
+                    _ => {
+                        return Err(JsError::type_error("prototype must be an object or null"));
+                    }
+                };
+                Ok(JsValue::Boolean(
+                    self.realm.set_prototype(target, prototype),
+                ))
+            }
+            NativeFunction::ReflectIsExtensible => {
+                let target =
+                    self.to_object(required_argument(arguments, 0, "Reflect.isExtensible")?)?;
+                Ok(JsValue::Boolean(self.realm.is_extensible(target)))
+            }
+            NativeFunction::ReflectPreventExtensions => {
+                let target = self.to_object(required_argument(
+                    arguments,
+                    0,
+                    "Reflect.preventExtensions",
+                )?)?;
+                self.realm.prevent_extensions(target);
+                Ok(JsValue::Boolean(true))
+            }
             other => Err(JsError::type_error(format!(
                 "unsupported proxy native {other:?}"
             ))),
@@ -307,7 +358,9 @@ impl JsRuntime {
         dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target = Self::require_object(required_argument(arguments, 0, "Reflect.construct")?)?;
+        // §27.1.5 step 1: `ToObject(target)`. The `newTarget` check below
+        // does stay a strict object test.
+        let target = self.to_object(required_argument(arguments, 0, "Reflect.construct")?)?;
         if !self.is_constructor(target) {
             return Err(JsError::type_error(
                 "Reflect.construct target must be a constructor",
@@ -316,6 +369,8 @@ impl JsRuntime {
         let new_target = match arguments.get(2) {
             None | Some(JsValue::Undefined) => target,
             Some(value) => {
+                // §27.1.5 step 5: a present `newTarget` must be an Object; a
+                // primitive is not coerced.
                 let new_target = Self::require_object(value).map_err(|_| {
                     JsError::type_error("Reflect.construct newTarget must be a constructor")
                 })?;

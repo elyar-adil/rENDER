@@ -28,6 +28,7 @@ pub(super) mod observers;
 pub(super) mod promise;
 pub(super) mod proxy;
 pub(super) mod regexp;
+pub(super) mod storage;
 pub(super) mod string;
 pub(super) mod style;
 pub(super) mod timers;

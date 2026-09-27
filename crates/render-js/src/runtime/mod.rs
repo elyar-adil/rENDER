@@ -101,6 +101,11 @@ pub struct JsRuntime {
     global_symbol_registry: BTreeMap<String, u64>,
     /// Active JavaScript call frames for stack traces and diagnostics.
     call_stack: Vec<CallFrame>,
+    /// Objects a `ToObject` call boxed that are still referenced only from the
+    /// interpreter's own Rust frames, not from any script-visible slot. The
+    /// collector treats them as roots so a collection triggered by a later
+    /// allocation in the same builtin cannot tombstone a live wrapper.
+    transient_roots: Vec<ObjectId>,
     /// Byte offsets where each source line starts, for error positioning.
     source_line_starts: Vec<usize>,
     /// JS-visible cookies (`document.cookie`), keyed by name.
@@ -182,6 +187,7 @@ impl JsRuntime {
             next_symbol_id: crate::value::FIRST_DYNAMIC_SYMBOL_ID,
             global_symbol_registry: BTreeMap::new(),
             call_stack: Vec::new(),
+            transient_roots: Vec::new(),
             source_line_starts: Vec::new(),
             js_cookie_jar: BTreeMap::new(),
             random_state: {
@@ -210,6 +216,17 @@ impl JsRuntime {
     #[must_use]
     pub const fn realm(&self) -> &Realm {
         &self.realm
+    }
+
+    /// Interpreter steps consumed by the script currently running (or the last
+    /// one that finished). Embedders use it as a progress signal for a long
+    /// bundle, where the first-failure position alone says nothing about how
+    /// much of the file actually executed.
+    #[must_use]
+    pub fn steps_consumed(&self) -> usize {
+        self.limits
+            .max_execution_steps
+            .saturating_sub(self.steps_remaining)
     }
 
     /// Drain callbacks registered through `queueMicrotask()` in FIFO order.
@@ -693,6 +710,9 @@ impl JsRuntime {
     ) -> Result<ScriptOutcome, JsError> {
         self.source_line_starts = build_line_starts(script.source());
         let from_revision = dom.revision();
+        // Nothing from the previous script can still be held by an interpreter
+        // frame, so its boxed-wrapper pins go before the collection runs.
+        self.transient_roots.clear();
         // Classic scripts share one realm, so reclaim the previous script's
         // garbage before allocating objects for this one.
         self.collect_garbage();

@@ -1,5 +1,14 @@
 # rENDER HTML5 浏览器功能完善总计划（严格执行版）
 
+> **状态：历史计划，已部分完成。** 本文是项目早期的 36 周路线图，其中的文件路径多为
+> Python 时代的（`engine.py`、`css/*.py`、`layout/*.py`、`backend/qt/`），与现在的
+> 八 crate Rust 架构不符。**计划本身的纪律条款仍然有效并被强制执行**（测试先行、
+> 无特判、回归红线、可观测性优先、文档同步）。
+>
+> 当前真相请读：`CLAUDE.md`（架构）、`docs/visual_fidelity_gaps.md`（带证据的能力缺口
+> 登记册）、`docs/real_site_acceptance.md`（页面契约）、`docs/testing_strategy.md`（测试分层）。
+> 已落地的部分见 `HANDOFF.md` 的时间线与 `PROGRESS.md` 的已核查为假登记表。
+
 > 目标：将 `rENDER` 从“可渲染部分网页的教学型引擎”推进到“具备主流 HTML5 页面可用性、可测试、可持续迭代”的浏览器内核。  
 > 周期：约 36 周（9 个月），按阶段推进，严格以测试与验收门槛为准，不达标不进入下一阶段。
 

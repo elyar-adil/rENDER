@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use render_css::computed::ComputedStyle;
 use render_css::properties::{
-    Display, DisplayBox, DisplayInside, DisplayOutside, Float, TypedPropertyValue,
+    Display, DisplayBox, DisplayInside, DisplayInternal, DisplayOutside, Float, TypedPropertyValue,
 };
 use render_dom::{Dom, DomRevision, NodeId, NodeKind};
 
@@ -41,6 +41,59 @@ pub enum FormattingNodeKind {
     Text(String),
 }
 
+/// The table structure level a display value places a box at (CSS 2.1 §17.2.1).
+/// Only a wrapper box and a row constrain their children; a cell, a caption and
+/// a column carry ordinary flow content.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableLevel {
+    /// A table wrapper box or a row group: children are row-level boxes.
+    Rows,
+    /// A table row: children are cells.
+    Row,
+    /// A table cell.
+    Cell,
+    /// A table caption, which sits beside the rows of its table.
+    Caption,
+    /// A column box, which takes part in the table structure but generates no
+    /// box of its own.
+    Column,
+    /// Not part of the table structure.
+    Other,
+}
+
+fn table_level(display: &Display) -> TableLevel {
+    match display {
+        // `display: table` and `display: inline-table` are a wrapper box, and a
+        // row group sits between the wrapper and the rows.
+        Display::Normal {
+            outside: DisplayOutside::Block | DisplayOutside::Inline,
+            inside: DisplayInside::Table,
+            ..
+        }
+        | Display::Internal(
+            DisplayInternal::TableRowGroup
+            | DisplayInternal::TableHeaderGroup
+            | DisplayInternal::TableFooterGroup,
+        ) => TableLevel::Rows,
+        Display::Internal(DisplayInternal::TableRow) => TableLevel::Row,
+        Display::Internal(DisplayInternal::TableCell) => TableLevel::Cell,
+        Display::Internal(DisplayInternal::TableCaption) => TableLevel::Caption,
+        Display::Internal(DisplayInternal::TableColumn | DisplayInternal::TableColumnGroup) => {
+            TableLevel::Column
+        }
+        _ => TableLevel::Other,
+    }
+}
+
+/// An anonymous table row or cell. The solver tells the two apart by the level
+/// of the box they sit in, and neither has a source element to look styles up
+/// on, so it inherits from the enclosing table structure box.
+const fn table_box() -> FormattingNodeKind {
+    FormattingNodeKind::BlockContainer {
+        context: FormattingContextKind::Block,
+    }
+}
+
 impl FormattingNodeKind {
     const fn accepts_inline_children(&self) -> bool {
         matches!(
@@ -60,6 +113,12 @@ pub struct FormattingNode {
     /// Element whose computed style applies to this box or text. Anonymous
     /// boxes and text nodes therefore remain styleable without copying styles.
     pub style_source: Option<NodeId>,
+    /// Whether this box is its parent's first child. CSS Text 3 §8.1 indents
+    /// "only lines that are the first formatted line of an element", and adds
+    /// that "the first line of an anonymous block box is only affected if it
+    /// is the first child of its parent element", so the solver needs to know
+    /// this before it can apply `text-indent`.
+    pub is_first_child: bool,
     pub kind: FormattingNodeKind,
     pub children: Vec<FormattingNodeId>,
 }
@@ -171,6 +230,8 @@ pub fn build_formatting_tree(
         diagnostics: Vec::new(),
         text_bytes: 0,
         limit_reported: false,
+        table_parent: None,
+        capitalize_word_start: true,
     };
     let root = builder
         .allocate(None, None, FormattingNodeKind::Root)
@@ -180,6 +241,7 @@ pub fn build_formatting_tree(
                 id: FormattingNodeId(0),
                 source: None,
                 style_source: None,
+                is_first_child: false,
                 kind: FormattingNodeKind::Root,
                 children: Vec::new(),
             });
@@ -202,6 +264,12 @@ struct Builder<'a> {
     diagnostics: Vec<FormattingDiagnostic>,
     text_bytes: usize,
     limit_reported: bool,
+    /// The wrapping level the enclosing table structure box imposes, if the
+    /// children currently being appended belong to one.
+    table_parent: Option<TableLevel>,
+    /// Whether the next letter read for layout begins a word, for
+    /// `text-transform: capitalize`.
+    capitalize_word_start: bool,
 }
 
 impl Builder<'_> {
@@ -221,6 +289,31 @@ impl Builder<'_> {
             return;
         }
         let children = self.dom.children(dom_parent).unwrap_or_default().to_vec();
+        if let Some(table_parent @ (TableLevel::Rows | TableLevel::Row | TableLevel::Column)) =
+            self.table_parent.take()
+        {
+            // A column group holds nothing but column boxes (§17.2.1).
+            if table_parent == TableLevel::Column {
+                for child in children {
+                    if self
+                        .styles
+                        .get(&child)
+                        .is_some_and(|style| table_level(&display(style)) == TableLevel::Column)
+                    {
+                        self.append_column_box(child, format_parent, depth);
+                    }
+                }
+                return;
+            }
+            self.append_table_children(
+                &children,
+                format_parent,
+                table_parent,
+                text_style_source,
+                depth,
+            );
+            return;
+        }
         let parent_accepts_inline = self
             .get(format_parent)
             .is_some_and(|node| node.kind.accepts_inline_children());
@@ -251,6 +344,106 @@ impl Builder<'_> {
         }
     }
 
+    /// CSS 2.1 §17.2.1: a table structure box only accepts children of the next
+    /// level. Anything else is wrapped in the anonymous table boxes that lead to
+    /// the required one, and whitespace-only text never generates them.
+    fn append_table_children(
+        &mut self,
+        children: &[NodeId],
+        format_parent: FormattingNodeId,
+        parent: TableLevel,
+        text_style_source: Option<NodeId>,
+        depth: usize,
+    ) {
+        for child in children.iter().copied() {
+            let Some(node) = self.dom.node(child) else {
+                continue;
+            };
+            if let NodeKind::Text(text) = &node.kind()
+                && (text.is_empty() || text.chars().all(char::is_whitespace))
+            {
+                continue;
+            }
+            let Some(style) = self.styles.get(&child) else {
+                continue;
+            };
+            let display = display(style);
+            let level = table_level(&display);
+            // `display: none` takes no part in the table structure.
+            if display == Display::Box(DisplayBox::None) {
+                continue;
+            }
+            if level == TableLevel::Column {
+                // §17.2.1: a column box generates no box of its own, but its
+                // `width` still sizes the columns it covers (§17.5.1), so it is
+                // kept as a child of the wrapper and only ever holds the column
+                // boxes of a column group.
+                self.append_column_box(child, format_parent, depth);
+                continue;
+            }
+            let required = match parent {
+                TableLevel::Rows => matches!(
+                    level,
+                    TableLevel::Rows | TableLevel::Row | TableLevel::Caption
+                ),
+                TableLevel::Row => level == TableLevel::Cell,
+                // A column group holds nothing but column boxes, and a cell or
+                // a caption holds ordinary flow content.
+                TableLevel::Cell | TableLevel::Caption | TableLevel::Column | TableLevel::Other => {
+                    false
+                }
+            };
+            if required {
+                self.append_dom_node(
+                    child,
+                    format_parent,
+                    text_style_source,
+                    false,
+                    false,
+                    &mut None,
+                    depth,
+                );
+                continue;
+            }
+            let row_parent = match parent {
+                TableLevel::Rows => match self.allocate(None, text_style_source, table_box()) {
+                    Some(row) => {
+                        self.append_child(format_parent, row);
+                        row
+                    }
+                    None => return,
+                },
+                _ => format_parent,
+            };
+            let Some(cell) = self.allocate(None, text_style_source, table_box()) else {
+                return;
+            };
+            self.append_child(row_parent, cell);
+            self.append_dom_node(
+                child,
+                cell,
+                text_style_source,
+                false,
+                false,
+                &mut None,
+                depth,
+            );
+        }
+    }
+
+    /// Keep a column box for its `width` (§17.5.1) without generating a box of
+    /// its own, holding only the column boxes of a column group.
+    fn append_column_box(&mut self, child: NodeId, format_parent: FormattingNodeId, depth: usize) {
+        let Some(id) = self.allocate(Some(child), Some(child), table_box()) else {
+            return;
+        };
+        self.append_child(format_parent, id);
+        let enclosing = self.table_parent;
+        self.table_parent = Some(TableLevel::Column);
+        self.append_dom_children(child, id, Some(child), depth.saturating_add(1));
+        self.table_parent = enclosing;
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn append_dom_node(
         &mut self,
@@ -272,6 +465,11 @@ impl Builder<'_> {
                 {
                     return;
                 }
+                let transform = self.text_transform_of(text_style_source);
+                // `text-transform` is applied here and not in the painter
+                // because it changes the characters the solver measures; see
+                // `transformed_text`.
+                let text = transformed_text(text, transform, &mut self.capitalize_word_start);
                 if self.text_bytes.saturating_add(text.len()) > self.limits.max_text_bytes {
                     self.diagnostics.push(FormattingDiagnostic {
                         node: Some(dom_node),
@@ -284,7 +482,7 @@ impl Builder<'_> {
                 let Some(id) = self.allocate(
                     Some(dom_node),
                     text_style_source,
-                    FormattingNodeKind::Text(text.clone()),
+                    FormattingNodeKind::Text(text.into_owned()),
                 ) else {
                     return;
                 };
@@ -330,6 +528,10 @@ impl Builder<'_> {
                 }
 
                 let (mut kind, mut inline_level) = self.formatting_kind(dom_node, &display);
+                // A table structure box constrains the level of its children;
+                // `append_table_children` applies the CSS 2.1 §17.2.1 anonymous
+                // table boxes while they are appended.
+                let table_parent = table_level(&display);
                 if inline_level && float(style) != Float::None {
                     kind = match kind {
                         FormattingNodeKind::Inline => FormattingNodeKind::BlockContainer {
@@ -356,6 +558,17 @@ impl Builder<'_> {
                         other => other,
                     };
                 }
+                // A block-level box opens a new line box and a `<br>` a new
+                // line, so neither continues the previous `capitalize` word.
+                // Without this, the second paragraph inside a container would
+                // inherit the first one's open word and stay lowercase.
+                let forced_line_start = matches!(
+                    node.kind(),
+                    NodeKind::Element(element) if element.local_name == "br"
+                );
+                if !inline_level || forced_line_start {
+                    self.capitalize_word_start = true;
+                }
                 let Some(id) = self.allocate(Some(dom_node), Some(dom_node), kind) else {
                     return;
                 };
@@ -381,7 +594,10 @@ impl Builder<'_> {
                     *anonymous = None;
                     self.append_child(format_parent, id);
                 }
+                let enclosing = self.table_parent;
+                self.table_parent = Some(table_parent);
                 self.append_dom_children(dom_node, id, Some(dom_node), depth.saturating_add(1));
+                self.table_parent = enclosing;
                 // An <input> has no DOM children, but it paints its current
                 // `value` or, when empty, its `placeholder` as the visible
                 // field content (HTML forms rendering).
@@ -478,8 +694,12 @@ impl Builder<'_> {
                 }
             }
             Display::Internal(_) => (
+                // CSS 2.1 §17.2: row groups, rows, cells and captions are laid
+                // out by the table solver, which places them itself. They keep
+                // the ordinary block context so a table structure box outside a
+                // table still lays out as a block.
                 FormattingNodeKind::BlockContainer {
-                    context: FormattingContextKind::Table,
+                    context: FormattingContextKind::Block,
                 },
                 false,
             ),
@@ -536,6 +756,7 @@ impl Builder<'_> {
             id,
             source,
             style_source,
+            is_first_child: false,
             kind,
             children: Vec::new(),
         });
@@ -543,8 +764,18 @@ impl Builder<'_> {
     }
 
     fn append_child(&mut self, parent: FormattingNodeId, child: FormattingNodeId) {
+        let is_first = self
+            .get_mut(parent)
+            .is_some_and(|parent| parent.children.is_empty());
         if let Some(parent) = self.get_mut(parent) {
             parent.children.push(child);
+        }
+        if is_first
+            && let Some(child) = usize::try_from(child.as_u32())
+                .ok()
+                .and_then(|index| self.nodes.get_mut(index))
+        {
+            child.is_first_child = true;
         }
     }
 
@@ -559,6 +790,16 @@ impl Builder<'_> {
             .ok()
             .and_then(|index| self.nodes.get_mut(index))
     }
+
+    /// The casing transform that applies to text read for `style_source`.
+    fn text_transform_of(&self, style_source: Option<NodeId>) -> TextTransform {
+        style_source
+            .and_then(|source| self.styles.get(&source))
+            .and_then(|style| style.get("text-transform"))
+            .map_or(TextTransform::None, |value| {
+                TextTransform::parse(value.css_text())
+            })
+    }
 }
 
 fn display(style: &ComputedStyle) -> Display {
@@ -569,6 +810,101 @@ fn display(style: &ComputedStyle) -> Display {
             inside: DisplayInside::Flow,
             list_item: false,
         },
+    }
+}
+
+/// The casing transform a computed `text-transform` asks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+impl TextTransform {
+    /// The grammar allows at most one casing keyword alongside the two
+    /// unmapped ones, so an exact match is enough and anything else - which
+    /// includes the initial value - is no transform. Compared without
+    /// lowercasing because this runs once per text node.
+    fn parse(value: &str) -> Self {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("uppercase") {
+            Self::Uppercase
+        } else if value.eq_ignore_ascii_case("lowercase") {
+            Self::Lowercase
+        } else if value.eq_ignore_ascii_case("capitalize") {
+            Self::Capitalize
+        } else {
+            Self::None
+        }
+    }
+}
+
+/// What counts as a letter for `text-transform: capitalize`.
+///
+/// CSS Text 3 §2.1.1 leaves the definition of a word to the user agent and
+/// suggests UAX29 word segmentation. That data is not available to this
+/// crate, so the approximation is Unicode's alphanumeric property, which is
+/// what "the first letter of a word" means in the scripts this engine shapes:
+/// a letter after a space, a hyphen or punctuation is titlecased, and
+/// digits, punctuation and the interior of a word are left alone.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric()
+}
+
+/// Apply `text-transform` to the text a formatting node renders.
+///
+/// CSS Text 3 §2.1: the property "transforms text for styling purposes. It
+/// has no effect on the underlying content, and must not affect the content
+/// of a plain text copy & paste operation."
+///
+/// It is applied here, where the DOM text node is read into the formatting
+/// tree, and not in the painter, because the transformed characters change
+/// advance widths. `uppercase` on a CJK-free string changes nothing visible,
+/// but on a Latin or Cyrillic one it changes where every following character
+/// lands, and `capitalize` can change the width of a run outright. A painter
+/// that uppercased the string it was handed would draw glyphs the solver
+/// never measured, so the wrap points, the intrinsic widths and the painted
+/// string would all disagree. Transforming once, at the single point where
+/// layout first reads the text, makes them agree by construction - and leaves
+/// the DOM text node untouched, so `textContent` still returns what the
+/// author wrote.
+///
+/// `full-width` and `full-size-kana` are not implemented. Both are marked
+/// at-risk in the CSS Text 3 CR, `full-size-kana` needs the Appendix G
+/// mapping table, and `full-width` needs UAX11 decompositions; a declaration
+/// using either renders untransformed.
+fn transformed_text<'a>(
+    text: &'a str,
+    transform: TextTransform,
+    capitalize_word_start: &mut bool,
+) -> std::borrow::Cow<'a, str> {
+    if text.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    match transform {
+        TextTransform::None => std::borrow::Cow::Borrowed(text),
+        TextTransform::Uppercase => std::borrow::Cow::Owned(text.to_uppercase()),
+        TextTransform::Lowercase => std::borrow::Cow::Owned(text.to_lowercase()),
+        // §2.1: "Puts the first typographic letter unit of each word, if
+        // lowercase, in titlecase; other characters are unaffected." The word
+        // state is threaded through the builder because §2.1.1 requires that
+        // inline box boundaries introduce no word boundary.
+        TextTransform::Capitalize => {
+            let mut out = String::with_capacity(text.len());
+            let mut at_word_start = *capitalize_word_start;
+            for character in text.chars() {
+                if at_word_start {
+                    out.extend(character.to_uppercase());
+                } else {
+                    out.push(character);
+                }
+                at_word_start = !is_word_character(character);
+            }
+            *capitalize_word_start = at_word_start;
+            std::borrow::Cow::Owned(out)
+        }
     }
 }
 
@@ -852,5 +1188,88 @@ mod tests {
                 context: FormattingContextKind::Block
             }
         )));
+    }
+
+    #[test]
+    fn only_a_table_wrapper_box_establishes_a_table_formatting_context() {
+        // CSS 2.1 §17.2: the table solver places row groups, rows and cells
+        // itself, so only `display: table` needs the table context.
+        let output = parse_document(
+            "<!doctype html><body><table id='t'><tbody id='g'><tr id='r'>\
+             <td id='a'>a</td></tr></tbody></table></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "body { display:block } table { display:table } tbody { display:table-row-group } \
+             tr { display:table-row } td { display:table-cell }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let context = |selector: &str| {
+            let source = find(&output.dom, selector);
+            let node = tree
+                .iter()
+                .find(|node| node.source == Some(source))
+                .expect("formatting node");
+            match node.kind {
+                FormattingNodeKind::BlockContainer { context } => context,
+                ref other => panic!("{selector} is {other:?}"),
+            }
+        };
+        assert_eq!(context("#t"), FormattingContextKind::Table);
+        assert_eq!(context("#g"), FormattingContextKind::Block);
+        assert_eq!(context("#r"), FormattingContextKind::Block);
+        assert_eq!(context("#a"), FormattingContextKind::Block);
+    }
+
+    #[test]
+    fn table_structure_boxes_wrap_children_of_the_wrong_level() {
+        // CSS 2.1 §17.2.1: a caption and a row are row-level children of the
+        // wrapper, a column box is kept without generating a box of its own, and
+        // a row child that is not a cell is wrapped in an anonymous table cell.
+        let output = parse_document(
+            "<!doctype html><body><table id='t'>\
+             <caption id='cap'>c</caption><colgroup><col></colgroup>\
+             <tr id='r'><td id='a' style='display:block'>x</td></tr></table></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "body { display:block } table { display:table } caption { display:table-caption } \
+             colgroup { display:table-column-group } col { display:table-column } \
+             tr { display:table-row } td { display:table-cell }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let children = |selector: &str| {
+            let source = find(&output.dom, selector);
+            tree.iter()
+                .find(|node| node.source == Some(source))
+                .expect("formatting node")
+                .children
+                .clone()
+        };
+        // The `colgroup` generates no box of its own and holds only the column
+        // boxes of its group, so the wrapper has the caption, the group and the
+        // row.
+        assert_eq!(children("#t").len(), 3);
+        let colgroup = children("#t")
+            .into_iter()
+            .map(|id| tree.get(id).expect("child node").clone())
+            .find(|node| node.source == Some(find(&output.dom, "colgroup")))
+            .expect("column group box");
+        assert_eq!(colgroup.children.len(), 1, "the group's column box");
+        let column = tree.get(colgroup.children[0]).expect("column box");
+        assert_eq!(column.source, Some(find(&output.dom, "col")));
+        assert!(
+            column.children.is_empty(),
+            "a column box must not generate descendants"
+        );
+        let row_children = children("#r");
+        assert_eq!(row_children.len(), 1);
+        let cell = tree.get(row_children[0]).expect("anonymous cell");
+        assert_eq!(cell.source, None, "the wrapper cell is anonymous");
+        let block = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#a")))
+            .expect("block formatting node");
+        assert_eq!(cell.children, vec![block.id]);
     }
 }

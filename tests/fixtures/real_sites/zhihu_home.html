@@ -1,0 +1,125 @@
+<!doctype html>
+<!--
+  Reduced snapshot of the Zhihu home feed shape (https://www.zhihu.com/).
+
+  Same reduction rules: the header landmark, the top-level channel navigation,
+  the search form, a feed of question cards, a hot list section, and a side
+  card. Real-site URL shapes are kept and every response is replaced by
+  deterministic local values (see zhihu_home.css).
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>知乎 - 有问题，就会有答案</title>
+<link rel="stylesheet" href="https://static.zhihu.com/heifue/assets/home.5c1d0ab.css">
+<script defer src="https://static.zhihu.com/heifue/assets/home.2a77b31.js"></script>
+</head>
+<body>
+<header class="page-head">
+  <a class="logo" href="https://www.zhihu.com/"><img src="https://static.zhihu.com/heifue/assets/header-logo.9f31c0d.svg.png" width="90" height="30" alt="知乎首页"></a>
+  <nav class="top-links" aria-label="主导航">
+    <a href="https://www.zhihu.com/">首页</a>
+    <a href="https://www.zhihu.com/explore">发现</a>
+    <a href="https://www.zhihu.com/video">视频</a>
+    <a href="https://www.zhihu.com/question">等待回答</a>
+  </nav>
+  <form class="search" role="search" action="https://www.zhihu.com/search" method="get">
+    <input type="text" id="js-zhihu-search" name="q" placeholder="有问题，就会有答案">
+    <button type="submit">搜索</button>
+  </form>
+</header>
+<main class="page-main">
+  <div class="columns">
+    <section class="feed">
+      <h1 class="feed-heading">为你推荐</h1>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000001">为什么自研浏览器内核比接入现有内核更难？</a></h2>
+        <p class="feed-excerpt">从 HTML 解析、CSS 级联、布局求解到绘制，每一层都需要可复现的测量与回归基线。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000001/answer/900000001">回答 · 214</a><a href="https://www.zhihu.com/question/700000001/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000002">CSS 排版里最容易被忽视的一条规则是什么？</a></h2>
+        <p class="feed-excerpt">行内块的基线对齐会牵动整行的行盒高度，而行盒高度又决定了下方的块盒位置。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000002/answer/900000002">回答 · 96</a><a href="https://www.zhihu.com/question/700000002/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000003">如何为渲染结果建立可信的像素基线？</a></h2>
+        <p class="feed-excerpt">系统字体会让同一份 HTML 在不同机器上得到不同的位图，确定性测量是前提。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000003/answer/900000003">回答 · 152</a><a href="https://www.zhihu.com/question/700000003/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000004">为什么滚动不应该重新触发布局？</a></h2>
+        <p class="feed-excerpt">把渲染表达为可重放的绘制命令，滚动只需要换视口原点。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000004/answer/900000004">回答 · 61</a><a href="https://www.zhihu.com/question/700000004/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000005">图片占位尺寸应该由谁来推断？</a></h2>
+        <p class="feed-excerpt">HTML 宽高属性、固有尺寸与约束尺寸三者的优先级需要被明确写下来。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000005/answer/900000005">回答 · 78</a><a href="https://www.zhihu.com/question/700000005/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000006">外链样式表的加载顺序为什么重要？</a></h2>
+        <p class="feed-excerpt">层叠顺序由文档顺序决定，而不是由下载完成顺序决定。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000006/answer/900000006">回答 · 43</a><a href="https://www.zhihu.com/question/700000006/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000007">UA 样式表该写到什么程度才算够用？</a></h2>
+        <p class="feed-excerpt">至少要让标题、链接、列表与表单控件看起来像它们本来的样子。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000007/answer/900000007">回答 · 188</a><a href="https://www.zhihu.com/question/700000007/follow">关注问题</a></p>
+      </article>
+      <article class="feed-item">
+        <h2 class="feed-title"><a href="https://www.zhihu.com/question/700000008">文档标题的编码嗅探顺序是怎样的？</a></h2>
+        <p class="feed-excerpt">BOM、传输层、首个 1024 字节内的 meta 声明，最后才是回退值。</p>
+        <p class="feed-actions"><a href="https://www.zhihu.com/question/700000008/answer/900000008">回答 · 37</a><a href="https://www.zhihu.com/question/700000008/follow">关注问题</a></p>
+      </article>
+    </section>
+    <aside class="rail">
+      <section class="rail-card">
+        <h2>知乎热榜</h2>
+        <ul class="rail-list">
+          <li><a href="https://www.zhihu.com/question/710000001">自研内核的工程量估算</a></li>
+          <li><a href="https://www.zhihu.com/question/710000002">中文断行规则的实现代价</a></li>
+          <li><a href="https://www.zhihu.com/question/710000003">无头渲染如何做视觉对比</a></li>
+          <li><a href="https://www.zhihu.com/question/710000004">缓存与失效的边界在哪里</a></li>
+        </ul>
+      </section>
+      <section class="rail-card">
+        <h2>你的关注</h2>
+        <img src="https://picx.zhihu.com/1000x1000_side-avatar_thumbnail.jpg" width="96" height="96" alt="用户头像">
+        <p class="rail-note">头像走图片解码与固有尺寸路径。</p>
+      </section>
+    </aside>
+  </div>
+  <section class="hot-list">
+    <h2>热门话题</h2>
+    <ol class="hot-items">
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19550517/intro">浏览器内核</a><span class="hot-meta">1</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551101/intro">前端性能</a><span class="hot-meta">2</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551234/intro">排版引擎</a><span class="hot-meta">3</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551300/intro">无头浏览器</a><span class="hot-meta">4</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551402/intro">可访问性</a><span class="hot-meta">5</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551500/intro">渲染管线</a><span class="hot-meta">6</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551611/intro">文本排版</a><span class="hot-meta">7</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551722/intro">图片管线</a><span class="hot-meta">8</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551833/intro">样式级联</a><span class="hot-meta">9</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19551944/intro">网络缓存</a><span class="hot-meta">10</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552055/intro">版本控制</a><span class="hot-meta">11</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552166/intro">单元测试</a><span class="hot-meta">12</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552277/intro">视觉回归</a><span class="hot-meta">13</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552388/intro">像素对比</a><span class="hot-meta">14</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552499/intro">滚动合成</a><span class="hot-meta">15</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552500/intro">事件循环</a><span class="hot-meta">16</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552611/intro">字体回退</a><span class="hot-meta">17</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552722/intro">资源调度</a><span class="hot-meta">18</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552833/intro">沙箱与安全</a><span class="hot-meta">19</span></li>
+      <li class="hot-item"><a href="https://www.zhihu.com/topic/19552944/intro">构建流程</a><span class="hot-meta">20</span></li>
+    </ol>
+  </section>
+</main>
+<footer class="page-foot">
+  <a href="https://www.zhihu.com/term/zhihu-terms">知乎协议</a>
+  <a href="https://www.zhihu.com/term/privacy">隐私保护指引</a>
+  <a href="https://www.zhihu.com/term/copyright">侵权投诉指引</a>
+</footer>
+</body>
+</html>

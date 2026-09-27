@@ -9,17 +9,22 @@ use crate::solver::FloatArea;
 use crate::solver::InlineAtom;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
+use crate::solver::PreviousUnit;
 use crate::solver::Solver;
 use crate::solver::TextRun;
+use crate::solver::TextSpacing;
 use crate::solver::TextStyle;
 use crate::solver::block::inline_float_band;
+use crate::solver::is_word_separator;
 use crate::solver::resolve::count_as_f32;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
+use render_css::computed::ComputedStyle;
 use render_css::properties::AlignItems;
 use render_css::properties::BoxSizing;
 use render_css::properties::Float;
 use render_css::properties::JustifyContent;
+use render_css::properties::Overflow;
 use render_css::properties::TextAlign;
 use render_css::properties::TypedPropertyValue;
 use render_dom::Node;
@@ -71,6 +76,26 @@ pub(super) fn parse_text_length(value: &str, basis: f32) -> Option<f32> {
     } else {
         None
     }
+}
+
+/// The computed length of a CSS Text 3 §7 spacing value.
+///
+/// `letter-spacing` and `word-spacing` both compute to "an absolute length",
+/// so what reaches layout is the specified length with `em` and `rem` still to
+/// resolve against the element's own font size. A unitless zero is a valid
+/// `<length>`; any other unitless number is not one, and the initial value
+/// `normal` computes to zero.
+fn text_spacing_length(value: &str, font_size: f32) -> f32 {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("normal") {
+        return 0.0;
+    }
+    if value.parse::<f32>().is_ok_and(|number| number == 0.0) {
+        return 0.0;
+    }
+    parse_text_length(&value.to_ascii_lowercase(), font_size)
+        .filter(|length| length.is_finite())
+        .unwrap_or(0.0)
 }
 
 pub(super) fn justify_offsets(
@@ -212,6 +237,232 @@ pub(super) const fn is_wide_character(character: char) -> bool {
     )
 }
 
+/// The character CSS Overflow 3 §3.1 substitutes for clipped inline text.
+const ELLIPSIS: char = '\u{2026}';
+
+/// Everything text measurement needs about one inline box's typography: what
+/// the measurer resolves glyph advances from, plus the CSS Text 3 §7 spacing
+/// that changes the run's total advance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct InlineTextStyle {
+    pub style: TextStyle,
+    pub spacing: TextSpacing,
+}
+
+/// The block container a run of inline content belongs to, and whether its
+/// first line counts as the first formatted line of the parent.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InlineTextContextSource {
+    pub style_source: Option<NodeId>,
+    pub is_first_child: bool,
+}
+
+/// The block container's own text properties that shape its inline content.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InlineTextContext {
+    /// CSS Text 3 §8.1 `text-indent`.
+    pub indent: FirstLineIndent,
+    /// CSS Overflow 3 §3.1 `text-overflow: ellipsis`.
+    pub ellipsis: bool,
+}
+
+/// CSS Text 3 §8.1 `text-indent`: a length or percentage plus the two
+/// keywords that change which lines it applies to.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FirstLineIndent {
+    /// Positive indents the start edge; negative hangs into the margin.
+    pub length: f32,
+    /// §8.1 `each-line`: also indent every line after a forced line break.
+    pub each_line: bool,
+    /// §8.1 `hanging`: invert which lines are affected, so the first line
+    /// hangs out and the rest are indented.
+    pub hanging: bool,
+}
+
+impl FirstLineIndent {
+    /// The indent one line box receives, which is zero unless that line is
+    /// the first formatted line of the block or `each-line`/`hanging` say so.
+    fn for_line(self, line: usize, after_forced_break: bool) -> f32 {
+        let first = line == 0 || (self.each_line && after_forced_break);
+        match (self.hanging, first) {
+            (false, true) | (true, false) => self.length,
+            (false, false) | (true, true) => 0.0,
+        }
+    }
+}
+
+/// The available inline band for a line, narrowed by `text-indent`.
+///
+/// CSS Text 3 §8.1: "The indent is treated as a margin applied to the start
+/// edge of the line box", so it moves where the line may begin; the end edge
+/// stays the content edge, which is what makes the room left for the line
+/// `content width - indent` without the band being shortened twice. `indent`
+/// is zero on every line §8.1 does not affect, which makes this the single
+/// place a line band is computed.
+fn indented_line_band(
+    floats: &[FloatArea],
+    containing: PhysicalRect,
+    line_y: &mut f32,
+    line_height: f32,
+    min_width: f32,
+    indent: f32,
+) -> (f32, f32) {
+    let (left, right) = inline_float_band(floats, containing, line_y, line_height, min_width);
+    (left + indent, right)
+}
+
+/// The typography one inline atom contributes to measurement.
+fn inline_typography(atom: &InlineAtom) -> InlineTextStyle {
+    InlineTextStyle {
+        style: atom.style,
+        spacing: atom.spacing,
+    }
+}
+
+/// The CSS Text 3 §7 spacing inserted before a typographic character unit
+/// whose own advance is `advance`.
+///
+/// §7.2 puts half of a unit's tracking on each side, so the gap between two
+/// units is the average of their two values, and nothing is inserted at the
+/// beginning or end of a line. That is why `previous` is part of the
+/// measurement: the same character advances differently at the start of a
+/// line than in the middle of one. A consecutive run of atomic inlines is a
+/// single unit, so no gap goes inside one. §7.1 then adds the extra word
+/// advance to a separator on top of the tracking it already receives as a
+/// character unit in its own right.
+fn spacing_before(
+    character: char,
+    style: InlineTextStyle,
+    advance: f32,
+    atomic: bool,
+    previous: Option<&PreviousUnit>,
+) -> f32 {
+    let mut spacing = 0.0;
+    if is_word_separator(character) && advance > 0.0 {
+        // §7.1: a word separator that has no advance of its own opens no extra
+        // space. None of the separators `is_word_separator` knows is
+        // zero-advance in the reference measurer, so this agrees with
+        // `TextSpacing::extra_advance`, which cannot see advances.
+        spacing += style.spacing.word_spacing;
+    }
+    if let Some(previous) = previous
+        && !(previous.atomic && atomic)
+    {
+        spacing += f32::midpoint(
+            previous.typography.spacing.letter_spacing,
+            style.spacing.letter_spacing,
+        );
+    }
+    spacing
+}
+
+/// CSS Overflow 3 §3.1: `text-overflow: ellipsis` "only applies to blocks with
+/// overflow other than visible", so the property needs a clipping box to mean
+/// anything. The horizontal axis is the one a line box overflows in a
+/// horizontal writing mode.
+fn clips_inline_axis(style: Option<&ComputedStyle>) -> bool {
+    matches!(
+        style.and_then(|style| style.typed("overflow-x")),
+        Some(TypedPropertyValue::Overflow(value)) if !matches!(value, Overflow::Visible)
+    )
+}
+
+impl Solver<'_> {
+    /// The block container's own text properties, resolved once per inline
+    /// formatting context.
+    pub(super) fn inline_text_context(
+        &mut self,
+        source: InlineTextContextSource,
+        inline_size: f32,
+    ) -> InlineTextContext {
+        let style = source
+            .style_source
+            .and_then(|style_source| self.styles.get(&style_source))
+            .cloned();
+        // `text-overflow` has no entry in the property registry, so its
+        // declaration arrives as raw token text. That is also why it is absent
+        // from a descendant's computed style when it is not declared there:
+        // §3.1 makes it a property of the block whose own content overflows,
+        // so a child must not inherit it.
+        let wants_ellipsis = style
+            .as_ref()
+            .and_then(|style| style.get("text-overflow"))
+            .is_some_and(|value| value.css_text().trim().eq_ignore_ascii_case("ellipsis"));
+        InlineTextContext {
+            indent: self.text_indent(style.as_ref(), source, inline_size),
+            ellipsis: wants_ellipsis && clips_inline_axis(style.as_ref()),
+        }
+    }
+
+    /// CSS Text 3 §8.1 `text-indent`, read off the block container.
+    ///
+    /// §8.1 indents "only lines that are the first formatted line of an
+    /// element", so an inline formatting context that is not its parent's
+    /// first child is not indented at all. The computed value is a
+    /// length-percentage plus the `hanging` and `each-line` keywords, and
+    /// percentages refer to "the block container's own logical width", so the
+    /// two components need different bases.
+    fn text_indent(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        source: InlineTextContextSource,
+        inline_size: f32,
+    ) -> FirstLineIndent {
+        if !source.is_first_child {
+            return FirstLineIndent::default();
+        }
+        let Some(value) = style
+            .and_then(|style| style.get("text-indent"))
+            .map(|value| value.css_text().to_owned())
+        else {
+            return FirstLineIndent::default();
+        };
+        let mut components = value.split_whitespace();
+        let length = components.next().unwrap_or_default().to_ascii_lowercase();
+        let font_size = source
+            .style_source
+            .and_then(|style_source| self.styles.get(&style_source))
+            .and_then(|style| style.get("font-size"))
+            .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
+            .unwrap_or(self.options.root_font_size);
+        let resolved = if length.ends_with('%') {
+            length
+                .trim_end_matches('%')
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .map(|percentage| percentage * inline_size / 100.0)
+        } else {
+            parse_text_length(&length, font_size)
+        };
+        let Some(resolved) = resolved else {
+            self.diagnostics.push(LayoutDiagnostic {
+                node: source.style_source,
+                code: LayoutDiagnosticCode::UnresolvedUsedValue,
+                message: format!("could not resolve 'text-indent': {value}"),
+            });
+            return FirstLineIndent::default();
+        };
+        let mut indent = FirstLineIndent {
+            length: resolved,
+            each_line: false,
+            hanging: false,
+        };
+        for keyword in components {
+            match keyword.to_ascii_lowercase().as_str() {
+                "each-line" => indent.each_line = true,
+                "hanging" => indent.hanging = true,
+                other => self.diagnostics.push(LayoutDiagnostic {
+                    node: source.style_source,
+                    code: LayoutDiagnosticCode::UnresolvedUsedValue,
+                    message: format!("could not resolve 'text-indent' keyword: {other}"),
+                }),
+            }
+        }
+        indent
+    }
+}
+
 impl Solver<'_> {
     #[allow(clippy::too_many_lines)]
     pub(super) fn layout_inline_content(
@@ -219,7 +470,7 @@ impl Solver<'_> {
         roots: &[FormattingNodeId],
         containing: PhysicalRect,
         positioning_containing: PhysicalRect,
-        text_align: TextAlign,
+        source: InlineTextContextSource,
         depth: usize,
         floats: &[FloatArea],
     ) -> (Vec<FragmentId>, f32) {
@@ -237,36 +488,65 @@ impl Solver<'_> {
             .find(|atom| atom.forced_break || !atom.character.is_whitespace())
             .is_some_and(|atom| atom.forced_break);
 
-        let default_style = TextStyle {
-            font_size: self.options.root_font_size,
-            line_height: self.options.default_line_height,
+        let text = self.inline_text_context(source, containing.size.width);
+        let default_style = InlineTextStyle {
+            style: TextStyle {
+                font_size: self.options.root_font_size,
+                line_height: self.options.default_line_height,
+            },
+            spacing: TextSpacing::default(),
         };
-        let first_style = atoms.first().map_or(default_style, |atom| atom.style);
+        let first_style = atoms.first().map_or(default_style, inline_typography);
         let mut fragments = Vec::new();
         let mut line_y = containing.origin.y;
-        let (mut line_left, mut line_right) = inline_float_band(
+        // CSS Text 3 §8.1: the indent is a margin on the start edge of the
+        // first formatted line, so it moves where the line may start and the
+        // room left for the line shrinks by the same amount. `line_indent` is
+        // the indent of the line being built and is zero on every line §8.1
+        // does not affect.
+        let mut line_index = 0_usize;
+        let mut after_forced_break = false;
+        let mut line_indent = text.indent.for_line(line_index, after_forced_break);
+        let (mut line_left, mut line_right) = indented_line_band(
             floats,
             containing,
             &mut line_y,
-            first_style.line_height,
+            first_style.style.line_height,
             0.0,
+            line_indent,
         );
         let mut line_x = line_left;
-        let mut current_line_height = first_style.line_height;
+        let mut current_line_height = first_style.style.line_height;
         let mut pending_space: Option<InlineAtom> = None;
         let mut current_run: Option<TextRun> = None;
+        // The typographic unit before the one being placed, which CSS Text 3
+        // §7.2 needs because it inserts tracking between units.
+        let mut previous_unit: Option<PreviousUnit> = None;
         let mut cursor = 0;
+        // Set when `text-overflow: ellipsis` has replaced the clipped text of
+        // the line being built with one glyph.
+        let mut ellipsized = false;
 
         while cursor < atoms.len() {
             let atom = atoms[cursor];
             if atom.forced_break {
                 self.flush_text_run(&mut current_run, &mut fragments);
                 line_y += current_line_height;
+                line_index += 1;
+                after_forced_break = true;
                 current_line_height = atom.style.line_height;
-                (line_left, line_right) =
-                    inline_float_band(floats, containing, &mut line_y, current_line_height, 0.0);
+                line_indent = text.indent.for_line(line_index, after_forced_break);
+                (line_left, line_right) = indented_line_band(
+                    floats,
+                    containing,
+                    &mut line_y,
+                    current_line_height,
+                    0.0,
+                    line_indent,
+                );
                 line_x = line_left;
                 pending_space = None;
+                previous_unit = None;
                 cursor += 1;
                 continue;
             }
@@ -275,7 +555,12 @@ impl Solver<'_> {
                 if let Some(space) = pending_space.take()
                     && line_x > line_left
                 {
-                    let width = self.text_measurer.measure(" ", space.style).advance;
+                    let width = self.measure_inline_unit(
+                        ' ',
+                        inline_typography(&space),
+                        false,
+                        previous_unit.as_ref(),
+                    );
                     self.push_character(
                         &mut current_run,
                         &mut fragments,
@@ -284,10 +569,13 @@ impl Solver<'_> {
                         line_x,
                         line_y,
                         width,
-                        space.style,
                     );
                     self.flush_text_run(&mut current_run, &mut fragments);
                     line_x += width;
+                    previous_unit = Some(PreviousUnit {
+                        typography: inline_typography(&space),
+                        atomic: false,
+                    });
                 }
                 if let Some((fragment, outer)) = self.layout_atomic_inline(
                     atomic,
@@ -309,12 +597,13 @@ impl Solver<'_> {
                     if (line_x - line_left).abs() < f32::EPSILON
                         && line_x + outer.size.width > line_right
                     {
-                        (line_left, line_right) = inline_float_band(
+                        (line_left, line_right) = indented_line_band(
                             floats,
                             containing,
                             &mut line_y,
                             current_line_height,
                             outer.size.width,
+                            line_indent,
                         );
                         line_x = line_left;
                         self.translate_fragment_subtree(
@@ -325,13 +614,17 @@ impl Solver<'_> {
                     }
                     if line_x > line_left && line_x + outer.size.width > line_right {
                         line_y += current_line_height;
+                        line_index += 1;
+                        after_forced_break = false;
                         current_line_height = atom.style.line_height;
-                        (line_left, line_right) = inline_float_band(
+                        line_indent = text.indent.for_line(line_index, after_forced_break);
+                        (line_left, line_right) = indented_line_band(
                             floats,
                             containing,
                             &mut line_y,
                             current_line_height,
                             0.0,
+                            line_indent,
                         );
                         line_x = line_left;
                         self.translate_fragment_subtree(
@@ -342,6 +635,13 @@ impl Solver<'_> {
                     }
                     line_x += outer.size.width;
                     current_line_height = current_line_height.max(outer.size.height);
+                    // §7.2: a consecutive run of atomic inlines is a single
+                    // typographic character unit, so the next unit is spaced
+                    // from it like any other.
+                    previous_unit = Some(PreviousUnit {
+                        typography: inline_typography(&atom),
+                        atomic: true,
+                    });
                     fragments.push(fragment);
                 }
                 cursor += 1;
@@ -355,14 +655,15 @@ impl Solver<'_> {
 
             let segment_end = inline_segment_end(&atoms, cursor);
             let segment = &atoms[cursor..segment_end];
-            let segment_width = self.measure_inline_segment(segment);
+            let segment_width = self.measure_inline_segment(segment, previous_unit.as_ref());
             if (line_x - line_left).abs() < f32::EPSILON && segment_width > line_right - line_left {
-                (line_left, line_right) = inline_float_band(
+                (line_left, line_right) = indented_line_band(
                     floats,
                     containing,
                     &mut line_y,
                     current_line_height,
                     segment_width,
+                    line_indent,
                 );
                 line_x = line_left;
             }
@@ -370,7 +671,12 @@ impl Solver<'_> {
                 .as_ref()
                 .filter(|_| line_x > line_left)
                 .map_or(0.0, |space| {
-                    self.text_measurer.measure(" ", space.style).advance
+                    self.measure_inline_unit(
+                        ' ',
+                        inline_typography(space),
+                        false,
+                        previous_unit.as_ref(),
+                    )
                 });
             if segment.first().is_some_and(|atom| atom.wrap_allowed)
                 && line_x > line_left
@@ -378,17 +684,32 @@ impl Solver<'_> {
             {
                 self.flush_text_run(&mut current_run, &mut fragments);
                 line_y += current_line_height;
+                line_index += 1;
+                after_forced_break = false;
                 current_line_height = segment[0].style.line_height;
-                (line_left, line_right) =
-                    inline_float_band(floats, containing, &mut line_y, current_line_height, 0.0);
+                line_indent = text.indent.for_line(line_index, after_forced_break);
+                (line_left, line_right) = indented_line_band(
+                    floats,
+                    containing,
+                    &mut line_y,
+                    current_line_height,
+                    0.0,
+                    line_indent,
+                );
                 line_x = line_left;
                 pending_space = None;
+                previous_unit = None;
             }
 
             if let Some(space) = pending_space.take()
                 && line_x > line_left
             {
-                let width = self.text_measurer.measure(" ", space.style).advance;
+                let width = self.measure_inline_unit(
+                    ' ',
+                    inline_typography(&space),
+                    false,
+                    previous_unit.as_ref(),
+                );
                 self.push_character(
                     &mut current_run,
                     &mut fragments,
@@ -397,25 +718,104 @@ impl Solver<'_> {
                     line_x,
                     line_y,
                     width,
-                    space.style,
                 );
                 line_x += width;
+                previous_unit = Some(PreviousUnit {
+                    typography: inline_typography(&space),
+                    atomic: false,
+                });
             }
 
             for atom in segment {
-                let width = self.measure_inline_character(atom.character, atom.style);
-                if atom.wrap_allowed && line_x + width > line_right && line_x > line_left {
+                // CSS Text 3 §7.2 inserts the gap between two units and nothing
+                // at the start of a line, so the wrap decision comes first: it
+                // decides what this unit's spacing even is. Measuring before the
+                // decision would leave a wrapped character carrying the tracking
+                // of the line it just left.
+                let typography = inline_typography(atom);
+                let bare = self.measure_inline_character(atom.character, atom.style);
+                let extra = spacing_before(
+                    atom.character,
+                    typography,
+                    bare,
+                    false,
+                    previous_unit.as_ref(),
+                );
+                // CSS Overflow 3 §3.1: room for the ellipsis is reserved out of
+                // the text rather than added to it, so the character that would
+                // collide with it is the one that gets dropped.
+                let ellipsis = if text.ellipsis {
+                    Some(self.measure_inline_unit(
+                        ELLIPSIS,
+                        typography,
+                        false,
+                        previous_unit.as_ref(),
+                    ))
+                } else {
+                    None
+                };
+                let limit = ellipsis.map_or(line_right, |ellipsis| {
+                    (line_right - ellipsis).max(line_left)
+                });
+                let overflows = line_x + bare + extra > limit;
+                let wraps = atom.wrap_allowed && overflows && line_x > line_left;
+                let width;
+                if wraps {
                     self.flush_text_run(&mut current_run, &mut fragments);
                     line_y += current_line_height;
+                    line_index += 1;
+                    after_forced_break = false;
                     current_line_height = atom.style.line_height;
-                    (line_left, line_right) = inline_float_band(
+                    line_indent = text.indent.for_line(line_index, after_forced_break);
+                    (line_left, line_right) = indented_line_band(
                         floats,
                         containing,
                         &mut line_y,
                         current_line_height,
                         0.0,
+                        line_indent,
                     );
                     line_x = line_left;
+                    width = bare.max(0.0);
+                } else {
+                    if let Some(ellipsis) = ellipsis
+                        && overflows
+                        && line_x > line_left
+                    {
+                        // The line cannot wrap, so it really does overflow, and
+                        // the ellipsis takes the place of the clipped text. It
+                        // reuses the measurement that reserved its room, so it
+                        // ends exactly where the text it replaced would have.
+                        self.flush_text_run(&mut current_run, &mut fragments);
+                        self.push_character(
+                            &mut current_run,
+                            &mut fragments,
+                            *atom,
+                            ELLIPSIS,
+                            line_x,
+                            line_y,
+                            ellipsis,
+                        );
+                        self.flush_text_run(&mut current_run, &mut fragments);
+                        line_y += current_line_height;
+                        line_index += 1;
+                        after_forced_break = false;
+                        current_line_height = atom.style.line_height;
+                        line_indent = text.indent.for_line(line_index, after_forced_break);
+                        (line_left, line_right) = indented_line_band(
+                            floats,
+                            containing,
+                            &mut line_y,
+                            current_line_height,
+                            0.0,
+                            line_indent,
+                        );
+                        line_x = line_left;
+                        previous_unit = None;
+                        ellipsized = true;
+                        break;
+                    }
+                    width = (bare + extra).max(0.0);
                 }
                 current_line_height = current_line_height.max(atom.style.line_height);
                 self.push_character(
@@ -426,11 +826,26 @@ impl Solver<'_> {
                     line_x,
                     line_y,
                     width,
-                    atom.style,
                 );
                 line_x += width;
+                previous_unit = Some(PreviousUnit {
+                    typography,
+                    atomic: false,
+                });
             }
-            cursor = segment_end;
+            if ellipsized {
+                // Whatever is left on this line is clipped. A forced break ends
+                // the line for real, so resume after it rather than dropping the
+                // rest of the block: a `nowrap` block with a `<br>` keeps the
+                // lines that follow the clipped one.
+                pending_space = None;
+                cursor = atoms[cursor..]
+                    .iter()
+                    .position(|atom| atom.forced_break)
+                    .map_or(atoms.len(), |offset| cursor + offset + 1);
+            } else {
+                cursor = segment_end;
+            }
         }
         self.flush_text_run(&mut current_run, &mut fragments);
         let trailing_line_height = if ends_with_forced_break {
@@ -439,7 +854,7 @@ impl Solver<'_> {
             current_line_height
         };
         let height = line_y - containing.origin.y + trailing_line_height;
-        self.align_inline_fragments(&fragments, containing, text_align);
+        self.align_inline_fragments(&fragments, containing, self.text_align(source.style_source));
         (fragments, height)
     }
 
@@ -519,11 +934,26 @@ impl Solver<'_> {
         atoms
     }
 
-    pub(super) fn measure_inline_segment(&self, segment: &[InlineAtom]) -> f32 {
-        segment
-            .iter()
-            .map(|atom| self.measure_inline_character(atom.character, atom.style))
-            .sum()
+    pub(super) fn measure_inline_segment(
+        &self,
+        segment: &[InlineAtom],
+        previous: Option<&PreviousUnit>,
+    ) -> f32 {
+        let mut previous = previous.copied();
+        let mut width = 0.0;
+        for atom in segment {
+            width += self.measure_inline_unit(
+                atom.character,
+                inline_typography(atom),
+                atom.atomic.is_some(),
+                previous.as_ref(),
+            );
+            previous = Some(PreviousUnit {
+                typography: inline_typography(atom),
+                atomic: atom.atomic.is_some(),
+            });
+        }
+        width
     }
 
     pub(super) fn measure_inline_character(&self, character: char, style: TextStyle) -> f32 {
@@ -533,11 +963,25 @@ impl Solver<'_> {
             .advance
     }
 
+    /// The advance of one typographic character unit, including the CSS Text
+    /// 3 §7 spacing that precedes it.
+    pub(super) fn measure_inline_unit(
+        &self,
+        character: char,
+        style: InlineTextStyle,
+        atomic: bool,
+        previous: Option<&PreviousUnit>,
+    ) -> f32 {
+        let advance = self.measure_inline_character(character, style.style);
+        let spacing = spacing_before(character, style, advance, atomic, previous);
+        (advance + spacing).max(0.0)
+    }
+
     pub(super) fn intrinsic_text_width(
         &self,
         text: &str,
         source: Option<NodeId>,
-        style: TextStyle,
+        style: InlineTextStyle,
     ) -> f32 {
         let preserves_whitespace = source
             .and_then(|source| self.styles.get(&source))
@@ -549,27 +993,45 @@ impl Solver<'_> {
                 )
             });
         if preserves_whitespace {
-            return self.text_measurer.measure(text, style).advance;
+            return self
+                .text_measurer
+                .measure_spaced(text, style.style, style.spacing)
+                .advance;
         }
         let mut width = 0.0;
         let mut pending_space = false;
         let mut has_content = false;
+        let mut previous: Option<PreviousUnit> = None;
         for character in text.chars() {
             if character.is_whitespace() {
                 pending_space |= has_content;
                 continue;
             }
             if pending_space {
-                width += self.text_measurer.measure(" ", style).advance;
+                // One collapsed separator stands for the whole run of white
+                // space, and it is a character unit like any other, so
+                // tracking goes before it too.
+                width += self.measure_inline_unit(' ', style, false, previous.as_ref());
+                previous = Some(PreviousUnit {
+                    typography: style,
+                    atomic: false,
+                });
                 pending_space = false;
             }
-            width += self.measure_inline_character(character, style);
+            width += self.measure_inline_unit(character, style, false, previous.as_ref());
+            previous = Some(PreviousUnit {
+                typography: style,
+                atomic: false,
+            });
             has_content = true;
         }
         width
     }
 
-    pub(super) fn text_style(&self, source: Option<NodeId>) -> TextStyle {
+    /// The typography text measurement needs for `source`: the font inputs the
+    /// measurer resolves advances from, plus the CSS Text 3 §7 spacing that
+    /// changes the total.
+    pub(super) fn inline_text_style(&mut self, source: Option<NodeId>) -> InlineTextStyle {
         let computed = source.and_then(|source| self.styles.get(&source));
         let font_size = computed
             .and_then(|style| style.get("font-size"))
@@ -581,10 +1043,52 @@ impl Solver<'_> {
             .and_then(|value| parse_line_height(value.css_text(), font_size))
             .unwrap_or(font_size * 1.2)
             .clamp(font_size, 1_024.0);
-        TextStyle {
-            font_size,
-            line_height,
+        InlineTextStyle {
+            style: TextStyle {
+                font_size,
+                line_height,
+            },
+            spacing: self.text_spacing(computed, source, font_size),
         }
+    }
+
+    /// CSS Text 3 §7.1/§7.2 `word-spacing` and `letter-spacing`.
+    ///
+    /// Both compute to an absolute length, so what reaches layout is still the
+    /// specified length and an `em` has to be resolved against the element's
+    /// own computed font size. A value this cannot read is the initial value -
+    /// no additional spacing - which is the conservative reading, and the one
+    /// that keeps a malformed declaration from moving text.
+    fn text_spacing(
+        &mut self,
+        computed: Option<&ComputedStyle>,
+        source: Option<NodeId>,
+        font_size: f32,
+    ) -> TextSpacing {
+        let length = |property: &str| {
+            computed
+                .and_then(|style| style.get(property))
+                .map_or(0.0, |value| {
+                    text_spacing_length(value.css_text(), font_size)
+                })
+        };
+        let spacing = TextSpacing {
+            letter_spacing: length("letter-spacing"),
+            word_spacing: length("word-spacing"),
+        };
+        for (property, value) in [
+            ("letter-spacing", spacing.letter_spacing),
+            ("word-spacing", spacing.word_spacing),
+        ] {
+            if !value.is_finite() {
+                self.diagnostics.push(LayoutDiagnostic {
+                    node: source,
+                    code: LayoutDiagnosticCode::UnresolvedUsedValue,
+                    message: format!("could not resolve '{property}': not a finite length"),
+                });
+            }
+        }
+        spacing
     }
 
     pub(super) fn collect_inline_atoms(
@@ -605,7 +1109,7 @@ impl Solver<'_> {
             return;
         };
         if let FormattingNodeKind::Text(text) = node.kind {
-            let text_style = self.text_style(node.style_source);
+            let typography = self.inline_text_style(node.style_source);
             let wrap_allowed = node
                 .style_source
                 .and_then(|source| self.styles.get(&source))
@@ -628,11 +1132,13 @@ impl Solver<'_> {
                     forced_break: false,
                     wrap_allowed,
                     atomic: None,
-                    style: text_style,
+                    style: typography.style,
+                    spacing: typography.spacing,
                 });
             }
             return;
         }
+        let typography = self.inline_text_style(node.style_source);
         if node.source.is_some_and(|source| {
             matches!(
                 self.dom.node(source).map(Node::kind),
@@ -646,7 +1152,8 @@ impl Solver<'_> {
                 forced_break: true,
                 wrap_allowed: false,
                 atomic: None,
-                style: self.text_style(node.style_source),
+                style: typography.style,
+                spacing: typography.spacing,
             });
             return;
         }
@@ -658,7 +1165,8 @@ impl Solver<'_> {
                 forced_break: false,
                 wrap_allowed: true,
                 atomic: Some(node_id),
-                style: self.text_style(node.style_source),
+                style: typography.style,
+                spacing: typography.spacing,
             });
             return;
         }
@@ -862,25 +1370,119 @@ impl Solver<'_> {
             return 0.0;
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
-            let style = self.text_style(node.style_source);
+            let style = self.inline_text_style(node.style_source);
             return self.intrinsic_text_width(text, node.style_source, style);
         }
         if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
             return self.atomic_outer_max_content_width(node_id);
         }
-        let inline_sequence = matches!(
+        if let Some(width) = self.table_max_content_width(node_id) {
+            return width;
+        }
+        if matches!(
             node.kind,
             FormattingNodeKind::AnonymousBlock | FormattingNodeKind::Inline
-        );
-        let widths = node
-            .children
-            .into_iter()
-            .map(|child| self.max_content_width(child));
-        if inline_sequence {
-            widths.sum()
-        } else {
-            widths.fold(0.0_f32, f32::max)
+        ) {
+            return self.inline_sequence_max_content_width(&node.children, 0);
         }
+        node.children
+            .into_iter()
+            .map(|child| self.max_content_width(child))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// CSS 2.1 §17.5.2.2: a table's max-content width is the sum of its column
+    /// widths, not the widest of its rows, so it needs the table algorithm
+    /// rather than the generic block measurement. Returns `None` for a box that
+    /// is not a table.
+    pub(super) fn table_max_content_width(&mut self, node_id: FormattingNodeId) -> Option<f32> {
+        if !self.is_table(node_id) {
+            return None;
+        }
+        let source = self
+            .formatting
+            .get(node_id)
+            .and_then(|node| node.style_source)?;
+        let style = self.styles.get(&source);
+        Some(self.table_intrinsic_widths(node_id, style, self.options.viewport.width, false))
+    }
+
+    /// CSS 2.1 §10.3.5: the narrowest width a box can take without overflowing
+    /// is the widest of its unbreakable runs. A soft wrap opportunity splits a
+    /// text run at every word and a forced break ends a line outright, so
+    /// neither raises the minimum above the widest single word.
+    pub(super) fn min_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let Some(node) = self.formatting.get(node_id).cloned() else {
+            return 0.0;
+        };
+        if let FormattingNodeKind::Text(text) = &node.kind {
+            let style = self.inline_text_style(node.style_source);
+            return text
+                .split_whitespace()
+                .map(|word| {
+                    self.text_measurer
+                        .measure_spaced(word, style.style, style.spacing)
+                        .advance
+                })
+                .fold(0.0_f32, f32::max);
+        }
+        if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
+            // A replaced box cannot be broken, so its minimum is its used
+            // outer width.
+            return self.atomic_outer_max_content_width(node_id);
+        }
+        if self.is_table(node_id) {
+            // §17.5.2.2: a table's min-content width is the sum of its column
+            // widths, not the widest of its rows.
+            let style = self
+                .formatting
+                .get(node_id)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            return self.table_intrinsic_widths(node_id, style, self.options.viewport.width, true);
+        }
+        node.children
+            .into_iter()
+            .map(|child| self.min_content_width(child))
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// CSS 2.1 §10.3.5 / CSS Overflow 3 §3.1: the max-content width of an
+    /// inline sequence is the width of its widest line, not the sum of all of
+    /// its content, because a forced break (`<br>`) ends the line.
+    pub(super) fn inline_sequence_max_content_width(
+        &mut self,
+        children: &[FormattingNodeId],
+        depth: usize,
+    ) -> f32 {
+        if depth > self.options.limits.max_depth {
+            return 0.0;
+        }
+        let mut widest: f32 = 0.0;
+        let mut line: f32 = 0.0;
+        for child in children.iter().copied() {
+            if self.is_forced_break(child) {
+                widest = widest.max(line);
+                line = 0.0;
+                continue;
+            }
+            line += self.max_content_width(child);
+        }
+        widest.max(line)
+    }
+
+    /// A `<br>` forces a line break, which every inline intrinsic-width
+    /// measurement has to account for.
+    pub(super) fn is_forced_break(&self, node_id: FormattingNodeId) -> bool {
+        self.formatting
+            .get(node_id)
+            .and_then(|node| node.source)
+            .is_some_and(|source| {
+                matches!(
+                    self.dom.node(source).map(Node::kind),
+                    Some(NodeKind::Element(data)) if data.local_name == "br"
+                )
+            })
     }
 
     pub(super) fn atomic_outer_max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
@@ -939,12 +1541,12 @@ impl Solver<'_> {
         x: f32,
         y: f32,
         width: f32,
-        style: TextStyle,
     ) {
+        let typography = inline_typography(&atom);
         if run.as_ref().is_some_and(|run| {
             run.formatting_node != atom.formatting_node
                 || (run.y - y).abs() > f32::EPSILON
-                || run.style != style
+                || run.typography != typography
         }) {
             self.flush_text_run(run, fragments);
         }
@@ -955,7 +1557,7 @@ impl Solver<'_> {
             x,
             y,
             width: 0.0,
-            style,
+            typography,
         });
         run.text.push(character);
         run.width += width;
@@ -969,8 +1571,12 @@ impl Solver<'_> {
         let Some(run) = run.take() else {
             return;
         };
-        let metrics = self.text_measurer.measure(&run.text, run.style);
-        let rect = PhysicalRect::new(run.x, run.y, run.width, run.style.line_height);
+        let metrics = self.text_measurer.measure_spaced(
+            &run.text,
+            run.typography.style,
+            run.typography.spacing,
+        );
+        let rect = PhysicalRect::new(run.x, run.y, run.width, run.typography.style.line_height);
         if let Some(fragment) = self.allocate_fragment(
             run.formatting_node,
             run.source,
@@ -978,7 +1584,7 @@ impl Solver<'_> {
             FragmentKind::Text(TextFragmentData {
                 text: run.text,
                 baseline: run.y + metrics.ascent,
-                font_size: run.style.font_size,
+                font_size: run.typography.style.font_size,
             }),
         ) {
             fragments.push(fragment);

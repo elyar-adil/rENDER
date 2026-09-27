@@ -3,6 +3,7 @@
 use super::inline::parse_font_size;
 use crate::fragment::FragmentId;
 use crate::fragment::FragmentKind;
+use crate::geometry::EdgeSizes;
 use crate::geometry::PhysicalRect;
 use crate::solver::AutoEdge;
 use crate::solver::LayoutDiagnostic;
@@ -71,6 +72,19 @@ impl Solver<'_> {
         match &fragment.kind {
             FragmentKind::Box(geometry) => Some(geometry.margin_rect()),
             FragmentKind::Text(_) => Some(fragment.rect),
+        }
+    }
+
+    /// The used height of a box's content box, which is what its in-flow
+    /// children are laid out in and what `vertical-align` aligns them within.
+    pub(super) fn fragment_content_height(&self, fragment: FragmentId) -> Option<f32> {
+        match &self
+            .fragments
+            .get(usize::try_from(fragment.as_u32()).ok()?)?
+            .kind
+        {
+            FragmentKind::Box(geometry) => Some(geometry.content_rect.size.height),
+            FragmentKind::Text(_) => None,
         }
     }
 
@@ -155,6 +169,67 @@ impl Solver<'_> {
         value.map_or(0.0, |value| {
             self.resolve_length(value, basis, node, property)
         })
+    }
+
+    /// The used border and padding of a box.
+    ///
+    /// The table algorithm can collapse them first: in the collapsed border
+    /// model only the winning cell of a shared grid line keeps its border, and
+    /// an `empty-cells: hide` cell keeps neither border nor padding (§17.6.2,
+    /// §17.5.2.1). An override replaces the resolved value edge for edge, so a
+    /// cell that only loses its left border still has its other three.
+    pub(super) fn resolve_box_edges(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        basis: f32,
+        source: Option<NodeId>,
+    ) -> (EdgeSizes, EdgeSizes) {
+        let collapsed = source
+            .and_then(|source| self.collapsed_edges.get(&source).copied())
+            .unwrap_or_default();
+        let border = collapsed
+            .border
+            .unwrap_or_else(|| self.resolve_box_border(style, basis, source));
+        let padding = collapsed
+            .padding
+            .unwrap_or_else(|| self.resolve_box_padding(style, basis, source));
+        (border, padding)
+    }
+
+    fn resolve_box_border(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        basis: f32,
+        source: Option<NodeId>,
+    ) -> EdgeSizes {
+        EdgeSizes {
+            top: self.resolve_border(style, "border-top-width", basis, source),
+            right: self.resolve_border(style, "border-right-width", basis, source),
+            bottom: self.resolve_border(style, "border-bottom-width", basis, source),
+            left: self.resolve_border(style, "border-left-width", basis, source),
+        }
+    }
+
+    fn resolve_box_padding(
+        &mut self,
+        style: Option<&ComputedStyle>,
+        basis: f32,
+        source: Option<NodeId>,
+    ) -> EdgeSizes {
+        EdgeSizes {
+            top: self
+                .resolve_edge(style, "padding-top", basis, source)
+                .max(0.0),
+            right: self
+                .resolve_edge(style, "padding-right", basis, source)
+                .max(0.0),
+            bottom: self
+                .resolve_edge(style, "padding-bottom", basis, source)
+                .max(0.0),
+            left: self
+                .resolve_edge(style, "padding-left", basis, source)
+                .max(0.0),
+        }
     }
 
     pub(super) fn resolve_inset(

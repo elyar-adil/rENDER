@@ -12,11 +12,44 @@ const VOID_ELEMENTS: [&str; 14] = [
 /// Raw-text elements whose children serialize verbatim (no entity escaping).
 const RAW_TEXT_ELEMENTS: [&str; 2] = ["script", "style"];
 
+/// The XLink namespace, whose prefix is always `xlink`.
+const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
+/// The XML namespace, whose prefix is always `xml`.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+/// The XMLNS namespace, which carries `xmlns` and `xmlns:*`.
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// The qualified name to serialize an attribute under.
+///
+/// Foreign content carries namespaced attributes (`xlink:href` in particular),
+/// and the fragment serialisation algorithm writes them with their prefix
+/// restored rather than dropping them.
+fn attribute_name(attribute: &render_dom::Attribute) -> String {
+    match attribute.namespace.as_deref() {
+        Some(XLINK_NAMESPACE) => format!("xlink:{}", attribute.local_name),
+        Some(XML_NAMESPACE) => format!("xml:{}", attribute.local_name),
+        Some(XMLNS_NAMESPACE) => match attribute.prefix.as_deref() {
+            // The default namespace declaration has no prefix.
+            None => attribute.local_name.clone(),
+            Some(prefix) => format!("{prefix}:{}", attribute.local_name),
+        },
+        _ => match attribute.prefix.as_deref() {
+            Some(prefix) => format!("{prefix}:{}", attribute.local_name),
+            None => attribute.local_name.clone(),
+        },
+    }
+}
+
 /// Serialize all children of `parent` as an HTML fragment string.
+///
+/// "If current node is a template element, then let current node instead be the
+/// template element's template contents" (13.3.2), so this is what
+/// `template.innerHTML` returns.
 #[must_use]
 pub fn serialize_html_fragment(dom: &Dom, parent: NodeId) -> String {
     let mut output = String::new();
-    for child in dom.children(parent).unwrap_or_default() {
+    let source = dom.template_contents(parent).unwrap_or(parent);
+    for child in dom.children(source).unwrap_or_default() {
         serialize_node(dom, *child, &mut output);
     }
     output
@@ -40,13 +73,8 @@ fn serialize_node(dom: &Dom, node: NodeId, output: &mut String) {
             output.push('<');
             output.push_str(local_name);
             for attribute in &element.attributes {
-                if attribute.prefix.is_some() || attribute.namespace.is_some() {
-                    // Foreign-object attributes are out of scope for this
-                    // minimal serializer.
-                    continue;
-                }
                 output.push(' ');
-                output.push_str(&attribute.local_name);
+                output.push_str(&attribute_name(attribute));
                 output.push_str("=\"");
                 escape_attribute(&attribute.value, output);
                 output.push('"');
@@ -60,6 +88,13 @@ fn serialize_node(dom: &Dom, node: NodeId, output: &mut String) {
                     && let Some(NodeKind::Text(data)) = dom.node(*child).map(render_dom::Node::kind)
                 {
                     output.push_str(data);
+                }
+            } else if let Some(contents) = dom.template_contents(node) {
+                // A template element has no children of its own: its markup is
+                // in the template contents, and serializing the element means
+                // serializing those.
+                for child in dom.children(contents).unwrap_or_default() {
+                    serialize_node(dom, *child, output);
                 }
             } else {
                 for child in node_ref.children() {
@@ -169,6 +204,17 @@ mod tests {
         assert_eq!(
             serialize_html_fragment(&dom, body),
             "<br><img src=\"x.png\" alt=\"a&quot;b\">"
+        );
+    }
+
+    #[test]
+    fn namespaced_and_case_adjusted_foreign_attributes_round_trip() {
+        let (dom, body) = body_of(
+            "<!doctype html><svg viewbox='0 0 1 1'><use xlink:href='#i' xml:lang='en'/></svg>",
+        );
+        assert_eq!(
+            serialize_html_fragment(&dom, body),
+            "<svg viewBox=\"0 0 1 1\"><use xlink:href=\"#i\" xml:lang=\"en\"></use></svg>"
         );
     }
 }

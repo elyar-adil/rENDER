@@ -39,7 +39,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::ObjectGetOwnPropertySymbols => {
-                let object = Self::require_object(required_argument(
+                let object = self.to_object(required_argument(
                     arguments,
                     0,
                     "Object.getOwnPropertySymbols",
@@ -106,7 +106,16 @@ impl JsRuntime {
                     "Symbol.prototype.valueOf requires that 'this' be a Symbol",
                 )),
             },
-            NativeFunction::NumValueOf => Ok(JsValue::Object(receiver)),
+            // ECMA-262 6.1.6.1.9: `Number.prototype.valueOf` returns the
+            // receiver's number, not the wrapper, so `Object(1).valueOf() === 1`
+            // and `typeof` is `"number"` exactly as in every engine. The
+            // String counterpart already unwraps.
+            NativeFunction::NumValueOf => match self.realm.host(receiver) {
+                Some(ObjectHost::NumberPrimitive(value)) => Ok(JsValue::Number(value)),
+                _ => Err(JsError::type_error(
+                    "Number.prototype.valueOf requires that 'this' be a Number",
+                )),
+            },
             NativeFunction::NumToFixed => {
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -152,12 +161,39 @@ impl JsRuntime {
                 let precision = precision as usize;
                 Ok(JsValue::String(format_number_precision(value, precision)))
             }
-            NativeFunction::NumToString => match self.realm.host(receiver) {
-                Some(ObjectHost::NumberPrimitive(value)) => {
-                    Ok(JsValue::String(crate::value::number_to_string(value)))
-                }
-                _ => Err(JsError::type_error("incompatible Number method receiver")),
-            },
+            // ECMA-262 21.1.3.9: an absent or `undefined` radix means 10, and
+            // anything outside 2..=36 is a `RangeError`. Bundled base64 and
+            // colour helpers depend on `(0xff).toString(16)`, which previously
+            // returned the decimal form.
+            NativeFunction::NumToString => {
+                let value = match self.realm.host(receiver) {
+                    Some(ObjectHost::NumberPrimitive(value)) => value,
+                    _ => {
+                        return Err(JsError::type_error("incompatible Number method receiver"));
+                    }
+                };
+                let radix = match arguments.first() {
+                    None | Some(JsValue::Undefined) => 10u32,
+                    Some(argument) => {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "the range check below bounds the value to 2..=36"
+                        )]
+                        let radix =
+                            crate::runtime::convert::to_integer_or_infinity(argument)? as u32;
+                        if !(2..=36).contains(&radix) {
+                            return Err(self.range_error(
+                                "toString() radix must be an integer between 2 and 36",
+                            ));
+                        }
+                        radix
+                    }
+                };
+                Ok(JsValue::String(
+                    crate::runtime::convert::number_to_radix_string(value, radix),
+                ))
+            }
             NativeFunction::BoolToString | NativeFunction::BoolValueOf => {
                 match self.realm.host(receiver) {
                     Some(ObjectHost::BooleanPrimitive(value)) => Ok(JsValue::String(
@@ -173,34 +209,78 @@ impl JsRuntime {
                 self.object_to_string_tag_for_object(receiver),
             )),
             NativeFunction::ObjectPrototypeValueOf => Ok(JsValue::Object(receiver)),
+            NativeFunction::ObjectProtoGetter => {
+                // Annex B.2.2.1: a primitive wrapper reports its intrinsic
+                // prototype; any other object reports its own `[[Prototype]]`,
+                // which is `null` for a null-prototype object.
+                Ok(self
+                    .realm
+                    .intrinsic_prototype_for_host(receiver)
+                    .or_else(|| self.realm.object(receiver).and_then(JsObject::prototype))
+                    .map_or(JsValue::Undefined, JsValue::Object))
+            }
+            NativeFunction::ObjectProtoSetter => {
+                let value = required_argument(arguments, 0, "__proto__")?;
+                let prototype = match value {
+                    JsValue::Object(object) => Some(*object),
+                    JsValue::Null => None,
+                    // A primitive that is neither `null` nor an object leaves
+                    // the prototype untouched, per the spec's final step.
+                    _ => return Ok(JsValue::Undefined),
+                };
+                self.realm.set_prototype(receiver, prototype);
+                Ok(JsValue::Undefined)
+            }
             NativeFunction::ObjectDefineGetter => {
                 self.object_define_accessor(receiver, arguments, true)
             }
             NativeFunction::ObjectPreventExtensions => {
-                let object = self.integrity_target(arguments, "preventExtensions")?;
+                let Some(object) = self.integrity_target(arguments, "preventExtensions")? else {
+                    return Err(JsError::type_error(
+                        "Object.preventExtensions called on null or undefined",
+                    ));
+                };
                 self.realm.prevent_extensions(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectSeal => {
-                let object = self.integrity_target(arguments, "seal")?;
+                let Some(object) = self.integrity_target(arguments, "seal")? else {
+                    return Err(JsError::type_error(
+                        "Object.seal called on null or undefined",
+                    ));
+                };
                 self.realm.seal_object(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectFreeze => {
-                let object = self.integrity_target(arguments, "freeze")?;
+                let Some(object) = self.integrity_target(arguments, "freeze")? else {
+                    return Err(JsError::type_error(
+                        "Object.freeze called on null or undefined",
+                    ));
+                };
                 self.realm.freeze_object(object);
                 Ok(JsValue::Object(object))
             }
             NativeFunction::ObjectIsExtensible => {
-                let object = self.integrity_target(arguments, "isExtensible")?;
+                let Some(object) = self.integrity_target(arguments, "isExtensible")? else {
+                    return Err(JsError::type_error(
+                        "Object.isExtensible called on null or undefined",
+                    ));
+                };
                 Ok(JsValue::Boolean(self.realm.is_extensible(object)))
             }
             NativeFunction::ObjectIsSealed => {
-                let object = self.integrity_target(arguments, "isSealed")?;
+                // §20.1.2.13: a non-object target is always sealed.
+                let Some(object) = self.integrity_target(arguments, "isSealed")? else {
+                    return Ok(JsValue::Boolean(true));
+                };
                 Ok(JsValue::Boolean(self.realm.is_sealed(object)))
             }
             NativeFunction::ObjectIsFrozen => {
-                let object = self.integrity_target(arguments, "isFrozen")?;
+                // §20.1.2.14: a non-object target is always frozen.
+                let Some(object) = self.integrity_target(arguments, "isFrozen")? else {
+                    return Ok(JsValue::Boolean(true));
+                };
                 Ok(JsValue::Boolean(self.realm.is_frozen(object)))
             }
             NativeFunction::ObjectDefineSetter => {
@@ -277,18 +357,24 @@ impl JsRuntime {
         };
         Ok(slot.map_or(JsValue::Undefined, JsValue::Object))
     }
-    /// Normalized first argument of the object-integrity builtins:
-    /// primitives coerce to their wrapper, mirroring `Object(...)`.
+    /// Normalized first argument of the object-integrity builtins.
+    ///
+    /// Primitives coerce to their wrapper, mirroring `Object(...)`. Returns
+    /// `None` only for a nullish argument: §20.1.2.{5,7,13,14,15,16} treat a
+    /// non-object target as "always sealed/frozen" for the two `is*` queries
+    /// and as a `ToObject` throw for the four mutating ones, so the caller
+    /// decides. Returning the global object here would report
+    /// `Object.isFrozen(null) === false`, which no engine does.
     pub(in crate::runtime) fn integrity_target(
         &mut self,
         arguments: &[JsValue],
         name: &str,
-    ) -> Result<ObjectId, JsError> {
+    ) -> Result<Option<ObjectId>, JsError> {
         let value = required_argument(arguments, 0, name)?;
         match value {
-            JsValue::Object(object) => Ok(*object),
-            JsValue::Null | JsValue::Undefined => Ok(self.realm.global_object()),
-            other => self.coerce_member_base(other, name),
+            JsValue::Object(object) => Ok(Some(*object)),
+            JsValue::Null | JsValue::Undefined => Ok(None),
+            other => self.to_object(other).map(Some),
         }
     }
 }
@@ -301,30 +387,13 @@ impl JsRuntime {
         // ECMA-262 Object(value) performs ToObject: primitives box into
         // their wrapper hosts so brand checks like
         // `Object(symbol) instanceof Symbol` behave as the spec requires
-        // (core-js gates its whole feature table on this).
-        match arguments.first() {
-            Some(JsValue::Object(object)) => return Ok(JsValue::Object(*object)),
-            Some(JsValue::Symbol(symbol)) => {
-                self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(
-                    self.realm.symbol_instance_wrapper(symbol.clone()),
-                ));
-            }
-            Some(JsValue::String(text)) => {
-                self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(self.realm.string_wrapper(text.clone())));
-            }
-            Some(JsValue::Number(number)) => {
-                self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(
-                    self.realm.number_primitive_wrapper(*number),
-                ));
-            }
-            Some(JsValue::Boolean(flag)) => {
-                self.ensure_heap_capacity(1)?;
-                return Ok(JsValue::Object(self.realm.boolean_primitive_wrapper(*flag)));
-            }
-            _ => {}
+        // (core-js gates its whole feature table on this). `Object(null)`
+        // and `Object(undefined)` yield a fresh ordinary object, which is
+        // the one place ToObject's throw is not observable.
+        if let Some(value) = arguments.first()
+            && !matches!(value, JsValue::Null | JsValue::Undefined)
+        {
+            return Ok(JsValue::Object(self.to_object(value)?));
         }
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(self.realm.create_ordinary_object()))
@@ -402,10 +471,14 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let target_value = required_argument(arguments, 0, "Object.assign")?;
+        // §20.1.2.1 step 1 is `ToObject(Target)`, so a primitive target becomes
+        // its wrapper and the wrapper is what comes back. A nullish target is
+        // deliberately replaced with a fresh object instead of throwing: real
+        // shims pass optional host objects here and expect a usable target.
         let target = if matches!(target_value, JsValue::Null | JsValue::Undefined) {
             self.realm.create_ordinary_object()
         } else {
-            Self::require_object(target_value)?
+            self.to_object(target_value)?
         };
         for source in &arguments[1..] {
             match source {
@@ -449,40 +522,37 @@ impl JsRuntime {
         kind: ObjectEntryKind,
     ) -> Result<JsValue, JsError> {
         let value = required_argument(arguments, 0, kind.function_name())?;
-        let properties = match value {
-            JsValue::Undefined | JsValue::Null | JsValue::Symbol(_) => Vec::new(),
-            JsValue::Object(object)
-                if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) =>
-            {
-                let keys = self.proxy_own_keys(dom, *object)?;
+        // `EnumerableOwnProperties` (§7.3.20) step 2 is `ToObject`, so a
+        // primitive contributes its own enumerable keys: a String primitive's
+        // indexed characters, nothing for Number/Boolean/Symbol. A nullish
+        // argument is deliberately answered with an empty list rather than a
+        // throw, because page feature-detection relies on that leniency.
+        let properties = if matches!(value, JsValue::Null | JsValue::Undefined) {
+            Vec::new()
+        } else {
+            let object = self.to_object(value)?;
+            if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+                let keys = self.proxy_own_keys(dom, object)?;
                 let mut properties = Vec::new();
                 for key in keys {
                     if self
-                        .proxy_get_own_property_descriptor(dom, *object, &key)?
+                        .proxy_get_own_property_descriptor(dom, object, &key)?
                         .is_some_and(|descriptor| descriptor.enumerable)
                     {
                         let value = if kind == ObjectEntryKind::Keys {
                             JsValue::Undefined
                         } else {
-                            self.get_member(dom, *object, &key)?
+                            self.get_member(dom, object, &key)?
                         };
                         properties.push((key, value));
                     }
                 }
                 properties
+            } else {
+                self.realm
+                    .enumerable_own_properties(object)
+                    .ok_or_else(|| JsError::type_error("object is invalid"))?
             }
-            JsValue::Object(object) => self
-                .realm
-                .enumerable_own_properties(*object)
-                .ok_or_else(|| JsError::type_error("object is invalid"))?,
-            JsValue::String(value) => value
-                .chars()
-                .enumerate()
-                .map(|(index, character)| {
-                    (index.to_string(), JsValue::String(character.to_string()))
-                })
-                .collect(),
-            JsValue::Boolean(_) | JsValue::Number(_) => Vec::new(),
         };
         let mut output = Vec::with_capacity(properties.len());
         for (key, value) in properties {
@@ -523,7 +593,9 @@ impl JsRuntime {
             // entire page when an optional host object is absent.
             return Ok(target.clone());
         }
-        let object = Self::require_object(target)?;
+        // §20.1.2.3 step 1 is `ToObject`, so a primitive target is defined on
+        // a fresh wrapper and that wrapper is returned.
+        let object = self.to_object(target)?;
         let key_argument = required_argument(arguments, 1, "Object.defineProperty")?;
         // `ToPropertyKey` keeps symbols as symbols: a symbol key must address
         // the object's symbol slots, never the string `Symbol(desc)` form.
@@ -684,12 +756,14 @@ impl JsRuntime {
         if matches!(target_value, JsValue::Null | JsValue::Undefined) {
             return Ok(target_value.clone());
         }
-        let target = Self::require_object(target_value)?;
+        // §20.1.2.2 step 1: `ToObject(O)`.
+        let target = self.to_object(target_value)?;
         let descriptors_value = required_argument(arguments, 1, "Object.defineProperties")?;
         if matches!(descriptors_value, JsValue::Null | JsValue::Undefined) {
             return Ok(JsValue::Object(target));
         }
-        let descriptors = Self::require_object(descriptors_value)?;
+        // §20.1.2.2 step 2: `ToObject(Properties)`.
+        let descriptors = self.to_object(descriptors_value)?;
         let properties = self
             .realm
             .enumerable_own_properties(descriptors)
@@ -708,7 +782,10 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let object = Self::require_object(required_argument(
+        // §20.1.2.4: `ToObject` first, so
+        // `Object.getOwnPropertyDescriptor("ab", "0")` reports the String
+        // exotic object's indexed character with spec attributes.
+        let object = self.to_object(required_argument(
             arguments,
             0,
             "Object.getOwnPropertyDescriptor",
@@ -754,11 +831,10 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // §20.1.2.7: `ToObject` first, so a primitive contributes its own
+        // descriptors (a String primitive's indices and `length`).
         let value = required_argument(arguments, 0, "Object.getOwnPropertyDescriptors")?;
-        if matches!(value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Object(self.realm.create_ordinary_object()));
-        }
-        let object = Self::require_object(value)?;
+        let object = self.to_object(value)?;
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
         for key in self.realm.own_property_names(object).unwrap_or_default() {
@@ -795,14 +871,15 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn object_get_prototype_of(
-        &self,
+        &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // §20.1.2.2: `Object.getPrototypeOf` starts with `ToObject`, so every
+        // primitive reports its wrapper's `[[Prototype]]` and only `null` or
+        // `undefined` throws. `Object.getPrototypeOf("x") === String.prototype`
+        // in every engine, and a 1.3MB production bundle relies on it.
         let value = required_argument(arguments, 0, "Object.getPrototypeOf")?;
-        if matches!(value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Null);
-        }
-        let object = Self::require_object(value)?;
+        let object = self.to_object(value)?;
         Ok(self
             .realm
             .object(object)
@@ -839,11 +916,10 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // §20.1.2.15: `ToObject` first, so a String primitive reports its
+        // indexed characters plus `length` like every other engine.
         let value = required_argument(arguments, 0, "Object.getOwnPropertyNames")?;
-        if matches!(value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Object(self.create_array_from_values(&[])?));
-        }
-        let object = Self::require_object(value)?;
+        let object = self.to_object(value)?;
         let names = self
             .realm
             .own_property_names(object)
@@ -855,14 +931,13 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn object_has_own(
-        &self,
+        &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // §20.1.2.18: `ToObject` first, so `Object.hasOwn("a", "0")` is true
+        // against a String wrapper's indexed characters.
         let value = required_argument(arguments, 0, "Object.hasOwn")?;
-        if matches!(value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Boolean(false));
-        }
-        let object = Self::require_object(value)?;
+        let object = self.to_object(value)?;
         let key_argument = required_argument(arguments, 1, "Object.hasOwn")?;
         let owned = match &key_argument {
             JsValue::Symbol(symbol) => self.realm.own_symbol_property(object, symbol).is_some(),
@@ -953,12 +1028,51 @@ impl JsRuntime {
         {
             return format!("[object {tag}]");
         }
+        // ECMA-262 20.1.3.6 step 5: the builtin tag comes from the internal
+        // slot, so every host the engine models has to name itself. Polyfills
+        // branch on exactly these strings, and a host that falls through to
+        // `"Object"` is indistinguishable from a plain object to them.
         let host_tag = match self.realm.host(object) {
             Some(ObjectHost::Array) => "Array",
             Some(ObjectHost::RegExp(_)) => "RegExp",
             Some(ObjectHost::StringPrimitive(_)) => "String",
+            Some(ObjectHost::NumberPrimitive(_)) => "Number",
+            Some(ObjectHost::BooleanPrimitive(_)) => "Boolean",
+            Some(ObjectHost::SymbolInstance(_)) => "Symbol",
+            Some(ObjectHost::DateInstance(_)) => "Date",
+            Some(ObjectHost::ErrorConstructor(_) | ObjectHost::ErrorInstance) => "Error",
+            Some(ObjectHost::Promise(_) | ObjectHost::PromiseSettler { .. }) => "Promise",
+            Some(ObjectHost::Collection { kind, .. } | ObjectHost::CollectionConstructor(kind)) => {
+                kind.tag()
+            }
+            Some(ObjectHost::CollectionIterator { .. } | ObjectHost::IteratorHelper { .. }) => {
+                match self
+                    .realm
+                    .get_symbol_descriptor(object, &JsSymbol::well_known("@@toStringTag"))
+                {
+                    Some(descriptor) => {
+                        return format!("[object {}]", descriptor.value.to_js_string());
+                    }
+                    None => "Object",
+                }
+            }
             Some(ObjectHost::Document(_)) => "HTMLDocument",
             Some(ObjectHost::TypedArray { kind, .. }) => kind.name(),
+            Some(
+                ObjectHost::XmlHttpRequest(_)
+                | ObjectHost::AbortController
+                | ObjectHost::AbortSignal
+                | ObjectHost::FormData { .. }
+                | ObjectHost::Response { .. }
+                | ObjectHost::ResponseHeaders { .. }
+                | ObjectHost::Blob { .. }
+                | ObjectHost::UrlInstance(_)
+                | ObjectHost::UrlSearchParams { .. }
+                | ObjectHost::Storage
+                | ObjectHost::IntersectionObserver { .. }
+                | ObjectHost::MutationObserver { .. }
+                | ObjectHost::VideoElement(_),
+            ) => "Object",
             _ if Self::is_callable_object(object, &self.realm) => "Function",
             _ => "Object",
         };

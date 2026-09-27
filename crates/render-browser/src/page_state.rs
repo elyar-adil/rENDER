@@ -85,6 +85,11 @@ pub(super) struct PageState {
     /// whenever mutations arrive faster than renders finish — the mutation is
     /// recorded here and the coordinator resubmits right after the commit.
     pub(super) render_dirty: bool,
+    /// The viewport the coalesced request asked for. The committed
+    /// `viewport` cannot stand in for it: a navigation resets that field to
+    /// zero, and resubmitting a zero-sized viewport would cancel the tab
+    /// instead of rendering the document the request was made for.
+    pub(super) render_dirty_viewport: Option<WindowSize<u32>>,
     pub(super) frame: Vec<u32>,
     pub(super) viewport: WindowSize<u32>,
     pub(super) display_list: Option<Arc<DisplayList>>,
@@ -200,6 +205,7 @@ impl PageState {
             started_scripts: HashSet::new(),
             initial_script_scan_completed: false,
             render_dirty: false,
+            render_dirty_viewport: None,
             frame: Vec::new(),
             viewport: WindowSize::new(0, 0),
             display_list: None,
@@ -232,6 +238,7 @@ impl PageState {
         self.started_scripts.clear();
         self.initial_script_scan_completed = false;
         self.render_dirty = false;
+        self.render_dirty_viewport = None;
         self.frame.clear();
         self.viewport = WindowSize::new(0, 0);
         self.display_list = None;
@@ -452,5 +459,11 @@ impl PageState {
     /// Whether the page still has script work that requires future turns.
     pub(super) fn has_pending_script_work(&self) -> bool {
         self.page.has_pending_immediate_work()
+    }
+
+    /// Whether a repaint was coalesced behind a render that has not reported a
+    /// completion, so only the coordinator can still honour it.
+    pub(super) const fn has_unresolved_render_request(&self) -> bool {
+        self.render_dirty
     }
 }

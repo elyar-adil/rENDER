@@ -16,6 +16,16 @@
 //! Everything outside the subset (gradients, text, clips, masks, embedded
 //! images, scripting) contributes nothing, matching how an `<img>`-loaded
 //! SVG must render: static and script-free.
+//!
+//! `use` and `symbol` indirection is outside the subset too, so a `<use>`
+//! contributes nothing: SVG 2 §3.2.4 renders it as a shadow tree cloned from
+//! its target, which needs the clone to resolve its own styles and geometry.
+//!
+//! Two things about the document are easy to get wrong and are pinned by
+//! tests: it is XML, so an attribute name is case-sensitive and `viewBox` is
+//! spelled with its capital `B`; and [`decode_svg_viewport`] exists because a
+//! caller that already knows the device-pixel size its box will occupy must
+//! be able to rasterise at that size rather than at the root's own attributes.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -104,11 +114,67 @@ pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, Ima
     let root = parse_xml(text).ok_or_else(|| {
         ImageDecodeError::Codec("svg document has no <svg> root element".to_owned())
     })?;
-    let root_width = attribute(&root, "width").and_then(parse_length);
-    let root_height = attribute(&root, "height").and_then(parse_length);
-    let view_box = attribute(&root, "viewbox").and_then(parse_view_box);
+    let view_box = root_view_box(&root);
+    let (width_f, height_f) = root_size(
+        attribute(&root, "width").and_then(parse_length),
+        attribute(&root, "height").and_then(parse_length),
+        view_box,
+    );
+    decode_viewport(&root, view_box, width_f, height_f, limits)
+}
 
-    let (width_f, height_f) = root_size(root_width, root_height, view_box);
+/// Decode an SVG document into an RGBA image of exactly `width` x `height`
+/// device pixels.
+///
+/// The `viewBox`, when the root has one, still supplies the user-space
+/// mapping: the geometry is scaled to fill the given viewport rather than to
+/// the root's own `width`/`height` attributes. Callers that already know the
+/// device-pixel size their page box will occupy - the inline-SVG path in
+/// [`crate::image::inline_svg`] resolves it from the element's geometry
+/// attributes - use this so the raster is produced at the size it is painted.
+///
+/// # Errors
+///
+/// Returns [`ImageDecodeError`] when the bytes are not valid UTF-8, no root
+/// `<svg>` element exists, or the target size violates `limits`.
+pub fn decode_svg_viewport(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    limits: ImageLimits,
+) -> Result<DecodedImage, ImageDecodeError> {
+    let text = str::from_utf8(bytes)
+        .map_err(|_| ImageDecodeError::Codec("svg document is not valid UTF-8".to_owned()))?;
+    let root = parse_xml(text).ok_or_else(|| {
+        ImageDecodeError::Codec("svg document has no <svg> root element".to_owned())
+    })?;
+    let view_box = root_view_box(&root);
+    decode_viewport(
+        &root,
+        view_box,
+        width.max(1) as f32,
+        height.max(1) as f32,
+        limits,
+    )
+}
+
+/// The root element's `viewBox`, as `(min-x, min-y, width, height)`.
+///
+/// `viewBox` is one of the two camelCase names SVG uses, and the document is
+/// XML, so the attribute name is matched case-sensitively. Reading it as
+/// `viewbox` silently found nothing, which left the root viewport unscaled
+/// while still reporting a plausible size.
+fn root_view_box(root: &XmlNode) -> Option<(f32, f32, f32, f32)> {
+    attribute(root, "viewBox").and_then(parse_view_box)
+}
+
+fn decode_viewport(
+    root: &XmlNode,
+    view_box: Option<(f32, f32, f32, f32)>,
+    width_f: f32,
+    height_f: f32,
+    limits: ImageLimits,
+) -> Result<DecodedImage, ImageDecodeError> {
     let width = width_f.round().max(1.0) as u32;
     let height = height_f.round().max(1.0) as u32;
     enforce_dimensions(width, height, limits)?;
@@ -148,7 +214,7 @@ pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, Ima
     };
 
     walk(
-        &root,
+        root,
         root_transform,
         Paint::Inherit,
         Paint::None,
@@ -693,8 +759,21 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Parse a `transform` attribute into a composed [`Affine`].
 fn parse_transform(raw: &str) -> Affine {
-    let mut result = Affine::IDENTITY;
+    transform_functions(raw)
+        .into_iter()
+        .fold(Affine::IDENTITY, |accumulated, (name, numbers)| {
+            accumulated.then(transform_function(&name, &numbers))
+        })
+}
+
+/// Split a `transform` attribute into its `(name, arguments)` pairs, in
+/// source order. SVG 2 §7.6 lets a list of transform functions appear in one
+/// attribute; an unparseable or unterminated entry ends the scan rather than
+/// failing the document.
+fn transform_functions(raw: &str) -> Vec<(String, Vec<f32>)> {
+    let mut functions = Vec::new();
     let bytes = raw.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -705,7 +784,7 @@ fn parse_transform(raw: &str) -> Affine {
         while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
             index += 1;
         }
-        let name = &raw[name_start..index];
+        let name = raw[name_start..index].to_owned();
         while index < bytes.len() && bytes[index] != b'(' {
             index += 1;
         }
@@ -717,95 +796,101 @@ fn parse_transform(raw: &str) -> Affine {
         while index < bytes.len() && bytes[index] != b')' {
             index += 1;
         }
-        let numbers: Vec<f32> = raw[args_start..index.min(raw.len())]
+        let arguments = raw[args_start..index.min(raw.len())]
             .split(|c: char| c == ',' || c.is_whitespace())
             .filter(|part| !part.is_empty())
             .filter_map(parse_length)
             .collect();
         index = index.min(raw.len()) + 1;
-        let applied = match name {
-            "translate" => Affine {
-                a: 1.0,
-                b: 0.0,
-                c: 0.0,
-                d: 1.0,
-                e: numbers.first().copied().unwrap_or(0.0),
-                f: numbers.get(1).copied().unwrap_or(0.0),
-            },
-            "scale" => {
-                let sx = numbers.first().copied().unwrap_or(1.0);
-                let sy = numbers.get(1).copied().unwrap_or(sx);
-                Affine {
-                    a: sx,
-                    b: 0.0,
-                    c: 0.0,
-                    d: sy,
-                    e: 0.0,
-                    f: 0.0,
-                }
-            }
-            "matrix" if numbers.len() == 6 => Affine {
-                a: numbers[0],
-                b: numbers[1],
-                c: numbers[2],
-                d: numbers[3],
-                e: numbers[4],
-                f: numbers[5],
-            },
-            "rotate" => {
-                let radians = numbers.first().copied().unwrap_or(0.0).to_radians();
-                let (sin, cos) = radians.sin_cos();
-                let rotation = Affine {
-                    a: cos,
-                    b: sin,
-                    c: -sin,
-                    d: cos,
-                    e: 0.0,
-                    f: 0.0,
-                };
-                match (numbers.get(1).copied(), numbers.get(2).copied()) {
-                    (Some(cx), Some(cy)) => Affine::IDENTITY
-                        .then(Affine {
-                            a: 1.0,
-                            b: 0.0,
-                            c: 0.0,
-                            d: 1.0,
-                            e: cx,
-                            f: cy,
-                        })
-                        .then(rotation)
-                        .then(Affine {
-                            a: 1.0,
-                            b: 0.0,
-                            c: 0.0,
-                            d: 1.0,
-                            e: -cx,
-                            f: -cy,
-                        }),
-                    _ => rotation,
-                }
-            }
-            "skewx" => Affine {
-                a: 1.0,
-                b: 0.0,
-                c: numbers.first().copied().unwrap_or(0.0).to_radians().tan(),
-                d: 1.0,
-                e: 0.0,
-                f: 0.0,
-            },
-            "skewy" => Affine {
-                a: 1.0,
-                b: numbers.first().copied().unwrap_or(0.0).to_radians().tan(),
-                c: 0.0,
-                d: 1.0,
-                e: 0.0,
-                f: 0.0,
-            },
-            _ => Affine::IDENTITY,
-        };
-        result = result.then(applied);
+        functions.push((name, arguments));
     }
-    result
+    functions
+}
+
+/// The affine for one transform function, per SVG 2 §7.6. An unknown name
+/// contributes the identity, so a document using a function outside this
+/// subset still renders the shapes it does support.
+fn transform_function(name: &str, numbers: &[f32]) -> Affine {
+    match name {
+        "translate" => Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: numbers.first().copied().unwrap_or(0.0),
+            f: numbers.get(1).copied().unwrap_or(0.0),
+        },
+        "scale" => {
+            let sx = numbers.first().copied().unwrap_or(1.0);
+            let sy = numbers.get(1).copied().unwrap_or(sx);
+            Affine {
+                a: sx,
+                b: 0.0,
+                c: 0.0,
+                d: sy,
+                e: 0.0,
+                f: 0.0,
+            }
+        }
+        "matrix" if numbers.len() == 6 => Affine {
+            a: numbers[0],
+            b: numbers[1],
+            c: numbers[2],
+            d: numbers[3],
+            e: numbers[4],
+            f: numbers[5],
+        },
+        "rotate" => {
+            let radians = numbers.first().copied().unwrap_or(0.0).to_radians();
+            let (sin, cos) = radians.sin_cos();
+            let rotation = Affine {
+                a: cos,
+                b: sin,
+                c: -sin,
+                d: cos,
+                e: 0.0,
+                f: 0.0,
+            };
+            match (numbers.get(1).copied(), numbers.get(2).copied()) {
+                (Some(cx), Some(cy)) => Affine::IDENTITY
+                    .then(Affine {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: cx,
+                        f: cy,
+                    })
+                    .then(rotation)
+                    .then(Affine {
+                        a: 1.0,
+                        b: 0.0,
+                        c: 0.0,
+                        d: 1.0,
+                        e: -cx,
+                        f: -cy,
+                    }),
+                _ => rotation,
+            }
+        }
+        "skewx" => Affine {
+            a: 1.0,
+            b: 0.0,
+            c: numbers.first().copied().unwrap_or(0.0).to_radians().tan(),
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        },
+        "skewy" => Affine {
+            a: 1.0,
+            b: numbers.first().copied().unwrap_or(0.0).to_radians().tan(),
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        },
+        _ => Affine::IDENTITY,
+    }
 }
 
 fn path_number(tokens: &[PathToken], index: &mut usize) -> Option<f32> {
@@ -918,7 +1003,7 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
                 let (x, y) = if relative { (p0x + x, p0y + y) } else { (x, y) };
                 for step in 1..=12 {
                     let t = step as f32 / 12.0;
-                    current.push(cubic_point(p0x, p0y, x1, y1, x2, y2, x, y, t));
+                    current.push(cubic_point((p0x, p0y), (x1, y1), (x2, y2), (x, y), t));
                 }
                 last_cubic_control = Some((x2, y2));
                 cursor = (x, y);
@@ -941,7 +1026,7 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
                     .map_or((p0x, p0y), |(cx, cy)| (2.0 * p0x - cx, 2.0 * p0y - cy));
                 for step in 1..=12 {
                     let t = step as f32 / 12.0;
-                    current.push(cubic_point(p0x, p0y, x1, y1, x2, y2, x, y, t));
+                    current.push(cubic_point((p0x, p0y), (x1, y1), (x2, y2), (x, y), t));
                 }
                 last_cubic_control = Some((x2, y2));
                 cursor = (x, y);
@@ -962,7 +1047,7 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
                 let (x, y) = if relative { (p0x + x, p0y + y) } else { (x, y) };
                 for step in 1..=10 {
                     let t = step as f32 / 10.0;
-                    current.push(quad_point(p0x, p0y, x1, y1, x, y, t));
+                    current.push(quad_point((p0x, p0y), (x1, y1), (x, y), t));
                 }
                 last_quad_control = Some((x1, y1));
                 cursor = (x, y);
@@ -977,7 +1062,7 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
                     .map_or((p0x, p0y), |(cx, cy)| (2.0 * p0x - cx, 2.0 * p0y - cy));
                 for step in 1..=10 {
                     let t = step as f32 / 10.0;
-                    current.push(quad_point(p0x, p0y, x1, y1, x, y, t));
+                    current.push(quad_point((p0x, p0y), (x1, y1), (x, y), t));
                 }
                 last_quad_control = Some((x1, y1));
                 cursor = (x, y);
@@ -1013,35 +1098,39 @@ fn parse_path(raw: &str) -> Vec<(Vec<(f32, f32)>, bool)> {
     subpaths
 }
 
-#[allow(clippy::many_single_char_names)]
+/// A point on a Bézier control polygon, as `(x, y)`.
+type ControlPoint = (f32, f32);
+
+/// A point on a cubic Bézier at parameter `t` (SVG 2 §8.3.6).
 fn cubic_point(
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    x2: f32,
-    y2: f32,
-    x3: f32,
-    y3: f32,
+    start: ControlPoint,
+    first_control: ControlPoint,
+    second_control: ControlPoint,
+    end: ControlPoint,
     t: f32,
 ) -> (f32, f32) {
     let inverse = 1.0 - t;
-    let a = inverse * inverse * inverse;
-    let b = 3.0 * inverse * inverse * t;
-    let c = 3.0 * inverse * t * t;
-    let d = t * t * t;
+    // The degree-3 Bernstein basis weights.
+    let w0 = inverse * inverse * inverse;
+    let w1 = 3.0 * inverse * inverse * t;
+    let w2 = 3.0 * inverse * t * t;
+    let w3 = t * t * t;
     (
-        a * x0 + b * x1 + c * x2 + d * x3,
-        a * y0 + b * y1 + c * y2 + d * y3,
+        w0 * start.0 + w1 * first_control.0 + w2 * second_control.0 + w3 * end.0,
+        w0 * start.1 + w1 * first_control.1 + w2 * second_control.1 + w3 * end.1,
     )
 }
 
-#[allow(clippy::many_single_char_names)]
-fn quad_point(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> (f32, f32) {
+/// A point on a quadratic Bézier at parameter `t` (SVG 2 §8.3.5).
+fn quad_point(start: ControlPoint, control: ControlPoint, end: ControlPoint, t: f32) -> (f32, f32) {
     let inverse = 1.0 - t;
+    // The degree-2 Bernstein basis weights.
+    let w0 = inverse * inverse;
+    let w1 = 2.0 * inverse * t;
+    let w2 = t * t;
     (
-        inverse * inverse * x0 + 2.0 * inverse * t * x1 + t * t * x2,
-        inverse * inverse * y0 + 2.0 * inverse * t * y1 + t * t * y2,
+        w0 * start.0 + w1 * control.0 + w2 * end.0,
+        w0 * start.1 + w1 * control.1 + w2 * end.1,
     )
 }
 
@@ -1092,7 +1181,7 @@ fn flush_number(number: &mut String, tokens: &mut Vec<PathToken>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, ImageLimits, decode_svg, parse_path};
+    use super::{Color, ImageLimits, decode_svg, decode_svg_viewport, parse_path};
 
     #[test]
     fn rect_fill_covers_exact_area() {
@@ -1121,12 +1210,43 @@ mod tests {
         assert_eq!(image.pixel(5, 5), Some(Color::rgba(0, 0, 0, 0)));
     }
 
+    /// `viewBox` is camelCase and the document is XML, so a case-insensitive
+    /// or lowercased lookup would find nothing. The rect covers user-space
+    /// 2..6 of a 10-unit `viewBox` mapped onto a 20px viewport, so its edges
+    /// land on device pixels 4 and 12.
     #[test]
-    fn viewBox_scales_geometry_to_the_viewport() {
+    fn view_box_scales_geometry_to_the_viewport() {
         let svg = br#"<svg width="20" height="20" viewBox="0 0 10 10"><rect x="2" y="2" width="4" height="4" fill="black"/></svg>"#;
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
-        assert_eq!(image.pixel(5, 5), Some(Color::rgb(0, 0, 0)));
-        assert_eq!(image.pixel(19, 19), Some(Color::rgba(0, 0, 0, 0)));
+        assert_eq!((image.width(), image.height()), (20, 20));
+        assert_eq!(image.pixel(4, 4), Some(Color::rgb(0, 0, 0)));
+        assert_eq!(image.pixel(11, 11), Some(Color::rgb(0, 0, 0)));
+        // The unscaled 2..6 rect would have covered pixels 2..5 instead.
+        assert_eq!(image.pixel(2, 2), Some(Color::rgba(0, 0, 0, 0)));
+        assert_eq!(image.pixel(12, 12), Some(Color::rgba(0, 0, 0, 0)));
+    }
+
+    /// The viewBox origin is part of the mapping: a non-zero `min-x`/`min-y`
+    /// shifts the whole user space, not just the scale.
+    #[test]
+    fn view_box_origin_translates_user_space() {
+        let svg = br#"<svg width="10" height="10" viewBox="5 5 10 10"><rect x="5" y="5" width="10" height="10" fill="black"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(0, 0, 0)));
+        assert_eq!(image.pixel(9, 9), Some(Color::rgb(0, 0, 0)));
+    }
+
+    /// A caller that already knows the device-pixel size of its page box
+    /// rasterises at that size; the viewBox still supplies the user-space
+    /// mapping, so the geometry scales to fill the given viewport.
+    #[test]
+    fn explicit_viewport_overrides_the_root_size() {
+        let svg = br#"<svg width="20" height="20" viewBox="0 0 10 10"><rect width="10" height="10" fill="black"/></svg>"#;
+        let image = decode_svg_viewport(svg, 40, 20, ImageLimits::default()).expect("decodes");
+        assert_eq!((image.width(), image.height()), (40, 20));
+        // 2:1 stretch of the 1:1 viewBox, so the whole viewport is covered.
+        assert_eq!(image.pixel(0, 0), Some(Color::rgb(0, 0, 0)));
+        assert_eq!(image.pixel(39, 19), Some(Color::rgb(0, 0, 0)));
     }
 
     #[test]

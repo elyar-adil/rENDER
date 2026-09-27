@@ -15,17 +15,26 @@ use render_browser::worker::RenderFailure;
 use render_browser::worker::RenderJob;
 use render_browser::worker::RenderWorker;
 use render_browser::worker::RenderWorkerOptions;
+use render_core::css::cascade::media_query_list_matches;
 use render_core::css::computed::ComputedStyle;
+use render_core::css::computed::ComputedValue;
+use render_core::css::selector::MatchContext;
+use render_core::css::stylesheet::StyleSheet;
 use render_core::document::Document;
 use render_core::document::DocumentBackends;
 use render_core::document::DocumentRenderOptions;
+use render_core::document::DocumentRenderOutput;
 use render_core::document::ExternalStyleSheets;
+use render_core::dom::Dom;
+use render_core::dom::NodeId;
 use render_core::image::ImageResources;
 use render_core::js::ElementRect;
+use render_core::layout::FragmentKind;
 use render_core::layout::PhysicalPoint;
 use render_core::layout::PhysicalSize;
 use render_core::paint::Color;
 use render_core::paint::CpuRasterizer;
+use render_core::paint::DisplayCommand;
 use render_core::paint::DisplayList;
 use render_core::paint::PaintScene;
 use render_core::paint::RasterControl;
@@ -33,6 +42,7 @@ use render_core::paint::RasterRequest;
 use render_net::FetchResult;
 use render_net::Url;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::env;
 use std::sync::Arc;
 use winit::dpi::PhysicalSize as WindowSize;
@@ -204,6 +214,28 @@ pub(super) fn process_page_render(
                     output.diagnostics.display_list.len(),
                     output.diagnostics.raster.len(),
                 );
+                let report = frame_style_report(
+                    &document,
+                    &output,
+                    &style_sheets,
+                    &base_url,
+                    output.layout.fragments.viewport,
+                );
+                eprintln!(
+                    "render-browser frame breakdown display_items={} content_height={} kinds={:?} display_none={} vanished={} zero_size_boxes={}",
+                    report.display_items,
+                    report.content_height,
+                    report.item_kinds,
+                    report.display_none,
+                    report.vanished,
+                    report.zero_size_boxes,
+                );
+                for line in &report.display_none_causes {
+                    eprintln!("render-browser {line}");
+                }
+                for line in &report.vanished_causes {
+                    eprintln!("render-browser {line}");
+                }
                 for (node, style) in output.styles.iter().take(16) {
                     eprintln!(
                         "render-browser style node={:?} display={:?} width={:?} height={:?} properties={}",
@@ -325,4 +357,245 @@ pub(super) fn merge_current_style_sheets(
         }
     }
     merged
+}
+
+/// How many elements a frame painted, and where the rest went.
+pub(super) struct FrameStyleReport {
+    pub(super) display_items: usize,
+    pub(super) content_height: f32,
+    pub(super) item_kinds: BTreeMap<&'static str, usize>,
+    pub(super) display_none: usize,
+    /// Elements whose computed `display` is not `none` yet which produced no
+    /// layout box at all.
+    pub(super) vanished: usize,
+    pub(super) zero_size_boxes: usize,
+    pub(super) display_none_causes: Vec<String>,
+    pub(super) vanished_causes: Vec<String>,
+}
+
+/// Number of `display:none` nodes and vanished elements named per frame.
+const CAUSE_SAMPLE_LIMIT: usize = 12;
+
+/// Explains, for one frame, why elements are missing from the display list.
+///
+/// A styled frame must never paint *fewer* items than the unstyled frame that
+/// preceded it, so a drop has to be attributable. Counting `display: none` is
+/// not enough on its own: the useful question is which declaration decided it
+/// and at which cascade origin, because a sheet that landed on the wrong owner
+/// or a stale revision produces a broad, silent collapse. `vanished` covers the
+/// complementary failure where an element kept its `display` value but never
+/// produced a box.
+fn frame_style_report(
+    document: &Document,
+    output: &DocumentRenderOutput,
+    style_sheets: &ExternalStyleSheets,
+    base_url: &Url,
+    viewport: PhysicalSize,
+) -> FrameStyleReport {
+    let dom = document.dom();
+    let mut item_kinds = BTreeMap::new();
+    for item in output.display.list.items() {
+        *item_kinds
+            .entry(display_command_name(&item.command))
+            .or_insert(0) += 1;
+    }
+    let mut box_sources = HashSet::new();
+    let mut zero_size_boxes = 0_usize;
+    for fragment in output.layout.fragments.iter() {
+        if let Some(source) = fragment.source {
+            box_sources.insert(source);
+        }
+        if matches!(&fragment.kind, FragmentKind::Box(_))
+            && fragment.rect.size.width <= 0.0
+            && fragment.rect.size.height <= 0.0
+        {
+            zero_size_boxes += 1;
+        }
+    }
+    let mut display_none_nodes = Vec::new();
+    let mut vanished_nodes = Vec::new();
+    for (node, style) in &output.styles {
+        let display = style
+            .get("display")
+            .map_or("block", ComputedValue::css_text);
+        if display == "none" {
+            display_none_nodes.push(*node);
+        } else if !matches!(
+            display,
+            "inline" | "contents" | "table-row-group" | "table-row"
+        ) && !box_sources.contains(node)
+        {
+            // An inline box has no fragment of its own, so only block-level and
+            // atomic boxes are required to appear here. One of these missing
+            // is a genuine collapse.
+            vanished_nodes.push(*node);
+        }
+    }
+    let sheets = ordered_applied_sheets(document, style_sheets, base_url);
+    let context = match_context(document, viewport);
+    let describe = |label: &str, nodes: &[NodeId]| -> Vec<String> {
+        nodes
+            .iter()
+            .take(CAUSE_SAMPLE_LIMIT)
+            .map(|node| {
+                format!(
+                    "{label} node {node:?} {} display-declaration={}",
+                    describe_node(dom, *node),
+                    display_declaration(dom, *node, &sheets, &context)
+                )
+            })
+            .collect()
+    };
+    FrameStyleReport {
+        display_items: output.display.list.items().len(),
+        content_height: output.layout.fragments.scrollable_content_size.height,
+        item_kinds,
+        display_none: display_none_nodes.len(),
+        vanished: vanished_nodes.len(),
+        zero_size_boxes,
+        display_none_causes: describe("display-none", &display_none_nodes),
+        vanished_causes: describe("vanished", &vanished_nodes),
+    }
+}
+
+const fn display_command_name(command: &DisplayCommand) -> &'static str {
+    match command {
+        DisplayCommand::SolidRect { .. } => "solid",
+        DisplayCommand::Border(_) => "border",
+        DisplayCommand::BoxShadow(_) => "shadow",
+        DisplayCommand::PushClip(_) => "push-clip",
+        DisplayCommand::PopClip => "pop-clip",
+        DisplayCommand::PushTransform(_) => "push-transform",
+        DisplayCommand::PopTransform => "pop-transform",
+        DisplayCommand::GlyphRun(_) => "glyph",
+        DisplayCommand::TextDecoration(_) => "decoration",
+        DisplayCommand::TextShadow(_) => "text-shadow",
+        DisplayCommand::ListMarker(_) => "list-marker",
+        DisplayCommand::Image(_) => "image",
+        DisplayCommand::LinearGradient(_) => "linear-gradient",
+        DisplayCommand::RadialGradient(_) => "radial-gradient",
+        DisplayCommand::Canvas { .. } => "canvas",
+        DisplayCommand::PushStackingContext(_) => "push-stack",
+        DisplayCommand::PopStackingContext => "pop-stack",
+    }
+}
+
+/// Applied sheets in DOM source order, so a reported declaration can name the
+/// link it came from.
+pub(super) fn ordered_applied_sheets<'a>(
+    document: &Document,
+    style_sheets: &'a ExternalStyleSheets,
+    base_url: &Url,
+) -> Vec<(String, &'a StyleSheet)> {
+    let plan = plan_external_style_sheets(
+        document,
+        base_url,
+        DocumentRenderOptions::default().document_limits,
+    );
+    plan.resources
+        .iter()
+        .filter_map(|resource| {
+            style_sheets
+                .get(&resource.key)
+                .map(|sheet| (resource.key.requested_url.as_str().to_owned(), sheet))
+        })
+        .collect()
+}
+
+pub(super) fn match_context(document: &Document, viewport: PhysicalSize) -> MatchContext {
+    MatchContext {
+        scope: None,
+        quirks_mode: document.quirks_mode() == render_core::html::QuirksMode::Quirks,
+        pseudo_element: None,
+        focused: None,
+        target: None,
+        hovered: HashSet::new(),
+        active: HashSet::new(),
+        visited_links: HashSet::new(),
+        viewport_width: Some(viewport.width),
+        viewport_height: Some(viewport.height),
+    }
+}
+
+pub(super) fn describe_node(dom: &Dom, node: NodeId) -> String {
+    let mut out = String::new();
+    if let Some(render_core::dom::NodeKind::Element(element)) =
+        dom.node(node).map(render_core::dom::Node::kind)
+    {
+        out.push('<');
+        out.push_str(&element.local_name);
+        out.push('>');
+    } else {
+        out.push_str("non-element");
+    }
+    for attribute in ["id", "class"] {
+        if let Ok(Some(value)) = dom.attribute(node, attribute) {
+            out.push(' ');
+            out.push_str(attribute);
+            out.push_str("=\"");
+            out.push_str(value);
+            out.push('"');
+        }
+    }
+    out
+}
+
+/// Cascade rank of one `display` declaration, with the report line it wins with.
+type DisplayRank = (bool, (u32, u32, u32), u64, String);
+
+pub(super) fn display_declaration(
+    dom: &Dom,
+    node: NodeId,
+    sheets: &[(String, &StyleSheet)],
+    context: &MatchContext,
+) -> String {
+    let mut best: Option<DisplayRank> = None;
+    for (url, sheet) in sheets {
+        for rule in &sheet.rules {
+            if !rule
+                .media
+                .iter()
+                .all(|query| media_query_list_matches(query, context))
+            {
+                continue;
+            }
+            if !render_core::css::selector::matches_selector_list(
+                dom,
+                node,
+                &rule.selectors,
+                context,
+            ) {
+                continue;
+            }
+            for declaration in &rule.declarations {
+                if !declaration.name.eq_ignore_ascii_case("display") {
+                    continue;
+                }
+                let specificity = rule.selectors.max_specificity();
+                let rank = (
+                    declaration.important,
+                    (specificity.ids, specificity.classes, specificity.types),
+                    rule.source_order,
+                    format!(
+                        "{url} rule#{} media={:?} !{} => display: {}",
+                        rule.source_order,
+                        rule.media,
+                        if declaration.important {
+                            "important"
+                        } else {
+                            "normal"
+                        },
+                        declaration.value.trim()
+                    ),
+                );
+                if best.as_ref().is_none_or(|current| rank > *current) {
+                    best = Some(rank);
+                }
+            }
+        }
+    }
+    best.map_or_else(
+        || "no matching author declaration (user-agent origin or inherited)".to_owned(),
+        |(_, _, _, text)| text,
+    )
 }

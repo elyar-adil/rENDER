@@ -1,0 +1,138 @@
+<!doctype html>
+<!--
+  Reduced snapshot of the Baidu search-results page shape
+  (https://www.baidu.com/s?wd=...). Same reduction rules as baidu_home.html:
+  landmark structure, result list, tab navigation, related-search rail, and
+  pager. Real-site URL shapes are kept; every response is replaced locally by
+  the acceptance harness (see baidu_results.css).
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>前端布局引擎_百度搜索</title>
+<link rel="stylesheet" href="https://ss1.bdstatic.com/home/static/search_9c17b04.css">
+<script defer src="https://ss1.bdstatic.com/home/static/search_4e2a1f.js"></script>
+</head>
+<body>
+<header class="page-head">
+  <a class="logo" href="https://www.baidu.com/"><img src="https://ss1.bdstatic.com/home/static/img/logo_79x30.png" width="79" height="30" alt="百度首页"></a>
+  <form class="search" role="search" action="https://www.baidu.com/s" method="get">
+    <input type="text" id="kw" name="wd" value="前端布局引擎">
+    <button type="submit" id="su">百度一下</button>
+  </form>
+  <nav class="result-tabs" aria-label="搜索分类">
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=baidu">网页</a>
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=news">新闻</a>
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=video">视频</a>
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=image">图片</a>
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=map">地图</a>
+    <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;tn=wenku">文库</a>
+  </nav>
+</header>
+<main class="page-main">
+  <section class="result-summary">
+    <p class="summary-line">百度为您找到相关结果约 12,400,000 个</p>
+  </section>
+  <div class="columns">
+    <section class="results">
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/layout-engine">前端布局引擎的实现路径</a></h3>
+        <p class="result-source">example.org - 2026-09-20</p>
+        <p class="result-abstract">从格式化结构到不可变片段，块级与行内求解器如何组合，并给出可回归的确定性测量。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/css-cascade">级联与特异性：从 UA 样式表到作者样式</a></h3>
+        <p class="result-source">example.org - 2026-08-31</p>
+        <p class="result-abstract">UA、作者、用户三层来源的顺序如何影响标题、链接与表单控件的最终呈现。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/text-measure">文本测量的确定性替代方案</a></h3>
+        <p class="result-source">example.org - 2026-08-02</p>
+        <p class="result-abstract">系统字体会让像素基线无法跨机复现，因此回归基线必须建立在可复现的测量器上。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/display-list">显示列表与增量重绘</a></h3>
+        <p class="result-source">example.org - 2026-07-11</p>
+        <p class="result-abstract">把渲染结果表达为命令序列，使滚动只需要重放已保留的绘制场景。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/image-srcset">图片候选选择与占位尺寸</a></h3>
+        <p class="result-source">example.org - 2026-06-24</p>
+        <p class="result-abstract">候选列表、尺寸提示与设备像素比共同决定实际请求的那一张图片。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/landmark-a11y">地标语义与键盘可达性</a></h3>
+        <p class="result-source">example.org - 2026-06-01</p>
+        <p class="result-abstract">页头、导航、主内容与侧栏的地标划分，决定了读屏与跳转菜单的结构。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/quirks-mode">文档模式与盒模型差异</a></h3>
+        <p class="result-source">example.org - 2026-05-19</p>
+        <p class="result-abstract">没有 doctype 的旧页面在盒模型与外边距折叠上的历史差异。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/scroll-region">滚动区域的几何与合成</a></h3>
+        <p class="result-source">example.org - 2026-05-06</p>
+        <p class="result-abstract">文档可滚动尺寸如何由片段树的边界推导，并限制视口原点的取值。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/ua-stylesheet">UA 样式表的长度与影响</a></h3>
+        <p class="result-source">example.org - 2026-04-22</p>
+        <p class="result-abstract">一份只有 display 声明的 UA 样式表，会让每个站点的标题和链接都退化为正文。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/typo-axis">排版轴缺失的后果</a></h3>
+        <p class="result-source">example.org - 2026-04-02</p>
+        <p class="result-abstract">字重、字形族与斜体在文本样式结构缺位时被丢弃，导致加粗在物理上不可实现。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/inline-svg">内联 SVG 的解析缺口</a></h3>
+        <p class="result-source">example.org - 2026-03-14</p>
+        <p class="result-abstract">站点几乎所有的图标都是内联 SVG，它需要作为外部内容进入构建阶段。</p>
+      </article>
+      <article class="result">
+        <h3 class="result-title"><a href="https://example.org/font-face">网络字体与关键帧的现状</a></h3>
+        <p class="result-source">example.org - 2026-02-28</p>
+        <p class="result-abstract">解析之后被丢弃的两类规则，解释了为什么站点字体与动画都不生效。</p>
+      </article>
+      <nav class="pager" aria-label="搜索结果分页">
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=0">上一页</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=10">1</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=20">2</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=30">3</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=40">4</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=50">5</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=60">6</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=70">7</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=80">8</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=90">9</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=100">10</a>
+        <a href="https://www.baidu.com/s?wd=%E5%89%8D%E7%AB%AF%E5%B8%83%E5%B1%80%E5%BC%95%E6%93%8E&amp;pn=110">下一页</a>
+      </nav>
+    </section>
+    <aside class="rail">
+      <section class="rail-card">
+        <h2>相关搜索</h2>
+        <ul class="rail-list">
+          <li><a href="https://www.baidu.com/s?wd=rel01">行内布局</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rel02">外边距折叠</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rel03">浮动与清除</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rel04">弹性布局</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rel05">网格布局</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rel06">表格布局</a></li>
+        </ul>
+      </section>
+      <section class="rail-card">
+        <h2>搜索结果可信度</h2>
+        <img src="https://ss1.bdstatic.com/home/static/img/mark_88x88.png" width="88" height="88" alt="搜索结果可信度标识">
+        <p class="rail-note">该标识由图片资源管线提供。</p>
+      </section>
+    </aside>
+  </div>
+</main>
+<footer class="page-foot">
+  <a href="https://www.baidu.com/about/">关于百度</a>
+  <a href="https://www.baidu.com/copyright/">©2026 Baidu</a>
+</footer>
+</body>
+</html>

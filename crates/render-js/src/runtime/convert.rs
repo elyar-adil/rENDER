@@ -285,3 +285,227 @@ pub(super) fn required_argument<'a>(
         ))
     })
 }
+
+/// `ToIntegerOrInfinity` (§7.1.5).
+pub(super) fn to_integer_or_infinity(value: &JsValue) -> Result<f64, JsError> {
+    let number = to_number(value)?;
+    Ok(integer_or_infinity(number))
+}
+
+/// `ToIntegerOrInfinity` for an already-numeric value.
+#[must_use]
+pub(crate) fn integer_or_infinity(number: f64) -> f64 {
+    if number.is_nan() {
+        return 0.0;
+    }
+    number.trunc()
+}
+
+const RADIX_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+/// ECMA-262 6.1.6.1.9 `Number.prototype.toString` with a non-decimal radix.
+///
+/// The integer part is exact when binary64 holds it, and the fraction is
+/// printed to the input's own precision: each step multiplies the remainder and
+/// its "half an ulp" bound by the radix, and stops once the remainder falls
+/// below that bound, rounding the final digit to even. That is the algorithm
+/// every shipping engine uses, so `(0.5).toString(2)` is `0.1` and
+/// `(1.5).toString(2)` is `1.1`, not a runaway digit tail.
+pub(crate) fn number_to_radix_string(value: f64, radix: u32) -> String {
+    debug_assert!((2..=36).contains(&radix));
+    if radix == 10 {
+        return crate::value::number_to_string(value);
+    }
+    if value.is_nan() {
+        return "NaN".to_owned();
+    }
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
+            "Infinity".to_owned()
+        } else {
+            "-Infinity".to_owned()
+        };
+    }
+    let negative = value.is_sign_negative();
+    let magnitude = value.abs();
+    let radix_value = f64::from(radix);
+    let mut integer = magnitude.floor();
+    let mut fraction = magnitude - integer;
+    let mut fraction_digits: Vec<u8> = Vec::new();
+    // Half an ulp of the input, never below the smallest denormal so a subnormal
+    // still terminates.
+    let mut delta = 0.5 * (next_double(magnitude) - magnitude);
+    delta = delta.max(f64::from_bits(1));
+    let mut round_up = false;
+    while fraction >= delta {
+        fraction *= radix_value;
+        delta *= radix_value;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the scaled remainder is below the radix"
+        )]
+        let digit = fraction as u32;
+        fraction -= f64::from(digit);
+        fraction_digits.push(RADIX_DIGITS[digit as usize]);
+        let half_even = fraction > 0.5 || (fraction == 0.5 && digit % 2 == 1);
+        if half_even && fraction + delta > 1.0 {
+            // The remaining fraction rounds the last digit up; carry after the
+            // integer digits are known so the overflow reaches them too.
+            round_up = true;
+            break;
+        }
+    }
+    let had_fraction = !fraction_digits.is_empty();
+    let mut integer_digits: Vec<u8> = Vec::new();
+    if integer <= 9_007_199_254_740_992.0 {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the bound above is 2^53 and fits in u64"
+        )]
+        let mut remaining = integer as u64;
+        let base = u64::from(radix);
+        loop {
+            integer_digits.push(RADIX_DIGITS[(remaining % base) as usize]);
+            remaining /= base;
+            if remaining == 0 {
+                break;
+            }
+        }
+    } else {
+        while integer >= 1.0 {
+            integer /= radix_value;
+            let remainder = integer - integer.floor();
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the scaled remainder is below the radix"
+            )]
+            integer_digits.push(RADIX_DIGITS[(remainder * radix_value) as usize]);
+        }
+    }
+    integer_digits.reverse();
+    let mut all_digits = integer_digits;
+    let fraction_length = fraction_digits.len();
+    let integer_length = all_digits.len();
+    all_digits.extend_from_slice(&fraction_digits);
+    if round_up {
+        increment_digits(&mut all_digits, radix);
+    }
+    // A carry out of the most significant digit is a new leading `1`.
+    let overflow = all_digits.len() > integer_length + fraction_length;
+    let mut output = Vec::with_capacity(all_digits.len() + 2);
+    if negative {
+        output.push(b'-');
+    }
+    if overflow {
+        output.push(b'1');
+    }
+    let split = all_digits.len() - fraction_length;
+    output.extend_from_slice(&all_digits[..split]);
+    if had_fraction {
+        output.push(b'.');
+        output.extend_from_slice(&all_digits[split..]);
+    }
+    String::from_utf8(output).expect("radix digits are ASCII")
+}
+
+/// Add one to the least significant digit of a most-significant-first digit
+/// string, propagating the carry toward the front. `digits` is never empty.
+fn increment_digits(digits: &mut [u8], radix: u32) {
+    for position in (0..digits.len()).rev() {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "radix digits are below 36"
+        )]
+        let value = u32::from(match digits[position] {
+            digit @ b'0'..=b'9' => digit - b'0',
+            digit @ b'a'..=b'z' => digit - b'a' + 10,
+            _ => continue,
+        });
+        if value + 1 < radix {
+            digits[position] = RADIX_DIGITS[(value + 1) as usize];
+            return;
+        }
+        digits[position] = b'0';
+    }
+}
+
+fn digit_value(digit: u8) -> Option<u32> {
+    match digit {
+        b'0'..=b'9' => Some(u32::from(digit - b'0')),
+        b'a'..=b'z' => Some(u32::from(digit - b'a') + 10),
+        _ => None,
+    }
+}
+
+/// The next representable binary64 above `value`, for the `toString` fraction
+/// precision bound.
+fn next_double(value: f64) -> f64 {
+    if value.is_nan() || value == f64::INFINITY {
+        return f64::INFINITY;
+    }
+    if value == 0.0 {
+        return f64::from_bits(1);
+    }
+    let bits = value.to_bits();
+    // Negative values count down, so step away from zero.
+    let stepped = if value < 0.0 {
+        bits.wrapping_sub(1)
+    } else {
+        bits.wrapping_add(1)
+    };
+    f64::from_bits(stepped)
+}
+
+/// ECMA-262 7.1.1.1 `parseInt(string, radix)`. The radix argument was
+/// previously ignored, which made every `parseInt(hex, 16)` in a bundle `NaN`.
+pub(crate) fn parse_int(text: &str, radix: Option<&JsValue>) -> Result<f64, JsError> {
+    let trimmed = text.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+    let (negative, digits_source) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    // `R = ToInt32(radix)`, with 0 meaning "infer from the input".
+    let mut radix_value = match radix {
+        None | Some(JsValue::Undefined) => 0u32,
+        Some(value) => to_int32(value)? as u32,
+    };
+    if !(2..=36).contains(&radix_value) && radix_value != 0 {
+        return Ok(f64::NAN);
+    }
+    let mut body = digits_source;
+    if radix_value == 16 || radix_value == 0 {
+        if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
+            body = rest;
+            radix_value = 16;
+        }
+    }
+    if radix_value == 0 {
+        radix_value = 10;
+    }
+    let significant = body
+        .strip_prefix('+')
+        .or_else(|| body.strip_prefix('-'))
+        .unwrap_or(body);
+    let end = significant
+        .chars()
+        .position(|c| digit_value(c as u8).is_none_or(|value| value >= radix_value))
+        .unwrap_or(significant.len());
+    if end == 0 {
+        return Ok(f64::NAN);
+    }
+    let mut magnitude = 0.0f64;
+    for character in significant[..end].chars() {
+        let digit = f64::from(digit_value(character as u8).unwrap_or_default());
+        // Horner accumulation keeps full binary64 precision for long inputs
+        // where `u64` would overflow.
+        magnitude = magnitude * f64::from(radix_value) + digit;
+    }
+    Ok(if negative { -magnitude } else { magnitude })
+}

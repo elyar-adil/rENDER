@@ -1072,15 +1072,20 @@ impl JsRuntime {
         }
     }
 
+    /// Strict "Type(value) is Object" test for the operations that genuinely
+    /// reject non-objects: `Proxy`/`new Proxy` targets, callable callback
+    /// arguments, `in` right-hand sides, `instanceof` right-hand sides, DOM
+    /// node receivers, and the entries of a `Map` constructor iterable.
+    ///
+    /// Operations whose spec text starts with `ToObject` must not use this;
+    /// they call [`JsRuntime::to_object`], which boxes primitives.
     pub(in crate::runtime) fn require_object(value: &JsValue) -> Result<ObjectId, JsError> {
         match value {
             JsValue::Object(object) => Ok(*object),
             JsValue::Null | JsValue::Undefined => Err(JsError::type_error(
                 "cannot access a property of null or undefined",
             )),
-            _ => Err(JsError::type_error(
-                "primitive object coercion is not implemented in this runtime slice",
-            )),
+            _ => Err(JsError::type_error("value is not an object")),
         }
     }
 

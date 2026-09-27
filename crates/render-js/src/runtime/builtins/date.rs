@@ -131,23 +131,16 @@ impl JsRuntime {
             }
             NativeFunction::DateNow => Ok(JsValue::Number(Self::now_ms())),
             NativeFunction::DateGetValue | NativeFunction::DateValueOf => {
-                match self.realm.host(receiver) {
-                    Some(ObjectHost::DateInstance(ms)) => Ok(JsValue::Number(ms)),
-                    _ => Err(JsError::type_error("incompatible Date method receiver")),
-                }
+                Ok(JsValue::Number(self.require_date_value(receiver)?))
             }
             NativeFunction::DateToString | NativeFunction::DateToGMTString => {
-                match self.realm.host(receiver) {
-                    Some(ObjectHost::DateInstance(ms)) => {
-                        let text = if function == NativeFunction::DateToString {
-                            Self::format_date_utc(ms)
-                        } else {
-                            Self::format_date_to_utc_string(ms)
-                        };
-                        Ok(JsValue::String(text))
-                    }
-                    _ => Err(JsError::type_error("incompatible Date method receiver")),
-                }
+                let ms = self.require_date_value(receiver)?;
+                let text = if function == NativeFunction::DateToString {
+                    Self::format_date_utc(ms)
+                } else {
+                    Self::format_date_to_utc_string(ms)
+                };
+                Ok(JsValue::String(text))
             }
             other => self.dispatch_promise_native(dom, other, receiver, arguments),
         }
@@ -334,6 +327,15 @@ impl JsRuntime {
     ) -> Result<f64, JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::DateInstance(ms)) => Ok(ms),
+            // ECMA-262 21.4.4.41.1 `thisTimeValue`: a `Date.prototype` method
+            // reached through `.call(5)` must see a primitive receiver as `NaN`
+            // rather than as a brand error, because the method never had a Date
+            // this-value to begin with.
+            Some(
+                ObjectHost::NumberPrimitive(_)
+                | ObjectHost::StringPrimitive(_)
+                | ObjectHost::BooleanPrimitive(_),
+            ) => Ok(f64::NAN),
             _ => Err(JsError::type_error("incompatible Date method receiver")),
         }
     }

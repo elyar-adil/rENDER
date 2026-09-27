@@ -1,0 +1,102 @@
+<!doctype html>
+<!--
+  Reduced snapshot of the Baidu home page shape (https://www.baidu.com/).
+
+  This is a *page shape*, not a capture: the landmark structure, the search
+  form, the hot-word block, the ranked feed, and the right rail are the parts
+  the acceptance contract asserts. Real-site URL shapes are kept so that the
+  harness exercises URL resolution, stylesheet discovery, image discovery, and
+  script discovery exactly as a live load would; the responses for those URLs
+  are replaced with deterministic local values (see baidu_home.css).
+
+  `role="search"` is applied to the search form so the landmark is assertable
+  without depending on a heuristic over form shapes.
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>百度一下，你就知道</title>
+<link rel="icon" href="https://ss1.bdstatic.com/home/static/img/favicon.ico">
+<link rel="stylesheet" href="https://ss1.bdstatic.com/home/static/main_20f3c22.css">
+<script defer src="https://ss1.bdstatic.com/home/static/main_9f0a1c3.js"></script>
+</head>
+<body>
+<header class="page-head">
+  <a class="logo" href="https://www.baidu.com/"><img src="https://ss1.bdstatic.com/home/static/img/logo_white_79x30.png" width="79" height="30" alt="百度首页"></a>
+  <nav class="top-links" aria-label="顶部导航">
+    <a href="https://news.baidu.com/">新闻</a>
+    <a href="https://www.hao123.com/">hao123</a>
+    <a href="https://map.baidu.com/">地图</a>
+    <a href="https://v.baidu.com/">视频</a>
+    <a href="https://tieba.baidu.com/">贴吧</a>
+    <a href="https://xueshu.baidu.com/">学术</a>
+  </nav>
+  <form class="search" role="search" action="https://www.baidu.com/s" method="get">
+    <input type="text" id="kw" name="wd" maxlength="55" autocomplete="off">
+    <button type="submit" id="su">百度一下</button>
+  </form>
+</header>
+<main class="page-main">
+  <section class="hot-words">
+    <h2>百度一下</h2>
+    <ul class="hot-list">
+      <li><a href="https://www.baidu.com/s?wd=%E8%B4%A2%E7%BB%8F">财经</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E6%96%B0%E9%97%BB">新闻</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E4%BA%BA%E5%B7%A5%E6%99%BA%E8%83%BD">人工智能</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E6%96%B0%E8%83%BD%E6%BA%90%E6%B1%BD%E8%BD%A6">新能源汽车</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E9%87%91%E8%9E%8D%E7%A7%91%E6%8A%80">金融科技</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E5%8C%BB%E7%96%97%E5%81%A5%E5%BA%B7">医疗健康</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E6%96%87%E6%97%85%E5%87%BA%E8%A1%8C">文旅出行</a></li>
+      <li><a href="https://www.baidu.com/s?wd=%E6%95%B0%E6%8D%AE%E4%BA%A7%E4%B8%9A">数据产业</a></li>
+    </ul>
+  </section>
+  <div class="columns">
+    <article class="feed">
+      <h2>今日热点</h2>
+      <ol class="feed-list">
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot01">跨平台渲染一致性提案进入公开评审</a><span class="feed-meta">01</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot02">国产浏览器内核发布可访问性里程碑版本</a><span class="feed-meta">02</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot03">大规模中文语料排版基准公开</a><span class="feed-meta">03</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot04">网络字体子集化方案进入标准讨论</a><span class="feed-meta">04</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot05">图片解码器在低内存设备上的性能报告</a><span class="feed-meta">05</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot06">布局引擎回归测试基线公开征集</a><span class="feed-meta">06</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot07">无脚本页面的首屏渲染耗时下降</a><span class="feed-meta">07</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot08">搜索结果页可访问性缺陷清单更新</a><span class="feed-meta">08</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot09">中文断行规则实现细节解读</a><span class="feed-meta">09</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot10">滚动区域合成与缓存策略说明</a><span class="feed-meta">10</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot11">图片占位尺寸推断的边界情况</a><span class="feed-meta">11</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot12">外链样式表按 DOM 顺序层叠的验证</a><span class="feed-meta">12</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot13">DOM 修订号与渲染失效的关系</a><span class="feed-meta">13</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot14">焦点顺序与地标角色的实现进度</a><span class="feed-meta">14</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot15">表格布局单元格的自动最小宽度</a><span class="feed-meta">15</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot16">缓存失效策略的内存上限调优</a><span class="feed-meta">16</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot17">资源调度顺序对首屏的影响</a><span class="feed-meta">17</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot18">视口单位在滚动容器中的取值</a><span class="feed-meta">18</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot19">文档标题编码嗅探的优先级</a><span class="feed-meta">19</span></li>
+        <li class="feed-item"><a class="feed-title" href="https://www.baidu.com/s?wd=hot20">显示列表增量更新的收益评估</a><span class="feed-meta">20</span></li>
+      </ol>
+    </article>
+    <aside class="rail">
+      <section class="rail-card">
+        <h2>我的热榜</h2>
+        <ul class="rail-list">
+          <li><a href="https://www.baidu.com/s?wd=rail01">开源浏览器内核协作计划</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rail02">中文排版字形簇切分</a></li>
+          <li><a href="https://www.baidu.com/s?wd=rail03">隐私友好的度量批处理</a></li>
+        </ul>
+      </section>
+      <section class="rail-card">
+        <h2>扫码进入百度 App</h2>
+        <img src="https://ss1.bdstatic.com/home/static/img/qrcode_160x160.png" width="160" height="160" alt="百度 App 下载二维码">
+        <p class="rail-note">二维码由图片管线解码并参与布局。</p>
+      </section>
+    </aside>
+  </div>
+</main>
+<footer class="page-foot">
+  <a href="https://www.baidu.com/about/">关于百度</a>
+  <a href="https://www.baidu.com/duty/">使用百度前必读</a>
+  <a href="https://www.baidu.com/copyright/">©2026 Baidu</a>
+</footer>
+</body>
+</html>

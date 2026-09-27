@@ -1,0 +1,94 @@
+<!doctype html>
+<!--
+  Reduced snapshot of the Zhihu article (zhuanlan) page shape
+  (https://zhuanlan.zhihu.com/p/...). Header navigation and the header search
+  form are landmark structure, not decoration, so the search landmark is
+  asserted here the same way as on the other four fixtures; the article body
+  itself carries the responsive `srcset`/`sizes` image shape and a plain
+  comment form that is deliberately *not* a search landmark.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see zhihu_article.css).
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>用确定性测量给渲染结果建立像素基线 - 知乎专栏</title>
+<meta name="description" content="为什么视觉回归基线必须建立在可复现的文本测量之上。">
+<link rel="stylesheet" href="https://static.zhihu.com/heifue/assets/column.7d31ab4.css">
+<script defer src="https://static.zhihu.com/heifue/assets/column.0b8ee42.js"></script>
+</head>
+<body>
+<header class="page-head">
+  <a class="logo" href="https://www.zhihu.com/"><img src="https://static.zhihu.com/heifue/assets/column-logo.1c0d4f2.png" width="90" height="30" alt="知乎专栏"></a>
+  <nav class="top-links" aria-label="主导航">
+    <a href="https://www.zhihu.com/">首页</a>
+    <a href="https://zhuanlan.zhihu.com/">专栏</a>
+    <a href="https://www.zhihu.com/question">问答</a>
+  </nav>
+  <form class="search" role="search" action="https://www.zhihu.com/search" method="get">
+    <input type="text" name="q" placeholder="搜索你感兴趣的内容">
+    <button type="submit">搜索</button>
+  </form>
+</header>
+<main class="page-main">
+  <article class="article">
+    <h1 class="article-title">用确定性测量给渲染结果建立像素基线</h1>
+    <p class="article-byline"><a href="https://www.zhihu.com/people/render">渲染实现者</a><span class="byline-sep">·</span>2026-09-22</p>
+    <img class="article-cover" src="https://pic1.zhihu.com/v2-cover_banner.jpg" width="1000" height="420" alt="文章封面：渲染管线的五个阶段">
+    <section class="article-section" id="system-fonts">
+      <h2>系统字体是第一个变量</h2>
+      <p class="article-text">同一份 HTML，在两台装不同字体的机器上会得到两张不同的位图。基线如果建立在系统字体上，它记录的是某台机器，而不是这段标记。</p>
+      <p class="article-text">确定性的做法是让测量本身可复现：给定相同的文本与字号，得到相同的宽度。这一步做到了，像素对比才有意义。</p>
+    </section>
+    <section class="article-section" id="candidate-images">
+      <h2>候选图片也要确定</h2>
+      <p class="article-text">响应式图片的候选选择依赖视口宽度与设备像素比。把这两个量固定下来，请求到的就是同一张图。</p>
+      <img class="article-figure" srcset="https://pic1.zhihu.com/80b82-article_16x9_b.jpg 320w, https://pic1.zhihu.com/80b82-article_16x9_r.jpg 640w, https://pic1.zhihu.com/80b82-article_16x9.jpg 1280w" sizes="(max-width: 600px) 100vw, 1000px" width="1000" height="562" alt="图：候选列表按视口宽度挑选">
+    </section>
+    <section class="article-section" id="human-baseline">
+      <h2>基线只能由人来确认</h2>
+      <p class="article-text">今天的渲染器在若干已记录的方面仍然是错的。把当前的输出直接固化成基线，等于把错误写成标准。</p>
+      <p class="article-text">因此基线的引入必须是显式的人工动作：先看图，确认这一屏确实应该长这样，再把它登记为基线。</p>
+    </section>
+    <section class="article-section" id="structural-assertions">
+      <h2>可复现的结构断言</h2>
+      <p class="article-text">相比像素，结构断言更适合作为默认门禁：文档标题、地标、可达链接、搜索地标、资源分类，以及滚动区域内文本块的顺序。</p>
+      <p class="article-text">像素差分作为报告存在，等有人看过之后再升级为门禁。</p>
+    </section>
+  </article>
+  <aside class="rail">
+    <section class="rail-card">
+      <h2>本文目录</h2>
+      <ul class="rail-list">
+        <li><a href="#system-fonts">系统字体是第一个变量</a></li>
+        <li><a href="#candidate-images">候选图片也要确定</a></li>
+        <li><a href="#human-baseline">基线只能由人来确认</a></li>
+        <li><a href="#structural-assertions">可复现的结构断言</a></li>
+      </ul>
+    </section>
+    <section class="rail-card">
+      <h2>作者</h2>
+      <img class="author-avatar" src="https://pic1.zhihu.com/v2-author-avatar.jpg" width="96" height="96" alt="作者头像">
+      <p class="rail-note">专栏作者</p>
+    </section>
+  </aside>
+  <section class="comments">
+    <h2>评论 · 12 条</h2>
+    <div class="comment-item"><p class="comment-text">确定性测量这条太关键了，跨机复现直接靠它。</p><p class="comment-meta"><a href="https://www.zhihu.com/people/a">a</a> · 赞 8</p></div>
+    <div class="comment-item"><p class="comment-text">结构断言做默认门禁、像素差分做报告，这个分工合理。</p><p class="comment-meta"><a href="https://www.zhihu.com/people/b">b</a> · 赞 6</p></div>
+    <div class="comment-item"><p class="comment-text">想知道基线位图在仓库里大概多大。</p><p class="comment-meta"><a href="https://www.zhihu.com/people/c">c</a> · 赞 4</p></div>
+    <div class="comment-item"><p class="comment-text">占位尺寸与固有尺寸的优先级建议单独写一条。</p><p class="comment-meta"><a href="https://www.zhihu.com/people/d">d</a> · 赞 3</p></div>
+    <div class="comment-item"><p class="comment-text">外链样式表的层叠顺序测试很有用。</p><p class="comment-meta"><a href="https://www.zhihu.com/people/e">e</a> · 赞 2</p></div>
+    <form class="comment-form" action="https://www.zhihu.com/api/v4/comments" method="post">
+      <input type="text" name="text" placeholder="写下你的评论">
+      <button type="submit">发布</button>
+    </form>
+  </section>
+</main>
+<footer class="page-foot">
+  <a href="https://www.zhihu.com/term/zhihu-terms">知乎协议</a>
+  <a href="https://www.zhihu.com/term/copyright">侵权投诉指引</a>
+</footer>
+</body>
+</html>

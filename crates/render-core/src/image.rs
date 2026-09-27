@@ -7,6 +7,7 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+pub mod inline_svg;
 pub mod svg;
 
 use std::collections::BTreeMap;

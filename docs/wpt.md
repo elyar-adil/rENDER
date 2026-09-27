@@ -19,28 +19,39 @@ and never replaces an existing non-empty directory.
 
 ## Full static reftest run
 
-The batch runner recursively discovers every local official HTML test that
-declares `link rel="match"` and executes every discovered pair through
-render-core's deterministic `Document` pipeline:
+The runner is the Rust integration test `crates/render-core/tests/wpt_reftests.rs`.
+It recursively discovers local official HTML tests that declare `link rel="match"`
+and executes every discovered pair through render-core's deterministic `Document`
+pipeline. There is no separate Python batch script.
 
 ```powershell
-python tools/run-wpt-reftests.py
+cargo test -p render-core --test wpt_reftests -- --ignored --nocapture
 ```
 
-The default scans the complete WPT checkout. Use `--suite css` or
-`--suite html` for a focused subsystem run, and use `--path-prefix` for a
-specific checkout-relative directory. `--max-cases` is only for an explicit
-smoke run; it must not be used for a conformance baseline.
+Select a subset through the environment rather than through command-line flags:
 
-The Rust runner emits one `WPT_RESULT` record per pair and a final summary:
+| Variable | Effect |
+| --- | --- |
+| `RENDER_WPT_ROOT` | the WPT checkout directory |
+| `RENDER_WPT_TEST` | run one test, with `RENDER_WPT_REFERENCE` naming its reference |
+| `RENDER_WPT_MANIFEST` | restrict discovery to a manifest of pairs |
+
+The runner emits one `WPT_RESULT` record per pair and a final summary:
 
 ```text
 WPT_SUMMARY  cases=...  pass=...  fail=...  unsupported=...  skip=...  infrastructure=...
 ```
 
-Pixel mismatches and infrastructure errors make the command fail after all
-cases have been processed. `unsupported` and `skip` are reported separately
-and are never counted as passes.
+Pixel mismatches and infrastructure errors make the command fail after all cases
+have been processed. `unsupported` and `skip` are reported separately and are never
+counted as passes.
+
+**This suite has never actually been executed.** The test, the fetch script and the
+runner all exist, and CI has a job for it (`.github/workflows/rust.yml`, `wpt-reftests`),
+but no run has ever completed against a real checkout, so no pass count in this
+repository is a WPT result. Treat any claim about WPT conformance as unverified until
+someone runs it and records the output. The job is `continue-on-error: true` precisely
+because an unobtainable checkout must not be reported as a pass.
 
 ## Scope
 

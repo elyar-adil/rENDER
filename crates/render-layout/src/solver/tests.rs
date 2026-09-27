@@ -1,7 +1,8 @@
 #![allow(clippy::float_cmp)]
 
 use crate::PhysicalRect;
-use crate::fragment::FragmentKind;
+use crate::fragment::{Fragment, FragmentKind};
+use crate::geometry::EdgeSizes;
 use crate::tree::{FormattingLimits, build_formatting_tree};
 use render_css::cascade::{CascadeInput, CascadeOrigin};
 use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
@@ -14,7 +15,7 @@ use crate::solver::{
     LayoutDiagnosticCode, LayoutLimits, LayoutOptions, SimpleTextMeasurer, layout_formatting_tree,
 };
 
-fn pipeline(
+pub(super) fn pipeline(
     html: &str,
     css: &str,
     width: f32,
@@ -52,9 +53,17 @@ fn pipeline(
     (output, styles, layout)
 }
 
-fn find(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
+pub(super) fn find(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
     let selector = parse_selector_list(selector).unwrap();
     select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+}
+
+pub(super) fn fragment(layout: &crate::solver::LayoutOutput, source: NodeId) -> &Fragment {
+    layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(source))
+        .unwrap_or_else(|| panic!("no fragment for the requested element"))
 }
 
 #[test]
@@ -757,6 +766,36 @@ fn explicit_grid_tracks_auto_place_items_with_gaps_and_box_model() {
     };
     assert_eq!(geometry.content_rect.size.width, 60.0);
     assert_eq!(geometry.margin_rect().size.width, 100.0);
+}
+
+#[test]
+fn a_fixed_width_box_keeps_its_specified_margins_when_it_fits() {
+    // §10.3.7 only solves the margin equation by adjusting a margin when the
+    // values are over-constrained. A box narrower than its containing block
+    // sits at its start margin with the rest of the block empty, so the used
+    // margins are the specified ones and the margin box is the border box.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='page'>\
+           <div id='narrow'></div><div id='wide'></div></div></body>",
+        "html, body, div { display:block; margin:0 } #page { width: 400px }\
+         #narrow { width: 50px; height: 10px } #wide { width: 500px; height: 10px }",
+        800.0,
+    );
+    let dom = &output.dom;
+    let geometry = |selector: &str| match &fragment(&layout, find(dom, selector)).kind {
+        FragmentKind::Box(geometry) => geometry.clone(),
+        other @ FragmentKind::Text(_) => panic!("{selector} is {other:?}"),
+    };
+    let narrow = geometry("#narrow");
+    assert_eq!(narrow.margin, EdgeSizes::default());
+    assert_eq!(narrow.content_rect.size.width, 50.0);
+    assert_eq!(narrow.margin_rect().size.width, 50.0);
+    // The over-constrained sibling still solves the equation, so its margin box
+    // is the border box and the box overflows to the right.
+    let wide = geometry("#wide");
+    assert_eq!(wide.content_rect.size.width, 500.0);
+    assert_eq!(wide.margin.right, -100.0);
+    assert_eq!(wide.margin_rect().size.width, 400.0);
 }
 
 #[test]

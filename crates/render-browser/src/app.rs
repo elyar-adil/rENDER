@@ -146,6 +146,10 @@ pub(super) enum HistoryMode {
 /// command queue is full. The two crates share the wording by contract.
 const NETWORK_QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag tracks an independent input-pipeline stage: pointer, selection, focus"
+)]
 pub(super) struct BrowserApp {
     pub(super) tabs: TabModel,
     pub(super) pages: HashMap<TabId, PageState>,
@@ -338,7 +342,7 @@ impl BrowserApp {
             page.frame.clear();
             page.viewport = viewport;
             page.expected_render = None;
-            page.render_dirty = false;
+            self.forget_dirty_render(id);
             self.render_worker.cancel_tab(id.as_u64());
             return;
         }
@@ -350,6 +354,7 @@ impl BrowserApp {
         // after the commit lands.
         if self.render_worker.is_tab_busy(id.as_u64()) {
             page.render_dirty = true;
+            page.render_dirty_viewport = Some(viewport);
             return;
         }
         page.render_generation = page.render_generation.saturating_add(1);
@@ -437,17 +442,35 @@ impl BrowserApp {
                 {
                     eprintln!("render-browser background render failed: {error}");
                 }
+                self.resubmit_dirty_render(id);
                 return;
             }
         };
+        // A newer render owns the tab, so this frame is discarded. The pending
+        // repaint request must be honoured on this path too: it used to be
+        // consumed only after a successful commit, which meant a discarded
+        // frame also stranded the request and froze the tab on whatever it had
+        // painted before. Reporting the frame here (before the gate) made a
+        // discarded frame look like a commit in the frame log.
+        if !self
+            .pages
+            .get(&id)
+            .is_some_and(|page| page.expected_render == Some(completed.identity))
+        {
+            if env::var_os("RENDER_DEBUG_FRAME").is_some() {
+                eprintln!(
+                    "render-browser discarding superseded frame page={} generation={}",
+                    completed.identity.tab_id, completed.identity.generation
+                );
+            }
+            self.resubmit_dirty_render(id);
+            return;
+        }
         log_completed_frame_debug(&frame, completed.identity.tab_id);
         let style_plan = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
             };
-            if page.expected_render != Some(completed.identity) {
-                return;
-            }
             page.expected_render = None;
             page.frame = frame.frame;
             page.viewport = frame.viewport;
@@ -524,17 +547,61 @@ impl BrowserApp {
         // just landed, so the worker is free and the page can resubmit to
         // converge on its latest revision (bounded by the busy check inside
         // schedule_page_render).
-        let dirty_viewport = self
+        self.resubmit_dirty_render(id);
+    }
+
+    /// Clears a coalesced repaint request without acting on it.
+    fn forget_dirty_render(&mut self, id: TabId) {
+        if let Some(page) = self.pages.get_mut(&id) {
+            page.render_dirty = false;
+            page.render_dirty_viewport = None;
+        }
+    }
+
+    /// Whether a tab still owes a repaint that nothing else will trigger.
+    fn has_unresolved_render_request(&self) -> bool {
+        self.pages
+            .values()
+            .any(PageState::has_unresolved_render_request)
+    }
+
+    /// Re-submits coalesced repaints whose running render was cancelled.
+    ///
+    /// A cancelled render reports no completion, so the event loop is never
+    /// woken for it. Without this recovery a repaint coalesced behind such a
+    /// render waits for an event that cannot arrive, and the tab keeps its
+    /// previous frame indefinitely.
+    pub(super) fn recover_unresolved_render_requests(&mut self) {
+        let idle = self
+            .pages
+            .iter()
+            .filter(|(_, page)| page.has_unresolved_render_request())
+            .map(|(id, _)| *id)
+            .filter(|id| !self.render_worker.is_tab_busy(id.as_u64()))
+            .collect::<Vec<_>>();
+        for id in idle {
+            self.resubmit_dirty_render(id);
+        }
+    }
+
+    /// Repaints a tab whose state changed while a render was running.
+    ///
+    /// Every path that finishes a render calls this, including the ones that
+    /// discard the frame: the request is only ever coalesced behind a running
+    /// render, so consuming it exclusively after a successful commit loses the
+    /// last known page state whenever that render is superseded. The viewport
+    /// is the one the request was made for rather than the last committed one,
+    /// which a navigation resets to zero.
+    fn resubmit_dirty_render(&mut self, id: TabId) {
+        let Some(viewport) = self
             .pages
             .get(&id)
-            .filter(|page| page.render_dirty)
-            .map(|page| page.viewport);
-        if let Some(viewport) = dirty_viewport {
-            if let Some(page) = self.pages.get_mut(&id) {
-                page.render_dirty = false;
-            }
-            self.schedule_page_render(id, viewport, false);
-        }
+            .and_then(|page| page.render_dirty_viewport)
+        else {
+            return;
+        };
+        self.forget_dirty_render(id);
+        self.schedule_page_render(id, viewport, false);
     }
 
     pub(super) fn compose_frame(&mut self, size: WindowSize<u32>) {
@@ -1237,6 +1304,11 @@ impl BrowserApp {
     }
 
     pub(super) fn install_source(&mut self, id: TabId, source: PageSource, loading: bool) {
+        // A committed navigation supersedes every frame still being computed
+        // for the document it replaces. `set_source` clears the expected
+        // render identity, so without this the old job would finish, fail the
+        // commit gate, and leave the tab showing the previous document.
+        self.render_worker.cancel_tab(id.as_u64());
         let fallback_title = source.title.clone();
         let mut title = fallback_title;
         let mut address = source.target.display_address();
@@ -1802,10 +1874,13 @@ impl BrowserApp {
                     .queue_dom_event(PageDomEvent::new(loaded.owner, "load"));
             }
         }
-        if !application.loaded.is_empty() {
-            page.external_styles_generation = page.external_styles_generation.saturating_add(1);
-            self.schedule_page_render_for_tab(id);
-        }
+        // Every completed image batch marks the page dirty, not only a batch
+        // that decoded something. A batch whose results were all stale, failed,
+        // or already applied still ended, and the page must repaint so the
+        // remaining plan converges; skipping it left a page whose images never
+        // decode permanently frozen on its last commit.
+        page.external_styles_generation = page.external_styles_generation.saturating_add(1);
+        self.schedule_page_render_for_tab(id);
         // An img can change src while the previous batch is in flight. That
         // response is correctly discarded as stale, but without a follow-up
         // scan the new URL would wait for an unrelated future render.
@@ -1887,6 +1962,10 @@ impl BrowserApp {
         self.pages.values().any(PageState::has_pending_script_work)
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the pointer policy reads as one dispatch over every hit target"
+    )]
     pub(super) fn handle_pointer_press(&mut self, event_loop: &ActiveEventLoop) {
         self.left_pointer_down = true;
         if let Some(menu) = self.address_menu.take() {
@@ -3281,6 +3360,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_network();
+        self.recover_unresolved_render_requests();
         self.poll_disk_cache();
         let active = self.tabs.active_id();
         let mut rendered_active = false;
@@ -3332,7 +3412,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         for id in navigation_candidates {
             self.drain_script_navigations(id);
         }
-        if self.has_pending_network() || self.has_pending_script_work() {
+        if self.has_pending_network()
+            || self.has_pending_script_work()
+            || self.has_unresolved_render_request()
+        {
             event_loop.set_control_flow(ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(16),
             ));

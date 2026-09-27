@@ -7,7 +7,9 @@
 mod fragment;
 mod geometry;
 mod grid;
+mod scrollport;
 mod solver;
+mod sticky;
 mod tree;
 
 pub use fragment::{
@@ -17,11 +19,13 @@ pub use geometry::{
     Direction, EdgeSizes, LogicalPoint, LogicalRect, LogicalSize, PhysicalPoint, PhysicalRect,
     PhysicalSize, WritingMode,
 };
+pub use scrollport::{ClipMode, ScrollportGeometry};
 pub use solver::{
     ImageResourceProvider, LayoutDiagnostic, LayoutDiagnosticCode, LayoutLimits, LayoutOptions,
-    LayoutOutput, SimpleTextMeasurer, TextMeasure, TextMeasurer, TextStyle, layout_formatting_tree,
-    layout_formatting_tree_with_images,
+    LayoutOutput, SimpleTextMeasurer, TextMeasure, TextMeasurer, TextSpacing, TextStyle,
+    is_word_separator, layout_formatting_tree, layout_formatting_tree_with_images,
 };
+pub use sticky::{StickyConstraint, StickyInsets, sticky_offset, sticky_view_rect};
 pub use tree::{
     FormattingContextKind, FormattingDiagnostic, FormattingDiagnosticCode, FormattingLimits,
     FormattingNode, FormattingNodeId, FormattingNodeKind, FormattingTree, FormattingWorkUnit,

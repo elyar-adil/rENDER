@@ -2,6 +2,35 @@
 
 > 目标：从“局部修补”切换到“规范驱动的渲染流水线”，优先保证布局与 DOM/脚本行为正确性。
 
+> ## ⚠️ 历史文档横幅（2026-09-27 加入）
+>
+> **本文描述的是一次已经完成的迁移方案，不是当前状态。**
+> 正文分析的对象是已删除的 Python 引擎（`layout/__init__.py`、`css/computed.py`、
+> `css/cascade.py`、`engine._execute_scripts()`、`js/promise.py`），
+> 并提出过一个名为 `RenderPipelineV2` 的 Python 新模块。这些文件与模块都不存在了。
+>
+> 按 `docs/generic-browser-todo.md` 的 "Priority -1: Gaps Are Implemented Forward,
+> Never Removed"，本文**不删除**——它记录了一次架构决策的推理过程，而这个过程解释了
+> 为什么今天的引擎长成现在的样子（例如：`css/computed.py` 提前把长度 px 化的问题，
+> 对应到今天的 `crates/render-css/src/computed.rs` 与 `crates/render-layout/src/solver/resolve.rs`
+> 之间的 computed/used value 分界）。
+>
+> **要看当前真相，请读：**
+>
+> - `docs/visual_fidelity_gaps.md` —— 经验证的视觉保真缺口，带 `file:line` 证据与排序
+> - `docs/html5_scope.md` —— 能力范围与状态标签
+> - `docs/html5_gap_matrix.md` —— 能力矩阵与测试基线
+> - `docs/generic-browser-todo.md` —— 项目法
+> - 代码本身：`crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs`
+>   的格式化上下文分派，就是正文第 0 节 A 点要求的目标结构；
+>   `crates/render-core/src/page.rs` 的 `Page`（协调一个 `Document`、一个 JS realm、
+>   一个事件循环与一个失效游标）与 `crates/render-core/src/invalidation.rs`
+>   就是正文第 1.1/1.2 节描述的分阶段管线与失效图；
+>   `crates/render-core/src/event_loop.rs` 就是正文第 0 节 D 点要求的三段式事件循环。
+>
+> **本横幅以下的内容是历史记录，其中的文件名、行号估计、模块命名与工作量估计
+> 全部属于 Python 时代，不得作为当前引擎的证据引用。**
+
 ## 0. 现状根因（非表象问题）
 
 ### A. 布局系统是“按节点递归直排”，不是“格式化上下文驱动”

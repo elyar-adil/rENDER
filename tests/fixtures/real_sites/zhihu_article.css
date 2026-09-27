@@ -1,0 +1,53 @@
+/*
+ * Deterministic stand-in for the Zhihu article stylesheet.
+ * Served in place of https://static.zhihu.com/heifue/assets/column.7d31ab4.css.
+ *
+ * The side column is stacked under the article rather than floated beside it, so
+ * that document order and vertical order agree. See baidu_home.css.
+ */
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #ffffff; color: #1a1a1a; font-size: 16px; line-height: 26px; }
+
+.page-head { display: block; width: 100%; height: 56px; background-color: #f6f7f8; }
+.logo { display: inline-block; width: 90px; height: 30px; margin-top: 13px; margin-left: 12px; }
+.logo img { display: block; width: 90px; height: 30px; }
+.top-links { display: inline-block; width: 400px; height: 22px; margin-top: 17px; margin-left: 28px; }
+.top-links a { display: inline-block; width: 110px; height: 22px; margin-right: 3px; color: #8590a6; }
+.search { display: inline-block; width: 380px; height: 34px; margin-top: 11px; margin-left: 170px; }
+.search input { display: inline-block; width: 300px; height: 34px; }
+.search button { display: inline-block; width: 72px; height: 34px; color: #ffffff; background-color: #175199; }
+
+.page-main { display: block; width: 1000px; margin-top: 16px; margin-left: 140px; }
+.article { display: block; width: 700px; }
+.article-title { display: block; width: 700px; height: 40px; margin-top: 0; margin-bottom: 0; font-size: 28px; line-height: 40px; }
+.article-byline { display: block; width: 700px; height: 22px; margin-top: 6px; color: #8590a6; font-size: 14px; line-height: 22px; }
+.article-byline a { color: #175199; }
+.byline-sep { display: inline-block; width: 20px; height: 22px; }
+.article-cover { display: block; width: 700px; height: 294px; margin-top: 12px; }
+.article-section { display: block; width: 700px; height: 420px; margin-top: 24px; }
+.article-section h2 { display: block; width: 700px; height: 30px; margin-top: 0; margin-bottom: 0; font-size: 21px; line-height: 30px; }
+.article-text { display: block; width: 700px; height: 52px; margin-top: 8px; }
+.article-figure { display: block; width: 700px; height: 320px; margin-top: 8px; }
+
+.rail { display: block; width: 700px; margin-top: 24px; margin-left: 0; }
+.rail-card { display: block; width: 700px; height: 190px; margin-bottom: 12px; padding-top: 12px; padding-bottom: 12px; background-color: #f6f7f8; }
+.rail-card h2 { display: block; width: 676px; height: 22px; margin-top: 0; margin-bottom: 0; font-size: 16px; line-height: 22px; }
+.rail-list { display: block; width: 676px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: block; width: 676px; height: 24px; }
+.rail-list a { color: #175199; }
+.rail-card img { display: block; width: 96px; height: 96px; }
+.rail-note { display: block; width: 676px; height: 20px; color: #8590a6; font-size: 12px; line-height: 20px; }
+
+.comments { display: block; width: 1000px; margin-top: 32px; }
+.comments h2 { display: block; width: 1000px; height: 28px; margin-top: 0; margin-bottom: 0; font-size: 18px; line-height: 28px; }
+.comment-item { display: block; width: 1000px; height: 66px; margin-top: 0; margin-bottom: 10px; padding-top: 8px; padding-bottom: 8px; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #ebebeb; }
+.comment-text { display: block; width: 1000px; height: 26px; margin-top: 0; }
+.comment-meta { display: block; width: 1000px; height: 20px; margin-top: 0; color: #8590a6; font-size: 13px; line-height: 20px; }
+.comment-meta a { color: #175199; }
+.comment-form { display: block; width: 1000px; height: 40px; margin-top: 12px; }
+.comment-form input { display: inline-block; width: 860px; height: 40px; }
+.comment-form button { display: inline-block; width: 120px; height: 40px; color: #ffffff; background-color: #175199; }
+
+.page-foot { display: block; width: 1000px; height: 40px; margin-top: 32px; margin-left: 140px; color: #8590a6; font-size: 12px; line-height: 20px; }
+.page-foot a { display: inline-block; width: 180px; height: 20px; margin-right: 10px; }

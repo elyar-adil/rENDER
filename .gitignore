@@ -151,3 +151,7 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# Regenerable measurement output from tools/css_corpus.rs over the gitignored .diag/ corpus.
+crates/render-css/examples/*_BEFORE.txt
+crates/render-css/examples/*_AFTER.txt

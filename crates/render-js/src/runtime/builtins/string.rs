@@ -18,6 +18,8 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::lexer::surrogate_placeholder;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::array::MAX_MATERIALIZED_ELEMENTS;
+use crate::runtime::builtins::array::to_length;
 use crate::runtime::convert::optional_index;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::slice_range;
@@ -38,11 +40,7 @@ impl JsRuntime {
         match function {
             NativeFunction::StringFromCharCode => Self::string_from_char_code(arguments),
             NativeFunction::StringFromCodePoint => Self::string_from_code_point(arguments),
-            NativeFunction::StringRaw => Ok(JsValue::String(
-                arguments
-                    .first()
-                    .map_or_else(String::new, JsValue::to_js_string),
-            )),
+            NativeFunction::StringRaw => self.string_raw(dom, arguments),
             NativeFunction::StringSubstr => {
                 let text = self.require_string_receiver(receiver)?;
                 let characters: Vec<char> = text.chars().collect();
@@ -342,6 +340,68 @@ impl JsRuntime {
                 "incompatible String method receiver (host {other:?})"
             ))),
         }
+    }
+
+    /// ECMA-262 22.1.2.4 `String.raw(template, ...substitutions)`.
+    ///
+    /// The literals are the template object's `raw` property, not the template
+    /// itself, so a template that omits `raw` is a `TypeError` rather than an
+    /// empty answer. A substitution is spliced only *between* two literals, so
+    /// a call that supplies fewer substitutions than literals appends nothing
+    /// instead of stringifying a hole.
+    pub(in crate::runtime) fn string_raw(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let Some(template) = arguments.first() else {
+            return Err(JsError::type_error("String.raw requires a template object"));
+        };
+        // Step 2/3: `ToObject(template)` then `ToObject(Get(template, "raw"))`.
+        // Both throw for `null`/`undefined` and for a missing `raw`, which is
+        // what an object that only looks array-like answers.
+        let cooked = self.to_object(template)?;
+        let raw = self
+            .realm
+            .get_property(cooked, "raw")
+            .ok_or_else(|| JsError::type_error("String.raw template has no 'raw' property"))?;
+        let literals = self.to_object(&raw)?;
+        // Step 4: `LengthOfArrayLike`.
+        let length = self
+            .realm
+            .get_property(literals, "length")
+            .map(|value| to_length(&value))
+            .transpose()?
+            .unwrap_or(0.0);
+        if length > MAX_MATERIALIZED_ELEMENTS as f64 {
+            return Err(
+                self.range_error("String.raw template literal count exceeds the engine limit")
+            );
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "to_length is a non-negative integer already bounded by the materialization cap"
+        )]
+        let count = length as usize;
+        // Step 5: an empty `raw` contributes nothing at all, not one `undefined`.
+        let mut output = String::new();
+        for index in 0..count {
+            output.push_str(
+                &self
+                    .get_member(dom, literals, &index.to_string())?
+                    .to_js_string(),
+            );
+            // Step 8.d: the final literal ends the string; step 8.e splices a
+            // substitution only when a later literal still follows.
+            if index + 1 == count {
+                break;
+            }
+            if let Some(substitution) = arguments.get(index + 1) {
+                output.push_str(&substitution.to_js_string());
+            }
+        }
+        Ok(JsValue::String(output))
     }
 
     pub(in crate::runtime) fn string_char_at(
@@ -675,6 +735,23 @@ impl JsRuntime {
             }
             None => JsValue::Number(-1.0),
         })
+    }
+
+    /// `String.prototype[Symbol.iterator]` (and its `values` alias): a String
+    /// Iterator over the receiver's code points, sharing `%IteratorPrototype%`
+    /// with every other engine iterator so `getProto(getProto(it))` walks the
+    /// same chain in polyfills that snapshot the intrinsic.
+    pub(in crate::runtime) fn string_iterator(
+        &mut self,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let text = self.require_string_receiver(receiver)?;
+        self.ensure_heap_capacity(1)?;
+        let values = text
+            .chars()
+            .map(|character| JsValue::String(character.to_string()))
+            .collect::<Vec<_>>();
+        Ok(JsValue::Object(self.realm.collection_iterator(values)))
     }
 
     /// `String.prototype.replace` with `$&`, `$1`–`$9`, `` $` ``, `$'`, `$$`

@@ -6,18 +6,41 @@ No Chromium, no system WebView. Every line must earn its place.
 ## Architecture
 
 ```
-crates/render-core      → engine library: DOM, CSS, JS, layout, painting
-  src/html/               HTML5 tokenizer + tree builder
-  src/dom.rs              Document/Element/Text tree
-  src/css/                stylesheet parsing, selectors, cascade, computed values
-  src/js/                 lexer, parser, runtime/ (evaluator, gc, builtins per Web API area)
-  src/layout/             block/inline/flex/grid/table formatting contexts
-  src/paint/              display list construction and CPU rasterization
-  src/page.rs             page session: load → style → layout → paint pipeline
-crates/render-net       → bounded HTTP(S) transport (ureq + rustls)
-crates/render-browser   → native desktop shell (winit + softbuffer)
+crates/render-dom      → DOM tree, namespaces, revisions, mutation journal
+crates/render-html     → HTML5 tokenizer, tree builder, encoding sniffing
+crates/render-css      → stylesheet parsing, selectors, cascade, typed values,
+                          computed values
+crates/render-layout   → CSS formatting structure + solver (block, inline, flex,
+                          grid, table) → immutable fragments
+crates/render-js       → JS lexer, parser, tree-walking interpreter, Web API
+                          builtins per domain, video module
+crates/render-core     → page session: load → style → layout → paint pipeline,
+                          image decode, display list, CPU rasterization,
+                          interaction/hit testing, navigation, event loop,
+                          capability registry
+  src/paint/            display list construction and CPU rasterization
+  src/image/            image and SVG decoders
+  src/interaction/      hit testing and content interaction
+  src/spec/             declared capability registry (see docs/visual_fidelity_gaps.md)
+crates/render-net      → bounded HTTP(S) transport (ureq + rustls)
+crates/render-browser  → native desktop shell (winit + softbuffer)
+                         font backend, resource scheduling, tab chrome,
                          private memory/disk cache and cache settings
 ```
+
+The engine crates are layered: `render-dom` knows nothing about CSS, `render-css`
+knows nothing about layout, and `render-layout` knows nothing about painting.
+`render-core` is the only crate that composes them. When a fix seems to require a
+layer to reach sideways, that is usually the signal that a seam is in the wrong place.
+
+## Capability gaps
+
+`docs/visual_fidelity_gaps.md` records the verified list of capabilities that are
+parsed-but-not-consumed, computed-but-dropped, or absent entirely, with `file:line`
+evidence. Read it before concluding that a property "is supported" - a property
+reaching the computed style map is not the same as a property having a consumer in
+layout or paint. See also `docs/generic-browser-todo.md`, whose "Priority -1" section
+states the rule that a gap gets implemented forward and never removed.
 
 ## Running
 
@@ -69,6 +92,12 @@ cargo test --workspace
 - `third_party/test262` (pin via `tools/fetch-test262.sh`) drives the JS conformance runner in `crates/render-core/tests/test262.rs`.
 - WPT reftests (`crates/render-core/tests/wpt_reftests.rs) run against a pinned WPT checkout fetched by `tools/fetch-wpt.ps1, configured through `RENDER_WPT_* env vars.
 
+The test262 gate is expensive: a full `cargo test --workspace` or a bare
+`cargo test -p render-core` runs it and takes about eight minutes, during which it
+holds the build lock and starves every other workspace. While iterating, scope to
+`cargo test -p <crate> --lib` or name the test targets explicitly, and run
+`cargo test -p render-core --test test262` on its own when the gate is the point.
+
 ## Required checks before finishing any change
 
 Run them all with `tools/check.sh (git bash), or individually:
@@ -76,8 +105,15 @@ Run them all with `tools/check.sh (git bash), or individually:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+python tools/check_site_neutrality.py
 cargo test --workspace
 ```
+
+`tools/check_site_neutrality.py` enforces the no-per-site-branches rule from
+`docs/generic-browser-todo.md` mechanically. A real commercial domain in a
+comparison, match arm, or substring test is a failure; a domain used as inert
+test data is not. A genuine exception needs a `// site-neutral: <reason>`
+comment on the line or the two lines above it.
 
 ## Design Principles
 

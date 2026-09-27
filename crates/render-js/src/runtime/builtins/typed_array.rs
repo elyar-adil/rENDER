@@ -13,6 +13,7 @@
     clippy::wrong_self_convention
 )]
 
+use super::array::callback_this_argument;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -57,21 +58,24 @@ impl JsRuntime {
                     required_argument(arguments, 0, "forEach")?,
                     &self.realm,
                 )?;
-                self.typed_array_for_each(dom, receiver, callback)
+                let this_argument = callback_this_argument(arguments);
+                self.typed_array_for_each(dom, receiver, callback, &this_argument)
             }
             NativeFunction::TypedArrayMap => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "map")?,
                     &self.realm,
                 )?;
-                self.typed_array_map_or_filter(dom, receiver, callback, true)
+                let this_argument = callback_this_argument(arguments);
+                self.typed_array_map_or_filter(dom, receiver, callback, &this_argument, true)
             }
             NativeFunction::TypedArrayFilter => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "filter")?,
                     &self.realm,
                 )?;
-                self.typed_array_map_or_filter(dom, receiver, callback, false)
+                let this_argument = callback_this_argument(arguments);
+                self.typed_array_map_or_filter(dom, receiver, callback, &this_argument, false)
             }
             other => self.dispatch_collections_native(dom, other, receiver, arguments),
         }
@@ -167,13 +171,19 @@ impl JsRuntime {
         };
         if let Some(JsValue::Object(mapper)) = arguments.get(1) {
             let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
+            let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
             for (index, value) in values.iter_mut().enumerate() {
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "source indices stay far below any precision boundary"
                 )]
                 let index_value = JsValue::Number(index as f64);
-                let element = self.call(dom, mapper, &[JsValue::Number(*value), index_value])?;
+                let element = self.call_with_this(
+                    dom,
+                    mapper,
+                    &[JsValue::Number(*value), index_value],
+                    this_argument.clone(),
+                )?;
                 *value = to_number(&element)?;
             }
         }
@@ -489,6 +499,7 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         callback: ObjectId,
+        this_argument: &JsValue,
     ) -> Result<JsValue, JsError> {
         let (_, buffer, start, length) = self.typed_array_host(receiver)?;
         for index in 0..length {
@@ -497,7 +508,7 @@ impl JsRuntime {
             let Some(element) = buffer.0.borrow().get(start + index).copied() else {
                 break;
             };
-            self.call(
+            self.call_with_this(
                 dom,
                 callback,
                 &[
@@ -505,6 +516,7 @@ impl JsRuntime {
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
+                this_argument.clone(),
             )?;
         }
         Ok(JsValue::Undefined)
@@ -517,6 +529,7 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         callback: ObjectId,
+        this_argument: &JsValue,
         map: bool,
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
@@ -525,7 +538,7 @@ impl JsRuntime {
             let Some(element) = buffer.0.borrow().get(start + index).copied() else {
                 break;
             };
-            let mapped = self.call(
+            let mapped = self.call_with_this(
                 dom,
                 callback,
                 &[
@@ -533,6 +546,7 @@ impl JsRuntime {
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
+                this_argument.clone(),
             )?;
             if map {
                 output.push(to_number(&mapped)?);

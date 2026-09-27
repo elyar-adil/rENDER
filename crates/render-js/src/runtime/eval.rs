@@ -217,6 +217,12 @@ impl JsRuntime {
     ) -> Result<Completion, JsError> {
         let mut value = JsValue::Undefined;
         for statement in statements {
+            // Wrappers `ToObject` boxed for a previous statement are unreachable
+            // from this one, so drop their GC pins; inside a native dispatch a
+            // Rust frame may still hold one, so leave the pins alone there.
+            if self.call_stack.is_empty() {
+                self.transient_roots.clear();
+            }
             match self.evaluate_statement(dom, statement)? {
                 Completion::Normal(next) => value = next,
                 abrupt @ (Completion::Return(_)
@@ -1253,6 +1259,26 @@ impl JsRuntime {
             Expr::Call {
                 callee, arguments, ..
             } => self.evaluate_call(dom, callee, arguments),
+            Expr::TaggedTemplate {
+                tag,
+                quasis,
+                expressions,
+                ..
+            } => {
+                // §13.3.11: the tag is resolved first, then the template object
+                // is created, then the substitutions run left to right, and only
+                // then is the tag called with all of them.
+                let Some((callee, receiver)) = self.resolve_call_target(dom, tag)? else {
+                    return Ok(JsValue::Undefined);
+                };
+                let template = self.create_template_object(quasis)?;
+                let mut values = Vec::with_capacity(expressions.len() + 1);
+                values.push(JsValue::Object(template));
+                for expression in expressions {
+                    self.evaluate_argument(dom, expression, &mut values)?;
+                }
+                self.call_with_this(dom, callee, &values, receiver)
+            }
             Expr::Sequence(expressions) => {
                 let mut value = JsValue::Undefined;
                 for expression in expressions {
@@ -1421,10 +1447,13 @@ impl JsRuntime {
                 Ok(())
             }
             Expr::Object(properties) => {
-                let object = match value {
+                // `BindingInitialization` for an object pattern starts with
+                // `ToObject`, so a primitive destructuring target boxes into
+                // its wrapper instead of throwing; only `null`/`undefined`
+                // produce a fresh object to assign onto.
+                let object = match &value {
                     JsValue::Null | JsValue::Undefined => self.realm.create_ordinary_object(),
-                    JsValue::Object(object) => object,
-                    _ => Self::require_object(&value)?,
+                    other => self.to_object(other)?,
                 };
                 let mut excluded = Vec::new();
                 for property in properties {
@@ -1984,6 +2013,28 @@ impl JsRuntime {
         callee: &Expr,
         arguments: &[Expr],
     ) -> Result<JsValue, JsError> {
+        let Some((callee, receiver)) = self.resolve_call_target(dom, callee)? else {
+            return Ok(JsValue::Undefined);
+        };
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            self.evaluate_argument(dom, argument, &mut values)?;
+        }
+        self.call_with_this(dom, callee, &values, receiver)
+    }
+
+    /// Resolve the callee of a call expression to the callable to invoke plus
+    /// the receiver `this` will see. Shared with `Expr::TaggedTemplate`, whose
+    /// argument list is already-built values rather than expressions.
+    ///
+    /// `None` is the engine's documented lenient path for a callee that is not
+    /// a function at all: a nullish or primitive callee makes the whole
+    /// expression evaluate to `undefined` without evaluating its arguments.
+    pub(super) fn resolve_call_target(
+        &mut self,
+        dom: &mut Dom,
+        callee: &Expr,
+    ) -> Result<Option<(ObjectId, JsValue)>, JsError> {
         let callee_label = match callee {
             Expr::Member { property, .. } => format!(".{property}"),
             Expr::ComputedMember { .. } => "[]".to_owned(),
@@ -2014,7 +2065,7 @@ impl JsRuntime {
             } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
-                    return Ok(JsValue::Undefined);
+                    return Ok(None);
                 }
                 let object = self.coerce_member_base(&receiver, property)?;
                 (self.get_member(dom, object, property)?, receiver)
@@ -2024,7 +2075,7 @@ impl JsRuntime {
             } => {
                 let receiver = self.evaluate(dom, object)?;
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
-                    return Ok(JsValue::Undefined);
+                    return Ok(None);
                 }
                 let key_value = self.evaluate(dom, property)?;
                 let key = key_value.to_js_string();
@@ -2039,30 +2090,53 @@ impl JsRuntime {
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
         let callee = match callee_value {
-            JsValue::Undefined | JsValue::Null => {
-                // Web pages routinely feature-detect optional host methods
-                // through a call guarded by a surrounding branch. Treat a
-                // missing host hook as an inert call so one telemetry shim
-                // cannot abort the entire application bootstrap.
-                return Ok(JsValue::Undefined);
-            }
-            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) => {
-                return Ok(JsValue::Undefined);
-            }
-            JsValue::Symbol(_) => {
-                return Ok(JsValue::Undefined);
-            }
+            // Web pages routinely feature-detect optional host methods through
+            // a call guarded by a surrounding branch. Treat a missing host hook
+            // as an inert call so one telemetry shim cannot abort the entire
+            // application bootstrap.
+            JsValue::Undefined
+            | JsValue::Null
+            | JsValue::String(_)
+            | JsValue::Number(_)
+            | JsValue::Boolean(_)
+            | JsValue::Symbol(_) => return Ok(None),
             value @ JsValue::Object(_) => Self::require_object(&value).map_err(|_| {
                 JsError::type_error(format!(
                     "value of callee{callee_label} is undefined or not callable"
                 ))
             })?,
         };
-        let mut values = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            self.evaluate_argument(dom, argument, &mut values)?;
+        Ok(Some((callee, receiver)))
+    }
+
+    /// ECMA-262 13.3.6 `GetTemplateObject`: a template object is an array
+    /// exotic object whose indices are the cooked strings and whose `raw`
+    /// property holds the unprocessed texts. The indices are ordinary data
+    /// properties; only `raw` is non-enumerable, so a tag function can walk the
+    /// strings with `for`/`map` exactly as it walks a real array.
+    fn create_template_object(&mut self, quasis: &[(String, String)]) -> Result<ObjectId, JsError> {
+        self.ensure_heap_capacity(2)?;
+        let mut cooked = Vec::with_capacity(quasis.len());
+        let mut raw = Vec::with_capacity(quasis.len());
+        for (cooked_value, raw_value) in quasis {
+            cooked.push(JsValue::String(cooked_value.clone()));
+            raw.push(JsValue::String(raw_value.clone()));
         }
-        self.call_with_this(dom, callee, &values, receiver)
+        let raw_object = self.create_array_from_values(&raw)?;
+        let template = self.create_array_from_values(&cooked)?;
+        let _ = self.realm.define_property(
+            template,
+            "raw",
+            PropertyDescriptor {
+                value: JsValue::Object(raw_object),
+                writable: false,
+                getter: None,
+                setter: None,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        Ok(template)
     }
 
     pub(super) fn evaluate_function_expression(
@@ -2137,6 +2211,25 @@ impl JsRuntime {
                     unreachable!("object literals cannot carry private names")
                 }
             };
+            // ECMA-262 13.2.5.1 step 5.a: only the `__proto__: value` colon
+            // member is special. A shorthand `{ __proto__ }`, a method
+            // `{ __proto__() {} }`, an accessor, and the computed
+            // `{ ["__proto__"]: v }` all install an ordinary own property.
+            if matches!(&property.key, PropertyKey::Static(key) if key == "__proto__")
+                && property.accessor.is_none()
+                && !property.shorthand
+                && !property.method
+            {
+                let value = self.evaluate(dom, &property.value)?;
+                let prototype = match value {
+                    JsValue::Object(object) => Some(object),
+                    JsValue::Null => None,
+                    // Any other primitive leaves `[[Prototype]]` untouched.
+                    _ => continue,
+                };
+                self.realm.set_prototype(object, prototype);
+                continue;
+            }
             let symbol_key = match &key_value {
                 JsValue::Symbol(symbol) => Some(symbol.clone()),
                 _ => None,
@@ -2214,14 +2307,18 @@ impl JsRuntime {
         if matches!(value, JsValue::Null | JsValue::Undefined) {
             return Ok(self.realm.create_ordinary_object());
         }
-        let source = Self::require_object(value)?;
-        self.ensure_heap_capacity(1)?;
-        let result = self.realm.create_ordinary_object();
-        for (key, value) in self
+        // Object rest starts with `CopyDataProperties`, whose first step is
+        // `ToObject`, so a primitive rest source boxes into its wrapper.
+        let source = self.to_object(value)?;
+        let properties = self
             .realm
             .enumerable_own_properties(source)
-            .unwrap_or_default()
-        {
+            .unwrap_or_default();
+        // Reserve the result before reading the wrapper's keys so no collection
+        // can tombstone the wrapper between the two steps.
+        self.ensure_heap_capacity(1)?;
+        let result = self.realm.create_ordinary_object();
+        for (key, value) in properties {
             if !excluded.contains(&key) && !self.realm.set_property(result, key, value) {
                 return Err(JsError::type_error("could not define object rest property"));
             }
@@ -3142,6 +3239,25 @@ impl JsRuntime {
                 // Method access falls through to the table below and binds
                 // to this wrapper instance.
             }
+            // Web Storage: `length` is the live entry count and the numeric
+            // slots are the stored values, both provided by the area's own
+            // property table (WHATWG HTML §11.2.3).
+            Some(ObjectHost::Storage) => {
+                if property == "length" {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "entry counts stay far below any precision boundary"
+                    )]
+                    let length = self.realm.own_property_names(object).map_or(0, |keys| keys.len());
+                    return Ok(JsValue::Number(length as f64));
+                }
+                if property.parse::<usize>().is_ok() {
+                    return Ok(self
+                        .realm
+                        .own_property(object, property)
+                        .map_or(JsValue::Null, |descriptor| descriptor.value));
+                }
+            }
             _ => {}
         }
         // Precedence for every host: a property found on a real interface
@@ -3470,6 +3586,23 @@ impl JsRuntime {
                     return Ok(());
                 }
             }
+            // `length` is read-only; a numeric slot writes the entry.
+            Some(ObjectHost::Storage) => {
+                if property == "length" {
+                    return Ok(());
+                }
+                if property.parse::<usize>().is_ok() {
+                    return if self.realm.set_property(
+                        object,
+                        property.to_owned(),
+                        JsValue::String(value.to_js_string()),
+                    ) {
+                        Ok(())
+                    } else {
+                        Err(JsError::type_error("could not store the value"))
+                    };
+                }
+            }
             Some(ObjectHost::RegExp(index)) if property == "lastIndex" => {
                 let number = to_number(&value)?;
                 #[allow(
@@ -3536,6 +3669,9 @@ impl JsRuntime {
                     .and_then(|function| function.class.clone());
                 !matches!(&class, Some(class) if !class.constructor)
             }
+            // A bound function is constructable exactly when its target is:
+            // `IsConstructor` looks through the [[BoundFunction]] wrapper.
+            Some(ObjectHost::BoundCallable { target, .. }) => self.is_constructor(target),
             _ => false,
         }
     }
@@ -3837,8 +3973,49 @@ impl JsRuntime {
                     }
                 }
             }
+            Some(ObjectHost::BoundCallable { .. }) => {
+                self.construct_bound_callable(dom, constructor, arguments)
+            }
             _ => Err(JsError::type_error("value is not a constructor")),
         }
+    }
+
+    /// ECMA-262 10.2.5.4 `BoundFunctionCreate` + `[[Construct]]`: a bound
+    /// function forwards construction to its target with the bound receiver and
+    /// the bound arguments prepended, and the wrapper itself supplies the
+    /// `new.target` the target observes.
+    fn construct_bound_callable(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::BoundCallable {
+            target,
+            arguments: bound_arguments,
+            ..
+        }) = self.realm.host(constructor)
+        else {
+            return Err(JsError::type_error("value is not a constructor"));
+        };
+        if !self.is_constructor(target) {
+            return Err(JsError::type_error("value is not a constructor"));
+        }
+        let mut combined = bound_arguments;
+        combined.extend_from_slice(arguments);
+        // §10.2.5.4: the wrapper is only transparent to `new.target` when it is
+        // itself the new target, as in `new (C.bind(null, 8))()`. An explicit
+        // `Reflect.construct(B, args, Other)` keeps `Other`.
+        let new_target = self
+            .new_target_stack
+            .last()
+            .filter(|value| **value != JsValue::Object(constructor))
+            .cloned()
+            .unwrap_or(JsValue::Object(target));
+        self.new_target_stack.push(new_target);
+        let constructed = self.construct_dispatch(dom, target, &combined);
+        self.new_target_stack.pop();
+        constructed
     }
 
     pub(super) fn call(
@@ -4303,11 +4480,26 @@ impl JsRuntime {
                 arguments.len()
             );
         }
+        // ECMA-262 does not specify when memory is reclaimed, so this runtime
+        // defines it: an active call frame's arguments are reachable, exactly
+        // like the variable environments the collector already treats as roots.
+        // Without that, a value the caller computed into a Rust argument — a
+        // `ToObject` wrapper, a freshly built array — could be swept while the
+        // callee is still reading it. Pins taken here are released when the
+        // dispatch returns, and a `ToObject` wrapper's pin survives until the
+        // outermost frame unwinds, which is when no frame can still read it.
+        let pinned = self.transient_roots.len();
+        self.transient_roots
+            .extend(arguments.iter().filter_map(|argument| match argument {
+                JsValue::Object(object) => Some(*object),
+                _ => None,
+            }));
         self.call_stack.push(CallFrame {
             name: format!("{function:?}"),
         });
         let result = self.call_native_dispatch(dom, function, receiver, arguments);
         self.call_stack.pop();
+        self.transient_roots.truncate(pinned);
         result
     }
 
@@ -4440,6 +4632,47 @@ impl JsRuntime {
             JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
         }
     }
+
+    /// ECMA-262 `ToObject` (§7.1.18): every primitive except `null` and
+    /// `undefined` boxes into a fresh wrapper whose `[[Prototype]]` is the
+    /// matching `%TypeName%.prototype%`, so `valueOf`/`toString` stay on the
+    /// prototype and the Number/Boolean wrappers own no properties at all.
+    ///
+    /// `ToObject` deliberately does not cache: `Object(1) !== Object(1)` in
+    /// every engine, so each call allocates its own wrapper. The one cached
+    /// wrapper in this runtime is the `Symbol`-as-property-key object built by
+    /// `get_symbol_value`, which is a different operation.
+    pub(crate) fn to_object(&mut self, value: &JsValue) -> Result<ObjectId, JsError> {
+        let object = match value {
+            JsValue::Object(object) => return Ok(*object),
+            JsValue::String(text) => {
+                self.ensure_heap_capacity(1)?;
+                self.realm.string_wrapper(text.clone())
+            }
+            JsValue::Number(number) => {
+                self.ensure_heap_capacity(1)?;
+                self.realm.number_primitive_wrapper(*number)
+            }
+            JsValue::Boolean(flag) => {
+                self.ensure_heap_capacity(1)?;
+                self.realm.boolean_primitive_wrapper(*flag)
+            }
+            JsValue::Symbol(symbol) => {
+                self.ensure_heap_capacity(1)?;
+                self.realm.symbol_instance_wrapper(symbol.clone())
+            }
+            JsValue::Null | JsValue::Undefined => {
+                return Err(JsError::type_error(
+                    "cannot convert null or undefined to object",
+                ));
+            }
+        };
+        // Nothing script-visible holds this wrapper yet, so pin it: a later
+        // allocation in the same builtin may collect, and a swept slot reads
+        // back as a prototype-less tombstone.
+        self.transient_roots.push(object);
+        Ok(object)
+    }
 }
 
 /// Byte offset a parsed expression node carries for diagnostics, when the
@@ -4458,6 +4691,7 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         | Expr::ComputedMember { offset, .. }
         | Expr::New { offset, .. }
         | Expr::Call { offset, .. }
+        | Expr::TaggedTemplate { offset, .. }
         | Expr::Assignment { offset, .. }
         | Expr::Class { offset, .. }
         | Expr::SuperMember { offset, .. }

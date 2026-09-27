@@ -11,8 +11,9 @@ use crate::layout::{PhysicalPoint, PhysicalRect};
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
     BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
-    DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient,
-    PaintCoordinateSpace, StackingContext, Transform2D,
+    DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient, ListMarkerPaint,
+    ListMarkerShape, PaintCoordinateSpace, StackingContext, TextDecoration, TextDecorationStyle,
+    TextShadowPaint, Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 
@@ -491,6 +492,10 @@ struct RasterState<'a> {
     /// Translation accumulated by open pure-translation stacking contexts,
     /// applied on top of every item offset.
     translation: PhysicalPoint,
+    /// `text-shadow` layers seen since the last glyph run. A shadow item
+    /// describes the glyph run that follows it, so the rasterizer holds the
+    /// parameters until the run supplies the glyph geometry.
+    pending_shadows: Vec<TextShadowPaint>,
     diagnostics: Vec<RasterDiagnostic>,
     viewport_origin: PhysicalPoint,
     control: Option<&'a dyn RasterControl>,
@@ -521,6 +526,7 @@ impl<'a> RasterState<'a> {
             ))],
             frames: Vec::new(),
             translation: PhysicalPoint::default(),
+            pending_shadows: Vec::new(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -546,6 +552,7 @@ impl<'a> RasterState<'a> {
             clips: vec![ClipRegion::rect(clip)],
             frames: Vec::new(),
             translation: PhysicalPoint::default(),
+            pending_shadows: Vec::new(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -587,20 +594,18 @@ impl<'a> RasterState<'a> {
             DisplayCommand::PushStackingContext(context) => self.push_stacking_context(*context),
             DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
             DisplayCommand::GlyphRun(run) => {
-                self.paint_glyph_run(item.id, run, glyphs, offset);
+                self.paint_glyph_run(item, run, glyphs, offset);
             }
             DisplayCommand::TextDecoration(decoration) => {
-                let clip = self.current_clip();
-                let control = self.control;
-                if !fill_rect(
-                    self.current_surface(),
-                    translate_rect(decoration.rect, offset),
-                    decoration.color,
-                    clip.as_ref(),
-                    control,
-                ) {
-                    self.cancelled = true;
-                }
+                self.paint_text_decoration(decoration, offset);
+            }
+            DisplayCommand::TextShadow(shadow) => {
+                // A shadow item describes the glyph run that follows it, so the
+                // run's glyph geometry is reused instead of duplicated.
+                self.pending_shadows.push(*shadow);
+            }
+            DisplayCommand::ListMarker(marker) => {
+                self.paint_list_marker(marker, offset);
             }
             DisplayCommand::Image(image) => {
                 if let Some(decoded) = images.and_then(|images| images.get(image.resource)) {
@@ -748,17 +753,27 @@ impl<'a> RasterState<'a> {
         }
     }
 
+    /// Paint order within CSS Text Decoration Level 3 §4: the shadow layers
+    /// paint first so they stay behind the glyphs, then the glyphs, then the
+    /// decoration lines.
     fn paint_glyph_run(
         &mut self,
-        item: DisplayItemId,
+        item: &DisplayItem,
         run: &GlyphRun,
         glyphs: &dyn GlyphMaskProvider,
         offset: PhysicalPoint,
     ) {
+        let shadows = std::mem::take(&mut self.pending_shadows);
+        for shadow in shadows
+            .iter()
+            .filter(|shadow| shadow.run == item.id.fragment_hint)
+        {
+            self.paint_text_shadow(item, shadow, run, glyphs, offset);
+        }
         for glyph in &run.glyphs {
             let Some(mask) = glyphs.shared_mask(run.font, glyph.glyph, run.font_size) else {
                 self.diagnostics.push(RasterDiagnostic {
-                    item,
+                    item: item.id,
                     code: RasterDiagnosticCode::MissingGlyph,
                     message: format!("no mask for glyph {}", glyph.glyph.0),
                 });
@@ -776,6 +791,263 @@ impl<'a> RasterState<'a> {
             ) {
                 self.cancelled = true;
                 return;
+            }
+        }
+    }
+
+    /// Rasterizes the stroke rectangles of one text decoration line over a run
+    /// (CSS Text Decoration Level 3 §3).
+    fn paint_text_decoration(&mut self, decoration: &TextDecoration, offset: PhysicalPoint) {
+        let thickness = decoration.thickness;
+        if thickness <= 0.0 || decoration.rect.size.width <= 0.0 {
+            return;
+        }
+        let rect = translate_rect(decoration.rect, offset);
+        let left = rect.origin.x;
+        let width = rect.size.width;
+        let top = rect.origin.y;
+        match decoration.style {
+            TextDecorationStyle::Solid => {
+                self.fill_decoration(left, top, width, thickness, decoration.color);
+            }
+            TextDecorationStyle::Double => {
+                // A double line is two strokes with a gap the thickness of one
+                // stroke between them (CSS Text Decoration Level 3 §3.1).
+                self.fill_decoration(left, top, width, thickness, decoration.color);
+                self.fill_decoration(
+                    left,
+                    top + thickness * 2.0,
+                    width,
+                    thickness,
+                    decoration.color,
+                );
+            }
+            TextDecorationStyle::Dotted => {
+                let step = (thickness * 2.0).max(1.0);
+                let mut x = 0.0;
+                while x < width {
+                    self.fill_decoration(
+                        left + x,
+                        top,
+                        thickness.min(width - x),
+                        thickness,
+                        decoration.color,
+                    );
+                    x += step;
+                }
+            }
+            TextDecorationStyle::Dashed => {
+                let dash = (thickness * 3.0).max(3.0);
+                let gap = (thickness * 3.0).max(3.0);
+                let mut x = 0.0;
+                while x < width {
+                    self.fill_decoration(
+                        left + x,
+                        top,
+                        dash.min(width - x),
+                        thickness,
+                        decoration.color,
+                    );
+                    x += dash + gap;
+                }
+            }
+            TextDecorationStyle::Wavy => {
+                // A wave is a sine of one period per four thicknesses; the
+                // stroke follows it, so the sampled step is a quarter of the
+                // shortest feature the shape has.
+                let amplitude = thickness / 2.0;
+                let period = (thickness * 4.0).max(4.0);
+                let step = (period / 16.0).max(1.0);
+                let middle = top + thickness / 2.0;
+                let mut x = 0.0;
+                while x < width {
+                    let phase = (x / period) * std::f32::consts::TAU;
+                    let y = middle - amplitude * phase.sin();
+                    self.fill_decoration(
+                        left + x,
+                        y - thickness / 2.0,
+                        step,
+                        thickness,
+                        decoration.color,
+                    );
+                    x += step;
+                }
+            }
+        }
+    }
+
+    fn fill_decoration(&mut self, x: f32, y: f32, width: f32, height: f32, color: Color) {
+        let clip = self.current_clip();
+        let control = self.control;
+        if !fill_rect(
+            self.current_surface(),
+            PhysicalRect::new(x, y, width, height),
+            color,
+            clip.as_ref(),
+            control,
+        ) {
+            self.cancelled = true;
+        }
+    }
+
+    /// Paints one `text-shadow` layer behind a glyph run: the same glyph
+    /// outlines, displaced by the shadow offset and, when a blur radius is
+    /// given, convolved with a box-blur approximation of a Gaussian of the
+    /// matching standard deviation.
+    ///
+    /// The shadow is composed from a scratch surface the size of its own
+    /// damage bounds, so the blur never allocates at viewport scale.
+    fn paint_text_shadow(
+        &mut self,
+        item: &DisplayItem,
+        shadow: &TextShadowPaint,
+        run: &GlyphRun,
+        glyphs: &dyn GlyphMaskProvider,
+        offset: PhysicalPoint,
+    ) {
+        if shadow.color.alpha == 0 {
+            return;
+        }
+        let area = translate_rect(item.bounds, offset);
+        let Some(visible) = intersection(Some(area), self.current_clip().map_or(area, |c| c.rect))
+        else {
+            return;
+        };
+        let origin_x = floor_to_u32(area.origin.x);
+        let origin_y = floor_to_u32(area.origin.y);
+        let width = ceil_to_u32(area.right()).saturating_sub(origin_x);
+        let height = ceil_to_u32(area.bottom()).saturating_sub(origin_y);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let mut layer = Surface::new(width, height, Color::TRANSPARENT);
+        for glyph in &run.glyphs {
+            let Some(mask) = glyphs.shared_mask(run.font, glyph.glyph, run.font_size) else {
+                self.diagnostics.push(RasterDiagnostic {
+                    item: item.id,
+                    code: RasterDiagnosticCode::MissingGlyph,
+                    message: format!("no mask for glyph {}", glyph.glyph.0),
+                });
+                continue;
+            };
+            let painted = translate_point(glyph.position, offset);
+            let local = PhysicalPoint {
+                x: painted.x + shadow.offset.x - area.origin.x,
+                y: painted.y + shadow.offset.y - area.origin.y,
+            };
+            if !paint_glyph(
+                &mut layer,
+                mask.as_ref(),
+                local,
+                shadow.color,
+                None,
+                self.control,
+            ) {
+                self.cancelled = true;
+                return;
+            }
+        }
+        blur_alpha(&mut layer, shadow.blur_radius);
+        let left = floor_to_u32(visible.origin.x);
+        let top = floor_to_u32(visible.origin.y);
+        let right = ceil_to_u32(visible.right()).min(self.width);
+        let bottom = ceil_to_u32(visible.bottom()).min(self.height);
+        for y in top..bottom {
+            if self.is_cancelled() {
+                return;
+            }
+            for x in left..right {
+                let alpha = layer
+                    .pixel(x.saturating_sub(origin_x), y.saturating_sub(origin_y))
+                    .map_or(0.0, |source| f32::from(source.alpha) / 255.0);
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let coverage = clip_coverage(
+                    self.current_clip().as_ref(),
+                    u32_to_f32(x) + 0.5,
+                    u32_to_f32(y) + 0.5,
+                );
+                if coverage <= 0.0 {
+                    continue;
+                }
+                if let Some(index) = self.current_surface().index(x, y) {
+                    let surface = self.current_surface();
+                    surface.pixels[index] = blend(
+                        surface.pixels[index],
+                        shadow.color.with_opacity(alpha * coverage),
+                        1.0,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Paints a list-item bullet. A disc and a circle are the inscribed disc
+    /// of the marker box, filled and hollow respectively (CSS Lists 3 §3.1
+    /// leaves their rendering to the user agent).
+    fn paint_list_marker(&mut self, marker: &ListMarkerPaint, offset: PhysicalPoint) {
+        let rect = translate_rect(marker.rect, offset);
+        if marker.shape == ListMarkerShape::Square {
+            self.fill_decoration(
+                rect.origin.x,
+                rect.origin.y,
+                rect.size.width,
+                rect.size.height,
+                marker.color,
+            );
+            return;
+        }
+        let diameter = rect.size.width.min(rect.size.height);
+        if diameter <= 0.0 {
+            return;
+        }
+        let center = PhysicalPoint {
+            x: rect.origin.x + rect.size.width / 2.0,
+            y: rect.origin.y + rect.size.height / 2.0,
+        };
+        let outer = diameter / 2.0;
+        let ring = (diameter * 0.2).max(1.0);
+        let inner = (outer - ring).max(0.0);
+        let Some(visible) = intersection(Some(rect), self.current_clip().map_or(rect, |c| c.rect))
+        else {
+            return;
+        };
+        let left = floor_to_u32(visible.origin.x);
+        let top = floor_to_u32(visible.origin.y);
+        let right = ceil_to_u32(visible.right().min(u32_to_f32(self.width)));
+        let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(self.height)));
+        for y in top..bottom {
+            if self.is_cancelled() {
+                return;
+            }
+            for x in left..right {
+                let point = PhysicalPoint {
+                    x: u32_to_f32(x) + 0.5,
+                    y: u32_to_f32(y) + 0.5,
+                };
+                let coverage = clip_coverage(self.current_clip().as_ref(), point.x, point.y);
+                if coverage <= 0.0 {
+                    continue;
+                }
+                let distance = (point.x - center.x).hypot(point.y - center.y);
+                let filled = (outer - distance).clamp(0.0, 1.0);
+                let alpha = if marker.shape == ListMarkerShape::Circle {
+                    (filled - (inner - distance).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+                } else {
+                    filled
+                };
+                if alpha <= 0.0 {
+                    continue;
+                }
+                if let Some(index) = self.current_surface().index(x, y) {
+                    let surface = self.current_surface();
+                    surface.pixels[index] = blend(
+                        surface.pixels[index],
+                        marker.color.with_opacity(alpha * coverage),
+                        1.0,
+                    );
+                }
             }
         }
     }
@@ -862,7 +1134,7 @@ impl<'a> RasterState<'a> {
     ///
     /// Layer pixels hold `document point + push-time offset`, so the mapping
     /// from layer pixels to parent pixels is
-    /// `T(offset) ∘ transform ∘ T(−offset)`.
+    /// `T(offset) �?transform �?T(−offset)`.
     fn warp_top_layer(&mut self, transform: Transform2D, offset: PhysicalPoint, opacity: f32) {
         let layer = self.layers.pop().expect("layer frame has a surface");
         let into_layer = Transform2D {
@@ -1607,6 +1879,110 @@ fn clear_rect(
     true
 }
 
+/// The widest blur radius the box-blur approximation will rasterize. A larger
+/// declared radius is already far wider than any shadow a page can show, and
+/// the convolution is separable, so clamping keeps the pass bounded.
+const MAX_BLUR_RADIUS: f32 = 1024.0;
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped into a small non-negative pixel radius first"
+)]
+fn blur_radius_in_pixels(radius: f32) -> i32 {
+    radius.round().clamp(0.0, MAX_BLUR_RADIUS) as i32
+}
+
+/// Convolves a scratch surface's alpha channel with a Gaussian of the given
+/// standard deviation.
+///
+/// CSS defines a `text-shadow` blur as a two-dimensional Gaussian with
+/// `sigma = blur / 2` (CSS Text Decoration Level 3 §4.2). A Gaussian is
+/// approximated here by three successive box blurs, whose combined variance
+/// matches a single box of `sqrt(3) * sigma`; three passes make the kernel
+/// close enough to Gaussian for a shadow while staying separable, so the cost
+/// stays linear in the area.
+fn blur_alpha(surface: &mut Surface, blur_radius: f32) {
+    if !blur_radius.is_finite() || blur_radius <= 0.0 {
+        return;
+    }
+    let sigma = blur_radius / 2.0;
+    let box_width = (3.0_f32).sqrt() * sigma;
+    if box_width < 1.0 {
+        return;
+    }
+    let radius = blur_radius_in_pixels(box_width / 2.0);
+    if radius < 1 {
+        return;
+    }
+    let width = i32::try_from(surface.width()).unwrap_or(i32::MAX);
+    let height = i32::try_from(surface.height()).unwrap_or(i32::MAX);
+    let mut alpha = vec![0_u8; surface.pixels.len()];
+    for (index, pixel) in surface.pixels.iter().enumerate() {
+        alpha[index] = pixel.alpha;
+    }
+    let mut line = vec![0_u8; alpha.len()];
+    for _ in 0..3 {
+        for y in 0..height {
+            box_blur_line(&alpha, &mut line, width, height, y, radius, true);
+        }
+        for x in 0..width {
+            box_blur_line(&line, &mut alpha, width, height, x, radius, false);
+        }
+    }
+    for (index, value) in alpha.iter().enumerate() {
+        if let Some(pixel) = surface.pixels.get_mut(index) {
+            pixel.alpha = *value;
+        }
+    }
+}
+
+/// One separable box-blur pass over a single row or column, with the edges
+/// clamped as a fully transparent surface would behave.
+fn box_blur_line(
+    source: &[u8],
+    target: &mut [u8],
+    width: i32,
+    height: i32,
+    index: i32,
+    radius: i32,
+    horizontal: bool,
+) {
+    let length = if horizontal { width } else { height };
+    let stride = if horizontal { 1 } else { width.max(1) };
+    let base = if horizontal { index * stride } else { index };
+    for position in 0..length {
+        let mut sum = 0_usize;
+        let mut count = 0_usize;
+        for delta in -radius..=radius {
+            let sample = position + delta;
+            if sample < 0 || sample >= length {
+                continue;
+            }
+            let offset = base + position * stride + delta * stride;
+            let Some(value) = usize::try_from(offset)
+                .ok()
+                .and_then(|index| source.get(index))
+                .copied()
+            else {
+                continue;
+            };
+            sum += usize::from(value);
+            count += 1;
+        }
+        let destination = base + position * stride;
+        if let Some(slot) = usize::try_from(destination)
+            .ok()
+            .and_then(|index| target.get_mut(index))
+        {
+            *slot = sum
+                .checked_div(count)
+                .and_then(|average| u8::try_from(average).ok())
+                .unwrap_or(0);
+        }
+    }
+}
+
 fn paint_glyph(
     surface: &mut Surface,
     mask: &GlyphMask,
@@ -1725,8 +2101,7 @@ fn paint_image(
 /// Blends `source` into `destination` through `transform`, which maps source
 /// pixel coordinates to destination pixel coordinates.
 ///
-/// Every destination pixel inside the transformed source bounding box —
-/// intersected with `clip` and the destination bounds — inverse-maps to a
+/// Every destination pixel inside the transformed source bounding box �?/// intersected with `clip` and the destination bounds �?inverse-maps to a
 /// bilinear source sample that blends in with `opacity`. Only the clip
 /// rectangle is honored here, on par with the former 1:1 composite: rounded
 /// clip shapes stay a paint-time concern because the source surface already
@@ -1983,8 +2358,9 @@ mod tests {
     use crate::paint::display_list::{
         BlendMode, BorderPaint, BoxShadowPaint, ClipShape, CompositingReason, CornerRadii,
         DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FontInstanceId, GlyphId,
-        GlyphInstance, GlyphRun, GradientStop, LinearGradient, PaintCoordinateSpace, PaintPhase,
-        StackingContext, Transform2D,
+        GlyphInstance, GlyphRun, GradientStop, LinearGradient, ListMarkerPaint, ListMarkerShape,
+        PaintCoordinateSpace, PaintPhase, StackingContext, TextDecoration, TextDecorationLine,
+        TextDecorationStyle, TextShadowPaint, Transform2D,
     };
     use crate::paint::{
         GlyphMask, GlyphMaskProvider, PaintScene, RasterControl, RasterRequest, RetainedFrame,
@@ -2060,6 +2436,312 @@ mod tests {
                 command: DisplayCommand::SolidRect { rect, color },
             }],
         }
+    }
+
+    /// A block of solid coverage used to stand in for a glyph outline.
+    fn block_masks() -> BlockMasks {
+        BlockMasks
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct BlockMasks;
+
+    impl GlyphMaskProvider for BlockMasks {
+        fn mask(
+            &self,
+            _font: FontInstanceId,
+            _glyph: GlyphId,
+            _font_size: f32,
+        ) -> Option<GlyphMask> {
+            Some(GlyphMask {
+                width: 4,
+                height: 4,
+                left: 0,
+                top: 4,
+                coverage: vec![255; 16],
+            })
+        }
+    }
+
+    fn command_items(
+        viewport: PhysicalSize,
+        bounds: PhysicalRect,
+        commands: Vec<(u32, DisplayCommand)>,
+    ) -> DisplayList {
+        let dom = Dom::new();
+        DisplayList {
+            dom_revision: dom.revision(),
+            viewport,
+            items: commands
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, (fragment_hint, command))| DisplayItem {
+                    id: DisplayItemId {
+                        source: None,
+                        fragment_hint,
+                        phase: PaintPhase::Content,
+                        ordinal: u32::try_from(ordinal).unwrap_or(0),
+                    },
+                    fragment: FragmentId::from_index(0),
+                    source: None,
+                    bounds,
+                    coordinate_space: PaintCoordinateSpace::Document,
+                    command,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn solid_underline_paints_one_stroke_row() {
+        let rect = PhysicalRect::new(2.0, 5.0, 6.0, 1.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 16.0,
+                height: 12.0,
+            },
+            rect,
+            vec![(
+                0,
+                DisplayCommand::TextDecoration(TextDecoration {
+                    rect,
+                    color: Color::rgb(0, 0, 255),
+                    line: TextDecorationLine::Underline,
+                    style: TextDecorationStyle::Solid,
+                    thickness: 1.0,
+                }),
+            )],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        assert!(output.diagnostics.is_empty());
+        assert_eq!(output.surface.pixel(2, 5), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(output.surface.pixel(7, 5), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(output.surface.pixel(8, 5), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(2, 4), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn dashed_underline_paints_gaps() {
+        let rect = PhysicalRect::new(1.0, 4.0, 20.0, 1.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 24.0,
+                height: 8.0,
+            },
+            rect,
+            vec![(
+                0,
+                DisplayCommand::TextDecoration(TextDecoration {
+                    rect,
+                    color: Color::rgb(255, 0, 0),
+                    line: TextDecorationLine::Underline,
+                    style: TextDecorationStyle::Dashed,
+                    thickness: 1.0,
+                }),
+            )],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        // A one-pixel stroke dashes three pixels on and three off.
+        assert_eq!(output.surface.pixel(1, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(3, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(4, 4), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(7, 4), Some(Color::rgb(255, 0, 0)));
+    }
+
+    #[test]
+    fn double_decoration_paints_two_strokes() {
+        let rect = PhysicalRect::new(1.0, 2.0, 4.0, 1.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 8.0,
+                height: 8.0,
+            },
+            rect,
+            vec![(
+                0,
+                DisplayCommand::TextDecoration(TextDecoration {
+                    rect,
+                    color: Color::rgb(0, 128, 0),
+                    line: TextDecorationLine::Overline,
+                    style: TextDecorationStyle::Double,
+                    thickness: 1.0,
+                }),
+            )],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        assert_eq!(output.surface.pixel(2, 2), Some(Color::rgb(0, 128, 0)));
+        assert_eq!(output.surface.pixel(2, 3), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(2, 4), Some(Color::rgb(0, 128, 0)));
+    }
+
+    #[test]
+    fn text_shadow_offsets_the_glyph_outline_behind_the_text() {
+        let run = GlyphRun {
+            font: FontInstanceId(0),
+            font_size: 8.0,
+            color: Color::rgb(0, 0, 0),
+            glyphs: vec![GlyphInstance {
+                glyph: GlyphId(65),
+                position: PhysicalPoint { x: 4.0, y: 8.0 },
+                advance: 4.0,
+            }],
+        };
+        let shadow = TextShadowPaint {
+            run: 7,
+            font: FontInstanceId(0),
+            font_size: 8.0,
+            offset: PhysicalPoint { x: 3.0, y: 0.0 },
+            blur_radius: 0.0,
+            color: Color::rgb(0, 0, 255),
+        };
+        let bounds = PhysicalRect::new(1.0, 4.0, 12.0, 8.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 20.0,
+                height: 14.0,
+            },
+            bounds,
+            vec![
+                (7, DisplayCommand::TextShadow(shadow)),
+                (7, DisplayCommand::GlyphRun(run)),
+            ],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &block_masks());
+        assert!(output.diagnostics.is_empty(), "{:?}", output.diagnostics);
+        // The glyph itself covers x = 4..8 and y = 4..8.
+        assert_eq!(output.surface.pixel(4, 7), Some(Color::rgb(0, 0, 0)));
+        // The shadow repeats it three pixels to the right, so x = 7..11 is
+        // blue where the glyph does not cover it. The shadow item comes
+        // before the run, so the two overlap in the text's favour.
+        assert_eq!(output.surface.pixel(7, 7), Some(Color::rgb(0, 0, 0)));
+        assert_eq!(output.surface.pixel(8, 7), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(output.surface.pixel(10, 7), Some(Color::rgb(0, 0, 255)));
+        assert_eq!(output.surface.pixel(11, 7), Some(Color::WHITE));
+    }
+
+    #[test]
+    fn text_shadow_blur_spreads_beyond_the_glyph_outline() {
+        let run = GlyphRun {
+            font: FontInstanceId(0),
+            font_size: 8.0,
+            color: Color::rgb(0, 0, 0),
+            glyphs: vec![GlyphInstance {
+                glyph: GlyphId(65),
+                position: PhysicalPoint { x: 8.0, y: 8.0 },
+                advance: 4.0,
+            }],
+        };
+        let shadow = TextShadowPaint {
+            run: 3,
+            font: FontInstanceId(0),
+            font_size: 8.0,
+            offset: PhysicalPoint { x: 0.0, y: 0.0 },
+            blur_radius: 4.0,
+            color: Color::rgb(0, 0, 0),
+        };
+        let bounds = PhysicalRect::new(4.0, 4.0, 16.0, 8.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 24.0,
+                height: 16.0,
+            },
+            bounds,
+            vec![
+                (3, DisplayCommand::TextShadow(shadow)),
+                (3, DisplayCommand::GlyphRun(run)),
+            ],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &block_masks());
+        // Four pixels outside the four-pixel glyph the shadow has faded, but
+        // not to nothing.
+        let faded = output.surface.pixel(6, 7).expect("shadow pixel");
+        assert!(
+            faded.red < 255 && faded.red > 0,
+            "the blur should have left partial coverage, found {faded:?}"
+        );
+        // And at the very edge of the shadow's own damage bounds the blur has
+        // decayed to nothing.
+        let edge = output.surface.pixel(4, 7).expect("shadow edge pixel");
+        assert!(
+            edge.red > 200,
+            "expected the blur to have faded out, {edge:?}"
+        );
+    }
+
+    #[test]
+    fn disc_marker_fills_and_circle_marker_hollows_the_same_box() {
+        let rect = PhysicalRect::new(2.0, 2.0, 8.0, 8.0);
+        let viewport = PhysicalSize {
+            width: 12.0,
+            height: 12.0,
+        };
+        let disc_list = command_items(
+            viewport,
+            rect,
+            vec![(
+                0,
+                DisplayCommand::ListMarker(ListMarkerPaint {
+                    rect,
+                    color: Color::rgb(0, 0, 0),
+                    shape: ListMarkerShape::Disc,
+                }),
+            )],
+        );
+        let circle_list = command_items(
+            viewport,
+            rect,
+            vec![(
+                0,
+                DisplayCommand::ListMarker(ListMarkerPaint {
+                    rect,
+                    color: Color::rgb(0, 0, 0),
+                    shape: ListMarkerShape::Circle,
+                }),
+            )],
+        );
+        let disc = CpuRasterizer.rasterize(&disc_list, Color::WHITE, &NoGlyphMasks);
+        let circle = CpuRasterizer.rasterize(&circle_list, Color::WHITE, &NoGlyphMasks);
+        let center = disc.surface.pixel(5, 5).expect("disc centre");
+        assert_eq!(center.alpha, 255, "the disc centre must be solid");
+        assert_eq!(
+            circle.surface.pixel(5, 5),
+            Some(Color::WHITE),
+            "the circle centre must stay hollow"
+        );
+        assert_eq!(
+            circle.surface.pixel(2, 5).map(|color| color.alpha > 0),
+            Some(true),
+            "the circle ring must be painted"
+        );
+        assert_eq!(
+            disc.surface.pixel(0, 0),
+            Some(Color::WHITE),
+            "paint must stay inside the marker box"
+        );
+    }
+
+    #[test]
+    fn square_marker_fills_its_rect() {
+        let rect = PhysicalRect::new(3.0, 3.0, 2.0, 2.0);
+        let list = command_items(
+            PhysicalSize {
+                width: 8.0,
+                height: 8.0,
+            },
+            rect,
+            vec![(
+                0,
+                DisplayCommand::ListMarker(ListMarkerPaint {
+                    rect,
+                    color: Color::rgb(255, 0, 255),
+                    shape: ListMarkerShape::Square,
+                }),
+            )],
+        );
+        let output = CpuRasterizer.rasterize(&list, Color::WHITE, &NoGlyphMasks);
+        assert_eq!(output.surface.pixel(3, 3), Some(Color::rgb(255, 0, 255)));
+        assert_eq!(output.surface.pixel(4, 4), Some(Color::rgb(255, 0, 255)));
+        assert_eq!(output.surface.pixel(5, 4), Some(Color::WHITE));
     }
 
     #[test]

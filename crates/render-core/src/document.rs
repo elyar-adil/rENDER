@@ -10,16 +10,19 @@ use std::collections::{BTreeMap, HashMap};
 
 use url::Url;
 
-use crate::css::cascade::{CascadeInput, CascadeOrigin};
+use crate::css::cascade::{
+    CascadeInput, CascadeOrigin, media_query_list_is_supported, media_query_list_matches,
+};
 use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
     compute_document_styles_with_hints,
 };
 use crate::css::selector::MatchContext;
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
-use crate::dom::{Dom, DomRevision, ElementData, Node, NodeId, NodeKind};
-use crate::html::{HtmlParseError, QuirksMode, parse_document};
+use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
+use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting};
 use crate::image::ImageResources;
+use crate::image::inline_svg::svg_geometry;
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
     LayoutOutput, PhysicalPoint, SimpleTextMeasurer, TextMeasurer, build_formatting_tree,
@@ -31,42 +34,366 @@ use crate::paint::{
     TextShaper, build_display_list_with_images,
 };
 
-/// Minimal interoperable defaults used before a generated HTML UA sheet lands.
+/// The HTML user-agent style sheet.
+///
+/// Source: WHATWG HTML Standard, "Rendering" chapter
+/// (<https://html.spec.whatwg.org/multipage/rendering.html>): §15.2 states
+/// that "the CSS rules given in these subsections are ... expected to be used
+/// as part of the user-agent level style sheet defaults for all documents that
+/// contain HTML elements", and §15.3.1-§15.3.12 plus §15.5.4-§15.5.6 give the
+/// per-element suggestions this sheet follows. Presentational *attribute*
+/// mappings from the same chapter stay in [`presentational_hint_declarations`]
+/// below, which cascades them per element at the same origin.
+///
 /// Longhands are intentional: shorthand expansion is a separate CSS feature.
+///
+/// Adaptations to this engine, each of which is a capability gap rather than a
+/// preference:
+///
+/// * The spec writes logical properties (`margin-block`,
+///   `padding-inline-start`, `inset-inline-start`, `border-inline-width`, ...).
+///   The layout solver consumes physical longhands only, so every logical
+///   property below is written out physically. This sheet is therefore
+///   left-to-right; the block direction and RTL mirror need `direction` support
+///   in the layout solver (render-layout) first.
+/// * `font-weight`, `font-style`, `font-family`, `small-caps`, `text-transform`,
+///   `letter-spacing`, `text-indent` and `vertical-align` reach the computed
+///   style but no consumer downstream of render-core reads them: the layout
+///   solver's `TextStyle` carries only `font_size` and `line_height`. The rules
+///   are correct and kept, but headings, emphasis, and monospace blocks render
+///   in the inherited face and weight today. See `docs/` and the render-layout
+///   `TextStyle` struct for the unblock.
+/// * `q` has no rule here on purpose: §15.3.4 styles it through
+///   `q::before { content: open-quote }` and `q::after { content: close-quote }`,
+///   and this engine does not generate content. Substituting a font change
+///   would be a different specification, not a smaller one.
+/// * Quirks-mode rules (§15.3.9 margin collapsing quirks, the `li` inside
+///   `list-style-position` default, and the table font reset) are not applied;
+///   this sheet is the no-quirks rendering.
+/// * `dialog` uses physical `left`/`right` instead of the spec's logical
+///   `inset-inline-*` pairs for the same reason as above.
 const UA_STYLE_SHEET: &str = r#"
+/* §15.3.1 Hidden elements. */
+head, area, base, basefont, datalist, link, meta, noembed, noframes, param,
+rp, script, style, template, title, track, [hidden] { display: none; }
+input[type="hidden" i] { display: none; }
+
+/* §15.3.2 The page. */
+html, body { display: block; }
+body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
+
+/* §15.3.3 Flow content. The block margins of the elements with default
+   margins are declared through `:where` for the reason given at
+   [`QUIRKS_STYLE_SHEET`]: the quirks-mode margin-collapsing rules of §15.3.9
+   are user-agent rules too, and a type selector would outrank them. */
 html, body, address, article, aside, blockquote, center, details, dialog, div,
 dd, dl, dt, fieldset, figcaption, figure, footer, form, header, hgroup, hr,
 legend, listing, main, menu, nav, ol, p, plaintext, pre, search, section, ul,
 xmp, h1, h2, h3, h4, h5, h6 { display: block; }
-li, summary { display: list-item; }
+center { text-align: center; }
+:where(blockquote, listing, p, plaintext, pre, xmp) {
+  margin-top: 1em; margin-bottom: 1em;
+}
+blockquote, figure { margin-left: 40px; margin-right: 40px; }
+address { font-style: italic; }
+listing, plaintext, pre, xmp { font-family: monospace; white-space: pre; }
+dialog:not([open]) { display: none; }
+dialog {
+  position: absolute;
+  left: 0; right: 0;
+  padding: 1em;
+  border: 1px solid;
+  background-color: canvas;
+  color: canvastext;
+}
+
+/* §15.3.4 Phrasing content. */
+cite, dfn, em, i, var { font-style: italic; }
+b, strong { font-weight: bolder; }
+code, kbd, samp, tt { font-family: monospace; }
+big { font-size: larger; }
+small { font-size: smaller; }
+sub { vertical-align: sub; }
+sup { vertical-align: super; }
+sub, sup { line-height: normal; font-size: smaller; }
+ruby { display: ruby; }
+rb { display: ruby-base; }
+rtc { display: ruby-text-container; }
+rt { display: ruby-text; }
+a:link { color: #0000ee; text-decoration-line: underline; }
+a:visited { color: #551a8b; text-decoration-line: underline; }
+mark { background-color: yellow; color: black; }
+abbr[title], acronym[title] {
+  text-decoration-line: underline;
+  text-decoration-style: dotted;
+}
+ins, u { text-decoration-line: underline; }
+del, s, strike { text-decoration-line: line-through; }
+nobr { white-space: nowrap; }
+
+/* §15.3.6 Sections and headings. */
+article, aside, hgroup, nav, section { display: block; }
+h1, h2, h3, h4, h5, h6 { font-weight: bold; }
+h1 { font-size: 2em; }
+h2 { font-size: 1.5em; }
+h3 { font-size: 1.17em; }
+h4 { font-size: 1em; }
+h5 { font-size: 0.83em; }
+h6 { font-size: 0.67em; }
+:where(h1) { margin-top: 0.67em; margin-bottom: 0.67em; }
+:where(h2) { margin-top: 0.83em; margin-bottom: 0.83em; }
+:where(h3) { margin-top: 1em; margin-bottom: 1em; }
+:where(h4) { margin-top: 1.33em; margin-bottom: 1.33em; }
+:where(h5) { margin-top: 1.67em; margin-bottom: 1.67em; }
+:where(h6) { margin-top: 2.33em; margin-bottom: 2.33em; }
+
+/* §15.3.7 Lists. */
+dir, dd, dl, dt, menu, ol, ul { display: block; }
+li { display: list-item; }
+:where(dir, dl, menu, ol, ul) { margin-top: 1em; margin-bottom: 1em; }
+:where(dl menu, dl ol, dl ul, ol ol, ol ul, ul menu, ul ol, ul ul) {
+  margin-top: 0; margin-bottom: 0;
+}
+dd { margin-left: 40px; }
+dir, menu, ol, ul { padding-left: 40px; }
+ol { list-style-type: decimal; }
+dir, menu, ul { list-style-type: disc; }
+ul ul, ul menu, ol ul, ol menu, menu ul, menu menu {
+  list-style-type: circle;
+}
+ul ul ul, ul ul menu, ul menu ul, ul menu menu,
+ol ul ul, ol ul menu, ol menu ul, ol menu menu,
+menu ul ul, menu ul menu, menu menu ul, menu menu menu {
+  list-style-type: square;
+}
+
+/* §15.3.8 Tables. */
 table { display: table; }
+caption { display: table-caption; }
+colgroup { display: table-column-group; }
+col { display: table-column; }
 thead { display: table-header-group; }
 tbody { display: table-row-group; }
 tfoot { display: table-footer-group; }
 tr { display: table-row; }
 td, th { display: table-cell; }
-caption { display: table-caption; }
-colgroup { display: table-column-group; }
-col { display: table-column; }
+th { font-weight: bold; }
+caption { text-align: center; }
+/* The engine cascades presentational attributes at the user-agent origin with
+   zero specificity (HTML5 §15.3) instead of the author origin the standard
+   specifies (§15.2), so a UA rule only yields to `cellpadding`/`cellspacing`
+   when it too has zero specificity. These two declarations therefore use
+   `:where`; moving the hints to their specified origin removes the need. */
+:where(td, th) { padding: 1px; }
+:where(table) { box-sizing: border-box; border-spacing: 2px; }
+/* §15.3.8, in the "presentational hints" block: a cell with a `nowrap`
+   attribute does not wrap. Declared through `:where` so that the quirks-mode
+   override in `presentational_hint_declarations` - which the specification
+   says must override this rule, and which sits at the same zero specificity -
+   wins on order. */
+:where(td[nowrap], th[nowrap]) { white-space: nowrap; }
+
+/* §15.3.10 Form controls. The spec defers the widget look to §15.5 and no
+   longer states a control font; engines ship a smaller UI face than the
+   document face, and `font-size` is the half of that this engine renders. */
+button, input, select, textarea { font-size: 13.3333px; }
 button, input, select, textarea { display: inline-block; }
-button { text-align: center; }
-input:not([type="hidden" i]) { width: 180px; min-height: 22px; padding-left: 4px; padding-right: 4px; border: 1px solid #888; }
-input[type="hidden" i] { display: none; }
-ruby { display: ruby; }
-rb { display: ruby-base; }
-rt { display: ruby-text; }
-rtc { display: ruby-text-container; }
-head, area, base, basefont, datalist, link, meta, noembed, noframes, param,
-rp, script, source, style, template, title, track, [hidden] { display: none; }
-body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
-center { text-align: center; }
+button, input:is([type="reset" i], [type="button" i], [type="submit" i]) {
+  text-align: center;
+}
+button, input, select, textarea { box-sizing: border-box; }
+textarea { white-space: pre-wrap; }
+input:not([type="hidden" i]) {
+  width: 180px; min-height: 22px;
+  padding-left: 4px; padding-right: 4px;
+  border: 1px solid #888;
+}
+
+/* §15.3.11 The hr element. */
+hr {
+  color: gray;
+  border-style: inset;
+  border-width: 1px;
+  margin-top: 0.5em; margin-bottom: 0.5em;
+  margin-left: auto; margin-right: auto;
+  overflow: hidden;
+}
+
+/* §15.3.12 The fieldset and legend elements. `ThreeDFace` is a system colour
+   this engine does not define, so the system button face is spelled out. */
+fieldset {
+  border: 2px groove;
+  border-color: #c0c0c0;
+  padding-top: 0.35em; padding-bottom: 0.625em;
+  padding-left: 0.75em; padding-right: 0.75em;
+}
+legend { padding-left: 2px; padding-right: 2px; }
+
+/* §15.5.5 The details and summary elements. */
+details > summary:first-of-type { display: list-item; }
+
+/* Inline SVG (SVG 2 §3.2.1, §3.11 and §4.2).
+
+   `width` and `height` on an `svg` element are presentation attributes for the
+   CSS properties of the same name (SVG 2 §4.2), so the element is sized by its
+   own geometry attributes rather than by its contents; the presentational-hint
+   path below supplies them, falling back to the `viewBox` extent.
+
+   `display: inline-block` is this engine's choice and not a quotation. The
+   initial value of `display` is `inline`, and a character-level inline box has
+   no geometry, so with the initial value every inline icon would have no box
+   to paint into. `inline-block` is the closest value this engine has to the
+   replaced element a browser treats an `svg` as, it is what
+   `image::inline_svg` registers a raster against, and any author `display`
+   overrides it.
+
+   `overflow: hidden` is SVG 2 §3.11 verbatim: "In the User Agent style sheet,
+   overflow is overridden for the 'svg' element when it is not the root element
+   of a stand-alone document ... to be hidden by default." It is the clip that
+   keeps a `foreignObject`'s HTML inside the icon's box.
+
+   §3.2.1's never-rendered element types have no direct representation in the
+   rendering tree whatever their `display` value. The list is also declared, as
+   data, in `image::inline_svg::NEVER_RENDERED_SVG_ELEMENTS`, and a test there
+   asserts that constant against the specification text, so this rule and that
+   list cannot drift apart. Hiding them here is also what keeps a `<title>`'s
+   text and a `<style>`'s CSS out of the page's text layout. The rule matches
+   by local name, which is the case the SVG namespace uses. */
+svg { display: inline-block; overflow: hidden; }
+clipPath, defs, desc, linearGradient, marker, mask, metadata, pattern,
+radialGradient, script, style, title { display: none; }
 "#;
+
+/// The part of the user-agent sheet that depends on the document's scripting
+/// mode.
+///
+/// §15.3.1's list of elements a user agent is expected to render with
+/// `display: none` names `head`, `link`, `meta`, `script`, `style`, `template`,
+/// `title` and the rest, and pointedly does **not** name `noscript`: whether
+/// a `noscript` element's contents are the fallback a page serves to a user
+/// without scripting, or inert text the parser never turned into elements, is
+/// decided by the scripting mode (HTML 13.2.4.5, and the `noscript` rules at
+/// 13.2.6.4.4 and 13.2.6.4.5).
+///
+/// So the rule is conditional, in the same way the parse is:
+///
+/// * **Scripting enabled.** The parser treats `noscript` contents as raw text,
+///   so the element holds a single text node and nothing under it can load or
+///   apply anything. The rule is still correct - a browser hides `noscript` -
+///   and hiding it is what keeps that text out of the rendering.
+/// * **Scripting disabled.** The contents are real markup, and the fallback is
+///   the point: `<noscript><link rel=stylesheet href=fallback.css></noscript>`
+///   must fetch and apply, and `<noscript><img src=a.png></noscript>` must
+///   draw. Hiding the element would suppress exactly the content the page
+///   intends this user to see.
+const NOSCRIPT_HIDDEN_WHILE_SCRIPTING: &str = "noscript { display: none; }\n";
+
+/// Whether a document's mode selects the quirks-mode rendering path.
+///
+/// This answers `Quirks` only, which is what the browser's own selector
+/// context does (`render-browser`'s render worker tests
+/// `document.quirks_mode() == QuirksMode::Quirks`). `LimitedQuirks` is
+/// deliberately not included: the headless and browser paths must agree, and
+/// changing which of the two modes counts is a decision about
+/// limited-quirks-mode rules that the HTML standard specifies separately and
+/// that neither path implements yet. See [`QUIRKS_STYLE_SHEET`] for what the
+/// quirks path does apply.
+const fn is_quirks_mode(mode: QuirksMode) -> bool {
+    matches!(mode, QuirksMode::Quirks)
+}
+
+/// The part of the user-agent sheet that applies only to a quirks-mode
+/// document.
+///
+/// **Citation.** Every rule below is quoted from the WHATWG HTML Living
+/// Standard, "Rendering" chapter (<https://html.spec.whatwg.org/multipage/rendering.html>),
+/// version of 25 September 2026, from the block each section gives under its
+/// own "In quirks mode" heading. Each comment names the sub-item it is, so a
+/// reviewer can check coverage against the document rather than against this
+/// file's claims.
+///
+/// **What is *not* here, and why.** The standard's quirks-mode rules that are
+/// not user-agent-sheet rules are the box-model changes in the original CSS 2
+/// §9.2.1.1 list: unitless `line-height` is inherited as a number rather than
+/// as a computed length, and percentage `height`/`margin`/`padding` are
+/// treated as `auto` on table cells and on non-replaced inline boxes. Those are
+/// solver behaviour in `render-layout`, not style-sheet rules, and they are
+/// **not implemented** - see `docs/visual_fidelity_gaps.md`. They are also not
+/// currently citable: CSS 2.1 has no quirks-mode section at all (§9.2.1.1
+/// there is "Anonymous block boxes"), and the CSS 2 URLs now serve the CSS 2.1
+/// text, so the list this comment describes could not be read from the
+/// specification while writing it. An implementer must read the source
+/// document first rather than take this paragraph as the rule.
+///
+/// The `list-style-position` rules of §15.3.7 are quoted in the specification
+/// and are also **not implemented**, because `list-style-position` is not in
+/// the property registry: a rule for a property nothing reads would be a
+/// declaration of support the engine does not have.
+///
+/// §15.3.9 ("Margin collapsing quirks") is quoted in the specification as four
+/// user-agent style sheet rules whose *conditions* are stated over the DOM -
+/// "has no substantial previous siblings", "is blank" - so they are not
+/// expressible as a selector. They are implemented in
+/// [`quirks_margin_declarations`] instead, which is the same user-agent
+/// origin and zero specificity the rules describe.
+const QUIRKS_STYLE_SHEET: &str = r#"
+/* §15.3.3 Flow content, "In quirks mode": a form's block-end margin. */
+form { margin-bottom: 1em; }
+
+/* §15.3.8 Tables, "In quirks mode": a table element's font, line height,
+   white-space and text alignment all reset to their initial values, so they
+   are inherited from no ancestor. `line-height`, `white-space` and
+   `text-align` have consumers; `font-weight`, `font-style` and `font-size`
+   reach the computed style but no paint or layout consumer reads them yet
+   (the S1 font-axis gap), so those three are correct CSS and currently inert. */
+table {
+  font-weight: initial;
+  font-style: initial;
+  font-size: initial;
+  line-height: initial;
+  white-space: initial;
+  text-align: initial;
+}
+
+/* §15.3.10 Form controls, "In quirks mode": a text control's box is sized
+   including its padding and border. */
+input:not([type=image i]), textarea { box-sizing: border-box; }
+"#;
+fn ua_style_sheet(
+    quirks_mode: QuirksMode,
+    scripting_enabled: bool,
+) -> std::borrow::Cow<'static, str> {
+    let base = if scripting_enabled {
+        std::borrow::Cow::Owned(format!("{UA_STYLE_SHEET}{NOSCRIPT_HIDDEN_WHILE_SCRIPTING}"))
+    } else {
+        std::borrow::Cow::Borrowed(UA_STYLE_SHEET)
+    };
+    if is_quirks_mode(quirks_mode) {
+        std::borrow::Cow::Owned(format!("{base}{QUIRKS_STYLE_SHEET}"))
+    } else {
+        base
+    }
+}
 
 /// HTML presentational attributes expressed as user-agent-origin CSS
 /// declarations (HTML5 rendering §15.3). These let classic markup
 /// (`bgcolor`, `width`, `align`, `cellpadding`, ...) style pages without a
 /// stylesheet while remaining overridable by any author rule.
-fn presentational_hint_declarations(dom: &Dom, node: NodeId) -> Vec<Declaration> {
+///
+/// An `svg` element's `width`/`height` join them, for the same reason: SVG 2
+/// §4.2 defines every presentation attribute by reference to its corresponding
+/// CSS property, and an `svg` element's size comes from those two attributes
+/// and its `viewBox` rather than from layout, which cannot measure foreign
+/// content.
+///
+/// In a quirks-mode document this is also where §15.3.9's margin-collapsing
+/// rules live, because their conditions are stated over the DOM rather than
+/// over selectors.
+fn presentational_hint_declarations(
+    dom: &Dom,
+    node: NodeId,
+    quirks_mode: QuirksMode,
+) -> Vec<Declaration> {
     fn declaration(name: &str, value: String) -> Declaration {
         Declaration {
             name: name.to_owned(),
@@ -200,7 +527,7 @@ fn presentational_hint_declarations(dom: &Dom, node: NodeId) -> Vec<Declaration>
         }
     }
 
-    // cellspacing → border spacing; a positive border attr draws the grid.
+    // cellspacing →border spacing; a positive border attr draws the grid.
     if tag == "table" {
         if let Some(cellspacing) = attribute("cellspacing") {
             hints.push(declaration("border-spacing", px_or_percent(cellspacing)));
@@ -232,7 +559,180 @@ fn presentational_hint_declarations(dom: &Dom, node: NodeId) -> Vec<Declaration>
             hints.push(declaration("margin-bottom", value));
         }
     }
+
+    // An `svg` element is sized by its own geometry attributes. The resolution
+    // is shared with the rasteriser so the box and the pixels agree.
+    if element.namespace == Namespace::Svg && element.local_name == "svg" {
+        let geometry = svg_geometry(element);
+        if let Some(width) = geometry.used_width() {
+            hints.push(declaration("width", format!("{width}px")));
+        }
+        if let Some(height) = geometry.used_height() {
+            hints.push(declaration("height", format!("{height}px")));
+        }
+    }
+
+    // §15.3.8 Tables, "In quirks mode": a cell with a `nowrap` attribute that
+    // also has a `width` attribute whose value parses as a *length* takes a
+    // `white-space: normal` hint, overriding the `td[nowrap]` rule above. The
+    // specification requires the width to be a length, so a percentage width -
+    // which is the case that actually breaks a nowrap cell - does not qualify.
+    //
+    // `nowrap` is a boolean attribute, so its presence is read through the
+    // unfiltered accessor: the `attribute` closure above drops an empty value,
+    // and a boolean attribute's value *is* empty.
+    if is_quirks_mode(quirks_mode)
+        && matches!(tag, "td" | "th")
+        && dom.attribute(node, "nowrap").ok().flatten().is_some()
+        && attribute("width").is_some_and(|width| !width.trim().ends_with('%'))
+    {
+        hints.push(declaration("white-space", "normal".to_owned()));
+    }
+
+    if is_quirks_mode(quirks_mode) {
+        hints.extend(quirks_margin_declarations(dom, node, element));
+    }
     hints
+}
+
+/// HTML 15 §15.3.9 "Margin collapsing quirks", implemented rule by rule.
+///
+/// The specification states four user-agent style sheet rules whose conditions
+/// are over the DOM, so they are expressed here as user-agent-origin
+/// declarations of zero specificity - the same cascade position the rules
+/// describe. `margin-block-start` and `margin-block-end` are written as the
+/// physical `margin-top` and `margin-bottom` for the reason given at the top
+/// of this file: the sheet is left-to-right because the layout solver consumes
+/// physical longhands only.
+///
+/// The specification's two definitions, quoted:
+///
+/// > A node is substantial if it is a text node that is not inter-element
+/// > whitespace, or if it is an element node.
+///
+/// > A node is blank if it is an element that contains no substantial nodes.
+///
+/// The conditions are deliberately not `:first-child`, `:last-child` or
+/// `:empty`. A comment node before the paragraph makes the element the first
+/// *child* while it still has no substantial previous siblings, and `:empty`
+/// counts comments, so both would zero margins the specification keeps.
+fn quirks_margin_declarations(dom: &Dom, node: NodeId, element: &ElementData) -> Vec<Declaration> {
+    fn zero(name: &str) -> Declaration {
+        Declaration {
+            name: name.to_owned(),
+            value: "0px".to_owned(),
+            important: false,
+        }
+    }
+    /// §15.3.9: "The elements with default margins are the following elements:
+    /// blockquote, dir, dl, h1, h2, h3, h4, h5, h6, listing, menu, ol, p,
+    /// plaintext, pre, ul, xmp." Note that `figure` is *not* among them, even
+    /// though this crate's user-agent sheet gives it a block margin.
+    const ELEMENTS_WITH_DEFAULT_MARGINS: [&str; 16] = [
+        "blockquote",
+        "dir",
+        "dl",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "listing",
+        "menu",
+        "ol",
+        "p",
+        "plaintext",
+        "pre",
+        "ul",
+    ];
+
+    if !ELEMENTS_WITH_DEFAULT_MARGINS.contains(&element.local_name.as_str()) {
+        return Vec::new();
+    }
+    let Some(parent_id) = dom.parent(node) else {
+        return Vec::new();
+    };
+    let Some(NodeKind::Element(parent)) = dom.node(parent_id).map(Node::kind) else {
+        return Vec::new();
+    };
+    let in_body = parent.local_name == "body";
+    let in_cell = matches!(parent.local_name.as_str(), "td" | "th");
+    if !in_body && !in_cell {
+        return Vec::new();
+    }
+
+    let children = dom.children(parent_id).unwrap_or_default();
+    let Some(position) = children.iter().position(|child| *child == node) else {
+        return Vec::new();
+    };
+    let no_substantial_previous = children[..position]
+        .iter()
+        .all(|child| !is_substantial(dom, *child));
+    let no_substantial_following = children[position + 1..]
+        .iter()
+        .all(|child| !is_substantial(dom, *child));
+    let blank = is_blank(dom, node);
+
+    let mut hints = Vec::new();
+    // "In quirks mode, any element with default margins that is the child of a
+    //  body, td, or th element and has no substantial previous siblings ...
+    //  'margin-block-start' property to zero."
+    if no_substantial_previous {
+        hints.push(zero("margin-top"));
+    }
+    // "... and is blank, is expected to have a user-agent level style sheet
+    //  rule that sets its 'margin-block-end' property to zero also."
+    if no_substantial_previous && blank {
+        hints.push(zero("margin-bottom"));
+    }
+    // "In quirks mode, any element with default margins that is the child of a
+    //  td or th element, has no substantial following siblings, and is blank,
+    //  is expected to have ... 'margin-block-start' ... to zero."
+    if in_cell && no_substantial_following && blank {
+        hints.push(zero("margin-top"));
+    }
+    // "In quirks mode, any p element that is the child of a td or th element
+    //  and has no substantial following siblings, is expected to have ...
+    //  'margin-block-end' ... to zero." Note this one is not conditioned on
+    //  being blank, and names `p` rather than the whole default-margin set.
+    if in_cell && element.local_name == "p" && no_substantial_following {
+        hints.push(zero("margin-bottom"));
+    }
+    hints
+}
+
+/// §15.3.9: "A node is substantial if it is a text node that is not
+/// inter-element whitespace, or if it is an element node."
+///
+/// A text node holding only ASCII whitespace is inter-element whitespace here:
+/// that is the case the definition exists to exclude, and it is why
+/// `<body>\n<p>` still has a paragraph with no substantial previous sibling.
+fn is_substantial(dom: &Dom, node: NodeId) -> bool {
+    match dom.node(node).map(Node::kind) {
+        Some(NodeKind::Element(_)) => true,
+        Some(NodeKind::Text(data)) => !data
+            .chars()
+            .all(|character| character.is_ascii_whitespace()),
+        _ => false,
+    }
+}
+
+/// §15.3.9: "A node is blank if it is an element that contains no substantial
+/// nodes." The element itself is not one of the nodes it contains, so this
+/// walks descendants only.
+fn is_blank(dom: &Dom, node: NodeId) -> bool {
+    let mut stack = dom.children(node).unwrap_or_default().to_vec();
+    while let Some(current) = stack.pop() {
+        let Some(current_ref) = dom.node(current) else {
+            continue;
+        };
+        if is_substantial(dom, current) {
+            return false;
+        }
+        stack.extend(current_ref.children().iter().copied());
+    }
+    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +772,22 @@ pub struct DocumentRenderOptions {
     pub scroll_offset: PhysicalPoint,
     pub display_list: DisplayListBuilderOptions,
     pub raster_background: Color,
+    /// The document's scripting mode, as HTML 13.2.4.5 defines it.
+    ///
+    /// It is a property of the parse, not a rendering preference, so it must
+    /// agree with the mode the DOM was built with: use
+    /// [`Document::parse_with_scripting`] to parse as a user agent with
+    /// scripting turned off and set this to `false` to match. The only
+    /// user-agent rule that depends on it is `noscript { display: none }`
+    /// (see [`NOSCRIPT_HIDDEN_WHILE_SCRIPTING`]), and the two modes disagree
+    /// about real content - with scripting disabled a `noscript` subtree is
+    /// the fallback markup the page is serving.
+    ///
+    /// The default is `true`, which is rENDER's mode: it has a script
+    /// execution engine, so it is a scripting-enabled user agent, and
+    /// `Document::parse` parses accordingly. Every existing caller therefore
+    /// keeps today's behaviour without naming this field.
+    pub scripting_enabled: bool,
 }
 
 impl Default for DocumentRenderOptions {
@@ -285,6 +801,7 @@ impl Default for DocumentRenderOptions {
             scroll_offset: PhysicalPoint::default(),
             raster_background: display_list.palette.canvas,
             display_list,
+            scripting_enabled: true,
         }
     }
 }
@@ -455,9 +972,28 @@ pub struct Document {
 impl Document {
     /// Parse an HTML document once. Subsequent script-driven updates should use
     /// [`Self::dom_mut`] and render the resulting DOM revision directly.
+    ///
+    /// rENDER is a scripting-enabled user agent, so this parses as one. Use
+    /// [`Self::parse_with_scripting`] for the scripting-disabled half, and
+    /// pair it with
+    /// [`DocumentRenderOptions::scripting_enabled`] set to the same value so
+    /// the user-agent sheet agrees with the DOM.
     #[must_use]
     pub fn parse(html: &str) -> Self {
-        let parsed = parse_document(html);
+        Self::parse_with_scripting(html, true)
+    }
+
+    /// Parse an HTML document in an explicitly chosen scripting mode.
+    ///
+    /// With scripting disabled, a `noscript` element's contents are markup
+    /// rather than raw text (13.2.4.5, 13.2.6.4.5 and 13.2.6.4.7), which is
+    /// what makes the no-JS fallback a user agent without scripting receives
+    /// real elements. Render it with `DocumentRenderOptions` whose
+    /// `scripting_enabled` is `false`; see
+    /// [`NOSCRIPT_HIDDEN_WHILE_SCRIPTING`].
+    #[must_use]
+    pub fn parse_with_scripting(html: &str, scripting_enabled: bool) -> Self {
+        let parsed = parse_document_with_scripting(html, scripting_enabled);
         Self {
             dom: parsed.dom,
             html_errors: parsed.errors,
@@ -523,13 +1059,32 @@ impl Document {
 
     /// Discovers embedded and external author stylesheet slots for the current
     /// DOM revision. This is a pure discovery step and performs no I/O.
+    ///
+    /// Media evaluation runs with no viewport, so a viewport-dependent media
+    /// feature cannot match here. Use
+    /// [`Self::discover_author_style_slots_with_context`] when the viewport is
+    /// known, or [`Self::render_with_external_style_sheets`], which supplies it.
     #[must_use]
     pub fn discover_author_style_slots(
         &self,
         base_url: &Url,
         limits: DocumentLimits,
     ) -> AuthorStyleDiscovery {
-        discover_author_style_slots(&self.dom, Some(base_url), limits)
+        self.discover_author_style_slots_with_context(base_url, limits, &MatchContext::default())
+    }
+
+    /// [`Self::discover_author_style_slots`] with the media-evaluation
+    /// environment supplied by the caller, so `@media (min-width: ...)` on a
+    /// `media` attribute is answered against the real viewport instead of
+    /// being treated as undecidable.
+    #[must_use]
+    pub fn discover_author_style_slots_with_context(
+        &self,
+        base_url: &Url,
+        limits: DocumentLimits,
+        context: &MatchContext,
+    ) -> AuthorStyleDiscovery {
+        discover_author_style_slots(&self.dom, Some(base_url), limits, context)
     }
 
     /// Renders with parsed external stylesheets supplied by the caller. Slots
@@ -638,9 +1193,31 @@ fn render_dom(
             *mark = now;
         }
     };
-    let ua_sheet = parse_stylesheet(UA_STYLE_SHEET);
+    let ua_sheet = parse_stylesheet(&ua_style_sheet(quirks_mode, options.scripting_enabled));
     stage_elapsed("ua-parse", &mut stage_mark);
-    let collected = collect_author_style_sheets(dom, base_url, external, options.document_limits);
+    // The same environment answers a stylesheet's `media` attribute, the
+    // `@media` rules inside it, and selector matching, so the three cannot
+    // disagree about which rules apply at this viewport or in this document
+    // mode.
+    //
+    // `quirks_mode` is not decorative: the selector engine reads it for the
+    // quirks-mode case-insensitive `id` and `class` matching of Selectors 4
+    // §4.3 ("in quirks mode, class and ID selectors match ASCII
+    // case-insensitively"), and the user-agent sheet below is built
+    // differently for a quirks document.
+    let match_context = MatchContext {
+        viewport_width: Some(options.layout.viewport.width),
+        viewport_height: Some(options.layout.viewport.height),
+        quirks_mode: is_quirks_mode(quirks_mode),
+        ..MatchContext::default()
+    };
+    let collected = collect_author_style_sheets(
+        dom,
+        base_url,
+        external,
+        options.document_limits,
+        &match_context,
+    );
     stage_elapsed("collect-sheets", &mut stage_mark);
     let mut cascade_inputs = Vec::with_capacity(collected.sheets.len().saturating_add(1));
     cascade_inputs.push(CascadeInput {
@@ -657,12 +1234,8 @@ fn render_dom(
         &cascade_inputs,
         &PropertyRegistry::standard_baseline(),
         &options.computation_limits,
-        &MatchContext {
-            viewport_width: Some(options.layout.viewport.width),
-            viewport_height: Some(options.layout.viewport.height),
-            ..MatchContext::default()
-        },
-        &|node| presentational_hint_declarations(dom, node),
+        &match_context,
+        &|node| presentational_hint_declarations(dom, node, quirks_mode),
     );
     stage_elapsed("cascade", &mut stage_mark);
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
@@ -765,8 +1338,9 @@ fn collect_author_style_sheets(
     base_url: Option<&Url>,
     external: &ExternalStyleSheets,
     limits: DocumentLimits,
+    context: &MatchContext,
 ) -> CollectedStyleSheets {
-    let discovery = discover_author_style_slots(dom, base_url, limits);
+    let discovery = discover_author_style_slots(dom, base_url, limits, context);
     let mut sheets = Vec::new();
     let mut diagnostics = discovery.diagnostics;
     let mut style_bytes = 0_usize;
@@ -824,8 +1398,9 @@ fn discover_author_style_slots(
     dom: &Dom,
     base_url: Option<&Url>,
     limits: DocumentLimits,
+    context: &MatchContext,
 ) -> AuthorStyleDiscovery {
-    let mut discovery = StyleDiscoveryState::default();
+    let mut discovery = StyleDiscoveryState::new(context);
     let mut stack = vec![dom.document()];
     let mut visited_nodes = 0_usize;
 
@@ -852,10 +1427,15 @@ fn discover_author_style_slots(
     discovery.finish(dom.revision())
 }
 
-#[derive(Default)]
-struct StyleDiscoveryState {
+/// One discovery pass over the DOM, accumulating style slots and the
+/// diagnostics the limits and the media evaluator produce.
+struct StyleDiscoveryState<'a> {
     slots: Vec<AuthorStyleSlot>,
     diagnostics: Vec<DocumentDiagnostic>,
+    /// The media-evaluation environment every slot's `media` attribute is
+    /// answered in, so one pass cannot score two slots against different
+    /// viewports.
+    context: &'a MatchContext,
     source_order: usize,
     external_count: usize,
     external_url_bytes: usize,
@@ -864,7 +1444,21 @@ struct StyleDiscoveryState {
     external_bytes_limit_reported: bool,
 }
 
-impl StyleDiscoveryState {
+impl<'a> StyleDiscoveryState<'a> {
+    const fn new(context: &'a MatchContext) -> Self {
+        Self {
+            slots: Vec::new(),
+            diagnostics: Vec::new(),
+            context,
+            source_order: 0,
+            external_count: 0,
+            external_url_bytes: 0,
+            slot_limit_reported: false,
+            external_limit_reported: false,
+            external_bytes_limit_reported: false,
+        }
+    }
+
     fn inspect_element(
         &mut self,
         node: NodeId,
@@ -873,7 +1467,7 @@ impl StyleDiscoveryState {
         limits: DocumentLimits,
     ) {
         if element.local_name == "style" {
-            let eligibility = style_eligibility(node, element, &mut self.diagnostics);
+            let eligibility = style_eligibility(node, element, &mut self.diagnostics, self.context);
             self.push_slot(
                 AuthorStyleSlot {
                     owner: node,
@@ -902,7 +1496,7 @@ impl StyleDiscoveryState {
     ) {
         let source_order = self.source_order;
         self.source_order = self.source_order.saturating_add(1);
-        let eligibility = style_eligibility(node, element, &mut self.diagnostics);
+        let eligibility = style_eligibility(node, element, &mut self.diagnostics, self.context);
         if self.external_count >= limits.max_external_style_sheets {
             self.report_external_count_limit(node);
             return;
@@ -995,6 +1589,7 @@ fn style_eligibility(
     node: NodeId,
     element: &ElementData,
     diagnostics: &mut Vec<DocumentDiagnostic>,
+    context: &MatchContext,
 ) -> AuthorStyleEligibility {
     let type_is_css = !attribute(element, "type").is_some_and(|kind| {
         !kind.trim().is_empty() && !kind.trim().eq_ignore_ascii_case("text/css")
@@ -1006,14 +1601,13 @@ fn style_eligibility(
             message: "an author stylesheet slot with a non-CSS type was not applied".to_owned(),
         });
     }
-    let media = evaluate_screen_media(attribute(element, "media"));
+    let media = evaluate_screen_media(attribute(element, "media"), context);
     if media.has_unsupported_query {
         diagnostics.push(DocumentDiagnostic {
             node: Some(node),
             code: DocumentDiagnosticCode::MediaQueryUnsupported,
-            message:
-                "the media list contains query syntax beyond simple screen/all/print media types"
-                    .to_owned(),
+            message: "the media list names a feature or syntax the media evaluator cannot answer"
+                .to_owned(),
         });
     }
     AuthorStyleEligibility {
@@ -1072,68 +1666,28 @@ struct MediaEvaluation {
     has_unsupported_query: bool,
 }
 
-fn evaluate_screen_media(media: Option<&str>) -> MediaEvaluation {
+/// Evaluate an author stylesheet's `media` attribute for a screen rendering.
+///
+/// Both answers come from the cascade's own evaluator, which is the only
+/// evaluator that decides whether the sheet's rules apply. There is
+/// deliberately no second parse here: a private copy that only understood
+/// media *types* called every feature-bearing query unsupported - the next
+/// word after `screen` is `and` - so `@media (min-width: 768px)` on a real
+/// page produced a false `MediaQueryUnsupported` warning, and its sheet was
+/// dropped rather than applied. One evaluator, one answer: a query reported
+/// here as unsupported is one the cascade genuinely cannot evaluate, and a
+/// query that matches here is one whose rules really were gathered.
+fn evaluate_screen_media(media: Option<&str>, context: &MatchContext) -> MediaEvaluation {
     let Some(media) = media.map(str::trim).filter(|media| !media.is_empty()) else {
         return MediaEvaluation {
             matches: true,
             has_unsupported_query: false,
         };
     };
-    let mut evaluation = MediaEvaluation::default();
-    for query in media.split(',').map(str::trim) {
-        let mut words = query.split_ascii_whitespace();
-        let Some(first) = words.next() else {
-            evaluation.has_unsupported_query = true;
-            continue;
-        };
-        let (negated, media_type) = if first.eq_ignore_ascii_case("not") {
-            (true, words.next())
-        } else if first.eq_ignore_ascii_case("only") {
-            (false, words.next())
-        } else {
-            (false, Some(first))
-        };
-        let Some(media_type) = media_type.filter(|_| words.next().is_none()) else {
-            evaluation.has_unsupported_query = true;
-            continue;
-        };
-        let type_matches = if media_type.eq_ignore_ascii_case("all")
-            || media_type.eq_ignore_ascii_case("screen")
-        {
-            true
-        } else if is_media_type_identifier(media_type) {
-            false
-        } else {
-            evaluation.has_unsupported_query = true;
-            continue;
-        };
-        evaluation.matches |= if negated { !type_matches } else { type_matches };
+    MediaEvaluation {
+        matches: media_query_list_matches(media, context),
+        has_unsupported_query: !media_query_list_is_supported(media),
     }
-    evaluation
-}
-
-fn is_media_type_identifier(value: &str) -> bool {
-    let mut characters = value.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
-    if first == '-' {
-        let Some(second) = characters.next() else {
-            return false;
-        };
-        if second != '-' && !is_identifier_start(second) {
-            return false;
-        }
-    } else if !is_identifier_start(first) {
-        return false;
-    }
-    characters.all(|character| {
-        is_identifier_start(character) || character.is_ascii_digit() || character == '-'
-    })
-}
-
-const fn is_identifier_start(character: char) -> bool {
-    character == '_' || character.is_ascii_alphabetic() || !character.is_ascii()
 }
 
 fn descendant_text_with_limit(dom: &Dom, root: &Node, max_bytes: usize) -> Option<String> {
@@ -1180,6 +1734,7 @@ mod tests {
         AuthorStyleSlot, AuthorStyleSource, Document, DocumentDiagnosticCode, DocumentLimits,
         DocumentRenderOptions, ExternalStyleSheetKey, ExternalStyleSheets,
     };
+    use crate::css::computed::ComputedValue;
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::image::{DecodedImage, ImageLimits, ImageResources, discover_images};
@@ -1203,6 +1758,27 @@ mod tests {
             .typed(property)
             .unwrap_or_else(|| panic!("{property} must have a typed computed value"))
             .to_css()
+    }
+
+    /// The computed value as text, for properties with no typed representation.
+    ///
+    /// A typed value is the better assertion where one exists, because it is
+    /// the value the consumers read. `white-space` has none, so the token-level
+    /// computed value is the only thing there is to assert on.
+    fn computed_css(
+        document: &Document,
+        render: &super::DocumentRenderOutput,
+        selector: &str,
+        property: &str,
+    ) -> String {
+        let node = target_id(document.dom(), selector);
+        render.styles[&node]
+            .get(property)
+            .map_or_else(
+                || panic!("{property} must have a computed value"),
+                ComputedValue::css_text,
+            )
+            .to_owned()
     }
 
     fn external_key(slot: &AuthorStyleSlot) -> ExternalStyleSheetKey {
@@ -1353,7 +1929,7 @@ mod tests {
         let document = Document::parse(
             "<!doctype html><link rel=stylesheet href=theme.css>\
              <link rel=stylesheet>\
-             <style media='screen and (min-width: 1px)'>body { color:red }</style>\
+             <style media='screen and (hover: hover)'>body { color:red }</style>\
              <body style='color:blue'></body>",
         );
         let render = document.render_reference(DocumentRenderOptions::default());
@@ -1377,6 +1953,82 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A media feature the cascade really can evaluate is neither reported as
+    /// unsupported nor used to drop the sheet.
+    ///
+    /// It used to be both. A private media evaluator in this file only
+    /// understood media *types*, and it marked any query carrying a feature
+    /// unsupported because the next word after `screen` is `and` - so every
+    /// `@media (min-width: 768px)` on a real page produced a false
+    /// `MediaQueryUnsupported` warning while the same query was evaluated
+    /// correctly by the cascade. That is the shape of defect this project has
+    /// already paid for twice with stale unsupported-feature claims.
+    #[test]
+    fn a_feature_bearing_media_query_is_evaluated_and_not_reported_unsupported() {
+        let document = Document::parse(
+            "<!doctype html><style media='screen and (min-width: 768px)'>#query { color:red }</style>\
+             <style media='(min-width: 100000px)'>#too-wide { color:red }</style>\
+             <p id=query></p><p id=too-wide></p>",
+        );
+        let options = DocumentRenderOptions {
+            layout: crate::layout::LayoutOptions {
+                viewport: PhysicalSize {
+                    width: 1_280.0,
+                    height: 720.0,
+                },
+                ..crate::layout::LayoutOptions::default()
+            },
+            ..DocumentRenderOptions::default()
+        };
+        let render = document.render_reference(options);
+
+        // The matching sheet is applied...
+        assert_eq!(
+            typed_css(&document, &render, "#query", "color"),
+            "rgb(255, 0, 0)"
+        );
+        // ...and the non-matching one is not, from a real comparison rather
+        // than from a parse that could not read it.
+        assert_eq!(
+            typed_css(&document, &render, "#too-wide", "color"),
+            "canvastext"
+        );
+        assert!(
+            !render.diagnostics.document.iter().any(|diagnostic| {
+                diagnostic.code == DocumentDiagnosticCode::MediaQueryUnsupported
+            }),
+            "a media feature the cascade evaluates must not be reported unsupported"
+        );
+    }
+
+    /// The default viewport is narrow enough that a `min-width` query the
+    /// cascade understands still gates its sheet, which is the other half of
+    /// "evaluated": support and matching are different questions.
+    #[test]
+    fn a_feature_bearing_media_query_gates_its_sheet_against_the_viewport() {
+        let document = Document::parse(
+            "<!doctype html><style media='(min-width: 100000px)'>#target { color:red }</style>\
+             <p id=target></p>",
+        );
+        let discovery = Url::parse("https://example.test/index.html").expect("base URL");
+        let slots = document
+            .discover_author_style_slots_with_context(
+                &discovery,
+                DocumentLimits::default(),
+                &MatchContext {
+                    viewport_width: Some(1_280.0),
+                    viewport_height: Some(720.0),
+                    ..MatchContext::default()
+                },
+            )
+            .slots;
+
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0].eligibility.media_fully_supported);
+        assert!(!slots[0].eligibility.media_matches);
+        assert!(!slots[0].eligibility.is_eligible());
     }
 
     #[test]
@@ -1448,7 +2100,7 @@ mod tests {
              <style media=print>#print { color: red }</style>\
              <style media='not print'>#not-print { color: red }</style>\
              <style media=speech>#speech { color: red }</style>\
-             <style media='screen and (min-width: 1px)'>#query { color: red }</style>\
+             <style media='screen and (hover: hover)'>#query { color: red }</style>\
              <style type=text/plain>#wrong-type { color: red }</style>\
              <p id=screen></p><p id=print></p><p id=not-print></p><p id=speech></p>\
              <p id=query></p><p id=wrong-type></p>",
@@ -1594,15 +2246,16 @@ mod tests {
             "<!doctype html><head>\
              <link rel=stylesheet href=print.css media=print>\
              <link rel=stylesheet href=plain.css type=text/plain>\
-             <link rel=stylesheet href=query.css media='screen and (min-width: 1px)'>\
+             <link rel=stylesheet href=query.css media='screen and (hover: hover)'>\
              <link rel=stylesheet href=screen.css media='only screen'>\
              <link rel=stylesheet href='http://['>\
+             <link rel=stylesheet href=wide.css media='(min-width: 100000px)'>\
              </head><body><p id=target></p></body>",
         );
         let base = Url::parse("https://example.test/base/page.html").expect("base URL");
         let discovery = document.discover_author_style_slots(&base, DocumentLimits::default());
 
-        assert_eq!(discovery.slots.len(), 5);
+        assert_eq!(discovery.slots.len(), 6);
         assert!(!discovery.slots[0].eligibility.media_matches);
         assert!(!discovery.slots[1].eligibility.type_is_css);
         assert!(!discovery.slots[2].eligibility.media_fully_supported);
@@ -1614,8 +2267,17 @@ mod tests {
                 ..
             }
         ));
+        // A feature the engine evaluates is supported syntax even when the
+        // environment cannot answer it: this discovery pass runs with no
+        // viewport, so the query cannot match, but nothing is missing.
+        assert!(discovery.slots[5].eligibility.media_fully_supported);
+        assert!(!discovery.slots[5].eligibility.media_matches);
         assert!(discovery.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == DocumentDiagnosticCode::ExternalStyleSheetUnresolved
+        }));
+        assert!(!discovery.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == DocumentDiagnosticCode::MediaQueryUnsupported
+                && diagnostic.node == Some(discovery.slots[5].owner)
         }));
 
         let mut external = ExternalStyleSheets::default();
@@ -1753,6 +2415,115 @@ mod tests {
         }));
     }
 
+    /// §15.3.1's list of elements a user agent renders with `display: none`
+    /// pointedly does not name `noscript`, because whether its contents are
+    /// the fallback a page serves to a user without scripting or inert text
+    /// the parser never turned into elements is decided by the scripting mode
+    /// (HTML 13.2.4.5, and the `noscript` rules at 13.2.6.4.4 and 13.2.6.4.5).
+    /// One DOM, two user agents, two answers.
+    #[test]
+    fn the_noscript_display_rule_follows_the_scripting_mode() {
+        let document = Document::parse_with_scripting(
+            "<!doctype html><body><noscript><img id=fallback src=fallback.png></noscript>",
+            false,
+        );
+        let hidden = document.render_reference(DocumentRenderOptions {
+            scripting_enabled: true,
+            ..DocumentRenderOptions::default()
+        });
+        let shown = document.render_reference(DocumentRenderOptions {
+            scripting_enabled: false,
+            ..DocumentRenderOptions::default()
+        });
+
+        assert_eq!(typed_css(&document, &hidden, "noscript", "display"), "none");
+        assert_eq!(
+            typed_css(&document, &shown, "noscript", "display"),
+            "inline"
+        );
+    }
+
+    /// With scripting disabled a `noscript` element's contents are real markup,
+    /// and that is the fallback the page is serving such a user. Hiding the
+    /// element suppressed exactly the content it exists to provide.
+    #[test]
+    fn scripting_disabled_noscript_fallback_markup_is_laid_out() {
+        let document = Document::parse_with_scripting(
+            "<!doctype html><body><noscript><img id=fallback src=fallback.png \
+             width=40 height=20></noscript>",
+            false,
+        );
+        let render = document.render_reference(DocumentRenderOptions {
+            scripting_enabled: false,
+            ..DocumentRenderOptions::default()
+        });
+        let fallback = target_id(document.dom(), "#fallback");
+        let size = render.layout.fragments.iter().find_map(|fragment| {
+            match (&fragment.kind, fragment.source == Some(fallback)) {
+                (FragmentKind::Box(geometry), true) => Some(geometry.content_rect.size),
+                _ => None,
+            }
+        });
+
+        assert_eq!(
+            size,
+            Some(PhysicalSize {
+                width: 40.0,
+                height: 20.0
+            }),
+            "a no-JS fallback image is content the page serves on purpose"
+        );
+    }
+
+    /// With scripting enabled the same markup produces a `noscript` element
+    /// holding one text node and no elements at all, so the `display: none`
+    /// rule hides inert text. This is the fact the rule's default rests on,
+    /// and it is asserted here rather than assumed: it is what made the
+    /// unconditional form harmless and what makes it wrong for the other mode.
+    #[test]
+    fn scripting_enabled_noscript_contents_are_inert_text() {
+        let document = Document::parse(
+            "<!doctype html><body><noscript><img id=fallback src=fallback.png></noscript>",
+        );
+        let noscript = target_id(document.dom(), "noscript");
+        let children = document
+            .dom()
+            .children(noscript)
+            .expect("noscript children");
+
+        assert!(
+            children.iter().all(|child| {
+                matches!(
+                    document.dom().node(*child).map(crate::dom::Node::kind),
+                    Some(NodeKind::Text(_))
+                )
+            }),
+            "with scripting enabled a noscript element's contents are one text node"
+        );
+        assert!(
+            parse_selector_list("#fallback")
+                .map(|selectors| {
+                    select_all(
+                        document.dom(),
+                        document.dom().document(),
+                        &selectors,
+                        &MatchContext::default(),
+                    )
+                    .is_empty()
+                })
+                .expect("valid selector")
+        );
+        assert_eq!(
+            typed_css(
+                &document,
+                &document.render_reference(DocumentRenderOptions::default()),
+                "noscript",
+                "display"
+            ),
+            "none"
+        );
+    }
+
     #[test]
     fn styles_in_template_contents_are_inert() {
         let mut document = Document::parse(
@@ -1839,6 +2610,286 @@ mod tests {
             render.diagnostics.document.iter().any(|diagnostic| {
                 diagnostic.code == DocumentDiagnosticCode::EmbeddedStyleLimit
             })
+        );
+    }
+
+    /// The parse already computes the three-way mode, and the selector engine
+    /// already reads `MatchContext::quirks_mode` (Selectors 4 §4.3: "in quirks
+    /// mode, class and ID selectors match ASCII case-insensitively"). What was
+    /// missing was the wiring: the headless render path built its
+    /// `MatchContext` from `MatchContext::default()`, so a quirks document was
+    /// matched with standards-mode semantics while `render-browser` - which
+    /// does set the flag - matched it the other way. The two paths disagreed
+    /// about the same DOM.
+    #[test]
+    fn quirks_mode_reaches_selector_matching_on_the_headless_path() {
+        // No doctype, so the parser puts the document in quirks mode.
+        let quirks = Document::parse(
+            "<html><body><style>#Foo, .Bar { color: #ff0000 }</style>\
+             <p id=foo class=bar>target</p></body></html>",
+        );
+        assert_eq!(quirks.quirks_mode().as_str(), "quirks");
+        let standards = Document::parse(
+            "<!doctype html><html><body><style>#Foo, .Bar { color: #ff0000 }</style>\
+             <p id=foo class=bar>target</p></body></html>",
+        );
+        assert_eq!(standards.quirks_mode().as_str(), "no-quirks");
+
+        assert_eq!(
+            typed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "p",
+                "color"
+            ),
+            "rgb(255, 0, 0)",
+            "quirks mode matches id and class selectors ASCII case-insensitively"
+        );
+        assert_eq!(
+            typed_css(
+                &standards,
+                &standards.render_reference(DocumentRenderOptions::default()),
+                "p",
+                "color"
+            ),
+            "canvastext",
+            "standards mode matches them case-sensitively"
+        );
+    }
+
+    /// §15.3.8 Tables, "In quirks mode": a table element's inherited typography
+    /// and text alignment reset to their initial values.
+    #[test]
+    fn quirks_mode_resets_a_table_elements_inherited_properties() {
+        let markup = "<body><div style='text-align:right; white-space:pre'>\
+             <table id=target><tr><td>cell</td></tr></table></div>";
+        let quirks = Document::parse(markup);
+        let standards = Document::parse(&format!("<!doctype html>{markup}"));
+
+        assert_eq!(
+            typed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "#target",
+                "text-align"
+            ),
+            "start"
+        );
+        assert_eq!(
+            computed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "#target",
+                "white-space"
+            ),
+            "normal"
+        );
+        assert_eq!(
+            typed_css(
+                &standards,
+                &standards.render_reference(DocumentRenderOptions::default()),
+                "#target",
+                "text-align"
+            ),
+            "right",
+            "standards mode inherits text-align from the ancestor"
+        );
+    }
+
+    /// §15.3.9's four margin-collapsing rules, each asserted against the
+    /// standards-mode result for the same markup so the pair cannot both be
+    /// wrong.
+    #[test]
+    fn quirks_mode_collapses_the_default_margins_of_edge_elements() {
+        fn margins(document: &Document, selector: &str) -> (String, String) {
+            let render = document.render_reference(DocumentRenderOptions::default());
+            (
+                typed_css(document, &render, selector, "margin-top"),
+                typed_css(document, &render, selector, "margin-bottom"),
+            )
+        }
+        let pair = |markup: &str| {
+            (
+                Document::parse(markup),
+                Document::parse(&format!("<!doctype html>{markup}")),
+            )
+        };
+
+        // Rule 1: first child of a body, no substantial previous siblings.
+        let (document, standards) = pair("<body><p id=first>one</p><p id=second>two</p>");
+        assert_ne!(
+            margins(&document, "#first").0,
+            margins(&standards, "#first").0,
+            "a leading paragraph's block-start margin is zeroed in quirks mode"
+        );
+        assert_eq!(
+            margins(&document, "#first").0,
+            "0px",
+            "§15.3.9 rule 1 zeroes the block-start margin"
+        );
+        assert_eq!(
+            margins(&document, "#second").0,
+            margins(&standards, "#second").0,
+            "a later paragraph keeps its default margin"
+        );
+
+        // A comment before the paragraph makes it the first *child* but not a
+        // paragraph with no substantial previous siblings, so `:first-child`
+        // would be the wrong test and the rule must still fire.
+        let (document, standards) = pair("<body><!--c--><p id=only>one</p></body>");
+        assert_eq!(margins(&document, "#only").0, "0px");
+        assert_ne!(
+            margins(&document, "#only").0,
+            margins(&standards, "#only").0
+        );
+        assert_eq!(
+            margins(&document, "#only").1,
+            margins(&standards, "#only").1
+        );
+
+        // Rule 2: the same, and blank, so the block-end margin goes too.
+        let (document, standards) = pair("<body><p id=blank></p><p id=full>text</p></body>");
+        assert_eq!(
+            margins(&document, "#blank"),
+            ("0px".to_owned(), "0px".to_owned())
+        );
+        assert_eq!(
+            margins(&document, "#full").0,
+            margins(&standards, "#full").0,
+            "a paragraph with content keeps its default block-start margin"
+        );
+
+        // A leading element that is *not* in the default-margin set does not
+        // make the following paragraph a first child in the rule's sense, and
+        // it is substantial, so the margin stays.
+        let (document, standards) = pair("<body><div>lead</div><p id=after>one</p></body>");
+        assert_eq!(
+            margins(&document, "#after").0,
+            margins(&standards, "#after").0
+        );
+
+        // Rules 3 and 4. Both need the element to have no substantial
+        // *following* siblings, and both fixtures lead with a `div` so that
+        // rule 1 (no substantial *previous* siblings) does not also fire and
+        // mask which rule did the work.
+        //
+        // Rule 4 names `p` and is not conditioned on being blank.
+        let (document, standards) = pair(
+            "<body><table><tr><td><div>lead</div><p id=cell-p>text</p></td></tr></table></body>",
+        );
+        assert_eq!(
+            margins(&document, "#cell-p").1,
+            "0px",
+            "§15.3.9 rule 4 zeroes a cell's last paragraph block-end margin"
+        );
+        assert_eq!(
+            margins(&document, "#cell-p").0,
+            margins(&standards, "#cell-p").0,
+            "rule 4 is not conditioned on having no substantial previous siblings"
+        );
+
+        // Rule 3 names the whole default-margin set and is conditioned on the
+        // element being blank, so a leading block-end margin survives.
+        let (document, standards) = pair(
+            "<body><table><tr><td><div>lead</div><ul id=cell-list></ul></td></tr></table></body>",
+        );
+        assert_eq!(
+            margins(&document, "#cell-list").0,
+            "0px",
+            "§15.3.9 rule 3 zeroes a cell's last blank default-margin element"
+        );
+        assert_eq!(
+            margins(&document, "#cell-list").1,
+            margins(&standards, "#cell-list").1,
+            "a cell's last default-margin element keeps its block-end margin unless blank"
+        );
+
+        // A cell's first *and* blank default-margin element takes both, from
+        // rule 1 and rule 2 together.
+        let (document, standards) =
+            pair("<body><table><tr><td><p id=cell-blank></p></td></tr></table></body>");
+        assert_eq!(
+            margins(&document, "#cell-blank"),
+            ("0px".to_owned(), "0px".to_owned())
+        );
+        assert_ne!(
+            margins(&document, "#cell-blank").1,
+            margins(&standards, "#cell-blank").1
+        );
+
+        // `figure` has a user-agent margin in this sheet and is deliberately
+        // not in §15.3.9's list, so quirks mode leaves it alone.
+        let (document, standards) = pair("<body><figure id=fig>x</figure></body>");
+        assert_eq!(margins(&document, "#fig"), margins(&standards, "#fig"));
+    }
+
+    /// §15.3.8 Tables, "In quirks mode": a cell with `nowrap` and a `width`
+    /// that parses as a length takes `white-space: normal`. A percentage width
+    /// does not qualify, which is the case the specification singles out.
+    #[test]
+    fn quirks_mode_normalises_white_space_on_a_sized_nowrap_cell() {
+        let markup = "<body><table><tr>\
+             <td id=length nowrap width=100>length</td>\
+             <td id=percent nowrap width='50%'>percent</td>\
+             </tr></table></body>";
+        let quirks = Document::parse(markup);
+        let standards = Document::parse(&format!("<!doctype html>{markup}"));
+
+        assert_eq!(
+            computed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "#length",
+                "white-space"
+            ),
+            "normal"
+        );
+        assert_eq!(
+            computed_css(
+                &standards,
+                &standards.render_reference(DocumentRenderOptions::default()),
+                "#length",
+                "white-space"
+            ),
+            "nowrap",
+            "standards mode keeps td[nowrap]"
+        );
+        assert_eq!(
+            computed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "#percent",
+                "white-space"
+            ),
+            "nowrap",
+            "a percentage width is not a length, so the rule does not apply"
+        );
+    }
+
+    /// §15.3.3 Flow content, "In quirks mode": a form's block-end margin.
+    #[test]
+    fn quirks_mode_gives_a_form_a_block_end_margin() {
+        let markup = "<body><form id=target><input></form></body>";
+        let quirks = Document::parse(markup);
+        let standards = Document::parse(&format!("<!doctype html>{markup}"));
+
+        assert_eq!(
+            typed_css(
+                &quirks,
+                &quirks.render_reference(DocumentRenderOptions::default()),
+                "#target",
+                "margin-bottom"
+            ),
+            "1em"
+        );
+        assert_eq!(
+            typed_css(
+                &standards,
+                &standards.render_reference(DocumentRenderOptions::default()),
+                "#target",
+                "margin-bottom"
+            ),
+            "0px"
         );
     }
 

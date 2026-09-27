@@ -185,6 +185,7 @@ pub(super) fn mark_host(
         | ObjectHost::MutationObserverConstructor
         | ObjectHost::Location(_)
         | ObjectHost::ErrorConstructor(_)
+        | ObjectHost::ErrorInstance
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::TypedArray { .. }
@@ -197,6 +198,7 @@ pub(super) fn mark_host(
         | ObjectHost::AbortControllerConstructor
         | ObjectHost::AbortController
         | ObjectHost::AbortSignal
+        | ObjectHost::Storage
         | ObjectHost::FormDataConstructor
         | ObjectHost::FormData { .. }
         | ObjectHost::ResponseConstructor
@@ -318,6 +320,15 @@ impl JsRuntime {
         let mut marked_environments: BTreeSet<usize> = BTreeSet::new();
         for root in self.realm.gc_identity_roots() {
             mark_object(self, &mut marked, &mut work, &mut marked_environments, root);
+        }
+        for root in &self.transient_roots {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *root,
+            );
         }
         for listeners in self.event_listeners.values().flat_map(listener_values) {
             mark_object(
