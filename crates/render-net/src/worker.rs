@@ -12,6 +12,14 @@ use crate::{
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
+
+/// The exact transport error message a synchronous queue-full rejection
+/// carries. Callers match on it to implement deferred resubmission without
+/// string-literal coupling on the private constant.
+#[must_use]
+pub fn queue_full_message() -> &'static str {
+    QUEUE_FULL_MESSAGE
+}
 const PAUSED_ORIGIN_MESSAGE: &str = "per-origin concurrency policy paused this origin";
 const MISSING_BATCH_RESULT_MESSAGE: &str = "batch worker ended without a result";
 const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -320,6 +328,27 @@ impl NetworkWorker {
     pub fn submit(&self, request: FetchRequest) -> RequestHandle<FetchResult> {
         let (response, receiver) = mpsc::channel();
         let cancel = CancelToken::default();
+        self.enqueue(Command::Fetch {
+            request: Box::new(request),
+            cancel: cancel.clone(),
+            response,
+        });
+        RequestHandle { receiver, cancel }
+    }
+
+    /// Queues one GET whose cancellation token outlives the submission call.
+    ///
+    /// Deferred-submission callers (browser backpressure) park a request when
+    /// the queue is full and resubmit it later; passing the parked token here
+    /// keeps a cancellation that arrived while the request was parked
+    /// effective on the resubmitted handle.
+    #[must_use]
+    pub fn submit_with_cancellation(
+        &self,
+        request: FetchRequest,
+        cancel: CancelToken,
+    ) -> RequestHandle<FetchResult> {
+        let (response, receiver) = mpsc::channel();
         self.enqueue(Command::Fetch {
             request: Box::new(request),
             cancel: cancel.clone(),

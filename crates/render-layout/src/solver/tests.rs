@@ -7,6 +7,7 @@ use render_css::cascade::{CascadeInput, CascadeOrigin};
 use render_css::computed::{ComputationLimits, PropertyRegistry, compute_document_styles};
 use render_css::selector::{MatchContext, parse_selector_list, select_all};
 use render_css::stylesheet::parse_stylesheet;
+use render_dom::NodeId;
 use render_html::parse_document;
 
 use crate::solver::{
@@ -73,6 +74,123 @@ fn inline_text_uses_computed_font_size_and_line_height() {
     };
     assert_eq!(text_data.font_size, 24.0);
     assert_eq!(text.rect.size.height, 36.0);
+}
+
+#[test]
+fn shrink_to_fit_float_sums_adjacent_floats() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='nav'><a>news</a><a>sports</a><a>finance</a></div></body>",
+        "html, body, #nav, #nav a { display:block; margin:0 } \
+         #nav { float:left } #nav a { float:left; margin-right:14px }",
+        800.0,
+    );
+    let nav = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#nav")))
+        .expect("navigation float fragment");
+    // Each link is a separate float. A shrink-to-fit parent must reserve
+    // the whole run, otherwise real news-site navigation collapses into a
+    // vertical column at the left edge.
+    assert!(
+        nav.rect.size.width > 100.0,
+        "adjacent floats were collapsed: {nav:?}"
+    );
+}
+
+#[test]
+#[ignore = "manual fixture probe for the live 163 homepage"]
+fn probe_live_163_navigation_width() {
+    let html = std::fs::read_to_string("../../.diag/163.html").expect("163 html fixture");
+    let css_text = std::fs::read_to_string("../../.diag/163-main.css").expect("163 css fixture");
+    let output = parse_document(&html);
+    let sheet = parse_stylesheet(&css_text);
+    let styles = compute_document_styles(
+        &output.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+    let layout = layout_formatting_tree(
+        &output.dom,
+        &formatting,
+        &styles,
+        LayoutOptions {
+            viewport: crate::PhysicalSize {
+                width: 1770.0,
+                height: 1026.0,
+            },
+            ..LayoutOptions::default()
+        },
+        &SimpleTextMeasurer,
+    );
+    let nav = find(&output.dom, ".nav-list");
+    let style = styles.get(&nav).expect("nav style");
+    eprintln!(
+        "nav style float={:?} display={:?}",
+        style.typed("float"),
+        style.typed("display")
+    );
+    let mut ancestor = output.dom.parent(nav);
+    for _ in 0..6 {
+        let Some(id) = ancestor else { break };
+        eprintln!(
+            "ancestor {id:?} style={:?}",
+            styles.get(&id).and_then(|s| s.typed("display"))
+        );
+        ancestor = output.dom.parent(id);
+    }
+    for node in formatting.iter().filter(|node| node.source == Some(nav)) {
+        eprintln!(
+            "nav formatting kind={:?} children={:?}",
+            node.kind, node.children
+        );
+        for child in &node.children {
+            let n = formatting.get(*child).expect("child");
+            let child_style = n.source.and_then(|source| styles.get(&source));
+            eprintln!(" child {:?} source={:?} kind={:?}", child, n.source, n.kind);
+            if n.source.is_some() {
+                eprintln!("   children={:?}", n.children);
+            }
+            if let Some(style) = child_style {
+                eprintln!(
+                    "   style float={:?} display={:?}",
+                    style.typed("float"),
+                    style.typed("display")
+                );
+            }
+            eprintln!(
+                "   fragment={:?}",
+                layout
+                    .fragments
+                    .iter()
+                    .find(|fragment| fragment.source == n.source)
+            );
+        }
+    }
+    let nav_fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(nav));
+    eprintln!("nav fragment={nav_fragment:?}");
+    eprintln!(
+        "fragments={} diagnostics={:?}",
+        layout.fragments.iter().count(),
+        layout.diagnostics.len()
+    );
+    eprintln!(
+        "source first-anchor fragments={:?}",
+        layout
+            .fragments
+            .iter()
+            .filter(|f| f.source == Some(NodeId::from_u64(1047)))
+            .count()
+    );
 }
 
 #[test]
@@ -860,6 +978,152 @@ fn flex_grow_and_shrink_distribute_content_box_space_with_gap() {
 }
 
 #[test]
+fn wrapped_flex_rows_keep_card_width_and_create_new_lines() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='cards'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>",
+        "html, body, #a, #b, #c { display:block; margin:0 } #cards { display:flex; flex-flow:row wrap; width:200px; column-gap:10px; row-gap:8px } #a, #b, #c { flex:0 0 90px; height:20px }",
+        200.0,
+    );
+    let rects = ["#a", "#b", "#c"].map(|selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    });
+    assert_eq!(rects[0], PhysicalRect::new(0.0, 0.0, 90.0, 20.0));
+    assert_eq!(rects[1], PhysicalRect::new(100.0, 0.0, 90.0, 20.0));
+    assert_eq!(rects[2], PhysicalRect::new(0.0, 28.0, 90.0, 20.0));
+    let cards = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#cards")))
+        .unwrap();
+    assert_eq!(cards.rect.size.height, 48.0);
+}
+
+#[test]
+fn wrapped_flex_rows_distribute_growth_per_line() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='cards'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>",
+        "html, body, #a, #b, #c { display:block; margin:0 } #cards { display:flex; flex-wrap:wrap; width:200px; gap:10px } #a, #b, #c { flex:1 0 90px; height:20px }",
+        200.0,
+    );
+    let rects = ["#a", "#b", "#c"].map(|selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    });
+    assert_eq!(rects[0], PhysicalRect::new(0.0, 0.0, 95.0, 20.0));
+    assert_eq!(rects[1], PhysicalRect::new(105.0, 0.0, 95.0, 20.0));
+    assert_eq!(rects[2], PhysicalRect::new(0.0, 30.0, 200.0, 20.0));
+}
+
+#[test]
+fn wrapping_uses_item_minimum_when_flex_basis_is_zero() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='cards'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>",
+        "html, body, #a, #b, #c { display:block; margin:0 } #cards { display:flex; flex-wrap:wrap; width:200px; gap:10px } #a, #b, #c { flex:1 0 0; min-width:90px; height:20px }",
+        200.0,
+    );
+    let c = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#c")))
+        .unwrap();
+    assert_eq!(c.rect.origin.y, 30.0);
+}
+
+#[test]
+fn align_self_overrides_flex_container_cross_alignment() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='row'><div id='a'></div><div id='b'></div></div></body>",
+        "html, body, #a, #b { display:block; margin:0 } #row { display:flex; width:200px; height:100px; align-items:center } #a, #b { flex:0 0 50px; height:20px } #b { align-self:flex-end }",
+        200.0,
+    );
+    let a = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#a")))
+        .unwrap();
+    let b = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#b")))
+        .unwrap();
+    assert_eq!(a.rect.origin.y, 40.0);
+    assert_eq!(b.rect.origin.y, 80.0);
+}
+
+#[test]
+fn wrapped_flex_align_content_and_reverse_control_line_positions() {
+    let html = "<!doctype html><body><div id='cards'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>";
+    let common = "html, body, #a, #b, #c { display:block; margin:0 } #cards { display:flex; flex-wrap:wrap; width:200px; height:100px; column-gap:10px; row-gap:10px; align-content:space-between } #a, #b, #c { flex:0 0 90px; height:20px }";
+    let (output, _, layout) = pipeline(html, common, 200.0);
+    let a = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#a")))
+        .unwrap();
+    let c = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#c")))
+        .unwrap();
+    assert_eq!((a.rect.origin.y, c.rect.origin.y), (0.0, 80.0));
+
+    let reversed = common.replace("flex-wrap:wrap", "flex-wrap:wrap-reverse");
+    let (output, _, layout) = pipeline(html, &reversed, 200.0);
+    let a = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#a")))
+        .unwrap();
+    let c = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#c")))
+        .unwrap();
+    assert_eq!((a.rect.origin.y, c.rect.origin.y), (80.0, 0.0));
+}
+
+#[test]
+fn definite_height_wrapped_columns_place_items_across_cross_axis() {
+    let html = "<!doctype html><body><div id='menu'><div id='a'></div><div id='b'></div><div id='c'></div></div></body>";
+    let css = "html, body, #a, #b, #c { display:block; margin:0 } #menu { display:flex; flex-direction:column; flex-wrap:wrap; width:100px; height:100px; row-gap:10px; column-gap:10px } #a, #b, #c { flex:0 0 40px; width:30px }";
+    let (output, _, layout) = pipeline(html, css, 100.0);
+    let rects = ["#a", "#b", "#c"].map(|selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    });
+    assert_eq!(rects[0], PhysicalRect::new(0.0, 0.0, 30.0, 40.0));
+    assert_eq!(rects[1], PhysicalRect::new(0.0, 50.0, 30.0, 40.0));
+    assert_eq!(rects[2], PhysicalRect::new(55.0, 0.0, 30.0, 40.0));
+
+    let reversed = css.replace("flex-wrap:wrap", "flex-wrap:wrap-reverse");
+    let (output, _, layout) = pipeline(html, &reversed, 100.0);
+    let a = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#a")))
+        .unwrap();
+    let c = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#c")))
+        .unwrap();
+    assert_eq!((a.rect.origin.x, c.rect.origin.x), (55.0, 0.0));
+}
+
+#[test]
 fn flex_basis_honors_border_box_padding_and_border_constraints() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='flex'><div id='item'></div></div></body>",
@@ -1419,6 +1683,97 @@ fn padding_top_percentage_boxes_keep_width_based_resolution_under_auto_heights()
     assert_eq!(rect("#fill").size.height, 0.0);
 }
 
+#[test]
+fn aspect_ratio_supplies_auto_block_height_from_used_width() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=card></div></body>",
+        "html, body, div { display:block; margin:0 } #card { width:320px; aspect-ratio:16 / 9; background:#123456 }",
+        640.0,
+    );
+    let card = find(&output.dom, "#card");
+    let rect = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(card))
+        .expect("aspect-ratio card fragment")
+        .rect;
+    assert_eq!(rect.size.width, 320.0);
+    assert!((rect.size.height - 180.0).abs() < 0.01);
+}
+
+#[test]
+fn explicit_grid_column_and_row_lines_place_cards_in_requested_tracks() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id=grid><div id=card></div></div></body>",
+        "html, body, div { display:block; margin:0 } #grid { display:grid; width:300px; grid-template-columns:100px 100px 100px; grid-template-rows:40px 40px } #card { grid-column:2; grid-row:2; height:20px }",
+        300.0,
+    );
+    let card = find(&output.dom, "#card");
+    let rect = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(card))
+        .expect("explicit grid card fragment")
+        .rect;
+    assert_eq!(rect.origin.x, 100.0);
+    assert_eq!(rect.origin.y, 40.0);
+}
+
+#[test]
+fn explicit_grid_spans_preserve_five_columns_and_leave_cards_beside_carousel() {
+    let html = "<!doctype html><body><div id='grid'><div id='carousel'></div><div id='a'></div><div id='b'></div><div id='c'></div><div id='d'></div><div id='e'></div><div id='f'></div></div></body>";
+    let css = "html, body, #carousel, #a, #b, #c, #d, #e, #f { display:block; margin:0 } #grid { display:grid; width:500px; grid-template-columns:repeat(5,1fr); gap:10px } #carousel { grid-column:1/3; grid-row:1/3; height:110px } #a, #b, #c, #d, #e, #f { height:50px }";
+    let (output, _, layout) = pipeline(html, css, 500.0);
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    };
+    assert_eq!(rect("#carousel"), PhysicalRect::new(0.0, 0.0, 194.0, 110.0));
+    assert_eq!(rect("#a"), PhysicalRect::new(204.0, 0.0, 92.0, 50.0));
+    assert_eq!(rect("#c"), PhysicalRect::new(408.0, 0.0, 92.0, 50.0));
+    assert_eq!(rect("#d"), PhysicalRect::new(204.0, 60.0, 92.0, 50.0));
+    assert_eq!(rect("#f"), PhysicalRect::new(408.0, 60.0, 92.0, 50.0));
+    assert_eq!(rect("#grid").size.height, 110.0);
+}
+
+#[test]
+fn negative_grid_lines_reference_the_final_explicit_boundary() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='grid'><div id='last'></div></div></body>",
+        "html, body, #last { display:block; margin:0 } #grid { display:grid; width:300px; grid-template-columns:repeat(3,1fr) } #last { grid-column:-2/-1; height:20px }",
+        300.0,
+    );
+    let item = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#last")))
+        .unwrap();
+    assert_eq!(item.rect, PhysicalRect::new(200.0, 0.0, 100.0, 20.0));
+}
+
+#[test]
+fn absolute_inset_height_is_definite_for_percentage_height_descendants() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='core'><div id='shim'></div><div id='overlay'><div id='slide'></div></div></div></body>",
+        "html, body, #core, #shim, #overlay, #slide { display:block; margin:0 } #core { position:relative; width:200px } #shim { height:120px } #overlay { position:absolute; top:0; bottom:0; left:0; right:0 } #slide { height:100% }",
+        200.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .unwrap()
+            .rect
+    };
+    assert_eq!(rect("#overlay"), PhysicalRect::new(0.0, 0.0, 200.0, 120.0));
+    assert_eq!(rect("#slide"), PhysicalRect::new(0.0, 0.0, 200.0, 120.0));
+}
+
 // `border: 0` is the classic reset over a user-agent border. The shorthand
 // must set the border WIDTH (not be misread as a color) and reset style and
 // color, so the used border size becomes zero.
@@ -1504,4 +1859,67 @@ fn font_size_compounds_through_em_inheritance() {
         panic!("expected text fragment")
     };
     assert_eq!(text_data.font_size, 48.0);
+}
+
+// The real-world media-cover card: the positioned ancestor gets its height
+// from a STATIC wrapper's `padding-top`, and the absolutely positioned fill
+// box sits deeper, wrapped in that static box. Its `height: 100%` must
+// resolve against the positioning ancestor's eventual padding box (carried
+// through the static wrapper), never the ancestor's provisional zero height.
+#[test]
+fn absolute_fill_resolves_height_through_static_padding_top_wrappers() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+         <div id=ancestor><div id=wrapper><div id=fill></div></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 } \
+         #ancestor { position:relative; width:282px } \
+         #wrapper { padding-top:56.25% } \
+         #fill { position:absolute; inset:0; width:100%; height:100% }",
+        600.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("cover fragment")
+            .rect
+    };
+    assert_eq!(rect("#wrapper").size.height, 282.0 * 0.5625);
+    let fill = rect("#fill");
+    assert_eq!(fill.size.width, 282.0);
+    assert!((fill.size.height - 282.0 * 0.5625).abs() < 0.01);
+    assert_eq!(fill.origin.y, rect("#wrapper").origin.y);
+}
+
+// Zhihu signin centering: a full-viewport flex column with a flex:1 middle
+// section that centers the card both axes (align-items/justify-content).
+#[test]
+fn flex_column_centering_centers_the_login_card() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body>\
+         <div id=home><div id=content><div id=card></div></div></div>\
+         </body>",
+        "html, body, div { display:block; margin:0 } \
+         #home { display:flex; flex-direction:column; height:100vh } \
+         #content { flex:1 1; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:688px } \
+         #card { display:flex; width:733px }",
+        1180.0,
+    );
+    let rect = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("card fragment")
+            .rect
+    };
+    let card = rect("#card");
+    assert_eq!(card.size.width, 733.0);
+    // align-items:center centers the card horizontally...
+    assert_eq!(card.origin.x, (1180.0 - 733.0) / 2.0);
+    // ...and justify-content:center centers it within the flex item's used
+    // main size, which `min-height:688px` lifts above the 600px viewport.
+    assert_eq!(card.origin.y, (688.0 - card.size.height) / 2.0);
 }

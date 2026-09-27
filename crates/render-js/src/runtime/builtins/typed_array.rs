@@ -273,7 +273,7 @@ impl JsRuntime {
                     ..
                 }) => source_buffer.0.borrow()[source_start..source_start + source_length].to_vec(),
                 Some(ObjectHost::Array) => self
-                    .array_elements_for(*object)
+                    .array_elements_for(*object)?
                     .iter()
                     .map(to_number)
                     .collect::<Result<Vec<_>, _>>()?,

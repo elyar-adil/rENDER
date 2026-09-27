@@ -526,8 +526,31 @@ impl fmt::Debug for HttpTransport {
 
 impl HttpTransport {
     /// Creates a transport with verified rustls HTTPS and bounded headers.
+    ///
+    /// A proxy resolved from the environment (`ALL_PROXY`/`HTTPS_PROXY`/`HTTP_PROXY`
+    /// with `NO_PROXY`) or, on Windows, the system proxy settings applies to
+    /// every request issued through this transport. Local addresses listed in
+    /// `NO_PROXY` and loopback targets bypass the proxy.
     #[must_use]
     pub fn new(config: FetchConfig) -> Self {
+        let proxy = ureq::Proxy::try_from_env();
+        if let Some(proxy) = &proxy {
+            eprintln!(
+                "render-net proxy: {}:{} (from environment or system settings)",
+                proxy.host(),
+                proxy.port(),
+            );
+        }
+        Self::with_proxy(config, proxy)
+    }
+
+    /// Creates a transport that routes every request through `proxy` when set.
+    ///
+    /// This is the injection point for callers with their own proxy policy;
+    /// [`HttpTransport::new`] resolves the proxy from the environment and the
+    /// platform instead.
+    #[must_use]
+    pub fn with_proxy(config: FetchConfig, proxy: Option<ureq::Proxy>) -> Self {
         let agent_config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             // Redirects are handled here so intermediate response headers are
@@ -553,7 +576,13 @@ impl HttpTransport {
             .timeout_send_body(Some(config.timeout))
             .timeout_recv_response(None)
             .timeout_recv_body(None)
+            // ureq 3.3's Brotli reader can finish decoding before it drains
+            // the length-delimited wire body, so the connection never returns
+            // to its pool. Gzip keeps compression and reliably reuses the
+            // connection across the many same-origin assets on real pages.
+            .accept_encoding("gzip")
             .user_agent(config.user_agent.clone())
+            .proxy(proxy)
             .build();
         Self {
             config: Arc::new(config),
@@ -1394,7 +1423,7 @@ mod tests {
         // Conditional revalidation must repeat the same content negotiation as
         // the original request (for example `Vary: Accept-Encoding`), so the
         // automatically advertised encodings stay identical on every request.
-        assert!(request.contains("accept-encoding: gzip, br"));
+        assert!(request.contains("accept-encoding: gzip"));
     }
 
     #[test]

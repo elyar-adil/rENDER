@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
+use render_core::document::{Document, ExternalStyleSheets};
 use render_core::dom::Dom;
 use render_core::dom::NodeId;
 use render_core::dom::NodeKind;
@@ -44,6 +46,7 @@ use crate::page_state::PageNavigation;
 use crate::page_state::PageState;
 use crate::render_worker::PageRenderFrame;
 use crate::render_worker::PageRenderPayload;
+use crate::render_worker::merge_current_style_sheets;
 use render_browser::chrome::ChromeLayout;
 use render_browser::chrome::HitTarget;
 use render_browser::chrome::Point;
@@ -54,10 +57,12 @@ use render_browser::home::HOME_TITLE;
 use render_browser::model::TabId;
 use render_browser::model::TabModel;
 use render_browser::navigation::NavigationTarget;
+use render_browser::resources::plan_external_style_sheets;
 use render_browser::scripts::{
     plan_classic_scripts, plan_unstarted_classic_scripts, prepare_script_batch,
 };
 use render_browser::settings::CacheClearUiState;
+use render_browser::worker::CompletedRender;
 use render_browser::worker::RenderCancellation;
 use render_browser::worker::RenderFailure;
 use render_browser::worker::RenderJob;
@@ -752,6 +757,233 @@ fn script_fetches_run_before_stylesheets_and_execution_waits_for_them() {
     }
 }
 
+#[test]
+fn script_inserted_stylesheet_is_discovered_after_initial_styles_resolve() {
+    let (mut app, tab) = headless_app_with("<link rel=stylesheet href=a.css>");
+    let (fresh, revision) = {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        let base = page.navigation.committed().target.history_url();
+        let first = plan_external_style_sheets(
+            page.page.document(),
+            &base,
+            render_core::document::DocumentLimits::default(),
+        );
+        page.started_style_sheets
+            .insert(first.resources[0].key.clone());
+        page.styles_resolved = true;
+
+        let dom = page.page.document_mut().dom_mut();
+        let head = dom
+            .parent(first.resources[0].key.owner)
+            .expect("link parent");
+        let added = dom.create_element("link");
+        dom.set_attribute(added, "rel", "stylesheet").expect("rel");
+        dom.set_attribute(added, "href", "b.css").expect("href");
+        dom.append_child(head, added).expect("append link");
+        page.dom_revision = dom.revision().as_u64();
+        (
+            plan_external_style_sheets(
+                page.page.document(),
+                &base,
+                render_core::document::DocumentLimits::default(),
+            ),
+            page.dom_revision,
+        )
+    };
+    assert_eq!(fresh.resources.len(), 2);
+
+    app.schedule_page_render(tab, WindowSize::new(800, 600), false);
+    let identity = app.pages.get(&tab).unwrap().expected_render.unwrap();
+    app.commit_render(CompletedRender {
+        identity,
+        result: Ok(PageRenderFrame {
+            frame: Vec::new(),
+            viewport: WindowSize::new(800, 600),
+            display_list: None,
+            paint_scene: None,
+            raster_background: Color::rgb(255, 255, 255),
+            content_height: 0.0,
+            viewport_height: 600.0,
+            applied_style_sheets: None,
+            style_plan: Some(fresh),
+            style_diagnostics: Vec::new(),
+            computed_styles: None,
+            geometry: None,
+            document_revision: revision,
+        }),
+    });
+
+    let page = app.pages.get(&tab).expect("page state");
+    let pending = page
+        .pending_style_sheets
+        .as_ref()
+        .expect("new stylesheet requested");
+    assert_eq!(pending.plan.resources.len(), 1);
+    assert!(
+        pending.plan.resources[0]
+            .request
+            .url
+            .as_str()
+            .ends_with("/b.css")
+    );
+    assert_eq!(page.started_style_sheets.len(), 2);
+}
+
+#[test]
+fn timer_inserted_script_runs_after_initial_script_scan_completed() {
+    let (mut app, tab) = headless_app_with("<main id=host></main>");
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        page.styles_resolved = true;
+        page.scripts_resolved = true;
+        page.initial_script_scan_completed = true;
+        page.page
+            .queue_script(
+                r#"setTimeout(function () {
+                    var s = document.createElement('script');
+                    s.textContent = "document.title = 'Dynamic'";
+                    document.getElementById('host').appendChild(s);
+                }, 1);"#,
+            )
+            .expect("queue timer setup");
+        page.run_page_turns();
+        page.created_at -= Duration::from_millis(50);
+        let (changed, _) = page.run_page_turns();
+        assert!(changed, "timer inserts a script element");
+        assert!(
+            !page.scripts_resolved,
+            "DOM change reopens script discovery"
+        );
+    }
+
+    app.start_classic_scripts(tab);
+    assert_eq!(
+        app.pages.get(&tab).unwrap().navigation.committed().title,
+        "Dynamic"
+    );
+}
+
+#[test]
+fn broken_image_does_not_refetch_on_every_render_but_new_source_does() {
+    let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/a.png>");
+    app.start_images(tab);
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        let first = page.pending_images.as_ref().expect("first image request");
+        assert!(
+            first.plan.resources[0]
+                .request
+                .url
+                .as_str()
+                .ends_with("/a.png")
+        );
+        page.cancel_images();
+    }
+
+    app.start_images(tab);
+    assert!(
+        app.pages.get(&tab).unwrap().pending_images.is_none(),
+        "the same failed source should not be requested each frame"
+    );
+
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        let dom = page.page.document_mut().dom_mut();
+        let image = find_id(dom, "photo");
+        dom.set_attribute(image, "src", "https://example.test/b.png")
+            .expect("new source");
+    }
+    app.start_images(tab);
+    let page = app.pages.get(&tab).expect("page state");
+    let second = page.pending_images.as_ref().expect("new image request");
+    assert!(
+        second.plan.resources[0]
+            .request
+            .url
+            .as_str()
+            .ends_with("/b.png")
+    );
+}
+
+#[test]
+fn image_source_changed_during_fetch_starts_replacement_immediately() {
+    let (mut app, tab) = headless_app_with("<img id=photo src=https://example.test/old.png>");
+    app.start_images(tab);
+    let old_url = app.pages[&tab]
+        .pending_images
+        .as_ref()
+        .expect("old request")
+        .plan
+        .resources[0]
+        .request
+        .url
+        .clone();
+    {
+        let page = app.pages.get_mut(&tab).expect("page state");
+        let dom = page.page.document_mut().dom_mut();
+        let image = find_id(dom, "photo");
+        dom.set_attribute(image, "src", "https://example.test/new.png")
+            .expect("new source");
+    }
+    app.finish_images(
+        tab,
+        vec![Ok(render_net::FetchResponse {
+            requested_url: old_url.clone(),
+            final_url: old_url.clone(),
+            redirect_chain: vec![old_url],
+            redirects: Vec::new(),
+            status: render_net::HttpStatus::from_u16(200),
+            headers: Vec::new(),
+            content_type: None,
+            body: Vec::new(),
+        })],
+    );
+    let replacement = app.pages[&tab]
+        .pending_images
+        .as_ref()
+        .expect("replacement request");
+    assert!(
+        replacement.plan.resources[0]
+            .request
+            .url
+            .as_str()
+            .ends_with("/new.png")
+    );
+}
+
+#[test]
+fn dynamic_stylesheet_merge_keeps_previous_css_and_drops_retargeted_links() {
+    let base = Url::parse("https://example.test/page.html").expect("base URL");
+    let mut document =
+        Document::parse("<link rel=stylesheet href=a.css><link rel=stylesheet href=old.css>");
+    let original = plan_external_style_sheets(
+        &document,
+        &base,
+        render_core::document::DocumentLimits::default(),
+    );
+    let mut existing = ExternalStyleSheets::default();
+    existing.insert_css(original.resources[0].key.clone(), "h1 { color: red }");
+    existing.insert_css(original.resources[1].key.clone(), "h1 { color: blue }");
+
+    document
+        .dom_mut()
+        .set_attribute(original.resources[1].key.owner, "href", "b.css")
+        .expect("retarget link");
+    let current = plan_external_style_sheets(
+        &document,
+        &base,
+        render_core::document::DocumentLimits::default(),
+    );
+    let mut incoming = ExternalStyleSheets::default();
+    incoming.insert_css(current.resources[1].key.clone(), "h1 { color: green }");
+    let merged = merge_current_style_sheets(&document, &base, &existing, &incoming);
+
+    assert_eq!(merged.len(), 2);
+    assert!(merged.get(&original.resources[0].key).is_some());
+    assert!(merged.get(&original.resources[1].key).is_none());
+    assert!(merged.get(&current.resources[1].key).is_some());
+}
+
 /// A 200 `text/javascript` response for the plan's single external script.
 fn script_response(
     plan: &render_browser::scripts::ScriptFetchPlan,
@@ -1002,7 +1234,11 @@ fn headless_app_with(html: &str) -> (BrowserApp, TabId) {
         hot: HitTarget::Chrome,
         cursor_icon: winit::window::CursorIcon::Default,
         drag: None,
+        tab_drag_paint: None,
+        scrollbar_drag: None,
+        scrollbar_hot: false,
         address_selecting: false,
+        content_selecting: false,
         address_menu: None,
         modifiers: winit::keyboard::ModifiersState::default(),
         title_bar_clicks: render_browser::chrome::TitleBarClickTracker::default(),
@@ -1143,6 +1379,113 @@ fn clicking_the_search_box_focuses_it_and_typing_renders_the_value() {
         "Enter must push a history entry for the form submission"
     );
     assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn focused_page_input_exposes_a_caret_that_tracks_the_editor_cursor() {
+    let (mut app, _tab, _kw) = headless_search_app();
+    click_search_box(&mut app);
+
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    let empty = app
+        .content_caret_geometry(chrome_height)
+        .expect("focused input has a caret");
+    assert!((empty.clip.x - 200.0).abs() < f32::EPSILON);
+    assert!((empty.clip.y - (chrome_height as f32 + 150.0)).abs() < f32::EPSILON);
+    let empty_x = empty.rect.x;
+
+    app.handle_keyboard(&pressed_character("a"));
+    let typed = app
+        .content_caret_geometry(chrome_height)
+        .expect("caret remains visible after typing");
+    assert!(
+        typed.rect.x > empty_x,
+        "typing must advance the visible caret"
+    );
+
+    app.handle_keyboard(&pressed_named(NamedKey::ArrowLeft));
+    let moved = app
+        .content_caret_geometry(chrome_height)
+        .expect("caret remains visible after moving");
+    assert!((moved.rect.x - empty_x).abs() < f32::EPSILON);
+
+    app.close_content_editor();
+    assert!(
+        app.content_caret_geometry(chrome_height).is_none(),
+        "blurring the control must remove its caret"
+    );
+}
+
+#[test]
+fn named_space_key_is_inserted_into_a_focused_page_input() {
+    let (mut app, tab, kw) = headless_search_app();
+    click_search_box(&mut app);
+    app.handle_keyboard(&pressed_character("hello"));
+    app.handle_keyboard(&pressed_named(NamedKey::Space));
+    app.handle_keyboard(&pressed_character("world"));
+    assert_eq!(committed_value(&app, tab, kw), "hello world");
+}
+
+#[test]
+fn dragging_in_a_page_input_creates_a_selection_that_replaces_on_type() {
+    let (mut app, tab, kw) = headless_search_app();
+    content_interaction::set_content_text_value(
+        app.pages
+            .get_mut(&tab)
+            .expect("page")
+            .page
+            .document_mut()
+            .dom_mut(),
+        kw,
+        "hello world",
+    )
+    .expect("set input value");
+
+    // The first click starts a pointer gesture.  Move while the button is
+    // held, then release; this follows the same path as native Winit events.
+    click_content_at(&mut app, 205.0, 167.0);
+    app.left_pointer_down = true;
+    let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
+    app.handle_cursor_move(PhysicalPosition::new(
+        235.0,
+        f64::from(chrome_height) + 167.0,
+    ));
+    app.handle_pointer_release();
+    let selected = app
+        .content_editor
+        .as_ref()
+        .and_then(|content| content.editor.selected_text())
+        .expect("dragging through a focused input must leave a non-empty selection")
+        .to_owned();
+    assert_eq!(selected, "hello");
+
+    app.handle_keyboard(&pressed_character("X"));
+    assert_eq!(committed_value(&app, tab, kw), "X world");
+}
+
+#[test]
+fn clicking_inside_existing_page_input_text_places_the_caret_near_the_click() {
+    let (mut app, tab, kw) = headless_search_app();
+    content_interaction::set_content_text_value(
+        app.pages
+            .get_mut(&tab)
+            .expect("page")
+            .page
+            .document_mut()
+            .dom_mut(),
+        kw,
+        "abcd",
+    )
+    .expect("set input value");
+
+    // The fallback text origin is x=205 in this headless fixture. A click a
+    // few pixels into the first glyph should place the caret before the end.
+    click_content_at(&mut app, 208.0, 167.0);
+    let content = app.content_editor.as_ref().expect("input gains focus");
+    assert!(
+        content.editor.cursor() < content.editor.text().len(),
+        "clicking within existing text must not always move the caret to the end"
+    );
 }
 
 #[test]

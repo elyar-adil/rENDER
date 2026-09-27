@@ -34,6 +34,8 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::UrlToString => Ok(self.url_to_string(&JsValue::Object(receiver))),
+            NativeFunction::UrlCreateObjectUrl => self.url_create_object_url(arguments),
+            NativeFunction::UrlRevokeObjectUrl => Ok(JsValue::Undefined),
             NativeFunction::UrlSearchParamsGet
             | NativeFunction::UrlSearchParamsHas
             | NativeFunction::UrlSearchParamsSet
@@ -48,6 +50,57 @@ impl JsRuntime {
             other => self.dispatch_style_native(dom, other, receiver, arguments),
         }
     }
+}
+
+impl JsRuntime {
+    /// Return a data URL for Blob values. The embedding treats data URLs as
+    /// ordinary resources, so this keeps `URL.createObjectURL(blob)` useful
+    /// for image/video elements without adding a second transport registry.
+    fn url_create_object_url(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let object = match arguments.first() {
+            Some(JsValue::Object(object)) => *object,
+            _ => return Err(JsError::type_error("createObjectURL requires a Blob")),
+        };
+        let (bytes, content_type) = match self.realm.host(object) {
+            Some(ObjectHost::Blob {
+                bytes,
+                content_type,
+            }) => (bytes.clone(), content_type.clone()),
+            _ => return Err(JsError::type_error("createObjectURL requires a Blob")),
+        };
+        let mime = if content_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            &content_type
+        };
+        Ok(JsValue::String(format!(
+            "data:{mime};base64,{}",
+            base64_encode(&bytes)
+        )))
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(TABLE[(first >> 2) as usize] as char);
+        output.push(TABLE[((first & 3) << 4 | second >> 4) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((second & 15) << 2 | third >> 6) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(third & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
 }
 
 impl JsRuntime {

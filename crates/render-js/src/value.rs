@@ -114,20 +114,66 @@ impl JsValue {
     }
 }
 
+/// ECMA-262 `ToString(Number)`: shortest round-trip digits with decimal
+/// notation for `1e-6 <= |x| < 1e21` and exponential notation outside that
+/// range (`1e+21`, `1.5e-7`).
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "the digit-count and exponent branches guarantee non-negative values"
+)]
 pub(crate) fn number_to_string(value: f64) -> String {
     if value.is_nan() {
-        "NaN".to_owned()
-    } else if value.is_infinite() {
-        if value.is_sign_positive() {
+        return "NaN".to_owned();
+    }
+    if value.is_infinite() {
+        return if value.is_sign_positive() {
             "Infinity".to_owned()
         } else {
             "-Infinity".to_owned()
-        }
-    } else if value.classify() == FpCategory::Zero {
-        "0".to_owned()
-    } else {
-        value.to_string()
+        };
     }
+    if value.classify() == FpCategory::Zero {
+        return "0".to_owned();
+    }
+    let negative = value < 0.0;
+    // `{:e}` renders the shortest round-trip mantissa, e.g. `1.5e-7`.
+    let formatted = format!("{:e}", value.abs());
+    let (mantissa, exponent) = formatted
+        .split_once('e')
+        .expect("LowerExp always emits an exponent");
+    let exponent: i32 = exponent.parse().expect("LowerExp emits a decimal exponent");
+    let digits: String = mantissa
+        .chars()
+        .filter(|character| *character != '.')
+        .collect();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "shortest round-trip digit counts stay far below i32::MAX"
+    )]
+    let k = digits.len() as i32;
+    let n = exponent + 1;
+    let text = if k <= n && n <= 21 {
+        let mut text = digits;
+        text.push_str(&"0".repeat((n - k) as usize));
+        text
+    } else if 0 < n && n <= 21 {
+        let mut text = digits;
+        text.insert(n as usize, '.');
+        text
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{}", "0".repeat((-n) as usize), digits)
+    } else {
+        let exponent = n - 1;
+        let sign = if exponent < 0 { "-" } else { "+" };
+        let magnitude = exponent.unsigned_abs();
+        if k == 1 {
+            format!("{digits}e{sign}{magnitude}")
+        } else {
+            format!("{}.{}e{sign}{magnitude}", &digits[..1], &digits[1..])
+        }
+    };
+    if negative { format!("-{text}") } else { text }
 }
 
 pub(crate) fn location_components(url: &Url) -> [(&'static str, String); 9] {
@@ -203,6 +249,36 @@ impl PropertyDescriptor {
     }
 }
 
+/// ECMAScript `SameValue` for two JavaScript values: `NaN` equals itself and
+/// `+0` differs from `-0`.
+#[allow(
+    clippy::float_cmp,
+    reason = "SameValue compares IEEE values bit-for-bit by definition"
+)]
+fn same_value(left: &JsValue, right: &JsValue) -> bool {
+    match (left, right) {
+        (JsValue::Number(left), JsValue::Number(right)) => {
+            (left.is_nan() && right.is_nan()) || left == right
+        }
+        _ => left == right,
+    }
+}
+
+/// Whether a redefinition request is a no-op against the current descriptor,
+/// which makes it legal even for a non-configurable property.
+fn descriptors_are_identical(current: &PropertyDescriptor, next: &PropertyDescriptor) -> bool {
+    if current.writable != next.writable
+        || current.enumerable != next.enumerable
+        || current.configurable != next.configurable
+        || current.getter != next.getter
+        || current.setter != next.setter
+        || current.is_accessor() != next.is_accessor()
+    {
+        return false;
+    }
+    current.is_accessor() || same_value(&current.value, &next.value)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     GetElementById,
@@ -216,7 +292,9 @@ pub(crate) enum NativeFunction {
     AttrGetName,
     AttrGetValue,
     CreateTextNode,
+    CreateComment,
     CreateDocumentFragment,
+    CreateEvent,
     GetComputedStyle,
     GlobalParseInt,
     GlobalParseFloat,
@@ -228,6 +306,8 @@ pub(crate) enum NativeFunction {
     GlobalDecodeURIComponent,
     GlobalEscape,
     GlobalUnescape,
+    GlobalAtob,
+    GlobalBtoa,
     GlobalEvalStub,
     GlobalImport,
     GlobalNoop,
@@ -336,6 +416,10 @@ pub(crate) enum NativeFunction {
     ArrayJoin,
     ArrayIndexOf,
     ArraySlice,
+    /// `Array.prototype.values` / `keys` / `entries`.
+    ArrayValues,
+    ArrayKeys,
+    ArrayEntries,
     ArraySplice,
     ArrayReverse,
     ArraySort,
@@ -352,6 +436,7 @@ pub(crate) enum NativeFunction {
     ArrayIncludes,
     ArrayReduce,
     FunctionPrototype,
+    FunctionToString,
     FunctionCall,
     FunctionBind,
     FunctionApply,
@@ -401,6 +486,7 @@ pub(crate) enum NativeFunction {
     ObjectGetOwnPropertyNames,
     ObjectGetOwnPropertySymbols,
     ObjectGetPrototypeOf,
+    ObjectSetPrototypeOf,
     ObjectHasOwn,
     ObjectPrototypeHasOwnProperty,
     ObjectPrototypeIsPrototypeOf,
@@ -428,6 +514,8 @@ pub(crate) enum NativeFunction {
     JsonParse,
     JsonStringify,
     PerformanceNow,
+    PerformanceGetEntries,
+    PerformanceGetEntriesByType,
     CollectionGet,
     CollectionSet,
     CollectionAdd,
@@ -454,14 +542,57 @@ pub(crate) enum NativeFunction {
     MutationDisconnect,
     MutationTakeRecords,
     ArrayPrototypeToString,
+    /// Iterator helpers (`%IteratorPrototype%` methods).
+    IteratorConstructor,
+    IteratorFrom,
+    IteratorPrototypeIterator,
+    IteratorHelperNext,
+    IteratorHelperReturn,
+    IteratorMap,
+    IteratorFilter,
+    IteratorTake,
+    IteratorDrop,
+    IteratorFlatMap,
+    IteratorReduce,
+    IteratorToArray,
+    IteratorForEach,
+    IteratorSome,
+    IteratorEvery,
+    IteratorFind,
+    IteratorConcat,
+    IteratorChunks,
+    IteratorWindows,
     GlobalFetch,
+    ReflectGet,
+    ReflectSet,
+    ReflectHas,
+    ReflectDeleteProperty,
+    ReflectOwnKeys,
+    ReflectGetOwnPropertyDescriptor,
+    ReflectDefineProperty,
+    ReflectConstruct,
     ResponseText,
     ResponseJson,
     ResponseHeadersGet,
+    BlobText,
+    BlobArrayBuffer,
+    BlobSlice,
+    UrlCreateObjectUrl,
+    UrlRevokeObjectUrl,
     XhrOpen,
     XhrSetRequestHeader,
     XhrSend,
     XhrGetResponseHeader,
+    XhrGetAllResponseHeaders,
+    XhrAddEventListener,
+    XhrRemoveEventListener,
+    AbortControllerAbort,
+    FormDataAppend,
+    FormDataGet,
+    FormDataSet,
+    FormDataHas,
+    FormDataDelete,
+    FormDataEntries,
     VideoPlay,
     VideoPause,
     VideoLoad,
@@ -652,6 +783,22 @@ impl ErrorKind {
     }
 }
 
+/// The behavior of one lazy iterator helper.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum IteratorHelperKind {
+    /// `Iterator.from` wrapper around a foreign iterator (forwards `next`).
+    Wrap,
+    Map,
+    Filter,
+    Take(u64),
+    Drop(u64),
+    FlatMap,
+    /// `concat`: chains the receiver with the remaining iterators.
+    Concat(Vec<ObjectId>),
+    Chunks(u64),
+    Windows(u64),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum ObjectHost {
     #[default]
@@ -729,6 +876,25 @@ pub(crate) enum ObjectHost {
         values: Vec<JsValue>,
         index: usize,
     },
+    /// A lazy iterator helper (`%IteratorPrototype%.map/take/chunks/...`).
+    /// The state machine is stepped one `next()` call at a time by
+    /// [`crate::runtime::builtins::iterator`].
+    IteratorHelper {
+        kind: IteratorHelperKind,
+        /// The underlying iterator and its `next` method.
+        source: Option<ObjectId>,
+        source_next: Option<ObjectId>,
+        /// The callback carried by map/filter/flatMap/reduce/...
+        callback: Option<ObjectId>,
+        /// A helper-specific inner iterator (flatMap, concat, windows).
+        inner: Option<ObjectId>,
+        inner_next: Option<ObjectId>,
+        /// Generic per-helper counter (`take`/`drop`/`chunks`/`windows`).
+        counter: u64,
+        /// Per-helper buffer (flatMap, concat, chunks, windows, reduce).
+        buffer: Vec<JsValue>,
+        done: bool,
+    },
     TypedArrayConstructor(TypedArrayKind),
     TypedArray {
         kind: TypedArrayKind,
@@ -749,6 +915,13 @@ pub(crate) enum ObjectHost {
     XmlHttpRequestConstructor,
     /// One `XMLHttpRequest` instance with its captured request state.
     XmlHttpRequest(XmlHttpRequestState),
+    AbortControllerConstructor,
+    AbortController,
+    AbortSignal,
+    FormDataConstructor,
+    FormData {
+        entries: Vec<(String, String)>,
+    },
     /// The `Response` constructor object.
     ResponseConstructor,
     /// One settled `fetch` response.
@@ -762,6 +935,18 @@ pub(crate) enum ObjectHost {
     /// A `response.headers` instance reading through its owning `Response`.
     ResponseHeaders {
         owner: ObjectId,
+    },
+    /// Immutable bytes exposed by the File API `Blob` surface. The runtime
+    /// keeps the payload bounded and stores it outside the DOM.
+    Blob {
+        bytes: Vec<u8>,
+        content_type: String,
+    },
+    BlobConstructor,
+    ProxyConstructor,
+    Proxy {
+        target: ObjectId,
+        handler: ObjectId,
     },
     /// The `Video` (`HTMLVideoElement`) constructor object.
     VideoConstructor,
@@ -889,6 +1074,13 @@ pub struct JsObject {
     pub(crate) host: ObjectHost,
     /// `Object.preventExtensions` and friends; every object starts extensible.
     extensible: bool,
+    /// Own private field values, keyed by the class-unique private-name id.
+    /// Presence is the brand check for `#field in object`.
+    private_fields: BTreeMap<u64, JsValue>,
+    /// Private methods and accessors installed on this object (class
+    /// prototypes and constructors). Instance lookup walks the prototype
+    /// chain, mirroring how private methods are reachable from derived code.
+    private_methods: BTreeMap<u64, PropertyDescriptor>,
 }
 
 impl Default for JsObject {
@@ -900,6 +1092,8 @@ impl Default for JsObject {
             prototype: None,
             host: ObjectHost::default(),
             extensible: true,
+            private_fields: BTreeMap::new(),
+            private_methods: BTreeMap::new(),
         }
     }
 }
@@ -925,6 +1119,7 @@ impl JsObject {
             .properties
             .values()
             .chain(self.symbols.values().map(|(_, descriptor)| descriptor))
+            .chain(self.private_methods.values())
         {
             if descriptor.is_accessor() {
                 references.extend(descriptor.getter);
@@ -933,7 +1128,36 @@ impl JsObject {
                 references.push(*id);
             }
         }
+        for value in self.private_fields.values() {
+            if let JsValue::Object(id) = value {
+                references.push(*id);
+            }
+        }
         references
+    }
+
+    /// Define (or overwrite) an own private field value.
+    pub(crate) fn set_private_field(&mut self, id: u64, value: JsValue) {
+        self.private_fields.insert(id, value);
+    }
+
+    #[must_use]
+    pub(crate) fn private_field(&self, id: u64) -> Option<&JsValue> {
+        self.private_fields.get(&id)
+    }
+
+    #[must_use]
+    pub(crate) fn has_private_field(&self, id: u64) -> bool {
+        self.private_fields.contains_key(&id)
+    }
+
+    pub(crate) fn define_private_method(&mut self, id: u64, descriptor: PropertyDescriptor) {
+        self.private_methods.insert(id, descriptor);
+    }
+
+    #[must_use]
+    pub(crate) fn private_method(&self, id: u64) -> Option<&PropertyDescriptor> {
+        self.private_methods.get(&id)
     }
 }
 
@@ -954,6 +1178,10 @@ pub struct Realm {
     symbol_prototype: ObjectId,
     promise_prototype: ObjectId,
     element_prototype: ObjectId,
+    /// `%IteratorPrototype%` carrying the iterator-helper methods.
+    iterator_prototype: ObjectId,
+    /// `%IteratorHelperPrototype%` shared by helper result objects.
+    iterator_helper_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -1032,6 +1260,43 @@ impl Realm {
             object_prototype,
             function_prototype,
         );
+        // DOM libraries feature-detect and use `instanceof Document` during
+        // startup. Keep a dedicated prototype for the live document wrapper
+        // so the check has the same result as a browser while the constructor
+        // remains intentionally non-constructible.
+        let document_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let document_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DomConstructor,
+            ..JsObject::default()
+        });
+        objects[document_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(document_prototype)),
+        );
+        objects[document_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(document_constructor)),
+        );
+        objects[document.0].prototype = Some(document_prototype);
+        for name in ["Document", "HTMLDocument"] {
+            objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(document_constructor),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
         Self::install_location(
             &mut objects,
             global,
@@ -1041,6 +1306,7 @@ impl Realm {
             document_url,
         );
         Self::install_navigator(&mut objects, global, object_prototype);
+        Self::install_screen(&mut objects, global, object_prototype);
         Self::install_performance(&mut objects, global, object_prototype, function_prototype);
         Self::install_errors(&mut objects, global, object_prototype, function_prototype);
         Self::install_event(&mut objects, global, object_prototype, function_prototype);
@@ -1062,10 +1328,13 @@ impl Realm {
             Self::install_promise(&mut objects, global, object_prototype, function_prototype);
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
+        let (iterator_prototype, iterator_helper_prototype) =
+            Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
+        Self::install_proxy_reflect(&mut objects, global, object_prototype, function_prototype);
         Self::install_video(&mut objects, global, object_prototype, function_prototype);
         Self::define_global_function(
             &mut objects,
@@ -1090,6 +1359,8 @@ impl Realm {
             ),
             ("escape", NativeFunction::GlobalEscape),
             ("unescape", NativeFunction::GlobalUnescape),
+            ("atob", NativeFunction::GlobalAtob),
+            ("btoa", NativeFunction::GlobalBtoa),
             ("eval", NativeFunction::GlobalEvalStub),
             ("__render_noop", NativeFunction::GlobalNoop),
         ] {
@@ -1305,6 +1576,21 @@ impl Realm {
             "prototype".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(url_prototype)),
         );
+        for (name, function) in [
+            ("createObjectURL", NativeFunction::UrlCreateObjectUrl),
+            ("revokeObjectURL", NativeFunction::UrlRevokeObjectUrl),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[url_constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         objects[global.0].properties.insert(
             "URL".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(url_constructor)),
@@ -1487,6 +1773,7 @@ impl Realm {
                 };
             }
         }
+        Self::install_builtin_metadata(&mut objects);
         Self {
             objects,
             global,
@@ -1502,6 +1789,8 @@ impl Realm {
             symbol_prototype,
             promise_prototype,
             element_prototype,
+            iterator_prototype,
+            iterator_helper_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
@@ -1617,7 +1906,7 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Number(value)),
             );
         }
-        for name in ["Element", "HTMLElement", "Node"] {
+        for name in ["Element", "HTMLElement", "Node", "DocumentFragment"] {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
@@ -1864,6 +2153,377 @@ impl Realm {
     ///
     /// Messages are buffered in the runtime and drained by the embedding; the
     /// interpreter never touches I/O itself.
+    /// Install the `Iterator` global, `%IteratorPrototype%` (helper methods),
+    /// and `%IteratorHelperPrototype%`. Returns both prototypes.
+    #[allow(clippy::too_many_lines)]
+    fn install_iterator(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> (ObjectId, ObjectId) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let helper_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("map", NativeFunction::IteratorMap),
+            ("filter", NativeFunction::IteratorFilter),
+            ("take", NativeFunction::IteratorTake),
+            ("drop", NativeFunction::IteratorDrop),
+            ("flatMap", NativeFunction::IteratorFlatMap),
+            ("reduce", NativeFunction::IteratorReduce),
+            ("toArray", NativeFunction::IteratorToArray),
+            ("forEach", NativeFunction::IteratorForEach),
+            ("some", NativeFunction::IteratorSome),
+            ("every", NativeFunction::IteratorEvery),
+            ("find", NativeFunction::IteratorFind),
+            ("concat", NativeFunction::IteratorConcat),
+            ("chunks", NativeFunction::IteratorChunks),
+            ("windows", NativeFunction::IteratorWindows),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let self_iterator = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::IteratorPrototypeIterator),
+            ..JsObject::default()
+        });
+        let symbol = JsSymbol::well_known("@@iterator");
+        objects[prototype.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol.clone(),
+                PropertyDescriptor::builtin(JsValue::Object(self_iterator)),
+            ),
+        );
+        for (name, function) in [
+            ("next", NativeFunction::IteratorHelperNext),
+            ("return", NativeFunction::IteratorHelperReturn),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[helper_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[helper_prototype.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol,
+                PropertyDescriptor::builtin(JsValue::Object(self_iterator)),
+            ),
+        );
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::IteratorConstructor),
+            ..JsObject::default()
+        });
+        let from = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::IteratorFrom),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "from".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(from)),
+        );
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "Iterator".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        (prototype, helper_prototype)
+    }
+
+    /// Attach spec-visible `name`/`length` own properties to built-in
+    /// functions and `X.prototype.constructor` back-references that the
+    /// individual install loops omit.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "builtin metadata is a single bootstrap pass"
+    )]
+    fn install_builtin_metadata(objects: &mut [JsObject]) {
+        let mut names: Vec<Option<String>> = vec![None; objects.len()];
+        let mut prototype_owner: Vec<Option<ObjectId>> = vec![None; objects.len()];
+        let mut callable: Vec<bool> = vec![false; objects.len()];
+        for (index, object) in objects.iter().enumerate() {
+            callable[index] = matches!(
+                object.host,
+                ObjectHost::NativeFunction(_)
+                    | ObjectHost::BoundFunction { .. }
+                    | ObjectHost::ObjectConstructor
+                    | ObjectHost::FunctionConstructor
+                    | ObjectHost::ArrayConstructor
+                    | ObjectHost::StringConstructor
+                    | ObjectHost::NumberConstructor
+                    | ObjectHost::BooleanConstructor
+                    | ObjectHost::DateConstructor
+                    | ObjectHost::SymbolConstructor
+                    | ObjectHost::RegExpConstructor
+                    | ObjectHost::PromiseConstructor
+                    | ObjectHost::ErrorConstructor(_)
+                    | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::ImageConstructor
+                    | ObjectHost::VideoConstructor
+                    | ObjectHost::XmlHttpRequestConstructor
+                    | ObjectHost::AbortControllerConstructor
+                    | ObjectHost::FormDataConstructor
+                    | ObjectHost::ResponseConstructor
+                    | ObjectHost::BlobConstructor
+                    | ObjectHost::ProxyConstructor
+                    | ObjectHost::IntersectionObserverConstructor
+                    | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::CollectionConstructor(_)
+                    | ObjectHost::TypedArrayConstructor(_)
+                    | ObjectHost::UrlConstructor
+                    | ObjectHost::UrlSearchParamsConstructor
+            );
+            for (key, descriptor) in &object.properties {
+                let JsValue::Object(target) = &descriptor.value else {
+                    continue;
+                };
+                if names[target.0].is_none() {
+                    names[target.0] = Some(key.clone());
+                }
+                if key == "prototype" && prototype_owner[target.0].is_none() {
+                    prototype_owner[target.0] = Some(ObjectId(index));
+                }
+            }
+            for (symbol, descriptor) in object.symbols.values() {
+                let JsValue::Object(target) = &descriptor.value else {
+                    continue;
+                };
+                if names[target.0].is_none()
+                    && let Some(description) = symbol.description()
+                {
+                    names[target.0] = Some(format!("[{description}]"));
+                }
+            }
+        }
+        for (index, object) in objects.iter_mut().enumerate() {
+            if let Some(owner) = prototype_owner[index]
+                && callable[owner.0]
+                && !object.properties.contains_key("constructor")
+            {
+                object.properties.insert(
+                    "constructor".to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Object(owner),
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+            if !callable[index] {
+                continue;
+            }
+            let name = names[index].clone().unwrap_or_default();
+            if !object.properties.contains_key("name") {
+                object.properties.insert(
+                    "name".to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::String(name.clone()),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+            if !object.properties.contains_key("length") {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "builtin arities are tiny integers"
+                )]
+                let length = Self::builtin_arity(&name) as f64;
+                object.properties.insert(
+                    "length".to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Number(length),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Spec arity for the common built-in names; unknown names fall back to
+    /// zero. A wrong arity only affects `length` assertions.
+    #[allow(
+        clippy::match_same_arms,
+        clippy::too_many_lines,
+        reason = "the arity groups read better split by feature area"
+    )]
+    fn builtin_arity(name: &str) -> usize {
+        match name {
+            "push"
+            | "map"
+            | "filter"
+            | "forEach"
+            | "some"
+            | "every"
+            | "find"
+            | "findIndex"
+            | "findLast"
+            | "findLastIndex"
+            | "includes"
+            | "indexOf"
+            | "lastIndexOf"
+            | "charAt"
+            | "charCodeAt"
+            | "codePointAt"
+            | "at"
+            | "repeat"
+            | "resolve"
+            | "reject"
+            | "all"
+            | "race"
+            | "allSettled"
+            | "any"
+            | "catch"
+            | "finally"
+            | "get"
+            | "has"
+            | "add"
+            | "bind"
+            | "isArray"
+            | "from"
+            | "getOwnPropertyDescriptors"
+            | "getOwnPropertySymbols"
+            | "getPrototypeOf"
+            | "hasOwnProperty"
+            | "isPrototypeOf"
+            | "propertyIsEnumerable"
+            | "parseFloat"
+            | "isNaN"
+            | "isFinite"
+            | "parse"
+            | "exec"
+            | "test"
+            | "toFixed"
+            | "toPrecision"
+            | "toExponential"
+            | "match"
+            | "search"
+            | "matchAll"
+            | "localeCompare"
+            | "startsWith"
+            | "endsWith"
+            | "sort"
+            | "reduce"
+            | "reduceRight"
+            | "fill"
+            | "flatMap"
+            | "toSorted"
+            | "isView"
+            | "freeze"
+            | "seal"
+            | "preventExtensions"
+            | "isFrozen"
+            | "isSealed"
+            | "isExtensible"
+            | "is"
+            | "getOwnPropertyNames"
+            | "setPrototypeOf"
+            | "trim"
+            | "trimStart"
+            | "trimEnd"
+            | "copyWithin"
+            | "toReversed" => 1,
+            "then"
+            | "set"
+            | "apply"
+            | "create"
+            | "defineProperties"
+            | "replace"
+            | "replaceAll"
+            | "slice"
+            | "substring"
+            | "substr"
+            | "splice"
+            | "padStart"
+            | "padEnd"
+            | "with"
+            | "toSpliced"
+            | "groupBy"
+            | "fromAsync"
+            | "parseInt"
+            | "assign"
+            | "getOwnPropertyDescriptor" => 2,
+            "defineProperty" => 3,
+            "construct" => 2,
+            "toString" | "valueOf" | "toISOString" | "toJSON" | "toUTCString" | "toDateString"
+            | "toTimeString" | "now" | "getTime" | "getFullYear" | "getUTCFullYear"
+            | "getMonth" | "getUTCMonth" | "getDate" | "getUTCDate" | "getDay" | "getUTCDay"
+            | "getHours" | "getUTCHours" | "getMinutes" | "getUTCMinutes" | "getSeconds"
+            | "getUTCSeconds" | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
+            | "pop" | "shift" | "clear" | "next" | "return" | "throw" | "random" | "flat"
+            | "normalize" | "keys" | "values" | "entries" | "of" | "toArray" | "toLocaleString"
+            | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleLowerCase"
+            | "toLocaleUpperCase" | "toLowerCase" | "toUpperCase" | "isWellFormed"
+            | "toWellFormed" => 0,
+            "Object" | "Function" | "Array" | "String" | "Number" | "Boolean" | "Error"
+            | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
+            | "URIError" | "AggregateError" | "Promise" | "ArrayBuffer" | "DataView" | "Symbol"
+            | "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" | "Uint8Array"
+            | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array" | "Uint32Array"
+            | "Int32Array" | "Float32Array" | "Float64Array" => 1,
+            "Date" | "UTC" => 7,
+            "RegExp" => 2,
+            _ => 0,
+        }
+    }
+
     fn install_console(objects: &mut Vec<JsObject>, global: ObjectId) {
         let console = ObjectId(objects.len());
         objects.push(JsObject::default());
@@ -1924,6 +2584,11 @@ impl Realm {
                 NativeFunction::RequestAnimationFrame,
             ),
             ("cancelAnimationFrame", NativeFunction::CancelAnimationFrame),
+            ("addEventListener", NativeFunction::WindowAddEventListener),
+            (
+                "removeEventListener",
+                NativeFunction::WindowRemoveEventListener,
+            ),
         ] {
             Self::define_global_function(objects, global, name, function);
         }
@@ -1990,7 +2655,8 @@ impl Realm {
                 },
             );
         }
-        for name in ["window", "self", "globalThis"] {
+        // The top-level browsing context is its own parent and top window.
+        for name in ["window", "self", "globalThis", "parent", "top"] {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
@@ -2047,6 +2713,42 @@ impl Realm {
         );
     }
 
+    /// Install the read-only screen metrics used by responsive site
+    /// bootstrap code.  The renderer updates `innerWidth`/`innerHeight` from
+    /// the live viewport; screen dimensions are a stable desktop baseline in
+    /// this single-window embedding and remain useful for feature detection.
+    fn install_screen(objects: &mut Vec<JsObject>, global: ObjectId, object_prototype: ObjectId) {
+        let screen = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, value) in [
+            ("width", 1_024.0),
+            ("height", 768.0),
+            ("availWidth", 1_024.0),
+            ("availHeight", 768.0),
+            ("colorDepth", 24.0),
+            ("pixelDepth", 24.0),
+        ] {
+            objects[screen.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(value)),
+            );
+        }
+        objects[global.0].properties.insert(
+            "screen".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(screen),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
     fn install_performance(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -2075,6 +2777,37 @@ impl Realm {
             "timeOrigin".to_owned(),
             PropertyDescriptor::builtin(JsValue::Number(0.0)),
         );
+        let timing = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        objects[timing.0].properties.insert(
+            "navigationStart".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Number(0.0)),
+        );
+        objects[performance.0].properties.insert(
+            "timing".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(timing)),
+        );
+        for (name, function) in [
+            ("getEntries", NativeFunction::PerformanceGetEntries),
+            (
+                "getEntriesByType",
+                NativeFunction::PerformanceGetEntriesByType,
+            ),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[performance.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         objects[global.0].properties.insert(
             "performance".to_owned(),
             PropertyDescriptor {
@@ -2162,6 +2895,7 @@ impl Realm {
                 NativeFunction::ObjectGetOwnPropertySymbols,
             ),
             ("getPrototypeOf", NativeFunction::ObjectGetPrototypeOf),
+            ("setPrototypeOf", NativeFunction::ObjectSetPrototypeOf),
             ("hasOwn", NativeFunction::ObjectHasOwn),
             ("preventExtensions", NativeFunction::ObjectPreventExtensions),
             ("seal", NativeFunction::ObjectSeal),
@@ -2205,6 +2939,7 @@ impl Realm {
                 configurable: true,
             },
         );
+        Self::define_prototype_constructor(objects, prototype, object);
         prototype
     }
 
@@ -2298,7 +3033,27 @@ impl Realm {
                 configurable: false,
             },
         );
+        Self::define_prototype_constructor(objects, prototype, string);
         prototype
+    }
+
+    /// `X.prototype.constructor === X` for builtin constructors.
+    fn define_prototype_constructor(
+        objects: &mut [JsObject],
+        prototype: ObjectId,
+        constructor: ObjectId,
+    ) {
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 
     fn install_regexp(
@@ -2371,6 +3126,10 @@ impl Realm {
                 enumerable: false,
                 configurable: false,
             },
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
         );
         objects[global.0].properties.insert(
             "RegExp".to_owned(),
@@ -2901,7 +3660,12 @@ impl Realm {
             host: ObjectHost::NativeFunction(NativeFunction::FunctionPrototype),
             ..JsObject::default()
         });
+        objects[prototype.0].properties.insert(
+            "name".to_owned(),
+            PropertyDescriptor::builtin(JsValue::String(String::new())),
+        );
         for (name, function) in [
+            ("toString", NativeFunction::FunctionToString),
             ("call", NativeFunction::FunctionCall),
             ("bind", NativeFunction::FunctionBind),
             ("apply", NativeFunction::FunctionApply),
@@ -3062,6 +3826,32 @@ impl Realm {
     ) {
         Self::define_global_function(objects, global, "fetch", NativeFunction::GlobalFetch);
 
+        Self::install_network_constructor(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "AbortController",
+            ObjectHost::AbortControllerConstructor,
+            &[("abort", NativeFunction::AbortControllerAbort)],
+        );
+        Self::install_network_constructor(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "FormData",
+            ObjectHost::FormDataConstructor,
+            &[
+                ("append", NativeFunction::FormDataAppend),
+                ("get", NativeFunction::FormDataGet),
+                ("set", NativeFunction::FormDataSet),
+                ("has", NativeFunction::FormDataHas),
+                ("delete", NativeFunction::FormDataDelete),
+                ("entries", NativeFunction::FormDataEntries),
+            ],
+        );
+
         // `Response` instances materialize when a transfer settles; the
         // constructor stays callable for feature detection and shims.
         let response_prototype = ObjectId(objects.len());
@@ -3129,6 +3919,15 @@ impl Realm {
             ("setRequestHeader", NativeFunction::XhrSetRequestHeader),
             ("send", NativeFunction::XhrSend),
             ("getResponseHeader", NativeFunction::XhrGetResponseHeader),
+            (
+                "getAllResponseHeaders",
+                NativeFunction::XhrGetAllResponseHeaders,
+            ),
+            ("addEventListener", NativeFunction::XhrAddEventListener),
+            (
+                "removeEventListener",
+                NativeFunction::XhrRemoveEventListener,
+            ),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -3170,6 +3969,18 @@ impl Realm {
                 configurable: false,
             },
         );
+        for (name, value) in [
+            ("UNSENT", 0.0),
+            ("OPENED", 1.0),
+            ("HEADERS_RECEIVED", 2.0),
+            ("LOADING", 3.0),
+            ("DONE", 4.0),
+        ] {
+            objects[xhr_constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(value)),
+            );
+        }
         objects[xhr_prototype.0].properties.insert(
             "constructor".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(xhr_constructor)),
@@ -3184,6 +3995,166 @@ impl Realm {
                 enumerable: false,
                 configurable: true,
             },
+        );
+
+        // File API Blob. It is deliberately a small, synchronous value
+        // object: network ownership remains with the browser embedding.
+        let blob_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("text", NativeFunction::BlobText),
+            ("arrayBuffer", NativeFunction::BlobArrayBuffer),
+            ("slice", NativeFunction::BlobSlice),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[blob_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let blob_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::BlobConstructor,
+            ..JsObject::default()
+        });
+        objects[blob_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(blob_prototype)),
+        );
+        objects[blob_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(blob_constructor)),
+        );
+        objects[global.0].properties.insert(
+            "Blob".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(blob_constructor)),
+        );
+    }
+
+    fn install_network_constructor(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+        name: &str,
+        host: ObjectHost,
+        methods: &[(&str, NativeFunction)],
+    ) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (method_name, native) in methods {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(*native),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                (*method_name).to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+            if name == "FormData" && *method_name == "entries" {
+                let symbol = JsSymbol::well_known("@@iterator");
+                objects[prototype.0].symbols.insert(
+                    symbol.id(),
+                    (symbol, PropertyDescriptor::builtin(JsValue::Object(method))),
+                );
+            }
+        }
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(prototype)),
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[global.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
+    /// Installs the ES Proxy constructor and the Reflect operations used by
+    /// proxy traps in application frameworks (Vue, React tooling, etc.).
+    fn install_proxy_reflect(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let proxy_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::ProxyConstructor,
+            ..JsObject::default()
+        });
+        objects[proxy_constructor.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Number(2.0)),
+        );
+        objects[global.0].properties.insert(
+            "Proxy".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(proxy_constructor)),
+        );
+
+        let reflect = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("get", NativeFunction::ReflectGet),
+            ("set", NativeFunction::ReflectSet),
+            ("has", NativeFunction::ReflectHas),
+            ("deleteProperty", NativeFunction::ReflectDeleteProperty),
+            ("ownKeys", NativeFunction::ReflectOwnKeys),
+            (
+                "getOwnPropertyDescriptor",
+                NativeFunction::ReflectGetOwnPropertyDescriptor,
+            ),
+            ("defineProperty", NativeFunction::ReflectDefineProperty),
+            ("construct", NativeFunction::ReflectConstruct),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[reflect.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[global.0].properties.insert(
+            "Reflect".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(reflect)),
         );
     }
 
@@ -3380,6 +4351,9 @@ impl Realm {
             ("includes", NativeFunction::ArrayIncludes),
             ("reduce", NativeFunction::ArrayReduce),
             ("toString", NativeFunction::ArrayPrototypeToString),
+            ("values", NativeFunction::ArrayValues),
+            ("keys", NativeFunction::ArrayKeys),
+            ("entries", NativeFunction::ArrayEntries),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -3389,6 +4363,17 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        // `Array.prototype[Symbol.iterator]` is the same function object as
+        // `values`, so iterator helpers work on arrays directly.
+        if let Some(values) = objects[prototype.0].properties.get("values")
+            && let JsValue::Object(values) = values.value
+        {
+            let symbol = JsSymbol::well_known("@@iterator");
+            objects[prototype.0].symbols.insert(
+                symbol.id(),
+                (symbol, PropertyDescriptor::builtin(JsValue::Object(values))),
             );
         }
         let array = ObjectId(objects.len());
@@ -3516,21 +4501,146 @@ impl Realm {
             return false;
         };
         let key = key.into();
-        if target
-            .properties
-            .get(&key)
-            .is_some_and(|current| !current.configurable)
-        {
+        if let Some(current) = target.properties.get(&key) {
+            if !current.configurable {
+                // ECMA-262 `ValidateAndApplyPropertyDescriptor`: redefining a
+                // non-configurable property is allowed when every field
+                // already matches (the write is a no-op).
+                return descriptors_are_identical(current, &descriptor);
+            }
+        } else if !target.extensible {
             return false;
         }
         if !target.properties.contains_key(&key) {
-            if !target.extensible {
-                return false;
-            }
             target.key_order.push(key.clone());
         }
         target.properties.insert(key, descriptor);
         true
+    }
+
+    /// [[`GetPrototypeOf`]].
+    #[must_use]
+    pub(crate) fn get_prototype(&self, object: ObjectId) -> Option<ObjectId> {
+        self.objects.get(object.0).and_then(JsObject::prototype)
+    }
+
+    /// The realm's `%Object.prototype%`.
+    #[must_use]
+    pub(crate) const fn object_prototype(&self) -> ObjectId {
+        self.object_prototype
+    }
+
+    /// Make a class constructor's `prototype` property non-writable, as
+    /// `ClassDefinitionEvaluation` requires (ordinary functions keep a
+    /// writable prototype).
+    pub(crate) fn configure_class_prototype(&mut self, function: ObjectId, prototype: ObjectId) {
+        let Some(target) = self.objects.get_mut(function.0) else {
+            return;
+        };
+        target.properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+    }
+
+    /// Own private method/accessor descriptor, if present on `object` itself.
+    #[must_use]
+    pub(crate) fn own_private_method(
+        &self,
+        object: ObjectId,
+        id: u64,
+    ) -> Option<PropertyDescriptor> {
+        self.objects
+            .get(object.0)
+            .and_then(|target| target.private_method(id).cloned())
+    }
+
+    pub(crate) fn set_private_field(&mut self, object: ObjectId, id: u64, value: JsValue) {
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.set_private_field(id, value);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn private_field(&self, object: ObjectId, id: u64) -> Option<&JsValue> {
+        self.objects.get(object.0)?.private_field(id)
+    }
+
+    #[must_use]
+    pub(crate) fn has_private_field(&self, object: ObjectId, id: u64) -> bool {
+        self.objects
+            .get(object.0)
+            .is_some_and(|target| target.has_private_field(id))
+    }
+
+    pub(crate) fn define_private_method(
+        &mut self,
+        object: ObjectId,
+        id: u64,
+        descriptor: PropertyDescriptor,
+    ) {
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.define_private_method(id, descriptor);
+        }
+    }
+
+    /// [[`SetPrototypeOf`]] for ordinary objects (class inheritance wiring).
+    pub(crate) fn set_prototype(&mut self, object: ObjectId, prototype: Option<ObjectId>) -> bool {
+        let Some(target) = self.objects.get(object.0) else {
+            return false;
+        };
+        if target.prototype == prototype {
+            return true;
+        }
+        if !target.extensible {
+            return false;
+        }
+        let mut candidate = prototype;
+        for _ in 0..self.objects.len() {
+            let Some(current) = candidate else {
+                self.objects[object.0].prototype = prototype;
+                return true;
+            };
+            if current == object {
+                return false;
+            }
+            candidate = match self.objects.get(current.0) {
+                Some(parent) => parent.prototype,
+                None => return false,
+            };
+        }
+        // Existing corrupt cycles should not be extended by another write.
+        false
+    }
+
+    /// Find a private method/accessor for `id` along the prototype chain.
+    #[must_use]
+    pub(crate) fn find_private_method(
+        &self,
+        object: ObjectId,
+        id: u64,
+    ) -> Option<PropertyDescriptor> {
+        let mut candidate = Some(object);
+        let mut visited = 0usize;
+        while let Some(current) = candidate {
+            let target = self.objects.get(current.0)?;
+            if let Some(descriptor) = target.private_method(id) {
+                return Some(descriptor.clone());
+            }
+            candidate = target.prototype;
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return None;
+            }
+        }
+        None
     }
 
     /// `Object.preventExtensions`: new own properties are rejected.
@@ -3637,13 +4747,17 @@ impl Realm {
     /// realm wrappers and every existing DOM/platform wrapper identity.
     pub(crate) fn gc_identity_roots(&self) -> Vec<ObjectId> {
         let mut roots = Vec::with_capacity(
-            2 + self.node_wrappers.len()
+            4 + self.node_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
                 + self.dataset_wrappers.len(),
         );
         roots.push(self.global);
         roots.push(self.document);
+        // The iterator prototypes are only reachable through helper objects,
+        // which may all be garbage at collection time; keep them rooted.
+        roots.push(self.iterator_prototype);
+        roots.push(self.iterator_helper_prototype);
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
@@ -3661,14 +4775,15 @@ impl Realm {
     /// than corrupted state. Returns the number of reclaimed slots.
     pub(crate) fn sweep_unmarked(&mut self, marked: &[bool]) -> usize {
         debug_assert_eq!(marked.len(), self.objects.len());
-        let mut reclaimed = 0usize;
+        let mut swept = 0usize;
         for (index, alive) in marked.iter().enumerate() {
             if !alive {
                 self.objects[index] = JsObject::default();
-                reclaimed = reclaimed.saturating_add(1);
+                swept = swept.saturating_add(1);
             }
         }
-        self.swept_objects = self.swept_objects.saturating_add(reclaimed);
+        let reclaimed = swept.saturating_sub(self.swept_objects);
+        self.swept_objects = swept;
         reclaimed
     }
 
@@ -3762,7 +4877,9 @@ impl Realm {
     }
 
     /// Create or overwrite an own symbol-keyed property, honouring
-    /// non-configurable descriptors and object extensibility.
+    /// non-configurable descriptors and object extensibility. A
+    /// non-configurable property accepts only a no-op redefinition, exactly
+    /// like the string-keyed `define_property`.
     pub(crate) fn define_symbol_property(
         &mut self,
         object: ObjectId,
@@ -3772,14 +4889,11 @@ impl Realm {
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
-        if target
-            .symbols
-            .get(&symbol.id())
-            .is_some_and(|(_, current)| !current.configurable)
-        {
-            return false;
-        }
-        if !target.symbols.contains_key(&symbol.id()) && !target.extensible {
+        if let Some((_, current)) = target.symbols.get(&symbol.id()) {
+            if !current.configurable {
+                return descriptors_are_identical(current, &descriptor);
+            }
+        } else if !target.extensible {
             return false;
         }
         target
@@ -4280,8 +5394,34 @@ impl Realm {
 
     pub(crate) fn collection_iterator(&mut self, values: Vec<JsValue>) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.object_prototype),
+            prototype: Some(self.iterator_prototype),
             host: ObjectHost::CollectionIterator { values, index: 0 },
+            ..JsObject::default()
+        })
+    }
+
+    /// Allocate a lazy iterator-helper state machine object.
+    pub(crate) fn iterator_helper(
+        &mut self,
+        kind: IteratorHelperKind,
+        source: Option<ObjectId>,
+        source_next: Option<ObjectId>,
+        callback: Option<ObjectId>,
+        counter: u64,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.iterator_helper_prototype),
+            host: ObjectHost::IteratorHelper {
+                kind,
+                source,
+                source_next,
+                callback,
+                inner: None,
+                inner_next: None,
+                counter,
+                buffer: Vec::new(),
+                done: false,
+            },
             ..JsObject::default()
         })
     }

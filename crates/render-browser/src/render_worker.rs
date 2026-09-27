@@ -8,6 +8,7 @@ use render_browser::font_backend::SystemFontBackend;
 use render_browser::resources::StylesheetFetchPlan;
 use render_browser::resources::StylesheetResourceDiagnostic;
 use render_browser::resources::apply_stylesheet_batch;
+use render_browser::resources::apply_stylesheet_batch_rematched;
 use render_browser::resources::plan_external_style_sheets;
 use render_browser::worker::RenderCancellation;
 use render_browser::worker::RenderFailure;
@@ -120,26 +121,36 @@ pub(super) fn process_page_render(
             } = *full;
             cancellation.check()?;
             let (style_sheets, applied_style_sheets, style_diagnostics) =
-                if let Some((mut plan, results)) = style_batch {
+                if let Some((plan, results)) = style_batch {
                     // Page scripts mutate the DOM while a large stylesheet is
                     // in flight, so the plan's revision routinely lags the
                     // snapshot. Re-plan against the snapshot (which already
-                    // contains those mutations) instead of discarding the
-                    // fetched CSS: this frame then renders styled, and the
-                    // coordinator's next cycle covers any brand-new links.
-                    if plan.revision != document.dom().revision() {
-                        plan = plan_external_style_sheets(
+                    // contains those mutations) and re-match the fetched CSS
+                    // by URL instead of discarding it: this frame then renders
+                    // styled, and the coordinator's next cycle covers any
+                    // brand-new links.
+                    let application = if plan.revision == document.dom().revision() {
+                        apply_stylesheet_batch(&document, &plan, results)
+                    } else {
+                        let fresh = plan_external_style_sheets(
                             &document,
                             &base_url,
                             DocumentRenderOptions::default().document_limits,
                         );
-                    }
-                    let application = apply_stylesheet_batch(&document, &plan, results);
-                    (
-                        application.style_sheets.clone(),
-                        Some(application.style_sheets),
-                        application.diagnostics,
-                    )
+                        apply_stylesheet_batch_rematched(&fresh, &plan, results)
+                    };
+                    // A follow-up batch contains only newly discovered links.
+                    // Keep earlier sheets whose owner and URL still exist in
+                    // this snapshot, while dropping detached or retargeted
+                    // links. Replacing the whole map here made a dynamic CSS
+                    // load strip every stylesheet fetched at startup.
+                    let merged = merge_current_style_sheets(
+                        &document,
+                        &base_url,
+                        &external_style_sheets,
+                        &application.style_sheets,
+                    );
+                    (merged.clone(), Some(merged), application.diagnostics)
                 } else {
                     (external_style_sheets, None, Vec::new())
                 };
@@ -209,6 +220,33 @@ pub(super) fn process_page_render(
                         style.properties().len(),
                     );
                 }
+                let dom = document.dom();
+                let mut pending = vec![dom.document()];
+                while let Some(node) = pending.pop() {
+                    if let Some(render_core::dom::NodeKind::Element(element)) =
+                        dom.node(node).map(render_core::dom::Node::kind)
+                        && element.local_name == "img"
+                        && let Some(loaded) = images.get_for_node(node)
+                    {
+                        let fragments = output
+                            .layout
+                            .fragments
+                            .iter()
+                            .filter(|fragment| fragment.source == Some(node))
+                            .map(|fragment| fragment.rect)
+                            .collect::<Vec<_>>();
+                        let opacity = output.styles.get(&node).and_then(|style| {
+                            style
+                                .get("opacity")
+                                .map(render_core::css::computed::ComputedValue::css_text)
+                        });
+                        eprintln!(
+                            "render-browser loaded img node={node:?} resource={:?} fragments={fragments:?} opacity={opacity:?}",
+                            loaded.id
+                        );
+                    }
+                    pending.extend(dom.children(node).unwrap_or_default().iter().copied());
+                }
             }
             let display_list = Arc::new(output.display.list);
             let paint_scene = Arc::new(PaintScene::from_shared_display_list(Arc::clone(
@@ -264,4 +302,27 @@ pub(super) fn process_page_render(
             })
         }
     }
+}
+
+/// Retains only sheets linked by the current DOM, preferring the newest
+/// parsed response when a link was fetched again.
+pub(super) fn merge_current_style_sheets(
+    document: &Document,
+    base_url: &Url,
+    existing: &ExternalStyleSheets,
+    incoming: &ExternalStyleSheets,
+) -> ExternalStyleSheets {
+    let current = plan_external_style_sheets(
+        document,
+        base_url,
+        DocumentRenderOptions::default().document_limits,
+    );
+    let mut merged = ExternalStyleSheets::default();
+    for resource in &current.resources {
+        let key = &resource.key;
+        if let Some(sheet) = incoming.get(key).or_else(|| existing.get(key)) {
+            merged.insert(key.clone(), sheet.clone());
+        }
+    }
+    merged
 }

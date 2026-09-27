@@ -19,6 +19,7 @@ use crate::event_loop::{
     ClockError, EventLoop, EventLoopLimits, MicrotaskCheckpoint, MicrotaskId, QueueError, Runnable,
     TaskId, TaskSource, TimerId, TurnOutcome,
 };
+use crate::image::{DecodedImage, ImageLimits, ImageResources};
 use crate::invalidation::{InvalidationCursor, InvalidationError, RenderingInvalidationPlan};
 use crate::js::{
     CompiledScript, ElementRect, FetchOutcome, JsError, JsMicrotask, JsRuntime, JsValue,
@@ -337,6 +338,14 @@ pub struct Page {
     js_timers: BTreeMap<u64, TimerId>,
     /// Latest border-box geometry per DOM node, refreshed after each render.
     geometry_index: BTreeMap<u64, ElementRect>,
+    /// Decoded video frames currently presented by `<video>` elements, keyed
+    /// by element node. Advanced every pump/turn from the script runtime's
+    /// presentation clocks; layout and paint consume them through the
+    /// ordinary image resource seams.
+    video_frames: ImageResources,
+    /// The frame store changed since the last completed raster, so a turn
+    /// with no DOM invalidation must still repaint.
+    video_frames_dirty: bool,
     /// Last `document.title` value this page applied to the document, so a
     /// repeated own-property read is not mistaken for a fresh assignment.
     script_title_override: Option<String>,
@@ -426,6 +435,8 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            video_frames: ImageResources::default(),
+            video_frames_dirty: false,
             script_title_override: None,
         }
     }
@@ -473,6 +484,8 @@ impl Page {
             microtask_source_bytes: BTreeMap::new(),
             js_timers: BTreeMap::new(),
             geometry_index: BTreeMap::new(),
+            video_frames: ImageResources::default(),
+            video_frames_dirty: false,
             script_title_override: None,
         };
         page.refresh_geometry_index();
@@ -937,6 +950,7 @@ impl Page {
         backends: DocumentBackends<'_>,
     ) -> Result<PagePumpOutcome, PageError> {
         self.event_loop.advance_time_to(now)?;
+        self.advance_video_playback();
         let mut executed_turns = 0;
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
@@ -952,6 +966,13 @@ impl Page {
                 }
             }
         }
+        // A pure-playback page has no tasks: its frame still needs a raster,
+        // and its media event callbacks a checkpoint.
+        if self.video_frames_dirty {
+            self.render_update(backends);
+            rendered_turns += 1;
+        }
+        self.drain_runtime_microtasks();
         Ok(PagePumpOutcome {
             executed_turns,
             rendered_turns,
@@ -1012,6 +1033,9 @@ impl Page {
         turn_budget: usize,
     ) -> Result<PagePumpOutcome, PageError> {
         self.event_loop.advance_time_to(now)?;
+        // Presentation clocks advance even without a raster; the frame store
+        // marks itself dirty for the next rendering pass.
+        self.advance_video_playback();
         let mut executed_turns = 0;
         let mut rendered_turns = 0;
         let mut task_results = Vec::new();
@@ -1027,6 +1051,7 @@ impl Page {
                 }
             }
         }
+        self.drain_runtime_microtasks();
         Ok(PagePumpOutcome {
             executed_turns,
             rendered_turns,
@@ -1080,8 +1105,14 @@ impl Page {
         id: u64,
         outcome: Result<FetchOutcome, String>,
     ) -> Result<(), JsError> {
-        self.runtime
-            .settle_fetch(self.document.dom_mut(), id, outcome);
+        // Video media loads settle through their own demux path.
+        if self.runtime.is_pending_video_fetch(id) {
+            self.runtime
+                .settle_video_fetch(self.document.dom_mut(), id, outcome);
+        } else {
+            self.runtime
+                .settle_fetch(self.document.dom_mut(), id, outcome);
+        }
         loop {
             let pending = self.runtime.take_pending_microtasks();
             if pending.is_empty() {
@@ -1157,6 +1188,7 @@ impl Page {
         &mut self,
         backends: Option<DocumentBackends<'_>>,
     ) -> Result<Option<PageTurnOutcome>, PageError> {
+        self.advance_video_playback();
         let mut executions = Vec::new();
         let event_loop = &mut self.event_loop;
         let runtime = &mut self.runtime;
@@ -1271,7 +1303,7 @@ impl Page {
 
         self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
-        let render = (!invalidation.is_empty())
+        let render = (!invalidation.is_empty() || self.video_frames_dirty)
             .then(|| backends.map(|backends| self.render_update(backends)))
             .flatten();
         Ok(Some(PageTurnOutcome {
@@ -1280,6 +1312,74 @@ impl Page {
             invalidation,
             render,
         }))
+    }
+
+    /// Advance every video presentation clock to the current virtual
+    /// instant and refresh the frame store the render path consumes.
+    ///
+    /// Publications from the runtime replace each bound element's frame (or
+    /// clear it); frame entries for nodes no longer published are dropped so
+    /// removed elements and collected `Video` objects release their pixels.
+    /// Media event callbacks queued by the step join the next microtask
+    /// checkpoint.
+    fn advance_video_playback(&mut self) {
+        let now = self.event_loop.now();
+        let publications = self
+            .runtime
+            .advance_video_playback(self.document.dom(), now);
+        let limits = ImageLimits::default();
+        let mut live: BTreeMap<NodeId, bool> = BTreeMap::new();
+        for publication in publications {
+            let applied = match &publication.frame {
+                Some(frame) => DecodedImage::from_rgba8(frame.width, frame.height, &frame.bytes)
+                    .ok()
+                    .and_then(|image| {
+                        self.video_frames
+                            .set_video_frame(
+                                publication.node,
+                                &publication.media_url,
+                                image,
+                                limits,
+                            )
+                            .ok()
+                    })
+                    .map(|_| ()),
+                None => self
+                    .video_frames
+                    .remove_video_frame(publication.node)
+                    .map(|_| ()),
+            };
+            if applied.is_some() {
+                self.video_frames_dirty = true;
+            }
+            live.insert(publication.node, true);
+        }
+        for node in self.video_frames.video_frame_nodes() {
+            if !live.contains_key(&node) {
+                self.video_frames.remove_video_frame(node);
+                self.video_frames_dirty = true;
+            }
+        }
+        self.queue_pending_runtime_microtasks();
+    }
+
+    /// Invoke the runtime's still-pending microtasks directly (media event
+    /// callbacks queued outside any task), mirroring the settle path.
+    ///
+    /// Handler failures are contained: a throwing `ontimeupdate` must not
+    /// abort the pump that is advancing playback.
+    fn drain_runtime_microtasks(&mut self) {
+        loop {
+            let pending = self.runtime.take_pending_microtasks();
+            if pending.is_empty() {
+                return;
+            }
+            for microtask in pending {
+                let _ = self
+                    .runtime
+                    .invoke_microtask(self.document.dom_mut(), microtask);
+            }
+        }
     }
 
     fn check_source_capacity(&self, task: &PageTask) -> Result<usize, PageQueueError> {
@@ -1311,7 +1411,10 @@ impl Page {
     fn render_update(&mut self, backends: DocumentBackends<'_>) -> PageRenderUpdate {
         let previous = self.snapshot.as_ref();
         let previous_revision = previous.map(|snapshot| snapshot.revision);
-        let next = self.document.render(self.render_options, backends);
+        let next =
+            self.document
+                .render_with_images(self.render_options, backends, &self.video_frames);
+        self.video_frames_dirty = false;
         let display_list_diff =
             previous.map(|snapshot| next.display.list.diff(&snapshot.display.list));
         let revision = next.revision;

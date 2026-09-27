@@ -157,14 +157,14 @@ fn bubbling_event_exposes_target_current_target_and_listener_this() {
         .execute(
             &mut parsed.dom,
             r#"
-                    var parent = document.getElementById("parent");
+                    var container = document.getElementById("parent");
                     var child = document.getElementById("child");
                     var observed = false;
                     function listener(event) {
                         observed = event.target === child &&
-                            event.currentTarget === parent && this === parent;
+                            event.currentTarget === container && this === container;
                     }
-                    parent.addEventListener("activate", listener);
+                    container.addEventListener("activate", listener);
                     var event = new Event("activate", { bubbles: true });
                     child.dispatchEvent(event);
                     observed && event.currentTarget === null;
@@ -191,6 +191,37 @@ fn object_reflection_and_assignment_cover_common_runtime_usage() {
             )
             .expect("Object builtins should execute");
     assert_eq!(outcome.value, JsValue::String("ba21true1".to_owned()));
+}
+
+#[test]
+fn proxy_traps_forward_real_world_reactive_access() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var target = { count: 1 };
+                var reads = 0;
+                var proxy = new Proxy(target, {
+                    get: function(object, key, receiver) {
+                        reads += 1;
+                        return Reflect.get(object, key, receiver);
+                    },
+                    set: function(object, key, value, receiver) {
+                        return Reflect.set(object, key, value, receiver);
+                    },
+                    has: function(object, key) { return Reflect.has(object, key); },
+                    deleteProperty: function(object, key) { return Reflect.deleteProperty(object, key); },
+                    ownKeys: function(object) { return Reflect.ownKeys(object); }
+                });
+                proxy.count = proxy.count + 1;
+                var keys = Object.keys(proxy);
+                ("count" in proxy) && delete proxy.count && target.count === undefined && reads > 0 && keys[0] === "count";
+            "#,
+        )
+        .expect("Proxy traps should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
 }
 
 #[test]
@@ -320,6 +351,57 @@ fn dom_interfaces_and_keyed_collections_cover_site_bootstrap_usage() {
         outcome.value,
         JsValue::String("function|true|true|3|1|true|6|false|1|2|ok".to_owned())
     );
+}
+
+#[test]
+fn document_create_event_returns_timestamped_event() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var event = document.createEvent("Event");
+                typeof event === "object" && typeof event.timeStamp === "number" &&
+                    event.timeStamp >= 0;
+            "#,
+        )
+        .expect("document.createEvent should produce a generic Event");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn browser_constructor_aliases_and_screen_metrics_are_available() {
+    let mut parsed = parse_document("<!doctype html><main></main>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                [typeof Document, typeof HTMLDocument, typeof DocumentFragment,
+                 document instanceof Document, screen.width, screen.height,
+                 screen.colorDepth, innerWidth > 0, innerHeight > 0].join("|");
+            "#,
+        )
+        .expect("browser globals should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("function|function|function|true|1024|768|24|true|true".to_owned())
+    );
+}
+
+#[test]
+fn base64_globals_support_media_bootstrap_decoding() {
+    let mut parsed = parse_document("<!doctype html><main></main>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, r#"btoa("render");"#)
+        .expect("btoa should execute");
+    assert_eq!(outcome.value, JsValue::String("cmVuZGVy".to_owned()));
+    let round_trip = runtime
+        .execute(&mut parsed.dom, r#"atob("cmVuZGVy");"#)
+        .expect("atob should execute");
+    assert_eq!(round_trip.value, JsValue::String("render".to_owned()));
 }
 
 #[test]
@@ -1627,6 +1709,37 @@ fn fetch_queues_exactly_one_pending_request_with_method_headers_and_body() {
 }
 
 #[test]
+fn blob_constructor_exposes_bounded_bytes_and_async_read_methods() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var blob = new Blob(["hello", new Uint8Array([32, 119, 111, 114, 108, 100])], {type:"text/plain"});
+                var summary = blob.size + ":" + blob.type;
+                var objectUrl = URL.createObjectURL(blob);
+                blob.slice(6).text().then(function (value) { summary += ":" + value; });
+            "#,
+        )
+        .expect("Blob script should execute");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "summary")
+        .expect("summary should be readable");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("11:text/plain:world".to_owned())
+    );
+    let url = runtime
+        .execute(&mut parsed.dom, "objectUrl")
+        .expect("object URL should be readable")
+        .value
+        .to_js_string();
+    assert!(url.starts_with("data:text/plain;base64,"));
+}
+
+#[test]
 fn fetch_resolves_relative_urls_against_the_document_base() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let url = Url::parse("https://example.test/app/").expect("test URL");
@@ -2052,7 +2165,7 @@ fn user_functions_expose_name_and_length_own_properties() {
 }
 
 #[test]
-fn default_and_rest_parameters_still_bind_argument_positions() {
+fn default_and_rest_parameters_bind_arguments_and_apply_defaults() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
     let outcome = runtime
@@ -2062,18 +2175,209 @@ fn default_and_rest_parameters_still_bind_argument_positions() {
                     function probe(a, b = 5, ...rest) {
                         return [a, b, typeof rest].join("|");
                     }
-                    probe(1, 2, 3, 4) + " / " + probe(7);
+                    probe(1, 2, 3, 4) + " / " + probe(7) + " / " + probe(7, undefined);
                 "#,
         )
         .expect("default/rest parameter call should execute");
-    // Default initializers are not applied by this runtime yet (parameters
-    // bind positionally, rest included), so the metadata markers must leave
-    // argument positions unchanged.
+    // Rest parameters collect the remaining arguments into an array; an
+    // omitted or explicitly `undefined` argument evaluates the default.
     assert_eq!(
         outcome.value,
-        // `Array.prototype.join` renders undefined members as "".
-        JsValue::String("1|2|number / 7||undefined".to_owned())
+        JsValue::String("1|2|object / 7|5|object / 7|5|object".to_owned())
     );
+}
+
+#[test]
+fn default_parameters_evaluate_when_arguments_are_undefined() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var calls = 0;
+                    function add(a, b = a + 1, c = (calls += 1, 10)) {
+                        return [a, b, c].join("|");
+                    }
+                    add(1) + " / " + add(1, 5, 7) + " / " + calls;
+                "#,
+        )
+        .expect("default parameters should execute");
+    // `b`'s initializer sees the earlier `a` binding; supplying `c`
+    // suppresses its initializer, so `calls` only increments once.
+    assert_eq!(
+        outcome.value,
+        JsValue::String("1|2|10 / 1|5|7 / 1".to_owned())
+    );
+}
+
+#[test]
+fn default_parameters_distinguish_undefined_from_null() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    function pick(value = "default") {
+                        return value === null ? "null" : String(value);
+                    }
+                    pick(undefined) + " / " + pick(null) + " / " + pick() + " / " + pick(0);
+                "#,
+        )
+        .expect("undefined-vs-null default probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("default / null / default / 0".to_owned())
+    );
+}
+
+#[test]
+fn throwing_default_parameters_propagate_before_the_body_runs() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var body = 0;
+                    function explode(value = (function () { throw new Error("boom"); })()) {
+                        body += 1;
+                    }
+                    var caught = "";
+                    try { explode(); } catch (error) { caught = error.message; }
+                    caught + " / " + body;
+                "#,
+        )
+        .expect("throwing default parameter probe should execute");
+    assert_eq!(outcome.value, JsValue::String("boom / 0".to_owned()));
+}
+
+#[test]
+fn default_parameters_see_later_parameters_in_the_temporal_dead_zone() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var outer = "outer";
+                    function probe(a = outer, b = later, later) {
+                        return [a, b].join("|");
+                    }
+                    var caught = "";
+                    try { probe(undefined, undefined, "third"); } catch (error) { caught = error.name; }
+                    probe("first", "second", "third") + " / " + caught;
+                "#,
+        )
+        .expect("temporal dead zone probe should execute");
+    // A default reading a later parameter (or its own binding) must not fall
+    // back to an outer binding of the same name.
+    assert_eq!(
+        outcome.value,
+        JsValue::String("first|second / ReferenceError".to_owned())
+    );
+}
+
+#[test]
+fn object_and_class_methods_apply_parameter_defaults() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                    var object = {
+                        double(value = 21) { return value * 2; },
+                        arrow: (value = 3) => value + 1
+                    };
+                    class Counter {
+                        constructor(step = 2) { this.step = step; }
+                        advance(value = this.step) { return value + 1; }
+                    }
+                    object.double() + object.arrow() + new Counter().advance() + new Counter(10).advance();
+                ",
+        )
+        .expect("method default parameter probe should execute");
+    assert_eq!(outcome.value, JsValue::Number(60.0));
+}
+
+#[test]
+fn parameter_defaults_do_not_change_function_length() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    function one(a, b = 1, c) {}
+                    var two = function (x = 1, y) {};
+                    var three = (...rest) => rest;
+                    [one.length, two.length, three.length].join("|");
+                "#,
+        )
+        .expect("function length probe should execute");
+    // `length` counts parameters before the first default and excludes rest.
+    assert_eq!(outcome.value, JsValue::String("1|0|0".to_owned()));
+}
+
+#[test]
+fn destructuring_arrow_parameter_defaults_apply_to_the_whole_pattern() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var read = ({x} = {x: 7}) => x;
+                    read() + "|" + read({x: 3});
+                "#,
+        )
+        .expect("destructuring arrow default probe should execute");
+    assert_eq!(outcome.value, JsValue::String("7|3".to_owned()));
+}
+
+#[test]
+fn arrow_default_parameters_see_the_lexical_this() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    var holder = {
+                        base: 10,
+                        read: function () {
+                            var arrow = (value = this.base) => value;
+                            return arrow() + "|" + arrow(4);
+                        }
+                    };
+                    holder.read();
+                "#,
+        )
+        .expect("arrow default `this` probe should execute");
+    assert_eq!(outcome.value, JsValue::String("10|4".to_owned()));
+}
+
+#[test]
+fn derived_constructor_parameters_apply_defaults_before_super() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                    class Base {
+                        constructor(value) { this.value = value; }
+                    }
+                    class Derived extends Base {
+                        constructor(value = 5) { super(value * 2); }
+                    }
+                    new Derived().value + "|" + new Derived(3).value;
+                "#,
+        )
+        .expect("derived constructor default probe should execute");
+    assert_eq!(outcome.value, JsValue::String("10|6".to_owned()));
 }
 
 #[test]
@@ -2200,5 +2504,421 @@ fn document_cookie_round_trips_and_deletes() {
     assert_eq!(
         outcome.value,
         JsValue::String("a=1; b=hello world | b=hello world".to_owned())
+    );
+}
+
+#[test]
+fn class_declarations_build_constructors_prototypes_and_methods() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                class Point {
+                    constructor(x, y) { this.x = x; this.y = y; }
+                    sum() { return this.x + this.y; }
+                    get doubled() { return this.sum() * 2; }
+                    set scalar(value) { this.x = value; this.y = value; }
+                    static origin() { return new Point(0, 0); }
+                }
+                var p = new Point(2, 3);
+                var o = Point.origin();
+                p.sum() === 5 && p.doubled === 10 &&
+                    (p.scalar = 4) === 4 && p.x === 4 && p.y === 4 &&
+                    o.x === 0 && o.y === 0 &&
+                    Point.prototype.constructor === Point &&
+                    Object.getPrototypeOf(p) === Point.prototype &&
+                    Point.name === "Point" &&
+                    p instanceof Point;
+            "#,
+        )
+        .expect("class declaration executes");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn class_inheritance_super_fields_and_private_names_work() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                class Base {
+                    #secret = 1;
+                    constructor(name) { this.name = name; }
+                    describe() { return "base:" + this.name; }
+                    reveal() { return this.#secret; }
+                }
+                class Derived extends Base {
+                    #secret = 2;
+                    label = "L";
+                    static kind = "derived";
+                    constructor(name) { super(name + "!"); }
+                    describe() { return "derived:" + super.describe(); }
+                    parentSecret() { return this.#secret; }
+                    hasSecret(object) { return #secret in object; }
+                }
+                var d = new Derived("x");
+                d.name === "x!" && d.describe() === "derived:base:x!" &&
+                    d.label === "L" && Derived.kind === "derived" &&
+                    d.reveal() === 1 && d.parentSecret() === 2 &&
+                    d instanceof Derived && d instanceof Base &&
+                    Object.getPrototypeOf(Derived) === Base &&
+                    d.hasSecret(d) && !d.hasSecret({});
+            "#,
+        )
+        .expect("class inheritance executes");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn class_expressions_and_default_derived_constructor_work() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var Named = class Inner {
+                    static label() { return Inner.name; }
+                };
+                class Base {
+                    constructor(value) { this.value = value; }
+                }
+                class Derived extends Base {}
+                var d = new Derived(7);
+                Named.name === "Inner" && Named.label() === "Inner" &&
+                    d.value === 7 && d.constructor === Derived;
+            "#,
+        )
+        .expect("class expression executes");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn iterator_helpers_map_filter_take_and_terminals() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var mapped = [1, 2, 3].values().map(function (x) { return x * 2; }).toArray().join(",");
+                var filtered = [1, 2, 3, 4].values().filter(function (x) { return x % 2 === 0; }).toArray().join(",");
+                var taken = [1, 2, 3].values().take(2).toArray().join(",");
+                var dropped = [1, 2, 3].values().drop(1).toArray().join(",");
+                var reduced = [1, 2, 3].values().reduce(function (a, b) { return a + b; }, 10);
+                var appended = [1, 2].values().concat([3, 4].values()).toArray().join(",");
+                var found = [1, 5, 3].values().find(function (x) { return x > 4; });
+                var some = [1, 2].values().some(function (x) { return x === 2; });
+                var every = [1, 2].values().every(function (x) { return x > 0; });
+                var chunks = [1, 2, 3, 4, 5].values().chunks(2).toArray().map(function (c) { return c.join("+"); }).join("|");
+                var windows = [1, 2, 3].values().windows(2).toArray().map(function (c) { return c.join("-"); }).join("|");
+                var flat = [1, 2].values().flatMap(function (x) { return [x, x * 10]; }).toArray().join(",");
+                var fromIterable = Iterator.from([7, 8]).toArray().join(",");
+                mapped + "|" + filtered + "|" + taken + "|" + dropped + "|" + reduced + "|" +
+                    appended + "|" + found + "|" + some + "|" + every + "|" + chunks + "|" +
+                    windows + "|" + flat + "|" + fromIterable;
+            "#,
+        )
+        .expect("iterator helpers execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "2,4,6|2,4|1,2|2,3|16|1,2,3,4|5|true|true|1+2|3+4|5|1-2|2-3|1,10,2,20|7,8".to_owned()
+        )
+    );
+}
+
+#[test]
+fn classes_can_extend_iterator_and_use_helpers() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                class Countdown extends Iterator {
+                    constructor(start) { super(); this.current = start; }
+                    next() {
+                        if (this.current < 0) { return { done: true }; }
+                        return { value: this.current--, done: false };
+                    }
+                }
+                var viaHelper = new Countdown(3).map(function (x) { return x + 1; }).toArray().join(",");
+                var selfIterable = [1].values()[Symbol.iterator]() === [1].values()[Symbol.iterator]();
+                var direct = (function () {
+                    var iterator = [9].values();
+                    return iterator[Symbol.iterator]() === iterator;
+                })();
+                viaHelper + "|" + selfIterable + "|" + direct;
+            "#,
+        )
+        .expect("Iterator subclass executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("4,3,2,1|false|true".to_owned())
+    );
+}
+
+#[test]
+fn nested_new_inside_constructor_body_keeps_its_own_new_target() {
+    // babel-transpiled classes (bilibili main bundle): a constructor body that
+    // runs `new Helper(...)` must construct the Helper with `Helper` itself as
+    // new.target. The engine used to leak the enclosing constructor's
+    // new.target into nested `new` expressions, so the Helper instance received
+    // the OUTER class's prototype and the inner `_classCallCheck`
+    // (`this instanceof Helper`) threw "Cannot call a class as a function".
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                function _classCallCheck(instance, ctor) {
+                    if (!(instance instanceof ctor)) {
+                        throw new TypeError("Cannot call a class as a function");
+                    }
+                }
+                var Helper = (function () {
+                    function Helper() { _classCallCheck(this, Helper); }
+                    return Helper;
+                })();
+                var Outer = (function () {
+                    function Outer() {
+                        _classCallCheck(this, Outer);
+                        this.helper = new Helper();
+                    }
+                    Outer.prototype.spawn = function () { return new Outer(); };
+                    return Outer;
+                })();
+                var outer = new Outer();
+                outer.helper instanceof Helper &&
+                    !(outer.helper instanceof Outer) &&
+                    (outer.spawn().helper instanceof Helper);
+            "#,
+        )
+        .expect("nested construction inside a constructor body should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn nested_new_sees_its_own_new_target_inside_class_constructors() {
+    // The instance created by a nested `new` links to the nested constructor's
+    // `prototype`, never to the enclosing constructor's new.target prototype,
+    // and `new.target` inside the nested body is the nested constructor.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var seen = [];
+                var inner;
+                var Inner = function Inner() { seen.push(new.target === Inner); };
+                class Outer {
+                    constructor() { inner = new Inner(); }
+                }
+                new Outer();
+                seen.length === 1 && seen[0] === true &&
+                    Object.getPrototypeOf(inner) === Inner.prototype &&
+                    inner instanceof Inner && !(inner instanceof Outer);
+            ",
+        )
+        .expect("new.target inside nested new should be the nested constructor");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn direct_iterator_new_stays_abstract_after_new_target_scope_fix() {
+    // `new Iterator()` is abstract even when it appears inside another
+    // constructor body; only `super()` from an Iterator subclass constructs.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let error = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                class Wrap {
+                    constructor() { this.iterator = new Iterator(); }
+                }
+                new Wrap();
+            ",
+        )
+        .expect_err("direct new Iterator() inside a constructor body is abstract");
+    assert_eq!(error.kind(), crate::JsErrorKind::Type);
+}
+
+#[test]
+fn iterator_subclass_super_still_constructs_through_new_target_scope_fix() {
+    // The abstract-Iterator exemption must keep working for `super()` from a
+    // subclass after new.target scoping is tightened for nested `new`.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                class Countdown extends Iterator {
+                    constructor(start) { super(); this.current = start; }
+                    next() {
+                        if (this.current < 0) { return { done: true }; }
+                        return { value: this.current--, done: false };
+                    }
+                }
+                new Countdown(2).map(function (x) { return x * 2; }).toArray().join(",");
+            "#,
+        )
+        .expect("Iterator subclass super() should keep constructing");
+    assert_eq!(outcome.value, JsValue::String("4,2,0".to_owned()));
+}
+
+#[test]
+fn object_define_property_keeps_symbol_keys_as_symbols() {
+    // core-js (bilibili log-reporter): installs `Symbol.unscopables` on
+    // `Array.prototype` via `Object.defineProperty`, then module code reads
+    // `proto[Symbol.unscopables]["keys"] = true`. The engine used to coerce
+    // the symbol key to the string "Symbol(unscopables)", so the later
+    // symbol-keyed read returned undefined and threw
+    // "Cannot read properties of undefined (reading 'keys')".
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var proto = Array.prototype;
+                var key = Symbol.unscopables;
+                var symbolsBefore = Object.getOwnPropertySymbols(proto).length;
+                void 0 === proto[key] &&
+                    Object.defineProperty(proto, key, { configurable: true, value: {} });
+                var slot = proto[key];
+                slot["keys"] = true;
+                slot.keys === true &&
+                    Object.getOwnPropertySymbols(proto).length === symbolsBefore + 1 &&
+                    Object.hasOwn(proto, key) &&
+                    Object.getOwnPropertyDescriptor(proto, key).configurable === true &&
+                    typeof proto["Symbol(unscopables)"] === "undefined";
+            "#,
+        )
+        .expect("symbol-keyed defineProperty roundtrip should execute");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn symbol_define_property_rejects_invalid_redefinitions() {
+    // A non-configurable symbol property rejects value changes but accepts
+    // the identical no-op redefinition, mirroring string-keyed semantics.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                globalThis.__object = {};
+                globalThis.__key = Symbol("tag");
+                Object.defineProperty(__object, __key, {
+                    value: 1,
+                    writable: false,
+                    configurable: false,
+                });
+            "#,
+        )
+        .expect("initial definition succeeds");
+    let error = runtime
+        .execute(
+            &mut parsed.dom,
+            "Object.defineProperty(__object, __key, { value: 2 });",
+        )
+        .expect_err("changing a non-configurable symbol property must throw");
+    assert_eq!(error.kind(), crate::JsErrorKind::Type);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                Object.defineProperty(__object, __key, { value: 1, writable: false, configurable: false });
+                var symbols = Object.getOwnPropertySymbols(__object);
+                __object[__key] === 1 && symbols.length === 1;
+            ",
+        )
+        .expect("no-op redefinition and probe run");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn repeated_gc_preserves_live_count_and_prototype_walks() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "globalThis.savedPrototype = {}; globalThis.savedChild = Object.create(savedPrototype);",
+        )
+        .expect("set up reachable objects");
+    runtime.collect_garbage();
+    let first_live_count = runtime.realm.object_count();
+    runtime.collect_garbage();
+    assert_eq!(runtime.realm.object_count(), first_live_count);
+    let outcome = runtime
+        .execute(&mut parsed.dom, "savedPrototype.isPrototypeOf(savedChild)")
+        .expect("prototype chain remains usable after repeated collection");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn object_set_prototype_of_changes_lookup_and_rejects_cycles() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var base = { value: 7 };
+                var child = {};
+                Object.setPrototypeOf(child, base);
+                var lookup = child.value === 7 && base.isPrototypeOf(child);
+                var cycleRejected = false;
+                try { Object.setPrototypeOf(base, child); } catch (_) { cycleRejected = true; }
+                Object.preventExtensions(child);
+                var noop = Object.setPrototypeOf(child, base) === child;
+                lookup && cycleRejected && noop;
+            ",
+        )
+        .expect("Object.setPrototypeOf should update the real prototype chain");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn global_var_does_not_replace_read_only_window_parent() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            "var parent = 42; parent === window && window.parent === window && top === window",
+        )
+        .expect("global var may coexist with a read-only Window property");
+    assert_eq!(outcome.value, JsValue::Boolean(true));
+}
+
+#[test]
+fn document_create_comment_produces_a_comment_node() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://comment.test/").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+            const comment = document.createComment("feature-detect");
+            comment.nodeType + ":" + comment.nodeValue
+        "#,
+        )
+        .expect("createComment runs");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("8:feature-detect".to_owned())
     );
 }

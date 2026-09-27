@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::css::computed::ComputedStyle;
+use crate::css::computed::{ComputedStyle, ComputedValue};
 use crate::css::properties::{
-    BorderStyle, CssColor, LengthPercentage, ObjectFit, Overflow, Position, Size,
-    TypedPropertyValue, Visibility, parse_typed_property,
+    BorderStyle, CssColor, LengthPercentage, LengthResolutionContext, ObjectFit, Overflow,
+    Position, Size, TransformFunction, TransformList, TransformOrigin, TypedPropertyValue,
+    Visibility, parse_typed_property,
 };
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
@@ -36,6 +37,80 @@ impl Default for Transform2D {
             translate_x: 0.0,
             translate_y: 0.0,
         }
+    }
+}
+
+impl Transform2D {
+    /// Maps a point through the affine matrix
+    /// `[[scale_x, skew_x, translate_x], [skew_y, scale_y, translate_y]]`.
+    #[must_use]
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.scale_x * x + self.skew_x * y + self.translate_x,
+            self.skew_y * x + self.scale_y * y + self.translate_y,
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::float_cmp)] // identity is an exact bit-pattern property
+    pub fn is_identity(&self) -> bool {
+        self.scale_x == 1.0
+            && self.skew_x == 0.0
+            && self.skew_y == 0.0
+            && self.scale_y == 1.0
+            && self.translate_x == 0.0
+            && self.translate_y == 0.0
+    }
+
+    /// True when the matrix reduces to a pure translation, which the
+    /// rasterizer can apply as a paint offset without an offscreen pass.
+    #[must_use]
+    #[allow(clippy::float_cmp)] // exact unit coefficients, not measured values
+    pub fn is_translation(&self) -> bool {
+        self.scale_x == 1.0 && self.skew_x == 0.0 && self.skew_y == 0.0 && self.scale_y == 1.0
+    }
+
+    #[must_use]
+    pub fn translation(&self) -> (f32, f32) {
+        (self.translate_x, self.translate_y)
+    }
+
+    /// Composes two matrices with `applied_first` mapping points before
+    /// `self` (i.e. `self ∘ applied_first`).
+    #[must_use]
+    pub fn then(&self, applied_first: &Self) -> Self {
+        Self {
+            scale_x: self.scale_x * applied_first.scale_x + self.skew_x * applied_first.skew_y,
+            skew_x: self.scale_x * applied_first.skew_x + self.skew_x * applied_first.scale_y,
+            skew_y: self.skew_y * applied_first.scale_x + self.scale_y * applied_first.skew_y,
+            scale_y: self.skew_y * applied_first.skew_x + self.scale_y * applied_first.scale_y,
+            translate_x: self.scale_x * applied_first.translate_x
+                + self.skew_x * applied_first.translate_y
+                + self.translate_x,
+            translate_y: self.skew_y * applied_first.translate_x
+                + self.scale_y * applied_first.translate_y
+                + self.translate_y,
+        }
+    }
+
+    /// Inverts the affine matrix; returns `None` when it is singular.
+    #[must_use]
+    pub fn inverse(&self) -> Option<Self> {
+        let determinant = self.scale_x * self.scale_y - self.skew_x * self.skew_y;
+        if determinant == 0.0 {
+            return None;
+        }
+        let inverse = 1.0 / determinant;
+        Some(Self {
+            scale_x: self.scale_y * inverse,
+            skew_x: -self.skew_x * inverse,
+            skew_y: -self.skew_y * inverse,
+            scale_y: self.scale_x * inverse,
+            translate_x: (self.skew_x * self.translate_y - self.scale_y * self.translate_x)
+                * inverse,
+            translate_y: (self.skew_y * self.translate_x - self.scale_x * self.translate_y)
+                * inverse,
+        })
     }
 }
 
@@ -509,25 +584,34 @@ impl Builder<'_> {
         let coordinate_space = fragment_coordinate_space(style.as_ref(), parent_space);
         let current_color = self.current_color(style.as_ref());
         let opacity = fragment_opacity(style.as_ref());
+        // Transforms are anchored to the border box: percentages in the
+        // transform list and the default transform-origin resolve against
+        // it (CSS Transforms Level 1 §4). Text fragments have no border
+        // box, so their fragment rect stands in.
+        let border_rect = match &fragment.kind {
+            FragmentKind::Box(geometry) => geometry.border_rect(),
+            FragmentKind::Text(_) => fragment.rect,
+        };
+        let transform = self.fragment_transform(style.as_ref(), border_rect);
         let hidden = matches!(
             style.as_ref().and_then(|style| style.typed("visibility")),
             Some(TypedPropertyValue::Visibility(
                 Visibility::Hidden | Visibility::Collapse
             ))
         );
-        if opacity < 1.0 {
+        // A transform groups the whole fragment — background, shadow, text,
+        // image, overflow clip and children — behind one affine matrix the
+        // same way opacity groups it behind an alpha. When both apply, a
+        // single stacking context carries them so rasterization only pays
+        // for one offscreen group.
+        let stacking_context = fragment_stacking_context(opacity, transform);
+        if let Some(context) = stacking_context {
             self.push(
                 &fragment,
                 PaintPhase::StackingContext,
                 fragment.rect,
                 coordinate_space,
-                DisplayCommand::PushStackingContext(StackingContext {
-                    opacity,
-                    transform: Transform2D::default(),
-                    blend_mode: BlendMode::Normal,
-                    isolated: true,
-                    reason: CompositingReason::Opacity,
-                }),
+                DisplayCommand::PushStackingContext(context),
             );
         }
 
@@ -581,7 +665,7 @@ impl Builder<'_> {
                 DisplayCommand::PopClip,
             );
         }
-        if opacity < 1.0 {
+        if stacking_context.is_some() {
             self.push(
                 &fragment,
                 PaintPhase::StackingContext,
@@ -589,6 +673,77 @@ impl Builder<'_> {
                 coordinate_space,
                 DisplayCommand::PopStackingContext,
             );
+        }
+    }
+
+    /// Resolves the fragment's `transform` property into the affine matrix
+    /// paint applies around the border box (CSS Transforms Level 1 §4–§5).
+    ///
+    /// Percentages inside `translate()` resolve against the border-box width
+    /// or height, the same per-axis basis CSS uses. Font-relative units use
+    /// the element's computed font size (stored as absolute pixels by the
+    /// computed-value stage) with the 16px engine default as fallback;
+    /// layout's already-resolved used lengths are not visible to paint, so
+    /// the list is re-resolved from the style here. Returns `None` when no
+    /// transform applies or the result is the identity, keeping the command
+    /// stream of untransformed fragments unchanged.
+    fn fragment_transform(
+        &self,
+        style: Option<&ComputedStyle>,
+        border_rect: PhysicalRect,
+    ) -> Option<Transform2D> {
+        let style = style?;
+        let Some(TypedPropertyValue::Transform(TransformList(functions))) =
+            style.typed("transform")
+        else {
+            return None;
+        };
+        if functions.is_empty() {
+            return None;
+        }
+        let font_size = style_font_size(style);
+        let viewport = self.fragments.viewport;
+        // The first function is the outermost mapping: M = F1 ∘ F2 ∘ … ∘ Fn.
+        let mut matrix = Transform2D::default();
+        for function in functions {
+            matrix = matrix.then(&transform_function_matrix(
+                function,
+                border_rect,
+                font_size,
+                viewport,
+            ));
+        }
+        // transform-origin re-bases the list around a fixed point:
+        // T(origin) ∘ M ∘ T(−origin). It defaults to 50% 50% of the box.
+        let origin = style
+            .typed("transform-origin")
+            .and_then(|value| match value {
+                TypedPropertyValue::TransformOrigin(origin) => Some(origin.clone()),
+                _ => None,
+            })
+            .unwrap_or(TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.5),
+            ));
+        let origin_x =
+            resolve_transform_length(&origin.0, border_rect.size.width, font_size, viewport);
+        let origin_y =
+            resolve_transform_length(&origin.1, border_rect.size.height, font_size, viewport);
+        let to_origin = Transform2D {
+            translate_x: origin_x,
+            translate_y: origin_y,
+            ..Transform2D::default()
+        };
+        let from_origin = Transform2D {
+            translate_x: -origin_x,
+            translate_y: -origin_y,
+            ..Transform2D::default()
+        };
+        matrix = to_origin.then(&matrix).then(&from_origin);
+        if matrix.is_identity() {
+            None
+        } else {
+            Some(matrix)
         }
     }
 
@@ -1668,6 +1823,123 @@ fn fragment_opacity(style: Option<&ComputedStyle>) -> f32 {
         .unwrap_or(1.0)
 }
 
+/// The stacking context grouping a fragment's whole subtree, if any: a
+/// transform or a sub-unity opacity (or both) paints through one group, so
+/// rasterization pays for a single offscreen composite per fragment.
+fn fragment_stacking_context(
+    opacity: f32,
+    transform: Option<Transform2D>,
+) -> Option<StackingContext> {
+    match transform {
+        Some(transform) => Some(StackingContext {
+            opacity,
+            transform,
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            reason: CompositingReason::Transform,
+        }),
+        None if opacity < 1.0 => Some(StackingContext {
+            opacity,
+            transform: Transform2D::default(),
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            reason: CompositingReason::Opacity,
+        }),
+        None => None,
+    }
+}
+
+/// Converts one transform list function into its 2D affine matrix.
+///
+/// `matrix(a, b, c, d, e, f)` uses the spec's argument order, which maps a
+/// column-vector matrix `[[a, c, e], [b, d, f]]` onto the `Transform2D`
+/// field layout; `rotate(θ)` is `matrix(cos θ, sin θ, −sin θ, cos θ, 0, 0)`,
+/// clockwise in the y-down screen coordinate system; `skew(ax, ay)` is
+/// `matrix(1, tan ay, tan ax, 1, 0, 0)`.
+#[allow(clippy::many_single_char_names)] // matrix(a, b, c, d, e, f) spec names
+fn transform_function_matrix(
+    function: &TransformFunction,
+    border_rect: PhysicalRect,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> Transform2D {
+    match function {
+        TransformFunction::Matrix([a, b, c, d, e, f]) => Transform2D {
+            scale_x: *a,
+            skew_x: *c,
+            skew_y: *b,
+            scale_y: *d,
+            translate_x: *e,
+            translate_y: *f,
+        },
+        TransformFunction::Translate(x, y) => Transform2D {
+            translate_x: resolve_transform_length(x, border_rect.size.width, font_size, viewport),
+            translate_y: resolve_transform_length(y, border_rect.size.height, font_size, viewport),
+            ..Transform2D::default()
+        },
+        TransformFunction::Scale(x, y) => Transform2D {
+            scale_x: *x,
+            scale_y: *y,
+            ..Transform2D::default()
+        },
+        TransformFunction::Rotate(radians) => {
+            let (sin, cos) = radians.sin_cos();
+            Transform2D {
+                scale_x: cos,
+                skew_x: -sin,
+                skew_y: sin,
+                scale_y: cos,
+                ..Transform2D::default()
+            }
+        }
+        TransformFunction::Skew(ax, ay) => Transform2D {
+            skew_x: ax.tan(),
+            skew_y: ay.tan(),
+            ..Transform2D::default()
+        },
+    }
+}
+
+/// Resolves one component of `translate()` or `transform-origin` against the
+/// border-box dimension of its axis. Unresolvable components (a calc the
+/// resolver rejects) fall back to zero rather than dropping the whole
+/// transform, mirroring how paint tolerates degenerate lengths elsewhere.
+fn resolve_transform_length(
+    value: &LengthPercentage,
+    basis: f32,
+    font_size: f32,
+    viewport: PhysicalSize,
+) -> f32 {
+    let context = LengthResolutionContext {
+        percentage_basis: Some(basis),
+        font_size,
+        viewport_width: viewport.width,
+        viewport_height: viewport.height,
+        ..LengthResolutionContext::default()
+    };
+    value.resolve(&context).unwrap_or(0.0)
+}
+
+/// Best-effort element font size for font-relative transform lengths. The
+/// computed-value stage stores an absolute pixel size (CSS 2.1 §6.1.1), so
+/// this is a cheap parse of the stored value; missing or unusual values fall
+/// back to the 16px engine default that `LengthResolutionContext::default`
+/// and the layout solver agree on.
+fn style_font_size(style: &ComputedStyle) -> f32 {
+    style
+        .get("font-size")
+        .map(ComputedValue::css_text)
+        .and_then(|text| {
+            text.trim()
+                .strip_suffix("px")
+                .unwrap_or(text.trim())
+                .parse::<f32>()
+                .ok()
+        })
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .unwrap_or(16.0)
+}
+
 fn typed_color(style: &ComputedStyle, property: &str) -> Option<CssColor> {
     match style.typed(property) {
         Some(TypedPropertyValue::Color(color)) => Some(*color),
@@ -1731,7 +2003,7 @@ mod tests {
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::css::stylesheet::parse_stylesheet;
     use crate::dom::NodeId;
-    use crate::html::parse_document;
+    use crate::html::{ParseOutput, parse_document};
     use crate::layout::{
         FormattingLimits, FragmentKind, LayoutOptions, PhysicalRect, SimpleTextMeasurer,
         build_formatting_tree, layout_formatting_tree,
@@ -1739,8 +2011,9 @@ mod tests {
     use crate::paint::Color;
 
     use super::{
-        Builder, ClipShape, DisplayCommand, DisplayListBuilderOptions, ImagePaint,
-        ReferenceTextShaper, build_display_list, build_display_list_with_images,
+        Builder, ClipShape, CompositingReason, DisplayCommand, DisplayListBuildOutput,
+        DisplayListBuilderOptions, ImagePaint, ReferenceTextShaper, StackingContext, Transform2D,
+        build_display_list, build_display_list_with_images,
     };
 
     #[test]
@@ -2482,5 +2755,233 @@ mod tests {
             Builder::object_fit_rect(content, 500.0, 100.0, ObjectFit::ScaleDown),
             PhysicalRect::new(10.0, 50.0, 200.0, 40.0)
         );
+    }
+
+    /// Builds the display list for a fixed two-box document styled by `css`,
+    /// returning the parsed DOM and the list for per-node assertions.
+    fn transform_display(css: &str) -> (ParseOutput, DisplayListBuildOutput) {
+        let output =
+            parse_document("<!doctype html><body><div id=box><div id=inner>x</div></div></body>");
+        let sheet = parse_stylesheet(css);
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let layout = layout_formatting_tree(
+            &output.dom,
+            &formatting,
+            &styles,
+            LayoutOptions::default(),
+            &SimpleTextMeasurer,
+        );
+        let display = build_display_list(
+            &layout.fragments,
+            &formatting,
+            &styles,
+            DisplayListBuilderOptions::default(),
+            &ReferenceTextShaper,
+        );
+        assert!(display.diagnostics.is_empty(), "{:?}", display.diagnostics);
+        (output, display)
+    }
+
+    fn node_contexts<'a>(
+        output: &ParseOutput,
+        selector: &str,
+        display: &'a DisplayListBuildOutput,
+    ) -> Vec<&'a StackingContext> {
+        let selector = parse_selector_list(selector).unwrap();
+        let node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        display
+            .list
+            .items()
+            .iter()
+            .filter(|item| {
+                item.source == Some(node)
+                    && matches!(item.command, DisplayCommand::PushStackingContext(_))
+            })
+            .map(|item| match &item.command {
+                DisplayCommand::PushStackingContext(context) => context,
+                _ => unreachable!("filtered above"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn transform_translate_resolves_percentages_against_the_border_box() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; transform: translate(50%, 20px) }",
+        );
+        let contexts = node_contexts(&output, "#box", &display);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].reason, CompositingReason::Transform);
+        assert!((contexts[0].opacity - 1.0).abs() < f32::EPSILON);
+        assert!(contexts[0].transform.is_translation());
+        let (tx, ty) = contexts[0].transform.translation();
+        assert!((tx - 50.0).abs() < 1e-4, "{tx}");
+        assert!((ty - 20.0).abs() < 1e-4, "{ty}");
+    }
+
+    #[test]
+    fn transform_rotate_uses_the_border_box_center_by_default() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; transform: rotate(90deg) }",
+        );
+        let contexts = node_contexts(&output, "#box", &display);
+        assert_eq!(contexts.len(), 1);
+        let t = contexts[0].transform;
+        // rotate(90deg) about (50, 25): (0, 0) maps to (75, -25).
+        assert!((t.scale_x - 0.0).abs() < 1e-4, "{t:?}");
+        assert!((t.skew_x - -1.0).abs() < 1e-4, "{t:?}");
+        assert!((t.skew_y - 1.0).abs() < 1e-4, "{t:?}");
+        assert!((t.scale_y - 0.0).abs() < 1e-4, "{t:?}");
+        assert!((t.translate_x - 75.0).abs() < 1e-4, "{t:?}");
+        assert!((t.translate_y - -25.0).abs() < 1e-4, "{t:?}");
+    }
+
+    #[test]
+    fn transform_origin_left_top_rebases_rotation_around_the_corner() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; transform: rotate(90deg); transform-origin: left top }",
+        );
+        let contexts = node_contexts(&output, "#box", &display);
+        assert_eq!(contexts.len(), 1);
+        let t = contexts[0].transform;
+        // With the origin at the corner the rotation keeps (0, 0) fixed, so
+        // the matrix is the bare rotation with zero translation.
+        assert!((t.scale_x - 0.0).abs() < 1e-4, "{t:?}");
+        assert!((t.skew_x - -1.0).abs() < 1e-4, "{t:?}");
+        assert!((t.skew_y - 1.0).abs() < 1e-4, "{t:?}");
+        assert!((t.scale_y - 0.0).abs() < 1e-4, "{t:?}");
+        assert!((t.translate_x - 0.0).abs() < 1e-4, "{t:?}");
+        assert!((t.translate_y - 0.0).abs() < 1e-4, "{t:?}");
+    }
+
+    #[test]
+    fn transform_none_and_absent_transform_emit_no_stacking_context() {
+        for css in [
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; transform: none }",
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px }",
+        ] {
+            let (_output, display) = transform_display(css);
+            assert!(
+                display
+                    .list
+                    .items()
+                    .iter()
+                    .all(|item| !matches!(item.command, DisplayCommand::PushStackingContext(_))),
+                "unexpected stacking context for {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn opacity_and_transform_share_a_single_stacking_context() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; opacity:0.5; transform: translate(10px, 0) }",
+        );
+        let contexts = node_contexts(&output, "#box", &display);
+        assert_eq!(contexts.len(), 1);
+        assert!((contexts[0].opacity - 0.5).abs() < 1e-6);
+        assert!(!contexts[0].transform.is_identity());
+        assert_eq!(contexts[0].reason, CompositingReason::Transform);
+    }
+
+    #[test]
+    fn transform_group_wraps_child_commands() {
+        let (output, display) = transform_display(
+            "html, body, #box, #inner { display:block; margin:0 } \
+             #box { width:100px; height:50px; transform: translate(10px, 0) } \
+             #inner { width:10px; height:10px; background-color:#123456 }",
+        );
+        let selector = parse_selector_list("#box").unwrap();
+        let box_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let selector = parse_selector_list("#inner").unwrap();
+        let inner_node = select_all(
+            &output.dom,
+            output.dom.document(),
+            &selector,
+            &MatchContext::default(),
+        )[0];
+        let items = display.list.items();
+        let push_index = items
+            .iter()
+            .position(|item| {
+                item.source == Some(box_node)
+                    && matches!(item.command, DisplayCommand::PushStackingContext(_))
+            })
+            .expect("transform push");
+        let pop_index = items
+            .iter()
+            .position(|item| {
+                item.source == Some(box_node)
+                    && matches!(item.command, DisplayCommand::PopStackingContext)
+            })
+            .expect("transform pop");
+        let child_index = items
+            .iter()
+            .position(|item| {
+                item.source == Some(inner_node)
+                    && matches!(item.command, DisplayCommand::SolidRect { .. })
+            })
+            .expect("child background");
+        assert!(push_index < child_index && child_index < pop_index);
+    }
+
+    #[test]
+    fn transform2d_math_composes_inverts_and_classifies() {
+        let translation = Transform2D {
+            translate_x: 5.0,
+            translate_y: 7.0,
+            ..Transform2D::default()
+        };
+        assert!(translation.is_translation());
+        let scale = Transform2D {
+            scale_x: 2.0,
+            scale_y: 3.0,
+            ..Transform2D::default()
+        };
+        assert!(!scale.is_translation());
+        assert_eq!(scale.apply(4.0, 5.0), (8.0, 15.0));
+
+        // `then` applies its argument first: scale ∘ translation.
+        let composed = scale.then(&translation);
+        assert_eq!(composed.apply(1.0, 1.0), (12.0, 24.0));
+
+        let inverse = composed.inverse().expect("invertible");
+        let (x, y) = inverse.apply(12.0, 24.0);
+        assert!((x - 1.0).abs() < 1e-4 && (y - 1.0).abs() < 1e-4);
+        assert!(
+            Transform2D {
+                scale_x: 0.0,
+                ..Transform2D::default()
+            }
+            .inverse()
+            .is_none()
+        );
+        assert!(Transform2D::default().is_identity());
     }
 }

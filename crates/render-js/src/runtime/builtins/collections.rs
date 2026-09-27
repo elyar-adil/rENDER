@@ -25,6 +25,17 @@ use crate::value::ObjectHost;
 use render_dom::Dom;
 
 impl JsRuntime {
+    fn collection_target(&self, receiver: ObjectId) -> ObjectId {
+        let mut current = receiver;
+        for _ in 0..8 {
+            match self.realm.host(current) {
+                Some(ObjectHost::Proxy { target, .. }) => current = target,
+                _ => break,
+            }
+        }
+        current
+    }
+
     pub(in crate::runtime) fn dispatch_collections_native(
         &mut self,
         dom: &mut Dom,
@@ -69,7 +80,10 @@ impl JsRuntime {
                 self.collection_iterator(receiver, CollectionView::Entries)
             }
             NativeFunction::CollectionIteratorNext => self.collection_iterator_next(receiver),
-            other => self.dispatch_string_native(dom, other, receiver, arguments),
+            other => match self.dispatch_iterator_native(dom, other, receiver, arguments) {
+                Some(result) => result,
+                None => self.dispatch_string_native(dom, other, receiver, arguments),
+            },
         }
     }
 }
@@ -110,7 +124,7 @@ impl JsRuntime {
                 "collection constructor currently requires an Array iterable",
             ));
         }
-        for item in self.array_elements_for(iterable) {
+        for item in self.array_elements_for(iterable)? {
             if kind.is_map() {
                 let pair = Self::require_object(&item)?;
                 let key = self.get_member(dom, pair, "0")?;
@@ -129,6 +143,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let key = required_argument(arguments, 0, "Map.get")?;
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
             return Err(JsError::type_error("incompatible Map receiver"));
         };
@@ -148,6 +163,7 @@ impl JsRuntime {
         value: JsValue,
         map_method: bool,
     ) -> Result<(), JsError> {
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { kind, .. }) = self.realm.host(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };
@@ -179,6 +195,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let key = required_argument(arguments, 0, "collection.has")?;
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { entries, .. }) = self.realm.host(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };
@@ -195,6 +212,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let key = required_argument(arguments, 0, "collection.delete")?;
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { entries, .. }) = self.realm.host_mut(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };
@@ -212,6 +230,7 @@ impl JsRuntime {
         &mut self,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { kind, entries }) = self.realm.host_mut(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };
@@ -233,6 +252,7 @@ impl JsRuntime {
             &self.realm,
         )?;
         let this_argument = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };
@@ -255,6 +275,7 @@ impl JsRuntime {
         receiver: ObjectId,
         view: CollectionView,
     ) -> Result<JsValue, JsError> {
+        let receiver = self.collection_target(receiver);
         let Some(ObjectHost::Collection { kind, entries }) = self.realm.host(receiver) else {
             return Err(JsError::type_error("incompatible collection receiver"));
         };

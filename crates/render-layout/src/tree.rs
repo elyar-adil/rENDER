@@ -382,6 +382,9 @@ impl Builder<'_> {
                     self.append_child(format_parent, id);
                 }
                 self.append_dom_children(dom_node, id, Some(dom_node), depth.saturating_add(1));
+                // An <input> has no DOM children, but it paints its current
+                // `value` or, when empty, its `placeholder` as the visible
+                // field content (HTML forms rendering).
                 if matches!(
                     self.dom.node(dom_node).map(render_dom::Node::kind),
                     Some(NodeKind::Element(element))
@@ -392,13 +395,18 @@ impl Builder<'_> {
                                 .ok()
                                 .flatten()
                                 .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
-                ) && let Some(value) = self.dom.attribute(dom_node, "value").ok().flatten()
-                    && !value.is_empty()
+                ) && let Some(shown_text) = self
+                    .dom
+                    .attribute(dom_node, "value")
+                    .ok()
+                    .flatten()
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| self.dom.attribute(dom_node, "placeholder").ok().flatten())
                 {
                     let Some(text_id) = self.allocate(
                         Some(dom_node),
                         Some(dom_node),
-                        FormattingNodeKind::Text(value.to_owned()),
+                        FormattingNodeKind::Text(shown_text.to_owned()),
                     ) else {
                         return;
                     };
@@ -422,7 +430,8 @@ impl Builder<'_> {
     fn formatting_kind(&mut self, node: NodeId, display: &Display) -> (FormattingNodeKind, bool) {
         if matches!(
             self.dom.node(node).map(render_dom::Node::kind),
-            Some(NodeKind::Element(element)) if element.local_name == "img"
+            Some(NodeKind::Element(element))
+                if matches!(element.local_name.as_str(), "img" | "video")
         ) {
             let inline = matches!(
                 display,
@@ -680,6 +689,29 @@ mod tests {
             node.source == Some(input)
                 && matches!(&node.kind, FormattingNodeKind::Text(value) if value == "百度")
         }));
+    }
+
+    #[test]
+    fn video_element_creates_an_atomic_inline_formatting_context_like_img() {
+        // HTML-aware replaced elements default to `display: inline`, yet they
+        // must still become atomic inline-level boxes (width/height replace
+        // the content) rather than character-level inline runs.
+        for tag in ["img", "video"] {
+            let output = parse_document(&format!("<!doctype html><body><{tag} id=media>"));
+            let styles = styles(&output.dom, "body { display:block }");
+            let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+            let media = find(&output.dom, "#media");
+            assert!(
+                tree.iter().any(|node| node.source == Some(media)
+                    && matches!(
+                        node.kind,
+                        FormattingNodeKind::AtomicInline {
+                            context: FormattingContextKind::Block
+                        }
+                    )),
+                "{tag} must be an atomic inline"
+            );
+        }
     }
 
     #[test]

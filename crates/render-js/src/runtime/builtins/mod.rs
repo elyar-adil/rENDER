@@ -13,17 +13,20 @@
 //! and hands unmatched functions to `dom.rs`.
 
 pub(super) mod array;
+pub(super) mod blob;
 pub(super) mod collections;
 pub(super) mod date;
 pub(super) mod dom;
 pub(super) mod events;
 pub(super) mod fetch;
 pub(super) mod global_fns;
+pub(super) mod iterator;
 pub(super) mod json;
 pub(super) mod math;
 pub(super) mod object;
 pub(super) mod observers;
 pub(super) mod promise;
+pub(super) mod proxy;
 pub(super) mod regexp;
 pub(super) mod string;
 pub(super) mod style;

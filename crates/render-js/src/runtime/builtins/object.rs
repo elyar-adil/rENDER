@@ -54,10 +54,14 @@ impl JsRuntime {
                 Ok(JsValue::Object(self.create_array_from_values(&symbols)?))
             }
             NativeFunction::ObjectAssign => self.object_assign(arguments),
-            NativeFunction::ObjectKeys => self.object_entries(arguments, ObjectEntryKind::Keys),
-            NativeFunction::ObjectValues => self.object_entries(arguments, ObjectEntryKind::Values),
+            NativeFunction::ObjectKeys => {
+                self.object_entries(dom, arguments, ObjectEntryKind::Keys)
+            }
+            NativeFunction::ObjectValues => {
+                self.object_entries(dom, arguments, ObjectEntryKind::Values)
+            }
             NativeFunction::ObjectEntries => {
-                self.object_entries(arguments, ObjectEntryKind::Entries)
+                self.object_entries(dom, arguments, ObjectEntryKind::Entries)
             }
             NativeFunction::ObjectCreate => self.object_create(arguments),
             NativeFunction::ObjectDefineProperty => self.object_define_property(arguments),
@@ -72,6 +76,7 @@ impl JsRuntime {
                 self.object_get_own_property_names(arguments)
             }
             NativeFunction::ObjectGetPrototypeOf => self.object_get_prototype_of(arguments),
+            NativeFunction::ObjectSetPrototypeOf => self.object_set_prototype_of(arguments),
             NativeFunction::ObjectHasOwn => self.object_has_own(arguments),
             NativeFunction::ObjectPrototypeHasOwnProperty => {
                 self.object_prototype_has_own_property(receiver, arguments)
@@ -439,12 +444,33 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn object_entries(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         kind: ObjectEntryKind,
     ) -> Result<JsValue, JsError> {
         let value = required_argument(arguments, 0, kind.function_name())?;
         let properties = match value {
             JsValue::Undefined | JsValue::Null | JsValue::Symbol(_) => Vec::new(),
+            JsValue::Object(object)
+                if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) =>
+            {
+                let keys = self.proxy_own_keys(dom, *object)?;
+                let mut properties = Vec::new();
+                for key in keys {
+                    if self
+                        .proxy_get_own_property_descriptor(dom, *object, &key)?
+                        .is_some_and(|descriptor| descriptor.enumerable)
+                    {
+                        let value = if kind == ObjectEntryKind::Keys {
+                            JsValue::Undefined
+                        } else {
+                            self.get_member(dom, *object, &key)?
+                        };
+                        properties.push((key, value));
+                    }
+                }
+                properties
+            }
             JsValue::Object(object) => self
                 .realm
                 .enumerable_own_properties(*object)
@@ -498,7 +524,15 @@ impl JsRuntime {
             return Ok(target.clone());
         }
         let object = Self::require_object(target)?;
-        let key = required_argument(arguments, 1, "Object.defineProperty")?.to_js_string();
+        let key_argument = required_argument(arguments, 1, "Object.defineProperty")?;
+        // `ToPropertyKey` keeps symbols as symbols: a symbol key must address
+        // the object's symbol slots, never the string `Symbol(desc)` form.
+        // core-js (bilibili log-reporter) installs `Symbol.unscopables` on
+        // `Array.prototype` through this path.
+        let symbol_key = match &key_argument {
+            JsValue::Symbol(symbol) => Some(symbol.clone()),
+            _ => None,
+        };
         let descriptor_value = required_argument(arguments, 2, "Object.defineProperty")?;
         if matches!(descriptor_value, JsValue::Null | JsValue::Undefined) {
             return Ok(JsValue::Object(object));
@@ -514,7 +548,12 @@ impl JsRuntime {
             }
             JsValue::Null | JsValue::Undefined => unreachable!(),
         };
-        let existing = self.realm.own_property(object, &key);
+        let existing = match &symbol_key {
+            Some(symbol) => self.realm.own_symbol_property(object, symbol),
+            None => self
+                .realm
+                .own_property(object, &key_argument.to_js_string()),
+        };
         // Field presence uses own-property checks: per spec, `{get:
         // undefined}` means "accessor with no getter", not "field absent".
         let get_field = self
@@ -597,6 +636,33 @@ impl JsRuntime {
             }
         };
         let descriptor_value = descriptor.value.clone();
+        if let Some(symbol) = &symbol_key {
+            if !self
+                .realm
+                .define_symbol_property(object, symbol, descriptor)
+            {
+                // Mirror the string-key fallback for polyfills that re-run
+                // their descriptor installer: applying the value is the
+                // observable part callers rely on when the existing property
+                // is writable.
+                let applied = match self.realm.own_symbol_property(object, symbol) {
+                    Some(current) if current.writable => self.realm.define_symbol_property(
+                        object,
+                        symbol,
+                        PropertyDescriptor {
+                            value: descriptor_value,
+                            ..current
+                        },
+                    ),
+                    _ => false,
+                };
+                if !applied {
+                    return Err(JsError::type_error("cannot redefine object property"));
+                }
+            }
+            return Ok(JsValue::Object(object));
+        }
+        let key = key_argument.to_js_string();
         if !self.realm.define_property(object, key.clone(), descriptor) {
             // Browser polyfills frequently re-run their descriptor installer
             // after a partial initialization. If the existing property is
@@ -647,9 +713,12 @@ impl JsRuntime {
             0,
             "Object.getOwnPropertyDescriptor",
         )?)?;
-        let key =
-            required_argument(arguments, 1, "Object.getOwnPropertyDescriptor")?.to_js_string();
-        let Some(descriptor) = self.realm.own_property(object, &key) else {
+        let key_argument = required_argument(arguments, 1, "Object.getOwnPropertyDescriptor")?;
+        let descriptor = match &key_argument {
+            JsValue::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
+            key => self.realm.own_property(object, &key.to_js_string()),
+        };
+        let Some(descriptor) = descriptor else {
             return Ok(JsValue::Undefined);
         };
         self.ensure_heap_capacity(1)?;
@@ -741,6 +810,31 @@ impl JsRuntime {
             .map_or(JsValue::Null, JsValue::Object))
     }
 
+    pub(in crate::runtime) fn object_set_prototype_of(
+        &mut self,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target = required_argument(arguments, 0, "Object.setPrototypeOf")?.clone();
+        if matches!(target, JsValue::Null | JsValue::Undefined) {
+            return Err(JsError::type_error(
+                "Object.setPrototypeOf target is nullish",
+            ));
+        }
+        let prototype = match required_argument(arguments, 1, "Object.setPrototypeOf")? {
+            JsValue::Object(object) => Some(*object),
+            JsValue::Null => None,
+            _ => return Err(JsError::type_error("prototype must be an object or null")),
+        };
+        let JsValue::Object(object) = target else {
+            return Ok(target);
+        };
+        if self.realm.set_prototype(object, prototype) {
+            Ok(JsValue::Object(object))
+        } else {
+            Err(JsError::type_error("cannot set prototype"))
+        }
+    }
+
     pub(in crate::runtime) fn object_get_own_property_names(
         &mut self,
         arguments: &[JsValue],
@@ -769,10 +863,15 @@ impl JsRuntime {
             return Ok(JsValue::Boolean(false));
         }
         let object = Self::require_object(value)?;
-        let key = required_argument(arguments, 1, "Object.hasOwn")?.to_js_string();
-        Ok(JsValue::Boolean(
-            self.realm.own_property(object, &key).is_some(),
-        ))
+        let key_argument = required_argument(arguments, 1, "Object.hasOwn")?;
+        let owned = match &key_argument {
+            JsValue::Symbol(symbol) => self.realm.own_symbol_property(object, symbol).is_some(),
+            key => self
+                .realm
+                .own_property(object, &key.to_js_string())
+                .is_some(),
+        };
+        Ok(JsValue::Boolean(owned))
     }
 
     pub(in crate::runtime) fn object_prototype_has_own_property(
@@ -780,11 +879,15 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let key =
-            required_argument(arguments, 0, "Object.prototype.hasOwnProperty")?.to_js_string();
-        Ok(JsValue::Boolean(
-            self.realm.own_property(receiver, &key).is_some(),
-        ))
+        let key_argument = required_argument(arguments, 0, "Object.prototype.hasOwnProperty")?;
+        let owned = match &key_argument {
+            JsValue::Symbol(symbol) => self.realm.own_symbol_property(receiver, symbol).is_some(),
+            key => self
+                .realm
+                .own_property(receiver, &key.to_js_string())
+                .is_some(),
+        };
+        Ok(JsValue::Boolean(owned))
     }
 
     pub(in crate::runtime) fn object_prototype_is_prototype_of(

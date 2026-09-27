@@ -51,6 +51,14 @@ pub(super) fn log_completed_frame_debug(frame: &PageRenderFrame, tab_id: u64) {
             command, item.source, item.bounds
         );
     }
+    for item in display_list.items() {
+        if let render_core::paint::DisplayCommand::Image(image) = &item.command {
+            eprintln!(
+                "render-browser image command source={:?} resource={:?} destination={:?} bounds={:?}",
+                item.source, image.resource, image.destination, item.bounds
+            );
+        }
+    }
 }
 
 pub(super) fn dump_debug_frame(frame: &[u32], size: WindowSize<u32>) {

@@ -120,7 +120,21 @@ pub enum Combinator {
 struct CompoundSelector {
     type_selector: Option<TypeSelector>,
     simple: Vec<SimpleSelector>,
-    pseudo_element: Option<String>,
+    pseudo_element: Option<PseudoElementSelector>,
+}
+
+/// A pseudo-element, optionally in functional notation such as
+/// `::view-transition-new(root)` or `::highlight(name)`.
+///
+/// Selectors 4 §3.9: unknown pseudo-elements are syntactically valid and
+/// simply match nothing. The same holds for functional pseudo-elements this
+/// renderer does not generate (view transitions, custom highlights, shadow
+/// DOM parts): the argument is preserved but the compound can never match,
+/// because [`MatchContext::pseudo_element`] carries no argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PseudoElementSelector {
+    name: String,
+    argument: Option<String>,
 }
 
 impl CompoundSelector {
@@ -522,7 +536,7 @@ impl<'a> Parser<'a> {
                                 self.error("compound selector has multiple pseudo-elements")
                             );
                         }
-                        pseudo_element = Some(self.parse_identifier()?.to_ascii_lowercase());
+                        pseudo_element = Some(self.parse_pseudo_element()?);
                     } else {
                         let saved = self.offset;
                         let legacy_name = self.parse_identifier()?.to_ascii_lowercase();
@@ -532,7 +546,10 @@ impl<'a> Parser<'a> {
                                     self.error("compound selector has multiple pseudo-elements")
                                 );
                             }
-                            pseudo_element = Some(legacy_name);
+                            pseudo_element = Some(PseudoElementSelector {
+                                name: legacy_name,
+                                argument: None,
+                            });
                         } else {
                             self.offset = saved;
                             simple.push(SimpleSelector::Pseudo(self.parse_pseudo_class()?));
@@ -551,6 +568,20 @@ impl<'a> Parser<'a> {
             simple,
             pseudo_element,
         })
+    }
+
+    fn parse_pseudo_element(&mut self) -> Result<PseudoElementSelector, SelectorParseError> {
+        let name = self.parse_identifier()?.to_ascii_lowercase();
+        let argument = if self.consume_char('(') {
+            let contents = self.consume_function_contents()?;
+            if contents.trim().is_empty() {
+                return Err(self.error("functional pseudo-element requires an argument"));
+            }
+            Some(contents.trim().to_owned())
+        } else {
+            None
+        };
+        Ok(PseudoElementSelector { name, argument })
     }
 
     fn parse_attribute(&mut self) -> Result<AttributeSelector, SelectorParseError> {
@@ -1118,7 +1149,11 @@ fn matches_compound(
     }
     match (&selector.pseudo_element, &context.pseudo_element) {
         (None, None) => true,
-        (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
+        (Some(expected), Some(actual)) => {
+            // Functional pseudo-elements carry an argument this renderer never
+            // generates, so they remain valid selectors that match nothing.
+            expected.argument.is_none() && expected.name.eq_ignore_ascii_case(actual)
+        }
         _ => false,
     }
 }
@@ -1728,6 +1763,76 @@ mod tests {
         assert!(parse_selector_list("div, :unsupported()").is_ok());
         assert!(parse_selector_list("#123").is_err());
         assert!(parse_selector_list(":nth-of-type(2 of .x)").is_err());
+    }
+
+    #[test]
+    fn functional_pseudo_elements_parse_and_never_match_dom_elements() {
+        // The exact selectors from qq.com's index.css (View Transitions).
+        let selectors =
+            parse_selector_list("html::view-transition-new(root),html::view-transition-old(root)")
+                .unwrap();
+        assert_eq!(selectors.selectors().len(), 2);
+        assert!(
+            parse_selector_list("html[data-theme-transition=fade]::view-transition-new(root)")
+                .is_ok()
+        );
+        assert!(
+            parse_selector_list("html[data-theme-transition=top-right]::view-transition-new(root)")
+                .is_ok()
+        );
+        assert!(parse_selector_list("div::view-transition-group(*)").is_ok());
+        assert!(parse_selector_list("::highlight(sel-1)").is_ok());
+
+        // A pseudo-element with an argument still counts once toward
+        // specificity (Selectors 4 §3.9), same as `::before`.
+        assert_eq!(
+            parse_selector_list("html::view-transition-new(root)")
+                .unwrap()
+                .max_specificity(),
+            Specificity {
+                ids: 0,
+                classes: 0,
+                types: 2
+            }
+        );
+
+        // Valid but matching nothing: the engine never surfaces a
+        // view-transition pseudo tree, and functional notation in a
+        // non-functional pseudo-element (`::before(x)`) matches nothing too.
+        let html = "<!doctype html><p id=x></p>";
+        assert!(query(html, "p::view-transition-new(root)").is_empty());
+        assert!(query(html, "p::before(x)").is_empty());
+
+        // A plain `::before` still matches under its explicit host context,
+        // while its functional spelling never does.
+        let output = parse_document(html);
+        let element = select_all(
+            &output.dom,
+            output.dom.document(),
+            &parse_selector_list("p").unwrap(),
+            &MatchContext::default(),
+        )[0];
+        let before = MatchContext {
+            pseudo_element: Some("before".to_owned()),
+            ..MatchContext::default()
+        };
+        assert!(matches_selector_list(
+            &output.dom,
+            element,
+            &parse_selector_list("p::before").unwrap(),
+            &before
+        ));
+        assert!(!matches_selector_list(
+            &output.dom,
+            element,
+            &parse_selector_list("p::before(x)").unwrap(),
+            &before
+        ));
+
+        // Malformed functional notation is still rejected.
+        assert!(parse_selector_list("div::highlight()").is_err());
+        assert!(parse_selector_list("div::highlight(unclosed").is_err());
+        assert!(parse_selector_list("div::highlight(a)extra").is_err());
     }
 
     #[test]

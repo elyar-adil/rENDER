@@ -15,6 +15,7 @@
 
 use crate::JsValue;
 use crate::ObjectId;
+use crate::parser::Expr;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::builtins::promise::PromiseState;
@@ -37,7 +38,7 @@ pub(super) struct GlobalBinding {
     pub(super) kind: VariableKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObjectEntryKind {
     Keys,
     Values,
@@ -70,9 +71,92 @@ pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
     pub(super) parameters: Vec<String>,
+    /// Default initializer expressions parallel to `parameters`; `None` for
+    /// parameters without one. A default evaluates left to right whenever
+    /// its argument is `undefined` or absent, in the call environment built
+    /// so far, so later defaults see earlier bindings.
+    pub(super) defaults: Vec<Option<Expr>>,
     pub(super) body: Vec<Statement>,
     pub(super) captured_environment: Vec<Environment>,
-    pub(super) lexical_this: Option<JsValue>,
+    /// Arrow functions do not bind their own `this`; they resolve the
+    /// enclosing function's `this` binding lexically.
+    pub(super) arrow: bool,
+    /// Class methods and constructors run in strict mode: a nullish `this`
+    /// never falls back to the global object.
+    pub(super) strict: bool,
+    /// Class-specific metadata for methods and constructors; `None` for
+    /// ordinary functions.
+    pub(super) class: Option<Rc<ClassFunction>>,
+    /// The final parameter collects the remaining arguments into an array.
+    pub(super) rest: bool,
+}
+
+/// One class body's private-name registry, chained to the lexically
+/// enclosing class so a nested class can access outer private names.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PrivateScope {
+    pub(super) names: BTreeMap<String, u64>,
+    pub(super) outer: Option<Rc<PrivateScope>>,
+}
+
+impl PrivateScope {
+    /// Resolve a written private name through the lexical class chain.
+    pub(super) fn resolve(&self, name: &str) -> Option<u64> {
+        let mut scope = self;
+        loop {
+            if let Some(id) = scope.names.get(name) {
+                return Some(*id);
+            }
+            scope = scope.outer.as_deref()?;
+        }
+    }
+}
+
+/// Class-specific metadata carried by a method or constructor function.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClassFunction {
+    /// The object `super.property` starts from (the class prototype for
+    /// instance methods, the constructor for static methods).
+    pub(super) home_object: Option<ObjectId>,
+    /// The parent constructor for derived classes; `None` for base classes
+    /// and non-constructors.
+    pub(super) super_constructor: Option<ObjectId>,
+    pub(super) derived: bool,
+    /// Instance fields initialized by a constructor (base) or by its
+    /// `super()` call (derived).
+    pub(super) fields: Vec<ClassFieldDefinition>,
+    /// Class-body private-name registry: written name -> unique id.
+    pub(super) private_names: Rc<PrivateScope>,
+    /// Whether this function is a constructor at all (base constructors are
+    /// constructible; methods are not).
+    pub(super) constructor: bool,
+    /// Environment vector of the class body, used to evaluate field
+    /// initializers when `super()` completes.
+    pub(super) environment: Vec<Environment>,
+}
+
+/// One class field definition: its resolved key and optional initializer.
+#[derive(Clone, Debug)]
+pub(super) struct ClassFieldDefinition {
+    pub(super) key: ClassFieldKey,
+    pub(super) initializer: Option<crate::parser::Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum ClassFieldKey {
+    Named(String),
+    Private(u64),
+}
+
+/// Per-call class context backing `super`, `new.target`, private names, and
+/// instance-field initialization. Pushed by every user-function call; arrows
+/// inherit the frame of the function they execute inside.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClassFrame {
+    pub(super) function: Option<Rc<ClassFunction>>,
+    /// Lexical private scope for `#name` resolution; set while class bodies,
+    /// field initializers, and static blocks evaluate, even outside a call.
+    pub(super) private_scope: Option<Rc<PrivateScope>>,
 }
 
 /// One active JavaScript call frame, retained for stack traces and

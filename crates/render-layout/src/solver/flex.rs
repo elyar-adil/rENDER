@@ -12,11 +12,14 @@ use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
+use render_css::properties::AlignContent;
 use render_css::properties::AlignItems;
+use render_css::properties::AlignSelf;
 use render_css::properties::AutoLengthPercentage;
 use render_css::properties::BoxSizing;
 use render_css::properties::FlexBasis;
 use render_css::properties::FlexDirection;
+use render_css::properties::FlexWrap;
 use render_css::properties::JustifyContent;
 use render_css::properties::Size;
 use render_css::properties::TypedPropertyValue;
@@ -25,6 +28,346 @@ use render_dom::NodeId;
 impl Solver<'_> {
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub(super) fn layout_flex_children(
+        &mut self,
+        children: &[FormattingNodeId],
+        containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        specified_height: Option<f32>,
+        depth: usize,
+        container_style: Option<&ComputedStyle>,
+        container_source: Option<NodeId>,
+    ) -> (Vec<FragmentId>, f32) {
+        let wrapping = match container_style.and_then(|style| style.typed("flex-wrap")) {
+            Some(TypedPropertyValue::FlexWrap(value)) => *value,
+            _ => FlexWrap::NoWrap,
+        };
+        let direction = match container_style.and_then(|style| style.typed("flex-direction")) {
+            Some(TypedPropertyValue::FlexDirection(value)) => *value,
+            _ => FlexDirection::Row,
+        };
+        if wrapping != FlexWrap::NoWrap
+            && matches!(direction, FlexDirection::Row | FlexDirection::RowReverse)
+            && !children.is_empty()
+        {
+            return self.layout_wrapped_flex_rows(
+                children,
+                containing,
+                positioning_containing,
+                specified_height,
+                depth,
+                container_style,
+                container_source,
+                wrapping == FlexWrap::WrapReverse,
+            );
+        }
+        if wrapping != FlexWrap::NoWrap
+            && matches!(
+                direction,
+                FlexDirection::Column | FlexDirection::ColumnReverse
+            )
+            && let Some(height) = specified_height
+            && !children.is_empty()
+        {
+            return self.layout_wrapped_flex_columns(
+                children,
+                containing,
+                positioning_containing,
+                height,
+                depth,
+                container_style,
+                container_source,
+                wrapping == FlexWrap::WrapReverse,
+            );
+        }
+        self.layout_flex_line(
+            children,
+            containing,
+            positioning_containing,
+            specified_height,
+            depth,
+            container_style,
+            container_source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn layout_wrapped_flex_rows(
+        &mut self,
+        children: &[FormattingNodeId],
+        containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        specified_height: Option<f32>,
+        depth: usize,
+        container_style: Option<&ComputedStyle>,
+        container_source: Option<NodeId>,
+        wrap_reverse: bool,
+    ) -> (Vec<FragmentId>, f32) {
+        let column_gap = self.resolve_gap(
+            container_style,
+            "column-gap",
+            containing.size.width,
+            container_source,
+        );
+        let row_gap = self.resolve_gap(
+            container_style,
+            "row-gap",
+            specified_height.unwrap_or(0.0),
+            container_source,
+        );
+        let mut ordered = children.to_vec();
+        ordered.sort_by_key(|id| {
+            let style = self
+                .formatting
+                .get(*id)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            match style.and_then(|style| style.typed("order")) {
+                Some(TypedPropertyValue::Order(value)) => *value,
+                _ => 0,
+            }
+        });
+        let mut lines: Vec<Vec<FormattingNodeId>> = vec![Vec::new()];
+        let mut line_width = 0.0;
+        for node in ordered {
+            let source = self.formatting.get(node).and_then(|node| node.source);
+            let style = self
+                .formatting
+                .get(node)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            let basis = self.flex_basis(node, style, true, containing.size.width, true, source);
+            let extras = self.flex_outer_extras(style, true, containing.size.width, source);
+            let minimum = match style.and_then(|style| style.typed("min-width")) {
+                Some(TypedPropertyValue::Size(Size::Auto)) | None => {
+                    self.intrinsic_flex_size(node, true, containing.size.width, 0)
+                }
+                _ => self
+                    .resolve_size_against(style, "min-width", Some(containing.size.width), source)
+                    .unwrap_or(0.0),
+            };
+            let outer = (basis.max(minimum) + extras).max(0.0);
+            let next_width = if lines.last().is_some_and(Vec::is_empty) {
+                outer
+            } else {
+                line_width + column_gap + outer
+            };
+            if next_width > containing.size.width
+                && lines.last().is_some_and(|line| !line.is_empty())
+            {
+                lines.push(Vec::new());
+                line_width = outer;
+            } else {
+                line_width = next_width;
+            }
+            lines.last_mut().expect("at least one flex line").push(node);
+        }
+
+        let mut laid_out = Vec::with_capacity(lines.len());
+        for line in &lines {
+            // A line is sized against the full inline size. The cross size is
+            // initially intrinsic; after all lines have been measured a
+            // definite container can distribute extra cross space to them.
+            let (fragments, height) = self.layout_flex_line(
+                line,
+                containing,
+                positioning_containing,
+                None,
+                depth,
+                container_style,
+                container_source,
+            );
+            laid_out.push((fragments, height));
+        }
+        let natural_height = laid_out.iter().map(|(_, height)| height).sum::<f32>()
+            + row_gap * count_as_f32(laid_out.len().saturating_sub(1));
+        let free_cross = specified_height.map_or(0.0, |height| (height - natural_height).max(0.0));
+        let align_content = match container_style.and_then(|style| style.typed("align-content")) {
+            Some(TypedPropertyValue::AlignContent(value)) => *value,
+            _ => AlignContent::Normal,
+        };
+        let line_count = laid_out.len();
+        let (extra_per_line, line_offset, extra_gap) =
+            Self::flex_line_distribution(align_content, line_count, free_cross);
+        let used_height = specified_height
+            .unwrap_or(natural_height)
+            .max(natural_height);
+        let align = match container_style.and_then(|style| style.typed("align-items")) {
+            Some(TypedPropertyValue::AlignItems(AlignItems::Normal)) => AlignItems::Stretch,
+            Some(TypedPropertyValue::AlignItems(value)) => *value,
+            _ => AlignItems::Stretch,
+        };
+        let mut cursor = line_offset;
+        let mut fragments = Vec::new();
+        for (line_fragments, natural_line_height) in laid_out {
+            let line_height = natural_line_height + extra_per_line;
+            let line_y = if wrap_reverse {
+                used_height - cursor - line_height
+            } else {
+                cursor
+            };
+            for fragment in line_fragments {
+                let node = self
+                    .fragments
+                    .get(fragment.as_u32() as usize)
+                    .map(|fragment| fragment.formatting_node);
+                let item_align = node.map_or(align, |node| self.flex_item_align(node, align));
+                let auto_height = node.is_some_and(|node| self.flex_cross_is_auto(node, "height"));
+                let original_height = self
+                    .fragment_outer_rect(fragment)
+                    .map_or(0.0, |rect| rect.size.height);
+                let cross_shift = if item_align == AlignItems::Stretch && auto_height {
+                    self.stretch_fragment_outer_height(fragment, line_height);
+                    0.0
+                } else {
+                    align_offset(item_align, line_height, original_height)
+                        - align_offset(item_align, natural_line_height, original_height)
+                };
+                self.translate_fragment_subtree(fragment, 0.0, line_y + cross_shift);
+                fragments.push(fragment);
+            }
+            cursor += line_height + row_gap + extra_gap;
+        }
+        (fragments, used_height)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn layout_wrapped_flex_columns(
+        &mut self,
+        children: &[FormattingNodeId],
+        containing: PhysicalRect,
+        positioning_containing: PhysicalRect,
+        specified_height: f32,
+        depth: usize,
+        container_style: Option<&ComputedStyle>,
+        container_source: Option<NodeId>,
+        wrap_reverse: bool,
+    ) -> (Vec<FragmentId>, f32) {
+        let row_gap = self.resolve_gap(
+            container_style,
+            "row-gap",
+            specified_height,
+            container_source,
+        );
+        let column_gap = self.resolve_gap(
+            container_style,
+            "column-gap",
+            containing.size.width,
+            container_source,
+        );
+        let mut ordered = children.to_vec();
+        ordered.sort_by_key(|id| {
+            let style = self
+                .formatting
+                .get(*id)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            match style.and_then(|style| style.typed("order")) {
+                Some(TypedPropertyValue::Order(value)) => *value,
+                _ => 0,
+            }
+        });
+        let mut columns: Vec<Vec<FormattingNodeId>> = vec![Vec::new()];
+        let mut column_widths = vec![0.0_f32];
+        let mut column_height = 0.0;
+        for node in ordered {
+            let source = self.formatting.get(node).and_then(|node| node.source);
+            let style = self
+                .formatting
+                .get(node)
+                .and_then(|node| node.style_source)
+                .and_then(|source| self.styles.get(&source));
+            let basis = self.flex_basis(node, style, false, specified_height, true, source);
+            let vertical_extras =
+                self.flex_outer_extras(style, false, containing.size.width, source);
+            let minimum = match style.and_then(|style| style.typed("min-height")) {
+                Some(TypedPropertyValue::Size(Size::Auto)) | None => {
+                    self.intrinsic_flex_size(node, false, specified_height, 0)
+                }
+                _ => self
+                    .resolve_size_against(style, "min-height", Some(specified_height), source)
+                    .unwrap_or(0.0),
+            };
+            let outer_height = (basis.max(minimum) + vertical_extras).max(0.0);
+            let next_height = if columns.last().is_some_and(Vec::is_empty) {
+                outer_height
+            } else {
+                column_height + row_gap + outer_height
+            };
+            if next_height > specified_height
+                && columns.last().is_some_and(|column| !column.is_empty())
+            {
+                columns.push(Vec::new());
+                column_widths.push(0.0);
+                column_height = outer_height;
+            } else {
+                column_height = next_height;
+            }
+            let width = self.intrinsic_flex_size(node, true, containing.size.width, 0)
+                + self.flex_outer_extras(style, true, containing.size.width, source);
+            let last_width = column_widths.last_mut().expect("at least one flex column");
+            *last_width = last_width.max(width);
+            columns
+                .last_mut()
+                .expect("at least one flex column")
+                .push(node);
+        }
+
+        let total_width = column_widths.iter().sum::<f32>()
+            + column_gap * count_as_f32(columns.len().saturating_sub(1));
+        let free_cross = (containing.size.width - total_width).max(0.0);
+        let align_content = match container_style.and_then(|style| style.typed("align-content")) {
+            Some(TypedPropertyValue::AlignContent(value)) => *value,
+            _ => AlignContent::Normal,
+        };
+        let (extra_per_column, offset, extra_gap) =
+            Self::flex_line_distribution(align_content, columns.len(), free_cross);
+        let used_width = containing.size.width.max(total_width);
+        let mut cursor = offset;
+        let mut fragments = Vec::new();
+        for (column, natural_width) in columns.into_iter().zip(column_widths) {
+            let width = natural_width + extra_per_column;
+            let x = if wrap_reverse {
+                containing.origin.x + used_width - cursor - width
+            } else {
+                containing.origin.x + cursor
+            };
+            let (column_fragments, _) = self.layout_flex_line(
+                &column,
+                PhysicalRect::new(x, containing.origin.y, width, specified_height),
+                positioning_containing,
+                Some(specified_height),
+                depth,
+                container_style,
+                container_source,
+            );
+            fragments.extend(column_fragments);
+            cursor += width + column_gap + extra_gap;
+        }
+        (fragments, specified_height)
+    }
+
+    fn flex_line_distribution(align: AlignContent, count: usize, free: f32) -> (f32, f32, f32) {
+        if count == 1 || matches!(align, AlignContent::Normal | AlignContent::Stretch) {
+            return (free / count_as_f32(count), 0.0, 0.0);
+        }
+        match align {
+            AlignContent::FlexEnd | AlignContent::End => (0.0, free, 0.0),
+            AlignContent::Center => (0.0, free / 2.0, 0.0),
+            AlignContent::SpaceBetween => (0.0, 0.0, free / count_as_f32(count - 1)),
+            AlignContent::SpaceAround => {
+                let gap = free / count_as_f32(count);
+                (0.0, gap / 2.0, gap)
+            }
+            AlignContent::SpaceEvenly => {
+                let gap = free / count_as_f32(count + 1);
+                (0.0, gap, gap)
+            }
+            _ => (0.0, 0.0, 0.0),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn layout_flex_line(
         &mut self,
         children: &[FormattingNodeId],
         containing: PhysicalRect,
@@ -174,6 +517,7 @@ impl Solver<'_> {
                 .get(item.node)
                 .and_then(|node| node.style_source)
                 .and_then(|source| self.styles.get(&source));
+            let item_align = self.flex_item_align(item.node, align);
             let cross_outer = if horizontal {
                 containing.size.width
             } else {
@@ -181,7 +525,7 @@ impl Solver<'_> {
                     item.node,
                     item_style,
                     cross_hint.unwrap_or(containing.size.width),
-                    align,
+                    item_align,
                     item.source,
                 )
             };
@@ -283,11 +627,13 @@ impl Solver<'_> {
             let Some(fragment) = item.fragment else {
                 continue;
             };
+            let item_align = self.flex_item_align(item.node, align);
             if item.auto_main_before {
                 cursor += auto_main_margin;
             }
             if horizontal {
-                if align == AlignItems::Stretch && self.flex_cross_is_auto(item.node, "height") {
+                if item_align == AlignItems::Stretch && self.flex_cross_is_auto(item.node, "height")
+                {
                     self.stretch_fragment_outer_height(fragment, line_cross);
                 }
                 let outer = self
@@ -298,7 +644,7 @@ impl Solver<'_> {
                         item.target_outer,
                         item.natural_outer_cross,
                     ));
-                let cross_offset = align_offset(align, line_cross, outer.size.height);
+                let cross_offset = align_offset(item_align, line_cross, outer.size.height);
                 let target_x = if reverse {
                     containing.origin.x + available_main - cursor - item.target_outer
                 } else {
@@ -319,7 +665,7 @@ impl Solver<'_> {
                         item.natural_outer_cross,
                         item.target_outer,
                     ));
-                let cross_offset = align_offset(align, line_cross, outer.size.width);
+                let cross_offset = align_offset(item_align, line_cross, outer.size.width);
                 let target_y = if reverse {
                     containing.origin.y + available_main - cursor - item.target_outer
                 } else {
@@ -343,6 +689,25 @@ impl Solver<'_> {
             available_main
         };
         (fragments, auto_height)
+    }
+
+    fn flex_item_align(&self, node: FormattingNodeId, inherited: AlignItems) -> AlignItems {
+        let style = self
+            .formatting
+            .get(node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source));
+        match style.and_then(|style| style.typed("align-self")) {
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::Normal | AlignSelf::Stretch)) => {
+                AlignItems::Stretch
+            }
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::FlexStart)) => AlignItems::FlexStart,
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::FlexEnd)) => AlignItems::FlexEnd,
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::Start)) => AlignItems::Start,
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::End)) => AlignItems::End,
+            Some(TypedPropertyValue::AlignSelf(AlignSelf::Center)) => AlignItems::Center,
+            _ => inherited,
+        }
     }
 
     pub(super) fn distribute_flex_space(items: &mut [FlexItem], available_without_gaps: f32) {
@@ -475,8 +840,14 @@ impl Solver<'_> {
             content
         };
         let property = if horizontal { "width" } else { "height" };
-        self.resolve_size(style.as_ref(), property, basis, node.source)
-            .map_or(content, |specified| specified.max(content))
+        // Intrinsic sizing treats percentage-dependent sizes as auto: the
+        // percentage basis would itself depend on content (CSS Sizing §5),
+        // so a `width:100%` descendant must not resolve against the
+        // available space here. A definite size caps the box's intrinsic
+        // contribution: the max-content size of a box with a definite size
+        // is that size, however wide its contents are.
+        self.resolve_size_against(style.as_ref(), property, None, node.source)
+            .unwrap_or(content)
     }
 
     pub(super) fn flex_outer_extras(

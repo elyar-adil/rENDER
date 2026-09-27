@@ -462,7 +462,7 @@ fn transparently_decodes_gzip_responses() {
             .lock()
             .expect("read request")
             .to_ascii_lowercase()
-            .contains("accept-encoding: gzip, br")
+            .contains("accept-encoding: gzip")
     );
 }
 
@@ -506,7 +506,10 @@ fn transparently_decodes_brotli_responses() {
     });
 
     let response = transport(|_| {})
-        .fetch(&FetchRequest::get(url), &CancelToken::default())
+        .fetch(
+            &FetchRequest::get(url).with_header("Accept-Encoding", "br"),
+            &CancelToken::default(),
+        )
         .expect("brotli response");
     server.join().expect("server exits");
 
@@ -523,7 +526,7 @@ fn transparently_decodes_brotli_responses() {
             .lock()
             .expect("read request")
             .to_ascii_lowercase()
-            .contains("accept-encoding: gzip, br"),
+            .contains("accept-encoding: br"),
         "advertising br requires decoding it, otherwise CDNs serve undecodable bodies"
     );
 }
@@ -961,7 +964,7 @@ fn posts_a_body_with_custom_headers_to_the_local_server() {
         "Content-Length must be derived from the body, got: {wire}"
     );
     assert!(
-        lowered.contains("accept-encoding: gzip, br"),
+        lowered.contains("accept-encoding: gzip"),
         "the transport must keep advertising decodable encodings on POST"
     );
     assert!(

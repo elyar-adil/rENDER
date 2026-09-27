@@ -1109,12 +1109,23 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn close_matching_list_item(&mut self, name: &str) {
-        if let Some(index) = self
-            .open_elements
-            .iter()
-            .rposition(|node| self.element_name(*node) == Some(name))
-        {
-            self.open_elements.truncate(index);
+        // A list item in an outer list must not be implicitly closed while a
+        // nested list is still open.  The old backwards search skipped over
+        // that nested `ul`/`ol`, so `<li><ul><li>a</li><li>b</li>...` moved
+        // the second item (and everything after it) outside the outer list.
+        // Stop at the nearest list container, matching the HTML "list item
+        // scope" rule.
+        for index in (0..self.open_elements.len()).rev() {
+            let Some(tag) = self.element_name(self.open_elements[index]) else {
+                continue;
+            };
+            if tag == name {
+                self.open_elements.truncate(index);
+                return;
+            }
+            if matches!(tag, "ul" | "ol" | "menu") {
+                return;
+            }
         }
     }
 
@@ -1418,6 +1429,19 @@ mod tests {
         assert_eq!(element_children(&output.dom, body), vec!["p", "div", "ul"]);
         let list = find_element(&output.dom, body, "ul").unwrap();
         assert_eq!(element_children(&output.dom, list), vec!["li", "li"]);
+    }
+
+    #[test]
+    fn keeps_outer_list_items_open_while_nested_list_is_active() {
+        let output = parse_document(
+            "<!doctype html><ul><li id=outer><ul><li id=inner-a></li><li id=inner-b></li></ul></li><li id=next></li></ul>",
+        );
+        let list = find_element(&output.dom, output.dom.document(), "ul").unwrap();
+        assert_eq!(element_children(&output.dom, list), vec!["li", "li"]);
+        let outer = find_element(&output.dom, list, "li").unwrap();
+        assert_eq!(element_children(&output.dom, outer), vec!["ul"]);
+        let nested = find_element(&output.dom, outer, "ul").unwrap();
+        assert_eq!(element_children(&output.dom, nested), vec!["li", "li"]);
     }
 
     #[test]

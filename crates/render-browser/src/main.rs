@@ -1,6 +1,8 @@
 //! Native browser shell for the self-owned Rust rendering pipeline.
 #![allow(clippy::cast_precision_loss)]
 mod app;
+#[cfg(test)]
+mod app_tests;
 mod content_interaction;
 mod diagnostics;
 mod fetch_handles;
@@ -8,9 +10,6 @@ mod frame;
 mod page_source;
 mod page_state;
 mod render_worker;
-
-#[cfg(test)]
-mod app_tests;
 
 use crate::app::BrowserApp;
 use crate::page_source::load_initial_page;

@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use render_dom::{Dom, NodeId};
 
-use super::properties::{expand_flex_shorthand, expand_gap_shorthand, parse_typed_property};
+use super::properties::{
+    expand_flex_shorthand, expand_gap_shorthand, expand_grid_axis_shorthand, parse_typed_property,
+};
 use super::selector::{MatchContext, Specificity, matching_specificity};
 use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
 
@@ -83,7 +85,7 @@ pub fn cascade_element(
     sources: &[CascadeInput<'_>],
     context: &MatchContext,
 ) -> CascadedStyle {
-    cascade_element_with_inline(dom, element, sources, context, &[])
+    cascade_element_with_origins(dom, element, sources, context, &[], &[])
 }
 
 /// Select cascaded declaration winners including an inline declaration list.
@@ -93,6 +95,21 @@ pub fn cascade_element_with_inline(
     element: NodeId,
     sources: &[CascadeInput<'_>],
     context: &MatchContext,
+    inline_declarations: &[Declaration],
+) -> CascadedStyle {
+    cascade_element_with_origins(dom, element, sources, context, &[], inline_declarations)
+}
+
+/// Select cascaded declaration winners including per-element declarations at
+/// the user-agent origin (HTML presentational hints) and at the author
+/// origin (the `style` attribute).
+#[must_use]
+pub fn cascade_element_with_origins(
+    dom: &Dom,
+    element: NodeId,
+    sources: &[CascadeInput<'_>],
+    context: &MatchContext,
+    ua_declarations: &[Declaration],
     inline_declarations: &[Declaration],
 ) -> CascadedStyle {
     let layer_orders = collect_layer_orders(sources);
@@ -148,6 +165,45 @@ pub fn cascade_element_with_inline(
                     });
                 }
             }
+        }
+    }
+
+    // HTML presentational hints sit at the user-agent origin with zero
+    // specificity, so every author rule wins over them while they still
+    // apply when no author rule targets the property (HTML5 rendering §15.3).
+    let ua_specificity = Specificity {
+        ids: 0,
+        classes: 0,
+        types: 0,
+    };
+    for declaration in ua_declarations {
+        source_order = source_order.saturating_add(1);
+        let priority = Priority {
+            important: false,
+            origin: origin_rank(CascadeOrigin::UserAgent, false),
+            layer: layer_rank(
+                &layer_orders,
+                CascadeOrigin::UserAgent,
+                sources.len(),
+                None,
+                false,
+            ),
+            specificity: ua_specificity,
+            source_order,
+        };
+        for (name, specified_value) in expanded_declaration(&declaration.name, &declaration.value) {
+            candidates.entry(name).or_default().push(Candidate {
+                priority,
+                value: CascadedValue {
+                    value: specified_value,
+                    important: false,
+                    origin: CascadeOrigin::UserAgent,
+                    layer: None,
+                    specificity: ua_specificity,
+                    source_order,
+                },
+                layer_key: None,
+            });
         }
     }
 
@@ -361,6 +417,11 @@ fn expanded_declaration(name: &str, value: &str) -> Vec<(String, String)> {
 
 fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
     let gap_alias = name == "gap" || name == "grid-gap";
+    let grid_axis = match name {
+        "grid-column" => Some(("grid-column-start", "grid-column-end")),
+        "grid-row" => Some(("grid-row-start", "grid-row-end")),
+        _ => None,
+    };
     let gap_longhand = match name {
         "grid-row-gap" => Some("row-gap"),
         "grid-column-gap" => Some("column-gap"),
@@ -369,20 +430,29 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
     if let Some(longhand) = gap_longhand {
         return vec![(longhand.to_owned(), value.to_owned())];
     }
-    if !gap_alias && name != "flex" && name != "overflow" {
+    if !gap_alias
+        && grid_axis.is_none()
+        && name != "flex"
+        && name != "flex-flow"
+        && name != "overflow"
+    {
         return vec![(name.to_owned(), value.to_owned())];
     }
     if css_wide_keyword(value).is_some() {
-        let longhands: &[&str] = if gap_alias {
-            &["row-gap", "column-gap"]
+        let longhands: Vec<&str> = if gap_alias {
+            vec!["row-gap", "column-gap"]
+        } else if let Some((start, end)) = grid_axis {
+            vec![start, end]
         } else if name == "flex" {
-            &["flex-grow", "flex-shrink", "flex-basis"]
+            vec!["flex-grow", "flex-shrink", "flex-basis"]
+        } else if name == "flex-flow" {
+            vec!["flex-direction", "flex-wrap"]
         } else {
-            &["overflow-x", "overflow-y"]
+            vec!["overflow-x", "overflow-y"]
         };
         return longhands
-            .iter()
-            .map(|longhand| ((*longhand).to_owned(), value.to_owned()))
+            .into_iter()
+            .map(|longhand| (longhand.to_owned(), value.to_owned()))
             .collect();
     }
     match name {
@@ -395,6 +465,15 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
                 ]
             },
         ),
+        "grid-column" | "grid-row" => expand_grid_axis_shorthand(value).map_or_else(
+            || vec![(name.to_owned(), value.to_owned())],
+            |(start, end)| {
+                let Some((start_name, end_name)) = grid_axis else {
+                    unreachable!("grid axis longhands checked above")
+                };
+                vec![(start_name.to_owned(), start), (end_name.to_owned(), end)]
+            },
+        ),
         "flex" => expand_flex_shorthand(value).map_or_else(
             || vec![(name.to_owned(), value.to_owned())],
             |(grow, shrink, basis)| {
@@ -405,6 +484,30 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
                 ]
             },
         ),
+        "flex-flow" => {
+            let lower = value.to_ascii_lowercase();
+            let mut direction = None;
+            let mut wrap = None;
+            for part in lower.split_ascii_whitespace() {
+                match part {
+                    "row" | "row-reverse" | "column" | "column-reverse" if direction.is_none() => {
+                        direction = Some(part)
+                    }
+                    "nowrap" | "wrap" | "wrap-reverse" if wrap.is_none() => wrap = Some(part),
+                    _ => return vec![(name.to_owned(), value.to_owned())],
+                }
+            }
+            if direction.is_none() && wrap.is_none() {
+                return vec![(name.to_owned(), value.to_owned())];
+            }
+            vec![
+                (
+                    "flex-direction".to_owned(),
+                    direction.unwrap_or("row").to_owned(),
+                ),
+                ("flex-wrap".to_owned(), wrap.unwrap_or("nowrap").to_owned()),
+            ]
+        }
         "overflow" => {
             let values: Vec<_> = value.split_ascii_whitespace().collect();
             if values.len() == 1 || values.len() == 2 {
@@ -1150,6 +1253,33 @@ mod tests {
         assert_eq!(
             style.get("column-gap").map(|value| value.value.as_str()),
             Some("30px")
+        );
+    }
+
+    #[test]
+    fn flex_flow_resets_both_longhands_and_accepts_case_insensitive_keywords() {
+        let (dom, target) = document_and_target();
+        let sheet = parse_stylesheet(
+            "#target { flex-direction: column; flex-wrap: wrap-reverse; flex-flow: ROW WRAP }",
+        );
+        let style = cascade_element(
+            &dom,
+            target,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &MatchContext::default(),
+        );
+        assert_eq!(
+            style
+                .get("flex-direction")
+                .map(|value| value.value.as_str()),
+            Some("row")
+        );
+        assert_eq!(
+            style.get("flex-wrap").map(|value| value.value.as_str()),
+            Some("wrap")
         );
     }
 

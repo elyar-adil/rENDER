@@ -11,6 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -301,9 +302,6 @@ impl Summary {
         self.buckets
             .entry(baseline_bucket(&record.path).to_owned())
             .or_default()[index] += 1;
-        self.buckets
-            .entry(baseline_bucket(&record.path).to_owned())
-            .or_default()[index] += 1;
         if record.status != Status::Pass {
             *self
                 .clusters
@@ -321,13 +319,28 @@ struct Worker {
     stdin: ChildStdin,
     current: Option<(String, Instant)>,
     records: Vec<ResultRecord>,
+    /// Identity of this worker process within its slot. Reader threads of a
+    /// killed worker keep delivering lines until the pipe closes; without
+    /// this tag a stale `Eof` would kill the healthy replacement and crash
+    /// every path it would otherwise run (a run-long cascade).
+    generation: u64,
 }
 
 #[derive(Debug)]
 enum WorkerEvent {
-    Line(usize, String),
-    Eof(usize),
+    Line {
+        slot: usize,
+        generation: u64,
+        line: String,
+    },
+    Eof {
+        slot: usize,
+        generation: u64,
+    },
 }
+
+/// Monotonic worker identity shared by every slot.
+static WORKER_GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
 #[allow(clippy::too_many_lines)]
 fn run_parallel(paths: &[String]) -> io::Result<Summary> {
@@ -386,8 +399,17 @@ fn run_parallel(paths: &[String]) -> io::Result<Summary> {
     let started = Instant::now();
     while !workers.is_empty() {
         match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(WorkerEvent::Line(id, line)) => {
-                if let Some(worker) = workers.get_mut(&id) {
+            Ok(WorkerEvent::Line {
+                slot,
+                generation,
+                line,
+            }) => {
+                if let Some(worker) = workers.get_mut(&slot) {
+                    if worker.generation != generation {
+                        // A killed worker's final records must not be
+                        // attributed to its successor's current path.
+                        continue;
+                    }
                     handle_worker_line(
                         worker,
                         &line,
@@ -402,19 +424,26 @@ fn run_parallel(paths: &[String]) -> io::Result<Summary> {
                     }
                 }
             }
-            Ok(WorkerEvent::Eof(id)) => {
-                replace_failed_worker(
-                    id,
-                    Status::Crash,
-                    "worker process exited unexpectedly",
-                    &mut workers,
-                    &mut pending,
-                    &sender,
-                    &mut summary,
-                    &mut completed,
-                    &mut results,
-                    &mut completed_file,
-                )?;
+            Ok(WorkerEvent::Eof { slot, generation }) => {
+                // Only the live generation may report a death; a stale Eof
+                // from an already-replaced process is ignored.
+                if workers
+                    .get(&slot)
+                    .is_none_or(|worker| worker.generation == generation)
+                {
+                    replace_failed_worker(
+                        slot,
+                        Status::Crash,
+                        "worker process exited unexpectedly",
+                        &mut workers,
+                        &mut pending,
+                        &sender,
+                        &mut summary,
+                        &mut completed,
+                        &mut results,
+                        &mut completed_file,
+                    )?;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -471,7 +500,8 @@ fn env_usize(name: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
-fn spawn_worker(id: usize, sender: &mpsc::Sender<WorkerEvent>) -> io::Result<Worker> {
+fn spawn_worker(slot: usize, sender: &mpsc::Sender<WorkerEvent>) -> io::Result<Worker> {
+    let generation = WORKER_GENERATIONS.fetch_add(1, Ordering::Relaxed);
     let mut child = Command::new(env::current_exe()?)
         .args([
             "--exact",
@@ -494,17 +524,25 @@ fn spawn_worker(id: usize, sender: &mpsc::Sender<WorkerEvent>) -> io::Result<Wor
     let sender = sender.clone();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if sender.send(WorkerEvent::Line(id, line)).is_err() {
+            if sender
+                .send(WorkerEvent::Line {
+                    slot,
+                    generation,
+                    line,
+                })
+                .is_err()
+            {
                 return;
             }
         }
-        let _ = sender.send(WorkerEvent::Eof(id));
+        let _ = sender.send(WorkerEvent::Eof { slot, generation });
     });
     Ok(Worker {
         child,
         stdin,
         current: None,
         records: Vec::new(),
+        generation,
     })
 }
 

@@ -12,11 +12,13 @@ use crate::solver::GridItem;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
 use crate::solver::Solver;
+use crate::solver::resolve::count_as_f32;
 use crate::solver::resolve::length_depends_on_percentage;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
 use render_css::properties::GridAutoRepeat;
+use render_css::properties::GridLine;
 use render_css::properties::GridTemplate;
 use render_css::properties::GridTrack;
 use render_css::properties::GridTrackBreadth;
@@ -24,6 +26,7 @@ use render_css::properties::LengthPercentage;
 use render_css::properties::Size;
 use render_css::properties::TypedPropertyValue;
 use render_dom::NodeId;
+use std::collections::HashSet;
 
 pub(super) fn grid_template(style: Option<&ComputedStyle>, property: &str) -> GridTemplate {
     match style.and_then(|style| style.typed(property)) {
@@ -74,6 +77,31 @@ impl Solver<'_> {
                 factor: 1.0,
             });
         }
+        // Positive grid-line starts may create implicit columns beyond the
+        // explicit template. Account for those before sizing the column axis.
+        let explicit_columns = children
+            .iter()
+            .filter_map(|node| {
+                let style = self
+                    .formatting
+                    .get(*node)
+                    .and_then(|node| node.style_source)
+                    .and_then(|source| self.styles.get(&source));
+                let (start, span) = grid_axis_placement(
+                    style,
+                    "grid-column-start",
+                    "grid-column-end",
+                    columns.len(),
+                );
+                start.unwrap_or(0).checked_add(span)
+            })
+            .max()
+            .map_or(columns.len(), |count| count.max(columns.len()));
+        if explicit_columns > self.options.limits.max_grid_tracks {
+            self.report_grid_track_limit(container_source);
+            return (Vec::new(), 0.0);
+        }
+        columns.resize(explicit_columns, TrackSizing::Intrinsic { minimum: 0.0 });
 
         let required_row_count = required_rows(children.len(), columns.len());
         let Ok(mut rows) = self.expand_grid_template(
@@ -96,15 +124,94 @@ impl Solver<'_> {
         let column_axis = size_axis(&columns, Some(containing.size.width), column_gap, &[]);
         let mut row_contributions = vec![0.0_f32; rows.len()];
         let mut items = Vec::with_capacity(children.len());
-        for (index, node) in children.iter().copied().enumerate() {
-            let (row, column) = automatic_position(index, columns.len());
-            let track_width = column_axis.size(column);
-            let track_x = containing.origin.x + column_axis.offset(column);
+        let mut occupied = HashSet::new();
+        let mut auto_cursor = 0usize;
+        for node in children.iter().copied() {
             let item_style = self
                 .formatting
                 .get(node)
                 .and_then(|node| node.style_source)
                 .and_then(|source| self.styles.get(&source));
+            let (explicit_column, column_span) = grid_axis_placement(
+                item_style,
+                "grid-column-start",
+                "grid-column-end",
+                columns.len(),
+            );
+            let (explicit_row, row_span) =
+                grid_axis_placement(item_style, "grid-row-start", "grid-row-end", rows.len());
+            if row_span
+                .checked_mul(column_span)
+                .is_none_or(|area| area > self.options.limits.max_grid_tracks)
+            {
+                self.report_grid_track_limit(container_source);
+                return (Vec::new(), 0.0);
+            }
+            let available_columns = columns.len().saturating_sub(column_span);
+            let fits = |row: usize, column: usize, occupied: &HashSet<(usize, usize)>| {
+                column <= available_columns
+                    && (row..row.saturating_add(row_span)).all(|r| {
+                        (column..column.saturating_add(column_span))
+                            .all(|c| !occupied.contains(&(r, c)))
+                    })
+            };
+            let (row, column) = match (explicit_row, explicit_column) {
+                (Some(row), Some(column)) => (row, column),
+                (Some(row), None) => {
+                    let column = (0..=available_columns)
+                        .find(|column| fits(row, *column, &occupied))
+                        .unwrap_or(0);
+                    (row, column)
+                }
+                (None, Some(column)) => {
+                    let start_row = auto_cursor / columns.len();
+                    let row = (start_row..self.options.limits.max_grid_tracks)
+                        .find(|row| fits(*row, column, &occupied))
+                        .unwrap_or(start_row);
+                    (row, column)
+                }
+                (None, None) => {
+                    let limit = self
+                        .options
+                        .limits
+                        .max_grid_tracks
+                        .saturating_sub(columns.len())
+                        .saturating_mul(columns.len());
+                    while auto_cursor < limit {
+                        let (row, column) = automatic_position(auto_cursor, columns.len());
+                        if fits(row, column, &occupied) {
+                            break;
+                        }
+                        auto_cursor = auto_cursor.saturating_add(1);
+                    }
+                    if auto_cursor >= limit {
+                        self.report_grid_track_limit(container_source);
+                        return (Vec::new(), 0.0);
+                    }
+                    let (row, column) = automatic_position(auto_cursor, columns.len());
+                    auto_cursor = auto_cursor.saturating_add(column_span);
+                    (row, column)
+                }
+            };
+            for r in row..row.saturating_add(row_span) {
+                for c in column..column.saturating_add(column_span) {
+                    occupied.insert((r, c));
+                }
+            }
+            let row_end = row.saturating_add(row_span);
+            if row_end > rows.len() {
+                if columns.len().saturating_add(row_end) > self.options.limits.max_grid_tracks {
+                    self.report_grid_track_limit(container_source);
+                    return (Vec::new(), 0.0);
+                }
+                rows.resize(row_end, TrackSizing::Intrinsic { minimum: 0.0 });
+                row_contributions.resize(rows.len(), 0.0);
+            }
+            let track_width = (column..column.saturating_add(column_span))
+                .map(|column| column_axis.size(column))
+                .sum::<f32>()
+                + column_gap * count_as_f32(column_span.saturating_sub(1));
+            let track_x = containing.origin.x + column_axis.offset(column);
             let item_source = self.formatting.get(node).and_then(|node| node.source);
             let forced_content_width = self.flex_content_width(
                 item_style,
@@ -147,12 +254,18 @@ impl Solver<'_> {
             let Some(result) = result else {
                 continue;
             };
-            if let Some(contribution) = row_contributions.get_mut(row) {
-                *contribution = contribution.max(result.outer_height);
+            let current_height = row_contributions[row..row_end].iter().sum::<f32>()
+                + row_gap * count_as_f32(row_span.saturating_sub(1));
+            if result.outer_height > current_height {
+                let additional = (result.outer_height - current_height) / count_as_f32(row_span);
+                for contribution in &mut row_contributions[row..row_end] {
+                    *contribution += additional;
+                }
             }
             items.push(GridItem {
                 fragment: result.fragment,
                 row,
+                row_span,
                 column,
                 natural_outer_height: result.outer_height,
                 stretch_height: self.grid_item_axis_is_auto(node, "height"),
@@ -162,7 +275,10 @@ impl Solver<'_> {
         let row_axis = size_axis(&rows, specified_height, row_gap, &row_contributions);
         let mut fragments = Vec::with_capacity(items.len());
         for item in items {
-            let row_height = row_axis.size(item.row);
+            let row_height = (item.row..item.row.saturating_add(item.row_span))
+                .map(|row| row_axis.size(row))
+                .sum::<f32>()
+                + row_gap * count_as_f32(item.row_span.saturating_sub(1));
             if item.stretch_height {
                 self.resize_fragment_outer_height(item.fragment, row_height);
             }
@@ -297,5 +413,56 @@ impl Solver<'_> {
             code: LayoutDiagnosticCode::GridTrackLimit,
             message: "grid track limit exceeded".to_owned(),
         });
+    }
+}
+
+/// Resolve numbered grid lines to zero-based boundaries. `-1` is the line
+/// after the final explicit track; named lines need separate line metadata.
+fn explicit_grid_line(
+    style: Option<&ComputedStyle>,
+    property: &str,
+    track_count: usize,
+) -> Option<usize> {
+    let Some(TypedPropertyValue::GridLine(line)) = style.and_then(|style| style.typed(property))
+    else {
+        return None;
+    };
+    let index = match line {
+        render_css::properties::GridLine::Line(value) if *value > 0 => {
+            usize::try_from(*value - 1).ok()?
+        }
+        render_css::properties::GridLine::Line(value) if *value < 0 => {
+            let offset = usize::try_from(value.unsigned_abs()).ok()?;
+            track_count.checked_add(1)?.checked_sub(offset)?
+        }
+        _ => return None,
+    };
+    Some(index)
+}
+
+fn grid_axis_placement(
+    style: Option<&ComputedStyle>,
+    start_property: &str,
+    end_property: &str,
+    track_count: usize,
+) -> (Option<usize>, usize) {
+    let start = explicit_grid_line(style, start_property, track_count);
+    let end = explicit_grid_line(style, end_property, track_count);
+    let start_span = match style.and_then(|style| style.typed(start_property)) {
+        Some(TypedPropertyValue::GridLine(GridLine::Span(value))) => usize::try_from(*value).ok(),
+        _ => None,
+    };
+    let end_span = match style.and_then(|style| style.typed(end_property)) {
+        Some(TypedPropertyValue::GridLine(GridLine::Span(value))) => usize::try_from(*value).ok(),
+        _ => None,
+    };
+    match (start, end) {
+        (Some(start), Some(end)) if end > start => (Some(start), end - start),
+        (Some(start), _) => (Some(start), end_span.unwrap_or(1).max(1)),
+        (_, Some(end)) => {
+            let span = start_span.unwrap_or(1).max(1);
+            (Some(end.saturating_sub(span)), span)
+        }
+        _ => (None, start_span.or(end_span).unwrap_or(1).max(1)),
     }
 }

@@ -15,6 +15,7 @@ use crate::tree::FormattingContextKind;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
+use render_css::properties::AspectRatio;
 use render_css::properties::BoxSizing;
 use render_css::properties::Clear;
 use render_css::properties::Display;
@@ -430,23 +431,56 @@ impl Solver<'_> {
             }),
         )?;
 
-        let specified_content_height =
-            css_height
-                .or(replaced_size.map(|size| size.height))
-                .map(|height| match (css_height.is_some(), box_sizing) {
-                    (true, BoxSizing::BorderBox) => {
-                        (height - padding.vertical() - border.vertical()).max(0.0)
+        let aspect_ratio_height = (css_height.is_none() && replaced_size.is_none())
+            .then(
+                || match style.and_then(|style| style.typed("aspect-ratio")) {
+                    Some(TypedPropertyValue::AspectRatio(AspectRatio::Ratio(ratio)))
+                        if ratio.is_finite() && *ratio > 0.0 && content_width > 0.0 =>
+                    {
+                        Some((content_width / *ratio).max(0.0))
                     }
-                    _ => height,
-                });
+                    _ => None,
+                },
+            )
+            .flatten();
+        let top = self.resolve_inset(style, "top", containing.size.height, node.source);
+        let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
+        let specified_content_height = css_height
+            .or(replaced_size.map(|size| size.height))
+            .or(aspect_ratio_height)
+            .map(|height| match (css_height.is_some(), box_sizing) {
+                (true, BoxSizing::BorderBox) => {
+                    (height - padding.vertical() - border.vertical()).max(0.0)
+                }
+                _ => height,
+            })
+            .or_else(|| {
+                // CSS 2 §10.6.4: an absolutely positioned non-replaced box
+                // with auto height and both block insets resolves its used
+                // height before its percentage-height descendants are laid
+                // out. Resizing only after child layout leaves them at a
+                // provisional 0px basis (common in carousel overlays).
+                if out_of_flow {
+                    top.zip(bottom).map(|(top, bottom)| {
+                        (containing.size.height
+                            - top
+                            - bottom
+                            - margin_top
+                            - margin_bottom
+                            - border.vertical()
+                            - padding.vertical())
+                        .max(0.0)
+                    })
+                } else {
+                    None
+                }
+            });
         // A specified (or replaced) content height is definite, so in-flow
         // children may resolve percentage heights against it; a content-sized
         // parent is indefinite (CSS 2 §10.5) and only contributes a tentative
         // 0 basis that children must ignore.
         let child_containing_height = specified_content_height.unwrap_or(0.0);
         let child_containing_height_definite = specified_content_height.is_some();
-        let top = self.resolve_inset(style, "top", containing.size.height, node.source);
-        let bottom = self.resolve_inset(style, "bottom", containing.size.height, node.source);
         let relative_offset = if position == Position::Relative {
             let horizontal = match (left, right) {
                 (Some(left), _) => left,
@@ -468,7 +502,32 @@ impl Solver<'_> {
             _ => FormattingContextKind::Block,
         };
         let positioned_child_containing = if position == Position::Static {
-            positioning_containing
+            // An absolute descendant may cross one or more static wrappers
+            // before reaching its positioned ancestor.  During the first
+            // pass an auto-height positioned ancestor has a zero provisional
+            // height, while its in-flow wrapper can already have a definite
+            // padding-derived height (the common `padding-top:56.25%`
+            // media-cover pattern).  Carry that known height through static
+            // wrappers so `height:100%` on the absolute child uses the
+            // ancestor's eventual padding box instead of the provisional 0.
+            // The wrapper's own margin box bottom (border/padding edges and
+            // the flow cursor are known even before its children lay out)
+            // bounds the ancestor's eventual padding box from below.
+            let known_margin_box_bottom =
+                margin_box_y + margin_top + border.vertical() + padding.vertical();
+            let carried = (known_margin_box_bottom - positioning_containing.origin.y)
+                .max(0.0)
+                .max(positioning_containing.size.height);
+            if positioning_containing.size.height <= 0.0 && carried > 0.0 {
+                PhysicalRect::new(
+                    positioning_containing.origin.x,
+                    positioning_containing.origin.y,
+                    positioning_containing.size.width,
+                    carried,
+                )
+            } else {
+                positioning_containing
+            }
         } else {
             PhysicalRect::new(
                 content_x - padding.left,
@@ -625,7 +684,31 @@ impl Solver<'_> {
         );
         self.finish_box(fragment, content_height, children.clone());
         let positioned_child_containing = if position == Position::Static {
-            positioning_containing
+            if positioning_containing.size.height <= 0.0 {
+                // The positioning ancestor's provisional padding box had no
+                // height because its auto height comes from this wrapper's
+                // own in-flow content (the `padding-top:56.25%` aspect-box
+                // pattern). In-flow layout has now resolved this wrapper's
+                // final margin box, which bounds the ancestor from below, so
+                // carry that extent into the containing rect: absolute
+                // descendants with `height:100%` must resolve against the
+                // real box (CSS 2 §10.5/§10.6), never a tentative zero.
+                let margin_box_bottom = margin_box_y
+                    + margin_top
+                    + border.vertical()
+                    + padding.vertical()
+                    + content_height
+                    + margin_bottom;
+                let carried = (margin_box_bottom - positioning_containing.origin.y).max(0.0);
+                PhysicalRect::new(
+                    positioning_containing.origin.x,
+                    positioning_containing.origin.y,
+                    positioning_containing.size.width,
+                    carried.max(positioning_containing.size.height),
+                )
+            } else {
+                positioning_containing
+            }
         } else {
             PhysicalRect::new(
                 content_x - padding.left,
@@ -659,14 +742,6 @@ impl Solver<'_> {
             self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);
         }
         if out_of_flow {
-            if specified_content_height.is_none()
-                && let (Some(top), Some(bottom)) = (top, bottom)
-            {
-                self.resize_fragment_outer_height(
-                    fragment,
-                    (containing.size.height - top - bottom).max(0.0),
-                );
-            }
             if let Some(outer) = self.fragment_outer_rect(fragment) {
                 let target_x = left.map_or_else(
                     || {

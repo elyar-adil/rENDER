@@ -10,10 +10,15 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
-use render_core::document::{Document, DocumentRenderOptions, DocumentRenderOutput};
+use render_browser::font_backend::SystemFontBackend;
+use render_core::document::{
+    Document, DocumentBackends, DocumentRenderOptions, DocumentRenderOutput,
+};
 use render_core::layout::{LayoutOptions, PhysicalPoint, PhysicalSize};
+use render_core::paint::{CpuRasterizer, PaintScene, RasterRequest};
 
 const DEFAULT_ITERATIONS: usize = 5;
 const DEFAULT_SCROLL_STEPS: usize = 12;
@@ -281,25 +286,40 @@ fn run_fixture(fixture: &Fixture, options: &Options) -> FixtureResult {
         let document = Document::parse(&fixture.source);
         parse_micros.push(parse_started.elapsed().as_micros());
 
+        let fonts = Arc::new(
+            SystemFontBackend::load()
+                .expect("the system font backend loads for browser-accurate benchmarking"),
+        );
+        let backends = DocumentBackends {
+            text_measurer: fonts.as_ref(),
+            text_shaper: fonts.as_ref(),
+            glyph_masks: fonts.as_ref(),
+        };
+
         let render_started = Instant::now();
-        let mut output = document.render_reference(render_options);
+        let output = document.render(render_options, backends);
         first_render_micros.push(render_started.elapsed().as_micros());
         first_visible_micros.push(first_visible_started.elapsed().as_micros());
+        shape = output_shape(&document, &output);
 
         let maximum_scroll = output.layout.fragments.max_scroll_offset().y;
+        // The browser scrolls by replaying the retained paint scene at a new
+        // viewport origin (no cascade/layout/display rebuild), so measure
+        // exactly that path for the scroll numbers.
+        let scene = PaintScene::from_display_list(output.display.list.clone());
         for step in 0..options.scroll_steps {
             let fraction = scroll_fraction(step, options.scroll_steps);
             let scroll_started = Instant::now();
-            output = document.render_reference(DocumentRenderOptions {
-                scroll_offset: PhysicalPoint {
-                    x: 0.0,
-                    y: maximum_scroll * fraction,
-                },
-                ..render_options
-            });
+            let _raster = CpuRasterizer.rasterize_request(
+                RasterRequest::new(&scene, render_options.raster_background, fonts.as_ref())
+                    .with_viewport_origin(PhysicalPoint {
+                        x: 0.0,
+                        y: maximum_scroll * fraction,
+                    }),
+                &render_core::paint::NoRasterCancellation,
+            );
             scroll_render_micros.push(scroll_started.elapsed().as_micros());
         }
-        shape = output_shape(&document, &output);
     }
 
     FixtureResult {
@@ -328,6 +348,21 @@ fn output_shape(document: &Document, output: &DocumentRenderOutput) -> OutputSha
         + output.diagnostics.layout.len()
         + output.diagnostics.display_list.len()
         + output.diagnostics.raster.len();
+    if std::env::var_os("RENDER_PERF_DIAG").is_some() {
+        eprintln!(
+            "diag breakdown: document={} style_sheets={} computed_styles={} formatting={} layout={} display={} raster={}",
+            output.diagnostics.document.len(),
+            output.diagnostics.style_sheets.len(),
+            output.diagnostics.computed_styles.len(),
+            output.diagnostics.formatting.len(),
+            output.diagnostics.layout.len(),
+            output.diagnostics.display_list.len(),
+            output.diagnostics.raster.len(),
+        );
+        for diagnostic in output.diagnostics.computed_styles.iter().take(8) {
+            eprintln!("computed_styles sample: {diagnostic:?}");
+        }
+    }
     OutputShape {
         fragments: output.layout.fragments.iter().count(),
         display_items: output.display.list.items().len(),

@@ -25,6 +25,7 @@ use crate::parser::Statement;
 use crate::runtime::convert::required_argument;
 use crate::runtime::eval::Completion;
 use crate::runtime::types::CallFrame;
+use crate::runtime::types::ClassFrame;
 use crate::runtime::types::Environment;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::PromiseRecord;
@@ -41,6 +42,7 @@ use std::collections::BTreeMap;
 use url::Url;
 
 mod builtins;
+mod class;
 mod convert;
 mod eval;
 mod gc;
@@ -63,9 +65,15 @@ pub struct JsRuntime {
     steps_remaining: usize,
     calls_active: usize,
     dom_nodes_created: usize,
-    this_stack: Vec<JsValue>,
     environment: Vec<Environment>,
     functions: Vec<UserFunction>,
+    /// Class context of each active user-function call, for `super`,
+    /// `new.target`, and field initialization.
+    class_frames: Vec<ClassFrame>,
+    /// `new.target` of each active construction, `Undefined` for plain calls.
+    new_target_stack: Vec<JsValue>,
+    /// Counter allocating class-unique private-name ids.
+    next_private_id: u64,
     promises: Vec<PromiseRecord>,
     pending_microtasks: Vec<JsMicrotask>,
     event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<ObjectId>>>,
@@ -150,9 +158,11 @@ impl JsRuntime {
             steps_remaining: limits.max_execution_steps,
             calls_active: 0,
             dom_nodes_created: 0,
-            this_stack: Vec::new(),
             environment: Vec::new(),
             functions: Vec::new(),
+            class_frames: Vec::new(),
+            new_target_stack: Vec::new(),
+            next_private_id: 1,
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
             event_listeners: BTreeMap::new(),
@@ -422,7 +432,6 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
-        self.this_stack.clear();
         self.environment.clear();
         self.call(dom, entry.callback, &[])?;
         self.queue_mutation_deliveries(dom);
@@ -479,7 +488,6 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
-        self.this_stack.clear();
         self.environment.clear();
         let default_enabled =
             self.dispatch_prepared_event(dom, target, event, event_type, bubbles)?;
@@ -501,7 +509,6 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
-        self.this_stack.clear();
         self.environment.clear();
         let outcome = match microtask {
             JsMicrotask::Callback(callback) => self.call(dom, callback, &[]),
@@ -566,7 +573,6 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
-        self.this_stack.clear();
         self.environment.clear();
         let prototype = self
             .realm
@@ -693,7 +699,6 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
-        self.this_stack.clear();
         self.environment.clear();
         let outcome = self.run_compiled_script(dom, &script.statements, from_revision);
         if let Err(error) = &outcome {

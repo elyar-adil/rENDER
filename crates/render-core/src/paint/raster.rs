@@ -12,7 +12,7 @@ use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
     BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
     DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphRun, LinearGradient,
-    PaintCoordinateSpace,
+    PaintCoordinateSpace, StackingContext, Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
 
@@ -421,9 +421,19 @@ impl CpuRasterizer {
     }
 }
 
-struct Layer {
-    surface: Surface,
-    opacity: f32,
+/// One open stacking context, tracked so a pop restores exactly what the
+/// push established.
+enum StackingFrame {
+    /// Pure translation at full opacity: items paint through the accumulated
+    /// offset and the pop only restores it. No offscreen surface exists.
+    Offset { translation: PhysicalPoint },
+    /// Offscreen surface that the pop warps back through `transform`, rebased
+    /// around the push-time paint `offset`.
+    Layer {
+        transform: Transform2D,
+        offset: PhysicalPoint,
+        opacity: f32,
+    },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -473,8 +483,14 @@ impl ClipRegion {
 struct RasterState<'a> {
     width: u32,
     height: u32,
-    layers: Vec<Layer>,
+    /// Paint surfaces, outermost first; the last entry receives all items.
+    layers: Vec<Surface>,
     clips: Vec<ClipRegion>,
+    /// Open stacking contexts, innermost last.
+    frames: Vec<StackingFrame>,
+    /// Translation accumulated by open pure-translation stacking contexts,
+    /// applied on top of every item offset.
+    translation: PhysicalPoint,
     diagnostics: Vec<RasterDiagnostic>,
     viewport_origin: PhysicalPoint,
     control: Option<&'a dyn RasterControl>,
@@ -496,16 +512,15 @@ impl<'a> RasterState<'a> {
         Self {
             width,
             height,
-            layers: vec![Layer {
-                surface: Surface::new(width, height, background),
-                opacity: 1.0,
-            }],
+            layers: vec![Surface::new(width, height, background)],
             clips: vec![ClipRegion::rect(PhysicalRect::new(
                 0.0,
                 0.0,
                 u32_to_f32(width),
                 u32_to_f32(height),
             ))],
+            frames: Vec::new(),
+            translation: PhysicalPoint::default(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -527,11 +542,10 @@ impl<'a> RasterState<'a> {
         Self {
             width,
             height,
-            layers: vec![Layer {
-                surface,
-                opacity: 1.0,
-            }],
+            layers: vec![surface],
             clips: vec![ClipRegion::rect(clip)],
+            frames: Vec::new(),
+            translation: PhysicalPoint::default(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
                 x: finite_non_negative(viewport_origin.x),
@@ -570,11 +584,8 @@ impl<'a> RasterState<'a> {
             DisplayCommand::Border(border) => self.paint_border(item.id, border, offset),
             DisplayCommand::PushClip(shape) => self.push_clip(*shape, offset),
             DisplayCommand::PopClip => self.pop_clip(item.id),
-            DisplayCommand::PushStackingContext(context) => self.layers.push(Layer {
-                surface: Surface::new(self.width, self.height, Color::TRANSPARENT),
-                opacity: context.opacity,
-            }),
-            DisplayCommand::PopStackingContext => self.pop_layer(item.id),
+            DisplayCommand::PushStackingContext(context) => self.push_stacking_context(*context),
+            DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
             DisplayCommand::GlyphRun(run) => {
                 self.paint_glyph_run(item.id, run, glyphs, offset);
             }
@@ -651,12 +662,19 @@ impl<'a> RasterState<'a> {
     }
 
     fn item_offset(&self, coordinate_space: PaintCoordinateSpace) -> PhysicalPoint {
-        match coordinate_space {
+        let base = match coordinate_space {
             PaintCoordinateSpace::Document => PhysicalPoint {
                 x: -self.viewport_origin.x,
                 y: -self.viewport_origin.y,
             },
             PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+        };
+        // Fast-path stacking-context translations shift both coordinate
+        // spaces: a transformed element is also the containing block for its
+        // fixed descendants.
+        PhysicalPoint {
+            x: base.x + self.translation.x,
+            y: base.y + self.translation.y,
         }
     }
 
@@ -787,32 +805,87 @@ impl<'a> RasterState<'a> {
         }
     }
 
-    fn pop_layer(&mut self, item: DisplayItemId) {
-        if self.layers.len() > 1 {
-            self.composite_top_layer();
-        } else {
-            self.diagnostics.push(RasterDiagnostic {
-                item,
-                code: RasterDiagnosticCode::UnbalancedState,
-                message: "unbalanced stacking-context pop".to_owned(),
+    #[allow(clippy::float_cmp)] // opacity arrives as an exact literal constant
+    fn push_stacking_context(&mut self, context: StackingContext) {
+        // A pure translation at full opacity only shifts where items paint:
+        // accumulate it into the offset instead of paying for an offscreen
+        // surface. Clips pushed inside inherit the shift because push_clip
+        // translates shapes by the current item offset.
+        if context.transform.is_translation() && context.opacity == 1.0 {
+            let (translate_x, translate_y) = context.transform.translation();
+            self.translation.x += translate_x;
+            self.translation.y += translate_y;
+            self.frames.push(StackingFrame::Offset {
+                translation: PhysicalPoint {
+                    x: translate_x,
+                    y: translate_y,
+                },
             });
+            return;
+        }
+        // Offscreen pass: the layer stores `document point + offset` pixels,
+        // so the pop can warp them back through the rebased transform. The
+        // frame anchors on the document-space offset at push time; nested
+        // fast-path translations keep composing through item_offset.
+        self.frames.push(StackingFrame::Layer {
+            transform: context.transform,
+            offset: self.item_offset(PaintCoordinateSpace::Document),
+            opacity: context.opacity,
+        });
+        self.layers
+            .push(Surface::new(self.width, self.height, Color::TRANSPARENT));
+    }
+
+    fn pop_stacking_context(&mut self, item: DisplayItemId) {
+        match self.frames.pop() {
+            Some(StackingFrame::Offset { translation }) => {
+                self.translation.x -= translation.x;
+                self.translation.y -= translation.y;
+            }
+            Some(StackingFrame::Layer {
+                transform,
+                offset,
+                opacity,
+            }) => self.warp_top_layer(transform, offset, opacity),
+            None => {
+                self.diagnostics.push(RasterDiagnostic {
+                    item,
+                    code: RasterDiagnosticCode::UnbalancedState,
+                    message: "unbalanced stacking-context pop".to_owned(),
+                });
+            }
         }
     }
 
-    fn composite_top_layer(&mut self) {
-        let layer = self.layers.pop().expect("non-root layer");
-        if !composite_surface(
-            &mut self.layers.last_mut().expect("parent layer").surface,
-            &layer.surface,
-            layer.opacity,
-            self.control,
-        ) {
+    /// Composites the top offscreen surface into its parent through the
+    /// stacking context's transform.
+    ///
+    /// Layer pixels hold `document point + push-time offset`, so the mapping
+    /// from layer pixels to parent pixels is
+    /// `T(offset) ∘ transform ∘ T(−offset)`.
+    fn warp_top_layer(&mut self, transform: Transform2D, offset: PhysicalPoint, opacity: f32) {
+        let layer = self.layers.pop().expect("layer frame has a surface");
+        let into_layer = Transform2D {
+            translate_x: -offset.x,
+            translate_y: -offset.y,
+            ..Transform2D::default()
+        };
+        let into_parent = Transform2D {
+            translate_x: offset.x,
+            translate_y: offset.y,
+            ..Transform2D::default()
+        };
+        let mapped = into_parent.then(&transform.then(&into_layer));
+        let clip = self.current_clip().map(|clip| clip.rect);
+        let control = self.control;
+        let parent = self.layers.last_mut().expect("parent surface");
+        if !warp_surface(parent, &layer, mapped, opacity, clip, control) {
             self.cancelled = true;
         }
     }
 
     fn current_surface(&mut self) -> &mut Surface {
-        &mut self.layers.last_mut().expect("root layer").surface
+        self.layers.last_mut().expect("root surface")
     }
 
     fn current_clip(&self) -> Option<ClipRegion> {
@@ -828,18 +901,34 @@ impl<'a> RasterState<'a> {
     }
 
     fn finish(mut self) -> CpuRasterOutput {
-        while self.layers.len() > 1 {
-            self.composite_top_layer();
+        while let Some(frame) = self.frames.pop() {
+            let StackingFrame::Layer {
+                transform,
+                offset,
+                opacity,
+            } = frame
+            else {
+                continue;
+            };
+            self.warp_top_layer(transform, offset, opacity);
         }
         self.output()
     }
 
     fn finish_cancellable(mut self) -> Result<CpuRasterOutput, RasterCancelled> {
-        while self.layers.len() > 1 {
+        while let Some(frame) = self.frames.pop() {
+            let StackingFrame::Layer {
+                transform,
+                offset,
+                opacity,
+            } = frame
+            else {
+                continue;
+            };
             if self.is_cancelled() {
                 return Err(RasterCancelled);
             }
-            self.composite_top_layer();
+            self.warp_top_layer(transform, offset, opacity);
             if self.was_cancelled() {
                 return Err(RasterCancelled);
             }
@@ -852,7 +941,7 @@ impl<'a> RasterState<'a> {
 
     fn output(mut self) -> CpuRasterOutput {
         CpuRasterOutput {
-            surface: self.layers.pop().expect("root layer").surface,
+            surface: self.layers.pop().expect("root surface"),
             diagnostics: self.diagnostics,
         }
     }
@@ -993,6 +1082,37 @@ fn clip_shape_contains(shape: ClipShape, point: PhysicalPoint) -> bool {
 
 fn clip_coverage(clip: Option<&ClipRegion>, x: f32, y: f32) -> f32 {
     let Some(clip) = clip else { return 1.0 };
+    // Fast path: a clip built purely from axis-aligned rects. All sixteen
+    // samples of one pixel cell share the same floor, so every sample agrees
+    // with every other and coverage is exactly 0.0 or 1.0. Intersecting the
+    // half-open rects once turns the sixteen sampled containment tests into
+    // four comparisons with bit-identical results.
+    let shapes = &clip.shapes[..clip.shape_count];
+    if shapes
+        .iter()
+        .all(|shape| matches!(shape, ClipShape::Rect(_)))
+    {
+        let mut left = f32::MIN;
+        let mut right = f32::MAX;
+        let mut top = f32::MIN;
+        let mut bottom = f32::MAX;
+        for shape in shapes {
+            let ClipShape::Rect(rect) = *shape else {
+                unreachable!("the all-rect guard was just checked");
+            };
+            left = left.max(rect.origin.x);
+            right = right.min(rect.right());
+            top = top.max(rect.origin.y);
+            bottom = bottom.min(rect.bottom());
+        }
+        if left >= right || top >= bottom {
+            return 0.0;
+        }
+        let cell_x = x.floor();
+        let cell_y = y.floor();
+        let inside = cell_x >= left && cell_x < right && cell_y >= top && cell_y < bottom;
+        return if inside { 1.0 } else { 0.0 };
+    }
     let samples = [0.125_f32, 0.375, 0.625, 0.875];
     let mut covered = 0_u32;
     for sample_y in samples {
@@ -1495,30 +1615,55 @@ fn paint_glyph(
     clip: Option<&ClipRegion>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
-    for y in 0..mask.height {
+    // The glyph origin, mask offsets, and row strides are constant for the
+    // whole run; hoisting them removes the per-pixel checked arithmetic.
+    let Some(base_x) = rounded_i32(position.x).checked_add(mask.left) else {
+        return true;
+    };
+    let Some(base_y) = rounded_i32(position.y).checked_sub(mask.top) else {
+        return true;
+    };
+    let mask_width = usize::try_from(mask.width).unwrap_or(usize::MAX / 2);
+    let mask_height = usize::try_from(mask.height).unwrap_or(0);
+    for y in 0..mask_height {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
-        for x in 0..mask.width {
-            let index = usize::try_from(y)
+        let row_offset = y.checked_mul(mask_width);
+        let target_y = i32::try_from(y).ok().and_then(|y| base_y.checked_add(y));
+        for x in 0..mask_width {
+            let Some(index) = row_offset.and_then(|offset| offset.checked_add(x)) else {
+                continue;
+            };
+            let Some(coverage) = mask.coverage.get(index).copied() else {
+                continue;
+            };
+            let Some(target_x) = i32::try_from(x).ok().and_then(|x| base_x.checked_add(x)) else {
+                continue;
+            };
+            let Some(target_y) = target_y else {
+                continue;
+            };
+            let Some((target_x, target_y)) = u32::try_from(target_x)
                 .ok()
-                .and_then(|y| {
-                    usize::try_from(mask.width)
-                        .ok()
-                        .and_then(|width| y.checked_mul(width))
-                })
-                .and_then(|row| usize::try_from(x).ok().and_then(|x| row.checked_add(x)));
-            let Some(coverage) = index.and_then(|index| mask.coverage.get(index)).copied() else {
+                .and_then(|target_x| u32::try_from(target_y).ok().map(|y| (target_x, y)))
+            else {
                 continue;
             };
-            let Some((target_x, target_y)) = glyph_pixel_position(position, mask, x, y) else {
-                continue;
+            let clip_alpha = match clip {
+                None => 1.0,
+                Some(clip) => {
+                    let alpha = clip_coverage(
+                        Some(clip),
+                        u32_to_f32(target_x) + 0.5,
+                        u32_to_f32(target_y) + 0.5,
+                    );
+                    if alpha <= 0.0 {
+                        continue;
+                    }
+                    alpha
+                }
             };
-            let clip_alpha =
-                clip_coverage(clip, u32_to_f32(target_x) + 0.5, u32_to_f32(target_y) + 0.5);
-            if clip_alpha <= 0.0 {
-                continue;
-            }
             if let Some(surface_index) = surface.index(target_x, target_y) {
                 surface.pixels[surface_index] = blend(
                     surface.pixels[surface_index],
@@ -1577,25 +1722,189 @@ fn paint_image(
     true
 }
 
-fn composite_surface(
+/// Blends `source` into `destination` through `transform`, which maps source
+/// pixel coordinates to destination pixel coordinates.
+///
+/// Every destination pixel inside the transformed source bounding box —
+/// intersected with `clip` and the destination bounds — inverse-maps to a
+/// bilinear source sample that blends in with `opacity`. Only the clip
+/// rectangle is honored here, on par with the former 1:1 composite: rounded
+/// clip shapes stay a paint-time concern because the source surface already
+/// carries their coverage. A singular transform paints nothing.
+fn warp_surface(
     destination: &mut Surface,
     source: &Surface,
+    transform: Transform2D,
     opacity: f32,
+    clip: Option<PhysicalRect>,
     control: Option<&dyn RasterControl>,
 ) -> bool {
-    let row_width = usize::try_from(destination.width).expect("surface width fits usize");
-    for (index, (destination, source)) in destination
-        .pixels
-        .iter_mut()
-        .zip(&source.pixels)
-        .enumerate()
-    {
-        if index % row_width == 0 && control.is_some_and(RasterControl::is_cancelled) {
+    let Some(inverse) = transform.inverse() else {
+        // A singular matrix (for example scale(0)) collapses the layer onto a
+        // point or line, which has no area to paint.
+        return true;
+    };
+    let corners = [
+        (0.0, 0.0),
+        (u32_to_f32(source.width), 0.0),
+        (0.0, u32_to_f32(source.height)),
+        (u32_to_f32(source.width), u32_to_f32(source.height)),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let (mapped_x, mapped_y) = transform.apply(x, y);
+        min_x = min_x.min(mapped_x);
+        min_y = min_y.min(mapped_y);
+        max_x = max_x.max(mapped_x);
+        max_y = max_y.max(mapped_y);
+    }
+    let warped = PhysicalRect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+    let clipped = clip.map_or(Some(warped), |rect| intersection(Some(warped), rect));
+    let destination_bounds = PhysicalRect::new(
+        0.0,
+        0.0,
+        u32_to_f32(destination.width),
+        u32_to_f32(destination.height),
+    );
+    let Some(visible) = intersection(clipped, destination_bounds) else {
+        return true;
+    };
+    let left = floor_to_u32(visible.origin.x);
+    let top = floor_to_u32(visible.origin.y);
+    let right = ceil_to_u32(visible.right().min(u32_to_f32(destination.width)));
+    let bottom = ceil_to_u32(visible.bottom().min(u32_to_f32(destination.height)));
+    for y in top..bottom {
+        if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
-        *destination = blend(*destination, *source, opacity);
+        // Inverse-map the row start once, then step along the row with the x
+        // coefficients; moving down a row only advances the y coefficients.
+        let mut source_x = inverse.scale_x * u32_to_f32(left)
+            + inverse.skew_x * u32_to_f32(y)
+            + inverse.translate_x;
+        let mut source_y = inverse.skew_y * u32_to_f32(left)
+            + inverse.scale_y * u32_to_f32(y)
+            + inverse.translate_y;
+        for x in left..right {
+            if let Some(color) = sample_bilinear(source, source_x, source_y) {
+                if let Some(index) = destination.index(x, y) {
+                    destination.pixels[index] = blend(destination.pixels[index], color, opacity);
+                }
+            }
+            source_x += inverse.scale_x;
+            source_y += inverse.skew_y;
+        }
     }
     true
+}
+
+/// Samples `surface` at a fractional coordinate with bilinear interpolation.
+///
+/// Neighbors outside the surface read as transparent black, and the four
+/// samples combine in premultiplied form so transparent edges do not darken
+/// the interpolated color. Integer coordinates shortcut to the exact pixel,
+/// which keeps identity and whole-pixel warps lossless.
+#[allow(clippy::float_cmp)] // integer coordinates are an exact bit-pattern test
+fn sample_bilinear(surface: &Surface, x: f32, y: f32) -> Option<Color> {
+    let width = u32_to_f32(surface.width);
+    let height = u32_to_f32(surface.height);
+    // The range test also rejects NaN, which would poison the weights.
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 || x >= width || y >= height {
+        return None;
+    }
+    let left = floor_to_u32(x);
+    let top = floor_to_u32(y);
+    let fraction_x = x - u32_to_f32(left);
+    let fraction_y = y - u32_to_f32(top);
+    if fraction_x == 0.0 && fraction_y == 0.0 {
+        return surface.pixel(left, top);
+    }
+    let sample = |column: u32, row: u32| {
+        surface
+            .pixel(column, row)
+            .map_or(PREMULTIPLIED_TRANSPARENT, premultiplied)
+    };
+    let mixed = PremultipliedColor::mix(
+        sample(left, top),
+        sample(left + 1, top),
+        sample(left, top + 1),
+        sample(left + 1, top + 1),
+        fraction_x,
+        fraction_y,
+    );
+    Some(unpremultiplied(mixed))
+}
+
+/// Color stored in premultiplied-alpha form, the space where linear
+/// interpolation between a color and transparent black never darkens the
+/// surviving color.
+#[derive(Clone, Copy)]
+struct PremultipliedColor {
+    red: f32,
+    green: f32,
+    blue: f32,
+    alpha: f32,
+}
+
+const PREMULTIPLIED_TRANSPARENT: PremultipliedColor = PremultipliedColor {
+    red: 0.0,
+    green: 0.0,
+    blue: 0.0,
+    alpha: 0.0,
+};
+
+fn premultiplied(color: Color) -> PremultipliedColor {
+    let alpha = f32::from(color.alpha);
+    PremultipliedColor {
+        red: f32::from(color.red) * alpha / 255.0,
+        green: f32::from(color.green) * alpha / 255.0,
+        blue: f32::from(color.blue) * alpha / 255.0,
+        alpha,
+    }
+}
+
+fn unpremultiplied(color: PremultipliedColor) -> Color {
+    if color.alpha <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let channel = |value: f32| clamped_rounded_u8(value * 255.0 / color.alpha);
+    Color::rgba(
+        channel(color.red),
+        channel(color.green),
+        channel(color.blue),
+        clamped_rounded_u8(color.alpha),
+    )
+}
+
+impl PremultipliedColor {
+    /// Bilinear combination of the four neighbors around a sample point,
+    /// weighted by the fractional offsets into the pixel cell.
+    fn mix(
+        top_left: Self,
+        top_right: Self,
+        bottom_left: Self,
+        bottom_right: Self,
+        fraction_x: f32,
+        fraction_y: f32,
+    ) -> Self {
+        let neighbors = [
+            (top_left, (1.0 - fraction_x) * (1.0 - fraction_y)),
+            (top_right, fraction_x * (1.0 - fraction_y)),
+            (bottom_left, (1.0 - fraction_x) * fraction_y),
+            (bottom_right, fraction_x * fraction_y),
+        ];
+        let mut mixed = PREMULTIPLIED_TRANSPARENT;
+        for (color, weight) in neighbors {
+            mixed.red += color.red * weight;
+            mixed.green += color.green * weight;
+            mixed.blue += color.blue * weight;
+            mixed.alpha += color.alpha * weight;
+        }
+        mixed
+    }
 }
 
 fn blend(destination: Color, source: Color, opacity: f32) -> Color {
@@ -1618,23 +1927,6 @@ fn blend(destination: Color, source: Color, opacity: f32) -> Color {
         channel(source.blue, destination.blue),
         clamped_rounded_u8(output_alpha * 255.0),
     )
-}
-
-fn glyph_pixel_position(
-    position: PhysicalPoint,
-    mask: &GlyphMask,
-    x: u32,
-    y: u32,
-) -> Option<(u32, u32)> {
-    let x = i32::try_from(x).ok()?;
-    let y = i32::try_from(y).ok()?;
-    let target_x = rounded_i32(position.x)
-        .checked_add(mask.left)?
-        .checked_add(x)?;
-    let target_y = rounded_i32(position.y)
-        .checked_sub(mask.top)?
-        .checked_add(y)?;
-    Some((u32::try_from(target_x).ok()?, u32::try_from(target_y).ok()?))
 }
 
 #[allow(
@@ -1689,15 +1981,18 @@ mod tests {
     use crate::dom::Dom;
     use crate::layout::{EdgeSizes, FragmentId, PhysicalPoint, PhysicalRect, PhysicalSize};
     use crate::paint::display_list::{
-        BorderPaint, BoxShadowPaint, ClipShape, CornerRadii, DisplayCommand, DisplayItem,
-        DisplayItemId, DisplayList, FontInstanceId, GlyphId, GlyphInstance, GlyphRun, GradientStop,
-        LinearGradient, PaintCoordinateSpace, PaintPhase,
+        BlendMode, BorderPaint, BoxShadowPaint, ClipShape, CompositingReason, CornerRadii,
+        DisplayCommand, DisplayItem, DisplayItemId, DisplayList, FontInstanceId, GlyphId,
+        GlyphInstance, GlyphRun, GradientStop, LinearGradient, PaintCoordinateSpace, PaintPhase,
+        StackingContext, Transform2D,
     };
     use crate::paint::{
         GlyphMask, GlyphMaskProvider, PaintScene, RasterControl, RasterRequest, RetainedFrame,
     };
 
-    use super::{Color, CpuRasterizer, NoGlyphMasks, NoRasterCancellation, RasterCancelled};
+    use super::{
+        Color, CpuRasterizer, NoGlyphMasks, NoRasterCancellation, RasterCancelled, Surface,
+    };
 
     #[derive(Clone, Copy, Debug)]
     struct Cancelled;
@@ -2152,5 +2447,384 @@ mod tests {
         );
 
         assert_eq!(result, Err(RasterCancelled));
+    }
+
+    fn stacking_context(transform: Transform2D, opacity: f32) -> StackingContext {
+        StackingContext {
+            opacity,
+            transform,
+            blend_mode: BlendMode::Normal,
+            isolated: true,
+            reason: CompositingReason::Transform,
+        }
+    }
+
+    fn command_item(ordinal: u32, command: DisplayCommand) -> DisplayItem {
+        DisplayItem {
+            id: DisplayItemId {
+                source: None,
+                fragment_hint: 0,
+                phase: PaintPhase::Background,
+                ordinal,
+            },
+            fragment: FragmentId::from_index(0),
+            source: None,
+            bounds: PhysicalRect::new(0.0, 0.0, 16.0, 16.0),
+            coordinate_space: PaintCoordinateSpace::Document,
+            command,
+        }
+    }
+
+    fn item_list(side: f32, items: Vec<DisplayItem>) -> DisplayList {
+        let dom = Dom::new();
+        DisplayList {
+            dom_revision: dom.revision(),
+            viewport: PhysicalSize {
+                width: side,
+                height: side,
+            },
+            items,
+        }
+    }
+
+    #[test]
+    fn translation_stacking_context_shifts_rects_without_offscreen_pass() {
+        let translation = Transform2D {
+            translate_x: 3.0,
+            translate_y: 2.0,
+            ..Transform2D::default()
+        };
+        let translated = item_list(
+            8.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(translation, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(1.0, 1.0, 2.0, 2.0),
+                        color: Color::rgb(0, 0, 255),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+                // Painted after the pop, so it must not inherit the shift.
+                command_item(
+                    3,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(0.0, 0.0, 1.0, 1.0),
+                        color: Color::rgb(0, 255, 0),
+                    },
+                ),
+            ],
+        );
+        let direct = item_list(
+            8.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(4.0, 3.0, 2.0, 2.0),
+                        color: Color::rgb(0, 0, 255),
+                    },
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(0.0, 0.0, 1.0, 1.0),
+                        color: Color::rgb(0, 255, 0),
+                    },
+                ),
+            ],
+        );
+
+        let shifted = CpuRasterizer.rasterize(&translated, Color::WHITE, &NoGlyphMasks);
+        let expected = CpuRasterizer.rasterize(&direct, Color::WHITE, &NoGlyphMasks);
+
+        assert_eq!(shifted.surface, expected.surface);
+        assert!(shifted.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn identity_stacking_context_with_opacity_matches_direct_alpha_paint() {
+        let opacity = f32::from(128_u8) / 255.0;
+        let grouped = item_list(
+            6.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(
+                        Transform2D::default(),
+                        opacity,
+                    )),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(1.0, 1.0, 2.0, 2.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+            ],
+        );
+        let direct = item_list(
+            6.0,
+            vec![command_item(
+                0,
+                DisplayCommand::SolidRect {
+                    rect: PhysicalRect::new(1.0, 1.0, 2.0, 2.0),
+                    color: Color::rgba(255, 0, 0, 128),
+                },
+            )],
+        );
+
+        let grouped_output = CpuRasterizer.rasterize(&grouped, Color::WHITE, &NoGlyphMasks);
+        let direct_output = CpuRasterizer.rasterize(&direct, Color::WHITE, &NoGlyphMasks);
+
+        assert_eq!(grouped_output.surface, direct_output.surface);
+        assert!(grouped_output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn scale_stacking_context_magnifies_content() {
+        let scale = Transform2D {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..Transform2D::default()
+        };
+        let scaled = item_list(
+            24.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(scale, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(0.0, 0.0, 10.0, 10.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&scaled, Color::WHITE, &NoGlyphMasks);
+
+        // Interior samples land fully inside the magnified rectangle.
+        assert_eq!(output.surface.pixel(0, 0), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(4, 6), Some(Color::rgb(255, 0, 0)));
+        // The rectangle doubles to 20x20; beyond it the background stays.
+        assert_eq!(output.surface.pixel(21, 21), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(23, 0), Some(Color::WHITE));
+        // The boundary pixel is a quarter-covered blend of red and
+        // transparency.
+        assert_eq!(
+            output.surface.pixel(19, 19),
+            Some(Color::rgb(255, 191, 191))
+        );
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn rotate_stacking_context_turns_a_horizontal_bar_upright() {
+        // rotate(90deg) about the document origin, shifted back into view:
+        // p' = (16 - y, x).
+        let rotation = Transform2D {
+            scale_x: 0.0,
+            skew_x: -1.0,
+            skew_y: 1.0,
+            scale_y: 0.0,
+            translate_x: 16.0,
+            translate_y: 0.0,
+        };
+        let rotated = item_list(
+            16.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(rotation, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(2.0, 6.0, 8.0, 2.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&rotated, Color::WHITE, &NoGlyphMasks);
+
+        // The horizontal bar (x 2..10, y 6..8) becomes a vertical bar at
+        // columns 9-10 and rows 2..10.
+        assert_eq!(output.surface.pixel(9, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(10, 8), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(8, 5), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(11, 5), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(9, 1), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn scaled_stacking_context_blends_with_layer_opacity() {
+        let scale = Transform2D {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..Transform2D::default()
+        };
+        let scaled = item_list(
+            24.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(scale, 0.5)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(0.0, 0.0, 10.0, 10.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&scaled, Color::WHITE, &NoGlyphMasks);
+
+        // Interior samples are pure red, blended at half opacity over white.
+        assert_eq!(output.surface.pixel(5, 5), Some(Color::rgb(255, 128, 128)));
+        assert_eq!(output.surface.pixel(0, 0), Some(Color::rgb(255, 128, 128)));
+        // Outside the magnified rectangle the background is untouched.
+        assert_eq!(output.surface.pixel(21, 21), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn nested_translation_and_scale_contexts_compose() {
+        let translate = Transform2D {
+            translate_x: 4.0,
+            ..Transform2D::default()
+        };
+        let scale = Transform2D {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..Transform2D::default()
+        };
+        let nested = item_list(
+            16.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(translate, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::PushStackingContext(stacking_context(scale, 1.0)),
+                ),
+                command_item(
+                    2,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(1.0, 1.0, 2.0, 2.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(3, DisplayCommand::PopStackingContext),
+                command_item(4, DisplayCommand::PopStackingContext),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&nested, Color::WHITE, &NoGlyphMasks);
+
+        // The rect (1,1)-(3,3) doubles to (2,2)-(6,6), then the outer
+        // translation shifts it to (6,2)-(10,6).
+        assert_eq!(output.surface.pixel(6, 2), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(7, 3), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(8, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(4, 2), Some(Color::WHITE));
+        assert_eq!(output.surface.pixel(10, 3), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn singular_transform_stacking_context_paints_nothing() {
+        let collapse = Transform2D {
+            scale_x: 0.0,
+            scale_y: 0.0,
+            ..Transform2D::default()
+        };
+        let collapsed = item_list(
+            6.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushStackingContext(stacking_context(collapse, 1.0)),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(1.0, 1.0, 2.0, 2.0),
+                        color: Color::rgb(0, 0, 255),
+                    },
+                ),
+                command_item(2, DisplayCommand::PopStackingContext),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&collapsed, Color::WHITE, &NoGlyphMasks);
+
+        assert_eq!(output.surface, Surface::new(6, 6, Color::WHITE));
+        assert!(output.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn warped_stacking_context_respects_enclosing_clip() {
+        let scale = Transform2D {
+            scale_x: 2.0,
+            scale_y: 2.0,
+            ..Transform2D::default()
+        };
+        let clipped = item_list(
+            16.0,
+            vec![
+                command_item(
+                    0,
+                    DisplayCommand::PushClip(ClipShape::Rect(PhysicalRect::new(
+                        0.0, 0.0, 8.0, 16.0,
+                    ))),
+                ),
+                command_item(
+                    1,
+                    DisplayCommand::PushStackingContext(stacking_context(scale, 1.0)),
+                ),
+                command_item(
+                    2,
+                    DisplayCommand::SolidRect {
+                        rect: PhysicalRect::new(2.0, 2.0, 4.0, 4.0),
+                        color: Color::rgb(255, 0, 0),
+                    },
+                ),
+                command_item(3, DisplayCommand::PopStackingContext),
+                command_item(4, DisplayCommand::PopClip),
+            ],
+        );
+
+        let output = CpuRasterizer.rasterize(&clipped, Color::WHITE, &NoGlyphMasks);
+
+        // The rect doubles to (4,4)-(12,12), but only the half inside the
+        // clip (x < 8) survives the composite.
+        assert_eq!(output.surface.pixel(4, 4), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(5, 5), Some(Color::rgb(255, 0, 0)));
+        assert_eq!(output.surface.pixel(7, 7), Some(Color::rgb(255, 0, 0)));
+        // Red source pixels warp here too, but the clip cuts them off.
+        assert_eq!(output.surface.pixel(9, 9), Some(Color::WHITE));
+        assert!(output.diagnostics.is_empty());
     }
 }

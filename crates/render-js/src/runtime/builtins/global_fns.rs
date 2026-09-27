@@ -30,6 +30,73 @@ use render_dom::Dom;
 use std::fmt::Write as _;
 
 impl JsRuntime {
+    fn base64_encode(bytes: &[u8]) -> String {
+        const TABLE: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied().unwrap_or(0);
+            let third = chunk.get(2).copied().unwrap_or(0);
+            output.push(TABLE[(first >> 2) as usize] as char);
+            output.push(TABLE[((first & 0x03) << 4 | second >> 4) as usize] as char);
+            if chunk.len() > 1 {
+                output.push(TABLE[((second & 0x0f) << 2 | third >> 6) as usize] as char);
+            } else {
+                output.push('=');
+            }
+            if chunk.len() > 2 {
+                output.push(TABLE[(third & 0x3f) as usize] as char);
+            } else {
+                output.push('=');
+            }
+        }
+        output
+    }
+
+    fn base64_decode(text: &str) -> Result<String, JsError> {
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>();
+        if compact.is_empty() {
+            return Ok(String::new());
+        }
+        if compact.len() % 4 != 0 {
+            return Err(JsError::dom("Invalid character in string"));
+        }
+        let value = |character: u8| -> Option<u8> {
+            match character {
+                b'A'..=b'Z' => Some(character - b'A'),
+                b'a'..=b'z' => Some(character - b'a' + 26),
+                b'0'..=b'9' => Some(character - b'0' + 52),
+                b'+' => Some(62),
+                b'/' => Some(63),
+                _ => None,
+            }
+        };
+        let bytes = compact.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+        for chunk in bytes.chunks_exact(4) {
+            let first =
+                value(chunk[0]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
+            let second =
+                value(chunk[1]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
+            decoded.push((first << 2) | (second >> 4));
+            if chunk[2] != b'=' {
+                let third =
+                    value(chunk[2]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
+                decoded.push((second << 4) | (third >> 2));
+                if chunk[3] != b'=' {
+                    let fourth = value(chunk[3])
+                        .ok_or_else(|| JsError::dom("Invalid character in string"))?;
+                    decoded.push((third << 6) | fourth);
+                }
+            }
+        }
+        Ok(decoded.into_iter().map(char::from).collect())
+    }
+
     pub(in crate::runtime) fn dispatch_residual_native(
         &mut self,
         dom: &mut Dom,
@@ -38,6 +105,17 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            NativeFunction::CreateComment
+            | NativeFunction::ReflectGet
+            | NativeFunction::ReflectSet
+            | NativeFunction::ReflectHas
+            | NativeFunction::ReflectDeleteProperty
+            | NativeFunction::ReflectOwnKeys
+            | NativeFunction::ReflectGetOwnPropertyDescriptor
+            | NativeFunction::ReflectDefineProperty
+            | NativeFunction::ReflectConstruct => {
+                self.dispatch_proxy_native(dom, function, receiver, arguments)
+            }
             // Fetch-domain functions are intercepted at the dispatch head in
             // `fetch.rs`; these arms exist so a new variant stays a compile
             // error here instead of a silent runtime gap.
@@ -45,11 +123,27 @@ impl JsRuntime {
             | NativeFunction::ResponseText
             | NativeFunction::ResponseJson
             | NativeFunction::ResponseHeadersGet
+            | NativeFunction::BlobText
+            | NativeFunction::BlobArrayBuffer
+            | NativeFunction::BlobSlice
             | NativeFunction::XhrOpen
             | NativeFunction::XhrSetRequestHeader
             | NativeFunction::XhrSend
-            | NativeFunction::XhrGetResponseHeader => {
+            | NativeFunction::XhrGetResponseHeader
+            | NativeFunction::XhrGetAllResponseHeaders
+            | NativeFunction::XhrAddEventListener
+            | NativeFunction::XhrRemoveEventListener
+            | NativeFunction::AbortControllerAbort
+            | NativeFunction::FormDataAppend
+            | NativeFunction::FormDataGet
+            | NativeFunction::FormDataSet
+            | NativeFunction::FormDataHas
+            | NativeFunction::FormDataDelete
+            | NativeFunction::FormDataEntries => {
                 self.dispatch_fetch_native(dom, function, receiver, arguments)
+            }
+            NativeFunction::UrlCreateObjectUrl | NativeFunction::UrlRevokeObjectUrl => {
+                self.dispatch_url_native(dom, function, receiver, arguments)
             }
             // Video-domain functions are intercepted right after the DOM
             // dispatch in `video.rs`; route to it for the same reason.
@@ -263,6 +357,19 @@ impl JsRuntime {
                     None => Ok(JsValue::String(text)),
                 }
             }
+            NativeFunction::GlobalAtob => {
+                let text = required_argument(arguments, 0, "atob")?.to_js_string();
+                Self::base64_decode(&text).map(JsValue::String)
+            }
+            NativeFunction::GlobalBtoa => {
+                let text = required_argument(arguments, 0, "btoa")?.to_js_string();
+                if text.chars().any(|character| character as u32 > 0xff) {
+                    return Err(JsError::dom("String contains an invalid character"));
+                }
+                Ok(JsValue::String(Self::base64_encode(
+                    &text.bytes().collect::<Vec<_>>(),
+                )))
+            }
             NativeFunction::GlobalParseInt => {
                 let text = required_argument(arguments, 0, "parseInt")?.to_js_string();
                 let trimmed = text.trim_start();
@@ -318,7 +425,11 @@ impl JsRuntime {
                 }
             }
             NativeFunction::PerformanceNow => Ok(JsValue::Number(Self::monotonic_now_ms())),
+            NativeFunction::PerformanceGetEntries | NativeFunction::PerformanceGetEntriesByType => {
+                Ok(JsValue::Object(self.create_array_from_values(&[])?))
+            }
             NativeFunction::FunctionPrototype
+            | NativeFunction::FunctionToString
             | NativeFunction::FunctionCall
             | NativeFunction::FunctionApply
             | NativeFunction::FunctionBind => {
@@ -375,6 +486,32 @@ impl JsRuntime {
             NativeFunction::ArrayPush => {
                 self.dispatch_array_native(dom, NativeFunction::ArrayPush, receiver, arguments)
             }
+            NativeFunction::ArrayValues
+            | NativeFunction::ArrayKeys
+            | NativeFunction::ArrayEntries => {
+                self.dispatch_array_native(dom, function, receiver, arguments)
+            }
+            NativeFunction::IteratorConstructor
+            | NativeFunction::IteratorFrom
+            | NativeFunction::IteratorPrototypeIterator
+            | NativeFunction::IteratorHelperNext
+            | NativeFunction::IteratorHelperReturn
+            | NativeFunction::IteratorMap
+            | NativeFunction::IteratorFilter
+            | NativeFunction::IteratorTake
+            | NativeFunction::IteratorDrop
+            | NativeFunction::IteratorFlatMap
+            | NativeFunction::IteratorReduce
+            | NativeFunction::IteratorToArray
+            | NativeFunction::IteratorForEach
+            | NativeFunction::IteratorSome
+            | NativeFunction::IteratorEvery
+            | NativeFunction::IteratorFind
+            | NativeFunction::IteratorConcat
+            | NativeFunction::IteratorChunks
+            | NativeFunction::IteratorWindows => self
+                .dispatch_iterator_native(dom, function, receiver, arguments)
+                .unwrap_or_else(|| Err(JsError::type_error("iterator helper dispatch failed"))),
             NativeFunction::ArrayReduce => {
                 self.dispatch_array_native(dom, NativeFunction::ArrayReduce, receiver, arguments)
             }
@@ -522,6 +659,9 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::CreateEvent => {
+                self.dispatch_dom_native(dom, NativeFunction::CreateEvent, receiver, arguments)
+            }
             NativeFunction::CreateElement => {
                 self.dispatch_dom_native(dom, NativeFunction::CreateElement, receiver, arguments)
             }
@@ -822,6 +962,12 @@ impl JsRuntime {
             NativeFunction::ObjectGetPrototypeOf => self.dispatch_object_native(
                 dom,
                 NativeFunction::ObjectGetPrototypeOf,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ObjectSetPrototypeOf => self.dispatch_object_native(
+                dom,
+                NativeFunction::ObjectSetPrototypeOf,
                 receiver,
                 arguments,
             ),

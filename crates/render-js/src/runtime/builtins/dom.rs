@@ -117,10 +117,30 @@ impl JsRuntime {
                 let node = dom.create_text(data);
                 self.wrap_node(node)
             }
+            NativeFunction::CreateComment => {
+                self.require_document(receiver)?;
+                let data = required_argument(arguments, 0, "createComment")?.to_js_string();
+                let node = dom.create_comment(data);
+                self.wrap_node(node)
+            }
             NativeFunction::CreateDocumentFragment => {
                 self.require_document(receiver)?;
                 let node = dom.create_document_fragment();
                 self.wrap_node(node)
+            }
+            NativeFunction::CreateEvent => {
+                self.require_document(receiver)?;
+                // Browsers accept several legacy interface names here. The
+                // generic Event object covers feature detection and exposes
+                // the timestamp read by framework schedulers.
+                let event = self.event_constructor(&[JsValue::String("event".to_owned())])?;
+                if let JsValue::Object(object) = event {
+                    self.realm
+                        .set_property(object, "timeStamp".to_owned(), JsValue::Number(0.0));
+                    Ok(JsValue::Object(object))
+                } else {
+                    Ok(event)
+                }
             }
             NativeFunction::GetComputedStyle => {
                 let argument = required_argument(arguments, 0, "getComputedStyle")?;

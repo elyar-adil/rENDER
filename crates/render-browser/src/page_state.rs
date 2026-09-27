@@ -12,7 +12,9 @@ use render_browser::scripts::ScriptFetchPlan;
 use render_browser::worker::RenderIdentity;
 use render_core::css::computed::ComputedStyle;
 use render_core::document::DocumentRenderOptions;
+use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
+use render_core::image::ImageResourceKey;
 use render_core::image::ImageResources;
 use render_core::js::ElementRect;
 use render_core::js::JsValue;
@@ -35,13 +37,35 @@ use std::sync::Arc;
 use std::time::Instant;
 use winit::dpi::PhysicalSize as WindowSize;
 
+/// Upper bound on event-loop turns drained while executing one prepared
+/// classic-script batch.
+///
+/// The drain normally finishes once the queued scripts and their load/error
+/// events have run (a handful of turns). A page whose scripts re-queue ready
+/// tasks from within those tasks could otherwise keep the UI thread in this
+/// loop forever, which blocks every other stage — network polling, render
+/// commits, input — indefinitely. When the budget is hit the remaining work
+/// stays in the page's event loop and drains through the normal bounded page
+/// pump instead.
+const SCRIPT_BATCH_TURN_BUDGET: usize = 1_024;
+
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag tracks an independent pipeline stage: styles, scripts, images, pending rerender"
+)]
 pub(super) struct PageState {
     pub(super) navigation: PageNavigation<CachedRequestHandle>,
     pub(super) page: Page,
     pub(super) cookies: CookieJar,
     pub(super) style_sheets: ExternalStyleSheets,
+    /// Keys already submitted for this document. A failed stylesheet is not
+    /// resubmitted on every paint; changing its URL creates a new key.
+    pub(super) started_style_sheets: HashSet<ExternalStyleSheetKey>,
     pub(super) style_batch: Option<(StylesheetFetchPlan, Vec<FetchResult>)>,
     pub(super) images: ImageResources,
+    /// Failed image loads are retried when their source changes, but not on
+    /// every paint of the same broken URL.
+    pub(super) attempted_images: HashSet<ImageResourceKey>,
     pub(super) computed_styles: BTreeMap<render_core::dom::NodeId, ComputedStyle>,
     pub(super) pending_images: Option<PendingImages>,
     pub(super) styles_resolved: bool,
@@ -55,6 +79,12 @@ pub(super) struct PageState {
     pub(super) held_scripts: Option<ScriptBatchPreparation>,
     pub(super) started_scripts: HashSet<render_core::dom::NodeId>,
     pub(super) initial_script_scan_completed: bool,
+    /// A DOM mutation (or style/image generation change) arrived while a
+    /// render for this tab was already running. The running render stays
+    /// committable, so instead of superseding it — which starves commits
+    /// whenever mutations arrive faster than renders finish — the mutation is
+    /// recorded here and the coordinator resubmits right after the commit.
+    pub(super) render_dirty: bool,
     pub(super) frame: Vec<u32>,
     pub(super) viewport: WindowSize<u32>,
     pub(super) display_list: Option<Arc<DisplayList>>,
@@ -79,21 +109,33 @@ pub(super) struct PageNavigation<H> {
 pub(super) struct PendingNavigation<H> {
     pub(super) requested_url: Url,
     pub(super) handle: H,
+    /// Wall-clock anchor for stall reporting; a navigation or resource batch
+    /// that stays in flight this long is surfaced on stderr once.
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
 }
 
+/// A resource batch in flight, with the wall-clock anchor for stall
+/// reporting (`since`/`stall_reported`).
 pub(super) struct PendingStyleSheets {
     pub(super) plan: StylesheetFetchPlan,
     pub(super) handle: CachedBatchHandle,
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
 }
 
 pub(super) struct PendingScripts {
     pub(super) plan: ScriptFetchPlan,
     pub(super) handle: CachedBatchHandle,
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
 }
 
 pub(super) struct PendingImages {
     pub(super) plan: ImageFetchPlan,
     pub(super) handle: CachedBatchHandle,
+    pub(super) since: Instant,
+    pub(super) stall_reported: bool,
 }
 
 impl<H> PageNavigation<H> {
@@ -108,6 +150,8 @@ impl<H> PageNavigation<H> {
         self.pending = Some(PendingNavigation {
             requested_url,
             handle,
+            since: Instant::now(),
+            stall_reported: false,
         });
     }
 
@@ -142,8 +186,10 @@ impl PageState {
             page,
             cookies: CookieJar::default(),
             style_sheets: ExternalStyleSheets::default(),
+            started_style_sheets: HashSet::new(),
             style_batch: None,
             images: ImageResources::default(),
+            attempted_images: HashSet::new(),
             computed_styles: BTreeMap::new(),
             pending_images: None,
             styles_resolved: false,
@@ -153,6 +199,7 @@ impl PageState {
             held_scripts: None,
             started_scripts: HashSet::new(),
             initial_script_scan_completed: false,
+            render_dirty: false,
             frame: Vec::new(),
             viewport: WindowSize::new(0, 0),
             display_list: None,
@@ -175,13 +222,16 @@ impl PageState {
         self.page = Page::with_url_unrendered(&source.html, &source.target.history_url());
         self.navigation.commit(source);
         self.style_sheets = ExternalStyleSheets::default();
+        self.started_style_sheets.clear();
         self.style_batch = None;
         self.images = ImageResources::default();
+        self.attempted_images.clear();
         self.computed_styles.clear();
         self.styles_resolved = false;
         self.scripts_resolved = false;
         self.started_scripts.clear();
         self.initial_script_scan_completed = false;
+        self.render_dirty = false;
         self.frame.clear();
         self.viewport = WindowSize::new(0, 0);
         self.display_list = None;
@@ -279,7 +329,16 @@ impl PageState {
                 (task, (owner, source_order, final_url))
             })
             .collect::<HashMap<_, _>>();
+        let mut turns = 0_usize;
         loop {
+            if turns >= SCRIPT_BATCH_TURN_BUDGET {
+                eprintln!(
+                    "render-browser script batch hit its {SCRIPT_BATCH_TURN_BUDGET}-turn budget; \
+                     remaining page work drains through the bounded page pump"
+                );
+                break;
+            }
+            turns += 1;
             match self.page.run_one_turn_without_render() {
                 Ok(Some(turn)) => {
                     let mut turn_origin = None;
@@ -374,7 +433,13 @@ impl PageState {
         self.drain_console();
         let revision_after = self.page.document().dom().revision().as_u64();
         self.dom_revision = revision_after;
-        (revision_after != revision_before, defaults)
+        let changed = revision_after != revision_before;
+        if changed {
+            // Timers, event handlers and fetch callbacks may append scripts
+            // long after the initial document scan completed.
+            self.scripts_resolved = false;
+        }
+        (changed, defaults)
     }
 
     /// Earliest wall-clock instant at which this page needs a wake-up.

@@ -91,7 +91,7 @@ impl JsRuntime {
             );
         let thresholds =
             match options.and_then(|object| self.realm.get_property(object, "threshold")) {
-                Some(JsValue::Object(array)) => self.array_elements_for(array),
+                Some(JsValue::Object(array)) => self.array_elements_for(array)?,
                 Some(value) if !matches!(value, JsValue::Undefined) => vec![value],
                 _ => vec![JsValue::Number(0.0)],
             };
@@ -272,7 +272,7 @@ impl JsRuntime {
         let values = drained
             .iter()
             .map(|record| self.mutation_record_value(record))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(JsValue::Object(self.create_array_from_values(&values)?))
     }
 
@@ -354,7 +354,7 @@ impl JsRuntime {
         let records = drained
             .iter()
             .map(|record| self.mutation_record_value(record))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let records = self.create_array_from_values(&records)?;
         self.call_with_this(
             dom,
@@ -367,30 +367,65 @@ impl JsRuntime {
     pub(in crate::runtime) fn mutation_record_value(
         &mut self,
         record: &render_dom::MutationRecord,
-    ) -> JsValue {
+    ) -> Result<JsValue, JsError> {
+        self.ensure_heap_capacity(1)?;
         let object = self.realm.create_object(None);
         let kind = &record.kind;
-        let (type_name, target, attribute_name) = match kind {
-            MutationKind::ChildList { target, .. } => ("childList", *target, None),
-            MutationKind::Attribute { target, local_name } => {
-                ("attributes", *target, Some(local_name.clone()))
+        let (type_name, target, attribute_name, added, removed) = match kind {
+            MutationKind::ChildList {
+                target,
+                added,
+                removed,
+            } => (
+                "childList",
+                *target,
+                None,
+                added.as_slice(),
+                removed.as_slice(),
+            ),
+            MutationKind::Attribute { target, local_name } => (
+                "attributes",
+                *target,
+                Some(local_name.clone()),
+                &[][..],
+                &[][..],
+            ),
+            MutationKind::CharacterData { target } => {
+                ("characterData", *target, None, &[][..], &[][..])
             }
-            MutationKind::CharacterData { target } => ("characterData", *target, None),
         };
         self.realm.set_property(
             object,
             "type".to_owned(),
             JsValue::String(type_name.to_owned()),
         );
-        let wrapper = self.realm.node_wrapper(target);
+        let wrapper = self.wrap_node(target)?;
         self.realm
-            .set_property(object, "target".to_owned(), JsValue::Object(wrapper));
+            .set_property(object, "target".to_owned(), wrapper);
         self.realm.set_property(
             object,
             "attributeName".to_owned(),
             attribute_name.map_or(JsValue::Null, JsValue::String),
         );
-        JsValue::Object(object)
+        for (name, nodes) in [("addedNodes", added), ("removedNodes", removed)] {
+            let values = nodes
+                .iter()
+                .map(|node| self.wrap_node(*node))
+                .collect::<Result<Vec<_>, _>>()?;
+            let list = self.create_array_from_values(&values)?;
+            self.realm
+                .set_property(object, name.to_owned(), JsValue::Object(list));
+        }
+        for name in [
+            "previousSibling",
+            "nextSibling",
+            "attributeNamespace",
+            "oldValue",
+        ] {
+            self.realm
+                .set_property(object, name.to_owned(), JsValue::Null);
+        }
+        Ok(JsValue::Object(object))
     }
 
     pub(in crate::runtime) fn has_ancestor(dom: &Dom, node: NodeId, ancestor: NodeId) -> bool {
@@ -529,5 +564,49 @@ impl JsRuntime {
             self.realm.set_property(entry, name.to_owned(), value);
         }
         Ok(JsValue::Object(entry))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use render_html::parse_document;
+
+    #[test]
+    fn child_list_records_expose_added_nodes_for_modulepreload_observers() {
+        let mut parsed = parse_document("<!doctype html><body></body>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"
+            var seen = [];
+            var observer = new MutationObserver(function (records) {
+                for (var record of records) {
+                    if (record.type === 'childList') {
+                        for (var node of record.addedNodes) seen.push(node.tagName);
+                    }
+                }
+            });
+            observer.observe(document.body, {childList:true, subtree:true});
+            document.body.appendChild(document.createElement('link'));
+        ",
+            )
+            .expect("observer setup should execute");
+        for _ in 0..16 {
+            let tasks = runtime.take_pending_microtasks();
+            if tasks.is_empty() {
+                break;
+            }
+            for task in tasks {
+                runtime
+                    .invoke_microtask(&mut parsed.dom, task)
+                    .expect("observer callback should iterate addedNodes");
+            }
+        }
+        let result = runtime
+            .execute(&mut parsed.dom, "seen.join(',')")
+            .expect("observer result should be readable");
+        assert_eq!(result.value, JsValue::String("LINK".to_owned()));
     }
 }

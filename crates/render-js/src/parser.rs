@@ -9,6 +9,8 @@
 use super::lexer::{TemplatePart, Token, TokenKind, tokenize};
 use super::{JsError, JsErrorKind, RuntimeLimits};
 use crate::JsValue;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VariableKind {
@@ -58,6 +60,8 @@ pub(super) enum BinaryOp {
     StrictNotEqual,
     LogicalAnd,
     LogicalOr,
+    /// `??`: short-circuiting nullish coalescing.
+    Nullish,
     BitwiseAnd,
     BitwiseXor,
     BitwiseOr,
@@ -76,7 +80,36 @@ pub(super) struct CatchClause {
 pub(super) enum PropertyKey {
     Static(String),
     Computed(Expr),
+    /// `#name`: a private class element.
+    Private(String),
     Spread,
+}
+
+/// The role one class body element plays during class evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClassElementKind {
+    Constructor,
+    Method,
+    Get,
+    Set,
+    Field,
+    /// `static { ... }`: one or more statements run against the constructor.
+    StaticBlock,
+}
+
+/// One element of a class body: a method/accessor/constructor, a field with
+/// an optional initializer, or a static initialization block.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ClassElement {
+    pub key: PropertyKey,
+    pub kind: ClassElementKind,
+    pub is_static: bool,
+    pub is_async: bool,
+    pub is_generator: bool,
+    pub parameters: Vec<String>,
+    pub body: Vec<Statement>,
+    pub initializer: Option<Expr>,
+    pub offset: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +186,13 @@ pub(super) enum Statement {
         body: Vec<Statement>,
         offset: usize,
     },
+    /// `class Name extends Base { ... }`, a lexical binding like `let`.
+    Class {
+        name: String,
+        super_class: Option<Box<Expr>>,
+        elements: Vec<ClassElement>,
+        offset: usize,
+    },
     Return(Option<Expr>),
     Throw(Expr),
     Try {
@@ -220,6 +260,15 @@ pub(super) enum Statement {
     Continue(Option<String>),
     Block(Vec<Statement>),
     Expression(Expr),
+    /// Parser-internal marker recording a parameter's default initializer.
+    /// The interpreter extracts these while creating the function (before
+    /// any body statement runs) and evaluates them during parameter
+    /// binding, so they never execute as ordinary statements.
+    ParameterDefault {
+        index: usize,
+        value: Expr,
+        offset: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,6 +290,43 @@ pub(super) enum Expr {
     Arrow {
         parameters: Vec<String>,
         body: Vec<Statement>,
+        offset: usize,
+    },
+    /// `class [Name] [extends Base] { ... }` as an expression.
+    Class {
+        name: Option<String>,
+        super_class: Option<Box<Expr>>,
+        elements: Vec<ClassElement>,
+        offset: usize,
+    },
+    /// `super.name` inside a method: a property reference with the current
+    /// receiver as its get/set receiver.
+    SuperMember {
+        property: String,
+        offset: usize,
+    },
+    /// `super[expression]`.
+    SuperComputedMember {
+        property: Box<Self>,
+        offset: usize,
+    },
+    /// `super(...)` inside a derived constructor.
+    SuperCall {
+        arguments: Vec<Self>,
+        offset: usize,
+    },
+    /// `new.target`.
+    NewTarget,
+    /// `object.#name`.
+    PrivateMember {
+        object: Box<Self>,
+        name: String,
+        offset: usize,
+    },
+    /// `#name in object`.
+    PrivateIn {
+        name: String,
+        object: Box<Self>,
         offset: usize,
     },
     Object(Vec<ObjectProperty>),
@@ -305,11 +391,105 @@ pub(super) enum Expr {
         value: Box<Self>,
         offset: usize,
     },
+    /// `target &&= value`, `target ||= value`, `target ??= value`: the
+    /// operator's short-circuit decision chooses whether the write happens.
+    LogicalAssignment {
+        target: Box<Self>,
+        operator: BinaryOp,
+        value: Box<Self>,
+        offset: usize,
+    },
     Sequence(Vec<Self>),
 }
 
 pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
     Parser::new(tokens, limits).program()
+}
+
+/// Whether the token after a class modifier keyword (`get`, `set`, `async`,
+/// `static`) lets it act as a modifier instead of an element name. A name
+/// followed by `(`/`=`/`;`/`}` (or nothing) is an ordinary element.
+fn class_modifier_follows(next: Option<&TokenKind>) -> bool {
+    !matches!(
+        next,
+        None | Some(
+            TokenKind::LeftParen | TokenKind::Equal | TokenKind::Semicolon | TokenKind::RightBrace
+        )
+    )
+}
+
+/// Class-body early errors (ECMA-262 §15.7.1): at most one constructor, no
+/// field named `constructor`, no static element named `prototype`, no
+/// private name `#constructor`, and no duplicate private names.
+fn validate_class_elements(elements: &[ClassElement]) -> Result<(), JsError> {
+    let mut constructors = 0usize;
+    // Private name -> the kinds already declared under it; a getter/setter
+    // pair may share one name, anything else is a duplicate.
+    let mut private_kinds: BTreeMap<String, Vec<ClassElementKind>> = BTreeMap::new();
+    for element in elements {
+        if let PropertyKey::Private(name) = &element.key {
+            if name == "constructor" {
+                return Err(JsError::syntax(
+                    "private name #constructor is invalid",
+                    element.offset,
+                ));
+            }
+            let kinds = private_kinds.entry(name.clone()).or_default();
+            let paired = kinds.len() == 1
+                && matches!(
+                    (kinds[0], element.kind),
+                    (ClassElementKind::Get, ClassElementKind::Set)
+                        | (ClassElementKind::Set, ClassElementKind::Get)
+                );
+            if !paired && !kinds.is_empty() {
+                return Err(JsError::syntax(
+                    format!("private name #{name} is declared twice"),
+                    element.offset,
+                ));
+            }
+            kinds.push(element.kind);
+        }
+        match (element.kind, element.is_static) {
+            (ClassElementKind::Constructor, false) => {
+                constructors += 1;
+                if constructors > 1 {
+                    return Err(JsError::syntax(
+                        "class may only have one constructor",
+                        element.offset,
+                    ));
+                }
+                if element.is_async || element.is_generator {
+                    return Err(JsError::syntax(
+                        "class constructor may not be an async or generator method",
+                        element.offset,
+                    ));
+                }
+            }
+            (_, false) => {
+                if matches!(
+                    &element.key,
+                    PropertyKey::Static(name) if name == "constructor"
+                ) && matches!(
+                    element.kind,
+                    ClassElementKind::Field | ClassElementKind::Get | ClassElementKind::Set
+                ) {
+                    return Err(JsError::syntax(
+                        "class may not have a field or accessor named constructor",
+                        element.offset,
+                    ));
+                }
+            }
+            (_, true) => {
+                if matches!(&element.key, PropertyKey::Static(name) if name == "prototype") {
+                    return Err(JsError::syntax(
+                        "static class element may not be named prototype",
+                        element.offset,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Parser {
@@ -323,6 +503,7 @@ impl Parser {
             function_depth: 0,
             loop_depth: 0,
             switch_depth: 0,
+            class_depth: 0,
             no_in: false,
         }
     }
@@ -337,6 +518,9 @@ struct Parser {
     function_depth: usize,
     loop_depth: usize,
     switch_depth: usize,
+    /// Nesting depth of class bodies currently being parsed; `#name`
+    /// references and `#name in` are only valid inside one.
+    class_depth: usize,
     /// While set, `in` is not treated as a binary operator (for-heads).
     no_in: bool,
 }
@@ -406,20 +590,16 @@ impl Parser {
         }
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "class") {
             self.advance();
-            let name = match self.current().kind.clone() {
-                TokenKind::Identifier(name) => {
-                    self.advance();
-                    name
-                }
-                _ => format!("__class_{}", self.current().offset),
+            let TokenKind::Identifier(name) = self.current().kind.clone() else {
+                return Err(self.error("class declaration requires a name"));
             };
-            let value = self.class_expression_tail(Some(name.clone()))?;
-            self.end_statement();
-            return Ok(Statement::Variable {
+            self.advance();
+            let (super_class, elements) = self.class_tail()?;
+            return Ok(Statement::Class {
                 offset: self.previous_offset(),
-                kind: VariableKind::Const,
                 name,
-                value: Some(value),
+                super_class,
+                elements,
             });
         }
         if matches!(
@@ -1121,9 +1301,33 @@ impl Parser {
             self.assignment_value(target, Some(BinaryOp::RightShift))
         } else if self.take(&TokenKind::UnsignedRightShiftEqual) {
             self.assignment_value(target, Some(BinaryOp::UnsignedRightShift))
+        } else if self.take(&TokenKind::AndAndEqual) {
+            self.logical_assignment_value(target, BinaryOp::LogicalAnd)
+        } else if self.take(&TokenKind::OrOrEqual) {
+            self.logical_assignment_value(target, BinaryOp::LogicalOr)
+        } else if self.take(&TokenKind::QuestionQuestionEqual) {
+            self.logical_assignment_value(target, BinaryOp::Nullish)
         } else {
             Ok(target)
         }
+    }
+
+    /// `x &&= y`, `x ||= y`, `x ??= y`: a short-circuit assignment whose
+    /// right-hand side only evaluates (and writes) when the current value
+    /// fails to short-circuit.
+    fn logical_assignment_value(
+        &mut self,
+        target: Expr,
+        operator: BinaryOp,
+    ) -> Result<Expr, JsError> {
+        self.validate_assignment_target(&target)?;
+        let value = self.assignment()?;
+        Ok(Expr::LogicalAssignment {
+            offset: self.previous_offset(),
+            target: Box::new(target),
+            operator,
+            value: Box::new(value),
+        })
     }
 
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
@@ -1139,6 +1343,7 @@ impl Parser {
             self.advance();
         }
         let mut patterns = Vec::new();
+        let mut defaults: Vec<Statement> = Vec::new();
         let parameters = if let TokenKind::Identifier(name) = &self.current().kind {
             let name = name.clone();
             self.advance();
@@ -1178,7 +1383,12 @@ impl Parser {
                         };
                     let has_default = self.take(&TokenKind::Equal);
                     if has_default {
-                        let _ = self.assignment()?;
+                        let value = self.assignment()?;
+                        defaults.push(Statement::ParameterDefault {
+                            index: parameters.len(),
+                            value,
+                            offset: self.previous_offset(),
+                        });
                     }
                     parameters.push(if has_default {
                         format!("{PARAMETER_DEFAULT_MARKER}{parameter}")
@@ -1216,6 +1426,10 @@ impl Parser {
         } else {
             vec![Statement::Return(Some(self.assignment()?))]
         };
+        if !defaults.is_empty() {
+            defaults.extend(body);
+            body = defaults;
+        }
         if !patterns.is_empty() {
             let mut declarations = Vec::new();
             for (temporary, pattern) in patterns {
@@ -1272,6 +1486,9 @@ impl Parser {
                 | Expr::ComputedMember { .. }
                 | Expr::Array(_)
                 | Expr::Object(_)
+                | Expr::PrivateMember { .. }
+                | Expr::SuperMember { .. }
+                | Expr::SuperComputedMember { .. }
         ) {
             Ok(())
         } else {
@@ -1280,7 +1497,7 @@ impl Parser {
     }
 
     fn conditional(&mut self) -> Result<Expr, JsError> {
-        let condition = self.logical_or()?;
+        let condition = self.nullish()?;
         if !self.take(&TokenKind::Question) {
             return Ok(condition);
         }
@@ -1299,6 +1516,15 @@ impl Parser {
         self.binary_level(
             Self::logical_and,
             &[(&TokenKind::OrOr, BinaryOp::LogicalOr)],
+        )
+    }
+
+    /// `??` binds tighter than `||` in this parser's table; the spec forbids
+    /// mixing them unparenthesized, which this engine accepts.
+    fn nullish(&mut self) -> Result<Expr, JsError> {
+        self.binary_level(
+            Self::logical_or,
+            &[(&TokenKind::QuestionQuestion, BinaryOp::Nullish)],
         )
     }
 
@@ -1421,6 +1647,25 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expr, JsError> {
+        if let TokenKind::PrivateName(name) = self.current().kind.clone()
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::In)
+            )
+        {
+            if self.class_depth == 0 {
+                return Err(self.error("private names are only allowed in class bodies"));
+            }
+            let offset = self.current().offset;
+            self.advance();
+            self.advance();
+            let object = self.unary()?;
+            return Ok(Expr::PrivateIn {
+                name,
+                object: Box::new(object),
+                offset,
+            });
+        }
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await") {
             // Promise suspension is outside the synchronous interpreter, but
             // await has unary expression precedence. Parsing it here avoids
@@ -1497,6 +1742,19 @@ impl Parser {
             });
         }
         if self.take(&TokenKind::New) {
+            if self.take(&TokenKind::Dot) {
+                let property = self.property_name()?;
+                if property != "target" {
+                    return Err(self.error("expected 'new.target'"));
+                }
+                // `new.target` is only valid in function code, eval code
+                // contained in a function, and class field/static-block
+                // initializers.
+                if self.function_depth == 0 && self.class_depth == 0 {
+                    return Err(self.error("new.target is only allowed inside functions"));
+                }
+                return self.postfix_tail(Expr::NewTarget);
+            }
             // `new` binds to a whole member chain (`new A.B.C(...)`), so
             // consume dots/computed members BEFORE the argument list.
             let mut target = self.primary()?;
@@ -1564,6 +1822,18 @@ impl Parser {
     fn postfix_tail(&mut self, mut expression: Expr) -> Result<Expr, JsError> {
         loop {
             if self.take(&TokenKind::Dot) {
+                if let TokenKind::PrivateName(name) = self.current().kind.clone() {
+                    if self.class_depth == 0 {
+                        return Err(self.error("private names are only allowed in class bodies"));
+                    }
+                    self.advance();
+                    expression = Expr::PrivateMember {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        name,
+                    };
+                    continue;
+                }
                 let property = self.property_name()?;
                 expression = Expr::Member {
                     offset: self.previous_offset(),
@@ -1637,7 +1907,30 @@ impl Parser {
                 let _ = self.take(&TokenKind::Star);
                 self.function_expression()
             }
-            TokenKind::Identifier(name) if name == "class" => self.class_expression_tail(None),
+            TokenKind::Identifier(name) if name == "class" => {
+                // An anonymous class may be followed by `extends`; only a
+                // real identifier names the class.
+                let name = if let TokenKind::Identifier(name) = self.current().kind.clone()
+                    && name != "extends"
+                {
+                    self.advance();
+                    Some(name)
+                } else {
+                    None
+                };
+                let (super_class, elements) = self.class_tail()?;
+                Ok(Expr::Class {
+                    offset: self.previous_offset(),
+                    name,
+                    super_class,
+                    elements,
+                })
+            }
+            TokenKind::Identifier(name) if name == "super" => self.super_expression(token.offset),
+            TokenKind::PrivateName(name) => Err(JsError::syntax(
+                format!("private name #{name} must be followed by 'in'"),
+                token.offset,
+            )),
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
@@ -1678,40 +1971,197 @@ impl Parser {
         }
     }
 
-    /// Parse a class header and skip its method body. The runtime represents
-    /// classes as ordinary constructible functions; consuming the complete
-    /// balanced body is still valuable because modern bundles use class syntax
-    /// heavily even when a particular class is never instantiated during the
-    /// initial render.
-    fn class_expression_tail(&mut self, name: Option<String>) -> Result<Expr, JsError> {
-        if name.is_none() && matches!(self.current().kind, TokenKind::Identifier(_)) {
+    /// `super` in primary position: `super(...)`, `super.name`, or
+    /// `super[expr]`. A following call/member chain is handled by the
+    /// postfix tail, which sees the resulting value expression.
+    fn super_expression(&mut self, offset: usize) -> Result<Expr, JsError> {
+        if self.at(&TokenKind::LeftParen) {
             self.advance();
+            let arguments = self.arguments_after_left_paren()?;
+            return Ok(Expr::SuperCall { arguments, offset });
         }
-        if matches!(&self.current().kind, TokenKind::Identifier(value) if value == "extends") {
+        if self.take(&TokenKind::Dot) {
+            let property = self.property_name()?;
+            return Ok(Expr::SuperMember { property, offset });
+        }
+        if self.take(&TokenKind::LeftBracket) {
+            let property = self.assignment()?;
+            self.require(
+                &TokenKind::RightBracket,
+                "expected ']' after computed super property",
+            )?;
+            return Ok(Expr::SuperComputedMember {
+                property: Box::new(property),
+                offset,
+            });
+        }
+        Err(JsError::syntax(
+            "'super' must be followed by '(' or a property access",
+            offset,
+        ))
+    }
+
+    /// Parse the `[extends Base] { elements }` tail shared by class
+    /// declarations and expressions, with the class name already consumed.
+    fn class_tail(&mut self) -> Result<(Option<Box<Expr>>, Vec<ClassElement>), JsError> {
+        let super_class = if matches!(&self.current().kind, TokenKind::Identifier(value) if value == "extends")
+        {
             self.advance();
-            while !self.at(&TokenKind::LeftBrace) && !self.at(&TokenKind::Eof) {
-                self.advance();
-            }
-        }
+            // `extends` takes a LeftHandSideExpression: member chains and
+            // calls (`extends mixin(A)`), never a bare `new`.
+            Some(Box::new(self.postfix()?))
+        } else {
+            None
+        };
         self.require(&TokenKind::LeftBrace, "expected '{' after class header")?;
-        let mut depth = 1_u32;
-        while depth > 0 && !self.at(&TokenKind::Eof) {
-            match self.current().kind {
-                TokenKind::LeftBrace => depth = depth.saturating_add(1),
-                TokenKind::RightBrace => depth = depth.saturating_sub(1),
-                _ => {}
+        self.class_depth = self.class_depth.saturating_add(1);
+        let mut elements = Vec::new();
+        while !self.at(&TokenKind::RightBrace) {
+            if self.at(&TokenKind::Eof) {
+                self.class_depth = self.class_depth.saturating_sub(1);
+                return Err(self.error("unterminated class body"));
             }
+            if self.take(&TokenKind::Semicolon) {
+                continue;
+            }
+            match self.class_element() {
+                Ok(element) => elements.push(element),
+                Err(error) => {
+                    self.class_depth = self.class_depth.saturating_sub(1);
+                    return Err(error);
+                }
+            }
+        }
+        self.class_depth = self.class_depth.saturating_sub(1);
+        self.require(&TokenKind::RightBrace, "expected '}' after class body")?;
+        validate_class_elements(&elements)?;
+        Ok((super_class, elements))
+    }
+
+    /// Parse one class body element: a method, accessor, constructor, field,
+    /// or static initialization block.
+    fn class_element(&mut self) -> Result<ClassElement, JsError> {
+        let offset = self.current().offset;
+        let static_start = self.current().offset;
+        let mut is_static = false;
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "static")
+            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+        {
             self.advance();
+            is_static = true;
+            if self.take(&TokenKind::LeftBrace) {
+                let body = self.statement_list(true)?;
+                self.require(&TokenKind::RightBrace, "expected '}' after static block")?;
+                return Ok(ClassElement {
+                    key: PropertyKey::Static("static".to_owned()),
+                    kind: ClassElementKind::StaticBlock,
+                    is_static: true,
+                    is_async: false,
+                    is_generator: false,
+                    parameters: Vec::new(),
+                    body,
+                    initializer: None,
+                    offset: static_start,
+                });
+            }
         }
-        if depth != 0 {
-            return Err(self.error("unterminated class body"));
+        let mut kind = ClassElementKind::Method;
+        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "get" || name == "set")
+            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+        {
+            let TokenKind::Identifier(name) = self.advance().kind else {
+                unreachable!("checked above");
+            };
+            kind = if name == "get" {
+                ClassElementKind::Get
+            } else {
+                ClassElementKind::Set
+            };
         }
-        Ok(Expr::Function {
-            offset: self.previous_offset(),
-            name,
+        let mut is_async = false;
+        if matches!(kind, ClassElementKind::Method)
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+        {
+            self.advance();
+            is_async = true;
+        }
+        let is_generator = self.take(&TokenKind::Star);
+        let key = self.class_element_key()?;
+        if self.at(&TokenKind::LeftParen) {
+            let (parameters, body) = self.function_tail()?;
+            let kind = if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
+                kind
+            } else if !is_static
+                && matches!(&key, PropertyKey::Static(name) if name == "constructor")
+            {
+                ClassElementKind::Constructor
+            } else {
+                ClassElementKind::Method
+            };
+            return Ok(ClassElement {
+                key,
+                kind,
+                is_static,
+                is_async,
+                is_generator,
+                parameters,
+                body,
+                initializer: None,
+                offset,
+            });
+        }
+        if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
+            return Err(self.error("expected '(' after accessor name"));
+        }
+        if is_async || is_generator {
+            return Err(self.error("expected '(' after method name"));
+        }
+        let initializer = if self.take(&TokenKind::Equal) {
+            Some(self.assignment()?)
+        } else {
+            None
+        };
+        self.class_field_terminator()?;
+        Ok(ClassElement {
+            key,
+            kind: ClassElementKind::Field,
+            is_static,
+            is_async: false,
+            is_generator: false,
             parameters: Vec::new(),
             body: Vec::new(),
+            initializer,
+            offset,
         })
+    }
+
+    /// Field terminator with automatic semicolon insertion: an explicit `;`,
+    /// the next element on a new line, or the class body's closing brace.
+    fn class_field_terminator(&mut self) -> Result<(), JsError> {
+        if self.take(&TokenKind::Semicolon) || self.at(&TokenKind::RightBrace) {
+            return Ok(());
+        }
+        if self.current().after_newline {
+            return Ok(());
+        }
+        Err(self.error("expected ';' after class field"))
+    }
+
+    fn class_element_key(&mut self) -> Result<PropertyKey, JsError> {
+        if let TokenKind::PrivateName(name) = self.current().kind.clone() {
+            self.advance();
+            return Ok(PropertyKey::Private(name));
+        }
+        if self.take(&TokenKind::LeftBracket) {
+            let key = self.assignment()?;
+            self.require(
+                &TokenKind::RightBracket,
+                "expected ']' after computed class element name",
+            )?;
+            return Ok(PropertyKey::Computed(key));
+        }
+        Ok(PropertyKey::Static(self.property_name()?))
     }
 
     fn template_literal(
@@ -1770,12 +2220,17 @@ impl Parser {
             "expected '(' before function parameters",
         )?;
         let mut parameters = Vec::new();
+        let mut defaults: Vec<Statement> = Vec::new();
+        let mut bound = BTreeSet::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
                 if self.take(&TokenKind::Ellipsis) {
                     let TokenKind::Identifier(parameter) = self.advance().kind else {
                         return Err(self.error("expected a rest parameter name"));
                     };
+                    if !bound.insert(parameter.clone()) {
+                        return Err(self.error("duplicate function parameters are not supported"));
+                    }
                     parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                     break;
                 }
@@ -1801,10 +2256,15 @@ impl Parser {
                 }
                 let has_default = self.take(&TokenKind::Equal);
                 if has_default {
-                    let _ = self.assignment()?;
+                    let value = self.assignment()?;
+                    defaults.push(Statement::ParameterDefault {
+                        index: parameters.len(),
+                        value,
+                        offset: self.previous_offset(),
+                    });
                 }
                 for parameter in bound_names {
-                    if parameters.contains(&parameter) {
+                    if !bound.insert(parameter.clone()) {
                         return Err(self.error("duplicate function parameters are not supported"));
                     }
                     parameters.push(if has_default {
@@ -1830,8 +2290,12 @@ impl Parser {
         self.function_depth = previous_function_depth;
         self.loop_depth = previous_loop_depth;
         self.no_in = previous_no_in;
-        let body = body?;
+        let mut body = body?;
         self.require(&TokenKind::RightBrace, "expected '}' after function body")?;
+        if !defaults.is_empty() {
+            defaults.extend(body);
+            body = defaults;
+        }
         Ok((parameters, body))
     }
 
@@ -2286,6 +2750,20 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             Ok(())
         }
         Statement::Expression(expression) => validate_strict_expression(expression),
+        Statement::Class {
+            name,
+            super_class,
+            elements,
+            ..
+        } => {
+            if is_strict_reserved_word(name) {
+                return Err(JsError::syntax(
+                    format!("{name} is reserved in strict mode"),
+                    0,
+                ));
+            }
+            validate_strict_class(super_class.as_deref(), elements)
+        }
         Statement::Variable { value, .. } => {
             value.as_ref().map_or(Ok(()), validate_strict_expression)
         }
@@ -2295,13 +2773,16 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             .try_for_each(validate_strict_expression),
         Statement::Return(value) => value.as_ref().map_or(Ok(()), validate_strict_expression),
         Statement::Throw(value) => validate_strict_expression(value),
+        Statement::ParameterDefault { value, .. } => validate_strict_expression(value),
         Statement::Break(_) | Statement::Continue(_) => Ok(()),
     }
 }
 
 fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
     match expression {
-        Expr::Assignment { target, value, .. } | Expr::CompoundAssignment { target, value, .. } => {
+        Expr::Assignment { target, value, .. }
+        | Expr::CompoundAssignment { target, value, .. }
+        | Expr::LogicalAssignment { target, value, .. } => {
             if matches!(target.as_ref(), Expr::Identifier(name) if is_strict_reserved_word(name)) {
                 return Err(JsError::syntax(
                     "assignment to a strict mode reserved word",
@@ -2389,7 +2870,427 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         }
         Expr::Literal(_) | Expr::RegexLiteral { .. } | Expr::This | Expr::Identifier(_) => Ok(()),
         Expr::Sequence(expressions) => expressions.iter().try_for_each(validate_strict_expression),
+        Expr::Class {
+            name,
+            super_class,
+            elements,
+            ..
+        } => {
+            if name.as_deref().is_some_and(is_strict_reserved_word) {
+                return Err(JsError::syntax("class name is reserved in strict mode", 0));
+            }
+            validate_strict_class(super_class.as_deref(), elements)
+        }
+        Expr::SuperMember { .. } | Expr::NewTarget => Ok(()),
+        Expr::SuperComputedMember { property, .. } => validate_strict_expression(property),
+        Expr::SuperCall { arguments, .. } => {
+            arguments.iter().try_for_each(validate_strict_expression)
+        }
+        Expr::PrivateMember { object, .. } | Expr::PrivateIn { object, .. } => {
+            validate_strict_expression(object)
+        }
     }
+}
+
+/// Class bodies are always strict code, so every element body and initializer
+/// is validated regardless of a `"use strict"` directive.
+fn validate_strict_class(
+    super_class: Option<&Expr>,
+    elements: &[ClassElement],
+) -> Result<(), JsError> {
+    if let Some(super_class) = super_class {
+        validate_strict_expression(super_class)?;
+    }
+    for element in elements {
+        if let PropertyKey::Computed(key) = &element.key {
+            validate_strict_expression(key)?;
+        }
+        if let Some(initializer) = &element.initializer {
+            validate_strict_expression(initializer)?;
+            // Class field initializers may not reference `await`/`yield`.
+            validate_reserved_expression(
+                initializer,
+                ReservedContext {
+                    async_context: true,
+                    generator_context: true,
+                },
+            )?;
+        }
+        if element
+            .parameters
+            .iter()
+            .any(|name| is_strict_reserved_word(name))
+        {
+            return Err(JsError::syntax(
+                "strict mode parameter uses a reserved word",
+                0,
+            ));
+        }
+        let context = ReservedContext {
+            async_context: element.is_async,
+            generator_context: element.is_generator,
+        };
+        for statement in &element.body {
+            validate_reserved_statement(statement, context)?;
+        }
+        validate_strict_statements(&element.body)?;
+    }
+    Ok(())
+}
+
+/// Whether an async or generator context reserves the given identifier.
+#[derive(Clone, Copy, Default)]
+struct ReservedContext {
+    async_context: bool,
+    generator_context: bool,
+}
+
+/// Strip a parameter's default/rest marker to recover its binding name.
+fn parameter_binding_name(parameter: &str) -> &str {
+    parameter
+        .strip_prefix(PARAMETER_DEFAULT_MARKER)
+        .or_else(|| parameter.strip_prefix(PARAMETER_REST_MARKER))
+        .unwrap_or(parameter)
+}
+
+fn check_reserved_identifier(name: &str, context: ReservedContext) -> Result<(), JsError> {
+    if context.async_context && name == "await" {
+        return Err(JsError::syntax(
+            "'await' is not allowed in this async context",
+            0,
+        ));
+    }
+    if context.generator_context && name == "yield" {
+        return Err(JsError::syntax(
+            "'yield' is not allowed as an identifier in a generator",
+            0,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_reserved_parameters(
+    parameters: &[String],
+    context: ReservedContext,
+) -> Result<(), JsError> {
+    for parameter in parameters {
+        check_reserved_identifier(parameter_binding_name(parameter), context)?;
+    }
+    Ok(())
+}
+
+fn validate_reserved_statements(
+    statements: &[Statement],
+    context: ReservedContext,
+) -> Result<(), JsError> {
+    for statement in statements {
+        validate_reserved_statement(statement, context)?;
+    }
+    Ok(())
+}
+
+/// Validate a nested class's elements against async/generator reservations.
+fn validate_reserved_class(elements: &[ClassElement]) -> Result<(), JsError> {
+    for element in elements {
+        if let PropertyKey::Computed(key) = &element.key {
+            validate_reserved_expression(key, ReservedContext::default())?;
+        }
+        if let Some(initializer) = &element.initializer {
+            validate_reserved_expression(
+                initializer,
+                ReservedContext {
+                    async_context: true,
+                    generator_context: true,
+                },
+            )?;
+        }
+        let context = ReservedContext {
+            async_context: element.is_async,
+            generator_context: element.is_generator,
+        };
+        for statement in &element.body {
+            validate_reserved_statement(statement, context)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_reserved_statement(
+    statement: &Statement,
+    context: ReservedContext,
+) -> Result<(), JsError> {
+    match statement {
+        Statement::Variable { name, value, .. } => {
+            check_reserved_identifier(name, context)?;
+            if let Some(value) = value {
+                validate_reserved_expression(value, context)?;
+            }
+        }
+        Statement::VariableList { declarations, .. } => {
+            for (name, value) in declarations {
+                check_reserved_identifier(name, context)?;
+                if let Some(value) = value {
+                    validate_reserved_expression(value, context)?;
+                }
+            }
+        }
+        Statement::Function {
+            name,
+            parameters,
+            body,
+            ..
+        } => {
+            check_reserved_identifier(name, context)?;
+            validate_reserved_parameters(parameters, context)?;
+            validate_reserved_statements(body, ReservedContext::default())?;
+        }
+        Statement::Class {
+            name,
+            super_class,
+            elements,
+            ..
+        } => {
+            check_reserved_identifier(name, context)?;
+            if let Some(super_class) = super_class {
+                validate_reserved_expression(super_class, context)?;
+            }
+            validate_reserved_class(elements)?;
+        }
+        Statement::Return(value) => {
+            if let Some(value) = value {
+                validate_reserved_expression(value, context)?;
+            }
+        }
+        Statement::Throw(value) | Statement::Expression(value) => {
+            validate_reserved_expression(value, context)?;
+        }
+        Statement::If {
+            condition,
+            consequent,
+            alternate,
+            ..
+        } => {
+            validate_reserved_expression(condition, context)?;
+            validate_reserved_statement(consequent, context)?;
+            if let Some(alternate) = alternate {
+                validate_reserved_statement(alternate, context)?;
+            }
+        }
+        Statement::Switch {
+            expression, cases, ..
+        } => {
+            validate_reserved_expression(expression, context)?;
+            for (tests, statements) in cases {
+                for test in tests {
+                    validate_reserved_expression(test, context)?;
+                }
+                validate_reserved_statements(statements, context)?;
+            }
+        }
+        Statement::While {
+            condition, body, ..
+        } => {
+            validate_reserved_expression(condition, context)?;
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::DoWhile {
+            condition, body, ..
+        } => {
+            validate_reserved_expression(condition, context)?;
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::For {
+            initializer,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            if let Some(initializer) = initializer {
+                validate_reserved_statement(initializer, context)?;
+            }
+            if let Some(condition) = condition {
+                validate_reserved_expression(condition, context)?;
+            }
+            if let Some(update) = update {
+                validate_reserved_expression(update, context)?;
+            }
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::ForIn {
+            name,
+            iterable,
+            body,
+            ..
+        }
+        | Statement::ForOf {
+            name,
+            iterable,
+            body,
+            ..
+        } => {
+            check_reserved_identifier(name, context)?;
+            validate_reserved_expression(iterable, context)?;
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::ForInExpr {
+            target,
+            iterable,
+            body,
+            ..
+        } => {
+            validate_reserved_expression(target, context)?;
+            validate_reserved_expression(iterable, context)?;
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::Labeled { label, body, .. } => {
+            check_reserved_identifier(label, context)?;
+            validate_reserved_statement(body, context)?;
+        }
+        Statement::Try {
+            body,
+            catch,
+            finally,
+            ..
+        } => {
+            validate_reserved_statements(body, context)?;
+            if let Some(catch) = catch {
+                check_reserved_identifier(&catch.parameter, context)?;
+                validate_reserved_statements(&catch.body, context)?;
+            }
+            if let Some(finally) = finally {
+                validate_reserved_statements(finally, context)?;
+            }
+        }
+        Statement::Block(statements) => validate_reserved_statements(statements, context)?,
+        Statement::ParameterDefault { value, .. } => {
+            validate_reserved_expression(value, context)?;
+        }
+        Statement::Break(_) | Statement::Continue(_) => {}
+    }
+    Ok(())
+}
+
+fn validate_reserved_expression(
+    expression: &Expr,
+    context: ReservedContext,
+) -> Result<(), JsError> {
+    match expression {
+        Expr::Identifier(name) => check_reserved_identifier(name, context)?,
+        Expr::Function {
+            name,
+            parameters,
+            body,
+            ..
+        } => {
+            if let Some(name) = name {
+                check_reserved_identifier(name, context)?;
+            }
+            validate_reserved_parameters(parameters, context)?;
+            validate_reserved_statements(body, ReservedContext::default())?;
+        }
+        Expr::Arrow {
+            parameters, body, ..
+        } => {
+            validate_reserved_parameters(parameters, context)?;
+            validate_reserved_statements(body, ReservedContext::default())?;
+        }
+        Expr::Class {
+            name,
+            super_class,
+            elements,
+            ..
+        } => {
+            if let Some(name) = name {
+                check_reserved_identifier(name, context)?;
+            }
+            if let Some(super_class) = super_class {
+                validate_reserved_expression(super_class, context)?;
+            }
+            validate_reserved_class(elements)?;
+        }
+        Expr::Object(properties) => {
+            for property in properties {
+                if let PropertyKey::Computed(key) = &property.key {
+                    validate_reserved_expression(key, context)?;
+                }
+                validate_reserved_expression(&property.value, context)?;
+            }
+        }
+        Expr::Array(elements) => {
+            for element in elements {
+                validate_reserved_expression(element, context)?;
+            }
+        }
+        Expr::Spread(inner) => validate_reserved_expression(inner, context)?,
+        Expr::ObjectRest { object, .. } => validate_reserved_expression(object, context)?,
+        Expr::Unary { operand, .. } => validate_reserved_expression(operand, context)?,
+        Expr::Binary { left, right, .. } => {
+            validate_reserved_expression(left, context)?;
+            validate_reserved_expression(right, context)?;
+        }
+        Expr::Conditional {
+            condition,
+            consequent,
+            alternate,
+            ..
+        } => {
+            validate_reserved_expression(condition, context)?;
+            validate_reserved_expression(consequent, context)?;
+            validate_reserved_expression(alternate, context)?;
+        }
+        Expr::Update { target, .. } => validate_reserved_expression(target, context)?,
+        Expr::Member { object, .. } => validate_reserved_expression(object, context)?,
+        Expr::ComputedMember {
+            object, property, ..
+        } => {
+            validate_reserved_expression(object, context)?;
+            validate_reserved_expression(property, context)?;
+        }
+        Expr::New {
+            constructor,
+            arguments,
+            ..
+        }
+        | Expr::Call {
+            callee: constructor,
+            arguments,
+            ..
+        } => {
+            validate_reserved_expression(constructor, context)?;
+            for argument in arguments {
+                validate_reserved_expression(argument, context)?;
+            }
+        }
+        Expr::Assignment { target, value, .. }
+        | Expr::CompoundAssignment { target, value, .. }
+        | Expr::LogicalAssignment { target, value, .. } => {
+            validate_reserved_expression(target, context)?;
+            validate_reserved_expression(value, context)?;
+        }
+        Expr::Sequence(expressions) => {
+            for expression in expressions {
+                validate_reserved_expression(expression, context)?;
+            }
+        }
+        Expr::SuperComputedMember { property, .. } => {
+            validate_reserved_expression(property, context)?;
+        }
+        Expr::SuperCall { arguments, .. } => {
+            for argument in arguments {
+                validate_reserved_expression(argument, context)?;
+            }
+        }
+        Expr::PrivateMember { object, .. } | Expr::PrivateIn { object, .. } => {
+            validate_reserved_expression(object, context)?;
+        }
+        Expr::Literal(_)
+        | Expr::RegexLiteral { .. }
+        | Expr::This
+        | Expr::SuperMember { .. }
+        | Expr::NewTarget => {}
+    }
+    Ok(())
 }
 
 fn is_strict_reserved_word(name: &str) -> bool {

@@ -18,6 +18,6 @@ pub use transport::{
     ByteRange, CacheValidators, CancelToken, ContentType, FetchConfig, FetchError, FetchRequest,
     FetchResponse, FetchResult, Header, HttpMethod, HttpStatus, HttpTransport, RedirectResponse,
 };
-pub use worker::{NetworkWorker, NetworkWorkerConfig, RequestHandle};
+pub use worker::{NetworkWorker, NetworkWorkerConfig, RequestHandle, queue_full_message};
 
 pub use url::Url;

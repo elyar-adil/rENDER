@@ -51,13 +51,20 @@ use render_browser::chrome::ChromeLayout;
 use render_browser::chrome::ChromeTheme;
 use render_browser::chrome::HitTarget;
 use render_browser::chrome::Point;
+use render_browser::chrome::Rect;
+use render_browser::chrome::ScrollbarGeometry;
 use render_browser::chrome::TabDrag;
+use render_browser::chrome::TextPainter;
 use render_browser::chrome::TitleBarClickTracker;
 use render_browser::chrome::TitleBarGesture;
 use render_browser::chrome::WindowAction;
 use render_browser::chrome::address_index_at_x;
+use render_browser::chrome::focus_accent;
 use render_browser::chrome::paint_address_context_menu;
 use render_browser::chrome::paint_chrome;
+use render_browser::chrome::paint_scrollbar;
+use render_browser::chrome::scrollbar_geometry;
+use render_browser::chrome::scrollbar_scroll_offset;
 use render_browser::editor::AddressCommand;
 use render_browser::editor::AddressEditor;
 use render_browser::editor::Clipboard;
@@ -90,7 +97,9 @@ use render_core::js::{FetchOutcome, PendingFetch};
 use render_core::layout::PhysicalPoint;
 use render_core::navigation::HistoryEntry;
 use render_core::page::PageDomEvent;
+use render_core::paint::DisplayCommand;
 use render_core::script::ScriptDiscoveryLimits;
+use render_net::CancelToken;
 use render_net::FetchError;
 use render_net::FetchRequest;
 use render_net::FetchResult;
@@ -106,7 +115,6 @@ use std::io;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -134,14 +142,6 @@ pub(super) enum HistoryMode {
     Current,
 }
 
-/// Total submission attempts, including the first, before a request parked
-/// behind a full network worker queue is allowed to surface the queue-full
-/// error through the normal polling path.
-const QUEUE_FULL_SUBMIT_ATTEMPTS: usize = 8;
-/// First backoff delay for queue-full resubmission; it doubles per attempt.
-const QUEUE_FULL_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(5);
-/// Ceiling for the queue-full backoff so the polling thread never stalls long.
-const QUEUE_FULL_RETRY_MAX_DELAY: Duration = Duration::from_millis(200);
 /// Rejection message produced by the render-net worker when its bounded
 /// command queue is full. The two crates share the wording by contract.
 const NETWORK_QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
@@ -174,7 +174,18 @@ pub(super) struct BrowserApp {
     pub(super) hot: HitTarget,
     pub(super) cursor_icon: CursorIcon,
     pub(super) drag: Option<TabDrag>,
+    /// Live tab-drag paint state: the dragged tab and per-tab paint offsets.
+    pub(super) tab_drag_paint: Option<(TabId, Vec<f32>)>,
+    /// Active page-scrollbar thumb drag: the pointer's grab offset inside
+    /// the thumb at press time.
+    pub(super) scrollbar_drag: Option<f32>,
+    /// Whether the pointer hovers the scrollbar track (thumb highlight).
+    pub(super) scrollbar_hot: bool,
     pub(super) address_selecting: bool,
+    /// True while the primary pointer is dragging through a focused page
+    /// text control.  The page editor owns the anchor/caret; this flag only
+    /// keeps pointer motion from being mistaken for tab dragging.
+    pub(super) content_selecting: bool,
     pub(super) address_menu: Option<AddressContextMenu>,
     pub(super) modifiers: ModifiersState,
     pub(super) title_bar_clicks: TitleBarClickTracker,
@@ -235,7 +246,11 @@ impl BrowserApp {
             hot: HitTarget::Chrome,
             cursor_icon: CursorIcon::Default,
             drag: None,
+            tab_drag_paint: None,
+            scrollbar_drag: None,
+            scrollbar_hot: false,
             address_selecting: false,
+            content_selecting: false,
             address_menu: None,
             modifiers: ModifiersState::default(),
             title_bar_clicks: TitleBarClickTracker::default(),
@@ -251,6 +266,9 @@ impl BrowserApp {
     ) -> Result<(), Box<dyn Error>> {
         let attributes = Window::default_attributes()
             .with_title("rENDER")
+            // The browser shell owns a compact, cross-platform title row. It
+            // keeps tabs and window actions in one modern row on every OS,
+            // while winit still supplies the native surface and input model.
             .with_decorations(false)
             .with_inner_size(LogicalSize::new(
                 f64::from(INITIAL_WIDTH),
@@ -315,14 +333,26 @@ impl BrowserApp {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
         };
-        page.render_generation = page.render_generation.saturating_add(1);
         if viewport.width == 0 || viewport.height == 0 {
+            page.render_generation = page.render_generation.saturating_add(1);
             page.frame.clear();
             page.viewport = viewport;
             page.expected_render = None;
+            page.render_dirty = false;
             self.render_worker.cancel_tab(id.as_u64());
             return;
         }
+        // A render for this tab is still running and its result stays
+        // committable. Superseding it on every DOM mutation would starve
+        // commits whenever mutations arrive faster than renders finish
+        // (the classic live-page stall); instead the running render wins,
+        // the mutation is remembered, and the coordinator resubmits right
+        // after the commit lands.
+        if self.render_worker.is_tab_busy(id.as_u64()) {
+            page.render_dirty = true;
+            return;
+        }
+        page.render_generation = page.render_generation.saturating_add(1);
         let identity = RenderIdentity {
             tab_id: id.as_u64(),
             generation: page.render_generation,
@@ -359,9 +389,10 @@ impl BrowserApp {
                 base_url: page.navigation.committed().target.history_url(),
                 external_style_sheets: page.style_sheets.clone(),
                 style_batch: page.style_batch.clone(),
-                discover_external_styles: !page.styles_resolved
-                    && page.pending_style_sheets.is_none()
-                    && page.style_batch.is_none(),
+                // Re-scan after DOM mutations as well as on initial load.
+                // Script-inserted links are common on real sites, and the
+                // completed batch may itself have raced with a new link.
+                discover_external_styles: page.pending_style_sheets.is_none(),
                 images: page.images.clone(),
             }))
         };
@@ -383,6 +414,10 @@ impl BrowserApp {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "render commit reads as one pipeline of style/geometry/frame updates"
+    )]
     pub(super) fn commit_render(&mut self, completed: CompletedRender<PageRenderFrame>) {
         let id = self
             .pages
@@ -448,7 +483,25 @@ impl BrowserApp {
                 page.styles_resolved = true;
                 self.tabs.set_loading(id, false);
             }
-            frame.style_plan
+            frame
+                .style_plan
+                .map(|mut plan| {
+                    // Retargeting a link invalidates its old key. If it later
+                    // points back to that URL, it needs a fresh request because
+                    // the parsed sheet was pruned from the active map.
+                    page.started_style_sheets
+                        .retain(|key| plan.resources.iter().any(|resource| &resource.key == key));
+                    page.started_style_sheets.extend(
+                        plan.resources
+                            .iter()
+                            .filter(|resource| page.style_sheets.get(&resource.key).is_some())
+                            .map(|resource| resource.key.clone()),
+                    );
+                    plan.resources
+                        .retain(|resource| !page.started_style_sheets.contains(&resource.key));
+                    plan
+                })
+                .filter(|plan| !plan.is_empty() || !page.styles_resolved)
         };
         report_stylesheet_diagnostics(&frame.style_diagnostics);
 
@@ -466,6 +519,21 @@ impl BrowserApp {
             self.request_redraw();
         } else {
             self.repaint_chrome();
+        }
+        // A DOM mutation arrived while this render was running: the commit
+        // just landed, so the worker is free and the page can resubmit to
+        // converge on its latest revision (bounded by the busy check inside
+        // schedule_page_render).
+        let dirty_viewport = self
+            .pages
+            .get(&id)
+            .filter(|page| page.render_dirty)
+            .map(|page| page.viewport);
+        if let Some(viewport) = dirty_viewport {
+            if let Some(page) = self.pages.get_mut(&id) {
+                page.render_dirty = false;
+            }
+            self.schedule_page_render(id, viewport, false);
         }
     }
 
@@ -492,11 +560,43 @@ impl BrowserApp {
                 layout.chrome_height,
             );
         }
+        let content_caret = self.content_caret_geometry(layout.chrome_height);
+        let content_selection = self.content_selection_geometry(layout.chrome_height);
+        let theme = self.theme;
+        // Scrollbar state is read before the canvas borrows the frame.
+        let scrollbar = self.active_scrollbar_geometry();
+        let scrollbar_dragging = self.scrollbar_drag.is_some();
+        let scrollbar_hot = self.scrollbar_hot || scrollbar_dragging;
         let mut canvas = Canvas::new(&mut self.frame, size.width, size.height);
+        if let Some(selection) = content_selection {
+            // Blend the highlight so the page's existing glyphs stay legible.
+            // The retained page raster is painted before this native editing
+            // overlay, so selection does not require a full page re-render.
+            canvas.with_clip(selection.clip, |canvas| {
+                canvas.blend_rect(selection.rect, content_selection_color(theme), 112);
+            });
+        }
+        if let Some(caret) = content_caret {
+            paint_content_caret(&mut canvas, caret, theme);
+        }
+        // The page scrollbar overlays the content raster beneath the chrome.
+        if let Some(geometry) = &scrollbar {
+            paint_scrollbar(
+                &mut canvas,
+                geometry,
+                scrollbar_hot,
+                scrollbar_dragging,
+                theme,
+            );
+        }
         let maximized = self
             .window
             .as_ref()
             .is_some_and(|window| window.is_maximized());
+        let drag_paint = self
+            .tab_drag_paint
+            .as_ref()
+            .map(|(tab, offsets)| (*tab, offsets.as_slice()));
         paint_chrome(
             &mut canvas,
             layout,
@@ -506,6 +606,7 @@ impl BrowserApp {
             self.theme,
             self.hot,
             maximized,
+            drag_paint,
             self.fonts.as_ref(),
         );
         if let Some(menu) = &self.address_menu {
@@ -521,6 +622,177 @@ impl BrowserApp {
         self.frame_size = size;
     }
 
+    /// Paint the insertion caret for the focused page control on top of the
+    /// retained page raster. Page controls are represented as ordinary layout
+    /// boxes and their value is converted to a formatting text child, so the
+    /// display list gives us the exact text origin and font size whenever the
+    /// control is non-empty. Empty controls use their computed padding and
+    /// border as a stable fallback until the first glyph is available.
+    pub(super) fn content_caret_geometry(&self, chrome_height: u32) -> Option<ContentCaret> {
+        let content = self.content_editor.as_ref()?;
+        if !content.editor.is_focused() || content.editor.selection().is_some() {
+            return None;
+        }
+        let page = self.pages.get(&content.tab)?;
+        let rect = page.geometry.get(&content.node.as_u64())?;
+        if rect.width <= 0.0 || rect.height <= 0.0 {
+            return None;
+        }
+
+        let mut glyph_origin = None;
+        let mut font_size = 16.0;
+        if let Some(display_list) = page.display_list.as_ref() {
+            for item in display_list.items() {
+                if item.source != Some(content.node) {
+                    continue;
+                }
+                if let DisplayCommand::GlyphRun(run) = &item.command {
+                    font_size = run.font_size.max(1.0);
+                    if let Some(first) = run.glyphs.first() {
+                        glyph_origin = Some(first.position.x);
+                    }
+                    break;
+                }
+            }
+        }
+
+        let border_left = page
+            .computed_styles
+            .get(&content.node)
+            .and_then(|style| style.get("border-left-width"))
+            .and_then(|value| parse_css_pixels(value.css_text()))
+            .unwrap_or(1.0)
+            .max(0.0);
+        let padding_left = page
+            .computed_styles
+            .get(&content.node)
+            .and_then(|style| style.get("padding-left"))
+            .and_then(|value| parse_css_pixels(value.css_text()))
+            .unwrap_or(4.0)
+            .max(0.0);
+        if glyph_origin.is_none() {
+            font_size = page
+                .computed_styles
+                .get(&content.node)
+                .and_then(|style| style.get("font-size"))
+                .and_then(|value| parse_css_pixels(value.css_text()))
+                .unwrap_or(font_size)
+                .max(1.0);
+        }
+        let base_x = glyph_origin.unwrap_or(rect.x + border_left + padding_left);
+        let prefix = &content.editor.text()[..content.editor.cursor()];
+        let cursor_width = self.fonts.measure(prefix, font_size);
+        let min_x = rect.x + border_left + 0.5;
+        let max_x = (rect.x + rect.width - border_left - 0.5).max(min_x);
+        let cursor_x = base_x.mul_add(1.0, cursor_width).clamp(min_x, max_x);
+
+        let scroll_y = page.scroll.offset_y();
+        let viewport_y = chrome_height as f32 + rect.y - scroll_y;
+        let caret_height = font_size.min((rect.height - 2.0).max(1.0));
+        let caret_y = viewport_y + (rect.height - caret_height).max(0.0) * 0.5;
+        Some(ContentCaret {
+            clip: Rect {
+                x: rect.x,
+                y: viewport_y,
+                width: rect.width,
+                height: rect.height,
+            },
+            rect: Rect {
+                x: cursor_x,
+                y: caret_y,
+                width: 1.5,
+                height: caret_height,
+            },
+        })
+    }
+
+    /// Paint geometry for a native selection in a page text control.  Page
+    /// text controls are rasterized as ordinary content, so selection is a
+    /// lightweight overlay that follows the same glyph origin as the caret.
+    pub(super) fn content_selection_geometry(
+        &self,
+        chrome_height: u32,
+    ) -> Option<ContentSelection> {
+        let content = self.content_editor.as_ref()?;
+        let (start, end) = content.editor.selection()?;
+        let page = self.pages.get(&content.tab)?;
+        let rect = page.geometry.get(&content.node.as_u64())?;
+        if rect.width <= 0.0 || rect.height <= 0.0 || start == end {
+            return None;
+        }
+
+        let mut base_x = rect.x + 1.0 + 4.0;
+        let mut font_size = 16.0;
+        let mut has_glyph_run = false;
+        if let Some(display_list) = page.display_list.as_ref() {
+            for item in display_list.items() {
+                if item.source != Some(content.node) {
+                    continue;
+                }
+                if let DisplayCommand::GlyphRun(run) = &item.command {
+                    has_glyph_run = true;
+                    font_size = run.font_size.max(1.0);
+                    if let Some(first) = run.glyphs.first() {
+                        base_x = first.position.x;
+                    }
+                    break;
+                }
+            }
+        }
+        let (border_left, padding_left) =
+            page.computed_styles
+                .get(&content.node)
+                .map_or((1.0, 4.0), |style| {
+                    let border = style
+                        .get("border-left-width")
+                        .and_then(|value| parse_css_pixels(value.css_text()))
+                        .unwrap_or(1.0)
+                        .max(0.0);
+                    let padding = style
+                        .get("padding-left")
+                        .and_then(|value| parse_css_pixels(value.css_text()))
+                        .unwrap_or(4.0)
+                        .max(0.0);
+                    if has_glyph_run {
+                        (border, padding)
+                    } else {
+                        font_size = style
+                            .get("font-size")
+                            .and_then(|value| parse_css_pixels(value.css_text()))
+                            .unwrap_or(font_size)
+                            .max(1.0);
+                        (border, padding)
+                    }
+                });
+        if !has_glyph_run {
+            base_x = rect.x + border_left + padding_left;
+        }
+        let value = content.editor.text();
+        let start_x = base_x + self.fonts.measure(&value[..start], font_size);
+        let end_x = base_x + self.fonts.measure(&value[..end], font_size);
+        let left = start_x.min(end_x).max(rect.x + border_left);
+        let right = end_x
+            .max(start_x)
+            .min(rect.x + rect.width - border_left)
+            .max(left);
+        let scroll_y = page.scroll.offset_y();
+        let viewport_y = chrome_height as f32 + rect.y - scroll_y;
+        Some(ContentSelection {
+            clip: Rect {
+                x: rect.x,
+                y: viewport_y,
+                width: rect.width,
+                height: rect.height,
+            },
+            rect: Rect {
+                x: left,
+                y: viewport_y,
+                width: right - left,
+                height: rect.height,
+            },
+        })
+    }
+
     pub(super) fn request_redraw(&self) {
         if let Some(window) = &self.window {
             window.request_redraw();
@@ -533,6 +805,12 @@ impl BrowserApp {
         };
         let size = window.inner_size();
         self.mark_chrome_damage(size);
+        // The focused page control caret is composited below the browser
+        // chrome. Include the page damage whenever it may have changed so a
+        // softbuffer present does not leave the old caret on screen.
+        if self.content_editor.is_some() {
+            self.mark_page_damage(size);
+        }
         self.compose_frame(size);
         self.request_redraw();
     }
@@ -612,6 +890,7 @@ impl BrowserApp {
     pub(super) fn handle_tab_intent(&mut self, intent: TabIntent) {
         if matches!(intent, TabIntent::Close(_)) {
             self.drag = None;
+            self.tab_drag_paint = None;
         }
         match intent {
             TabIntent::New => {
@@ -882,45 +1161,36 @@ impl BrowserApp {
         }
     }
 
-    /// Submits one request, retrying with bounded exponential backoff when the
-    /// network worker rejects it because its command queue is momentarily full.
+    /// Submits one request without ever blocking the event loop on a full
+    /// network-worker queue.
     ///
     /// Real pages fire dozens of concurrent subresource fetches; a burst like
-    /// that must not turn into hard per-resource failures. Once the worker
-    /// accepts the submission (or the retry budget is spent, leaving the last
-    /// handle to settle through the normal polling path) the handle is returned
-    /// unchanged. Every other immediate outcome, such as a stopped worker, is
-    /// surfaced exactly as the worker produced it.
+    /// that fills the worker's bounded command queue and a submission is then
+    /// rejected synchronously. Instead of sleeping on the UI thread (which
+    /// stalled first paints on resource-heavy pages), the request parks as
+    /// deferred work and the polling pass resubmits it once the queue drains.
+    /// Every other immediate outcome, such as a stopped worker, is surfaced
+    /// exactly as the worker produced it.
     fn submit_with_queue_full_backoff(
         &mut self,
         request: FetchRequest,
         epoch: CacheEpoch,
     ) -> CachedRequestHandle {
-        let mut delay = QUEUE_FULL_RETRY_INITIAL_DELAY;
-        let mut handle = self.network.submit(request.clone());
-        for _ in 1..QUEUE_FULL_SUBMIT_ATTEMPTS {
-            match handle.try_recv() {
-                Err(TryRecvError::Empty) => {
-                    return CachedRequestHandle::pending(request, epoch, handle);
-                }
-                Err(TryRecvError::Disconnected) => {
-                    unreachable!("submit always answers its handle exactly once")
-                }
-                Ok(Err(FetchError::Transport(message)))
-                    if message == NETWORK_QUEUE_FULL_MESSAGE => {}
-                Ok(result) => {
-                    return CachedRequestHandle {
-                        request,
-                        epoch,
-                        state: CachedRequestState::Ready(Box::new(Some(result))),
-                    };
-                }
+        let handle = self.network.submit(request.clone());
+        match handle.try_recv() {
+            Err(TryRecvError::Empty) => CachedRequestHandle::pending(request, epoch, handle),
+            Err(TryRecvError::Disconnected) => {
+                unreachable!("submit always answers its handle exactly once")
             }
-            thread::sleep(delay);
-            delay = delay.saturating_mul(2).min(QUEUE_FULL_RETRY_MAX_DELAY);
-            handle = self.network.submit(request.clone());
+            Ok(Err(FetchError::Transport(message))) if message == NETWORK_QUEUE_FULL_MESSAGE => {
+                CachedRequestHandle::deferred(request, epoch)
+            }
+            Ok(result) => CachedRequestHandle {
+                request,
+                epoch,
+                state: CachedRequestState::Ready(Box::new(Some(result))),
+            },
         }
-        CachedRequestHandle::pending(request, epoch, handle)
     }
 
     pub(super) fn submit_cached_batch(&mut self, requests: Vec<FetchRequest>) -> CachedBatchHandle {
@@ -1042,6 +1312,8 @@ impl BrowserApp {
                 return;
             };
             page.cancel_style_sheets();
+            page.started_style_sheets
+                .extend(plan.resources.iter().map(|resource| resource.key.clone()));
             plan.requests()
                 .into_iter()
                 .map(|request| page.cookies.decorate_request(request))
@@ -1049,7 +1321,12 @@ impl BrowserApp {
         };
         let handle = self.submit_cached_batch(requests);
         if let Some(page) = self.pages.get_mut(&id) {
-            page.pending_style_sheets = Some(PendingStyleSheets { plan, handle });
+            page.pending_style_sheets = Some(PendingStyleSheets {
+                plan,
+                handle,
+                since: Instant::now(),
+                stall_reported: false,
+            });
         } else {
             handle.cancel();
             return;
@@ -1147,7 +1424,12 @@ impl BrowserApp {
                 handle.cancel();
                 return;
             };
-            page.pending_scripts = Some(PendingScripts { plan, handle });
+            page.pending_scripts = Some(PendingScripts {
+                plan,
+                handle,
+                since: Instant::now(),
+                stall_reported: false,
+            });
             self.tabs.set_loading(id, true);
         }
 
@@ -1170,7 +1452,7 @@ impl BrowserApp {
             if page.pending_images.is_some() {
                 return;
             }
-            let plan = plan_images_with_styles_and_context(
+            let mut plan = plan_images_with_styles_and_context(
                 page.page.document(),
                 &page.computed_styles,
                 &page.navigation.committed().target.history_url(),
@@ -1182,6 +1464,12 @@ impl BrowserApp {
                     device_pixel_ratio_milli: 1_000,
                 },
             );
+            page.attempted_images
+                .retain(|key| plan.resources.iter().any(|resource| &resource.key == key));
+            plan.resources
+                .retain(|resource| !page.attempted_images.contains(&resource.key));
+            page.attempted_images
+                .extend(plan.resources.iter().map(|resource| resource.key.clone()));
             let requests = plan
                 .requests()
                 .into_iter()
@@ -1207,20 +1495,90 @@ impl BrowserApp {
         }
         let handle = self.submit_cached_batch(requests);
         if let Some(page) = self.pages.get_mut(&id) {
-            page.pending_images = Some(PendingImages { plan, handle });
+            page.pending_images = Some(PendingImages {
+                plan,
+                handle,
+                since: Instant::now(),
+                stall_reported: false,
+            });
         } else {
             handle.cancel();
         }
     }
 
+    /// Reports resource batches that stay in flight suspiciously long, once
+    /// each. A hung transfer used to be invisible: the page just never
+    /// advanced. Surfacing the stuck batch makes the stall diagnosable
+    /// without stopping the pipeline.
+    fn report_stalled_batches(&mut self) {
+        const STALL_REPORT_AFTER: Duration = Duration::from_secs(30);
+        for page in self.pages.values_mut() {
+            if let Some(pending) = page.navigation.pending.as_mut()
+                && !pending.stall_reported
+                && pending.since.elapsed() >= STALL_REPORT_AFTER
+            {
+                pending.stall_reported = true;
+                eprintln!(
+                    "render-browser navigation still in flight after {:?}: {}",
+                    pending.since.elapsed(),
+                    pending.requested_url,
+                );
+            }
+            if let Some(pending) = page.pending_style_sheets.as_mut()
+                && !pending.stall_reported
+                && pending.since.elapsed() >= STALL_REPORT_AFTER
+            {
+                pending.stall_reported = true;
+                eprintln!(
+                    "render-browser stylesheet batch still in flight after {:?} ({} resources)",
+                    pending.since.elapsed(),
+                    pending.plan.resources.len(),
+                );
+            }
+            if let Some(pending) = page.pending_scripts.as_mut()
+                && !pending.stall_reported
+                && pending.since.elapsed() >= STALL_REPORT_AFTER
+            {
+                pending.stall_reported = true;
+                eprintln!(
+                    "render-browser script batch still in flight after {:?} ({} resources)",
+                    pending.since.elapsed(),
+                    pending.plan.resources.len(),
+                );
+            }
+            if let Some(pending) = page.pending_images.as_mut()
+                && !pending.stall_reported
+                && pending.since.elapsed() >= STALL_REPORT_AFTER
+            {
+                pending.stall_reported = true;
+                eprintln!(
+                    "render-browser image batch still in flight after {:?} ({} resources)",
+                    pending.since.elapsed(),
+                    pending.plan.resources.len(),
+                );
+            }
+        }
+    }
+
     pub(super) fn poll_network(&mut self) {
+        self.report_stalled_batches();
         let mut completed_documents = Vec::new();
         let mut completed_style_sheets = Vec::new();
         let mut completed_scripts = Vec::new();
         let mut completed_images = Vec::new();
         let mut new_fetches: Vec<(TabId, PendingFetch)> = Vec::new();
+        // Queue-full-parked requests retry from this polling pass: the
+        // event loop must never block on submission, and a parked request
+        // only becomes live again once the worker's queue drains. The
+        // closure owns a worker handle clone so polling can keep mutating
+        // the rest of the app while parked requests resubmit.
+        let network = self.network.clone();
+        let resubmit = &mut move |request: FetchRequest, cancel: CancelToken| {
+            network.submit_with_cancellation(request, cancel)
+        };
         for (id, page) in &mut self.pages {
             if let Some(pending) = page.navigation.pending.as_mut() {
+                pending.handle.retry_deferred(resubmit);
                 match pending.handle.try_recv() {
                     Ok(result) => completed_documents.push((*id, result)),
                     Err(TryRecvError::Empty) => {}
@@ -1230,6 +1588,7 @@ impl BrowserApp {
                 }
             }
             if let Some(pending) = page.pending_style_sheets.as_mut() {
+                pending.handle.retry_deferred(resubmit);
                 match pending.handle.try_recv() {
                     Ok(results) => completed_style_sheets.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
@@ -1239,6 +1598,7 @@ impl BrowserApp {
                 }
             }
             if let Some(pending) = page.pending_scripts.as_mut() {
+                pending.handle.retry_deferred(resubmit);
                 match pending.handle.try_recv() {
                     Ok(results) => completed_scripts.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
@@ -1248,6 +1608,7 @@ impl BrowserApp {
                 }
             }
             if let Some(pending) = page.pending_images.as_mut() {
+                pending.handle.retry_deferred(resubmit);
                 match pending.handle.try_recv() {
                     Ok(results) => completed_images.push((*id, results)),
                     Err(TryRecvError::Empty) => {}
@@ -1262,6 +1623,9 @@ impl BrowserApp {
         }
         for (tab, request) in new_fetches {
             self.submit_page_fetch(tab, &request);
+        }
+        for (_tab, _id, handle) in &mut self.pending_fetches {
+            handle.retry_deferred(resubmit);
         }
         let settlement_errors = self.poll_pending_fetch_settlements();
         for error in settlement_errors {
@@ -1442,6 +1806,10 @@ impl BrowserApp {
             page.external_styles_generation = page.external_styles_generation.saturating_add(1);
             self.schedule_page_render_for_tab(id);
         }
+        // An img can change src while the previous batch is in flight. That
+        // response is correctly discarded as stale, but without a follow-up
+        // scan the new URL would wait for an unrelated future render.
+        self.start_images(id);
     }
 
     pub(super) fn schedule_page_render_for_tab(&mut self, id: TabId) {
@@ -1544,9 +1912,19 @@ impl BrowserApp {
             self.address_clicks.reset();
             self.address_selecting = false;
         }
+        // The scrollbar overlay sits inside the content rect; it takes
+        // pointer priority so page links underneath stay unpressed.
+        if target == HitTarget::Content
+            && let Some(geometry) = self.active_scrollbar_geometry()
+            && geometry.track.contains(self.cursor)
+        {
+            self.begin_scrollbar_interaction(&geometry);
+            return;
+        }
         match target {
             HitTarget::Tab(id) => {
                 self.drag = Some(TabDrag::new(id, self.cursor.x));
+                self.tab_drag_paint = None;
                 self.handle_tab_intent(TabIntent::Activate(id));
             }
             HitTarget::CloseTab(id) => self.handle_tab_intent(TabIntent::Close(id)),
@@ -1616,6 +1994,7 @@ impl BrowserApp {
     }
 
     pub(super) fn handle_content_press(&mut self) {
+        self.content_selecting = false;
         self.editor.set_focused(false);
         let id = self.tabs.active_id();
         let hit_node = self.content_node_at_cursor();
@@ -1632,12 +2011,15 @@ impl BrowserApp {
             && let Some(value) = self.content_text_input_value(id, node)
         {
             let mut editor = AddressEditor::new(value);
+            let click_index = self.content_index_at_x(id, node, self.cursor.x);
+            editor.place_cursor(click_index, false);
             editor.set_focused(true);
             self.content_editor = Some(ContentTextEditor {
                 tab: id,
                 node,
                 editor,
             });
+            self.content_selecting = true;
             if let Some(window) = &self.window {
                 window.set_ime_allowed(true);
             }
@@ -2049,6 +2431,69 @@ impl BrowserApp {
         display_hit.or(geometry_hit)
     }
 
+    /// Map a page-control click to the nearest UTF-8 boundary. The text child
+    /// generated for an input is present in the display list with the same
+    /// glyph origin and font size used by rasterization; empty/stale frames
+    /// fall back to the control's computed border and padding.
+    fn content_index_at_x(&self, tab: TabId, node: render_core::dom::NodeId, x: f32) -> usize {
+        let Some(page) = self.pages.get(&tab) else {
+            return 0;
+        };
+        let Some(value) = content_text_input_value(page.page.document().dom(), node) else {
+            return 0;
+        };
+        let Some(rect) = page.geometry.get(&node.as_u64()) else {
+            return value.len();
+        };
+        let mut base_x = rect.x + 1.0 + 4.0;
+        let mut font_size = 16.0;
+        let mut has_glyph_run = false;
+        if let Some(display_list) = page.display_list.as_ref() {
+            for item in display_list.items() {
+                if item.source != Some(node) {
+                    continue;
+                }
+                if let DisplayCommand::GlyphRun(run) = &item.command {
+                    has_glyph_run = true;
+                    font_size = run.font_size.max(1.0);
+                    if let Some(first) = run.glyphs.first() {
+                        base_x = first.position.x;
+                    }
+                    break;
+                }
+            }
+        }
+        if !has_glyph_run {
+            if let Some(style) = page.computed_styles.get(&node) {
+                let border = style
+                    .get("border-left-width")
+                    .and_then(|value| parse_css_pixels(value.css_text()))
+                    .unwrap_or(1.0);
+                let padding = style
+                    .get("padding-left")
+                    .and_then(|value| parse_css_pixels(value.css_text()))
+                    .unwrap_or(4.0);
+                base_x = rect.x + border.max(0.0) + padding.max(0.0);
+                font_size = style
+                    .get("font-size")
+                    .and_then(|value| parse_css_pixels(value.css_text()))
+                    .unwrap_or(font_size)
+                    .max(1.0);
+            }
+        }
+        let target = (x - base_x).max(0.0);
+        let mut previous = 0.0;
+        for (index, character) in value.char_indices() {
+            let end = index + character.len_utf8();
+            let width = self.fonts.measure(&value[index..end], font_size);
+            if target < previous + width * 0.5 {
+                return index;
+            }
+            previous += width;
+        }
+        value.len()
+    }
+
     pub(super) fn handle_context_menu_press(&mut self) {
         let Some((target, scale)) = self
             .layout
@@ -2110,8 +2555,16 @@ impl BrowserApp {
         let previous_hot = self.hot;
         self.hot = layout.hit_test(self.cursor);
         let hot_changed = self.hot != previous_hot;
+        let previous_scrollbar_hot = self.scrollbar_hot;
+        self.scrollbar_hot = self.scrollbar_drag.is_none()
+            && self
+                .active_scrollbar_geometry()
+                .is_some_and(|geometry| geometry.track.contains(self.cursor));
         let cursor_icon = match self.hot {
             HitTarget::AddressBar => CursorIcon::Text,
+            HitTarget::Content if self.scrollbar_hot || self.scrollbar_drag.is_some() => {
+                CursorIcon::Default
+            }
             HitTarget::Content => self
                 .content_node_at_cursor()
                 .and_then(|node| {
@@ -2145,29 +2598,116 @@ impl BrowserApp {
             self.repaint_chrome();
             return;
         }
-        let move_intent = self
-            .left_pointer_down
-            .then(|| {
-                self.drag
-                    .as_mut()
-                    .and_then(|drag| drag.update(self.cursor.x, layout))
-            })
-            .flatten();
-        if let Some(intent) = move_intent {
-            self.handle_tab_intent(intent);
-        } else if hot_changed || self.drag.is_some() {
+        if let Some(grab) = self.scrollbar_drag {
+            if let Some(geometry) = self.active_scrollbar_geometry()
+                && let Some(page) = self.pages.get(&self.tabs.active_id())
+            {
+                let target = scrollbar_scroll_offset(
+                    &geometry,
+                    self.cursor.y,
+                    grab,
+                    page.scroll.content_height(),
+                    page.scroll.viewport_height(),
+                    layout.scale,
+                );
+                let delta = target - page.scroll.offset_y();
+                self.apply_scroll_delta(delta);
+            }
+            return;
+        }
+        if self.content_selecting
+            && self.left_pointer_down
+            && let Some(content) = self.content_editor.as_ref()
+        {
+            let tab = content.tab;
+            let node = content.node;
+            let index = self.content_index_at_x(tab, node, self.cursor.x);
+            if let Some(content) = self.content_editor.as_mut() {
+                content.editor.extend_pointer_selection(index);
+            }
+            self.repaint_chrome();
+            return;
+        }
+        let move_intent = self.left_pointer_down.then(|| {
+            self.drag
+                .as_mut()
+                .and_then(|drag| drag.paint_offsets(self.cursor.x, layout))
+        });
+        if let Some(offsets) = move_intent.flatten() {
+            if let Some(drag) = self.drag.as_ref() {
+                self.tab_drag_paint = Some((drag.tab(), offsets));
+            }
+            self.repaint_chrome();
+        } else if hot_changed || previous_scrollbar_hot != self.scrollbar_hot || self.drag.is_some()
+        {
             self.repaint_chrome();
         }
     }
 
     pub(super) fn handle_pointer_release(&mut self) {
         self.left_pointer_down = false;
+        let release_intent = self.layout.as_ref().and_then(|layout| {
+            self.drag
+                .as_mut()
+                .and_then(|drag| drag.release(self.cursor.x, layout))
+        });
         self.drag = None;
+        self.tab_drag_paint = None;
+        self.scrollbar_drag = None;
+        if let Some(intent) = release_intent {
+            self.handle_tab_intent(intent);
+        }
         if self.address_selecting {
             self.address_selecting = false;
             self.editor.finish_pointer_selection();
             self.repaint_chrome();
         }
+        if self.content_selecting {
+            self.content_selecting = false;
+            if let Some(content) = self.content_editor.as_mut() {
+                content.editor.finish_pointer_selection();
+            }
+            self.repaint_chrome();
+        }
+    }
+
+    /// Scrollbar geometry for the active tab's current frame, if any.
+    fn active_scrollbar_geometry(&self) -> Option<ScrollbarGeometry> {
+        let layout = self.layout.as_ref()?;
+        let page = self.pages.get(&self.tabs.active_id())?;
+        scrollbar_geometry(
+            layout.content,
+            page.scroll.content_height(),
+            page.scroll.viewport_height(),
+            page.scroll.offset_y(),
+            layout.scale,
+        )
+    }
+
+    /// Starts a scrollbar interaction on the content area's right edge:
+    /// pressing the thumb grabs it; pressing the track pages toward the
+    /// pointer and then grabs the thumb at its center.
+    fn begin_scrollbar_interaction(&mut self, geometry: &ScrollbarGeometry) {
+        if geometry.thumb.contains(self.cursor) {
+            self.scrollbar_drag = Some(self.cursor.y - geometry.thumb.y);
+        } else {
+            let viewport = self
+                .pages
+                .get(&self.tabs.active_id())
+                .map_or(0.0, |page| page.scroll.viewport_height());
+            let delta = if self.cursor.y < geometry.thumb.y {
+                -viewport
+            } else {
+                viewport
+            };
+            self.apply_scroll_delta(delta);
+            let Some(jumped) = self.active_scrollbar_geometry() else {
+                return;
+            };
+            self.scrollbar_drag = Some(jumped.thumb.height * 0.5);
+        }
+        self.scrollbar_hot = true;
+        self.repaint_chrome();
     }
 
     pub(super) fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
@@ -2179,6 +2719,14 @@ impl BrowserApp {
             return;
         }
         let delta_y = wheel_document_delta_y(delta);
+        self.apply_scroll_delta(delta_y);
+    }
+
+    /// Applies one document-space scroll delta to the active tab and, when
+    /// the offset changed, refreshes the viewport bookkeeping, the scroll
+    /// event, and the (retained-raster) repaint. Shared by the wheel and the
+    /// scrollbar thumb/track interactions.
+    fn apply_scroll_delta(&mut self, delta_y: f32) {
         let id = self.tabs.active_id();
         let changed = self
             .pages
@@ -2299,6 +2847,7 @@ impl BrowserApp {
             }
             Key::Named(NamedKey::Backspace) => self.editor.backspace(),
             Key::Named(NamedKey::Delete) => self.editor.delete(),
+            Key::Named(NamedKey::Space) => self.editor.insert(" "),
             Key::Named(NamedKey::ArrowLeft) => self.editor.move_left(shift),
             Key::Named(NamedKey::ArrowRight) => self.editor.move_right(shift),
             Key::Named(NamedKey::Home) => self.editor.move_home(shift),
@@ -2472,27 +3021,43 @@ impl BrowserApp {
             Key::Named(NamedKey::Backspace) => {
                 content.editor.backspace();
                 self.sync_content_editor();
+                self.repaint_chrome();
                 true
             }
             Key::Named(NamedKey::Delete) => {
                 content.editor.delete();
                 self.sync_content_editor();
+                self.repaint_chrome();
+                true
+            }
+            Key::Named(NamedKey::Space) => {
+                // Some Winit backends expose the spacebar as a named key and
+                // leave `KeyEvent.text` empty.  It is still printable input.
+                if content.editor.preedit().is_empty() {
+                    content.editor.insert(" ");
+                    self.sync_content_editor();
+                    self.repaint_chrome();
+                }
                 true
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 content.editor.move_left(shift);
+                self.repaint_chrome();
                 true
             }
             Key::Named(NamedKey::ArrowRight) => {
                 content.editor.move_right(shift);
+                self.repaint_chrome();
                 true
             }
             Key::Named(NamedKey::Home) => {
                 content.editor.move_home(shift);
+                self.repaint_chrome();
                 true
             }
             Key::Named(NamedKey::End) => {
                 content.editor.move_end(shift);
+                self.repaint_chrome();
                 true
             }
             Key::Character(_) if !primary && !self.modifiers.alt_key() => {
@@ -2504,6 +3069,7 @@ impl BrowserApp {
                 {
                     content.editor.insert(value);
                     self.sync_content_editor();
+                    self.repaint_chrome();
                 }
                 true
             }
@@ -2519,6 +3085,7 @@ impl BrowserApp {
         };
         content.editor.set_preedit(preedit);
         self.sync_content_editor_display();
+        self.repaint_chrome();
     }
 
     /// Commits IME text into the focused content control and fires the
@@ -2559,7 +3126,16 @@ impl BrowserApp {
             }
             self.schedule_page_render_for_tab(tab);
         }
+        if self
+            .content_editor
+            .as_ref()
+            .is_some_and(|content| content.tab == self.tabs.active_id())
+            && let Some(window) = &self.window
+        {
+            self.mark_page_damage(window.inner_size());
+        }
         self.content_editor = None;
+        self.content_selecting = false;
     }
 
     pub(super) fn update_window_title(&self) {
@@ -2576,6 +3152,31 @@ impl BrowserApp {
     ) {
         eprintln!("render-browser could not {operation}: {error}");
         event_loop.exit();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ContentCaret {
+    pub(super) clip: Rect,
+    pub(super) rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ContentSelection {
+    pub(super) clip: Rect,
+    pub(super) rect: Rect,
+}
+
+fn paint_content_caret(canvas: &mut Canvas<'_>, caret: ContentCaret, theme: ChromeTheme) {
+    canvas.with_clip(caret.clip, |canvas| {
+        canvas.rect(caret.rect, focus_accent(theme));
+    });
+}
+
+fn content_selection_color(theme: ChromeTheme) -> u32 {
+    match theme {
+        ChromeTheme::Light => 0x0094_bff5,
+        ChromeTheme::Dark => 0x0033_5f95,
     }
 }
 
@@ -2641,6 +3242,8 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.close_content_editor();
                 self.left_pointer_down = false;
                 self.drag = None;
+                self.tab_drag_paint = None;
+                self.scrollbar_drag = None;
                 if let Some(window) = &self.window {
                     window.set_ime_allowed(false);
                 }
@@ -2683,6 +3286,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         let mut rendered_active = false;
         let mut navigation_candidates = Vec::new();
         let mut title_candidates = Vec::new();
+        let mut script_candidates = Vec::new();
         for (id, page) in &mut self.pages {
             let revision_before = page.dom_revision;
             let turn_budget = if *id == active {
@@ -2700,6 +3304,8 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                     if revision_after != revision_before {
                         rendered_active |= *id == active;
                         title_candidates.push(*id);
+                        page.scripts_resolved = false;
+                        script_candidates.push(*id);
                     }
                 }
                 Err(error) => eprintln!("render-browser page pump failed: {error}"),
@@ -2719,6 +3325,9 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         }
         for id in title_candidates {
             self.sync_page_title(id);
+        }
+        for id in script_candidates {
+            self.start_classic_scripts(id);
         }
         for id in navigation_candidates {
             self.drain_script_navigations(id);
@@ -2767,6 +3376,17 @@ impl RawKeyInput {
 
 pub(super) fn key_character_is(key: &Key, expected: &str) -> bool {
     matches!(key, Key::Character(value) if value.eq_ignore_ascii_case(expected))
+}
+
+fn parse_css_pixels(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("0") {
+        return Some(0.0);
+    }
+    value
+        .strip_suffix("px")
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
 }
 
 /// Map a key input to the DOM `KeyboardEvent.key` string it represents.

@@ -14,10 +14,14 @@
 )]
 
 //! Video playback pipeline: MP4 demuxing, H.264 bitstream support, a decoder
-//! backend boundary, and the timestamped frame queue the future paint phase
-//! will consume.
+//! backend boundary, the timestamped frame queue, and the presentation clock
+//! that drives decoded frames onto the screen.
 //!
-//! Phase scope (video playback phase 1):
+//! Audio is deliberately not implemented: this runtime has no audio device,
+//! so audio tracks are ignored and playback runs on the presentation clock
+//! alone (no audio-video synchronization).
+//!
+//! Phase scope (video playback phase 2 builds on phase 1):
 //! - `demux_h264_track` locates the H.264 video track in a progressive MP4
 //!   (`stsz`/`stco`/`stsc`/`stts`/`stss`/`ctts` plus the `avcC` record) via
 //!   Mozilla's pure-Rust `mp4parse` crate.
@@ -27,8 +31,12 @@
 //! - `VideoPipeline` is the lazy, pull-based entry point: `decode_next_frame`
 //!   decodes one more sample whenever the caller asks for a frame, feeding a
 //!   bounded [`FrameQueue`]. The `HTMLVideoElement` bindings hold one
-//!   pipeline per element once its media loads; a presentation clock and
-//!   frame hand-off into paint arrive in a later phase.
+//!   pipeline per element once its media loads.
+//! - `present` adds the presentation machinery on top of the pipeline: a
+//!   virtual-clock-anchored position (play/pause/seek/ended semantics,
+//!   `timeupdate` throttling, fixed 1.0 playback rate), forward-only decode
+//!   driven by the clock, retained-frame selection for the presented frame,
+//!   and the RGBA hand-off the paint phase consumes through the page.
 //! - Pixel decoding sits behind the [`VideoDecoder`] trait. The shipped
 //!   [`PlaceholderDecoder`] reports [`VideoError::DecoderUnavailable`]: the
 //!   suggested `openh264` crate compiles vendored C and was rejected under
@@ -38,6 +46,7 @@
 pub mod avc;
 pub mod decoder;
 pub mod demuxer;
+pub mod present;
 
 #[cfg(test)]
 pub(crate) mod test_mp4;
@@ -53,6 +62,11 @@ pub use demuxer::VideoCodec;
 pub use demuxer::VideoSample;
 pub use demuxer::VideoTrackInfo;
 pub use demuxer::demux_h264_track;
+pub use present::FramePublication;
+pub use present::PlaybackSignal;
+use present::PresentationState;
+pub use present::PresentedFrame;
+pub use present::TIMEUPDATE_INTERVAL;
 
 /// Default bound on frames retained by a [`FrameQueue`]. At typical frame
 /// rates this is several seconds of buffered video, and it keeps a decoder
@@ -199,11 +213,12 @@ impl FrameQueue {
 
 /// Lazy demux/decode pipeline over one buffered MP4.
 ///
-/// The pipeline owns the container bytes, the demuxed sample table, and a
-/// decoder backend. Decoding is pull-based: every [`Self::decode_next_frame`]
-/// call decodes samples until a frame is available or the stream ends. This
-/// is the object the `HTMLVideoElement` bindings retain; the future paint
-/// phase will consume frames from it on the presentation clock.
+/// The pipeline owns the container bytes, the demuxed sample table, a
+/// decoder backend, and the presentation state (clock, retained frames).
+/// Decoding is pull-based: every [`Self::decode_next_frame`] call decodes
+/// samples until a frame is available or the stream ends, and
+/// [`Self::advance_playback`] drives that pull on the presentation clock.
+/// This is the object the `HTMLVideoElement` bindings retain.
 pub struct VideoPipeline {
     track: DemuxedTrack,
     container: Vec<u8>,
@@ -212,6 +227,7 @@ pub struct VideoPipeline {
     decoder: Box<dyn VideoDecoder>,
     decoder_ready: bool,
     queue: FrameQueue,
+    presentation: PresentationState,
 }
 
 impl VideoPipeline {
@@ -238,6 +254,7 @@ impl VideoPipeline {
         decoder: Box<dyn VideoDecoder>,
     ) -> Result<Self, VideoError> {
         let track = demux_h264_track(container)?;
+        let duration = track.info.duration_seconds;
         Ok(Self {
             track,
             container: container.to_vec(),
@@ -246,6 +263,7 @@ impl VideoPipeline {
             decoder,
             decoder_ready: false,
             queue: FrameQueue::new(DEFAULT_FRAME_QUEUE_CAPACITY),
+            presentation: PresentationState::new(duration),
         })
     }
 

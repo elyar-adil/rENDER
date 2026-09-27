@@ -13,10 +13,10 @@ use url::Url;
 use crate::css::cascade::{CascadeInput, CascadeOrigin};
 use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
-    compute_document_styles,
+    compute_document_styles_with_hints,
 };
 use crate::css::selector::MatchContext;
-use crate::css::stylesheet::{StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
+use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::dom::{Dom, DomRevision, ElementData, Node, NodeId, NodeKind};
 use crate::html::{HtmlParseError, QuirksMode, parse_document};
 use crate::image::ImageResources;
@@ -59,7 +59,181 @@ rtc { display: ruby-text-container; }
 head, area, base, basefont, datalist, link, meta, noembed, noframes, param,
 rp, script, source, style, template, title, track, [hidden] { display: none; }
 body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
+center { text-align: center; }
 "#;
+
+/// HTML presentational attributes expressed as user-agent-origin CSS
+/// declarations (HTML5 rendering §15.3). These let classic markup
+/// (`bgcolor`, `width`, `align`, `cellpadding`, ...) style pages without a
+/// stylesheet while remaining overridable by any author rule.
+fn presentational_hint_declarations(dom: &Dom, node: NodeId) -> Vec<Declaration> {
+    fn declaration(name: &str, value: String) -> Declaration {
+        Declaration {
+            name: name.to_owned(),
+            value,
+            important: false,
+        }
+    }
+    fn px_or_percent(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.ends_with('%') {
+            trimmed.to_owned()
+        } else {
+            let digits = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>();
+            format!("{digits}px")
+        }
+    }
+    let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind) else {
+        return Vec::new();
+    };
+    let attribute = |name: &str| {
+        dom.attribute(node, name)
+            .ok()
+            .flatten()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let tag = element.local_name.as_str();
+    let mut hints = Vec::new();
+
+    // bgcolor: background painting on the classic set of elements.
+    if matches!(
+        tag,
+        "body" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "col" | "colgroup"
+    ) && let Some(bgcolor) = attribute("bgcolor")
+    {
+        hints.push(declaration("background-color", bgcolor.to_owned()));
+    }
+
+    // width/height presentational sizes.
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "img" | "video" | "col" | "colgroup" | "iframe" | "object"
+    ) && let Some(width) = attribute("width")
+    {
+        hints.push(declaration("width", px_or_percent(width)));
+    }
+    if matches!(
+        tag,
+        "table" | "td" | "th" | "img" | "video" | "iframe" | "object"
+    ) && let Some(height) = attribute("height")
+    {
+        hints.push(declaration("height", px_or_percent(height)));
+    }
+
+    // align: text alignment for cell/block content, geometry for
+    // table/images.
+    if let Some(align) = attribute("align") {
+        let align = align.to_ascii_lowercase();
+        match tag {
+            "table" => match align.as_str() {
+                "center" => {
+                    hints.push(declaration("margin-left", "auto".to_owned()));
+                    hints.push(declaration("margin-right", "auto".to_owned()));
+                }
+                "left" => hints.push(declaration("float", "left".to_owned())),
+                "right" => hints.push(declaration("float", "right".to_owned())),
+                _ => {}
+            },
+            "img" | "video" | "object" | "embed" => match align.as_str() {
+                "left" => hints.push(declaration("float", "left".to_owned())),
+                "right" => hints.push(declaration("float", "right".to_owned())),
+                "center" => {
+                    hints.push(declaration("margin-left", "auto".to_owned()));
+                    hints.push(declaration("margin-right", "auto".to_owned()));
+                    hints.push(declaration("display", "block".to_owned()));
+                }
+                _ => {}
+            },
+            "td" | "th" | "tr" | "thead" | "tbody" | "tfoot" | "caption" | "p" | "div" | "h1"
+            | "h2" | "h3" | "h4" | "h5" | "h6" | "legend" | "col" | "colgroup" => {
+                if matches!(align.as_str(), "left" | "right" | "center" | "justify") {
+                    hints.push(declaration("text-align", align));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // valign: vertical alignment inside table parts.
+    if matches!(
+        tag,
+        "tr" | "td" | "th" | "thead" | "tbody" | "tfoot" | "col" | "colgroup"
+    ) && let Some(valign) = attribute("valign")
+    {
+        let valign = valign.to_ascii_lowercase();
+        if matches!(valign.as_str(), "top" | "middle" | "bottom" | "baseline") {
+            hints.push(declaration("vertical-align", valign));
+        }
+    }
+
+    // cellpadding applies to the cells of a table; cells look up the
+    // nearest ancestor table themselves.
+    if matches!(tag, "td" | "th") {
+        let mut ancestor = dom.parent(node);
+        while let Some(current) = ancestor {
+            if let Some(NodeKind::Element(parent)) = dom.node(current).map(Node::kind) {
+                if parent.local_name.as_str() == "table" {
+                    if let Some(cellpadding) = dom
+                        .attribute(current, "cellpadding")
+                        .ok()
+                        .flatten()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        let digits = cellpadding
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>();
+                        hints.push(declaration("padding", format!("{digits}px")));
+                    }
+                    break;
+                }
+                if parent.local_name.as_str() == "table" {
+                    break;
+                }
+            }
+            ancestor = dom.parent(current);
+        }
+    }
+
+    // cellspacing → border spacing; a positive border attr draws the grid.
+    if tag == "table" {
+        if let Some(cellspacing) = attribute("cellspacing") {
+            hints.push(declaration("border-spacing", px_or_percent(cellspacing)));
+        }
+        if let Some(border) = attribute("border") {
+            let digits = border
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u32>()
+                .unwrap_or(0);
+            if digits > 0 {
+                hints.push(declaration("border-style", "outset".to_owned()));
+                hints.push(declaration("border-width", format!("{digits}px")));
+            }
+        }
+    }
+
+    // hspace/vspace margins on replaced elements.
+    if matches!(tag, "img" | "video" | "object" | "embed") {
+        if let Some(hspace) = attribute("hspace") {
+            let value = px_or_percent(hspace);
+            hints.push(declaration("margin-left", value.clone()));
+            hints.push(declaration("margin-right", value));
+        }
+        if let Some(vspace) = attribute("vspace") {
+            let value = px_or_percent(vspace);
+            hints.push(declaration("margin-top", value.clone()));
+            hints.push(declaration("margin-bottom", value));
+        }
+    }
+    hints
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocumentLimits {
@@ -455,8 +629,19 @@ fn render_dom(
     external: &ExternalStyleSheets,
     images: Option<&ImageResources>,
 ) -> DocumentRenderOutput {
+    let stage_timing = std::env::var_os("RENDER_STAGE_TIMING").is_some();
+    let mut stage_mark = std::time::Instant::now();
+    let stage_elapsed = |name: &str, mark: &mut std::time::Instant| {
+        if stage_timing {
+            let now = std::time::Instant::now();
+            eprintln!("stage {}: {:?}", name, now.duration_since(*mark));
+            *mark = now;
+        }
+    };
     let ua_sheet = parse_stylesheet(UA_STYLE_SHEET);
+    stage_elapsed("ua-parse", &mut stage_mark);
     let collected = collect_author_style_sheets(dom, base_url, external, options.document_limits);
+    stage_elapsed("collect-sheets", &mut stage_mark);
     let mut cascade_inputs = Vec::with_capacity(collected.sheets.len().saturating_add(1));
     cascade_inputs.push(CascadeInput {
         sheet: &ua_sheet,
@@ -467,7 +652,7 @@ fn render_dom(
         origin: CascadeOrigin::Author,
     }));
 
-    let styles = compute_document_styles(
+    let styles = compute_document_styles_with_hints(
         dom,
         &cascade_inputs,
         &PropertyRegistry::standard_baseline(),
@@ -477,8 +662,11 @@ fn render_dom(
             viewport_height: Some(options.layout.viewport.height),
             ..MatchContext::default()
         },
+        &|node| presentational_hint_declarations(dom, node),
     );
+    stage_elapsed("cascade", &mut stage_mark);
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
+    stage_elapsed("formatting", &mut stage_mark);
     let layout = layout_formatting_tree_with_images(
         dom,
         &formatting,
@@ -487,6 +675,7 @@ fn render_dom(
         backends.text_measurer,
         images,
     );
+    stage_elapsed("layout", &mut stage_mark);
     let display = build_display_list_with_images(
         &layout.fragments,
         &formatting,
@@ -495,6 +684,7 @@ fn render_dom(
         backends.text_shaper,
         images,
     );
+    stage_elapsed("display", &mut stage_mark);
     let paint_viewport_origin = layout.fragments.clamp_scroll_offset(options.scroll_offset);
     let raster = CpuRasterizer.rasterize_viewport_with_images(
         &display.list,
@@ -503,6 +693,7 @@ fn render_dom(
         paint_viewport_origin,
         images,
     );
+    stage_elapsed("raster", &mut stage_mark);
 
     let mut document_diagnostics = collected.diagnostics;
     if quirks_mode != QuirksMode::NoQuirks {

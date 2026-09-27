@@ -157,13 +157,36 @@ pub struct ChromeLayout {
 
 impl ChromeLayout {
     #[must_use]
+    pub fn new(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
+        Self::new_with_decorations(width, height, scale, tabs, false)
+    }
+
+    /// Layout used by the live browser window when the OS owns the title bar
+    /// and its minimize/maximize/close controls. The client area still draws
+    /// browser tabs, navigation, and the address editor, but never reserves a
+    /// second synthetic title bar.
+    #[must_use]
+    pub fn new_native(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
+        // Kept as a source-compatible alias for callers that used the old
+        // native-frame layout. The browser now owns a modern, cross-platform
+        // title row so tabs and window actions stay together on every OS.
+        Self::new(width, height, scale, tabs)
+    }
+
+    #[must_use]
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::too_many_lines,
         reason = "native dimensions and DPI-scaled chrome metrics are finite positive pixels"
     )]
-    pub fn new(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
+    fn new_with_decorations(
+        width: u32,
+        height: u32,
+        scale: f32,
+        tabs: &[Tab],
+        native_decorations: bool,
+    ) -> Self {
         let scale = scale.max(0.5);
         let width_f = width as f32;
         let tab_strip_height = 42.0 * scale;
@@ -178,20 +201,31 @@ impl ChromeLayout {
             WindowControl::Close,
         ];
         let control_group_width = control_width * control_kinds.len() as f32;
-        let controls_x = (width_f - control_group_width).max(0.0);
-        let window_controls = control_kinds
-            .into_iter()
-            .enumerate()
-            .map(|(index, control)| WindowControlGeometry {
-                control,
-                bounds: Rect {
-                    x: controls_x + index as f32 * control_width,
-                    y: 0.0,
-                    width: control_width,
-                    height: tab_strip_height,
-                },
-            })
-            .collect::<Vec<_>>();
+        // With native decorations the platform title bar is outside the
+        // client area. Keep all client pixels available to the tab strip and
+        // do not create a second set of synthetic window buttons.
+        let controls_x = if native_decorations {
+            width_f
+        } else {
+            (width_f - control_group_width).max(0.0)
+        };
+        let window_controls = if native_decorations {
+            Vec::new()
+        } else {
+            control_kinds
+                .into_iter()
+                .enumerate()
+                .map(|(index, control)| WindowControlGeometry {
+                    control,
+                    bounds: Rect {
+                        x: controls_x + index as f32 * control_width,
+                        y: 0.0,
+                        width: control_width,
+                        height: tab_strip_height,
+                    },
+                })
+                .collect::<Vec<_>>()
+        };
         let new_tab_width = 30.0 * scale;
         let tab_area_right = (controls_x - new_tab_width - 8.0 * scale).max(left);
         let tab_area = (tab_area_right - left).max(0.0);
@@ -246,7 +280,11 @@ impl ChromeLayout {
         let title_bar = Rect {
             x: title_bar_x,
             y: 0.0,
-            width: (controls_x - title_bar_x).max(0.0),
+            width: if native_decorations {
+                0.0
+            } else {
+                (controls_x - title_bar_x).max(0.0)
+            },
             height: tab_strip_height,
         };
 
@@ -351,6 +389,78 @@ impl ChromeLayout {
         }
         (index != current).then_some(index)
     }
+
+    /// Static slot stride (uniform tab width plus gap) used by drag geometry.
+    fn drag_stride(&self) -> Option<(f32, f32, f32, f32)> {
+        let first = self.tabs.first()?;
+        let width = first.bounds.width;
+        let stride = self
+            .tabs
+            .get(1)
+            .map_or(0.0, |second| second.bounds.x - first.bounds.x);
+        Some((first.bounds.x, width, stride, stride - width))
+    }
+
+    /// Per-tab paint offsets for one live-drag frame.
+    ///
+    /// The dragged tab is painted at `dragged_x` (clamped to the strip);
+    /// every other tab slides one slot toward the dragged tab's origin, with
+    /// the slide progressing across the gap the dragged tab's center is
+    /// currently crossing. At the extremes this reproduces the exact slot
+    /// order the committed reorder will produce.
+    #[must_use]
+    fn drag_slot_offsets(&self, dragged: TabId, dragged_x: f32) -> Vec<f32> {
+        let Some(origin) = self.tabs.iter().position(|tab| tab.id == dragged) else {
+            return Vec::new();
+        };
+        let Some((base, width, stride, gap)) = self.drag_stride() else {
+            return Vec::new();
+        };
+        let count = self.tabs.len();
+        let center = dragged_x.clamp(base, base + (count - 1) as f32 * stride) + width * 0.5;
+        self.tabs
+            .iter()
+            .enumerate()
+            .map(|(index, geometry)| {
+                if index == origin {
+                    return center - width * 0.5 - geometry.bounds.x;
+                }
+                // The midpoint between this slot and the adjacent slot on the
+                // side facing the dragged tab's origin.
+                let midpoint = if index > origin {
+                    base + index as f32 * stride - gap * 0.5
+                } else {
+                    base + (index + 1) as f32 * stride - gap * 0.5
+                };
+                let progress = if index > origin {
+                    ((center - midpoint) / stride + 0.5).clamp(0.0, 1.0)
+                } else {
+                    ((midpoint - center) / stride + 0.5).clamp(0.0, 1.0)
+                };
+                let shift = stride * progress;
+                if index > origin { -shift } else { shift }
+            })
+            .collect()
+    }
+
+    /// The slot index the dragged tab would occupy if released at `dragged_x`.
+    #[must_use]
+    fn drag_insertion_index(&self, dragged: TabId, dragged_x: f32) -> Option<usize> {
+        let origin = self.tabs.iter().position(|tab| tab.id == dragged)?;
+        let (base, width, stride, _) = self.drag_stride()?;
+        let count = self.tabs.len();
+        let center = dragged_x.clamp(base, base + (count - 1) as f32 * stride) + width * 0.5;
+        let nearest = ((center - base - width * 0.5) / stride).round();
+        if !nearest.is_finite() {
+            return Some(origin);
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "the rounded slot index is bounded by the tab count before the cast"
+        )]
+        let index = usize::try_from(nearest as i64).unwrap_or(origin);
+        Some(index.min(count - 1))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -398,6 +508,9 @@ pub struct TabDrag {
     tab: TabId,
     start_x: f32,
     active: bool,
+    /// Pointer offset from the dragged tab's static left edge, captured when
+    /// the drag activates so the tab keeps following the grab point.
+    grab_offset: f32,
 }
 
 impl TabDrag {
@@ -407,23 +520,58 @@ impl TabDrag {
             tab,
             start_x,
             active: false,
+            grab_offset: 0.0,
         }
     }
 
+    /// The tab being dragged.
     #[must_use]
-    pub fn update(&mut self, pointer_x: f32, layout: &ChromeLayout) -> Option<TabIntent> {
-        if !self.active && (pointer_x - self.start_x).abs() >= 6.0 * layout.scale {
-            self.active = true;
+    pub const fn tab(&self) -> TabId {
+        self.tab
+    }
+
+    /// Paint offsets (one per tab, in [`ChromeLayout::tabs`] order) for a live
+    /// drag: the dragged tab follows the pointer continuously while neighbors
+    /// slide toward the vacated slot in proportion to how far the dragged
+    /// tab's center has crossed each gap midpoint. Returns `None` until the
+    /// drag crosses its activation threshold.
+    #[must_use]
+    pub fn paint_offsets(&mut self, pointer_x: f32, layout: &ChromeLayout) -> Option<Vec<f32>> {
+        self.activate(pointer_x, layout);
+        if !self.active {
+            return None;
         }
+        Some(layout.drag_slot_offsets(self.tab, pointer_x - self.grab_offset))
+    }
+
+    /// The reorder committed when the pointer is released after a live drag.
+    #[must_use]
+    pub fn release(&mut self, pointer_x: f32, layout: &ChromeLayout) -> Option<TabIntent> {
+        self.activate(pointer_x, layout);
         if !self.active {
             return None;
         }
         layout
-            .reorder_index(self.tab, pointer_x)
+            .drag_insertion_index(self.tab, pointer_x - self.grab_offset)
             .map(|index| TabIntent::Move {
                 tab: self.tab,
                 index,
             })
+    }
+
+    fn activate(&mut self, pointer_x: f32, layout: &ChromeLayout) {
+        if self.active || (pointer_x - self.start_x).abs() < 6.0 * layout.scale {
+            return;
+        }
+        self.active = true;
+        // The grab offset comes from the pointer-down position so the tab
+        // tracks the grab point from the first activated frame on.
+        self.grab_offset = self.start_x
+            - layout
+                .tabs
+                .iter()
+                .find(|geometry| geometry.id == self.tab)
+                .map_or(0.0, |geometry| geometry.bounds.x);
     }
 }
 
@@ -626,6 +774,34 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Fill a clipped rectangle with a translucent color while preserving the
+    /// pixels underneath. Used by focused page-control selection overlays.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rectangles are clipped to finite framebuffer bounds before conversion"
+    )]
+    pub fn blend_rect(&mut self, rect: Rect, color: u32, alpha: u8) {
+        let left = rect.x.max(self.clip.x).floor().max(0.0) as u32;
+        let top = rect.y.max(self.clip.y).floor().max(0.0) as u32;
+        let right = (rect.x + rect.width)
+            .min(self.clip.x + self.clip.width)
+            .ceil()
+            .clamp(0.0, self.width as f32) as u32;
+        let right = right.max(left);
+        let bottom = (rect.y + rect.height)
+            .min(self.clip.y + self.clip.height)
+            .ceil()
+            .clamp(0.0, self.height as f32) as u32;
+        let bottom = bottom.max(top);
+        for y in top..bottom {
+            for x in left..right {
+                let index = y as usize * self.width as usize + x as usize;
+                self.pixels[index] = blend(self.pixels[index], color, alpha);
+            }
+        }
+    }
+
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
@@ -747,6 +923,7 @@ pub fn paint_chrome(
     theme: ChromeTheme,
     hot: HitTarget,
     maximized: bool,
+    drag: Option<(TabId, &[f32])>,
     text: &impl TextPainter,
 ) {
     let palette = Palette::new(theme);
@@ -772,61 +949,177 @@ pub fn paint_chrome(
         },
         palette.toolbar,
     );
-    paint_tabs(canvas, layout, tabs, active, hot, text, palette);
+    paint_tabs(canvas, layout, tabs, active, hot, drag, text, palette);
     paint_window_controls(canvas, layout, hot, maximized, palette);
     paint_toolbar(canvas, layout, hot, palette);
     paint_address(canvas, layout, editor, text, palette);
 }
 
+/// Overlay page scrollbar: a translucent track strip with a rounded thumb.
+/// `hot`/`dragging` darken the thumb the way mainstream browsers do.
+pub fn paint_scrollbar(
+    canvas: &mut Canvas<'_>,
+    geometry: &ScrollbarGeometry,
+    hot: bool,
+    dragging: bool,
+    theme: ChromeTheme,
+) {
+    let (resting, active_color) = match theme {
+        ChromeTheme::Light => (0x00c1_c4c9, 0x00a8_acb2),
+        ChromeTheme::Dark => (0x004a_4d55, 0x005c_6068),
+    };
+    let color = if dragging || hot {
+        active_color
+    } else {
+        resting
+    };
+    canvas.rounded_rect(geometry.thumb, geometry.thumb.width * 0.5, color);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "painting a tab strip with live drag state needs the full visual snapshot"
+)]
 fn paint_tabs(
     canvas: &mut Canvas<'_>,
     layout: &ChromeLayout,
     tabs: &[Tab],
     active: TabId,
     hot: HitTarget,
+    drag: Option<(TabId, &[f32])>,
     text: &impl TextPainter,
     palette: Palette,
 ) {
-    for (tab, geometry) in tabs.iter().zip(&layout.tabs) {
-        let is_active = tab.id == active;
-        let is_hot = matches!(hot, HitTarget::Tab(id) | HitTarget::CloseTab(id) if id == tab.id);
-        let background = if is_active {
-            palette.toolbar
-        } else if is_hot {
-            palette.tab_hover
-        } else {
-            palette.tab_strip
-        };
-        canvas.top_rounded_rect(geometry.bounds, 9.0 * layout.scale, background);
-        let mut text_x = geometry.bounds.x + 14.0 * layout.scale;
-        if tab.loading {
-            let indicator = 7.0 * layout.scale;
-            canvas.rounded_rect(
-                Rect {
-                    x: text_x,
-                    y: geometry.bounds.y + (geometry.bounds.height - indicator) * 0.5,
-                    width: indicator,
-                    height: indicator,
-                },
-                indicator * 0.5,
-                palette.accent,
+    let Some((dragged, drag_offsets)) = drag else {
+        for (tab, geometry) in tabs.iter().zip(&layout.tabs) {
+            paint_one_tab(
+                canvas, layout, tab, *geometry, 0.0, active, hot, false, text, palette,
             );
-            text_x += 14.0 * layout.scale;
         }
-        let max_width = (geometry.close.x - text_x - 5.0 * layout.scale).max(0.0);
-        let title = elide(&tab.title, max_width, 13.0 * layout.scale, text);
-        text.paint(
+        paint_new_tab_button(canvas, layout, hot, palette);
+        return;
+    };
+    let offsets = |index: usize| drag_offsets.get(index).copied().unwrap_or(0.0);
+    for (index, (tab, geometry)) in tabs.iter().zip(&layout.tabs).enumerate() {
+        if tab.id == dragged {
+            continue;
+        }
+        paint_one_tab(
             canvas,
-            &title,
-            Point {
-                x: text_x,
-                y: geometry.bounds.y + 9.0 * layout.scale,
-            },
-            13.0 * layout.scale,
-            palette.text,
+            layout,
+            tab,
+            *geometry,
+            offsets(index),
+            active,
+            hot,
+            true,
+            text,
+            palette,
         );
-        paint_close_icon(canvas, geometry.close, layout.scale, palette.icon);
     }
+    if let Some((index, (tab, geometry))) = tabs
+        .iter()
+        .zip(&layout.tabs)
+        .enumerate()
+        .find(|(_, (tab, _))| tab.id == dragged)
+    {
+        paint_one_tab(
+            canvas,
+            layout,
+            tab,
+            *geometry,
+            offsets(index),
+            active,
+            hot,
+            true,
+            text,
+            palette,
+        );
+    }
+    paint_new_tab_button(canvas, layout, hot, palette);
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one tab's full visual state is naturally wider than a handful of fields"
+)]
+fn paint_one_tab(
+    canvas: &mut Canvas<'_>,
+    layout: &ChromeLayout,
+    tab: &Tab,
+    geometry: TabGeometry,
+    offset: f32,
+    active: TabId,
+    hot: HitTarget,
+    dragging: bool,
+    text: &impl TextPainter,
+    palette: Palette,
+) {
+    let geometry = translate_tab_geometry(geometry, offset);
+    let is_active = tab.id == active;
+    let is_hot =
+        !dragging && matches!(hot, HitTarget::Tab(id) | HitTarget::CloseTab(id) if id == tab.id);
+    let background = if is_active {
+        palette.toolbar
+    } else if is_hot {
+        palette.tab_hover
+    } else {
+        palette.tab_strip
+    };
+    canvas.top_rounded_rect(geometry.bounds, 9.0 * layout.scale, background);
+    let mut text_x = geometry.bounds.x + 14.0 * layout.scale;
+    if tab.loading {
+        let indicator = 7.0 * layout.scale;
+        canvas.rounded_rect(
+            Rect {
+                x: text_x,
+                y: geometry.bounds.y + (geometry.bounds.height - indicator) * 0.5,
+                width: indicator,
+                height: indicator,
+            },
+            indicator * 0.5,
+            palette.accent,
+        );
+        text_x += 14.0 * layout.scale;
+    }
+    let max_width = (geometry.close.x - text_x - 5.0 * layout.scale).max(0.0);
+    let title = elide(&tab.title, max_width, 13.0 * layout.scale, text);
+    text.paint(
+        canvas,
+        &title,
+        Point {
+            x: text_x,
+            y: geometry.bounds.y + 9.0 * layout.scale,
+        },
+        13.0 * layout.scale,
+        palette.text,
+    );
+    paint_close_icon(canvas, geometry.close, layout.scale, palette.icon);
+}
+
+fn translate_tab_geometry(geometry: TabGeometry, offset: f32) -> TabGeometry {
+    if offset == 0.0 {
+        return geometry;
+    }
+    TabGeometry {
+        id: geometry.id,
+        bounds: Rect {
+            x: geometry.bounds.x + offset,
+            ..geometry.bounds
+        },
+        close: Rect {
+            x: geometry.close.x + offset,
+            ..geometry.close
+        },
+    }
+}
+
+fn paint_new_tab_button(
+    canvas: &mut Canvas<'_>,
+    layout: &ChromeLayout,
+    hot: HitTarget,
+    palette: Palette,
+) {
     let plus = layout.new_tab;
     if hot == HitTarget::NewTab {
         canvas.rounded_rect(plus, 7.0 * layout.scale, palette.tab_hover);
@@ -1465,6 +1758,79 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
     }
 }
 
+/// Geometry of the page-content scrollbar for one frame. `None` when the
+/// content does not overflow the viewport (nothing to scroll, nothing drawn).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarGeometry {
+    pub track: Rect,
+    pub thumb: Rect,
+}
+
+/// Scrollbar metrics: an overlay strip on the content's right edge whose
+/// thumb length reflects the viewport/content ratio and whose position maps
+/// the scroll offset through the remaining travel.
+#[must_use]
+pub fn scrollbar_geometry(
+    content: Rect,
+    content_height: f32,
+    viewport_height: f32,
+    scroll_y: f32,
+    scale: f32,
+) -> Option<ScrollbarGeometry> {
+    let max_scroll = content_height - viewport_height;
+    if !(max_scroll > 0.0 && content.height > 0.0) {
+        return None;
+    }
+    let width = 11.0 * scale;
+    let margin = 2.0 * scale;
+    let track = Rect {
+        x: content.x + content.width - width,
+        y: content.y,
+        width,
+        height: content.height,
+    };
+    let travel = track.height - margin * 2.0;
+    let thumb_height =
+        (viewport_height / content_height * travel).clamp(24.0 * scale, travel.max(0.0));
+    let scroll_ratio = (scroll_y / max_scroll).clamp(0.0, 1.0);
+    let thumb_y = track.y + margin + scroll_ratio * (travel - thumb_height);
+    Some(ScrollbarGeometry {
+        track,
+        thumb: Rect {
+            x: track.x + margin,
+            y: thumb_y,
+            width: track.width - margin * 2.0,
+            height: thumb_height,
+        },
+    })
+}
+
+/// Inverse mapping for thumb dragging: the thumb follows the pointer while
+/// preserving the grab offset inside it, and the scroll offset follows the
+/// thumb through the track's travel.
+#[must_use]
+pub fn scrollbar_scroll_offset(
+    geometry: &ScrollbarGeometry,
+    pointer_y: f32,
+    grab_offset: f32,
+    content_height: f32,
+    viewport_height: f32,
+    scale: f32,
+) -> f32 {
+    let max_scroll = (content_height - viewport_height).max(0.0);
+    if max_scroll <= 0.0 {
+        return 0.0;
+    }
+    let margin = 2.0 * scale;
+    let travel = geometry.track.height - margin * 2.0 - geometry.thumb.height;
+    if !(travel > 0.0) {
+        return 0.0;
+    }
+    let thumb_y = pointer_y - grab_offset;
+    let ratio = ((thumb_y - (geometry.track.y + margin)) / travel).clamp(0.0, 1.0);
+    ratio * max_scroll
+}
+
 fn elide(text_value: &str, max_width: f32, size: f32, text: &impl TextPainter) -> String {
     if text.measure(text_value, size) <= max_width {
         return text_value.to_owned();
@@ -1541,6 +1907,17 @@ impl Palette {
                 menu_shadow: 0x000c_0d0f,
             },
         }
+    }
+}
+
+/// Accent used for focus indicators in both the browser chrome and focused
+/// page controls. Keeping this in one place prevents the page caret from
+/// becoming unreadable when the native theme changes.
+#[must_use]
+pub const fn focus_accent(theme: ChromeTheme) -> u32 {
+    match theme {
+        ChromeTheme::Light => 0x001a_73e8,
+        ChromeTheme::Dark => 0x006e_a8fe,
     }
 }
 
@@ -1756,23 +2133,103 @@ mod tests {
     }
 
     #[test]
-    fn drag_reorders_only_after_crossing_threshold() {
+    fn drag_commits_reorder_only_on_release() {
         let mut tabs = TabModel::new("One", "about:home");
         let first = tabs.active_id();
         tabs.apply(TabIntent::New);
         let layout = ChromeLayout::new(1_000, 700, 1.0, tabs.tabs());
         let start = layout.tabs[0].bounds.x + 10.0;
         let mut drag = TabDrag::new(first, start);
-        assert_eq!(drag.update(start + 2.0, &layout), None);
+        // Below the activation threshold nothing moves or commits.
+        assert_eq!(drag.paint_offsets(start + 2.0, &layout), None);
+        assert_eq!(drag.release(start + 2.0, &layout), None);
+        // Activating only changes paint geometry; the model order is untouched
+        // until release.
+        let crossing = layout.tabs[1].bounds.x + layout.tabs[1].bounds.width;
+        assert!(drag.paint_offsets(crossing, &layout).is_some());
         assert_eq!(
-            drag.update(
-                layout.tabs[1].bounds.x + layout.tabs[1].bounds.width,
-                &layout
-            ),
+            drag.release(crossing, &layout),
             Some(TabIntent::Move {
                 tab: first,
                 index: 1,
             })
+        );
+    }
+
+    #[test]
+    fn live_drag_moves_dragged_tab_continuously_and_slides_neighbors() {
+        let mut tabs = TabModel::new("One", "about:home");
+        let first = tabs.active_id();
+        tabs.apply(TabIntent::New);
+        tabs.apply(TabIntent::New);
+        let layout = ChromeLayout::new(1_000, 700, 1.0, tabs.tabs());
+        let start = layout.tabs[0].bounds.x + 10.0;
+        let mut drag = TabDrag::new(first, start);
+        let static_second = layout.tabs[1].bounds.x;
+        let stride = static_second - layout.tabs[0].bounds.x;
+
+        // Midway into the first gap the dragged tab has moved continuously and
+        // the neighbor is partially displaced.
+        let midway = start + stride * 0.5;
+        let offsets = drag.paint_offsets(midway, &layout).expect("active drag");
+        let dragged_static = layout.tabs[0].bounds.x;
+        assert!(
+            (offsets[0] - stride * 0.5).abs() < 0.5,
+            "dragged tab follows the pointer, got {}",
+            offsets[0]
+        );
+        assert!(
+            offsets[1] < 0.0 && offsets[1] > -stride,
+            "neighbor slides left without overshooting, got {}",
+            offsets[1]
+        );
+        assert!(
+            offsets[2].abs() < 0.001,
+            "far tabs do not move yet, got {}",
+            offsets[2]
+        );
+
+        // Far right: the dragged tab clamps to the last slot; the two tabs in
+        // between sit exactly one slot left; nothing else moves.
+        let far = layout.tabs[0].bounds.x + layout.tabs[2].bounds.x + 1_000.0;
+        let offsets = drag.paint_offsets(far, &layout).expect("active drag");
+        let dragged_final = dragged_static + offsets[0];
+        assert!(
+            (dragged_final - layout.tabs[2].bounds.x).abs() < 0.5,
+            "dragged tab rests on the last slot, got {dragged_final}"
+        );
+        assert!(
+            (offsets[1] + stride).abs() < 0.5,
+            "first neighbor slid one slot left"
+        );
+        assert!(
+            (offsets[2] + stride).abs() < 0.5,
+            "second neighbor slid one slot left"
+        );
+        assert_eq!(
+            drag.release(far, &layout),
+            Some(TabIntent::Move {
+                tab: first,
+                index: 2,
+            })
+        );
+
+        // Far left of the origin: neighbors slide right by one slot instead.
+        let mut drag = TabDrag::new(tabs.tabs()[2].id, layout.tabs[2].bounds.x + 10.0);
+        let far_left = layout.tabs[0].bounds.x - 1_000.0;
+        let offsets = drag.paint_offsets(far_left, &layout).expect("active drag");
+        assert!(
+            (offsets[0] - stride).abs() < 0.5,
+            "left neighbor slid one slot right"
+        );
+        assert!(
+            (offsets[1] - stride).abs() < 0.5,
+            "left neighbor slid one slot right"
+        );
+        assert!(
+            (offsets[2] + 2.0 * stride).abs() < 0.5,
+            "dragged tab rests on the first slot, got {}",
+            offsets[2]
         );
     }
 
@@ -1908,5 +2365,77 @@ mod tests {
         let result = clamp_interval(54.0, 54.0, 53.999_996);
         assert!(result.is_finite());
         assert!((53.999_996..=54.0).contains(&result));
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::{Point, Rect, ScrollbarGeometry, scrollbar_geometry, scrollbar_scroll_offset};
+
+    const CONTENT: Rect = Rect {
+        x: 0.0,
+        y: 100.0,
+        width: 1000.0,
+        height: 500.0,
+    };
+
+    #[test]
+    fn no_geometry_without_overflow() {
+        assert!(scrollbar_geometry(CONTENT, 500.0, 500.0, 0.0, 1.0).is_none());
+        assert!(scrollbar_geometry(CONTENT, 400.0, 500.0, 0.0, 1.0).is_none());
+    }
+
+    #[test]
+    fn thumb_length_reflects_viewport_ratio_and_position_maps_offset() {
+        let geometry = scrollbar_geometry(CONTENT, 2000.0, 500.0, 0.0, 1.0).expect("scrollbar");
+        // Quarter of the content is visible; thumb is a quarter of travel,
+        // clamped to at least 24px.
+        // travel = 500 - 2*2(margin) = 496; ratio 500/2000 -> 124px
+        assert!((geometry.thumb.height - 124.0).abs() < 0.01);
+        assert_eq!(geometry.thumb.y, geometry.track.y + 2.0);
+        assert_eq!(geometry.thumb.x + geometry.thumb.width, CONTENT.width - 2.0);
+
+        let bottom = scrollbar_geometry(CONTENT, 2000.0, 500.0, 1500.0, 1.0).expect("scrollbar");
+        assert!(
+            (bottom.thumb.y + bottom.thumb.height
+                - (geometry.track.y + geometry.track.height - 2.0))
+                .abs()
+                < 0.01
+        );
+    }
+
+    #[test]
+    fn dragging_maps_pointer_back_to_scroll_offset() {
+        let geometry = scrollbar_geometry(CONTENT, 2000.0, 500.0, 0.0, 1.0).expect("scrollbar");
+        // Grab the thumb at its top (grab offset 0) and drag to the bottom
+        // of the travel: the offset must reach max_scroll.
+        let travel_bottom = geometry.track.y + geometry.track.height - 2.0 - geometry.thumb.height;
+        let bottom = scrollbar_scroll_offset(&geometry, travel_bottom, 0.0, 2000.0, 500.0, 1.0);
+        assert!((bottom - 1500.0).abs() < 0.01, "{bottom}");
+        let top =
+            scrollbar_scroll_offset(&geometry, geometry.track.y + 2.0, 0.0, 2000.0, 500.0, 1.0);
+        assert!((top - 0.0).abs() < 0.01, "{top}");
+    }
+
+    #[test]
+    fn track_hit_and_thumb_grab_use_the_same_geometry() {
+        let geometry = scrollbar_geometry(CONTENT, 2000.0, 500.0, 375.0, 1.0).expect("scrollbar");
+        // A pointer inside the thumb is inside the track too (single hit
+        // region), and the thumb's y is between the track bounds.
+        let center = Point {
+            x: geometry.thumb.x + 1.0,
+            y: geometry.thumb.y + 1.0,
+        };
+        assert!(geometry.track.contains(center));
+    }
+
+    #[test]
+    fn thumb_minimum_length_keeps_tiny_viewport_ratios_grabbable() {
+        let geometry = scrollbar_geometry(CONTENT, 100_000.0, 500.0, 0.0, 1.0).expect("scrollbar");
+        assert!((geometry.thumb.height - 24.0).abs() < 0.01);
+        let _ = ScrollbarGeometry {
+            track: geometry.track,
+            thumb: geometry.thumb,
+        };
     }
 }

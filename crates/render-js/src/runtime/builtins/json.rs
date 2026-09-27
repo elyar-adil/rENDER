@@ -382,7 +382,7 @@ impl JsRuntime {
                     return Err(JsError::type_error("Converting circular structure to JSON"));
                 }
                 let result = if matches!(self.realm.host(*object), Some(ObjectHost::Array)) {
-                    let values = self.array_elements_for(*object);
+                    let values = self.array_elements_for(*object)?;
                     let mut output = String::from("[");
                     for (index, value) in values.iter().enumerate() {
                         if index > 0 {

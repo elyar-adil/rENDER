@@ -3,9 +3,14 @@ use super::{JsError, JsErrorKind, RuntimeLimits};
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TokenKind {
     Identifier(String),
+    /// `#name`, the private-name form used by class fields and methods.
+    PrivateName(String),
     String(String),
     Number(f64),
-    RegexLiteral { pattern: String, flags: String },
+    RegexLiteral {
+        pattern: String,
+        flags: String,
+    },
     Template(Vec<TemplatePart>),
     Let,
     Const,
@@ -80,13 +85,17 @@ pub(super) enum TokenKind {
     Ampersand,
     AmpersandEqual,
     AndAnd,
+    AndAndEqual,
     Pipe,
     PipeEqual,
     OrOr,
+    OrOrEqual,
     Caret,
     CaretEqual,
     Tilde,
     Question,
+    QuestionQuestion,
+    QuestionQuestionEqual,
     Arrow,
     Eof,
 }
@@ -191,6 +200,16 @@ impl Lexer<'_> {
                 '[' => self.single(TokenKind::LeftBracket),
                 ']' => self.single(TokenKind::RightBracket),
                 ':' => self.single(TokenKind::Colon),
+                '?' if self.peek_second() == Some('?') => {
+                    self.advance();
+                    self.advance();
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::QuestionQuestionEqual
+                    } else {
+                        TokenKind::QuestionQuestion
+                    }
+                }
                 '?' => self.single(TokenKind::Question),
                 '~' => self.single(TokenKind::Tilde),
                 '+' if self.peek_second() == Some('+') => {
@@ -244,7 +263,12 @@ impl Lexer<'_> {
                 '&' if self.peek_second() == Some('&') => {
                     self.advance();
                     self.advance();
-                    TokenKind::AndAnd
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::AndAndEqual
+                    } else {
+                        TokenKind::AndAnd
+                    }
                 }
                 '&' if self.peek_second() == Some('=') => {
                     self.advance();
@@ -255,7 +279,12 @@ impl Lexer<'_> {
                 '|' if self.peek_second() == Some('|') => {
                     self.advance();
                     self.advance();
-                    TokenKind::OrOr
+                    if self.peek() == Some('=') {
+                        self.advance();
+                        TokenKind::OrOrEqual
+                    } else {
+                        TokenKind::OrOr
+                    }
                 }
                 '|' if self.peek_second() == Some('=') => {
                     self.advance();
@@ -283,6 +312,7 @@ impl Lexer<'_> {
                 '`' => self.template()?,
                 '0'..='9' => self.number()?,
                 '\\' if self.peek_second() == Some('u') => self.identifier()?,
+                '#' => self.private_name(start)?,
                 value if is_identifier_start(value) => self.identifier()?,
                 _ => {
                     return Err(JsError::syntax(
@@ -308,6 +338,11 @@ impl Lexer<'_> {
         match self.tokens.last().map(|token| &token.kind) {
             None => true,
             Some(TokenKind::RightBrace) => self.last_block_close,
+            // A regexp may follow the closing parenthesis of a control
+            // statement (`if (x) /re/.test(x)`).  Treating every `)` as an
+            // expression value misclassifies the slash as division and leaves
+            // the regexp escape (for example `\w`) as an unsupported token.
+            Some(TokenKind::RightParen) if self.paren_closes_control_head() => true,
             Some(kind) => !matches!(
                 kind,
                 TokenKind::Identifier(_)
@@ -326,6 +361,42 @@ impl Lexer<'_> {
                     | TokenKind::MinusMinus
             ),
         }
+    }
+
+    /// Return whether the most recent `)` closes the condition of a control
+    /// statement rather than a function/method call.  This is the same
+    /// backwards matching used by `paren_opens_block`, but is needed at the
+    /// token immediately after the right parenthesis.
+    fn paren_closes_control_head(&self) -> bool {
+        let mut depth = 0_usize;
+        for (reverse_index, token) in self.tokens.iter().rev().enumerate().skip(1) {
+            match token.kind {
+                TokenKind::RightParen => depth += 1,
+                TokenKind::LeftParen => {
+                    if depth == 0 {
+                        let before = self
+                            .tokens
+                            .iter()
+                            .rev()
+                            .nth(reverse_index + 1)
+                            .map(|token| &token.kind);
+                        return matches!(
+                            before,
+                            Some(
+                                TokenKind::If
+                                    | TokenKind::While
+                                    | TokenKind::For
+                                    | TokenKind::Switch
+                                    | TokenKind::Catch
+                            )
+                        );
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Record one `{` and classify it as a block or object literal opener.
@@ -399,12 +470,16 @@ impl Lexer<'_> {
             | TokenKind::Ampersand
             | TokenKind::AmpersandEqual
             | TokenKind::AndAnd
+            | TokenKind::AndAndEqual
             | TokenKind::Pipe
             | TokenKind::PipeEqual
             | TokenKind::OrOr
+            | TokenKind::OrOrEqual
             | TokenKind::Caret
             | TokenKind::CaretEqual
             | TokenKind::Tilde
+            | TokenKind::QuestionQuestion
+            | TokenKind::QuestionQuestionEqual
             | TokenKind::RightBracket
             | TokenKind::RightBrace
             | TokenKind::LeftParen
@@ -586,6 +661,32 @@ impl Lexer<'_> {
         }
     }
 
+    /// Scan `#` followed by an identifier: a private name. The `#` itself is
+    /// not part of the name; the class evaluator scopes names per class body.
+    fn private_name(&mut self, start: usize) -> Result<TokenKind, JsError> {
+        self.advance();
+        let first = self.identifier_character(start)?;
+        if !is_identifier_start(first) {
+            return Err(JsError::syntax("expected a private name after '#'", start));
+        }
+        let mut name = String::from(first);
+        while let Some(character) = self.peek() {
+            let character = if character == '\\' && self.peek_second() == Some('u') {
+                self.identifier_escape(start)?
+            } else if is_identifier_continue(character) {
+                self.advance();
+                character
+            } else {
+                break;
+            };
+            if !is_identifier_continue(character) {
+                return Err(JsError::syntax("invalid private name character", start));
+            }
+            name.push(character);
+        }
+        Ok(TokenKind::PrivateName(name))
+    }
+
     fn identifier(&mut self) -> Result<TokenKind, JsError> {
         let start = self.offset;
         let first = self.identifier_character(start)?;
@@ -727,9 +828,10 @@ impl Lexer<'_> {
                 if self.offset == digits_start || self.peek().is_some_and(is_identifier_continue) {
                     return Err(JsError::syntax("invalid numeric literal", start));
                 }
-                return u64::from_str_radix(&self.source[digits_start..self.offset], radix)
-                    .map(|value| TokenKind::Number(value as f64))
-                    .map_err(|_| JsError::syntax("invalid numeric literal", start));
+                return Ok(TokenKind::Number(radix_digits_to_number(
+                    &self.source[digits_start..self.offset],
+                    radix,
+                )));
             }
         }
         while self.peek().is_some_and(|value| value.is_ascii_digit()) {
@@ -1028,8 +1130,67 @@ impl Lexer<'_> {
     }
 }
 
+/// ECMAScript accepts arbitrarily long binary, octal and hexadecimal integer
+/// literals. Keep the most significant 53 bits and use the remaining bits to
+/// round to the nearest binary64 value (ties to even).
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "top contains at most 53 significant bits, exactly representable as binary64"
+)]
+fn radix_digits_to_number(digits: &str, radix: u32) -> f64 {
+    let bits_per_digit = radix.trailing_zeros() as usize;
+    let Some(first_nonzero) = digits.find(|digit: char| digit != '0') else {
+        return 0.0;
+    };
+    let significant = &digits[first_nonzero..];
+    let first = significant
+        .chars()
+        .next()
+        .and_then(|digit| digit.to_digit(radix))
+        .expect("lexer already validated radix digits");
+    let first_bits = (u32::BITS - first.leading_zeros()) as usize;
+    let bit_len = first_bits + (significant.len() - 1) * bits_per_digit;
+    if bit_len > 1024 {
+        return f64::INFINITY;
+    }
+
+    let mut top = 0_u64;
+    let mut guard = false;
+    let mut sticky = false;
+    let mut bit_index = 0;
+    for (index, digit) in significant.chars().enumerate() {
+        let value = digit
+            .to_digit(radix)
+            .expect("lexer already validated radix digits");
+        let width = if index == 0 {
+            first_bits
+        } else {
+            bits_per_digit
+        };
+        for shift in (0..width).rev() {
+            let bit = (value >> shift) & 1 != 0;
+            match bit_index.cmp(&53) {
+                std::cmp::Ordering::Less => top = (top << 1) | u64::from(bit),
+                std::cmp::Ordering::Equal => guard = bit,
+                std::cmp::Ordering::Greater => sticky |= bit,
+            }
+            bit_index += 1;
+        }
+    }
+
+    if bit_len <= 53 {
+        return top as f64;
+    }
+    if guard && (sticky || top & 1 != 0) {
+        top += 1;
+    }
+    let exponent = i32::try_from(bit_len - 53).expect("bounded by binary64 exponent range");
+    (top as f64) * 2_f64.powi(exponent)
+}
+
 fn is_identifier_start(character: char) -> bool {
-    character.is_alphabetic() || matches!(character, '_' | '$')
+    // ECMAScript IdentifierStart is UnicodeIDStart plus `$` and `_`.
+    unicode_ident::is_xid_start(character) || matches!(character, '_' | '$')
 }
 
 pub(super) fn surrogate_placeholder(value: u32) -> char {
@@ -1040,15 +1201,34 @@ pub(super) fn surrogate_placeholder(value: u32) -> char {
 }
 
 fn is_identifier_continue(character: char) -> bool {
-    is_identifier_start(character)
-        || character.is_alphanumeric()
-        || matches!(character, '\u{200c}' | '\u{200d}')
+    unicode_ident::is_xid_continue(character)
+        || matches!(character, '_' | '$' | '\u{200c}' | '\u{200d}')
 }
 
 #[cfg(test)]
 mod tests {
     use super::{TokenKind, tokenize};
     use crate::RuntimeLimits;
+
+    #[test]
+    fn accepts_large_radix_literals_and_rounds_ties_to_even() {
+        for (source, expected) in [
+            ("0x10000000000000000", 18_446_744_073_709_551_616.0),
+            ("0x20000000000001", 9_007_199_254_740_992.0),
+            ("0x20000000000003", 9_007_199_254_740_996.0),
+            (
+                "0b100000000000000000000000000000000000000000000000000000",
+                9_007_199_254_740_992.0,
+            ),
+            ("0o1000000000000000000000", 9_223_372_036_854_775_808.0),
+        ] {
+            let tokens = tokenize(source, &RuntimeLimits::default()).expect(source);
+            assert_eq!(tokens[0].kind, TokenKind::Number(expected), "{source}");
+        }
+        let huge = format!("0x{}", "f".repeat(500));
+        let tokens = tokenize(&huge, &RuntimeLimits::default()).expect("large hex literal");
+        assert_eq!(tokens[0].kind, TokenKind::Number(f64::INFINITY));
+    }
 
     #[test]
     fn tokenizes_member_calls_strings_and_control_flow() {
@@ -1122,5 +1302,26 @@ mod tests {
         ] {
             assert!(tokens.iter().any(|token| token.kind == expected));
         }
+    }
+
+    #[test]
+    fn tokenizes_regex_after_control_condition() {
+        let tokens = tokenize(
+            r"if (value) /^on\w+/.test(value); if (value) /[\\/]/.test(value);",
+            &RuntimeLimits::default(),
+        )
+        .expect("a regexp after an if condition must not be parsed as division");
+        assert_eq!(
+            tokens
+                .iter()
+                .filter(|token| matches!(token.kind, TokenKind::RegexLiteral { .. }))
+                .count(),
+            2
+        );
+        tokenize(
+            r#"if("function"==typeof t[c])/^on\w+/.test(c)?fn():other();"#,
+            &RuntimeLimits::default(),
+        )
+        .expect("regex in a minified if condition should tokenize");
     }
 }

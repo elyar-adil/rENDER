@@ -311,6 +311,22 @@ where
         Ok(())
     }
 
+    /// Whether a submitted job for `tab_id` is currently running.
+    ///
+    /// Coalescing callers use this to avoid cancelling in-flight work: while
+    /// this returns `true`, the running render can still be committed, so a
+    /// caller reacting to a DOM mutation should mark the page dirty and
+    /// resubmit after the commit instead of superseding the active job.
+    #[must_use]
+    pub fn is_tab_busy(&self, tab_id: u64) -> bool {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active
+            .contains_key(&tab_id)
+    }
+
     /// Cancel and forget all work for a closed or zero-sized tab.
     pub fn cancel_tab(&self, tab_id: u64) {
         let mut queue = self

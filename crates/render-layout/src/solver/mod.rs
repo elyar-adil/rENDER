@@ -293,6 +293,7 @@ struct FlexItem {
 struct GridItem {
     fragment: FragmentId,
     row: usize,
+    row_span: usize,
     column: usize,
     natural_outer_height: f32,
     stretch_height: bool,

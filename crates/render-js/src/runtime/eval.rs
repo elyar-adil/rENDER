@@ -52,6 +52,9 @@ use crate::runtime::convert::to_number;
 use crate::runtime::convert::unsigned_shift_right;
 use crate::runtime::types::Binding;
 use crate::runtime::types::CallFrame;
+use crate::runtime::types::ClassFrame;
+use crate::runtime::types::ClassFunction;
+use crate::runtime::types::Environment;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::NavigationRequest;
@@ -69,6 +72,25 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+/// Coercion hint passed to `ToPrimitive` (`Symbol.toPrimitive` receives the
+/// name, `OrdinaryToPrimitive` uses the method order).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrimitiveHint {
+    Default,
+    Number,
+    String,
+}
+
+impl PrimitiveHint {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Number => "number",
+            Self::String => "string",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) enum Completion {
     Normal(JsValue),
@@ -82,6 +104,8 @@ pub(super) enum AssignmentReference {
     Binding(String),
     Property { object: ObjectId, property: String },
     SymbolProperty { object: ObjectId, symbol: JsSymbol },
+    Private { object: ObjectId, name: String },
+    SuperProperty { property: String },
 }
 
 pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
@@ -173,8 +197,10 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
             }
         }
         Statement::Function { .. }
+        | Statement::Class { .. }
         | Statement::Variable { .. }
         | Statement::VariableList { .. }
+        | Statement::ParameterDefault { .. }
         | Statement::Return(_)
         | Statement::Throw(_)
         | Statement::Break(_)
@@ -254,6 +280,17 @@ impl JsRuntime {
                     var_names.insert(name.clone());
                     functions.push((name, parameters, body));
                 }
+                Statement::Class { name, .. } => {
+                    if lexical_declarations
+                        .insert(name.clone(), VariableKind::Const)
+                        .is_some()
+                    {
+                        return Err(JsError::syntax(
+                            format!("binding {name:?} is declared more than once"),
+                            0,
+                        ));
+                    }
+                }
                 _ => collect_var_names(statement, &mut var_names),
             }
         }
@@ -274,7 +311,7 @@ impl JsRuntime {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
         for (name, parameters, body) in functions {
-            let value = self.create_function(Some(name), parameters, body, None)?;
+            let value = self.create_function(Some(name), parameters, body)?;
             self.initialize_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -331,6 +368,16 @@ impl JsRuntime {
                     }
                     functions.push((name, parameters, body));
                 }
+                Statement::Class { name, .. }
+                    if declarations
+                        .insert(name.clone(), VariableKind::Const)
+                        .is_some() =>
+                {
+                    return Err(JsError::syntax(
+                        format!("binding {name:?} is declared more than once"),
+                        0,
+                    ));
+                }
                 _ => {}
             }
         }
@@ -338,7 +385,7 @@ impl JsRuntime {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
         for (name, parameters, body) in functions {
-            let value = self.create_function(Some(name), parameters, body, None)?;
+            let value = self.create_function(Some(name), parameters, body)?;
             self.initialize_binding(name, value, VariableKind::Const)?;
         }
         Ok(())
@@ -349,7 +396,7 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
     ) -> Result<JsValue, JsError> {
-        self.create_function(None, parameters, body, None)
+        self.create_function(None, parameters, body)
     }
 
     pub(super) fn create_arrow_function(
@@ -357,12 +404,14 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
     ) -> Result<JsValue, JsError> {
-        let lexical_this = self
-            .this_stack
+        // Arrows inherit `super` and `this` lexically from the function they
+        // execute inside, so they carry that class's metadata and bind no
+        // `this` of their own.
+        let class = self
+            .class_frames
             .last()
-            .cloned()
-            .unwrap_or(JsValue::Undefined);
-        self.create_function(None, parameters, body, Some(lexical_this))
+            .and_then(|frame| frame.function.clone());
+        self.create_function_meta(None, parameters, body, true, false, class)
     }
 
     pub(super) fn create_function(
@@ -370,24 +419,42 @@ impl JsRuntime {
         name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
-        lexical_this: Option<JsValue>,
     ) -> Result<JsValue, JsError> {
-        let is_arrow = lexical_this.is_some();
-        self.ensure_heap_capacity(if is_arrow { 1 } else { 2 })?;
+        self.create_function_meta(name, parameters, body, false, false, None)
+    }
+
+    pub(super) fn create_function_meta(
+        &mut self,
+        name: Option<&str>,
+        parameters: &[String],
+        body: &[Statement],
+        arrow: bool,
+        strict: bool,
+        class: Option<Rc<ClassFunction>>,
+    ) -> Result<JsValue, JsError> {
+        self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
-        let (parameters, length) = Self::binding_parameters(parameters);
+        let (body, defaults) = Self::extract_parameter_defaults(body);
+        let (parameters, length, rest) = Self::binding_parameters(parameters);
+        let defaults = (0..parameters.len())
+            .map(|index| defaults.get(&index).cloned())
+            .collect();
         self.functions.push(UserFunction {
             name: name.map(str::to_owned),
             parameters,
-            body: body.to_vec(),
+            defaults,
+            body,
             captured_environment: self.environment.clone(),
-            lexical_this,
+            arrow,
+            strict,
+            class,
+            rest,
         });
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
         // before the first default initializer, excluding the rest parameter.
         let name = name.unwrap_or("");
-        let function = if is_arrow {
+        let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
             self.realm.user_function(function_index, name, length)
@@ -399,15 +466,17 @@ impl JsRuntime {
     /// names and derive the spec `length`: the parameter count before the
     /// first default initializer, with the rest parameter excluded. The
     /// `\0`-prefixed arrow destructuring temporaries pass through untouched.
-    fn binding_parameters(parameters: &[String]) -> (Vec<String>, usize) {
+    fn binding_parameters(parameters: &[String]) -> (Vec<String>, usize, bool) {
         let mut names = Vec::with_capacity(parameters.len());
         let mut length = 0_usize;
         let mut counting = true;
+        let mut rest = false;
         for parameter in parameters {
-            let binding = parameter
-                .strip_prefix(PARAMETER_DEFAULT_MARKER)
-                .or_else(|| parameter.strip_prefix(PARAMETER_REST_MARKER));
-            if let Some(binding) = binding {
+            if let Some(binding) = parameter.strip_prefix(PARAMETER_REST_MARKER) {
+                names.push(binding.to_owned());
+                counting = false;
+                rest = true;
+            } else if let Some(binding) = parameter.strip_prefix(PARAMETER_DEFAULT_MARKER) {
                 names.push(binding.to_owned());
                 counting = false;
             } else {
@@ -417,7 +486,25 @@ impl JsRuntime {
                 }
             }
         }
-        (names, length)
+        (names, length, rest)
+    }
+
+    /// Remove the parser's [`Statement::ParameterDefault`] markers from a
+    /// function body and return them keyed by parameter position. The parser
+    /// prepends one marker per defaulted parameter, in parameter order; the
+    /// evaluator never sees them as ordinary statements.
+    fn extract_parameter_defaults(body: &[Statement]) -> (Vec<Statement>, BTreeMap<usize, Expr>) {
+        let mut defaults = BTreeMap::new();
+        let mut statements = Vec::with_capacity(body.len());
+        for statement in body {
+            match statement {
+                Statement::ParameterDefault { index, value, .. } => {
+                    defaults.insert(*index, value.clone());
+                }
+                statement => statements.push(statement.clone()),
+            }
+        }
+        (statements, defaults)
     }
 
     #[allow(
@@ -486,6 +573,17 @@ impl JsRuntime {
                 Ok(Completion::Normal(value))
             }
             Statement::Function { name, .. } => self.lookup_binding(name).map(Completion::Normal),
+            Statement::Class {
+                name,
+                super_class,
+                elements,
+                ..
+            } => {
+                let value =
+                    self.evaluate_class(dom, Some(name), super_class.as_deref(), elements)?;
+                self.initialize_binding(name, value.clone(), VariableKind::Const)?;
+                Ok(Completion::Normal(value))
+            }
             Statement::Return(value) => {
                 let value = match value {
                     Some(expression) => self.evaluate(dom, expression)?,
@@ -638,6 +736,9 @@ impl JsRuntime {
             Statement::Expression(expression) => {
                 self.evaluate(dom, expression).map(Completion::Normal)
             }
+            // Parameter defaults are consumed while binding a call's
+            // parameters; reaching one here means it was not extracted.
+            Statement::ParameterDefault { .. } => Ok(Completion::Normal(JsValue::Undefined)),
         }
     }
 
@@ -973,12 +1074,7 @@ impl JsRuntime {
                 let object = self.construct_regex(pattern, flags)?;
                 Ok(JsValue::Object(object))
             }
-            Expr::This => Ok(self
-                .this_stack
-                .last()
-                .cloned()
-                // Bare `this` outside any function refers to the global object.
-                .unwrap_or_else(|| JsValue::Object(self.realm.global_object()))),
+            Expr::This => self.current_this(),
             Expr::Identifier(name) => self.lookup_binding(name),
             Expr::Function {
                 name,
@@ -989,6 +1085,58 @@ impl JsRuntime {
             Expr::Arrow {
                 parameters, body, ..
             } => self.create_arrow_function(parameters, body),
+            Expr::Class {
+                name,
+                super_class,
+                elements,
+                ..
+            } => self.evaluate_class(dom, name.as_deref(), super_class.as_deref(), elements),
+            Expr::SuperMember { property, .. } => self.read_super_property(dom, property),
+            Expr::SuperComputedMember { property, .. } => {
+                let key = self.evaluate(dom, property)?.to_js_string();
+                self.read_super_property(dom, &key)
+            }
+            Expr::SuperCall { arguments, .. } => {
+                let class = self.class_frame().ok_or_else(|| {
+                    JsError::new(JsErrorKind::Syntax, "'super' keyword unexpected here", None)
+                })?;
+                if !class.derived {
+                    return Err(JsError::type_error(
+                        "super() is only valid in derived constructors",
+                    ));
+                }
+                let Some(super_constructor) = class.super_constructor else {
+                    return Err(JsError::type_error(
+                        "super() called in a class without a parent constructor",
+                    ));
+                };
+                let mut values = Vec::with_capacity(arguments.len());
+                for argument in arguments {
+                    self.evaluate_argument(dom, argument, &mut values)?;
+                }
+                let instance = self.construct(dom, super_constructor, &values)?;
+                let JsValue::Object(instance) = instance else {
+                    return Err(JsError::type_error(
+                        "super constructor returned a non-object",
+                    ));
+                };
+                self.initialize_this(JsValue::Object(instance));
+                self.run_instance_fields(dom, &class, instance)?;
+                Ok(JsValue::Object(instance))
+            }
+            Expr::NewTarget => Ok(self
+                .new_target_stack
+                .last()
+                .cloned()
+                .unwrap_or(JsValue::Undefined)),
+            Expr::PrivateMember { object, name, .. } => {
+                let object = self.evaluate(dom, object)?;
+                self.read_private(dom, &object, name)
+            }
+            Expr::PrivateIn { name, object, .. } => {
+                let object = self.evaluate(dom, object)?;
+                self.private_in(&object, name).map(JsValue::Boolean)
+            }
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
             Expr::Spread(expression) => self.evaluate(dom, expression),
@@ -1016,7 +1164,7 @@ impl JsRuntime {
                 operator, operand, ..
             } => {
                 let value = self.evaluate(dom, operand)?;
-                self.evaluate_unary(*operator, &value)
+                self.evaluate_unary(dom, *operator, &value)
             }
             Expr::Binary {
                 operator,
@@ -1044,8 +1192,9 @@ impl JsRuntime {
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let previous = self.read_assignment_reference(dom, &reference)?;
+                let numeric = self.to_numeric_primitive(dom, previous.clone())?;
                 let next =
-                    Self::evaluate_binary_values(*operator, &previous, &JsValue::Number(1.0))?;
+                    Self::evaluate_binary_values(*operator, &numeric, &JsValue::Number(1.0))?;
                 self.write_assignment_reference(dom, &reference, next.clone())?;
                 Ok(if *prefix { next } else { previous })
             }
@@ -1088,7 +1237,18 @@ impl JsRuntime {
                 for argument in arguments {
                     self.evaluate_argument(dom, argument, &mut values)?;
                 }
-                self.construct(dom, constructor, &values)
+                // A `new` expression constructs with its own new.target: the
+                // constructor being evaluated. Push it so a nested `new` inside
+                // another constructor's body does not inherit the enclosing
+                // construction's new.target — that leak gave the nested
+                // instance the outer prototype and tripped transpiled
+                // `_classCallCheck` guards ("Cannot call a class as a
+                // function"). `super()` keeps using the stack top because it
+                // must construct the parent with the derived new.target.
+                self.new_target_stack.push(JsValue::Object(constructor));
+                let constructed = self.construct(dom, constructor, &values);
+                self.new_target_stack.pop();
+                constructed
             }
             Expr::Call {
                 callee, arguments, ..
@@ -1138,6 +1298,27 @@ impl JsRuntime {
                 self.write_assignment_reference(dom, &reference, value.clone())?;
                 Ok(value)
             }
+            Expr::LogicalAssignment {
+                target,
+                operator,
+                value,
+                ..
+            } => {
+                let reference = self.resolve_assignment_reference(dom, target)?;
+                let current = self.read_assignment_reference(dom, &reference)?;
+                let short_circuits = match operator {
+                    BinaryOp::LogicalAnd => !current.is_truthy(),
+                    BinaryOp::LogicalOr => current.is_truthy(),
+                    BinaryOp::Nullish => !matches!(current, JsValue::Null | JsValue::Undefined),
+                    _ => false,
+                };
+                if short_circuits {
+                    return Ok(current);
+                }
+                let value = self.evaluate(dom, value)?;
+                self.write_assignment_reference(dom, &reference, value.clone())?;
+                Ok(value)
+            }
         }
     }
 
@@ -1172,6 +1353,21 @@ impl JsRuntime {
                     object,
                     property: key_text,
                 })
+            }
+            Expr::PrivateMember { object, name, .. } => {
+                let evaluated = self.evaluate(dom, object)?;
+                let object = self.coerce_member_base(&evaluated, name)?;
+                Ok(AssignmentReference::Private {
+                    object,
+                    name: name.clone(),
+                })
+            }
+            Expr::SuperMember { property, .. } => Ok(AssignmentReference::SuperProperty {
+                property: property.clone(),
+            }),
+            Expr::SuperComputedMember { property, .. } => {
+                let key = self.evaluate(dom, property)?.to_js_string();
+                Ok(AssignmentReference::SuperProperty { property: key })
             }
             _ => Err(JsError::new(
                 JsErrorKind::Syntax,
@@ -1247,6 +1443,9 @@ impl JsRuntime {
                             self.evaluate(dom, expression)?.to_js_string()
                         }
                         PropertyKey::Spread => unreachable!("spread handled above"),
+                        PropertyKey::Private(_) => {
+                            unreachable!("object literals cannot carry private names")
+                        }
                     };
                     let property_value = self.get_member(dom, object, &key)?;
                     excluded.push(key);
@@ -1274,6 +1473,12 @@ impl JsRuntime {
             AssignmentReference::SymbolProperty { object, symbol } => {
                 self.get_symbol_value(dom, *object, symbol)
             }
+            AssignmentReference::Private { object, name } => {
+                self.read_private(dom, &JsValue::Object(*object), name)
+            }
+            AssignmentReference::SuperProperty { property } => {
+                self.read_super_property(dom, property)
+            }
         }
     }
 
@@ -1290,6 +1495,12 @@ impl JsRuntime {
             }
             AssignmentReference::SymbolProperty { object, symbol } => {
                 self.set_symbol_value(dom, *object, symbol, value)
+            }
+            AssignmentReference::Private { object, name } => {
+                self.write_private(dom, &JsValue::Object(*object), name, value)
+            }
+            AssignmentReference::SuperProperty { property } => {
+                self.write_super_property(dom, property, value)
             }
         }
     }
@@ -1310,11 +1521,17 @@ impl JsRuntime {
                             )?));
                         }
                         Ok(JsValue::Boolean(
-                            self.realm.delete_property(object, &property),
+                            self.delete_property_value(dom, object, &property)?,
                         ))
                     }
                     AssignmentReference::SymbolProperty { object, symbol } => Ok(JsValue::Boolean(
                         self.realm.delete_symbol_property(object, &symbol),
+                    )),
+                    AssignmentReference::Private { .. }
+                    | AssignmentReference::SuperProperty { .. } => Err(JsError::new(
+                        JsErrorKind::Syntax,
+                        "private and super members cannot be deleted",
+                        None,
                     )),
                     AssignmentReference::Binding(_) => {
                         unreachable!("member expressions resolve to property references");
@@ -1329,24 +1546,42 @@ impl JsRuntime {
         }
     }
 
-    /// Numeric-hint `ToPrimitive` for the hosts we can convert directly.
-    pub(super) fn numeric_primitive(&self, value: &JsValue) -> JsValue {
-        if let JsValue::Object(object) = value {
-            return match self.realm.host(*object) {
-                Some(ObjectHost::DateInstance(ms)) => JsValue::Number(ms),
-                Some(ObjectHost::StringPrimitive(text)) => JsValue::String(text.clone()),
-                Some(ObjectHost::NumberPrimitive(number)) => JsValue::Number(number),
-                Some(ObjectHost::BooleanPrimitive(value)) => JsValue::Boolean(value),
-                _ => value.clone(),
-            };
-        }
-        value.clone()
-    }
-
     /// ECMA-262 [[Get]]: read a property through the prototype chain,
     /// invoking accessor getters with `this` bound to the original receiver.
     /// Ordinary property reads keep using `Realm::get_property` fast paths;
     /// this entry point is required wherever accessors may exist.
+    /// The active `this` binding, walking the environment chain past block
+    /// and arrow scopes. Top-level code has no binding and sees the global
+    /// object; a derived constructor's binding is uninitialized until
+    /// `super()` runs.
+    pub(super) fn current_this(&self) -> Result<JsValue, JsError> {
+        for environment in self.environment.iter().rev() {
+            let environment = environment.borrow();
+            if let Some(binding) = environment.bindings.get("this") {
+                if !binding.initialized {
+                    return Err(JsError::reference(
+                        "must call super constructor before accessing 'this'",
+                    ));
+                }
+                return Ok(binding.value.clone());
+            }
+        }
+        Ok(JsValue::Object(self.realm.global_object()))
+    }
+
+    /// Bind `this` in the nearest environment that declares the binding (the
+    /// active derived constructor's call environment).
+    pub(super) fn initialize_this(&mut self, value: JsValue) {
+        for environment in self.environment.iter().rev() {
+            let mut environment = environment.borrow_mut();
+            if let Some(binding) = environment.bindings.get_mut("this") {
+                binding.value = value;
+                binding.initialized = true;
+                return;
+            }
+        }
+    }
+
     pub(super) fn get_value(
         &mut self,
         dom: &mut Dom,
@@ -1433,7 +1668,7 @@ impl JsRuntime {
             JsValue::Object(object)
                 if matches!(self.realm.host(*object), Some(ObjectHost::Array)) =>
             {
-                Ok(self.array_elements_for(*object))
+                self.array_elements_for(*object)
             }
             JsValue::String(text) => Ok(text
                 .chars()
@@ -1450,11 +1685,24 @@ impl JsRuntime {
                 let array_like = self
                     .realm
                     .get_property(*object, "length")
-                    .map(|length| to_number(&length).map(|length| length.max(0.0) as usize))
-                    .unwrap_or(Ok(0))?;
-                (0..array_like)
-                    .map(|index| self.get_member(dom, *object, &index.to_string()))
-                    .collect()
+                    .map(|length| super::builtins::array::to_length(&length))
+                    .transpose()?
+                    .unwrap_or(0.0);
+                if array_like > super::builtins::array::MAX_MATERIALIZED_ELEMENTS as f64 {
+                    return Err(JsError::resource(
+                        "array-like length exceeds the materialization bound",
+                    ));
+                }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let count = array_like as usize;
+                let mut values = Vec::new();
+                values
+                    .try_reserve_exact(count)
+                    .map_err(|_| JsError::resource("array-like exceeds the available heap"))?;
+                for index in 0..count {
+                    values.push(self.get_member(dom, *object, &index.to_string())?);
+                }
+                Ok(values)
             }
             JsValue::Null | JsValue::Undefined | JsValue::Symbol(_) => Err(JsError::type_error(
                 format!("{} is not iterable", value.to_js_string()),
@@ -1551,12 +1799,30 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// `ToPrimitive` with the default hint, as used by the `+` operator and
+    /// the parser's template-literal lowering (`"" + value`).
     pub(super) fn to_numeric_primitive(
         &mut self,
         dom: &mut Dom,
         value: JsValue,
     ) -> Result<JsValue, JsError> {
-        self.to_primitive_with_hint(dom, value, false)
+        self.to_primitive_with_hint(dom, value, PrimitiveHint::Default)
+    }
+
+    /// ECMA-262 `ToNumber` for values that may be objects: run `ToPrimitive`
+    /// (number hint) so user-defined `valueOf`/`toString` participate, then
+    /// apply the primitive conversion.
+    pub(super) fn to_number_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<f64, JsError> {
+        if matches!(value, JsValue::Object(_)) {
+            let primitive =
+                self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Number)?;
+            return to_number(&primitive);
+        }
+        to_number(value)
     }
 
     /// ECMA-262 `ToString` for values that may be objects: run `ToPrimitive`
@@ -1567,7 +1833,7 @@ impl JsRuntime {
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<String, JsError> {
-        let primitive = self.to_primitive_with_hint(dom, value.clone(), true)?;
+        let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?;
         if std::env::var_os("RENDER_TRACE_STRING").is_some()
             && let JsValue::Object(object) = value
         {
@@ -1587,19 +1853,21 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: JsValue,
-        prefer_string: bool,
+        hint: PrimitiveHint,
     ) -> Result<JsValue, JsError> {
         let JsValue::Object(object) = value else {
             return Ok(value);
         };
         match self.realm.host(object) {
-            Some(ObjectHost::DateInstance(ms)) => return Ok(JsValue::Number(ms)),
+            Some(ObjectHost::DateInstance(ms)) if hint != PrimitiveHint::String => {
+                return Ok(JsValue::Number(ms));
+            }
             Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
             Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
             Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
             Some(ObjectHost::Array) => {
                 let text = self
-                    .array_elements_for(object)
+                    .array_elements_for(object)?
                     .iter()
                     .map(|value| match value {
                         JsValue::Null | JsValue::Undefined => String::new(),
@@ -1613,7 +1881,6 @@ impl JsRuntime {
         }
         // An exotic `Symbol.toPrimitive` method gets first refusal, called
         // with the coercion hint; a primitive result short-circuits.
-        let hint = if prefer_string { "string" } else { "default" };
         let to_primitive_method = self
             .realm
             .get_symbol_descriptor(object, &JsSymbol::well_known("@@toPrimitive"))
@@ -1631,7 +1898,7 @@ impl JsRuntime {
             let invoked = self.call_with_this(
                 dom,
                 method,
-                &[JsValue::String(hint.to_owned())],
+                &[JsValue::String(hint.name().to_owned())],
                 JsValue::Object(object),
             )?;
             if !matches!(invoked, JsValue::Object(_)) {
@@ -1641,7 +1908,9 @@ impl JsRuntime {
                 "Cannot convert object to primitive value",
             ));
         }
-        let method_order: [&str; 2] = if prefer_string {
+        // OrdinaryToPrimitive: `number` tries valueOf then toString; `string`
+        // reverses the order; `default` follows the number order.
+        let method_order: [&str; 2] = if hint == PrimitiveHint::String {
             ["toString", "valueOf"]
         } else {
             ["valueOf", "toString"]
@@ -1718,9 +1987,28 @@ impl JsRuntime {
         let callee_label = match callee {
             Expr::Member { property, .. } => format!(".{property}"),
             Expr::ComputedMember { .. } => "[]".to_owned(),
+            Expr::SuperMember { property, .. } => format!(".{property}"),
+            Expr::SuperComputedMember { .. } => "[]".to_owned(),
+            Expr::PrivateMember { name, .. } => format!(".#{name}"),
             _ => String::new(),
         };
         let (callee_value, receiver) = match callee {
+            Expr::SuperMember { property, .. } => {
+                let value = self.read_super_property(dom, property)?;
+                let receiver = self.current_this()?;
+                (value, receiver)
+            }
+            Expr::SuperComputedMember { property, .. } => {
+                let key = self.evaluate(dom, property)?.to_js_string();
+                let value = self.read_super_property(dom, &key)?;
+                let receiver = self.current_this()?;
+                (value, receiver)
+            }
+            Expr::PrivateMember { object, name, .. } => {
+                let receiver = self.evaluate(dom, object)?;
+                let value = self.read_private(dom, &receiver, name)?;
+                (value, receiver)
+            }
             Expr::Member {
                 object, property, ..
             } => {
@@ -1738,9 +2026,15 @@ impl JsRuntime {
                 if matches!(receiver, JsValue::Null | JsValue::Undefined) {
                     return Ok(JsValue::Undefined);
                 }
-                let key = self.evaluate(dom, property)?.to_js_string();
+                let key_value = self.evaluate(dom, property)?;
+                let key = key_value.to_js_string();
                 let object = self.coerce_member_base(&receiver, &key)?;
-                (self.get_member(dom, object, &key)?, receiver)
+                let callee = if let JsValue::Symbol(symbol) = &key_value {
+                    self.get_symbol_value(dom, object, symbol)?
+                } else {
+                    self.get_member(dom, object, &key)?
+                };
+                (callee, receiver)
             }
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
@@ -1784,7 +2078,7 @@ impl JsRuntime {
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
-            let value = self.create_function(Some(name), parameters, body, None)?;
+            let value = self.create_function(Some(name), parameters, body)?;
             self.initialize_binding(name, value.clone(), VariableKind::Const)?;
             Ok(value)
         })();
@@ -1839,6 +2133,9 @@ impl JsRuntime {
                 PropertyKey::Static(key) => JsValue::String(key.clone()),
                 PropertyKey::Computed(expression) => self.evaluate(dom, expression)?,
                 PropertyKey::Spread => unreachable!("spread property handled above"),
+                PropertyKey::Private(_) => {
+                    unreachable!("object literals cannot carry private names")
+                }
             };
             let symbol_key = match &key_value {
                 JsValue::Symbol(symbol) => Some(symbol.clone()),
@@ -1976,7 +2273,8 @@ impl JsRuntime {
     }
 
     pub(super) fn evaluate_unary(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         operator: UnaryOp,
         value: &JsValue,
     ) -> Result<JsValue, JsError> {
@@ -1996,9 +2294,18 @@ impl JsRuntime {
                 }
                 .to_owned(),
             )),
-            UnaryOp::Plus => Ok(JsValue::Number(to_number(&self.numeric_primitive(value))?)),
-            UnaryOp::Minus => Ok(JsValue::Number(-to_number(&self.numeric_primitive(value))?)),
-            UnaryOp::BitwiseNot => Ok(JsValue::Number(f64::from(!to_int32(value)?))),
+            UnaryOp::Plus => {
+                let primitive = self.to_numeric_primitive(dom, value.clone())?;
+                Ok(JsValue::Number(to_number(&primitive)?))
+            }
+            UnaryOp::Minus => {
+                let primitive = self.to_numeric_primitive(dom, value.clone())?;
+                Ok(JsValue::Number(-to_number(&primitive)?))
+            }
+            UnaryOp::BitwiseNot => {
+                let primitive = self.to_numeric_primitive(dom, value.clone())?;
+                Ok(JsValue::Number(f64::from(!to_int32(&primitive)?)))
+            }
             UnaryOp::Void => Ok(JsValue::Undefined),
             UnaryOp::Delete => unreachable!("delete evaluates an assignment reference"),
         }
@@ -2018,22 +2325,28 @@ impl JsRuntime {
         if operator == BinaryOp::LogicalOr && left.is_truthy() {
             return Ok(left);
         }
+        if operator == BinaryOp::Nullish && !matches!(left, JsValue::Null | JsValue::Undefined) {
+            return Ok(left);
+        }
         let right = self.evaluate(dom, right)?;
         // Logical operators return one of their original operands. Applying
         // ToPrimitive here changes objects such as `globalThis` into
         // "[object Object]", which breaks feature detection patterns like
         // `typeof globalThis !== "undefined" && globalThis`.
-        if matches!(operator, BinaryOp::LogicalAnd | BinaryOp::LogicalOr) {
+        if matches!(
+            operator,
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish
+        ) {
             return Ok(right);
         }
         if operator == BinaryOp::Instanceof {
             return self.instanceof(dom, &left, &right).map(JsValue::Boolean);
         }
         if operator == BinaryOp::In {
-            return self.property_in(&left, &right).map(JsValue::Boolean);
+            return self.property_in(dom, &left, &right).map(JsValue::Boolean);
         }
         // ECMA-262 IsLooselyEqual/IsStrictEqual: equality operators never
-        // coerce their operands through ToPrimitive here — strict equality
+        // coerce their operands through ToPrimitive here �?strict equality
         // compares raw values and loose equality applies the spec algorithm
         // in abstract_equal. Arithmetic and relational operators below keep
         // the numeric conversion.
@@ -2055,7 +2368,7 @@ impl JsRuntime {
         let left = self.to_numeric_primitive(dom, left)?;
         let right = self.to_numeric_primitive(dom, right)?;
         match operator {
-            BinaryOp::LogicalAnd | BinaryOp::LogicalOr => Ok(right),
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => Ok(right),
             BinaryOp::Add => {
                 if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
                     Ok(JsValue::String(format!(
@@ -2095,7 +2408,12 @@ impl JsRuntime {
 
     /// The `in` operator: property existence on objects, index bounds on
     /// strings.
-    pub(super) fn property_in(&self, key: &JsValue, container: &JsValue) -> Result<bool, JsError> {
+    pub(super) fn property_in(
+        &mut self,
+        dom: &mut Dom,
+        key: &JsValue,
+        container: &JsValue,
+    ) -> Result<bool, JsError> {
         if let JsValue::Symbol(symbol) = key {
             return match container {
                 JsValue::Object(object) => {
@@ -2109,6 +2427,9 @@ impl JsRuntime {
         let name = key.to_js_string();
         match container {
             JsValue::Object(object) => {
+                if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) {
+                    return self.proxy_has(dom, *object, &name);
+                }
                 if self.realm.get_property(*object, &name).is_some() {
                     return Ok(true);
                 }
@@ -2216,7 +2537,15 @@ impl JsRuntime {
                     0,
                 ));
             }
-            if !self.realm.set_global(name.to_owned(), value) {
+            // Global `var` declarations are allowed to coexist with an
+            // existing Window property. The declaration itself must not
+            // overwrite hosts such as the read-only `window.parent`.
+            let existing_window_property = kind == VariableKind::Var
+                && self
+                    .realm
+                    .own_property(self.realm.global_object(), name)
+                    .is_some();
+            if !existing_window_property && !self.realm.set_global(name.to_owned(), value) {
                 return Err(JsError::type_error(format!(
                     "global property {name:?} is not writable"
                 )));
@@ -2312,6 +2641,11 @@ impl JsRuntime {
             if self.realm.set_global(name.to_owned(), value) {
                 return Ok(());
             }
+            if kind == VariableKind::Var {
+                // A sloppy global `var` initializer assignment to a
+                // read-only Window property fails silently in browsers.
+                return Ok(());
+            }
             return Err(JsError::type_error(format!(
                 "global property {name:?} is not writable"
             )));
@@ -2336,6 +2670,13 @@ impl JsRuntime {
             return Err(JsError::reference(format!(
                 "cannot access {name} before initialization"
             )));
+        }
+        if let Some(value) = match name {
+            "innerWidth" | "outerWidth" => Some(self.viewport.width),
+            "innerHeight" | "outerHeight" => Some(self.viewport.height),
+            _ => None,
+        } {
+            return Ok(JsValue::Number(f64::from(value)));
         }
         self.realm
             .global(name)
@@ -2391,6 +2732,9 @@ impl JsRuntime {
         property: &str,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_get(dom, object, property);
+        }
         // Own data properties win outright (instance fields such as a
         // RegExp's `source`); own accessors run their getter.
         if let Some(descriptor) = self.realm.own_property(object, property) {
@@ -2445,6 +2789,14 @@ impl JsRuntime {
                     };
                     return Ok(JsValue::String(name));
                 }
+                "nodeValue" | "data" => {
+                    return Ok(match dom.node(node_id).map(render_dom::Node::kind) {
+                        Some(NodeKind::Text(data) | NodeKind::Comment(data)) => {
+                            JsValue::String(data.clone())
+                        }
+                        _ => JsValue::Null,
+                    });
+                }
                 _ => {}
             }
         }
@@ -2475,6 +2827,16 @@ impl JsRuntime {
                         None => Ok(JsValue::Null),
                     };
                 }
+                _ => {}
+            },
+            Some(ObjectHost::Blob {
+                bytes,
+                content_type,
+            }) => match property {
+                "size" => {
+                    return Ok(JsValue::Number(bytes.len() as f64));
+                }
+                "type" => return Ok(JsValue::String(content_type.clone())),
                 _ => {}
             },
             Some(ObjectHost::Node(node)) => match property {
@@ -2826,9 +3188,11 @@ impl JsRuntime {
             (Some(ObjectHost::Document(_)), "createTextNode") => {
                 Some(NativeFunction::CreateTextNode)
             }
+            (Some(ObjectHost::Document(_)), "createComment") => Some(NativeFunction::CreateComment),
             (Some(ObjectHost::Document(_)), "createDocumentFragment") => {
                 Some(NativeFunction::CreateDocumentFragment)
             }
+            (Some(ObjectHost::Document(_)), "createEvent") => Some(NativeFunction::CreateEvent),
             (Some(ObjectHost::Node(_)), "compareDocumentPosition") => {
                 Some(NativeFunction::CompareDocumentPosition)
             }
@@ -2884,7 +3248,22 @@ impl JsRuntime {
             (Some(ObjectHost::CollectionIterator { .. }), "next") => {
                 Some(NativeFunction::CollectionIteratorNext)
             }
+            (Some(ObjectHost::IteratorHelper { .. }), "next") => {
+                Some(NativeFunction::IteratorHelperNext)
+            }
+            (Some(ObjectHost::IteratorHelper { .. }), "return") => {
+                Some(NativeFunction::IteratorHelperReturn)
+            }
             (Some(ObjectHost::StringPrimitive(_)), name) => string_method_native(name),
+            (Some(ObjectHost::Blob { .. }), "text") => Some(NativeFunction::BlobText),
+            (Some(ObjectHost::Blob { .. }), "arrayBuffer") => Some(NativeFunction::BlobArrayBuffer),
+            (Some(ObjectHost::Blob { .. }), "slice") => Some(NativeFunction::BlobSlice),
+            (Some(ObjectHost::UrlConstructor), "createObjectURL") => {
+                Some(NativeFunction::UrlCreateObjectUrl)
+            }
+            (Some(ObjectHost::UrlConstructor), "revokeObjectURL") => {
+                Some(NativeFunction::UrlRevokeObjectUrl)
+            }
             (Some(ObjectHost::MutationObserver { .. }), "observe") => {
                 Some(NativeFunction::MutationObserve)
             }
@@ -2919,6 +3298,9 @@ impl JsRuntime {
         value: JsValue,
     ) -> Result<(), JsError> {
         self.consume_step()?;
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_set(dom, object, property, value);
+        }
         let location_base = match self.realm.host(object) {
             Some(ObjectHost::Location(url)) => Some(url.clone()),
             _ => None,
@@ -3075,9 +3457,19 @@ impl JsRuntime {
                 // attributes (stringified, like the IDL DOMString setter).
                 return JsRuntime::set_dataset_member(dom, node, property, &value);
             }
-            // Assignments to primitive string wrappers are silently ignored,
-            // mirroring how non-strict engines drop them.
-            Some(ObjectHost::StringPrimitive(_)) => return Ok(()),
+            // String exotic objects are ordinary apart from their virtual
+            // indexed characters and `length`; writes to those are ignored,
+            // but ordinary properties must be stored.
+            Some(ObjectHost::StringPrimitive(text)) => {
+                if property == "length" {
+                    return Ok(());
+                }
+                if let Ok(index) = property.parse::<usize>()
+                    && index < text.chars().count()
+                {
+                    return Ok(());
+                }
+            }
             Some(ObjectHost::RegExp(index)) if property == "lastIndex" => {
                 let number = to_number(&value)?;
                 #[allow(
@@ -3101,6 +3493,53 @@ impl JsRuntime {
         self.set_value(dom, object, property, value)
     }
 
+    /// `IsConstructor` (§7.2.5): mirrors the constructor arms of
+    /// `construct_dispatch` so callers such as `Reflect.construct` reject
+    /// non-constructors with a `TypeError` before dispatching.
+    pub(super) fn is_constructor(&self, object: ObjectId) -> bool {
+        match self.realm.host(object) {
+            Some(
+                ObjectHost::ObjectConstructor
+                | ObjectHost::ArrayConstructor
+                | ObjectHost::StringConstructor
+                | ObjectHost::NumberConstructor
+                | ObjectHost::BooleanConstructor
+                | ObjectHost::FunctionConstructor
+                | ObjectHost::DateConstructor
+                | ObjectHost::ErrorConstructor(_)
+                | ObjectHost::PromiseConstructor
+                | ObjectHost::EventConstructor
+                | ObjectHost::DomConstructor
+                | ObjectHost::ImageConstructor
+                | ObjectHost::VideoConstructor
+                | ObjectHost::XmlHttpRequestConstructor
+                | ObjectHost::AbortControllerConstructor
+                | ObjectHost::FormDataConstructor
+                | ObjectHost::ResponseConstructor
+                | ObjectHost::BlobConstructor
+                | ObjectHost::ProxyConstructor
+                | ObjectHost::IntersectionObserverConstructor
+                | ObjectHost::MutationObserverConstructor
+                | ObjectHost::CollectionConstructor(_)
+                | ObjectHost::TypedArrayConstructor(_)
+                | ObjectHost::RegExpConstructor
+                | ObjectHost::UrlConstructor
+                | ObjectHost::UrlSearchParamsConstructor,
+            ) => true,
+            // Iterator is an abstract constructor: `new Iterator()` throws,
+            // but a subclass's `super()` constructs through it.
+            Some(ObjectHost::NativeFunction(NativeFunction::IteratorConstructor)) => true,
+            Some(ObjectHost::UserFunction(index)) => {
+                let class = self
+                    .functions
+                    .get(index)
+                    .and_then(|function| function.class.clone());
+                !matches!(&class, Some(class) if !class.constructor)
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn construct(
         &mut self,
         dom: &mut Dom,
@@ -3119,22 +3558,134 @@ impl JsRuntime {
         result
     }
 
+    /// ECMA-262 20.2.1.1 `Function(...parameterArgs, bodyArg)`: build the
+    /// corresponding function expression, parse it, and evaluate it in the
+    /// global scope (the constructor never closes over the caller's locals).
+    fn function_constructor(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let mut parts = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            parts.push(self.to_string_value(dom, argument)?);
+        }
+        let body = parts.pop().unwrap_or_default();
+        let parameters = parts.join(",");
+        let source = format!("(function anonymous({parameters}\n) {{\n{body}\n}})");
+        let script = crate::CompiledScript::compile(&source, &self.limits)?;
+        let environment = std::mem::take(&mut self.environment);
+        let result = (|| {
+            self.instantiate_statements(&script.statements)?;
+            match self.evaluate_statements(dom, &script.statements)? {
+                Completion::Normal(value @ JsValue::Object(_)) => Ok(value),
+                _ => Err(JsError::syntax(
+                    "Function constructor source did not produce a function",
+                    0,
+                )),
+            }
+        })();
+        self.environment = environment;
+        result
+    }
+
+    /// ECMA-262 22.2.4.1 `RegExp(pattern, flags)`: no arguments yields an
+    /// empty pattern, an existing `RegExp` supplies its source and flags, and
+    /// an explicit flags argument recompiles.
+    fn regexp_constructor_value(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+        called_without_new: bool,
+    ) -> Result<JsValue, JsError> {
+        let pattern = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let flags = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(object) = &pattern
+            && let Some(ObjectHost::RegExp(index)) = self.realm.host(*object)
+        {
+            if called_without_new
+                && matches!(flags, JsValue::Undefined)
+                && let Some(JsValue::Object(constructor)) = self.realm.global("RegExp")
+                && matches!(
+                    self.get_value(dom, *object, "constructor")?,
+                    JsValue::Object(pattern_constructor) if pattern_constructor == constructor
+                )
+            {
+                return Ok(pattern.clone());
+            }
+            let source = self.regexes[index].compiled.source().to_owned();
+            let flags_text = match &flags {
+                JsValue::Undefined => self.regexes[index].compiled.flags().describe(),
+                value => self.to_string_value(dom, value)?,
+            };
+            let object = self.construct_regex(&source, &flags_text)?;
+            return Ok(JsValue::Object(object));
+        }
+        let pattern_text = match &pattern {
+            JsValue::Undefined => String::new(),
+            value => self.to_string_value(dom, value)?,
+        };
+        let flags_text = match &flags {
+            JsValue::Undefined => String::new(),
+            value => self.to_string_value(dom, value)?,
+        };
+        let object = self.construct_regex(&pattern_text, &flags_text)?;
+        Ok(JsValue::Object(object))
+    }
+
     pub(super) fn construct_dispatch(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // `new.target` supplies the instance prototype: a `super()` call from
+        // a derived constructor must create an object whose prototype is the
+        // derived class's prototype, not the parent's.
+        let new_target = self
+            .new_target_stack
+            .last()
+            .cloned()
+            .unwrap_or(JsValue::Object(constructor));
+        let instance_prototype = |runtime: &mut Self| -> Option<ObjectId> {
+            let target = match &new_target {
+                JsValue::Object(target) => Some(*target),
+                _ => None,
+            }
+            .unwrap_or(constructor);
+            runtime
+                .realm
+                .get_property(target, "prototype")
+                .and_then(|value| match value {
+                    JsValue::Object(prototype) => Some(prototype),
+                    _ => None,
+                })
+        };
         match self.realm.host(constructor) {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
             Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
-            Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
-                None | Some(JsValue::Undefined) => 0.0,
-                Some(value) => to_number(value)?,
-            })),
-            Some(ObjectHost::BooleanConstructor) => Ok(JsValue::Boolean(
-                arguments.first().is_none_or(JsValue::is_truthy),
-            )),
+            Some(ObjectHost::StringConstructor) => {
+                let text = match arguments.first() {
+                    None => String::new(),
+                    Some(value) => self.to_string_value(dom, value)?,
+                };
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.string_wrapper(text)))
+            }
+            Some(ObjectHost::NumberConstructor) => {
+                let number = match arguments.first() {
+                    None | Some(JsValue::Undefined) => 0.0,
+                    Some(value) => self.to_number_value(dom, value)?,
+                };
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.number_primitive_wrapper(number)))
+            }
+            Some(ObjectHost::BooleanConstructor) => {
+                let value = arguments.first().is_none_or(JsValue::is_truthy);
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.boolean_primitive_wrapper(value)))
+            }
+            Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
             Some(ObjectHost::DateConstructor) => {
                 let ms = Self::date_from_constructor_arguments(arguments)?;
                 self.ensure_heap_capacity(1)?;
@@ -3175,9 +3726,15 @@ impl JsRuntime {
             Some(ObjectHost::XmlHttpRequestConstructor) => {
                 self.xml_http_request_constructor(constructor)
             }
+            Some(ObjectHost::AbortControllerConstructor) => {
+                self.abort_controller_constructor(constructor)
+            }
+            Some(ObjectHost::FormDataConstructor) => self.form_data_constructor(constructor),
             Some(ObjectHost::ResponseConstructor) => {
                 self.response_constructor(constructor, arguments)
             }
+            Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, constructor, arguments),
+            Some(ObjectHost::ProxyConstructor) => self.proxy_constructor(constructor, arguments),
             Some(ObjectHost::IntersectionObserverConstructor) => {
                 self.intersection_observer_constructor(constructor, arguments)
             }
@@ -3191,13 +3748,7 @@ impl JsRuntime {
                 self.typed_array_constructor(dom, constructor, kind, arguments)
             }
             Some(ObjectHost::RegExpConstructor) => {
-                let pattern = required_argument(arguments, 0, "RegExp")?.to_js_string();
-                let flags = match arguments.get(1) {
-                    None | Some(JsValue::Undefined) => String::new(),
-                    Some(value) => value.to_js_string(),
-                };
-                let object = self.construct_regex(&pattern, &flags)?;
-                Ok(JsValue::Object(object))
+                self.regexp_constructor_value(dom, arguments, false)
             }
             Some(ObjectHost::UrlConstructor) => self.url_constructor(constructor, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
@@ -3206,19 +3757,84 @@ impl JsRuntime {
             Some(ObjectHost::ArrowFunction(_)) => {
                 Err(JsError::type_error("arrow function is not a constructor"))
             }
-            Some(ObjectHost::UserFunction(index)) => {
+            Some(ObjectHost::NativeFunction(NativeFunction::IteratorConstructor)) => {
+                // `new Iterator()` directly is abstract, but `super()` from a
+                // subclass constructs an ordinary object with the subclass's
+                // prototype, exactly like the spec's NewTarget check. The
+                // nested-`new` scope push means a direct `new Iterator()`
+                // always resolves new.target to Iterator itself.
+                let new_target = self
+                    .new_target_stack
+                    .last()
+                    .cloned()
+                    .unwrap_or(JsValue::Object(constructor));
+                if new_target == JsValue::Object(constructor) {
+                    return Err(JsError::type_error("Iterator is abstract"));
+                }
                 self.ensure_heap_capacity(1)?;
-                let prototype = match self.realm.get_property(constructor, "prototype") {
-                    Some(JsValue::Object(prototype)) => Some(prototype),
-                    _ => None,
-                };
-                let instance = self.realm.create_object(prototype);
-                let result =
-                    self.call_user(dom, index, arguments, JsValue::Object(instance), true)?;
-                if matches!(result, JsValue::Object(_)) {
-                    Ok(result)
-                } else {
-                    Ok(JsValue::Object(instance))
+                let prototype = instance_prototype(self);
+                Ok(JsValue::Object(self.realm.create_object(prototype)))
+            }
+            Some(ObjectHost::UserFunction(index)) => {
+                let class = self
+                    .functions
+                    .get(index)
+                    .and_then(|function| function.class.clone());
+                match class {
+                    Some(class) if !class.constructor => {
+                        Err(JsError::type_error("class method is not a constructor"))
+                    }
+                    Some(class) => {
+                        self.new_target_stack.push(JsValue::Object(constructor));
+                        let result = if class.derived {
+                            // A derived constructor receives `this` from its
+                            // `super()` call; call_user returns the final
+                            // `this` on normal completion.
+                            let result =
+                                self.call_user(dom, index, arguments, JsValue::Undefined, true);
+                            match result {
+                                Ok(JsValue::Object(instance)) => Ok(JsValue::Object(instance)),
+                                Ok(_) => Err(JsError::type_error(
+                                    "derived constructor did not return an object",
+                                )),
+                                Err(error) => Err(error),
+                            }
+                        } else {
+                            self.ensure_heap_capacity(1)?;
+                            let prototype = instance_prototype(self);
+                            let instance = self.realm.create_object(prototype);
+                            self.run_instance_fields(dom, &class, instance)?;
+                            let result = self.call_user(
+                                dom,
+                                index,
+                                arguments,
+                                JsValue::Object(instance),
+                                true,
+                            )?;
+                            if matches!(result, JsValue::Object(_)) {
+                                Ok(result)
+                            } else {
+                                Ok(JsValue::Object(instance))
+                            }
+                        };
+                        self.new_target_stack.pop();
+                        result
+                    }
+                    None => {
+                        self.ensure_heap_capacity(1)?;
+                        let prototype = instance_prototype(self);
+                        let instance = self.realm.create_object(prototype);
+                        self.new_target_stack.push(JsValue::Object(constructor));
+                        let result =
+                            self.call_user(dom, index, arguments, JsValue::Object(instance), true);
+                        self.new_target_stack.pop();
+                        let result = result?;
+                        if matches!(result, JsValue::Object(_)) {
+                            Ok(result)
+                        } else {
+                            Ok(JsValue::Object(instance))
+                        }
+                    }
                 }
             }
             _ => Err(JsError::type_error("value is not a constructor")),
@@ -3253,7 +3869,7 @@ impl JsRuntime {
         let result = match self.realm.host(callee) {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
             Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
-            Some(ObjectHost::FunctionConstructor) => Ok(JsValue::Undefined),
+            Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
             Some(ObjectHost::StringConstructor) => Ok(JsValue::String(match arguments.first() {
                 None => String::new(),
                 Some(value) => self.to_string_value(dom, value)?,
@@ -3293,8 +3909,18 @@ impl JsRuntime {
             Some(ObjectHost::XmlHttpRequestConstructor) => Err(JsError::type_error(
                 "XMLHttpRequest constructor requires 'new'",
             )),
+            Some(ObjectHost::AbortControllerConstructor) => Err(JsError::type_error(
+                "AbortController constructor requires 'new'",
+            )),
+            Some(ObjectHost::FormDataConstructor) => {
+                Err(JsError::type_error("FormData constructor requires 'new'"))
+            }
             Some(ObjectHost::ResponseConstructor) => {
                 Err(JsError::type_error("Response constructor requires 'new'"))
+            }
+            Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, callee, arguments),
+            Some(ObjectHost::ProxyConstructor) => {
+                Err(JsError::type_error("Proxy constructor requires 'new'"))
             }
             Some(ObjectHost::IntersectionObserverConstructor) => Err(JsError::type_error(
                 "IntersectionObserver constructor requires 'new'",
@@ -3310,14 +3936,9 @@ impl JsRuntime {
                 self.typed_array_constructor(dom, callee, kind, arguments)
             }
             Some(ObjectHost::RegExpConstructor) => {
-                // `RegExp(re)` called without `new` behaves like construction.
-                let pattern = required_argument(arguments, 0, "RegExp")?.to_js_string();
-                let flags = match arguments.get(1) {
-                    None | Some(JsValue::Undefined) => String::new(),
-                    Some(value) => value.to_js_string(),
-                };
-                let object = self.construct_regex(&pattern, &flags)?;
-                Ok(JsValue::Object(object))
+                // `RegExp(re)` called without `new` behaves like construction,
+                // except that a same-realm pattern is returned unchanged.
+                self.regexp_constructor_value(dom, arguments, true)
             }
             Some(ObjectHost::UrlConstructor) => self.url_constructor(callee, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
@@ -3336,6 +3957,22 @@ impl JsRuntime {
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionPrototype)) => {
                 Ok(JsValue::Undefined)
             }
+            Some(ObjectHost::NativeFunction(NativeFunction::FunctionToString)) => {
+                let function = Self::require_callable_object(&receiver, &self.realm)?;
+                let name = self
+                    .realm
+                    .get_property(function, "name")
+                    .map_or_else(String::new, |value| value.to_js_string());
+                let native = !matches!(
+                    self.realm.host(function),
+                    Some(ObjectHost::UserFunction(_) | ObjectHost::ArrowFunction(_))
+                );
+                Ok(JsValue::String(if native {
+                    format!("function {name}() {{ [native code] }}")
+                } else {
+                    format!("function {name}() {{ }}")
+                }))
+            }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionCall)) => {
                 self.function_call(dom, &receiver, arguments)
             }
@@ -3344,7 +3981,7 @@ impl JsRuntime {
                 let callable = Self::require_callable_object(&receiver, &self.realm)?;
                 let this_argument = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 let call_arguments = match arguments.get(1) {
-                    Some(JsValue::Object(array)) => self.array_elements_for(*array),
+                    Some(JsValue::Object(array)) => self.array_elements_for(*array)?,
                     _ => Vec::new(),
                 };
                 self.call_with_this(dom, callable, &call_arguments, this_argument)
@@ -3384,6 +4021,16 @@ impl JsRuntime {
                 self.call_with_this(dom, target, &combined, receiver)
             }
             Some(ObjectHost::UserFunction(index)) => {
+                if self
+                    .functions
+                    .get(index)
+                    .and_then(|function| function.class.as_ref())
+                    .is_some_and(|class| class.constructor)
+                {
+                    return Err(JsError::type_error(
+                        "class constructor cannot be invoked without 'new'",
+                    ));
+                }
                 self.call_user(dom, index, arguments, receiver, true)
             }
             Some(ObjectHost::ArrowFunction(index)) => {
@@ -3461,23 +4108,45 @@ impl JsRuntime {
         receiver: JsValue,
         create_arguments_binding: bool,
     ) -> Result<JsValue, JsError> {
-        // All user functions are treated as sloppy mode: a nullish `this`
-        // falls back to the global object.
-        let receiver = match receiver {
-            JsValue::Undefined | JsValue::Null => JsValue::Object(self.realm.global_object()),
-            other => other,
-        };
         let function = self
             .functions
             .get(index)
             .cloned()
             .ok_or_else(|| JsError::type_error("function object refers to unknown code"))?;
+        // Class methods and constructors are strict: a nullish `this` stays
+        // undefined instead of falling back to the global object.
+        let receiver = if function.strict {
+            receiver
+        } else {
+            match receiver {
+                JsValue::Undefined | JsValue::Null => JsValue::Object(self.realm.global_object()),
+                other => other,
+            }
+        };
         let previous_environment =
-            std::mem::replace(&mut self.environment, function.captured_environment);
+            std::mem::replace(&mut self.environment, function.captured_environment.clone());
         let mut call_environment = EnvironmentRecord {
             function_scope: true,
             ..EnvironmentRecord::default()
         };
+        // Every non-arrow function binds its own `this`; a derived
+        // constructor starts with an uninitialized binding that `super()`
+        // replaces, so reading `this` before then is a ReferenceError.
+        if !function.arrow {
+            let derived_constructor = function
+                .class
+                .as_ref()
+                .is_some_and(|class| class.constructor && class.derived);
+            call_environment.bindings.insert(
+                "this".to_owned(),
+                Binding {
+                    value: receiver,
+                    mutable: true,
+                    initialized: !derived_constructor,
+                    kind: VariableKind::Var,
+                },
+            );
+        }
         if create_arguments_binding {
             let arguments_object = self.create_array_from_values(arguments)?;
             call_environment.bindings.insert(
@@ -3490,33 +4159,77 @@ impl JsRuntime {
                 },
             );
         }
-        for (index, parameter) in function.parameters.iter().enumerate() {
-            call_environment.bindings.insert(
-                parameter.clone(),
-                Binding {
-                    value: arguments.get(index).cloned().unwrap_or(JsValue::Undefined),
-                    mutable: true,
-                    initialized: true,
-                    kind: VariableKind::Var,
-                },
-            );
+        // A parameter list with any default initializer is "non-simple" per
+        // spec: every parameter binding is created uninitialized first so a
+        // default that reads a later (or its own) parameter observes the
+        // temporal dead zone instead of an outer binding.
+        if function.defaults.iter().any(Option::is_some) {
+            for parameter in &function.parameters {
+                call_environment.bindings.insert(
+                    parameter.clone(),
+                    Binding {
+                        value: JsValue::Undefined,
+                        mutable: true,
+                        initialized: false,
+                        kind: VariableKind::Var,
+                    },
+                );
+            }
         }
-        self.environment
-            .push(Rc::new(RefCell::new(call_environment)));
-        self.this_stack
-            .push(function.lexical_this.clone().unwrap_or(receiver));
+        let call_environment = Rc::new(RefCell::new(call_environment));
+        self.environment.push(call_environment.clone());
+        // Arrows inherit the enclosing class context dynamically; named
+        // functions use their own class metadata.
+        let class_context = if function.arrow {
+            self.class_frames.last().cloned().unwrap_or_default()
+        } else {
+            ClassFrame {
+                function: function.class.clone(),
+                private_scope: function
+                    .class
+                    .as_ref()
+                    .map(|class| class.private_names.clone()),
+            }
+        };
+        self.class_frames.push(class_context);
         let label = function
             .name
             .clone()
             .unwrap_or_else(|| format!("<anonymous fn #{index}>"));
+        // Diagnostic: append the body source offset to the frame label so
+        // offline stack traces map back to minified bundle positions
+        // (RENDER_JS_FRAME_OFFSETS=1).
+        let label = match function.body.first().and_then(statement_offset) {
+            Some(offset) if std::env::var_os("RENDER_JS_FRAME_OFFSETS").is_some() => {
+                format!("{label}@{offset}")
+            }
+            _ => label,
+        };
         self.call_stack.push(CallFrame { name: label });
         let result = self
-            .instantiate_statements(&function.body)
+            .bind_parameters(dom, &function, arguments, &call_environment)
+            .and_then(|()| self.instantiate_statements(&function.body))
             .and_then(|()| self.evaluate_statements(dom, &function.body));
         self.call_stack.pop();
-        self.this_stack.pop();
+        self.class_frames.pop();
+        // A constructor's `[[Construct]]` result is its final `this`
+        // (a base constructor's pre-created instance, or the object a
+        // derived constructor received from `super()`).
+        let final_this = call_environment
+            .borrow()
+            .bindings
+            .get("this")
+            .map(|binding| binding.value.clone());
         self.environment = previous_environment;
         match result? {
+            Completion::Normal(_)
+                if function
+                    .class
+                    .as_ref()
+                    .is_some_and(|class| class.constructor) =>
+            {
+                Ok(final_this.unwrap_or(JsValue::Undefined))
+            }
             Completion::Normal(_) => Ok(JsValue::Undefined),
             Completion::Return(value) => Ok(value),
             Completion::Break(_) | Completion::Continue(_) => Err(JsError::new(
@@ -3527,6 +4240,54 @@ impl JsRuntime {
         }
     }
 
+    /// Bind a user function's parameters in order. Each parameter takes its
+    /// positional argument, except that an absent or `undefined` argument
+    /// evaluates the parameter's default initializer in the environment
+    /// built so far, so later defaults see earlier bindings. The final rest
+    /// parameter collects the remaining arguments into an array.
+    fn bind_parameters(
+        &mut self,
+        dom: &mut Dom,
+        function: &UserFunction,
+        arguments: &[JsValue],
+        call_environment: &Environment,
+    ) -> Result<(), JsError> {
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            let value = if function.rest && index + 1 == function.parameters.len() {
+                let rest =
+                    self.create_array_from_values(arguments.get(index..).unwrap_or_default())?;
+                JsValue::Object(rest)
+            } else {
+                match arguments.get(index) {
+                    Some(argument) if !matches!(argument, JsValue::Undefined) => argument.clone(),
+                    _ => match function.defaults.get(index).and_then(Option::as_ref) {
+                        Some(default) => self.evaluate(dom, default)?,
+                        None => JsValue::Undefined,
+                    },
+                }
+            };
+            let mut environment = call_environment.borrow_mut();
+            match environment.bindings.get_mut(parameter) {
+                Some(binding) => {
+                    binding.value = value;
+                    binding.initialized = true;
+                }
+                None => {
+                    environment.bindings.insert(
+                        parameter.clone(),
+                        Binding {
+                            value,
+                            mutable: true,
+                            initialized: true,
+                            kind: VariableKind::Var,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(super) fn call_native(
         &mut self,
@@ -3535,6 +4296,13 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        if std::env::var_os("RENDER_TRACE_NATIVE").is_some() {
+            eprintln!(
+                "[native] {function:?} receiver={:?} args={}",
+                self.realm.host(receiver),
+                arguments.len()
+            );
+        }
         self.call_stack.push(CallFrame {
             name: format!("{function:?}"),
         });
@@ -3587,7 +4355,11 @@ impl JsRuntime {
                     | ObjectHost::UrlConstructor
                     | ObjectHost::UrlSearchParamsConstructor
                     | ObjectHost::XmlHttpRequestConstructor
+                    | ObjectHost::AbortControllerConstructor
+                    | ObjectHost::FormDataConstructor
                     | ObjectHost::ResponseConstructor
+                    | ObjectHost::BlobConstructor
+                    | ObjectHost::ProxyConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::TypedArrayConstructor(_)
@@ -3630,7 +4402,11 @@ impl JsRuntime {
                     | ObjectHost::UrlConstructor
                     | ObjectHost::UrlSearchParamsConstructor
                     | ObjectHost::XmlHttpRequestConstructor
+                    | ObjectHost::AbortControllerConstructor
+                    | ObjectHost::FormDataConstructor
                     | ObjectHost::ResponseConstructor
+                    | ObjectHost::BlobConstructor
+                    | ObjectHost::ProxyConstructor
                     | ObjectHost::IntersectionObserverConstructor
                     | ObjectHost::CollectionConstructor(_)
                     | ObjectHost::TypedArrayConstructor(_)
@@ -3683,13 +4459,21 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         | Expr::New { offset, .. }
         | Expr::Call { offset, .. }
         | Expr::Assignment { offset, .. }
-        | Expr::CompoundAssignment { offset, .. } => Some(*offset),
+        | Expr::Class { offset, .. }
+        | Expr::SuperMember { offset, .. }
+        | Expr::SuperComputedMember { offset, .. }
+        | Expr::SuperCall { offset, .. }
+        | Expr::PrivateMember { offset, .. }
+        | Expr::PrivateIn { offset, .. }
+        | Expr::CompoundAssignment { offset, .. }
+        | Expr::LogicalAssignment { offset, .. } => Some(*offset),
         Expr::Literal(_)
         | Expr::This
         | Expr::Identifier(_)
         | Expr::Object(_)
         | Expr::Array(_)
         | Expr::Spread(_)
+        | Expr::NewTarget
         | Expr::Sequence(_) => None,
     }
 }
@@ -3709,7 +4493,9 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
         | Statement::ForIn { offset, .. }
         | Statement::ForOf { offset, .. }
         | Statement::ForInExpr { offset, .. }
-        | Statement::Labeled { offset, .. } => Some(*offset),
+        | Statement::Labeled { offset, .. }
+        | Statement::Class { offset, .. }
+        | Statement::ParameterDefault { offset, .. } => Some(*offset),
         Statement::Return(_)
         | Statement::Throw(_)
         | Statement::Break(_)

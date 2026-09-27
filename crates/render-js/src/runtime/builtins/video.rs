@@ -27,10 +27,20 @@
 //! `play()` promises, and queues the `loadedmetadata`/`error` callbacks of
 //! the `on*` properties at the next microtask checkpoint.
 //!
-//! Phase-1 boundaries: the presentation clock (and `timeupdate`) does not
-//! run yet, `currentTime` writes are accepted but do not reposition the
-//! decode cursor, and `addEventListener` on video elements is not wired
-//! (use the `onloadedmetadata`/`onerror` properties).
+//! Phase 2 adds the presentation clock: the embedding drives
+//! [`JsRuntime::advance_video_playback`] with the page's virtual clock on
+//! every turn, which advances `currentTime`, pulls decoded frames up to the
+//! clock position, fires the throttled `timeupdate` plus the
+//! `play`/`pause`/`ended`/`error` callbacks, and returns the frame
+//! publications the paint phase keys to the DOM `<video>` element whose
+//! resolved `src` matches the element's media (the explicit node binding
+//! a full `HTMLVideoElement` wrapper integration will replace).
+//!
+//! Audio is deliberately not implemented: this runtime has no audio device.
+//!
+//! `addEventListener` on video elements is still not wired (use the
+//! `on<event>` properties). `playbackRate` stays fixed at 1.0; the property
+//! slot exists for a later phase.
 
 use crate::JsError;
 use crate::JsValue;
@@ -46,10 +56,17 @@ use crate::value::ObjectHost;
 use crate::value::VideoElementState;
 use crate::value::VideoMedia;
 use crate::value::VideoPlayPromise;
+use crate::video::PlaybackSignal;
 use crate::video::VideoPipeline;
+use crate::video::present::FramePublication;
 use render_dom::Dom;
+use render_dom::Namespace;
+use render_dom::NodeId;
+use render_dom::NodeKind;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
+use std::time::Duration;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_video_native(
@@ -109,6 +126,9 @@ impl JsRuntime {
             ("onloadedmetadata", JsValue::Null),
             ("onerror", JsValue::Null),
             ("ontimeupdate", JsValue::Null),
+            ("onplay", JsValue::Null),
+            ("onpause", JsValue::Null),
+            ("onended", JsValue::Null),
         ] {
             self.realm.set_property(instance, name.to_owned(), value);
         }
@@ -139,8 +159,26 @@ impl JsRuntime {
         let (promise, value) = self.create_promise()?;
         if self.number_property(receiver, "readyState") >= 1.0 {
             // HAVE_METADATA or better: playback starts immediately.
+            // Restarting after the end rewinds to the start (the play()
+            // restart rule), including the script-visible position so the
+            // next advance does not read the stale value as a seek.
+            if let Some(pipeline) = self.video_pipeline_handle(receiver) {
+                let mut pipeline = pipeline.borrow_mut();
+                if pipeline.playback_ended() {
+                    pipeline.seek_to(0.0);
+                    self.realm.set_property(
+                        receiver,
+                        "currentTime".to_owned(),
+                        JsValue::Number(0.0),
+                    );
+                    self.realm
+                        .set_property(receiver, "ended".to_owned(), JsValue::Boolean(false));
+                }
+                pipeline.start_playback();
+            }
             self.realm
                 .set_property(receiver, "paused".to_owned(), JsValue::Boolean(false));
+            self.queue_video_event(receiver, "play");
             self.resolve_promise(promise, &JsValue::Undefined);
             return Ok(value);
         }
@@ -190,17 +228,26 @@ impl JsRuntime {
         Ok(value)
     }
 
-    /// `video.pause()`: phase 1 marks the element paused and fulfills the
-    /// promise; the presentation clock does not run yet.
+    /// `video.pause()`: freezes the presentation clock at the last published
+    /// position and queues the `pause` callback on the paused->transition.
     fn video_pause(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         if !matches!(self.realm.host(receiver), Some(ObjectHost::VideoElement(_))) {
             return Err(JsError::type_error(
                 "incompatible Video method receiver (entry point VideoPause)",
             ));
         }
-        let (promise, value) = self.create_promise()?;
+        let was_playing = self
+            .video_pipeline_handle(receiver)
+            .is_some_and(|pipeline| pipeline.borrow().is_playing());
+        if let Some(pipeline) = self.video_pipeline_handle(receiver) {
+            pipeline.borrow_mut().pause_playback();
+        }
         self.realm
             .set_property(receiver, "paused".to_owned(), JsValue::Boolean(true));
+        if was_playing {
+            self.queue_video_event(receiver, "pause");
+        }
+        let (promise, value) = self.create_promise()?;
         self.resolve_promise(promise, &JsValue::Undefined);
         Ok(value)
     }
@@ -332,7 +379,14 @@ impl JsRuntime {
         };
         match outcome {
             Ok(outcome) if (200..300).contains(&outcome.status) => {
-                match VideoPipeline::open(&outcome.body) {
+                #[cfg(test)]
+                let opened = take_test_video_decoder().map_or_else(
+                    || VideoPipeline::open(&outcome.body),
+                    |decoder| VideoPipeline::with_decoder(&outcome.body, decoder),
+                );
+                #[cfg(not(test))]
+                let opened = VideoPipeline::open(&outcome.body);
+                match opened {
                     Ok(pipeline) => {
                         let (duration, width, height) = {
                             let track = pipeline.track();
@@ -376,6 +430,17 @@ impl JsRuntime {
                             self.resolve_promise(play_promise.record, &JsValue::Undefined);
                         }
                         self.queue_video_event(element, "loadedmetadata");
+                        // A `play()` that initiated this load begins playback
+                        // once metadata is available (it already unpaused the
+                        // element when its promise joined the load).
+                        if matches!(
+                            self.realm.get_property(element, "paused"),
+                            Some(JsValue::Boolean(false))
+                        ) && let Some(pipeline) = self.video_pipeline_handle(element)
+                        {
+                            pipeline.borrow_mut().start_playback();
+                            self.queue_video_event(element, "play");
+                        }
                     }
                     Err(error) => self.fail_video_load(element, id, &error.to_string()),
                 }
@@ -397,16 +462,179 @@ impl JsRuntime {
         self.find_video_element_by_load_id(id).is_some()
     }
 
-    /// Shared pipeline handle of a loaded video element, for the future
-    /// paint phase's frame consumption.
+    /// Shared pipeline handle of a loaded video element, for the paint
+    /// phase's frame consumption.
     #[must_use]
     pub fn video_pipeline(&self, element: ObjectId) -> Option<Rc<RefCell<VideoPipeline>>> {
+        self.video_pipeline_handle(element)
+    }
+
+    /// Cloned pipeline handle of a loaded video element, or `None` while no
+    /// media is loaded.
+    fn video_pipeline_handle(&self, element: ObjectId) -> Option<Rc<RefCell<VideoPipeline>>> {
         match self.realm.host(element) {
             Some(ObjectHost::VideoElement(state)) => {
                 state.media.as_ref().map(|media| media.pipeline().clone())
             }
             _ => None,
         }
+    }
+
+    /// Advance every loaded video element's presentation clock to the page's
+    /// current virtual instant and return the paint-phase publications.
+    ///
+    /// Each step: honor script `currentTime` writes as seeks (within the
+    /// decoded-frame window), run the clock, pull frames up to the position,
+    /// publish `currentTime`/`ended`, and queue the `on*` callbacks
+    /// (`timeupdate` throttled to ~250 ms, then `ended`/`error`). The
+    /// publications bind each element to the DOM `<video>` element whose
+    /// resolved `src` matches its media, so the embedding can key frames to
+    /// the node the paint phase draws.
+    pub fn advance_video_playback(&mut self, dom: &Dom, now: Duration) -> Vec<FramePublication> {
+        let mut handles: Vec<(ObjectId, Rc<RefCell<VideoPipeline>>)> = Vec::new();
+        for (index, object) in self.realm.objects().iter().enumerate() {
+            if let ObjectHost::VideoElement(state) = &object.host
+                && let Some(media) = &state.media
+            {
+                handles.push((ObjectId::from_index(index), media.pipeline().clone()));
+            }
+        }
+        if handles.is_empty() {
+            return Vec::new();
+        }
+        let mut claimed: HashSet<NodeId> = HashSet::new();
+        for (_, pipeline) in &handles {
+            if let Some(node) = pipeline.borrow().bound_node() {
+                claimed.insert(node);
+            }
+        }
+        let mut candidates: Option<Vec<(NodeId, url::Url)>> = None;
+        let mut publications = Vec::new();
+        for (element, pipeline) in handles {
+            let resolved_src = match self.realm.host(element) {
+                Some(ObjectHost::VideoElement(state)) => state.resolved_src.clone(),
+                _ => None,
+            };
+            // Keep the DOM node binding current: a node whose `src` no longer
+            // resolves to this element's media is released, and an unbound
+            // element claims a matching node once.
+            let mut bound = pipeline.borrow().bound_node();
+            let binding_valid = bound.is_some_and(|node| {
+                resolved_src
+                    .as_ref()
+                    .is_some_and(|resolved| self.video_node_matches(dom, node, resolved))
+            });
+            if !binding_valid {
+                if let Some(node) = bound.take() {
+                    claimed.remove(&node);
+                }
+                pipeline.borrow_mut().unbind_node();
+            }
+            if bound.is_none() && resolved_src.is_some() {
+                let entries = candidates.get_or_insert_with(|| {
+                    Self::collect_video_src_nodes(dom)
+                        .into_iter()
+                        .filter(|(node, _)| !claimed.contains(node))
+                        .filter_map(|(node, source)| {
+                            self.resolve_fetch_url(&source).ok().map(|url| (node, url))
+                        })
+                        .collect()
+                });
+                if let Some((node, _)) = entries.iter().find(|(node, url)| {
+                    Some(url) == resolved_src.as_ref() && !claimed.contains(node)
+                }) {
+                    pipeline.borrow_mut().bind_to_node(*node);
+                    claimed.insert(*node);
+                    bound = Some(*node);
+                }
+            }
+            // A script `currentTime` write diverges from the published
+            // position only when script moved it.
+            let requested = self.number_property(element, "currentTime");
+            let published = pipeline.borrow().published_position();
+            if requested.is_finite() && requested != published {
+                pipeline.borrow_mut().seek_to(requested);
+                self.queue_video_event(element, "timeupdate");
+            }
+            let looping = matches!(
+                self.realm.get_property(element, "loop"),
+                Some(JsValue::Boolean(true))
+            );
+            let signals = pipeline.borrow_mut().advance_playback(now, looping);
+            let position = pipeline.borrow().published_position();
+            if position != self.number_property(element, "currentTime") {
+                self.realm.set_property(
+                    element,
+                    "currentTime".to_owned(),
+                    JsValue::Number(position),
+                );
+            }
+            let ended_now = pipeline.borrow().playback_ended();
+            let ended_before = matches!(
+                self.realm.get_property(element, "ended"),
+                Some(JsValue::Boolean(true))
+            );
+            if ended_now != ended_before {
+                self.realm
+                    .set_property(element, "ended".to_owned(), JsValue::Boolean(ended_now));
+            }
+            for signal in signals {
+                match signal {
+                    PlaybackSignal::TimeUpdate => self.queue_video_event(element, "timeupdate"),
+                    PlaybackSignal::Ended => self.queue_video_event(element, "ended"),
+                    PlaybackSignal::DecodeFailed => self.queue_video_event(element, "error"),
+                }
+            }
+            if let (Some(node), Some(media_url)) = (bound, resolved_src) {
+                publications.push(FramePublication {
+                    node,
+                    media_url,
+                    frame: pipeline.borrow().current_frame_rgba(),
+                });
+            }
+        }
+        publications
+    }
+
+    /// Whether the `<video>` element at `node` still carries `resolved` as
+    /// its current `src`.
+    fn video_node_matches(&self, dom: &Dom, node: NodeId, resolved: &url::Url) -> bool {
+        if !matches!(
+            dom.node(node).map(render_dom::Node::kind),
+            Some(NodeKind::Element(element))
+                if element.namespace == Namespace::Html && element.local_name == "video"
+        ) {
+            return false;
+        }
+        match dom.attribute(node, "src") {
+            Ok(Some(source)) => match self.resolve_fetch_url(source) {
+                Ok(url) => &url == resolved,
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// DOM `<video>` elements with a non-empty `src` attribute, tree order.
+    fn collect_video_src_nodes(dom: &Dom) -> Vec<(NodeId, String)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dom.document()];
+        while let Some(node) = pending.pop() {
+            let Some(current) = dom.node(node) else {
+                continue;
+            };
+            if matches!(
+                current.kind(),
+                NodeKind::Element(element)
+                    if element.namespace == Namespace::Html && element.local_name == "video"
+            ) && let Ok(Some(source)) = dom.attribute(node, "src")
+                && !source.is_empty()
+            {
+                found.push((node, source.to_owned()));
+            }
+            pending.extend(current.children().iter().rev().copied());
+        }
+        found
     }
 
     /// Reject a pending load: pending `play()` promises get a `TypeError`
@@ -533,14 +761,38 @@ fn supports_avc(codecs: &str) -> bool {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Decoder backends queued by tests and consumed one per settled media
+    /// load, so the JS playback surface can be exercised end to end before
+    /// a real H.264 backend is wired.
+    static TEST_VIDEO_DECODERS: RefCell<std::collections::VecDeque<Box<dyn crate::video::VideoDecoder>>> =
+        RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Queue a decoder backend the next settled media load will use (tests).
+#[cfg(test)]
+pub(crate) fn push_test_video_decoder(decoder: Box<dyn crate::video::VideoDecoder>) {
+    TEST_VIDEO_DECODERS.with(|queue| queue.borrow_mut().push_back(decoder));
+}
+
+#[cfg(test)]
+fn take_test_video_decoder() -> Option<Box<dyn crate::video::VideoDecoder>> {
+    TEST_VIDEO_DECODERS.with(|queue| queue.borrow_mut().pop_front())
+}
+
+#[cfg(test)]
 mod tests {
     use crate::JsRuntime;
     use crate::JsValue;
     use crate::runtime::types::FetchOutcome;
     use crate::runtime::types::PendingFetch;
+    use crate::video::VideoPipeline;
+    use crate::video::test_mp4::ColorTestDecoder;
     use crate::video::test_mp4::TestMp4Builder;
     use render_dom::Dom;
     use render_html::parse_document;
+    use std::cell::RefCell;
+    use std::time::Duration;
     use url::Url;
 
     /// A runtime on `https://example.test/watch` with microtask and media
@@ -552,7 +804,11 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let mut parsed = parse_document("<!doctype html><p>video</p>");
+            Self::with_html("<!doctype html><p>video</p>")
+        }
+
+        fn with_html(html: &str) -> Self {
+            let mut parsed = parse_document(html);
             let url = Url::parse("https://example.test/watch").expect("test URL");
             let runtime = JsRuntime::with_url(&parsed.dom, &url);
             let dom = std::mem::take(&mut parsed.dom);
@@ -622,6 +878,46 @@ mod tests {
             self.runtime
                 .settle_video_fetch(&mut self.dom, id, Err(message.to_owned()));
             self.drain_microtasks();
+        }
+
+        /// Advance the presentation clocks to `now` and run the callbacks
+        /// the step queued.
+        fn advance(&mut self, now: Duration) -> Vec<crate::video::present::FramePublication> {
+            let publications = self.runtime.advance_video_playback(&self.dom, now);
+            self.drain_microtasks();
+            publications
+        }
+
+        fn advance_ms(&mut self, millis: u64) -> Vec<crate::video::present::FramePublication> {
+            self.advance(Duration::from_millis(millis))
+        }
+
+        fn pipeline(&mut self, variable: &str) -> std::rc::Rc<RefCell<VideoPipeline>> {
+            match self.execute(variable) {
+                JsValue::Object(element) => self
+                    .runtime
+                    .video_pipeline(element)
+                    .expect("media is loaded"),
+                other => panic!("video element is {other:?}"),
+            }
+        }
+
+        /// The `NodeId` of the first DOM `<video>` element.
+        fn video_node(&self) -> render_dom::NodeId {
+            let dom = &self.dom;
+            let mut pending = vec![dom.document()];
+            while let Some(node) = pending.pop() {
+                if matches!(
+                    dom.node(node).map(render_dom::Node::kind),
+                    Some(render_dom::NodeKind::Element(element))
+                        if element.namespace == render_dom::Namespace::Html
+                            && element.local_name == "video"
+                ) {
+                    return node;
+                }
+                pending.extend(dom.children(node).unwrap_or_default().iter().rev().copied());
+            }
+            panic!("test markup has no <video> element");
         }
     }
 
@@ -853,6 +1149,181 @@ mod tests {
         assert!(
             error.to_string().contains("Video method receiver"),
             "unexpected error: {error}"
+        );
+    }
+
+    /// Drive one loaded, playing element through settlement.
+    fn playing_harness(html: &str, script: &str) -> Harness {
+        super::push_test_video_decoder(Box::new(ColorTestDecoder::new(64, 48)));
+        let mut harness = Harness::with_html(html);
+        harness.execute(script);
+        let request = harness.take_video_fetch();
+        harness.settle_ok(request.id, TestMp4Builder::new().build());
+        harness
+    }
+
+    #[test]
+    fn playback_clock_advances_current_time_and_frames() {
+        let mut harness = playing_harness(
+            "<!doctype html><p>video</p>",
+            "var v = new Video(); v.src = 'movie.mp4'; \
+             var updates = 0; v.ontimeupdate = function () { updates += 1; }; \
+             v.play();",
+        );
+        harness.advance_ms(0);
+        assert_eq!(
+            harness.scalar("v.paused + ':' + v.ended + ':' + updates"),
+            "false:false:1"
+        );
+        harness.advance_ms(700);
+        assert_eq!(harness.scalar("v.currentTime + ':' + updates"), "0.7:2");
+        let pipeline = harness.pipeline("v");
+        assert_eq!(pipeline.borrow().current_frame_timestamp(), Some(0.5));
+        assert_eq!(
+            pipeline
+                .borrow()
+                .current_frame_rgba()
+                .expect("frame presented")
+                .bytes[0],
+            2
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_fire_events_and_freeze_position() {
+        let mut harness = playing_harness(
+            "<!doctype html><p>video</p>",
+            "var v = new Video(); v.src = 'movie.mp4'; \
+             var events = ''; v.onplay = function () { events += 'p'; }; \
+             v.onpause = function () { events += 'P'; }; v.play();",
+        );
+        harness.advance_ms(0);
+        harness.advance_ms(600);
+        assert_eq!(harness.scalar("v.currentTime"), "0.6");
+        harness.execute("v.pause()");
+        harness.advance_ms(1_200);
+        assert_eq!(harness.scalar("v.paused + ':' + v.currentTime"), "true:0.6");
+        harness.execute("v.play()");
+        harness.advance_ms(1_300);
+        assert_eq!(
+            harness.scalar("v.paused + ':' + v.currentTime"),
+            "false:0.6"
+        );
+        harness.advance_ms(1_500);
+        assert_eq!(harness.scalar("v.currentTime"), "0.8");
+        // Settlement started playback (p), the pause fired P, and the
+        // explicit resume fired p again.
+        assert_eq!(harness.scalar("events"), "pPp");
+    }
+
+    #[test]
+    fn ended_transitions_once_and_restarts_on_play() {
+        let mut harness = playing_harness(
+            "<!doctype html><p>video</p>",
+            "var v = new Video(); v.src = 'movie.mp4'; \
+             var ended = 0; v.onended = function () { ended += 1; }; \
+             var updates = 0; v.ontimeupdate = function () { updates += 1; }; \
+             v.play();",
+        );
+        harness.advance_ms(0);
+        harness.advance_ms(2_000);
+        assert_eq!(
+            harness.scalar("v.ended + ':' + v.currentTime + ':' + ended + ':' + updates"),
+            "true:2:1:2"
+        );
+        // The ended state is frozen: further advances change nothing.
+        harness.advance_ms(3_000);
+        assert_eq!(
+            harness.scalar("v.ended + ':' + ended + ':' + updates"),
+            "true:1:2"
+        );
+        // play() restarts from the beginning.
+        harness.execute("v.play()");
+        harness.advance_ms(2_100);
+        harness.advance_ms(2_200);
+        assert_eq!(
+            harness.scalar("v.ended + ':' + v.currentTime + ':' + ended"),
+            "false:0.1:1"
+        );
+    }
+
+    #[test]
+    fn script_current_time_write_seeks_within_decoded_frames() {
+        let mut harness = playing_harness(
+            "<!doctype html><p>video</p>",
+            "var v = new Video(); v.src = 'movie.mp4'; \
+             var updates = 0; v.ontimeupdate = function () { updates += 1; }; \
+             v.play();",
+        );
+        harness.advance_ms(0);
+        harness.advance_ms(1_000);
+        assert_eq!(harness.scalar("v.currentTime"), "1");
+        harness.execute("v.currentTime = 0.5");
+        harness.advance_ms(1_005);
+        assert_eq!(harness.scalar("v.currentTime"), "0.5");
+        // The seek fired a prompt timeupdate on top of the clock ticks.
+        assert_eq!(harness.scalar("updates"), "3");
+        let pipeline = harness.pipeline("v");
+        assert_eq!(pipeline.borrow().current_frame_timestamp(), Some(0.5));
+        assert_eq!(
+            pipeline
+                .borrow()
+                .current_frame_rgba()
+                .expect("frame presented")
+                .bytes[0],
+            2
+        );
+        // Playback continues from the seek target.
+        harness.advance_ms(1_100);
+        assert_eq!(harness.scalar("v.currentTime"), "0.595");
+    }
+
+    #[test]
+    fn dom_src_binding_publishes_frames_for_paint() {
+        let mut harness = playing_harness(
+            "<!doctype html><video id=player src='movie.mp4'></video>",
+            "var v = new Video(); v.src = 'movie.mp4'; v.play();",
+        );
+        let node = harness.video_node();
+        harness.advance_ms(0);
+        let publications = harness.advance_ms(600);
+        assert_eq!(publications.len(), 1, "the DOM element binds to the media");
+        assert_eq!(publications[0].node, node);
+        assert_eq!(
+            publications[0].media_url.as_str(),
+            "https://example.test/movie.mp4"
+        );
+        let frame = publications[0]
+            .frame
+            .as_ref()
+            .expect("a frame is presented");
+        assert_eq!((frame.width, frame.height), (64, 48));
+        assert_eq!(frame.bytes[0], 2, "the 0.5 s frame is on screen");
+
+        // Losing the src attribute releases the binding and the frame.
+        harness
+            .dom
+            .remove_attribute(node, "src")
+            .expect("src is removable");
+        assert!(harness.advance_ms(1_200).is_empty());
+    }
+
+    #[test]
+    fn placeholder_decoder_fires_error_once_and_freezes() {
+        let mut harness = Harness::new();
+        harness.execute(
+            "var v = new Video(); v.src = 'movie.mp4'; \
+             var failures = 0; v.onerror = function () { failures += 1; }; \
+             v.play();",
+        );
+        let request = harness.take_video_fetch();
+        harness.settle_ok(request.id, TestMp4Builder::new().build());
+        harness.advance_ms(0);
+        assert_eq!(harness.scalar("failures"), "1");
+        harness.advance_ms(100);
+        assert_eq!(
+            harness.scalar("failures + ':' + v.currentTime + ':' + v.ended"),
+            "1:0:false"
         );
     }
 }

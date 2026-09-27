@@ -7,6 +7,8 @@
 
 #![allow(clippy::cast_precision_loss)]
 
+pub mod svg;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -84,6 +86,10 @@ pub struct ImageResourceKey {
 pub enum ImageSource {
     Element,
     VideoPoster,
+    /// The frame a `<video>` element currently presents. Managed by the
+    /// video pipeline (installed through [`ImageResources::set_video_frame`]),
+    /// not by URL-keyed image loads.
+    VideoFrame,
     CssBackground,
 }
 
@@ -320,6 +326,11 @@ pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKe
     if key.source == ImageSource::CssBackground {
         return true;
     }
+    // Presented video frames are owned by the video pipeline's lifecycle,
+    // not by URL revalidation.
+    if key.source == ImageSource::VideoFrame {
+        return false;
+    }
     let Some(element) = html_element(dom, key.owner) else {
         return false;
     };
@@ -356,6 +367,7 @@ pub enum ImageFormat {
     Jpeg,
     Gif,
     WebP,
+    Svg,
 }
 
 impl ImageFormat {
@@ -366,6 +378,7 @@ impl ImageFormat {
             "image/jpeg" | "image/pjpeg" => Some(Self::Jpeg),
             "image/gif" => Some(Self::Gif),
             "image/webp" => Some(Self::WebP),
+            "image/svg+xml" | "image/svg" => Some(Self::Svg),
             _ => None,
         }
     }
@@ -377,15 +390,19 @@ impl ImageFormat {
             Self::Jpeg => "image/jpeg",
             Self::Gif => "image/gif",
             Self::WebP => "image/webp",
+            Self::Svg => "image/svg+xml",
         }
     }
 
-    const fn codec(self) -> CodecImageFormat {
+    /// The raster-codec backend for this format; `None` for SVG, which the
+    /// engine rasterizes itself instead of via the image crate.
+    const fn codec(self) -> Option<CodecImageFormat> {
         match self {
-            Self::Png => CodecImageFormat::Png,
-            Self::Jpeg => CodecImageFormat::Jpeg,
-            Self::Gif => CodecImageFormat::Gif,
-            Self::WebP => CodecImageFormat::WebP,
+            Self::Png => Some(CodecImageFormat::Png),
+            Self::Jpeg => Some(CodecImageFormat::Jpeg),
+            Self::Gif => Some(CodecImageFormat::Gif),
+            Self::WebP => Some(CodecImageFormat::WebP),
+            Self::Svg => None,
         }
     }
 }
@@ -427,6 +444,34 @@ impl DecodedImage {
                 expected,
             });
         }
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    /// Construct from tightly packed 8-bit RGBA bytes (the layout decoded
+    /// video frames arrive in).
+    ///
+    /// # Errors
+    ///
+    /// Returns a dimension error when `bytes` is not exactly
+    /// `width * height * 4`.
+    pub fn from_rgba8(width: u32, height: u32, bytes: &[u8]) -> Result<Self, ImageDecodeError> {
+        let expected = pixel_len(width, height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(ImageDecodeError::DimensionOverflow)?;
+        if bytes.len() != expected {
+            return Err(ImageDecodeError::PixelBufferLength {
+                actual: bytes.len(),
+                expected,
+            });
+        }
+        let pixels = bytes
+            .chunks_exact(4)
+            .map(|pixel| Color::rgba(pixel[0], pixel[1], pixel[2], pixel[3]))
+            .collect();
         Ok(Self {
             width,
             height,
@@ -537,13 +582,21 @@ pub fn decode_image(
             limit: limits.max_encoded_bytes,
         });
     }
-    let reader = ImageReader::with_format(Cursor::new(bytes), format.codec());
+    if format == ImageFormat::Svg {
+        return svg::decode_svg(bytes, limits);
+    }
+    let Some(codec_format) = format.codec() else {
+        return Err(ImageDecodeError::Codec(
+            "format has no raster codec".to_owned(),
+        ));
+    };
+    let reader = ImageReader::with_format(Cursor::new(bytes), codec_format);
     let (width, height) = reader
         .into_dimensions()
         .map_err(|error| ImageDecodeError::Codec(error.to_string()))?;
     enforce_dimensions(width, height, limits)?;
 
-    let decoded = ImageReader::with_format(Cursor::new(bytes), format.codec())
+    let decoded = ImageReader::with_format(Cursor::new(bytes), codec_format)
         .decode()
         .map_err(|error| ImageDecodeError::Codec(error.to_string()))?
         .into_rgba8();
@@ -631,13 +684,22 @@ impl ImageResources {
 
     #[must_use]
     pub fn get_for_node(&self, node: NodeId) -> Option<&LoadedImage> {
-        self.by_node_url.values().find(|loaded| {
-            loaded.key.owner == node
-                && matches!(
-                    loaded.key.source,
-                    ImageSource::Element | ImageSource::VideoPoster
-                )
-        })
+        // A presented video frame outranks the element's poster: while a
+        // frame is on screen the poster is hidden, exactly like browsers.
+        self.by_node_url
+            .values()
+            .find(|loaded| {
+                loaded.key.owner == node && matches!(loaded.key.source, ImageSource::VideoFrame)
+            })
+            .or_else(|| {
+                self.by_node_url.values().find(|loaded| {
+                    loaded.key.owner == node
+                        && matches!(
+                            loaded.key.source,
+                            ImageSource::Element | ImageSource::VideoPoster
+                        )
+                })
+            })
     }
 
     #[must_use]
@@ -726,6 +788,64 @@ impl ImageResources {
             .decoded_bytes
             .saturating_sub(loaded.image.decoded_bytes());
         Some(loaded)
+    }
+
+    /// Install or replace the frame a `<video>` element currently presents.
+    ///
+    /// The entry is keyed by the element node, so layout sizes the video by
+    /// the frame's intrinsic dimensions and paint draws it through the same
+    /// `Image` display command as ordinary decoded images; a new resource id
+    /// per replacement keeps display-list diffs honest about content changes.
+    /// Any earlier frame for the node is dropped first, whatever URL it was
+    /// published under.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-limit error without changing the existing frame.
+    pub fn set_video_frame(
+        &mut self,
+        node: NodeId,
+        media_url: &Url,
+        frame: DecodedImage,
+        limits: ImageLimits,
+    ) -> Result<ImageResourceId, ImageStoreError> {
+        self.remove_video_frame(node);
+        let key = ImageResourceKey {
+            owner: node,
+            requested_url: media_url.clone(),
+            source_snapshot: String::new(),
+            source: ImageSource::VideoFrame,
+            selection_context: ImageSelectionContext::default(),
+        };
+        self.insert(key, frame, limits)
+    }
+
+    /// Drop the presented frame of the `<video>` element at `node` (element
+    /// removed, media unloaded, or element collected).
+    pub fn remove_video_frame(&mut self, node: NodeId) -> Option<LoadedImage> {
+        let map_key = self
+            .by_node_url
+            .iter()
+            .find(|((owner, _), loaded)| {
+                *owner == node && loaded.key.source == ImageSource::VideoFrame
+            })
+            .map(|((owner, url), _)| (*owner, url.clone()))?;
+        let loaded = self.by_node_url.remove(&map_key)?;
+        self.by_id.remove(&loaded.id);
+        self.decoded_bytes = self
+            .decoded_bytes
+            .saturating_sub(loaded.image.decoded_bytes());
+        Some(loaded)
+    }
+
+    /// Nodes with a presented video frame, for lifecycle pruning.
+    #[must_use]
+    pub fn video_frame_nodes(&self) -> Vec<NodeId> {
+        self.by_node_url
+            .iter()
+            .filter(|(_, loaded)| loaded.key.source == ImageSource::VideoFrame)
+            .map(|((owner, _), _)| *owner)
+            .collect()
     }
 }
 
@@ -906,7 +1026,13 @@ fn supported_image_type(value: &str) -> bool {
             .trim()
             .to_ascii_lowercase()
             .as_str(),
-        "image/png" | "image/jpeg" | "image/pjpeg" | "image/gif" | "image/webp"
+        "image/png"
+            | "image/jpeg"
+            | "image/pjpeg"
+            | "image/gif"
+            | "image/webp"
+            | "image/svg+xml"
+            | "image/svg"
     )
 }
 
@@ -1095,9 +1221,11 @@ mod tests {
     use crate::html::parse_document;
 
     use super::{
-        ImageDecodeError, ImageFormat, ImageLimits, ImageResources, ImageSelectionContext,
-        decode_image, discover_images, discover_images_with_context, image_key_is_current,
+        DecodedImage, ImageDecodeError, ImageFormat, ImageLimits, ImageResources,
+        ImageSelectionContext, decode_image, discover_images, discover_images_with_context,
+        image_key_is_current,
     };
+    use crate::paint::Color;
 
     fn png_bytes() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1204,6 +1332,86 @@ mod tests {
             "data:image/png;base64,AA=="
         );
         assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn presented_video_frame_outranks_the_poster_and_releases_cleanly() {
+        let parsed = parse_document("<video id=player poster='poster.png'></video>");
+        let document_url = Url::parse("https://example.test/watch").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+        let poster_key = discovery.resources[0].key.clone();
+        let node = poster_key.owner;
+
+        let mut images = ImageResources::default();
+        let poster = DecodedImage::from_pixels(4, 4, vec![Color::rgb(1, 2, 3); 16]).unwrap();
+        let poster_id = images
+            .insert(poster_key, poster, ImageLimits::default())
+            .unwrap();
+        assert_eq!(
+            images.get_for_node(node).map(|loaded| loaded.id),
+            Some(poster_id),
+            "before playback the poster shows"
+        );
+
+        let media_url = Url::parse("https://example.test/movie.mp4").unwrap();
+        let mut frame_bytes = Vec::with_capacity(2 * 4 * 4);
+        for _ in 0..2 * 4 {
+            frame_bytes.extend_from_slice(&[9, 8, 7, 255]);
+        }
+        let frame = DecodedImage::from_rgba8(2, 4, &frame_bytes).unwrap();
+        let frame_id = images
+            .set_video_frame(node, &media_url, frame, ImageLimits::default())
+            .unwrap();
+        assert_ne!(frame_id, poster_id);
+        assert_eq!(
+            images.get_for_node(node).map(|loaded| loaded.id),
+            Some(frame_id),
+            "a presented frame hides the poster"
+        );
+        assert_eq!(images.get_for_node(node).unwrap().image.width(), 2);
+        assert_eq!(images.video_frame_nodes(), vec![node]);
+
+        // Replacing under a different URL drops the earlier frame; removing
+        // releases the node back to the poster.
+        let other_url = Url::parse("https://example.test/other.mp4").unwrap();
+        let frame = DecodedImage::from_rgba8(2, 4, &[255; 2 * 4 * 4]).unwrap();
+        let replaced = images
+            .set_video_frame(node, &other_url, frame, ImageLimits::default())
+            .unwrap();
+        assert_eq!(images.video_frame_nodes(), vec![node]);
+        assert_eq!(
+            images.get_for_node(node).map(|loaded| loaded.id),
+            Some(replaced)
+        );
+        assert_eq!(
+            images.decoded_bytes(),
+            poster_and_frame_bytes(4 * 4, 2 * 4),
+            "byte accounting covers poster plus one frame"
+        );
+
+        images.remove_video_frame(node);
+        assert!(images.video_frame_nodes().is_empty());
+        assert_eq!(
+            images.get_for_node(node).map(|loaded| loaded.id),
+            Some(poster_id),
+            "the poster returns after the frame is gone"
+        );
+    }
+
+    fn poster_and_frame_bytes(poster_pixels: usize, frame_pixels: usize) -> usize {
+        poster_pixels.saturating_mul(4) + frame_pixels.saturating_mul(4)
+    }
+
+    #[test]
+    fn from_rgba8_validates_the_byte_length() {
+        assert!(DecodedImage::from_rgba8(2, 2, &[0; 16]).is_ok());
+        assert_eq!(
+            DecodedImage::from_rgba8(2, 2, &[0; 15]).unwrap_err(),
+            super::ImageDecodeError::PixelBufferLength {
+                actual: 15,
+                expected: 16
+            }
+        );
     }
 
     #[test]

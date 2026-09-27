@@ -12,10 +12,10 @@ use cssparser::{ParseError, Parser, ParserInput, Token};
 
 use render_dom::{Dom, Node, NodeId, NodeKind};
 
-use super::cascade::{CascadeInput, CascadedStyle, cascade_element_with_inline};
+use super::cascade::{CascadeInput, CascadedStyle, cascade_element_with_origins};
 use super::properties::{TypedPropertyValue, parse_typed_property};
 use super::selector::MatchContext;
-use super::stylesheet::{CssWideKeyword, css_wide_keyword, parse_declaration_list};
+use super::stylesheet::{CssWideKeyword, Declaration, css_wide_keyword, parse_declaration_list};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PropertyDefinition {
@@ -132,16 +132,26 @@ impl PropertyRegistry {
             ("box-sizing", "content-box"),
             ("z-index", "auto"),
             ("flex-direction", "row"),
+            ("flex-wrap", "nowrap"),
             ("flex-basis", "auto"),
             ("flex-grow", "0"),
             ("flex-shrink", "1"),
             ("justify-content", "normal"),
             ("align-items", "stretch"),
+            ("align-self", "auto"),
+            ("align-content", "normal"),
             ("order", "0"),
             ("row-gap", "normal"),
             ("column-gap", "normal"),
             ("grid-template-columns", "none"),
             ("grid-template-rows", "none"),
+            ("grid-column-start", "auto"),
+            ("grid-column-end", "auto"),
+            ("grid-row-start", "auto"),
+            ("grid-row-end", "auto"),
+            ("aspect-ratio", "auto"),
+            ("transform", "none"),
+            ("transform-origin", "50% 50%"),
         ] {
             registry.define(name, false, initial);
         }
@@ -1110,6 +1120,21 @@ pub fn compute_document_styles(
     limits: &ComputationLimits,
     context: &MatchContext,
 ) -> BTreeMap<NodeId, ComputedStyle> {
+    compute_document_styles_with_hints(dom, sources, registry, limits, context, &|_| Vec::new())
+}
+
+/// Like [`compute_document_styles`], with a per-element source of extra
+/// user-agent-origin declarations. HTML drives this with its presentational
+/// attributes (`bgcolor`, `width`, `align`, ...), which must cascade at the
+/// UA origin so any author rule overrides them.
+pub fn compute_document_styles_with_hints(
+    dom: &Dom,
+    sources: &[CascadeInput<'_>],
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    context: &MatchContext,
+    hints: &dyn Fn(NodeId) -> Vec<Declaration>,
+) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
     let mut stack = vec![(dom.document(), None)];
     while let Some((node, parent_element)) = stack.pop() {
@@ -1120,7 +1145,9 @@ pub fn compute_document_styles(
                 .ok()
                 .flatten()
                 .map_or_else(Vec::new, |source| parse_declaration_list(source).0);
-            let cascaded = cascade_element_with_inline(dom, node, sources, context, &inline);
+            let ua_hints = hints(node);
+            let cascaded =
+                cascade_element_with_origins(dom, node, sources, context, &ua_hints, &inline);
             let style = compute_style(
                 &cascaded,
                 parent_element.and_then(|parent| styles.get(&parent)),

@@ -97,8 +97,24 @@ pub(super) fn mark_function(
     for environment in &function.captured_environment {
         mark_environment(runtime, marked, work, marked_environments, environment);
     }
-    if let Some(this) = &function.lexical_this {
-        mark_value(runtime, marked, work, marked_environments, this);
+    // Class metadata keeps the home object and parent constructor alive, and
+    // the class body environment needed by field initializers.
+    if let Some(class) = &function.class {
+        if let Some(home) = class.home_object {
+            mark_object(runtime, marked, work, marked_environments, home);
+        }
+        if let Some(super_constructor) = class.super_constructor {
+            mark_object(
+                runtime,
+                marked,
+                work,
+                marked_environments,
+                super_constructor,
+            );
+        }
+        for environment in &class.environment {
+            mark_environment(runtime, marked, work, marked_environments, environment);
+        }
     }
 }
 
@@ -178,8 +194,18 @@ pub(super) fn mark_host(
         | ObjectHost::VideoConstructor
         | ObjectHost::XmlHttpRequestConstructor
         | ObjectHost::XmlHttpRequest(_)
+        | ObjectHost::AbortControllerConstructor
+        | ObjectHost::AbortController
+        | ObjectHost::AbortSignal
+        | ObjectHost::FormDataConstructor
+        | ObjectHost::FormData { .. }
         | ObjectHost::ResponseConstructor
         | ObjectHost::Response { .. } => {}
+        ObjectHost::Blob { .. } | ObjectHost::BlobConstructor | ObjectHost::ProxyConstructor => {}
+        ObjectHost::Proxy { target, handler } => {
+            mark_object(runtime, marked, work, marked_environments, *target);
+            mark_object(runtime, marked, work, marked_environments, *handler);
+        }
         ObjectHost::VideoElement(state) => {
             // Pending `play()` promises stay reachable until the media load
             // settles, mirroring the fetch-transfer target roots below.
@@ -228,6 +254,25 @@ pub(super) fn mark_host(
         }
         ObjectHost::CollectionIterator { values, .. } => {
             for value in values {
+                mark_value(runtime, marked, work, marked_environments, value);
+            }
+        }
+        ObjectHost::IteratorHelper {
+            source,
+            source_next,
+            callback,
+            inner,
+            inner_next,
+            buffer,
+            ..
+        } => {
+            for object in [source, source_next, callback, inner, inner_next]
+                .into_iter()
+                .flatten()
+            {
+                mark_object(runtime, marked, work, marked_environments, *object);
+            }
+            for value in buffer {
                 mark_value(runtime, marked, work, marked_environments, value);
             }
         }
@@ -392,8 +437,8 @@ impl JsRuntime {
                 }
             }
         }
-        // Collecting mid-execution must also treat the active scopes and `this`
-        // chain as roots; between scripts these are empty.
+        // Collecting mid-execution must also treat the active scopes as
+        // roots; between scripts these are empty.
         for scope in &self.environment {
             for binding in scope.borrow().bindings.values() {
                 mark_value(
@@ -404,15 +449,6 @@ impl JsRuntime {
                     &binding.value,
                 );
             }
-        }
-        for value in &self.this_stack {
-            mark_value(
-                self,
-                &mut marked,
-                &mut work,
-                &mut marked_environments,
-                value,
-            );
         }
         while let Some(object) = work.pop() {
             let index = object.as_usize();

@@ -670,6 +670,19 @@ fn format_number_unit(value: f32, unit: &str) -> String {
     format!("{}{unit}", format_number(value))
 }
 
+/// Formats an angle stored in radians as degrees. Converting back from f32
+/// radians accumulates round-trip noise (`30deg` would read back as
+/// `30.000002`), so the output is snapped to five decimal places: far below
+/// any visual precision while keeping canonical values clean.
+fn format_degrees(radians: f32) -> String {
+    let degrees = radians.to_degrees();
+    if degrees.is_finite() {
+        format_number((degrees * 1e5).round() / 1e5)
+    } else {
+        format_number(degrees)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayOutside {
     Block,
@@ -790,6 +803,11 @@ keyword_enum!(FlexDirection {
     Column => "column",
     ColumnReverse => "column-reverse",
 });
+keyword_enum!(FlexWrap {
+    NoWrap => "nowrap",
+    Wrap => "wrap",
+    WrapReverse => "wrap-reverse",
+});
 keyword_enum!(JustifyContent {
     Normal => "normal",
     FlexStart => "flex-start",
@@ -809,6 +827,28 @@ keyword_enum!(AlignItems {
     Start => "start",
     End => "end",
     Center => "center",
+});
+keyword_enum!(AlignSelf {
+    Auto => "auto",
+    Normal => "normal",
+    Stretch => "stretch",
+    FlexStart => "flex-start",
+    FlexEnd => "flex-end",
+    Start => "start",
+    End => "end",
+    Center => "center",
+});
+keyword_enum!(AlignContent {
+    Normal => "normal",
+    Stretch => "stretch",
+    FlexStart => "flex-start",
+    FlexEnd => "flex-end",
+    Start => "start",
+    End => "end",
+    Center => "center",
+    SpaceBetween => "space-between",
+    SpaceAround => "space-around",
+    SpaceEvenly => "space-evenly",
 });
 keyword_enum!(TextAlign {
     Start => "start",
@@ -839,6 +879,24 @@ pub enum Size {
     Stretch,
     FitContent(Option<LengthPercentage>),
     LengthPercentage(LengthPercentage),
+}
+
+/// A preferred aspect ratio used when one of the box dimensions is auto.
+/// `auto` keeps the normal content/replaced-element sizing rules.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AspectRatio {
+    Auto,
+    Ratio(f32),
+}
+
+impl AspectRatio {
+    #[must_use]
+    pub fn to_css(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Ratio(value) => format_number(value),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -893,6 +951,17 @@ pub enum GridAutoRepeat {
     Fit,
 }
 
+/// One `<grid-line>` component of a `grid-*-start`/`grid-*-end` placement
+/// (CSS Grid §8.2). Line numbers are 1-based; negative values count backward
+/// from the end of the explicit grid and zero is invalid, per §8.1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridLine {
+    Auto,
+    Line(i32),
+    /// `span <integer>`, and bare `span` (a span of one track).
+    Span(i32),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum GridTrack {
     Breadth(GridTrackBreadth),
@@ -944,6 +1013,82 @@ impl CssColor {
     }
 }
 
+/// One function of a CSS `transform` list (CSS Transforms Level 1).
+///
+/// 3D functions are accepted only when they reduce to a 2D affine
+/// contribution: without a 3D pipeline `rotateX`/`rotateY`/`perspective`
+/// cannot be honored, so they parse as errors and drop the declaration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TransformFunction {
+    /// `matrix(a, b, c, d, e, f)` in the spec's argument order.
+    Matrix([f32; 6]),
+    /// `translate(x, y)` with a missing second argument defaulted to zero.
+    Translate(LengthPercentage, LengthPercentage),
+    /// `scale(x, y)` with a missing second argument defaulted to the first.
+    Scale(f32, f32),
+    /// `rotate(angle)` in radians; positive angles rotate clockwise in the
+    /// y-down screen coordinate system.
+    Rotate(f32),
+    /// `skew(ax, ay)` in radians with a missing second argument defaulted
+    /// to zero.
+    Skew(f32, f32),
+}
+
+impl TransformFunction {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        match self {
+            Self::Matrix([a, b, c, d, e, f]) => format!(
+                "matrix({}, {}, {}, {}, {}, {})",
+                format_number(*a),
+                format_number(*b),
+                format_number(*c),
+                format_number(*d),
+                format_number(*e),
+                format_number(*f),
+            ),
+            Self::Translate(x, y) => format!("translate({}, {})", x.to_css(), y.to_css()),
+            Self::Scale(x, y) => format!("scale({}, {})", format_number(*x), format_number(*y)),
+            Self::Rotate(radians) => format!("rotate({}deg)", format_degrees(*radians)),
+            Self::Skew(ax, ay) => format!(
+                "skew({}deg, {}deg)",
+                format_degrees(*ax),
+                format_degrees(*ay),
+            ),
+        }
+    }
+}
+
+/// Computed `transform` value; `none` is an empty list.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct TransformList(pub Vec<TransformFunction>);
+
+impl TransformList {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        if self.0.is_empty() {
+            return "none".to_owned();
+        }
+        self.0
+            .iter()
+            .map(TransformFunction::to_css)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Computed `transform-origin` as an x/y pair. A third z length is accepted
+/// by the grammar but ignored by the 2D pipeline.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransformOrigin(pub LengthPercentage, pub LengthPercentage);
+
+impl TransformOrigin {
+    #[must_use]
+    pub fn to_css(&self) -> String {
+        format!("{} {}", self.0.to_css(), self.1.to_css())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypedPropertyValue {
     Display(Display),
@@ -968,15 +1113,22 @@ pub enum TypedPropertyValue {
     BackgroundPosition(String),
     BackgroundSize(String),
     FlexDirection(FlexDirection),
+    FlexWrap(FlexWrap),
     FlexBasis(FlexBasis),
     FlexGrow(f32),
     FlexShrink(f32),
     JustifyContent(JustifyContent),
     AlignItems(AlignItems),
+    AlignSelf(AlignSelf),
+    AlignContent(AlignContent),
     TextAlign(TextAlign),
     Order(i32),
     Gap(Gap),
     GridTemplate(GridTemplate),
+    GridLine(GridLine),
+    AspectRatio(AspectRatio),
+    Transform(TransformList),
+    TransformOrigin(TransformOrigin),
 }
 
 impl TypedPropertyValue {
@@ -1005,15 +1157,22 @@ impl TypedPropertyValue {
             Self::BackgroundPosition(_) => "background-position",
             Self::BackgroundSize(_) => "background-size",
             Self::FlexDirection(_) => "flex-direction",
+            Self::FlexWrap(_) => "flex-wrap",
             Self::FlexBasis(_) => "flex-basis",
             Self::FlexGrow(_) => "flex-grow",
             Self::FlexShrink(_) => "flex-shrink",
             Self::JustifyContent(_) => "justify-content",
             Self::AlignItems(_) => "align-items",
+            Self::AlignSelf(_) => "align-self",
+            Self::AlignContent(_) => "align-content",
             Self::TextAlign(_) => "text-align",
             Self::Order(_) => "order",
             Self::Gap(_) => "gap",
             Self::GridTemplate(_) => "grid-template",
+            Self::GridLine(_) => "grid-line",
+            Self::AspectRatio(_) => "aspect-ratio",
+            Self::Transform(_) => "transform",
+            Self::TransformOrigin(_) => "transform-origin",
         }
     }
 
@@ -1043,13 +1202,20 @@ impl TypedPropertyValue {
             | Self::BackgroundPosition(value)
             | Self::BackgroundSize(value) => value.clone(),
             Self::FlexDirection(value) => value.as_str().to_owned(),
+            Self::FlexWrap(value) => value.as_str().to_owned(),
             Self::FlexBasis(value) => value.to_css(),
             Self::JustifyContent(value) => value.as_str().to_owned(),
             Self::AlignItems(value) => value.as_str().to_owned(),
+            Self::AlignSelf(value) => value.as_str().to_owned(),
+            Self::AlignContent(value) => value.as_str().to_owned(),
             Self::TextAlign(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
             Self::Gap(value) => value.to_css(),
             Self::GridTemplate(value) => value.to_css(),
+            Self::GridLine(value) => value.to_css(),
+            Self::AspectRatio(value) => value.to_css(),
+            Self::Transform(value) => value.to_css(),
+            Self::TransformOrigin(value) => value.to_css(),
         }
     }
 }
@@ -1226,6 +1392,16 @@ impl GridTrackBreadth {
     }
 }
 
+impl GridLine {
+    fn to_css(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Line(value) => value.to_string(),
+            Self::Span(value) => format!("span {value}"),
+        }
+    }
+}
+
 fn serialize_grid_tracks(tracks: &[GridTrack]) -> String {
     tracks
         .iter()
@@ -1291,17 +1467,27 @@ pub fn parse_typed_property(
             | "border-bottom-color"
             | "border-left-color"
             | "flex-direction"
+            | "flex-wrap"
             | "flex-basis"
             | "flex-grow"
             | "flex-shrink"
             | "justify-content"
             | "align-items"
+            | "align-self"
+            | "align-content"
             | "text-align"
             | "order"
             | "row-gap"
             | "column-gap"
             | "grid-template-columns"
             | "grid-template-rows"
+            | "grid-column-start"
+            | "grid-column-end"
+            | "grid-row-start"
+            | "grid-row-end"
+            | "aspect-ratio"
+            | "transform"
+            | "transform-origin"
     );
     if !supported {
         return None;
@@ -1350,6 +1536,7 @@ fn parse_property<'i>(
         "flex-direction" => {
             parse_keyword(input, FlexDirection::parse).map(TypedPropertyValue::FlexDirection)
         }
+        "flex-wrap" => parse_keyword(input, FlexWrap::parse).map(TypedPropertyValue::FlexWrap),
         "flex-basis" => parse_flex_basis(input).map(TypedPropertyValue::FlexBasis),
         "flex-grow" => parse_non_negative_number(input).map(TypedPropertyValue::FlexGrow),
         "flex-shrink" => parse_non_negative_number(input).map(TypedPropertyValue::FlexShrink),
@@ -1359,11 +1546,23 @@ fn parse_property<'i>(
         "align-items" => {
             parse_keyword(input, AlignItems::parse).map(TypedPropertyValue::AlignItems)
         }
+        "align-self" => parse_keyword(input, AlignSelf::parse).map(TypedPropertyValue::AlignSelf),
+        "align-content" => {
+            parse_keyword(input, AlignContent::parse).map(TypedPropertyValue::AlignContent)
+        }
         "text-align" => parse_keyword(input, TextAlign::parse).map(TypedPropertyValue::TextAlign),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
         "row-gap" | "column-gap" => parse_gap(input).map(TypedPropertyValue::Gap),
         "grid-template-columns" | "grid-template-rows" => {
             parse_grid_template(input).map(TypedPropertyValue::GridTemplate)
+        }
+        "grid-column-start" | "grid-column-end" | "grid-row-start" | "grid-row-end" => {
+            parse_grid_line(input).map(TypedPropertyValue::GridLine)
+        }
+        "aspect-ratio" => parse_aspect_ratio(input).map(TypedPropertyValue::AspectRatio),
+        "transform" => parse_transform_list(input).map(TypedPropertyValue::Transform),
+        "transform-origin" => {
+            parse_transform_origin(input).map(TypedPropertyValue::TransformOrigin)
         }
         "width" | "height" | "min-width" | "min-height" => {
             parse_size(input).map(TypedPropertyValue::Size)
@@ -1385,6 +1584,47 @@ fn parse_property<'i>(
             parse_keyword(input, BorderStyle::parse).map(TypedPropertyValue::BorderStyle)
         }
         _ => unreachable!("unsupported properties are filtered before parsing"),
+    }
+}
+
+fn parse_aspect_ratio<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, AspectRatio> {
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("auto"))
+        .is_ok()
+    {
+        // `auto` may be followed by a preferred ratio for replaced elements.
+        if input.is_exhausted() {
+            return Ok(AspectRatio::Auto);
+        }
+        let ratio = parse_aspect_ratio_number(input)?;
+        return Ok(AspectRatio::Ratio(ratio));
+    }
+    Ok(AspectRatio::Ratio(parse_aspect_ratio_number(input)?))
+}
+
+fn parse_aspect_ratio_number<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let numerator = input.expect_number()?;
+    if !numerator.is_finite() || numerator <= 0.0 {
+        return Err(location.new_custom_error(()));
+    }
+    let denominator = if input
+        .try_parse(|candidate| candidate.expect_delim('/'))
+        .is_ok()
+    {
+        let denominator = input.expect_number()?;
+        if !denominator.is_finite() || denominator <= 0.0 {
+            return Err(location.new_custom_error(()));
+        }
+        denominator
+    } else {
+        1.0
+    };
+    let ratio = numerator / denominator;
+    if ratio.is_finite() && ratio > 0.0 {
+        Ok(ratio)
+    } else {
+        Err(location.new_custom_error(()))
     }
 }
 
@@ -1806,11 +2046,313 @@ fn parse_opacity<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
     Ok(value.clamp(0.0, 1.0))
 }
 
+fn parse_transform_list<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, TransformList> {
+    if input
+        .try_parse(|input| input.expect_ident_matching("none"))
+        .is_ok()
+    {
+        return Ok(TransformList(Vec::new()));
+    }
+    let mut functions = Vec::new();
+    let mut saw_function = false;
+    while !input.is_exhausted() {
+        if let Some(function) = parse_transform_function(input)? {
+            functions.push(function);
+        }
+        saw_function = true;
+    }
+    if !saw_function {
+        // An empty value is invalid; only the `none` keyword denotes the
+        // empty list.
+        return Err(input.new_custom_error(()));
+    }
+    Ok(TransformList(functions))
+}
+
+/// Parses one transform function. Returns `Ok(None)` for functions accepted
+/// by the grammar that contribute an identity to the 2D pipeline
+/// (`translateZ`, `scaleZ`).
+fn parse_transform_function<'i>(
+    input: &mut Parser<'i, '_>,
+) -> CssResult<'i, Option<TransformFunction>> {
+    let name = input.expect_function()?.to_string();
+    input.parse_nested_block(|arguments| {
+        let function = parse_transform_arguments(&name, arguments)?;
+        if !arguments.is_exhausted() {
+            return Err(arguments.current_source_location().new_custom_error(()));
+        }
+        Ok(function)
+    })
+}
+
+fn parse_transform_arguments<'i>(
+    name: &str,
+    input: &mut Parser<'i, '_>,
+) -> CssResult<'i, Option<TransformFunction>> {
+    // Transform function names are ASCII case-insensitive per CSS syntax.
+    let location = input.current_source_location();
+    match name.to_ascii_lowercase().as_str() {
+        "matrix" => {
+            let values = parse_comma_separated_numbers(input, 6)?;
+            Ok(Some(TransformFunction::Matrix([
+                values[0], values[1], values[2], values[3], values[4], values[5],
+            ])))
+        }
+        "matrix3d" => {
+            let values = parse_comma_separated_numbers(input, 16)?;
+            // A 4x4 matrix projects onto the 2D affine pipeline only when the
+            // depth row and column vanish (m13/m23/m31/m32/m43 == 0 with
+            // m33 == 1), the perspective row vanishes (m14/m24/m34 == 0 with
+            // m44 == 1), and only the 2D translation entries m41/m42 survive.
+            let affine = values[2] == 0.0
+                && values[3] == 0.0
+                && values[6] == 0.0
+                && values[7] == 0.0
+                && values[8] == 0.0
+                && values[9] == 0.0
+                && values[10] == 1.0
+                && values[11] == 0.0
+                && values[14] == 0.0
+                && values[15] == 1.0;
+            if !affine {
+                return Err(location.new_custom_error(()));
+            }
+            Ok(Some(TransformFunction::Matrix([
+                values[0], values[1], values[4], values[5], values[12], values[13],
+            ])))
+        }
+        "translate" => {
+            let x = parse_length_percentage(input, false)?;
+            let y = input
+                .try_parse(|input| {
+                    input.expect_comma()?;
+                    parse_length_percentage(input, false)
+                })
+                .unwrap_or(LengthPercentage::Zero);
+            Ok(Some(TransformFunction::Translate(x, y)))
+        }
+        "translatex" => Ok(Some(TransformFunction::Translate(
+            parse_length_percentage(input, false)?,
+            LengthPercentage::Zero,
+        ))),
+        "translatey" => Ok(Some(TransformFunction::Translate(
+            LengthPercentage::Zero,
+            parse_length_percentage(input, false)?,
+        ))),
+        "translate3d" => {
+            let x = parse_length_percentage(input, false)?;
+            input.expect_comma()?;
+            let y = parse_length_percentage(input, false)?;
+            input.expect_comma()?;
+            // The z offset is accepted by the grammar but cannot affect a 2D
+            // pipeline; it is parsed and dropped.
+            parse_length_percentage(input, false)?;
+            Ok(Some(TransformFunction::Translate(x, y)))
+        }
+        "translatez" => {
+            parse_length_percentage(input, false)?;
+            Ok(None)
+        }
+        "scale" => {
+            let x = parse_finite_number(input)?;
+            let y = input
+                .try_parse(|input| {
+                    input.expect_comma()?;
+                    parse_finite_number(input)
+                })
+                .unwrap_or(x);
+            Ok(Some(TransformFunction::Scale(x, y)))
+        }
+        "scalex" => Ok(Some(TransformFunction::Scale(
+            parse_finite_number(input)?,
+            1.0,
+        ))),
+        "scaley" => Ok(Some(TransformFunction::Scale(
+            1.0,
+            parse_finite_number(input)?,
+        ))),
+        "scale3d" => {
+            let x = parse_finite_number(input)?;
+            input.expect_comma()?;
+            let y = parse_finite_number(input)?;
+            input.expect_comma()?;
+            parse_finite_number(input)?;
+            Ok(Some(TransformFunction::Scale(x, y)))
+        }
+        "scalez" => {
+            parse_finite_number(input)?;
+            Ok(None)
+        }
+        "rotate" | "rotatez" => Ok(Some(TransformFunction::Rotate(parse_angle_argument(
+            input,
+        )?))),
+        "rotate3d" => {
+            let x = parse_finite_number(input)?;
+            input.expect_comma()?;
+            let y = parse_finite_number(input)?;
+            input.expect_comma()?;
+            let z = parse_finite_number(input)?;
+            input.expect_comma()?;
+            let angle = parse_angle_argument(input)?;
+            // Only a rotation about the z axis projects onto the 2D pipeline;
+            // a negative axis component flips the rotation direction.
+            if x == 0.0 && y == 0.0 && z != 0.0 {
+                let direction = if z > 0.0 { angle } else { -angle };
+                Ok(Some(TransformFunction::Rotate(direction)))
+            } else {
+                Err(location.new_custom_error(()))
+            }
+        }
+        "skew" => {
+            let ax = parse_angle_argument(input)?;
+            let ay = input
+                .try_parse(|input| {
+                    input.expect_comma()?;
+                    parse_angle_argument(input)
+                })
+                .unwrap_or(0.0);
+            Ok(Some(TransformFunction::Skew(ax, ay)))
+        }
+        "skewx" => Ok(Some(TransformFunction::Skew(
+            parse_angle_argument(input)?,
+            0.0,
+        ))),
+        "skewy" => Ok(Some(TransformFunction::Skew(
+            0.0,
+            parse_angle_argument(input)?,
+        ))),
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_comma_separated_numbers<'i>(
+    input: &mut Parser<'i, '_>,
+    count: usize,
+) -> CssResult<'i, Vec<f32>> {
+    let location = input.current_source_location();
+    let values = input.parse_comma_separated(|input| {
+        let value = input.expect_number().map_err(ParseError::from)?;
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(location.new_custom_error(()))
+        }
+    })?;
+    if values.len() != count {
+        return Err(location.new_custom_error(()));
+    }
+    Ok(values)
+}
+
+fn parse_angle_argument<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    match input.next()? {
+        Token::Number { value, .. } if *value == 0.0 => Ok(0.0),
+        Token::Dimension { value, unit, .. } => {
+            // Angle units are ASCII case-insensitive per CSS syntax.
+            let radians = match unit.to_ascii_lowercase().as_str() {
+                "deg" => value.to_radians(),
+                "grad" => *value * std::f32::consts::PI / 200.0,
+                "rad" => *value,
+                "turn" => *value * std::f32::consts::TAU,
+                _ => return Err(location.new_custom_error(())),
+            };
+            // Overflow tokens must not leak non-finite angles into transform
+            // math, mirroring the number-argument guard.
+            if radians.is_finite() {
+                Ok(radians)
+            } else {
+                Err(location.new_custom_error(()))
+            }
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
+fn parse_transform_origin<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, TransformOrigin> {
+    // Slot-based assignment (CSS Transforms §4): `top`/`bottom` are
+    // vertical-only, `left`/`right` horizontal-only, `center` fits whichever
+    // slot is open, and bare lengths/percentages fill x then y. A trailing
+    // length is the z offset, accepted but ignored by the 2D pipeline.
+    let mut x: Option<LengthPercentage> = None;
+    let mut y: Option<LengthPercentage> = None;
+    let mut values = 0;
+    while values < 3 && !input.is_exhausted() {
+        let location = input.current_source_location();
+        let keyword = input.try_parse(|input| {
+            input
+                .expect_ident()
+                .map(|keyword| keyword.to_ascii_lowercase())
+        });
+        if let Ok(keyword) = keyword {
+            let percentage =
+                transform_origin_keyword(&keyword).ok_or_else(|| location.new_custom_error(()))?;
+            let resolved = LengthPercentage::Percentage(percentage);
+            match (values, keyword.as_str()) {
+                // First value: a vertical-only keyword fills y directly.
+                (0, "top" | "bottom") => y = Some(resolved),
+                (0, _) => x = Some(resolved),
+                // Second value fills the only slot still open and must belong
+                // to that slot's axis.
+                (1, "top" | "bottom") if x.is_none() => {
+                    return Err(location.new_custom_error(()));
+                }
+                (1, _) if x.is_none() => x = Some(resolved),
+                (1, "left" | "right") => return Err(location.new_custom_error(())),
+                (1, _) => y = Some(resolved),
+                _ => return Err(location.new_custom_error(())),
+            }
+        } else {
+            let value = parse_length_percentage(input, false)?;
+            match values {
+                0 => x = Some(value),
+                // A length after a leading vertical keyword fills x.
+                1 if x.is_none() => x = Some(value),
+                1 => y = Some(value),
+                // Third value: the z position, a plain length, ignored in 2D.
+                2 if value.is_length_only() => {}
+                _ => return Err(location.new_custom_error(())),
+            }
+        }
+        values += 1;
+    }
+    if values == 0 {
+        // An empty value is invalid; the 50% 50% default belongs to the
+        // initial-value path, not the parser.
+        return Err(input.new_custom_error(()));
+    }
+    Ok(TransformOrigin(
+        x.unwrap_or(LengthPercentage::Percentage(0.5)),
+        y.unwrap_or(LengthPercentage::Percentage(0.5)),
+    ))
+}
+
+fn transform_origin_keyword(keyword: &str) -> Option<f32> {
+    match keyword {
+        "left" | "top" => Some(0.0),
+        "center" => Some(0.5),
+        "right" | "bottom" => Some(1.0),
+        _ => None,
+    }
+}
+
 fn parse_non_negative_number<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
     let location = input.current_source_location();
     match input.next()?.clone() {
         Token::Number { value, .. } if value.is_finite() && value >= 0.0 => Ok(value),
         _ => Err(location.new_custom_error(())),
+    }
+}
+
+/// Parse a `<number>` argument, rejecting the non-finite values that numeric
+/// overflow tokens can carry so transform math stays bounded.
+fn parse_finite_number<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, f32> {
+    let location = input.current_source_location();
+    let value = input.expect_number()?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(location.new_custom_error(()))
     }
 }
 
@@ -1850,6 +2392,83 @@ fn parse_gap<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Gap> {
     } else {
         parse_length_percentage(input, true).map(Gap::LengthPercentage)
     }
+}
+
+/// Parse one `<grid-line>` (CSS Grid §8.2) with the forms real sheets use:
+/// `auto`, a nonzero `<integer>` (negative counts from the explicit grid
+/// end), `span`, `span <integer>`, `<integer> span`, and `span` + integer in
+/// either order. Line-name custom idents are rejected until named tracks are
+/// supported by the layout engine.
+fn parse_grid_line<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, GridLine> {
+    let location = input.current_source_location();
+    let integer = |input: &mut Parser<'i, '_>| -> CssResult<'i, i32> {
+        let value = parse_integer(input)?;
+        // CSS Grid §8.1: a line number of zero makes the declaration invalid.
+        if value == 0 {
+            return Err(input.new_custom_error(()));
+        }
+        Ok(value)
+    };
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("auto"))
+        .is_ok()
+    {
+        return Ok(GridLine::Auto);
+    }
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("span"))
+        .is_ok()
+    {
+        let count = input.try_parse(integer).unwrap_or(1);
+        if count < 1 {
+            return Err(location.new_custom_error(()));
+        }
+        return Ok(GridLine::Span(count));
+    }
+    let value = integer(input)?;
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("span"))
+        .is_ok()
+    {
+        if value < 1 {
+            return Err(location.new_custom_error(()));
+        }
+        return Ok(GridLine::Span(value));
+    }
+    Ok(GridLine::Line(value))
+}
+
+/// Expand a `grid-column` / `grid-row` shorthand into its start/end longhand
+/// values (CSS Grid §8.3): `a / b` sets both sides, a single component sets
+/// the start side and leaves the end side `auto`. Returns `None` when the
+/// value is not a valid axis placement, so the caller keeps the declaration
+/// for diagnostics instead of dropping it silently.
+pub(crate) fn expand_grid_axis_shorthand(css: &str) -> Option<(String, String)> {
+    let mut input = ParserInput::new(css);
+    let mut parser = Parser::new(&mut input);
+    parser
+        .parse_entirely(|input| {
+            let start = parse_grid_line(input)?;
+            let end = if input
+                .try_parse(|candidate| candidate.expect_delim('/'))
+                .is_ok()
+            {
+                // Two spans on one axis cannot resolve against a grid
+                // (CSS Grid §8.1); the shorthand is invalid as a whole.
+                if matches!(start, GridLine::Span(_))
+                    && input
+                        .try_parse(|candidate| candidate.expect_ident_matching("span"))
+                        .is_ok()
+                {
+                    return Err(input.new_custom_error(()));
+                }
+                parse_grid_line(input)?
+            } else {
+                GridLine::Auto
+            };
+            Ok((start.to_css(), end.to_css()))
+        })
+        .ok()
 }
 
 const MAX_PARSED_GRID_TRACKS: usize = 4_096;
@@ -2346,14 +2965,65 @@ mod tests {
     #![allow(clippy::float_cmp)]
 
     use super::{
-        Display, DisplayInside, DisplayOutside, LengthPercentage, MaxSize, Size, TextAlign,
-        TypedPropertyValue, parse_typed_property,
+        AspectRatio, Display, DisplayInside, DisplayOutside, Length, LengthPercentage, LengthUnit,
+        MaxSize, PropertyParseError, Size, TextAlign, TransformFunction, TransformList,
+        TransformOrigin, TypedPropertyValue, parse_typed_property,
     };
 
     fn parse(name: &str, css: &str) -> TypedPropertyValue {
         parse_typed_property(name, css)
             .expect("supported property")
             .expect("valid value")
+    }
+
+    fn transform(css: &str) -> TransformList {
+        match parse("transform", css) {
+            TypedPropertyValue::Transform(list) => list,
+            other => panic!("expected a transform list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_aspect_ratio_forms_and_rejects_invalid_ratios() {
+        assert_eq!(
+            parse("aspect-ratio", "16 / 9"),
+            TypedPropertyValue::AspectRatio(AspectRatio::Ratio(16.0 / 9.0))
+        );
+        assert_eq!(
+            parse("aspect-ratio", "auto"),
+            TypedPropertyValue::AspectRatio(AspectRatio::Auto)
+        );
+        assert_eq!(
+            parse("aspect-ratio", "auto 4 / 3"),
+            TypedPropertyValue::AspectRatio(AspectRatio::Ratio(4.0 / 3.0))
+        );
+        for value in ["0", "16 / 0", "-1 / 2", "16 / -9"] {
+            assert!(
+                parse_typed_property("aspect-ratio", value)
+                    .expect("supported property")
+                    .is_err()
+            );
+        }
+    }
+
+    fn origin(css: &str) -> TransformOrigin {
+        match parse("transform-origin", css) {
+            TypedPropertyValue::TransformOrigin(origin) => origin,
+            other => panic!("expected a transform origin, got {other:?}"),
+        }
+    }
+
+    fn px(value: f32) -> LengthPercentage {
+        LengthPercentage::Length(Length {
+            value,
+            unit: LengthUnit::Px,
+        })
+    }
+
+    fn invalid(name: &str, css: &str) -> PropertyParseError {
+        parse_typed_property(name, css)
+            .expect("supported property")
+            .expect_err("value must be rejected")
     }
 
     #[test]
@@ -2601,5 +3271,477 @@ mod tests {
         };
         assert_eq!(row, "8px");
         assert_eq!(column, "24px");
+    }
+
+    #[test]
+    fn parses_grid_line_longhands_with_span_and_negative_forms() {
+        use super::GridLine;
+        let line = |value: &str| match parse("grid-column-start", value) {
+            TypedPropertyValue::GridLine(line) => line,
+            other => panic!("expected a grid line, got {other:?}"),
+        };
+        assert_eq!(line("auto"), GridLine::Auto);
+        assert_eq!(line("3"), GridLine::Line(3));
+        assert_eq!(line("-2"), GridLine::Line(-2));
+        assert_eq!(line("span"), GridLine::Span(1));
+        assert_eq!(line("span 2"), GridLine::Span(2));
+        assert_eq!(line("2 span"), GridLine::Span(2));
+        assert_eq!(parse("grid-row-end", "span 4").to_css(), "span 4");
+        for invalid in ["0", "span 0", "span -1", "-2 span", "2.5", "main-start", ""] {
+            assert!(
+                parse_typed_property("grid-column-start", invalid)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_axis_shorthand_expands_start_and_end_lines() {
+        let expand = |value: &str| super::expand_grid_axis_shorthand(value);
+        assert_eq!(expand("2"), Some(("2".to_owned(), "auto".to_owned())));
+        assert_eq!(
+            expand("span 2 / 3"),
+            Some(("span 2".to_owned(), "3".to_owned()))
+        );
+        assert_eq!(expand("1 / -1"), Some(("1".to_owned(), "-1".to_owned())));
+        assert_eq!(
+            expand("auto / span 2"),
+            Some(("auto".to_owned(), "span 2".to_owned()))
+        );
+        // Two spans cannot resolve against a grid; the whole shorthand is
+        // invalid (CSS Grid §8.1).
+        assert_eq!(expand("span 2 / span 3"), None);
+        assert_eq!(expand("1 / 0"), None);
+        assert_eq!(expand("/ 2"), None);
+        assert_eq!(expand("1 / 2 / 3"), None);
+    }
+
+    #[test]
+    fn transform_none_is_an_empty_list_that_serializes_to_none() {
+        assert_eq!(transform("none"), TransformList(Vec::new()));
+        assert_eq!(transform("none").to_css(), "none");
+    }
+
+    #[test]
+    fn parses_translate_functions_in_all_grammatical_forms() {
+        assert_eq!(
+            transform("translate(10px)").0,
+            vec![TransformFunction::Translate(
+                px(10.0),
+                LengthPercentage::Zero
+            )]
+        );
+        assert_eq!(
+            transform("translate(10px, 20px)").0,
+            vec![TransformFunction::Translate(px(10.0), px(20.0))]
+        );
+        assert_eq!(
+            transform("translateX(-3px)").0,
+            vec![TransformFunction::Translate(
+                px(-3.0),
+                LengthPercentage::Zero
+            )]
+        );
+        assert_eq!(
+            transform("translateY(25%)").0,
+            vec![TransformFunction::Translate(
+                LengthPercentage::Zero,
+                LengthPercentage::Percentage(0.25)
+            )]
+        );
+        assert_eq!(
+            transform("translate3d(0, 0, 0)").0,
+            vec![TransformFunction::Translate(
+                LengthPercentage::Zero,
+                LengthPercentage::Zero
+            )]
+        );
+        assert!(matches!(
+            transform("translate(calc(100% - 10px), 0)").0.as_slice(),
+            [TransformFunction::Translate(
+                LengthPercentage::Calculation(_),
+                LengthPercentage::Zero
+            )]
+        ));
+        // translateZ contributes nothing to the 2D pipeline.
+        assert_eq!(transform("translateZ(10px)"), TransformList(Vec::new()));
+    }
+
+    #[test]
+    fn parses_scale_functions_with_second_argument_defaulting() {
+        assert_eq!(
+            transform("scale(2)").0,
+            vec![TransformFunction::Scale(2.0, 2.0)]
+        );
+        assert_eq!(
+            transform("scale(2, 0.5)").0,
+            vec![TransformFunction::Scale(2.0, 0.5)]
+        );
+        assert_eq!(
+            transform("scale(-1)").0,
+            vec![TransformFunction::Scale(-1.0, -1.0)]
+        );
+        assert_eq!(
+            transform("scale(0)").0,
+            vec![TransformFunction::Scale(0.0, 0.0)]
+        );
+        assert_eq!(
+            transform("scaleX(3)").0,
+            vec![TransformFunction::Scale(3.0, 1.0)]
+        );
+        assert_eq!(
+            transform("scaleY(0.25)").0,
+            vec![TransformFunction::Scale(1.0, 0.25)]
+        );
+        assert_eq!(
+            transform("scale3d(2, 3, 4)").0,
+            vec![TransformFunction::Scale(2.0, 3.0)]
+        );
+        // scaleZ contributes nothing to the 2D pipeline.
+        assert_eq!(transform("scaleZ(2)"), TransformList(Vec::new()));
+    }
+
+    #[test]
+    fn parses_rotate_angles_across_units_and_axis_aliases() {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        assert_eq!(
+            transform("rotate(45deg)").0,
+            vec![TransformFunction::Rotate(45f32.to_radians())]
+        );
+        assert_eq!(
+            transform("rotate(0)").0,
+            vec![TransformFunction::Rotate(0.0)]
+        );
+        assert_eq!(
+            transform("rotate(0.5turn)").0,
+            vec![TransformFunction::Rotate(PI)]
+        );
+        assert_eq!(
+            transform("rotate(200grad)").0,
+            vec![TransformFunction::Rotate(PI)]
+        );
+        assert_eq!(
+            transform("rotate(1rad)").0,
+            vec![TransformFunction::Rotate(1.0)]
+        );
+        assert_eq!(
+            transform("rotateZ(-90deg)").0,
+            vec![TransformFunction::Rotate(-FRAC_PI_2)]
+        );
+        assert_eq!(
+            transform("rotate(-90deg)").0,
+            vec![TransformFunction::Rotate(-FRAC_PI_2)]
+        );
+        // Function names and angle units are ASCII case-insensitive.
+        assert_eq!(
+            transform("ROTATE(90DEG)").0,
+            vec![TransformFunction::Rotate(FRAC_PI_2)]
+        );
+        assert_eq!(
+            transform("rotate3d(0, 0, 1, 45deg)").0,
+            vec![TransformFunction::Rotate(45f32.to_radians())]
+        );
+        // A negative z axis component flips the rotation direction.
+        assert_eq!(
+            transform("rotate3d(0, 0, -2, 45deg)").0,
+            vec![TransformFunction::Rotate(-45f32.to_radians())]
+        );
+    }
+
+    #[test]
+    fn parses_skew_functions_with_optional_second_angle() {
+        assert_eq!(
+            transform("skew(10deg)").0,
+            vec![TransformFunction::Skew(10f32.to_radians(), 0.0)]
+        );
+        assert_eq!(
+            transform("skew(10deg, -20deg)").0,
+            vec![TransformFunction::Skew(
+                10f32.to_radians(),
+                -20f32.to_radians()
+            )]
+        );
+        assert_eq!(
+            transform("skewX(30deg)").0,
+            vec![TransformFunction::Skew(30f32.to_radians(), 0.0)]
+        );
+        assert_eq!(
+            transform("skewY(45deg)").0,
+            vec![TransformFunction::Skew(0.0, 45f32.to_radians())]
+        );
+    }
+
+    #[test]
+    fn parses_matrix_and_projects_affine_matrix3d() {
+        assert_eq!(
+            transform("matrix(1, 2, 3, 4, 5, 6)").0,
+            vec![TransformFunction::Matrix([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])]
+        );
+        assert_eq!(
+            transform("matrix3d(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 10, 20, 0, 1)").0,
+            vec![TransformFunction::Matrix([1.0, 0.0, 0.0, 1.0, 10.0, 20.0])]
+        );
+        // A perspective term (m14 != 0 here) cannot be projected onto the 2D
+        // affine pipeline, so the declaration is dropped.
+        assert!(
+            parse_typed_property(
+                "transform",
+                "matrix3d(1, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 10, 20, 0, 1)"
+            )
+            .expect("supported")
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_3d_only_transform_functions() {
+        for css in [
+            "perspective(10px)",
+            "rotateX(45deg)",
+            "rotateY(45deg)",
+            "rotate3d(1, 0, 0, 45deg)",
+            "rotate3d(0, 1, 0, 45deg)",
+            "rotate3d(0, 0, 0, 45deg)",
+            "translateZ(10px) rotateX(45deg)",
+        ] {
+            assert!(
+                parse_typed_property("transform", css)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {css}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_transform_values_with_a_source_location() {
+        for css in [
+            "",
+            "10px",
+            "bogus(10px)",
+            "translate 10px",
+            "translate()",
+            "translate(10px,)",
+            "translate(10px, 20px, 5px)",
+            "translate(10px 20px)",
+            "scale()",
+            "scale(2,)",
+            "scale(1e40)",
+            "scale3d(2, 3)",
+            "matrix(1, 2, 3)",
+            "matrix(1, 2, 3, 4, 5, 6, 7)",
+            "matrix(1e40, 0, 0, 1, 0, 0)",
+            "rotate()",
+            "rotate(45)",
+            "rotate(1e40deg)",
+            "skew(10deg, 20deg, 30deg)",
+            "translateX(10px), rotate(45deg)",
+            "translateX(10px) 10px",
+        ] {
+            assert!(
+                parse_typed_property("transform", css)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {css:?}"
+            );
+        }
+        // Errors carry the source location through PropertyParseError.
+        let error = invalid("transform", "rotate(45)");
+        assert_eq!(error.property(), "transform");
+        assert!(error.to_string().contains("at 0:8"), "{error}");
+    }
+
+    #[test]
+    fn preserves_transform_function_order_in_lists() {
+        assert_eq!(
+            transform("translateX(10px) rotate(45deg)").0,
+            vec![
+                TransformFunction::Translate(px(10.0), LengthPercentage::Zero),
+                TransformFunction::Rotate(45f32.to_radians()),
+            ]
+        );
+        assert_eq!(transform("scale(2) skewX(30deg) translate(5px)").0.len(), 3);
+        // Identity-only 3D functions contribute nothing but keep their
+        // neighbors' order intact.
+        assert_eq!(
+            transform("translateZ(10px) rotate(45deg) scaleZ(2)").0,
+            vec![TransformFunction::Rotate(45f32.to_radians())]
+        );
+    }
+
+    #[test]
+    fn normalizes_transform_serialization() {
+        assert_eq!(
+            transform("translate(10px)").to_css(),
+            "translate(10px, 0px)"
+        );
+        assert_eq!(transform("translateX(5%)").to_css(), "translate(5%, 0px)");
+        assert_eq!(
+            transform("translateY(-2px)").to_css(),
+            "translate(0px, -2px)"
+        );
+        assert_eq!(
+            transform("translate(calc(100% - 10px), 0)").to_css(),
+            "translate(calc(100% - 10px), 0px)"
+        );
+        assert_eq!(
+            transform("translate3d(0, 0, 0)").to_css(),
+            "translate(0px, 0px)"
+        );
+        assert_eq!(transform("scale(2)").to_css(), "scale(2, 2)");
+        assert_eq!(transform("scaleX(3)").to_css(), "scale(3, 1)");
+        assert_eq!(transform("rotate(0.25turn)").to_css(), "rotate(90deg)");
+        assert_eq!(transform("rotate(200grad)").to_css(), "rotate(180deg)");
+        // Radian storage snaps back to clean degrees on serialization.
+        assert_eq!(transform("rotate(1rad)").to_css(), "rotate(57.29578deg)");
+        assert_eq!(transform("rotate(-90deg)").to_css(), "rotate(-90deg)");
+        assert_eq!(transform("skew(30deg)").to_css(), "skew(30deg, 0deg)");
+        assert_eq!(transform("skewY(45deg)").to_css(), "skew(0deg, 45deg)");
+        assert_eq!(
+            transform("matrix(1, 0, 0, 1, 10, 20)").to_css(),
+            "matrix(1, 0, 0, 1, 10, 20)"
+        );
+        assert_eq!(
+            transform("translateX(10px) rotate(45deg)").to_css(),
+            "translate(10px, 0px) rotate(45deg)"
+        );
+    }
+
+    #[test]
+    fn parses_transform_origin_keywords_lengths_and_defaults() {
+        assert_eq!(
+            origin("50% 50%"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.5)
+            )
+        );
+        assert_eq!(
+            origin("left top"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.0),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+        assert_eq!(origin("100px 200px"), TransformOrigin(px(100.0), px(200.0)));
+        // Single values leave the missing slot at the 50% default.
+        assert_eq!(
+            origin("center"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.5)
+            )
+        );
+        assert_eq!(
+            origin("left"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.0),
+                LengthPercentage::Percentage(0.5)
+            )
+        );
+        assert_eq!(
+            origin("top"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+        assert_eq!(
+            origin("center bottom"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(1.0)
+            )
+        );
+        assert_eq!(
+            origin("10px"),
+            TransformOrigin(px(10.0), LengthPercentage::Percentage(0.5))
+        );
+    }
+
+    #[test]
+    fn parses_transform_origin_with_leading_vertical_keyword() {
+        // Regression: `top`/`bottom` first used to fall through to an error.
+        assert_eq!(
+            origin("top left"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.0),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+        assert_eq!(
+            origin("top center"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+        assert_eq!(
+            origin("bottom right"),
+            TransformOrigin(
+                LengthPercentage::Percentage(1.0),
+                LengthPercentage::Percentage(1.0)
+            )
+        );
+        assert_eq!(
+            origin("top 25%"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.25),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+        assert_eq!(
+            origin("bottom 10px"),
+            TransformOrigin(px(10.0), LengthPercentage::Percentage(1.0))
+        );
+    }
+
+    #[test]
+    fn parses_transform_origin_three_value_forms_ignoring_z() {
+        assert_eq!(
+            origin("50% 50% 10px"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.5),
+                LengthPercentage::Percentage(0.5)
+            )
+        );
+        assert_eq!(
+            origin("left top 0"),
+            TransformOrigin(
+                LengthPercentage::Percentage(0.0),
+                LengthPercentage::Percentage(0.0)
+            )
+        );
+    }
+
+    #[test]
+    fn serializes_transform_origin_normally() {
+        assert_eq!(origin("left top").to_css(), "0% 0%");
+        assert_eq!(origin("center").to_css(), "50% 50%");
+        assert_eq!(origin("100px 200px").to_css(), "100px 200px");
+    }
+
+    #[test]
+    fn rejects_invalid_transform_origin_values() {
+        for css in [
+            "",
+            "top top",
+            "left left",
+            "center left",
+            "left top 25%",
+            "top center right",
+            "top 10px left",
+            "left 10px top",
+            "middle",
+        ] {
+            assert!(
+                parse_typed_property("transform-origin", css)
+                    .expect("supported")
+                    .is_err(),
+                "unexpectedly accepted {css:?}"
+            );
+        }
     }
 }

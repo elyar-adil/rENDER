@@ -18,6 +18,7 @@ use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::properties::AlignItems;
 use render_css::properties::BoxSizing;
+use render_css::properties::Float;
 use render_css::properties::JustifyContent;
 use render_css::properties::TextAlign;
 use render_css::properties::TypedPropertyValue;
@@ -825,10 +826,35 @@ impl Solver<'_> {
             .get(node_id)
             .map(|node| node.children.clone())
             .unwrap_or_default();
-        children
-            .into_iter()
-            .map(|child| self.max_content_width(child))
-            .fold(0.0_f32, f32::max)
+        let mut widest = 0.0_f32;
+        let mut float_run = 0.0_f32;
+        for child in children {
+            let child_float = self.float_side(child);
+            let child_width = self.max_content_width(child);
+            if std::env::var_os("RENDER_DEBUG_INTRINSIC").is_some() {
+                eprintln!("  child={child:?} float={child_float:?} max={child_width}");
+            }
+            if child_float == Float::None {
+                // Whitespace between inline/floating children is represented
+                // by empty anonymous blocks. It does not terminate a run of
+                // adjacent floats; doing so makes every link in a real
+                // navigation bar start on a new line.
+                if child_width > f32::EPSILON {
+                    float_run = 0.0;
+                    widest = widest.max(child_width);
+                }
+            } else {
+                // Adjacent floats share a line in a shrink-to-fit box. The
+                // preferred width is their combined outer width, including
+                // margins, rather than the width of only the widest float.
+                float_run += self.atomic_outer_max_content_width(child);
+                widest = widest.max(float_run);
+            }
+        }
+        if std::env::var_os("RENDER_DEBUG_INTRINSIC").is_some() {
+            eprintln!("intrinsic float node={node_id:?} width={widest}");
+        }
+        widest
     }
 
     pub(super) fn max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {

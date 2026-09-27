@@ -60,6 +60,9 @@ pub enum StylesheetDiagnosticCode {
     StalePlan,
     MissingBatchResult,
     ExtraBatchResult,
+    /// A slot present in the re-planned snapshot whose URL was not part of
+    /// the in-flight batch; it stays pending for the next discovery cycle.
+    PendingFetch,
     Transport,
     UnexpectedResponseUrl,
     HttpStatus,
@@ -227,6 +230,88 @@ pub fn apply_stylesheet_batch(
                 result_count - plan.resources.len()
             ),
         });
+    }
+
+    application
+}
+
+/// Applies batch results that were fetched for an earlier plan revision to a
+/// plan freshly built from the current snapshot.
+///
+/// Page scripts mutate the DOM while stylesheets are in flight, so the fresh
+/// snapshot can contain slots the departed batch never requested and can have
+/// dropped links the batch did request. Results are therefore matched to
+/// slots by requested URL instead of by index: a matched result applies to
+/// the current slot (re-keyed to the current owner), a slot without a match
+/// stays pending for the next discovery cycle, and a result whose link
+/// disappeared is dropped.
+///
+/// # Panics
+///
+/// Never panics: the `expect` when consuming a matched result guards an
+/// element proven present by the preceding `position` search.
+#[must_use]
+pub fn apply_stylesheet_batch_rematched(
+    plan: &StylesheetFetchPlan,
+    fetched_for: &StylesheetFetchPlan,
+    results: Vec<FetchResult>,
+) -> StylesheetBatchApplication {
+    let mut application = StylesheetBatchApplication {
+        revision: plan.revision,
+        style_sheets: ExternalStyleSheets::default(),
+        loaded: Vec::new(),
+        diagnostics: plan.diagnostics.clone(),
+    };
+
+    // A pending result is identified by the response URL when the transfer
+    // succeeded, and by the slot URL it was requested for when it failed
+    // (transport errors carry no URL of their own).
+    let mut pending: Vec<(Option<Url>, Option<FetchResult>)> = results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            let url = match &result {
+                Ok(response) => Some(response.requested_url.clone()),
+                Err(_) => fetched_for
+                    .resources
+                    .get(index)
+                    .map(|resource| resource.key.requested_url.clone()),
+            };
+            (url, Some(result))
+        })
+        .collect();
+
+    for resource in &plan.resources {
+        let matched = pending.iter().position(|(url, result)| {
+            result.is_some() && url.as_ref() == Some(&resource.key.requested_url)
+        });
+        match matched {
+            Some(index) => {
+                let result = pending[index]
+                    .1
+                    .take()
+                    .expect("matched pending result is present");
+                match result {
+                    Ok(response) => apply_response(resource, response, &mut application),
+                    Err(error) => application.diagnostics.push(resource_diagnostic(
+                        resource,
+                        StylesheetDiagnosticSeverity::Error,
+                        StylesheetDiagnosticCode::Transport,
+                        format!("stylesheet transfer failed: {error}"),
+                    )),
+                }
+            }
+            None => application.diagnostics.push(StylesheetResourceDiagnostic {
+                owner: Some(resource.key.owner),
+                source_order: Some(resource.source_order),
+                requested_url: Some(resource.key.requested_url.clone()),
+                severity: StylesheetDiagnosticSeverity::Warning,
+                code: StylesheetDiagnosticCode::PendingFetch,
+                message:
+                    "stylesheet was discovered after its batch departed; fetching on the next cycle"
+                        .to_owned(),
+            }),
+        }
     }
 
     application
@@ -542,7 +627,7 @@ mod tests {
 
     use super::{
         CSS_ACCEPT, StylesheetDiagnosticCode, absolutize_css_urls, apply_stylesheet_batch,
-        decode_css_bytes, plan_external_style_sheets,
+        apply_stylesheet_batch_rematched, decode_css_bytes, plan_external_style_sheets,
     };
 
     #[test]
@@ -730,6 +815,158 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| { diagnostic.code == StylesheetDiagnosticCode::Transport })
+        );
+    }
+
+    #[test]
+    fn rematched_batch_applies_fetched_css_to_current_plan_slots() {
+        let (base, server) = serve(1, |path| match path {
+            "/styles/a.css" => response("200 OK", Some("text/css"), b"p { color: red }"),
+            _ => response("404 Not Found", Some("text/css"), b""),
+        });
+        let mut document = Document::parse("<link rel=stylesheet href=styles/a.css>");
+        let plan = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+
+        // A page script appends another stylesheet link while the batch is in
+        // flight, moving the document to a new revision.
+        let owner = plan.resources[0].key.owner;
+        let head = document.dom().parent(owner).expect("link parent");
+        let link = document.dom_mut().create_element("link");
+        document
+            .dom_mut()
+            .set_attribute(link, "rel", "stylesheet")
+            .expect("set rel");
+        document
+            .dom_mut()
+            .set_attribute(link, "href", "styles/b.css")
+            .expect("set href");
+        document
+            .dom_mut()
+            .append_child(head, link)
+            .expect("append link");
+        assert_ne!(plan.revision, document.dom().revision());
+
+        let fresh = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+        assert_eq!(fresh.resources.len(), 2);
+
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let results = transport.fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let application = apply_stylesheet_batch_rematched(&fresh, &plan, results);
+        server.join().expect("server thread");
+
+        // The fetched CSS re-keys onto the fresh slot instead of being
+        // discarded, and the appended link stays pending for the next cycle.
+        assert!(
+            application
+                .style_sheets
+                .get(&fresh.resources[0].key)
+                .is_some()
+        );
+        assert_eq!(application.loaded.len(), 1);
+        assert!(
+            !application
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == StylesheetDiagnosticCode::StalePlan })
+        );
+        assert!(application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == StylesheetDiagnosticCode::PendingFetch
+                && diagnostic.requested_url.as_ref() == Some(&fresh.resources[1].key.requested_url)
+        }));
+    }
+
+    #[test]
+    fn rematched_batch_drops_results_whose_slot_left_the_plan() {
+        let (base, server) = serve(1, |path| match path {
+            "/styles/a.css" => response("200 OK", Some("text/css"), b"p { color: red }"),
+            _ => response("404 Not Found", Some("text/css"), b""),
+        });
+        let mut document = Document::parse("<link rel=stylesheet href=styles/a.css>");
+        let plan = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+
+        // The page retargets the link while the batch is in flight; the
+        // fetched bytes no longer correspond to any slot in the fresh plan.
+        let owner = plan.resources[0].key.owner;
+        document
+            .dom_mut()
+            .set_attribute(owner, "href", "styles/c.css")
+            .expect("retarget link");
+
+        let fresh = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let results = transport.fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        let application = apply_stylesheet_batch_rematched(&fresh, &plan, results);
+        server.join().expect("server thread");
+
+        assert!(application.style_sheets.is_empty());
+        assert_eq!(application.loaded.len(), 0);
+        assert!(
+            application
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == StylesheetDiagnosticCode::PendingFetch })
+        );
+        assert!(
+            !application.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == StylesheetDiagnosticCode::ExtraBatchResult
+            })
+        );
+        assert!(!application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == StylesheetDiagnosticCode::UnexpectedResponseUrl
+        }));
+    }
+
+    #[test]
+    fn rematched_batch_attributes_transport_failures_across_revisions() {
+        let mut document = Document::parse("<link rel=stylesheet href=styles/a.css>");
+        let base = Url::parse("https://example.test/index.html").expect("base URL");
+        let plan = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+
+        // An unrelated mutation (a script appending a node) moves the
+        // revision while the stylesheet slot itself stays put.
+        let owner = plan.resources[0].key.owner;
+        let head = document.dom().parent(owner).expect("link parent");
+        let paragraph = document.dom_mut().create_element("p");
+        document
+            .dom_mut()
+            .append_child(head, paragraph)
+            .expect("append node");
+
+        let fresh = plan_external_style_sheets(&document, &base, DocumentLimits::default());
+        assert_eq!(fresh.resources.len(), 1);
+
+        let application =
+            apply_stylesheet_batch_rematched(&fresh, &plan, vec![Err(FetchError::Timeout)]);
+
+        assert!(application.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == StylesheetDiagnosticCode::Transport
+                && diagnostic.source_order == Some(0)
+        }));
+        assert!(
+            !application
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == StylesheetDiagnosticCode::StalePlan })
+        );
+        assert!(
+            !application
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == StylesheetDiagnosticCode::PendingFetch })
         );
     }
 

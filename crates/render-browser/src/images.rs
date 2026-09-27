@@ -269,6 +269,9 @@ fn apply_response(
         return;
     }
     let sniffed_format = sniff_image_format(&response.body);
+    let declared_supported = response.content_type.as_ref().is_some_and(|content_type| {
+        ImageFormat::from_media_type(&content_type.media_type).is_some()
+    });
     let Some(format) = resolve_image_format(
         resource,
         response.content_type.as_ref(),
@@ -277,20 +280,26 @@ fn apply_response(
     ) else {
         return;
     };
-    if sniffed_format != Some(format) {
-        application.diagnostics.push(resource_diagnostic(
-            resource,
-            ImageDiagnosticSeverity::Error,
-            ImageResourceDiagnosticCode::ContentTypeMismatch,
-            format!(
-                "image bytes do not match declared content type '{}'",
-                response
-                    .content_type
-                    .as_ref()
-                    .map_or("unknown", |content_type| content_type.media_type.as_str())
-            ),
-        ));
-        return;
+    if format != ImageFormat::Svg && sniffed_format != Some(format) {
+        // Bytes contradicting a *supported* declared type stay a hard error
+        // (corrupted transfer, wrong asset). An unsupported declared type
+        // already fell back to the sniffed format above; the bytes are the
+        // only source of truth at that point.
+        if declared_supported {
+            application.diagnostics.push(resource_diagnostic(
+                resource,
+                ImageDiagnosticSeverity::Error,
+                ImageResourceDiagnosticCode::ContentTypeMismatch,
+                format!(
+                    "image bytes do not match declared content type '{}'",
+                    response
+                        .content_type
+                        .as_ref()
+                        .map_or("unknown", |content_type| content_type.media_type.as_str())
+                ),
+            ));
+            return;
+        }
     }
     let decoded = match decode_image(&response.body, format, limits) {
         Ok(decoded) => decoded,
@@ -335,6 +344,15 @@ fn resolve_image_format(
 ) -> Option<ImageFormat> {
     let Some(content_type) = content_type else {
         let Some(sniffed_format) = sniffed_format else {
+            if resource
+                .key
+                .requested_url
+                .path()
+                .to_ascii_lowercase()
+                .ends_with(".svg")
+            {
+                return Some(ImageFormat::Svg);
+            }
             application.diagnostics.push(resource_diagnostic(
                 resource,
                 ImageDiagnosticSeverity::Error,
@@ -356,6 +374,13 @@ fn resolve_image_format(
         return Some(sniffed_format);
     };
     if let Some(declared_format) = ImageFormat::from_media_type(&content_type.media_type) {
+        if declared_format == ImageFormat::Svg
+            && let Some(sniffed_format) = sniffed_format
+        {
+            // Bytes beat a text/svg label that contradicts a binary image
+            // signature (CDNs mislabel PNG payloads as svg+xml).
+            return Some(sniffed_format);
+        }
         return Some(declared_format);
     }
     if is_generic_binary_media_type(&content_type.media_type)
@@ -367,6 +392,22 @@ fn resolve_image_format(
             ImageResourceDiagnosticCode::UnsupportedContentType,
             format!(
                 "image response declared generic content type '{}'; using sniffed '{}'",
+                content_type.media_type,
+                sniffed_format.media_type()
+            ),
+        ));
+        return Some(sniffed_format);
+    }
+    // A declared-but-unsupported content type with a valid image signature
+    // (common CDNs label SVG/PNG URLs inconsistently) decodes by content:
+    // browsers honor the actual bytes over a wrong label.
+    if let Some(sniffed_format) = sniffed_format {
+        application.diagnostics.push(resource_diagnostic(
+            resource,
+            ImageDiagnosticSeverity::Warning,
+            ImageResourceDiagnosticCode::UnsupportedContentType,
+            format!(
+                "image response declared unsupported content type '{}'; using sniffed '{}'",
                 content_type.media_type,
                 sniffed_format.media_type()
             ),
@@ -549,6 +590,33 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_declared_type_with_valid_signature_decodes_by_content() {
+        // A PNG payload labeled image/svg+xml (CDN mislabeling): the sniffed
+        // signature wins over the unsupported declared type.
+        let (base, server) = serve(1, Some("image/svg+xml"), PNG);
+        let document = Document::parse("<img src='mislabeled.png'>");
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        server.join().expect("server thread");
+
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+
+        assert_eq!(application.loaded.len(), 1, "mislabeled PNG decodes");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
     fn missing_content_type_uses_a_supported_image_signature() {
         let (base, server) = serve(1, None, PNG);
         let document = Document::parse("<img src='image'>");
@@ -654,5 +722,54 @@ mod tests {
         );
         stream.write_all(headers.as_bytes()).expect("write headers");
         stream.write_all(body).expect("write body");
+    }
+    #[test]
+    fn svg_content_type_decodes_through_the_normal_pipeline() {
+        const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12"><rect x="1" y="1" width="10" height="10" fill="#ff6600"/></svg>"##;
+        let (base, server) = serve(1, Some("image/svg+xml"), SVG);
+        let document = Document::parse("<img src='icon.svg'>");
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        server.join().expect("server thread");
+
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+        assert_eq!(application.loaded.len(), 1, "svg decodes");
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn svg_url_without_content_type_decodes_by_extension() {
+        const SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><circle cx="4" cy="4" r="3" fill="#06c"/></svg>"##;
+        let (base, server) = serve(1, None, SVG);
+        let document = Document::parse("<img src='arrow.svg'>");
+        let plan = plan_images(&document, &base, ImageLimits::default());
+        let results = transport().fetch_batch(
+            plan.requests(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        server.join().expect("server thread");
+
+        let mut images = ImageResources::default();
+        let application = apply_image_batch(
+            &document,
+            &plan,
+            results,
+            &mut images,
+            ImageLimits::default(),
+        );
+        assert_eq!(application.loaded.len(), 1, "extension-sniffed svg decodes");
+        assert_eq!(images.len(), 1);
     }
 }
