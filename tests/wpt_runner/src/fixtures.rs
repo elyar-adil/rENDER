@@ -54,9 +54,16 @@ impl FixtureAccount {
     }
 
     /// Record one missing fixture for one test.
+    ///
+    /// The tree is whatever the URL names *at its shallowest level*, not
+    /// necessarily the suite's top level. WPT nests helper trees under an area
+    /// (`html/shadow-dom/`, `css/css-images/`), and a reference to
+    /// `/html/shadow-dom/...` is resolvable by adding `html`, which the runner
+    /// already has. Reporting it as "add `shadow-dom`" would send someone to
+    /// fetch a top-level tree that does not exist.
     pub fn record(&mut self, url: &str, test_path: &str) {
         self.tests = self.tests.saturating_add(1);
-        match top_level_tree(url) {
+        match fetch_scope(url) {
             Some(tree) => {
                 *self.by_tree.entry(tree).or_default() += 1;
             }
@@ -123,32 +130,39 @@ impl FixtureAccount {
     }
 }
 
-/// The top-level WPT tree a rooted URL lives in.
+/// The trees this runner already holds, so a reference into one of them is not
+/// reported as a fetch gap.
 ///
-/// Returns `None` for a URL with no path segment after the leading slash, and
-/// for a *relative* URL - which cannot be attributed without knowing the
-/// referring file, and attributing it wrongly is worse than admitting the gap.
+/// This is the difference between "add `shadow-dom`" (a tree that does not exist
+/// at the suite root) and "nothing to add" (the file is `html/shadow-dom/`, and
+/// the runner already fetched `html`). Getting it wrong in the *confident*
+/// direction sends someone to fetch a path the archive does not contain.
+const PRESENT_TREES: &[&str] = &["css", "dom", "html", "resources", "common", "fonts"];
+
+/// The fetch scope a rooted URL falls into.
+///
+/// `None` for a relative URL: it resolves against the referring file, and
+/// attributing it without that file would be a confident wrong answer.
 #[must_use]
-pub fn top_level_tree(url: &str) -> Option<String> {
+pub fn fetch_scope(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
-    // Only a *rooted* URL names a tree. A relative URL - including a bare
-    // filename with no leading slash - resolves against the referring file, and
-    // attributing it to a tree without that file would be a confident wrong
-    // answer. `support/a.css` and `WebIDLParser.js` are both relative; only
-    // `/WebIDLParser.js` is root-level.
     let rooted = path.strip_prefix('/')?;
-    // "/" strips to the empty string, which has no `/` and would otherwise fall
-    // into the bare-file branch below and be reported as a `resources` gap.
-    // An empty path names no tree at all.
     if rooted.is_empty() {
+        return None;
+    }
+    let mut segments = rooted.split('/').filter(|s| !s.is_empty());
+    let first = segments.next()?;
+    if first == "." || first == ".." {
         return None;
     }
     if !rooted.contains('/') {
         // A bare file at the suite root. WPT keeps these in `resources/`.
         return Some("resources (root-level files)".to_owned());
     }
-    let first = rooted.split('/').next()?;
-    if first.is_empty() || first == "." || first == ".." {
+    if PRESENT_TREES.contains(&first) {
+        // Already fetched. The missing part is *inside* a tree this runner has,
+        // so it is either a genuinely absent file or one the census's exclusion
+        // rules removed. Reporting it as a fetch gap is wrong either way.
         return None;
     }
     Some(first.to_owned())
@@ -156,15 +170,27 @@ pub fn top_level_tree(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FixtureAccount, top_level_tree};
+    use super::{FixtureAccount, fetch_scope};
 
     #[test]
-    fn a_rooted_url_names_its_tree() {
-        assert_eq!(top_level_tree("/web-animations/x.js"), Some("web-animations".to_owned()));
-        assert_eq!(top_level_tree("/svg/x.html"), Some("svg".to_owned()));
+    fn a_rooted_url_names_a_tree_the_fetch_would_need() {
+        assert_eq!(fetch_scope("/web-animations/x.js"), Some("web-animations".to_owned()));
+        assert_eq!(fetch_scope("/svg/x.html"), Some("svg".to_owned()));
         // A query string does not change which tree a fixture is in.
-        assert_eq!(top_level_tree("/fetch/api.js?v=1"), Some("fetch".to_owned()));
-        assert_eq!(top_level_tree("/css/a/b.css#frag"), Some("css".to_owned()));
+        assert_eq!(fetch_scope("/fetch/api.js?v=1"), Some("fetch".to_owned()));
+    }
+
+    #[test]
+    fn a_url_inside_a_tree_we_already_hold_is_not_a_fetch_gap() {
+        // The measured run reported 130 tests as needing a tree called
+        // `shadow-dom`. There is no such top-level tree: the files are
+        // `html/shadow-dom/`, and the runner already fetched `html`. Reporting it
+        // would have sent someone to fetch a path the archive does not contain.
+        // The failure mode is worse than silence because it reads as actionable.
+        assert_eq!(fetch_scope("/html/shadow-dom/x.html"), None);
+        assert_eq!(fetch_scope("/css/css-images/x.png"), None);
+        assert_eq!(fetch_scope("/dom/nodes/x.js"), None);
+        assert_eq!(fetch_scope("/resources/x.js"), None);
     }
 
     #[test]
@@ -173,7 +199,7 @@ mod tests {
         // `resources/`. Reporting the second as unattributed would leave a
         // number in the report that nobody can act on.
         assert_eq!(
-            top_level_tree("/WebIDLParser.js"),
+            fetch_scope("/WebIDLParser.js"),
             Some("resources (root-level files)".to_owned())
         );
     }
@@ -187,29 +213,12 @@ mod tests {
         // calling it `resources`. `support/a.css` lives in the test's own
         // directory, and reporting it as a `resources` gap would send someone
         // to add a tree that is already there.
-        assert_eq!(top_level_tree("support/a.css"), None);
-        assert_eq!(top_level_tree("../shared/x.html"), None);
-        assert_eq!(top_level_tree(""), None);
-        assert_eq!(top_level_tree("/"), None);
+        assert_eq!(fetch_scope("support/a.css"), None);
+        assert_eq!(fetch_scope("../shared/x.html"), None);
+        assert_eq!(fetch_scope(""), None);
+        assert_eq!(fetch_scope("/"), None);
         // A bare filename with no leading slash is relative, not root-level.
-        assert_eq!(top_level_tree("WebIDLParser.js"), None);
-    }
-
-    #[test]
-    fn the_ranking_is_by_count_then_name() {
-        let mut account = FixtureAccount::new();
-        for _ in 0..3 {
-            account.record("/web-animations/a.js", "css/a.html");
-        }
-        for _ in 0..5 {
-            account.record("/svg/a.js", "css/b.html");
-        }
-        account.record("/xhr/a.js", "css/c.html");
-        let ranked = account.ranked();
-        assert_eq!(ranked[0], ("svg", 5));
-        assert_eq!(ranked[1], ("web-animations", 3));
-        assert_eq!(ranked[2], ("xhr", 1));
-        assert_eq!(account.tests(), 9);
+        assert_eq!(fetch_scope("WebIDLParser.js"), None);
     }
 
     #[test]

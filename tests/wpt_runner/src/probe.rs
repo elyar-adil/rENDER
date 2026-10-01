@@ -271,16 +271,18 @@ pub fn run(suite_root: &Path, revision: &str) -> Probe {
 
     // ---- Step 5: a real test runs through the loaded harness --------------
     //
-    // The point of loading the harness is to run a test with it, so the probe
-    // does that, and reads the verdict back out of the harness rather than out
-    // of the adapter. A probe that only proved "the file compiled" would leave
-    // open the possibility that it compiles and does nothing useful.
+    // Deliberately **not** gated on the `createElementNS` step above. That step
+    // is expected to fail on this engine until it grows the method, and an
+    // earlier version returned at the first failure - so the two most important
+    // steps never ran and the probe reported "10 of 13" while having tested
+    // nothing about whether a test can execute. A probe that stops at the first
+    // problem cannot distinguish "this is the only problem" from "this is the
+    // first of several", and the second reading is the actionable one.
     //
-    // Two tests, not one, and that is not padding: a harness that reports
-    // success for a test with a *satisfied* assertion proves nothing, because
-    // "pass" is also the value a harness initialises to and never updates. The
-    // falsifying case is the one that matters, and a probe without it cannot
-    // distinguish a working harness from one that reports `0` unconditionally.
+    // The two cases are pass and fail, and both are required. A harness that
+    // reports the same verdict for a satisfied and an unsatisfied assertion has
+    // proved nothing, and "pass" is also the value a harness initialises to and
+    // never updates - so only the falsifying case can distinguish them.
     let satisfied = probe_trivial_test(&mut runtime, &mut parsed.dom, "assert_equals(1, 1)");
     let satisfied_status = probe_trivial_test_status(&runtime);
     probe.record(

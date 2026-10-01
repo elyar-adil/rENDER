@@ -197,13 +197,16 @@ fn cmd_fixtures(args: &[String]) -> ExitCode {
     };
 
     let mut account = wpt_runner::fixtures::FixtureAccount::new();
-    for area in &census.areas {
-        for notable in &area.population.notable {
-            if let Some(url) = notable.reason.strip_prefix("missing fixture: ") {
-                account.record(url, &notable.path);
-            }
-        }
-    }
+    // `record_all` rather than `record` in a loop: only it tracks *distinct*
+    // fixtures, and a report saying "0 distinct" alongside "307 tests" is the
+    // kind of self-contradiction that makes a reader distrust the whole table.
+    account.record_all(
+        census
+            .areas
+            .iter()
+            .flat_map(|area| area.missing_fixtures.iter())
+            .map(|(test_path, url)| (url.clone(), test_path.clone())),
+    );
 
     println!("================================================================================");
     println!("rENDER WPT runner - missing fixture account");
@@ -211,13 +214,9 @@ fn cmd_fixtures(args: &[String]) -> ExitCode {
     println!("wpt revision : {WPT_REVISION}");
     println!("areas        : {}", areas.join(", "));
     println!();
-    println!(
-        "{} test(s) blocked by a fixture absent from the checkout, referencing {} distinct",
-        account.tests(),
-        account.distinct_fixtures()
-    );
-    println!("fixture(s). Every one of these is a FETCH limit, not a suite defect: the file");
-    println!("exists at the pinned revision and this cache simply does not hold its tree.");
+    println!("{} test(s) blocked by a fixture absent from the checkout, referencing", account.tests());
+    println!("{} distinct fixture(s). Every one of these is a FETCH limit, not a suite", account.distinct_fixtures());
+    println!("defect: the file exists at the pinned revision and this cache does not hold its tree.");
     println!();
     println!("  tests blocked   WPT tree to add");
     println!("  ------------    ----------------------------------------------------");
@@ -230,9 +229,10 @@ fn cmd_fixtures(args: &[String]) -> ExitCode {
     println!();
     if !account.is_complete() {
         println!(
-            "INCOMPLETE: {} fixture reference(s) could not be attributed to a tree. Those are\n\
-             relative URLs, which resolve against the referring file, and this accounting\n\
-             refuses to guess. They are counted in the total above but have no tree.",
+            "INCOMPLETE: {} reference(s) could not be attributed to a fetch scope. Those are\n\
+             relative URLs, which resolve against the referring file, and URLs inside a tree\n\
+             this cache already holds - so they are not a reason to fetch anything. They are\n\
+             counted in the total above and need a human to look.",
             account.unclassified()
         );
     }
@@ -437,9 +437,6 @@ fn cmd_negative_control(args: &[String]) -> ExitCode {
         }
     }
 }
-
-#[cfg(not(feature = "engine"))]
-fn unreachable_without_the_engine() {}
 
 /// Whether the real adapter can be made to fail, and what it said.
 #[cfg(feature = "engine")]

@@ -534,35 +534,42 @@ pub fn render_probe(probe: &crate::probe::Probe) -> String {
         .expect("write to String cannot fail");
     }
     writeln!(out).expect("write to String cannot fail");
-    match probe.first_failure() {
-        None if probe.all_held() => {
-            writeln!(
-                out,
-                "VERDICT: the engine can load and drive WPT's own testharness.js. `dom/` and\n\
-                 \x20`html/` are executable. A conformance number for those areas is a matter of\n\
-                 \x20the adapter, not of a missing engine capability."
-            )
-            .expect("write to String cannot fail");
+    if probe.all_held() {
+        writeln!(
+            out,
+            "VERDICT: the engine can load and drive WPT's own testharness.js. `dom/` and\n\
+             \x20`html/` are executable. A conformance number for those areas is a matter of\n\
+             \x20the adapter, not of a missing engine capability."
+        )
+        .expect("write to String cannot fail");
+    } else {
+        let failures: Vec<&crate::probe::ProbeStep> =
+            probe.steps.iter().filter(|s| !s.held).collect();
+        writeln!(
+            out,
+            "VERDICT: {} of {} steps did not hold. The first is \"{}\".",
+            failures.len(),
+            probe.steps.len(),
+            failures[0].name
+        )
+        .expect("write to String cannot fail");
+        writeln!(out).expect("write to String cannot fail");
+        for failure in &failures {
+            writeln!(out, "  [FAIL] {}", failure.name).expect("write to String cannot fail");
+            writeln!(out, "         observed: {}", failure.detail)
+                .expect("write to String cannot fail");
         }
-        None => {
-            writeln!(
-                out,
-                "VERDICT: the probe ran no steps. That is not a pass; it is a probe with\n\
-                 \x20nothing to say, and no conclusion is drawn from it."
-            )
-            .expect("write to String cannot fail");
-        }
-        Some(failure) => {
-            writeln!(
-                out,
-                "VERDICT: NO. The first step that did not hold is \"{}\".\n\
-                 \x20Everything above it held; everything below it was not attempted, because a\n\
-                 \x20step that cannot run makes every later step meaningless.",
-                failure.name
-            )
-            .expect("write to String cannot fail");
-            writeln!(out, "\n  observed: {}", failure.detail).expect("write to String cannot fail");
-        }
+        writeln!(out).expect("write to String cannot fail");
+        writeln!(
+            out,
+            "Read the LAST two failures first. They are the ones that decide whether a\n\
+             \x20conformance number is obtainable, and they fail here because\n\
+             \x20`document.createElementNS` is unimplemented - which stops WPT's harness from\n\
+             \x20building its on-page results table. The runner works around it with\n\
+             \x20`setup({{output: false}})`, a documented harness property for exactly this case,\n\
+             \x20so the conformance run proceeds; see tools/wpt/FINDINGS.md."
+        )
+        .expect("write to String cannot fail");
     }
     out
 }

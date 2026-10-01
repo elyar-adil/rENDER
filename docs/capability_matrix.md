@@ -26,9 +26,12 @@ says so. `docs/visual_fidelity_gaps.md` is the working register; this file is th
 | Python static gate | 15 passed, 55 subtests | this session |
 | site-neutrality gate | **9 rules, 173 files, currently exit 1** on 9 genuine violations | this session |
 | **test262** | **30,808 / 98,096 = 31.4%** | **2026-09-20, NOT re-measured this session** |
-| **html5lib tree construction** | **5,702 / 7,377 pairs = 77.29% pass**; 190 acceptable difference, 776 unimplemented, **709 engine defect (9.61%)** | this session, at a pinned revision |
-| html5lib parse-error count agreement | **2,666 / 6,601 = 40.39%** - under-reports on 3,100, over-reports on 835 | this session |
-| WPT (CSS / DOM) | **not yet measured** - a runner is being built | pending |
+| **html5lib tree construction** | **5,810 / 7,377 pairs = 78.75%**; 190 acceptable difference, 776 unimplemented, **601 engine defect (8.15%)** | this session, pinned |
+| html5lib parse-error count agreement | **4,784 / 6,601 = 72.47%** under `max`, **60.60%** under `sum` - the gap between those two is the choice of reading, not the parser | this session |
+| **WPT `dom/`** | **32 / 297 executable = 10.8%**, 0 vacuous passes | this session, pinned `c7fdee80f3f1` |
+| **WPT `html/`** | **165 / 2,520 executable = 6.5%**, 31 errored, 0 vacuous passes | this session, pinned |
+| **WPT combined** | **197 / 2,817 = 7.0%** - 5,962 scored, 8,060 skipped, 1,684 with no assertion site at all | this session, pinned |
+| **WPT `css/`** | **cannot be run** - `testcss.js` is an iframe driver and the engine has no nested browsing contexts | - |
 | production HTML corpus sweep | **3,718 documents**, 0 of our diagnostic kinds at fault, 3 real defects found and fixed | this session |
 | production CSS corpus | 11,102 rules, 42,356 declarations, 1.93 MB | this session |
 | production JS | a 2.27 MB real bundle completes; a second probe also runs to completion, 0 threw | this session |
@@ -133,11 +136,43 @@ finding, and it is the opposite of what a test-count table suggests.
 site-named directory. That is how a count gets quietly inflated, and it happened twice this
 session.
 
-**The first external number of any kind for CSS, HTML or DOM now exists**, from the html5lib tree
-construction suite at a pinned revision: **5,702 of 7,377 (test, scripting-mode) pairs pass, 77.29%**,
-with 190 acceptable differences, 776 unimplemented features and **709 engine defects (9.61%)**. The
-WPT runner for CSS and DOM is built and still cannot run, and the reason is known rather than
-unknown - `testcss.js` is an iframe driver and the engine has no nested browsing contexts.
+**The first external numbers of any kind for CSS, HTML or DOM now exist**, from two pinned
+suites.
+
+- **Tree construction: 78.75%** of 7,377 (test, scripting-mode) pairs pass.
+- **DOM and HTML: 7.0%** - 197 of 2,817 executable tests, with 5,962 scored and 8,060 skipped.
+  Per area, `dom/` is **10.8%** and `html/` is **6.5%**.
+- **CSS still cannot be run at all**, and the reason is structural rather than a gap in the runner:
+  `testcss.js` is an iframe driver and the engine has no nested browsing contexts.
+
+**So the honest answer to "how far off is it" is now three numbers rather than one estimate, and
+they disagree by an order of magnitude** - a parser that is nearly conformant, a DOM API surface
+that is not, and a CSS conformance figure that does not exist. That disagreement *is* the finding.
+An average of them would be a lie, and it is why no single percentage is quoted anywhere in this
+document.
+
+The DOM and HTML figure is low for a reason that is worth naming rather than excusing: of 2,817
+executable tests, the largest single mechanism is **1,564 that lack canvas** and **630 that lack a
+nested browsing context**, both unimplemented capabilities rather than wrong answers. **The
+defects proper are 664 tests**, and the largest defect mechanism - host objects not initialising
+Web IDL defaults - accounts for 638 of them across two mechanisms, where **every default is declared
+in the interface's IDL, so it is one change per interface rather than 638 changes.**
+
+**How the number arrived is part of it.** The first run reported a clean 7.4% - **and all 210 of
+its passes were vacuous**, because the result sink read a field WPT does not define, so every
+assertion count was zero. It was caught by noticing that `pass` and
+`executed_with_zero_assertions_evaluated` were **the same number**. The count now comes from
+wrapping the assertions, **and a pass with zero assertions is scored as a skip rather than a
+pass.** That is the fourth instrument defect in this project and the deepest one: the others
+produced wrong numbers, and this one produced a fabricated one.
+
+**And one engine finding came out of building the runner:** a stack overflow **aborts the process**,
+which `catch_unwind` cannot catch, so a runner's defence against a truncated result file does not
+apply. The cause is that `max_call_depth: 4,096` at roughly 2 KiB per frame assumes hundreds of
+megabytes while the main thread has 1 MiB - **so the engine's own recursion guard is unreachable.**
+
+**The remaining 1,046 unclassified failures are real and unnamed**, and they are the first thing to
+read after the two defect mechanisms.
 
 **That suite also produced the most instructive result in this document, and it is a failure.** It
 found that a specification reading had been made **backwards, in the direction that made a broken

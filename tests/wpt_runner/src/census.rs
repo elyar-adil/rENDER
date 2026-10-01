@@ -224,6 +224,14 @@ pub struct AreaCensus {
     pub assertion_sites: u64,
     /// Total bytes of test source classified.
     pub source_bytes: u64,
+    /// Every missing fixture, with the test that needs it.
+    ///
+    /// Separate from [`Population::notable`], which is a *truncated* display list
+    /// capped at a few hundred entries so a human can read it. Using the display
+    /// list for accounting gave "307 tests blocked" where the true figure was
+    /// 655 - a number that is quietly wrong by more than half, and wrong in the
+    /// direction that looks like a smaller problem.
+    pub missing_fixtures: Vec<(String, String)>,
 }
 
 impl AreaCensus {
@@ -410,10 +418,15 @@ fn record(out: &mut AreaCensus, rel: &str, classification: Classification) {
                 out.cannot_fail += 1;
             }
             match blocker {
-                Blocker::MissingFixture(url) => out.population.notable.push(Notable {
-                    path: rel.to_owned(),
-                    reason: format!("missing fixture: {url}"),
-                }),
+                Blocker::MissingFixture(url) => {
+                    // The complete record, for accounting.
+                    out.missing_fixtures.push(((*rel).to_owned(), url.clone()));
+                    // And the truncated display list, for a human to read.
+                    out.population.notable.push(Notable {
+                        path: rel.to_owned(),
+                        reason: format!("missing fixture: {url}"),
+                    })
+                }
                 Blocker::Unscannable(why) => out.population.notable.push(Notable {
                     path: rel.to_owned(),
                     reason: format!("unscannable: {why}"),
