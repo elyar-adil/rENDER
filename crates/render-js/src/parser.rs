@@ -136,11 +136,19 @@ pub(super) enum ObjectAccessorKind {
     Setter,
 }
 
+/// A binding position: either a plain name or a destructuring pattern.
+///
+/// A pattern cannot be flattened into an equivalent list of index or member
+/// accesses, because an array pattern draws its values from the *iterator
+/// protocol* rather than from indexed properties. `var [a] = map` reads the
+/// map's first entry, not `map[0]`; `var [a] = someTypedArray` reads through
+/// `@@iterator`; and a non-iterable source must throw rather than silently
+/// produce `undefined`. The runtime walks the pattern itself for that reason.
 #[derive(Clone, Debug, PartialEq)]
-enum BindingPattern {
+pub(super) enum BindingPattern {
     Identifier(String),
     Object {
-        properties: Vec<(String, Self)>,
+        properties: Vec<(PropertyKey, Self)>,
         rest: Option<Box<Self>>,
     },
     Array {
@@ -153,7 +161,25 @@ enum BindingPattern {
     },
 }
 
-fn collect_binding_names(pattern: &BindingPattern, names: &mut Vec<String>) {
+/// What one declarator in a `var`/`let`/`const` list binds.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum BindingTarget {
+    Name(String),
+    Pattern(BindingPattern),
+}
+
+impl BindingTarget {
+    pub(super) fn names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        match self {
+            Self::Name(name) => names.push(name.clone()),
+            Self::Pattern(pattern) => collect_binding_names(pattern, &mut names),
+        }
+        names
+    }
+}
+
+pub(super) fn collect_binding_names(pattern: &BindingPattern, names: &mut Vec<String>) {
     match pattern {
         BindingPattern::Identifier(name) => names.push(name.clone()),
         BindingPattern::Object { properties, rest } => {
@@ -186,7 +212,7 @@ pub(super) enum Statement {
     },
     VariableList {
         kind: VariableKind,
-        declarations: Vec<(String, Option<Expr>)>,
+        declarations: Vec<(BindingTarget, Option<Expr>)>,
         offset: usize,
     },
     Function {
@@ -341,11 +367,6 @@ pub(super) enum Expr {
     Object(Vec<ObjectProperty>),
     Array(Vec<Self>),
     Spread(Box<Self>),
-    ObjectRest {
-        object: Box<Self>,
-        excluded: Vec<String>,
-        offset: usize,
-    },
     Unary {
         operator: UnaryOp,
         operand: Box<Self>,
@@ -790,14 +811,13 @@ impl Parser {
         let mut declarations = Vec::new();
         loop {
             if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
-                let offset = self.current().offset;
                 let pattern = self.binding_pattern()?;
                 self.require(
                     &TokenKind::Equal,
                     "destructuring declarations require an initializer",
                 )?;
                 let initializer = self.assignment()?;
-                Self::lower_binding_pattern(pattern, initializer, &mut declarations, offset);
+                declarations.push((BindingTarget::Pattern(pattern), Some(initializer)));
             } else {
                 let TokenKind::Identifier(name) = self.advance().kind else {
                     return Err(self.error("expected a binding after declaration keyword"));
@@ -810,7 +830,7 @@ impl Parser {
                 if kind == VariableKind::Const && value.is_none() {
                     return Err(self.error("const declarations require an initializer"));
                 }
-                declarations.push((name, value));
+                declarations.push((BindingTarget::Name(name), value));
             }
             if !self.take(&TokenKind::Comma) {
                 break;
@@ -819,21 +839,24 @@ impl Parser {
         if end_statement {
             self.end_statement();
         }
-        if declarations.len() == 1 {
-            let (name, value) = declarations.pop().expect("one declaration exists");
-            Ok(Statement::Variable {
+        // A single plain name keeps the compact `Statement::Variable` shape,
+        // which the for-loop head and several early-error checks match on.
+        if declarations.len() == 1
+            && matches!(declarations.first(), Some((BindingTarget::Name(_), _)))
+            && let (BindingTarget::Name(name), value) = declarations.pop().expect("one exists")
+        {
+            return Ok(Statement::Variable {
                 offset: self.previous_offset(),
                 kind,
                 name,
                 value,
-            })
-        } else {
-            Ok(Statement::VariableList {
-                offset: self.previous_offset(),
-                kind,
-                declarations,
-            })
+            });
         }
+        Ok(Statement::VariableList {
+            offset: self.previous_offset(),
+            kind,
+            declarations,
+        })
     }
 
     fn binding_pattern(&mut self) -> Result<BindingPattern, JsError> {
@@ -846,10 +869,23 @@ impl Parser {
                     let _ = self.take(&TokenKind::Comma);
                     break;
                 }
-                let property = self.property_name()?;
+                // `PropertyName : AssignmentElement`, so a computed key may
+                // carry an arbitrary expression evaluated in binding order.
+                let key = if self.take(&TokenKind::LeftBracket) {
+                    let expression = self.assignment()?;
+                    self.require(
+                        &TokenKind::RightBracket,
+                        "expected ']' after computed binding key",
+                    )?;
+                    PropertyKey::Computed(expression)
+                } else {
+                    PropertyKey::Static(self.property_name()?)
+                };
                 let mut pattern = if self.take(&TokenKind::Colon) {
                     self.binding_pattern()?
-                } else if is_identifier_name(&property) {
+                } else if let PropertyKey::Static(property) = &key
+                    && is_identifier_name(property)
+                {
                     BindingPattern::Identifier(property.clone())
                 } else {
                     return Err(self.error("object binding shorthand requires an identifier"));
@@ -860,7 +896,7 @@ impl Parser {
                         value: self.assignment()?,
                     };
                 }
-                properties.push((property, pattern));
+                properties.push((key, pattern));
                 if !self.take(&TokenKind::Comma) {
                     break;
                 }
@@ -908,105 +944,15 @@ impl Parser {
         Ok(BindingPattern::Identifier(name))
     }
 
-    /// Lower binding patterns into the interpreter's ordinary declarations.
-    /// Composite patterns retain each intermediate value once, preserving
-    /// getter and initializer evaluation order.
-    fn lower_binding_pattern(
+    /// Lower one pattern-bearing declarator into the list form, keeping a
+    /// single pattern declarator on the compact `Variable` shape by way of a
+    /// synthetic single-element list the caller unwraps.
+    fn lower_declarator(
         pattern: BindingPattern,
         initializer: Expr,
-        declarations: &mut Vec<(String, Option<Expr>)>,
-        offset: usize,
+        declarations: &mut Vec<(BindingTarget, Option<Expr>)>,
     ) {
-        match pattern {
-            BindingPattern::Identifier(name) => declarations.push((name, Some(initializer))),
-            BindingPattern::Default { pattern, value } => {
-                let temporary = format!("\0binding_default_{offset}_{}", declarations.len());
-                declarations.push((temporary.clone(), Some(initializer)));
-                Self::lower_binding_pattern(
-                    *pattern,
-                    Expr::Conditional {
-                        offset,
-                        condition: Box::new(Expr::Binary {
-                            offset,
-                            operator: BinaryOp::StrictEqual,
-                            left: Box::new(Expr::Identifier(temporary.clone())),
-                            right: Box::new(Expr::Literal(JsValue::Undefined)),
-                        }),
-                        consequent: Box::new(value),
-                        alternate: Box::new(Expr::Identifier(temporary)),
-                    },
-                    declarations,
-                    offset,
-                );
-            }
-            BindingPattern::Object { properties, rest } => {
-                let temporary = format!("\0object_binding_{offset}_{}", declarations.len());
-                declarations.push((temporary.clone(), Some(initializer)));
-                let excluded = properties
-                    .iter()
-                    .map(|(property, _)| property.clone())
-                    .collect();
-                for (property, pattern) in properties {
-                    Self::lower_binding_pattern(
-                        pattern,
-                        Expr::Member {
-                            offset,
-                            object: Box::new(Expr::Identifier(temporary.clone())),
-                            property,
-                        },
-                        declarations,
-                        offset,
-                    );
-                }
-                if let Some(pattern) = rest {
-                    Self::lower_binding_pattern(
-                        *pattern,
-                        Expr::ObjectRest {
-                            offset,
-                            object: Box::new(Expr::Identifier(temporary)),
-                            excluded,
-                        },
-                        declarations,
-                        offset,
-                    );
-                }
-            }
-            BindingPattern::Array { elements, rest } => {
-                let temporary = format!("\0array_binding_{offset}_{}", declarations.len());
-                declarations.push((temporary.clone(), Some(initializer)));
-                let element_count = elements.len();
-                for (index, pattern) in elements.into_iter().enumerate() {
-                    if let Some(pattern) = pattern {
-                        Self::lower_binding_pattern(
-                            pattern,
-                            Expr::Member {
-                                offset,
-                                object: Box::new(Expr::Identifier(temporary.clone())),
-                                property: index.to_string(),
-                            },
-                            declarations,
-                            offset,
-                        );
-                    }
-                }
-                if let Some(pattern) = rest {
-                    Self::lower_binding_pattern(
-                        *pattern,
-                        Expr::Call {
-                            offset,
-                            callee: Box::new(Expr::Member {
-                                offset,
-                                object: Box::new(Expr::Identifier(temporary)),
-                                property: "slice".to_owned(),
-                            }),
-                            arguments: vec![Expr::Literal(JsValue::Number(element_count as f64))],
-                        },
-                        declarations,
-                        offset,
-                    );
-                }
-            }
-        }
+        declarations.push((BindingTarget::Pattern(pattern), Some(initializer)));
     }
 
     fn function_declaration(&mut self) -> Result<Statement, JsError> {
@@ -1166,13 +1112,18 @@ impl Parser {
                 let name = match pattern {
                     BindingPattern::Identifier(name) => name,
                     pattern => {
+                        // The loop variable is one temporary, and the pattern is
+                        // destructured from it at the top of the body. The
+                        // temporary is a `var` so it is shared across
+                        // iterations; the pattern's own names keep the declared
+                        // kind, which is what gives `for (const [k] of ..)` its
+                        // per-iteration binding.
                         let temporary = format!("\0for_of_{}", declaration_start);
                         let mut declarations = Vec::new();
-                        Self::lower_binding_pattern(
+                        Self::lower_declarator(
                             pattern,
                             Expr::Identifier(temporary.clone()),
                             &mut declarations,
-                            declaration_start,
                         );
                         let body = Statement::Block(vec![
                             Statement::VariableList {
@@ -1452,12 +1403,7 @@ impl Parser {
         if !patterns.is_empty() {
             let mut declarations = Vec::new();
             for (temporary, pattern) in patterns {
-                Self::lower_binding_pattern(
-                    pattern,
-                    Expr::Identifier(temporary),
-                    &mut declarations,
-                    checkpoint,
-                );
+                Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
             }
             body.insert(
                 0,
@@ -2879,7 +2825,7 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         }),
         Expr::Array(elements) => elements.iter().try_for_each(validate_strict_expression),
         Expr::Spread(expression) => validate_strict_expression(expression),
-        Expr::ObjectRest { object, .. } => validate_strict_expression(object),
+
         Expr::Unary {
             operator: UnaryOp::Delete,
             operand,
@@ -3094,8 +3040,10 @@ fn validate_reserved_statement(
             }
         }
         Statement::VariableList { declarations, .. } => {
-            for (name, value) in declarations {
-                check_reserved_identifier(name, context)?;
+            for (target, value) in declarations {
+                if let BindingTarget::Name(name) = target {
+                    check_reserved_identifier(name, context)?;
+                }
                 if let Some(value) = value {
                     validate_reserved_expression(value, context)?;
                 }
@@ -3290,7 +3238,6 @@ fn validate_reserved_expression(
             }
         }
         Expr::Spread(inner) => validate_reserved_expression(inner, context)?,
-        Expr::ObjectRest { object, .. } => validate_reserved_expression(object, context)?,
         Expr::Unary { operand, .. } => validate_reserved_expression(operand, context)?,
         Expr::Binary { left, right, .. } => {
             validate_reserved_expression(left, context)?;

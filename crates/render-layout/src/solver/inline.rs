@@ -42,6 +42,23 @@ use render_dom::Node;
 use render_dom::NodeId;
 use render_dom::NodeKind;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// Whether the intrinsic-sizing trace is switched on.
+///
+/// `RENDER_DEBUG_INTRINSIC` is one of the project's **documented observability
+/// seams**, not scaffolding: `PROGRESS.md`'s "Debug switches" table lists it as
+/// verified live and says to prefer it over adding a new print statement, so
+/// [`Solver::atomic_inline_intrinsic_width`]'s per-child trace belongs here and
+/// stays. It is read through a `OnceLock` because that function runs once per
+/// child of every shrink-to-fit box in the document and `std::env::var_os`
+/// allocates and takes the environment lock on each call - a real cost on the
+/// sizing path even when the switch is off, which is the state it is in for
+/// every page that is not being debugged.
+fn intrinsic_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RENDER_DEBUG_INTRINSIC").is_some())
+}
 
 #[allow(
     clippy::cast_precision_loss,
@@ -1489,6 +1506,7 @@ impl<'a> Solver<'a> {
     }
 
     pub(super) fn atomic_inline_intrinsic_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let trace = intrinsic_trace_enabled();
         let children = self
             .formatting
             .get(node_id)
@@ -1499,7 +1517,7 @@ impl<'a> Solver<'a> {
         for child in children {
             let child_float = self.float_side(child);
             let child_width = self.max_content_width(child);
-            if std::env::var_os("RENDER_DEBUG_INTRINSIC").is_some() {
+            if trace {
                 eprintln!("  child={child:?} float={child_float:?} max={child_width}");
             }
             if child_float == Float::None {
@@ -1519,7 +1537,7 @@ impl<'a> Solver<'a> {
                 widest = widest.max(float_run);
             }
         }
-        if std::env::var_os("RENDER_DEBUG_INTRINSIC").is_some() {
+        if trace {
             eprintln!("intrinsic float node={node_id:?} width={widest}");
         }
         widest
@@ -1775,7 +1793,9 @@ impl<'a> Solver<'a> {
                 // §7.2 treats a consecutive run of atomic inlines as a single
                 // typographic character unit, so nothing goes inside one.
                 Some(node) => self.atomic_outer_max_content_width(node),
-                None => self.measure_inline_unit(atom.character, typography, false, previous.as_ref()),
+                None => {
+                    self.measure_inline_unit(atom.character, typography, false, previous.as_ref())
+                }
             };
             previous = Some(PreviousUnit {
                 typography,

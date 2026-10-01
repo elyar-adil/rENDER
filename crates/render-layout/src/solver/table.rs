@@ -129,8 +129,10 @@ impl Side {
 
 /// CSS 2.1 §17.6.2: the border that survives where two compete. A `hidden`
 /// border beats everything, then the wider border, then the style with the
-/// higher precedence, and a complete tie goes to the cell that was added first
-/// because the claims are collected top-left first.
+/// higher precedence, and a complete tie goes to the claim collected first -
+/// which, because the cells are collected before the table's own claims and in
+/// top-left order, is §17.6.2.1 rule 4's own answer for the common case
+/// (see [`BorderClaim::outranks`]).
 fn collapsed_border_winner(competing: &[BorderClaim]) -> Option<usize> {
     let mut winner: Option<usize> = None;
     for (index, claim) in competing.iter().enumerate() {
@@ -144,26 +146,43 @@ fn collapsed_border_winner(competing: &[BorderClaim]) -> Option<usize> {
 /// A border competing for one grid line of the table.
 #[derive(Clone, Copy)]
 struct BorderClaim {
-    /// The cell the border belongs to, or the table itself, which is never
-    /// collapsed because it wins every outer line.
+    /// The cell the border belongs to, or the table itself. The table is an
+    /// ordinary claimant on every outer line: §17.6.2.1 gives it no exemption.
     source: Option<NodeId>,
-    /// The table's own border beats the cells that share its edge.
-    table: bool,
     side: Side,
     width: f32,
     style: BorderStyle,
 }
 
 impl BorderClaim {
-    /// CSS 2.1 §17.6.2 conflict resolution: the table's border wins the outer
-    /// lines, a `hidden` border beats any width, a wider border beats a narrower
-    /// one, and equal widths are decided by the style precedence `double`,
-    /// `solid`, `dashed`, `dotted`, `ridge`, `outset`, `groove`, `inset`,
-    /// `none`.
+    /// CSS 2.1 §17.6.2.1 conflict resolution, in the order the specification
+    /// states the rules:
+    ///
+    /// 1. `hidden` beats everything.
+    /// 2. A wider border beats a narrower one.
+    /// 3. Among equal widths, styles are preferred in the order `double`,
+    ///    `solid`, `dashed`, `dotted`, `ridge`, `outset`, `groove`, `inset`.
+    /// 4. **Not implemented, and it cannot be implemented from what a claim
+    ///    carries.** Rule 4 orders claims "if border styles differ only in
+    ///    color", and [`BorderClaim`] holds no colour: a pair that differs only
+    ///    in colour compares equal here, and the winner is then the one
+    ///    collected first. That happens to be rule 4's *second* sentence for
+    ///    two elements of the same type - "the one further to the left and
+    ///    further to the top wins" - and, because the cells are collected
+    ///    before the table's own claims, it is also rule 4's *type* order
+    ///    (`cell > row > row group > column > column group > table`) for the
+    ///    only pair of types this engine can compare. Colouring the claim is
+    ///    the missing half; see the report on `docs/visual_fidelity_gaps.md`
+    ///    S29's rule-4 entry.
+    ///
+    /// There is deliberately **no** table-ness shortcut here. A previous
+    /// version returned `self.table` on a table-ness difference, which made
+    /// the table win the outer lines whatever the widths: `table { border: 1px
+    /// solid }` beside `td { border: 8px solid }` resolved to a 1px line where
+    /// §17.6.2.1 rule 2 says the 8px border wins. §17.6.2.1 has no exception
+    /// for the table at any width - the table is only *last* in rule 4's
+    /// colour-only tie - and rule 2 comes before rule 4 at all.
     fn outranks(&self, other: &Self) -> bool {
-        if self.table != other.table {
-            return self.table;
-        }
         let hidden = |claim: &Self| claim.style == BorderStyle::Hidden;
         match (hidden(self), hidden(other)) {
             (true, false) => return true,
@@ -928,18 +947,26 @@ impl Solver<'_> {
         definite: bool,
     ) -> f32 {
         let available = available.max(0.0);
-        if Self::table_layout_is_fixed(style) {
-            // §17.5.2.1: a fixed-layout table takes its width from `width` or
-            // its containing block, and its columns never measure their cells.
-            return available;
-        }
         let structure = self.table_structure(&self.in_flow_children(node));
         // A collapsed border and a hidden empty cell change what a cell occupies,
         // so they have to be resolved before the columns are measured.
         self.apply_table_edge_rules(node, style, available, &structure);
         let spacing = Self::table_border_spacing(style, available);
         let columns = structure.columns;
-        if definite {
+        if Self::table_layout_is_fixed(style) || definite {
+            // §17.5.2.2: with a definite width the columns share the table's used
+            // width and the result is grown to the sum of the columns.
+            //
+            // §17.5.2.1 says the same of a fixed-layout table, whose columns
+            // never measure their cells but whose width is still "the greater of
+            // the value of the 'width' property for the table element and the sum
+            // of the column widths (plus cell spacing or borders)". Answering a
+            // fixed table with `available` unconditionally left it narrower than
+            // the columns its own first row declares, so the cells overflowed it:
+            // a 300px table with three 100px cells measured 300 while its cells
+            // tiled 306 and the last hung 6px outside the table box. A cell's
+            // `width` is a *content* width (§10.4), so its padding and border
+            // belong to the column width and the declared 300 never covered them.
             return self
                 .table_column_widths(
                     style,
@@ -1127,6 +1154,20 @@ impl Solver<'_> {
     /// widths and the content offsets depend on, and the surviving border is
     /// painted by the cell that won it with its own style and colour, so the
     /// painter needs no knowledge of the conflict.
+    ///
+    /// The residual difference from §17.6.2's row-width equation is that the
+    /// winner's content is inset by the whole border rather than by half of it,
+    /// which makes the columns *unequal*: three cells that declare the same
+    /// 1px border resolve to 104/103/103 rather than to 103/103/103, a 1px
+    /// drift that accumulates across the grid. That is a real per-column error
+    /// and not a sub-pixel one, but closing it needs the per-side resolved
+    /// *colour* on the fragment so one border can be painted across both
+    /// halves - `BoxGeometry` has no slot for it and the painter resolves
+    /// colour from the element's computed style
+    /// (`crates/render-core/src/paint/display_list.rs:2842`). Splitting the
+    /// width here without that would paint a shared line in two colours and
+    /// would make §17.6.2.1 rule 3's equal-width tie-break unobservable, so
+    /// the asymmetry is recorded rather than taken.
     fn collapse_table_borders(
         &mut self,
         node: FormattingNodeId,
@@ -1138,7 +1179,7 @@ impl Solver<'_> {
         // separates two rows at one column, a vertical line separates two
         // columns at one row.
         let mut lines: BTreeMap<(bool, usize, usize), Vec<BorderClaim>> = BTreeMap::new();
-        // The border each cell resolves to before any of it collapses, so that
+        // The border each box resolves to before any of it collapses, so that
         // losing one edge leaves the other three alone.
         let mut resolved: BTreeMap<NodeId, EdgeSizes> = BTreeMap::new();
         for (row_index, row) in structure.grid.iter().enumerate() {
@@ -1156,7 +1197,7 @@ impl Solver<'_> {
                 for side in SIDES {
                     let (horizontal, line_row, line_column) =
                         Self::grid_line(row_index, cell, side);
-                    let claim = self.border_claim(Some(source), style, side, basis, false);
+                    let claim = self.border_claim(Some(source), style, side, basis);
                     edges = side.with(edges, claim.width);
                     lines
                         .entry((horizontal, line_row, line_column))
@@ -1166,12 +1207,18 @@ impl Solver<'_> {
                 resolved.insert(source, edges);
             }
         }
-        // The table's own border is on the outer grid lines and wins against the
-        // cells that share them (§17.6.2).
+        // The table's own border claims the outer grid lines like any other
+        // claimant (§17.6.2.1). It is collected *after* the cells, so a tie goes
+        // to the cell - which is what rule 4's type order says, since the
+        // table is last in it - and it is recorded in `resolved` like every
+        // other claimant so that a cell which beats it can collapse the table's
+        // own edge to nothing.
         if let Some(source) = self.formatting.get(node).and_then(|node| node.source) {
+            let mut edges = EdgeSizes::default();
             for column in 0..structure.columns {
                 for (side, line_row) in [(Side::Top, 0), (Side::Bottom, structure.rows.len())] {
-                    let claim = self.border_claim(Some(source), table_style, side, basis, true);
+                    let claim = self.border_claim(Some(source), table_style, side, basis);
+                    edges = side.with(edges, claim.width);
                     lines
                         .entry((true, line_row, column))
                         .or_default()
@@ -1180,13 +1227,15 @@ impl Solver<'_> {
             }
             for row in 0..structure.rows.len() {
                 for (side, line_column) in [(Side::Left, 0), (Side::Right, structure.columns)] {
-                    let claim = self.border_claim(Some(source), table_style, side, basis, true);
+                    let claim = self.border_claim(Some(source), table_style, side, basis);
+                    edges = side.with(edges, claim.width);
                     lines
                         .entry((false, row, line_column))
                         .or_default()
                         .push(claim);
                 }
             }
+            resolved.insert(source, edges);
         }
         for (source, edges) in resolved {
             self.collapsed_edges.entry(source).or_default().border = Some(edges);
@@ -1223,7 +1272,6 @@ impl Solver<'_> {
         style: Option<&ComputedStyle>,
         side: Side,
         basis: f32,
-        table: bool,
     ) -> BorderClaim {
         let (border, _) = self.resolve_box_edges(style, basis, source);
         let width = match side {
@@ -1235,7 +1283,6 @@ impl Solver<'_> {
         let border_style = border_style_of(style, side);
         BorderClaim {
             source,
-            table,
             side,
             width: if border_style == BorderStyle::Hidden {
                 // A `hidden` border takes no space; it only wins.
@@ -1247,9 +1294,14 @@ impl Solver<'_> {
         }
     }
 
-    /// Collapse one edge of a cell so that it occupies no space. The cell's
+    /// Collapse one edge of a claimant so that it occupies no space. The box's
     /// resolved border has to be in the map already, otherwise the sides that
     /// did not lose would be zeroed as well.
+    ///
+    /// This is also how the table's own border loses an outer grid line: the
+    /// table is an ordinary claimant, so a cell with a wider `border-left`
+    /// takes the line and the table's edge collapses to nothing rather than
+    /// winning by being the table (§17.6.2.1).
     fn collapse_cell_edge(&mut self, source: NodeId, side: Side) {
         let Some(edges) = self.collapsed_edges.get_mut(&source) else {
             return;
@@ -1310,6 +1362,27 @@ impl Solver<'_> {
             self.hide_empty_cells(style, structure);
         }
     }
+
+    /// [`Self::apply_table_edge_rules`] for the caller that has to run it
+    /// *before* the block algorithm resolves the table box's own edges.
+    ///
+    /// §17.6.2.1 makes the table an ordinary claimant on the outer grid lines,
+    /// so the table's used border is whatever survives there - not what it
+    /// declares. A cell with a wider `border-left` collapses the table's own
+    /// left border to nothing, and a content width computed against the
+    /// declared border would then be 2px narrower than the box the grid is
+    /// placed in, putting the cells outside their own table. Resolving it here
+    /// makes `non_content` and the columns agree on one number.
+    pub(super) fn resolve_table_edge_rules_before_sizing(
+        &mut self,
+        node: FormattingNodeId,
+        style: Option<&ComputedStyle>,
+        basis: f32,
+    ) {
+        let structure = self.table_structure(&self.in_flow_children(node));
+        self.apply_table_edge_rules(node, style, basis, &structure);
+    }
+
     /// The used border and padding of a cell, with the table's collapsing
     /// applied. A column width has to reserve exactly what the cell will occupy.
     fn cell_horizontal_extras(

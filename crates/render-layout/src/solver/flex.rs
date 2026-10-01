@@ -859,8 +859,13 @@ impl Solver<'_> {
         let mut broadest: f32 = 0.0;
         let mut total: f32 = 0.0;
         for child in children.iter().copied() {
-            let child_size =
-                self.flex_intrinsic_size(child, horizontal, basis, depth.saturating_add(1), minimum);
+            let child_size = self.flex_intrinsic_size(
+                child,
+                horizontal,
+                basis,
+                depth.saturating_add(1),
+                minimum,
+            );
             let child_size = if is_flex {
                 let child_node = self.formatting.get(child);
                 let child_source = child_node.and_then(|node| node.source);
@@ -1030,7 +1035,8 @@ impl Solver<'_> {
                     let available = (available - extras).max(0.0);
                     f32::min(
                         self.intrinsic_flex_size(node, true, available, 0),
-                        self.flex_intrinsic_size(node, true, available, 0, true).max(available),
+                        self.flex_intrinsic_size(node, true, available, 0, true)
+                            .max(available),
                     )
                 })
                 + extras

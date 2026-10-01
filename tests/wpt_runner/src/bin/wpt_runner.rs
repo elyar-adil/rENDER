@@ -409,25 +409,37 @@ fn cmd_negative_control(args: &[String]) -> ExitCode {
             if half2.held { "HELD" } else { "FAILED" },
             half2.detail
         );
+        println!(
+            "\n  Note the third case. It asserts something TRUE and requires a pass with a\n\
+             \x20 non-zero evaluated count. A control that only checked failures would have\n\
+             \x20 passed against a run whose 210 passes had all evaluated zero assertions -\n\
+             \x20 the result sink was reading a field testharness.js does not define, and\n\
+             \x20 every vacuous pass in that run came from this exact gap."
+        );
         println!();
         if half2.held {
             println!(
                 "VERDICT: both halves held. The pipeline reports a 100% vacuous rate for an\n\
-                 adapter that cannot fail, and reports a real failure for a test whose\n\
-                 assertion is false. Both directions are proven, so a rate from this build is\n\
-                 interpretable in both directions."
+                 adapter that cannot fail, reports a real failure for a test whose assertion\n\
+                 is false, and reports a real pass with a non-zero assertion count for one\n\
+                 whose assertion holds. All three directions are proven, so a rate from\n\
+                 \x20this build is interpretable in both directions."
             );
             ExitCode::SUCCESS
         } else {
             eprintln!(
                 "VERDICT: half 2 FAILED. The pipeline could not produce a failure from a test\n\
-                 whose assertion is false, so a pass rate from this build is not evidence of\n\
+                 whose assertion is false, or a pass with a non-zero assertion count from\n\
+                 one whose assertion holds. A pass rate from this build is not evidence of\n\
                  anything. Do not report a rate."
             );
             ExitCode::FAILURE
         }
     }
 }
+
+#[cfg(not(feature = "engine"))]
+fn unreachable_without_the_engine() {}
 
 /// Whether the real adapter can be made to fail, and what it said.
 #[cfg(feature = "engine")]
@@ -447,14 +459,27 @@ struct Falsification {
 fn falsification_check(options: &Options) -> Falsification {
     use wpt_runner::wptdom::WptHarnessEngine;
 
-    let cases: [(&str, &str); 2] = [
-        ("a false assert_equals", "assert_equals(1, 2)"),
-        ("a false assert_true", "assert_true(false)"),
+    // Half 2 has two directions, and the second one exists because of a bug the
+    // first could not see. A run once reported 210 passes that had all evaluated
+    // zero assertions: the sink read a field WPT does not define, so the count
+    // was silently 0 and a 7.4% rate was made entirely of vacuous passes. The
+    // falsification below caught nothing because it only ever looked at
+    // failures - a runner that cannot produce a failure *and* a runner that
+    // cannot count a success fail in opposite directions, and only one of them
+    // produces a plausible-looking number.
+    //
+    // So: a test with assertions that all HOLD must come back a pass with a
+    // non-zero evaluated count. If it does not, the count is being read from the
+    // wrong place and every pass in the run is vacuous.
+    let cases: [(&str, &str, bool); 3] = [
+        ("a false assert_equals", "assert_equals(1, 2)", false),
+        ("a false assert_true", "assert_true(false)", false),
+        ("a TRUE assert_equals", "assert_equals(1, 1)", true),
     ];
     let mut details = Vec::new();
     let mut all_failed_correctly = true;
 
-    for (label, body) in cases {
+    for (label, body, should_pass) in cases {
         let Ok(mut engine) = WptHarnessEngine::new(&options.suite_root) else {
             return Falsification {
                 held: false,
@@ -477,7 +502,14 @@ fn falsification_check(options: &Options) -> Falsification {
             assertion_sites: 1,
         };
         let result = wpt_runner::engine::run_one(&mut engine, &ctx);
-        let ok = result.outcome == Outcome::Fail && result.failing_assertion.is_some();
+        // The pass direction requires BOTH `Pass` *and* a non-zero assertion
+        // count. Requiring only `Pass` would have passed against the bug that
+        // produced 210 vacuous passes.
+        let ok = if should_pass {
+            result.outcome == Outcome::Pass && result.assertions_evaluated > 0
+        } else {
+            result.outcome == Outcome::Fail && result.failing_assertion.is_some()
+        };
         // Every note is carried into the control's own output. When the control
         // fails - and it did, the first time - the reason has to be in the
         // control's output, not in a result file nobody opened. A control that
@@ -493,8 +525,10 @@ fn falsification_check(options: &Options) -> Falsification {
             .or(result.error.as_deref())
             .map_or("<no message>", |m| m);
         details.push(format!(
-            "{label}: outcome={} reason=\"{}\"{}",
+            "{label}: outcome={} evaluated={} (expected {}) reason=\"{}\"{}",
             result.outcome,
+            result.assertions_evaluated,
+            if should_pass { "a pass, evaluated>0" } else { "a fail with an assertion" },
             reason.replace('\n', " "),
             notes
         ));

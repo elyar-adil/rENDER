@@ -242,7 +242,10 @@ fn has_attribute(element: &render_dom::ElementData, name: &str) -> bool {
         .any(|attribute| attribute.local_name == name)
 }
 
-#[allow(clippy::too_many_arguments, reason = "replay threads the corpus through the walk")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "replay threads the corpus through the walk"
+)]
 fn collect_scripts(
     dom: &render_dom::Dom,
     node: NodeId,
@@ -303,13 +306,7 @@ fn collect_scripts(
     }
     for child in dom.children(node).unwrap_or_default() {
         collect_scripts(
-            dom,
-            *child,
-            manifest,
-            assets_dir,
-            base_url,
-            blocking,
-            deferred,
+            dom, *child, manifest, assets_dir, base_url, blocking, deferred,
         );
     }
 }

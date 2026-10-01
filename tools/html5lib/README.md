@@ -59,7 +59,9 @@ behind rather than reporting a number from half a corpus.
 cargo run -p render-html --example html5lib                    # the report
 cargo run -p render-html --example html5lib -- --suite html5lib   # one source only
 cargo run -p render-html --example html5lib -- --explain        # both trees per failure
+cargo run -p render-html --example html5lib -- --explain-all    # ... and the passing ones too
 cargo run -p render-html --example html5lib -- --filter "adoption01.dat#5"
+cargo run -p render-html --example html5lib -- --error-gaps     # parse-error deltas, every case
 cargo run -p render-html --example html5lib -- --negative-control
 ```
 
@@ -68,6 +70,34 @@ cargo run -p render-html --example html5lib -- --negative-control
 `tools/html5lib/triage.py` groups the runner's compact failure list by mechanism
 and prints the distinct inputs for each, which is how the ranked mechanism table
 in the report was read off.
+
+## The `#document-fragment` cases
+
+A test with a `#document-fragment` section is run through the HTML fragment
+parsing algorithm (13.4) with the context element the test names, and its
+expected tree is that fragment's children rather than a whole document's. It is
+the same dump and the same diff as a document case, so the negative control's
+four mutations cover it without being extended.
+
+The report ends with a table of those cases **by context element**, because a
+context element names the part of 13.4 it exercises — a `table` context is the
+insertion-mode reset, an `svg` one is the foreign-content dispatcher, a
+`textarea` one is the tokenizer's starting state — and because these cases were
+once a tenth of the suite in a single unexamined bucket. The table also prints
+the four buckets a case the engine cannot pass can be in, **including the empty
+ones**, so that a bucket nobody can see is a bucket nobody counts:
+
+| group | meaning |
+| --- | --- |
+| `spec-algorithm` | a specification-defined algorithm, named |
+| `other-crate` | a capability in another crate |
+| `ruled-out` | a browser behaviour this project has ruled out |
+| `harness` | a data shape or comparison convention |
+
+The last three are empty for this corpus **by construction**: a `.dat` file is a
+string and a tree, so it cannot express a second document, a script that runs, a
+fetch, a media element or a worker, and `#document-fragment` names only a
+namespace and a local name.
 
 ## The negative control
 
@@ -97,10 +127,19 @@ errors a conformant implementation reports, and different implementations have
 different vocabularies for them. That is a separate conformance requirement
 (13.2.2) and it is reported as a separate line, labelled as not part of the tree
 figure, because a parser can build the right tree and still report the wrong
-number of errors.
+number of errors. The report prints it under **both** readings of
+`#new-errors`, because the corpus's own `tree-construction/README.md` says that
+section *adds* to the count while the corpus's data says most of it renames, and
+the gap between the two lines is the choice of reading rather than anything
+about the parser. 13.2.2 requires a checker to report *at least one* error when
+there is one and *none* when there is none, and that is the whole of the
+requirement; the count beyond it measures agreement with html5lib's vocabulary,
+not conformance.
 
-**Not compared:** the `#document-fragment` serialisation, because the fragment
-parsing algorithm those tests exercise is not implemented at all.
+**Not compared:** the `#document-fragment` serialisation, which two fragment
+cases carry. It would be a third comparison with nothing in the negative control
+covering it, and a `.dat` file states a serialisation as one opaque line, so a
+difference in it would name no mechanism.
 
 ## The `.dat` format
 

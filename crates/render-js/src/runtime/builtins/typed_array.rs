@@ -42,6 +42,14 @@ impl JsRuntime {
             NativeFunction::TypedArrayIndexOf => self.typed_array_index_of(receiver, arguments),
             NativeFunction::TypedArrayIncludes => self.typed_array_includes(receiver, arguments),
             NativeFunction::TypedArrayJoin => self.typed_array_join(receiver, arguments),
+            NativeFunction::TypedArrayValues => {
+                let values = self
+                    .typed_array_elements(receiver)?
+                    .into_iter()
+                    .map(JsValue::Number)
+                    .collect();
+                Ok(JsValue::Object(self.realm.collection_iterator(values)))
+            }
             NativeFunction::TypedArrayFrom => {
                 let kind = match self.realm.host(receiver) {
                     Some(ObjectHost::TypedArrayConstructor(kind)) => kind,

@@ -304,6 +304,35 @@ pub struct ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// The computed value of `property` on this element, or `None` when there
+    /// is none to read.
+    ///
+    /// # `None` is not an answer about support
+    ///
+    /// Two different questions have to be told apart, and this method cannot
+    /// tell either of them:
+    ///
+    /// - **"Does this declaration apply here?"** - the cascade's own question.
+    ///   The registry installs an initial value for every property it defines,
+    ///   so `get` returns `Some` for all of them and the `Option` is `Some`
+    ///   far more often than "the document wrote something" would suggest. Use
+    ///   [`Self::specified`] for author intent; see `docs/visual_fidelity_gaps.md`
+    ///   S22, which is the recorded instance of this going wrong.
+    /// - **"Does this engine have such a property at all?"** - a question about
+    ///   the engine, identical for every element, and the one a diagnostic or a
+    ///   support oracle has to ask. `None` here means *both* "this element has
+    ///   no value" and "no such property exists in this engine", and `Some`
+    ///   covers everything from a fully implemented property to one the registry
+    ///   defines with an initial value and no grammar at all. Use
+    ///   [`crate::supports::property_support`] for that, which has three states
+    ///   precisely so that "defined but not implemented" is not collapsed into
+    ///   "implemented".
+    ///
+    /// The two questions are deliberately separate queries rather than one
+    /// tri-state return, because support is a constant and this type is
+    /// per-element: a single return value would put a constant inside a varying
+    /// answer, and would change the meaning of a method that roughly a hundred
+    /// call sites already read as "give me the value".
     #[must_use]
     pub fn get(&self, property: &str) -> Option<&ComputedValue> {
         if property.starts_with("--") {
@@ -1328,6 +1357,128 @@ mod tests {
     fn target_id(dom: &render_dom::Dom, selector: &str) -> render_dom::NodeId {
         let selector = parse_selector_list(selector).expect("valid test selector");
         select_all(dom, dom.document(), &selector, &MatchContext::default())[0]
+    }
+
+    /// `ComputedStyle::get` cannot answer the support question, and this is the
+    /// shape of the failure rather than an assertion about it.
+    ///
+    /// Four properties, one per corner of the space a support oracle needs:
+    ///
+    /// | property | engine | `get` on an element that declared nothing |
+    /// | --- | --- | --- |
+    /// | `display` | grammar | `Some("inline")` |
+    /// | `text-indent` | metadata only, no grammar | `Some("0px")` |
+    /// | `backdrop-filter` | unknown | `None` |
+    /// | `font-family` | unknown, and a real page asks about it | `None` |
+    ///
+    /// So `get(p).is_some()` is **true** for a fully implemented property and
+    /// for one this engine can only hold the initial value of, and is false for
+    /// one it has never heard of. The two "defined but not implemented" states
+    /// collapse into `Some` and cannot be told apart, and a property the engine
+    /// does not know reads as absent rather than unsupported - which is the
+    /// failure `docs/visual_fidelity_gaps.md` S22 records for author intent, in
+    /// the other direction.
+    ///
+    /// The last two rows are the sharp ones, because a *declared* unknown
+    /// property is stored: the cascade has nowhere else to put it. So
+    /// `get("backdrop-filter").is_some()` is true exactly when the document
+    /// used a property this engine does not implement - the predicate is
+    /// inverted, and an oracle built on it would report support for precisely
+    /// the declarations that prove it is missing.
+    #[test]
+    fn get_cannot_answer_the_support_question_and_the_support_query_can() {
+        use crate::supports::{PropertySupport, property_support};
+
+        assert_eq!(property_support("display"), PropertySupport::Grammar);
+        assert_eq!(
+            property_support("text-indent"),
+            PropertySupport::MetadataOnly
+        );
+        assert_eq!(
+            property_support("backdrop-filter"),
+            PropertySupport::Unsupported
+        );
+        // The name is case-insensitive in CSS, so the query is too.
+        assert_eq!(property_support("DISPLAY"), PropertySupport::Grammar);
+
+        let output = parse_document("<!doctype html><div id='a'></div><div id='b'></div>");
+        let sheet = parse_stylesheet("#a { backdrop-filter: blur(2px) } #b { display: block }");
+        let styles = compute_document_styles(
+            &output.dom,
+            &[CascadeInput {
+                sheet: &sheet,
+                origin: CascadeOrigin::Author,
+            }],
+            &PropertyRegistry::standard_baseline(),
+            &ComputationLimits::default(),
+            &MatchContext::default(),
+        );
+        let used = &styles[&target_id(&output.dom, "#a")];
+        let silent = &styles[&target_id(&output.dom, "#b")];
+
+        // Implemented, and metadata-only, both read as present on an element
+        // that declared nothing, so `get` cannot tell them apart.
+        assert_eq!(
+            silent.get("display").map(super::ComputedValue::css_text),
+            Some("block")
+        );
+        assert_eq!(
+            silent
+                .get("text-indent")
+                .map(super::ComputedValue::css_text),
+            Some("0px")
+        );
+        // An unknown property reads as absent on an element that said nothing
+        // about it...
+        assert!(silent.get("backdrop-filter").is_none());
+        // ...and *present* on one that did, because the cascade has nowhere else
+        // to put a declaration for a property it has no metadata for. So
+        // `get(p).is_some()` is true exactly when the document used a property
+        // this engine does not implement: the predicate is inverted, and an
+        // oracle built on it would report support for precisely the
+        // declarations that prove it is missing.
+        assert_eq!(
+            used.get("backdrop-filter")
+                .map(super::ComputedValue::css_text),
+            Some("blur(2px)")
+        );
+        // `property_support` gives the same honest answer either way, and it is
+        // a property of the engine rather than of the element.
+        assert_eq!(
+            property_support("backdrop-filter"),
+            PropertySupport::Unsupported
+        );
+    }
+
+    /// `@supports` and [`crate::supports::property_support`] answer the same
+    /// question about the same property, so they must not be able to drift.
+    /// The oracle collapses [`crate::supports::PropertySupport`] to a bool, and
+    /// a bool is what a feature query can carry - so "known" has to be exactly
+    /// "not `Unsupported`" for both.
+    #[test]
+    fn the_support_query_and_the_at_supports_oracle_agree() {
+        use crate::supports::{PropertySupport, property_support, supports_declaration};
+
+        for (property, value, expected) in [
+            ("display", "grid", PropertySupport::Grammar),
+            ("border-collapse", "collapse", PropertySupport::Grammar),
+            // Defined, with an initial value, and no grammar: the state a bool
+            // cannot carry and the reason the query has three.
+            ("text-indent", "1px", PropertySupport::MetadataOnly),
+            ("letter-spacing", "normal", PropertySupport::MetadataOnly),
+            ("z-index", "auto", PropertySupport::MetadataOnly),
+            ("backdrop-filter", "blur(2px)", PropertySupport::Unsupported),
+            ("font-family", "Arial", PropertySupport::Unsupported),
+            ("text-overflow", "ellipsis", PropertySupport::Unsupported),
+            ("nonesuch-property", "1px", PropertySupport::Unsupported),
+        ] {
+            assert_eq!(property_support(property), expected, "{property}");
+            assert_eq!(
+                supports_declaration(property, value),
+                expected != PropertySupport::Unsupported,
+                "{property}"
+            );
+        }
     }
 
     #[test]

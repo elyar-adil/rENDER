@@ -30,6 +30,67 @@ pub struct ParseOutput {
     pub quirks_mode: QuirksMode,
 }
 
+/// A context element for the HTML fragment parsing algorithm (13.4).
+///
+/// 13.4 takes a *node* as its context; this takes a description of one, because
+/// the parse creates its own document and the only things it ever does with the
+/// context element are read its namespace, read its local name, read its
+/// attributes (through the "fake" start tag token the integration-point test
+/// uses) and compare its name against the table of modes. None of those is the
+/// identity of a node in some other document, and a `NodeId` from another
+/// `Dom` would be meaningless here: the ids are per-`Dom` counters, so a
+/// borrowed one would silently alias an unrelated node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FragmentContext {
+    /// The context element's namespace.
+    pub namespace: Namespace,
+    /// The context element's local name.
+    pub local_name: String,
+    /// The context element's attributes, which become the attributes of the
+    /// "fake" start tag token 13.4 creates for it. A MathML `annotation-xml`
+    /// context element is an HTML integration point only when one of them is
+    /// `encoding="text/html"` or `encoding="application/xhtml+xml"`, so this
+    /// list is load-bearing rather than decorative.
+    pub attributes: Vec<AttributeToken>,
+    /// The context document's quirks mode, which 13.4 copies onto the document
+    /// the fragment is parsed into.
+    pub quirks_mode: QuirksMode,
+}
+
+impl FragmentContext {
+    /// A context element in the HTML namespace with no attributes, which is what
+    /// `innerHTML` on an ordinary element and every whole-tree `<template>` clone
+    /// pass.
+    #[must_use]
+    pub fn html(local_name: impl Into<String>) -> Self {
+        Self {
+            namespace: Namespace::Html,
+            local_name: local_name.into(),
+            attributes: Vec::new(),
+            quirks_mode: QuirksMode::NoQuirks,
+        }
+    }
+}
+
+/// The result of the HTML fragment parsing algorithm (13.4).
+#[derive(Clone, Debug)]
+pub struct FragmentParseOutput {
+    /// The document the fragment was parsed into, holding the `html` element
+    /// that 13.4 creates as the root of the stack of open elements.
+    pub dom: Dom,
+    /// The `DocumentFragment` the nodes were inserted into: 13.4's "root
+    /// insertion target", and the value the algorithm returns.
+    ///
+    /// It has no parent, exactly as the standard's fragment has none, so the
+    /// `html` element in `dom` is empty and everything the parse produced is
+    /// here. A caller assigning `innerHTML` replaces the target's children with
+    /// these.
+    pub fragment: NodeId,
+    pub errors: Vec<HtmlParseError>,
+    /// The context document's quirks mode, as 13.4 copies it.
+    pub quirks_mode: QuirksMode,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InsertionMode {
     Initial,
@@ -87,6 +148,44 @@ pub fn parse_document_with_scripting(input: &str, scripting_enabled: bool) -> Pa
     builder.parse()
 }
 
+/// The HTML fragment parsing algorithm (13.4), with the scripting flag chosen by
+/// the caller.
+///
+/// This is the one parser entry point that takes a context element, and it is
+/// the one `element.innerHTML = ...`, `setHTML`, `DOMParser.parseFromString` and
+/// `<template>` cloning all route through, so it is a capability a real page
+/// needs rather than a conformance exercise.
+///
+/// The algorithm has three steps that a document parse does not have and that
+/// each produce a plausible wrong tree when they are skipped. All three are
+/// implemented here and each has a test:
+///
+/// * **the context element** is the parser's *adjusted current node* while
+///   nothing has been pushed onto the stack of open elements (13.2.4.1), which
+///   is what decides whether the content is HTML or foreign content at all, and
+///   which namespace a foreign element is created in;
+/// * **"reset the insertion mode appropriately"** (13.2.4.1) consults the
+///   context element at the *bottom* of the stack, which is not on it, so the
+///   walk has to substitute it rather than find it;
+/// * **the form element pointer** step is the one step with no observable
+///   consequence, and saying so is part of implementing it: two independent
+///   conditions in 13.2.6.1 have to hold before an element is associated with
+///   the pointer, and neither can hold here.
+///
+/// The scripting mode defaults to `Inert`'s tree-builder half, as
+/// [`parse_document`] does, because a document parse and a fragment parse differ
+/// in the scripting flag only where the standard says they do.
+#[must_use]
+pub fn parse_html_fragment_with_scripting(
+    input: &str,
+    context: &FragmentContext,
+    scripting_enabled: bool,
+) -> FragmentParseOutput {
+    let mut builder = TreeBuilder::new(input);
+    builder.scripting_disabled = !scripting_enabled;
+    builder.parse_fragment(context)
+}
+
 struct TreeBuilder<'a> {
     tokenizer: Tokenizer<'a>,
     dom: Dom,
@@ -141,6 +240,21 @@ struct TreeBuilder<'a> {
     /// document that has said anything at all, which is what makes
     /// `<body>x</body><frameset>` keep its body and `<frameset>` replace one.
     frameset_ok: bool,
+    /// The parser's fragment context element (13.2.4.1), non-null only in the
+    /// fragment case.
+    ///
+    /// It is a real node in this parse's document even though nothing links it
+    /// into the tree, because half a dozen rules read it by identity rather than
+    /// by name: the "adjusted current node" that decides whether the content is
+    /// foreign, the "HTML integration point" test, and "reset the insertion mode
+    /// appropriately", which reaches it as the bottom of the stack of open
+    /// elements. It is deliberately **not** on the stack: 13.4 sets the stack to
+    /// contain only the root `html` element, and every scope test in the
+    /// algorithm sees exactly that.
+    fragment_context: Option<NodeId>,
+    /// The parser's root insertion target (13.2.4.1): the `DocumentFragment` the
+    /// nodes go into, non-null only in the fragment case.
+    root_insertion_target: Option<NodeId>,
 }
 
 /// An entry in the list of active formatting elements: either a marker, or a
@@ -184,10 +298,107 @@ impl<'a> TreeBuilder<'a> {
             ignore_next_line_feed: false,
             temporary_head: None,
             frameset_ok: true,
+            fragment_context: None,
+            root_insertion_target: None,
         }
     }
 
     fn parse(mut self) -> ParseOutput {
+        self.run();
+        let mut errors = self.tokenizer.into_errors();
+        errors.extend(self.tree_errors);
+        ParseOutput {
+            dom: self.dom,
+            errors,
+            quirks_mode: self.quirks_mode,
+        }
+    }
+
+    /// "Start the HTML parser and let it run until it has consumed all the
+    /// characters just inserted into the input stream" (13.4), which is the same
+    /// loop a document parse runs: the fragment case is a different *starting
+    /// state*, not a different loop.
+    fn parse_fragment(mut self, context: &FragmentContext) -> FragmentParseOutput {
+        self.begin_fragment(context);
+        self.run();
+        let fragment = self
+            .root_insertion_target
+            .expect("the fragment case always sets a root insertion target");
+        let mut errors = self.tokenizer.into_errors();
+        errors.extend(self.tree_errors);
+        FragmentParseOutput {
+            dom: self.dom,
+            fragment,
+            errors,
+            quirks_mode: self.quirks_mode,
+        }
+    }
+
+    /// The setup half of 13.4, in the order the algorithm gives it.
+    fn begin_fragment(&mut self, context: &FragmentContext) {
+        // "If contextDocument is in quirks mode, then set document's mode to
+        // 'quirks'. Otherwise, if contextDocument is in limited-quirks mode, then
+        // set document's mode to 'limited-quirks'."
+        self.quirks_mode = context.quirks_mode;
+
+        // "Set the state of the HTML parser's tokenization stage as follows,
+        // switching on context". There is no appropriate end tag token in the
+        // fragment case, so every text content model runs to the end of the
+        // input, which is the whole point of `</script>` being text inside a
+        // `script` context.
+        self.tokenizer.switch_to(
+            fragment_content_model(context, self.scripting_disabled),
+            None,
+        );
+
+        // "Let root be the result of creating an element given document, 'html',
+        // the HTML namespace, null, null, false ... Append root to document. Set
+        // up the HTML parser's stack of open elements so that it contains just
+        // the single element root."
+        let root = self.dom.create_element("html");
+        let _ = self.dom.append_child(self.dom.document(), root);
+        self.open_elements.push(root);
+
+        // "Set the parser's fragment context element to context", and "let
+        // fragment be the result of creating a document fragment ... Set the
+        // parser's root insertion target to fragment."
+        let node = self
+            .dom
+            .create_element_ns(context.namespace.clone(), context.local_name.clone());
+        for attribute in &context.attributes {
+            let _ = self
+                .dom
+                .set_attribute(node, &attribute.name, &attribute.value);
+        }
+        self.fragment_context = Some(node);
+        self.root_insertion_target = Some(self.dom.create_document_fragment());
+
+        // "If context is a template element, then push 'in template' onto the
+        // stack of template insertion modes so that it is the new current
+        // template insertion mode."  This is what makes `<template>`'s contents
+        // fragment-case inert: they go into the fragment's own template contents
+        // rather than into the context element's.
+        if context.namespace == Namespace::Html && context.local_name == "template" {
+            self.template_modes.push(InsertionMode::InTemplate);
+        }
+
+        // "Reset the parser's insertion mode appropriately."
+        self.reset_insertion_mode();
+
+        // "Set the HTML parser's form element pointer to the nearest node to
+        // context that is a form element (going straight up the ancestor chain,
+        // and including the element itself, if it is a form element), if any."
+        //
+        // can never be observed. "Create an element for a token" (13.2.6.1)
+        // associates an element with the pointer only if the fragment context
+        // element is null -- it is not -- *and* only if the intended parent is in
+        // the same tree as the form the pointer names, which a node in a fresh
+        // document never is with respect to a form in the context's own document.
+        // Either condition alone is enough, so the inherited pointer is inert
+        // whether the context element is itself a form or merely sits inside one.
+    }
+
+    fn run(&mut self) {
         loop {
             let token = self.tokenizer.next();
             let is_eof = token == Token::Eof;
@@ -206,27 +417,45 @@ impl<'a> TreeBuilder<'a> {
                 break;
             }
         }
-        let mut errors = self.tokenizer.into_errors();
-        errors.extend(self.tree_errors);
-        ParseOutput {
-            dom: self.dom,
-            errors,
-            quirks_mode: self.quirks_mode,
-        }
     }
 
     /// The "tree construction dispatcher" (13.2.6).
     ///
-    /// The rules for parsing tokens in foreign content are not an insertion
+    /// "The adjusted current node is the parser's fragment context element if the
+    /// parser's fragment context element is non-null and the stack of open
+    /// elements has only one node in it; otherwise, the adjusted current node is
+    /// the current node" (13.2.4.1).
+    ///
+    /// This is the first of the three steps of 13.4 that a document parse does
+    /// not have, and it is the one with the widest blast radius: the tree
+    /// construction dispatcher (13.2.6) reads it to decide whether a token is
+    /// HTML content or foreign content, and the rules for foreign content read
+    /// it again for the namespace a new element is created in. A document parse
+    /// gets the current node either way, which is why a tree builder that only
+    /// parses documents can leave this out and still pass most of the suite.
+    fn adjusted_current_node(&self) -> NodeId {
+        match self.fragment_context {
+            Some(context) if self.open_elements.len() == 1 => context,
+            _ => self.current_node(),
+        }
+    }
+
+    /// "The rules for parsing tokens in foreign content" are not an insertion
     /// mode: the dispatcher selects them independently of the current insertion
     /// mode, which is left unchanged while they are in use.
     fn in_foreign_content(&self, token: &Token) -> bool {
-        let Some(current) = self.open_elements.last().copied() else {
-            // "If the stack of open elements is empty".
+        if self.open_elements.is_empty() && self.fragment_context.is_none() {
+            // "If the adjusted current node is an element in the HTML
+            // namespace" is decided against a node that does not exist yet: the
+            // stack of open elements is empty for the whole of the "initial" and
+            // "before html" modes, and there is no adjusted current node there at
+            // all, so the question cannot arise and the token is HTML content.
             return false;
-        };
-        // "The adjusted current node" is the current node. This tree builder
-        // parses whole documents only, so there is no fragment context element.
+        }
+        let current = self.adjusted_current_node();
+        // "If the adjusted current node is an element in the HTML namespace,
+        // then this is a case for the rules given in the section corresponding to
+        // the current insertion mode in HTML content."
         if self.is_html_element(current) {
             return false;
         }
@@ -256,9 +485,14 @@ impl<'a> TreeBuilder<'a> {
     /// only when there is an adjusted current node and it is not an element in
     /// the HTML namespace.
     fn allows_cdata_section(&self) -> bool {
-        self.open_elements
-            .last()
-            .is_some_and(|current| !self.is_html_element(*current))
+        // "If there is an adjusted current node and it is not an element in the
+        // HTML namespace". A document parse has no adjusted current node until
+        // the stack of open elements is non-empty; a fragment parse always has
+        // one, because the stack starts with the root `html` element.
+        if self.open_elements.is_empty() && self.fragment_context.is_none() {
+            return false;
+        }
+        !self.is_html_element(self.adjusted_current_node())
     }
 
     fn process(&mut self, token: &Token) -> Action {
@@ -748,7 +982,18 @@ impl<'a> TreeBuilder<'a> {
                 // the second element on the stack of open elements is not a body
                 // element, or if there is a template element on the stack of
                 // open elements, then ignore the token."
-                if self.has_open_template() {
+                //
+                // The first clause is the fragment case: 13.4 puts only the root
+                // `html` element on the stack, so a `body` start tag in a
+                // fragment is dropped and the fragment's own nodes are unaffected
+                // by it. The `html` element 13.4 created is not a body element
+                // either, so the second clause alone would cover the fragment
+                // case; both are spelled out because both are real conditions
+                // and a document can reach the second one too.
+                if self.open_elements.len() < 2
+                    || self.element_name(self.open_elements[1]) != Some("body")
+                    || self.has_open_template()
+                {
                     return Action::Consumed;
                 }
                 // "Otherwise, set the frameset-ok flag to 'not ok'; then, for
@@ -916,7 +1161,18 @@ impl<'a> TreeBuilder<'a> {
             // elements and insert. There is no separate "in select" mode in the
             // current standard, so `option` and `optgroup` are handled below
             // rather than by a mode of their own.
+            //
+            // "If the parser's fragment context element is a select element
+            // (fragment case): Parse error. Ignore the token." The context
+            // element is not on the stack of open elements, so the scope test
+            // below cannot see it, and without this clause a `select` context
+            // would accept a nested `select` and produce a tree no browser
+            // produces.
             Token::StartTag(tag) if tag.name == "select" => {
+                if self.fragment_context_is("select") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    return Action::Consumed;
+                }
                 self.frameset_ok = false;
                 if self.has_select_in_scope() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
@@ -1032,7 +1288,17 @@ impl<'a> TreeBuilder<'a> {
             // parser pops elements until a select element has been popped. Then
             // reconstruct the active formatting elements, insert, and pop
             // immediately.
+            //
+            // "If the parser's fragment context element is a select element
+            // (fragment case): Parse error. Ignore the token. Return." An `input`
+            // inside a `select` is a parse error that the stack-based rule
+            // already drops; the context element is invisible to that rule, so
+            // without this clause `innerHTML` on a `select` would accept one.
             Token::StartTag(tag) if tag.name == "input" => {
+                if self.fragment_context_is("select") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    return Action::Consumed;
+                }
                 if self.has_select_in_scope() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                     self.pop_through("select");
@@ -1289,11 +1555,15 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::EndTag(tag) if tag.name == "p" => {
-                if !self.has_open_element("p") {
+                // "An end tag whose tag name is 'p': if the stack of open
+                // elements does not have a p element in button scope, then this
+                // is a parse error; insert an HTML element for a p start tag
+                // token with no attributes. Close a p element."
+                if !self.has_p_in_button_scope() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                     self.insert_element(&empty_tag("p"), true);
                 }
-                self.pop_through("p");
+                self.close_p_element();
                 Action::Consumed
             }
             // "An end tag whose tag name is one of: 'address', 'article',
@@ -1425,6 +1695,54 @@ impl<'a> TreeBuilder<'a> {
 
     fn has_select_in_scope(&self) -> bool {
         self.has_element_name_in_scope("select")
+    }
+
+    /// "The stack of open elements has a [names] element in table scope" (13.2.4.2).
+    ///
+    /// Two details of "table scope" are load-bearing and neither is a name
+    /// search over the whole stack:
+    ///
+    /// * the walk stops at `html`, `table` and `template`, so a `table` in
+    ///   another table is not in the inner table's scope, which is what makes
+    ///   `</table>` close the innermost one;
+    /// * the element types the rules name are **HTML** types. "References to
+    ///   element types that do not explicitly mention a namespace always refer to
+    ///   elements in the HTML namespace" (13.2.6.5), and an SVG `tr` under a
+    ///   `<table>` is a foreign element, not a `tr`. The fragment cases are where
+    ///   this shows: `<table><svg><tr>` puts an SVG `tr` on the stack, and a
+    ///   local-name test reads it as the table row it is not.
+    fn table_scope_has(&self, names: &[&str]) -> bool {
+        for node in self.open_elements.iter().rev() {
+            if self.is_html_element(*node)
+                && self
+                    .element_name(*node)
+                    .is_some_and(|name| names.contains(&name))
+            {
+                return true;
+            }
+            if self.is_table_scope_boundary(*node) {
+                return false;
+            }
+        }
+        false
+    }
+
+    fn is_table_scope_boundary(&self, node: NodeId) -> bool {
+        self.is_html_element(node)
+            && matches!(self.element_name(node), Some("html" | "table" | "template"))
+    }
+
+    /// The current node's local name, but only for an element in the HTML
+    /// namespace. The table insertion modes' "clear the stack back to a table
+    /// context" steps name HTML element types, so an SVG `table` reached through
+    /// `<table><svg><table>` is not a stopping point and is popped.
+    fn current_html_tag(&self) -> Option<&str> {
+        let node = self.current_node();
+        if self.is_html_element(node) {
+            self.element_name(node)
+        } else {
+            None
+        }
     }
 
     /// The last entry in the list of active formatting elements that is an
@@ -1567,8 +1885,29 @@ impl<'a> TreeBuilder<'a> {
                 self.mode = InsertionMode::InTableBody;
                 Action::Reprocess
             }
+            // "A start tag whose tag name is 'table'" (13.2.6.4.9): parse error;
+            // if the stack of open elements does not have a table element in
+            // table scope, ignore the token. Otherwise pop elements until a
+            // table element has been popped, reset the insertion mode
+            // appropriately, and reprocess the token.
+            //
+            // The first clause is why a `table` fragment's content does not
+            // acquire a table of its own: 13.4 leaves nothing but the root `html`
+            // element on the stack, so `innerHTML = "<table><tr>"` on a `table`
+            // drops the `<table>` and yields a `tbody` and a `tr` -- which is
+            // also the only reading under which the second clause is reachable
+            // for a nested table.
+            Token::StartTag(tag) if tag.name == "table" => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                if self.table_scope_has(&["table"]) {
+                    self.pop_through("table");
+                    self.reset_insertion_mode();
+                    return Action::Reprocess;
+                }
+                Action::Consumed
+            }
             Token::EndTag(tag) if tag.name == "table" => {
-                if self.has_open_element("table") {
+                if self.table_scope_has(&["table"]) {
                     self.pop_through("table");
                     self.reset_insertion_mode();
                 } else {
@@ -1884,8 +2223,25 @@ impl<'a> TreeBuilder<'a> {
                 }
                 Action::Consumed
             }
-            Token::StartTag(tag) if tag.name == "tr" => {
-                if self.has_open_element("tr") {
+            // "A start tag whose tag name is one of: 'caption', 'col', 'colgroup',
+            // 'tbody', 'tfoot', 'thead', 'tr'": if the stack of open elements does
+            // not have a tr element in table scope, this is a parse error; ignore
+            // the token. Otherwise clear the stack back to a table row context,
+            // pop the current node (which will be a tr element), switch to "in
+            // table body", and reprocess the token.
+            //
+            // The `tr` in the test is what makes a `tr` fragment's content behave:
+            // 13.4 leaves only the root `html` element on the stack, so
+            // `innerHTML = "<tbody><td>"` on a `tr` drops the `<tbody>` and the
+            // `<td>` becomes the fragment's only child. Reading the test as
+            // "is there a `tr` anywhere on the stack" instead drops both.
+            Token::StartTag(tag)
+                if matches!(
+                    tag.name.as_str(),
+                    "caption" | "col" | "colgroup" | "tbody" | "tfoot" | "thead" | "tr"
+                ) =>
+            {
+                if self.table_scope_has(&["tr"]) {
                     self.clear_stack_to_table_row_context();
                     self.pop_current();
                     self.mode = InsertionMode::InTableBody;
@@ -1895,14 +2251,41 @@ impl<'a> TreeBuilder<'a> {
                     Action::Consumed
                 }
             }
-            Token::EndTag(tag)
-                if matches!(tag.name.as_str(), "table" | "tbody" | "tfoot" | "thead") =>
-            {
-                if self.has_open_element("tr") {
+            // "An end tag whose tag name is 'table'": the same test as the start
+            // tag group above and the same steps, but the standard gives it its
+            // own entry, so it is an arm of its own rather than sharing the
+            // `</tbody>` arm's extra requirement below.
+            Token::EndTag(tag) if tag.name == "table" => {
+                if self.table_scope_has(&["tr"]) {
                     self.clear_stack_to_table_row_context();
                     self.pop_current();
                     self.mode = InsertionMode::InTableBody;
                     Action::Reprocess
+                } else {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    Action::Consumed
+                }
+            }
+            // "An end tag whose tag name is one of: 'tbody', 'tfoot', 'thead'": if
+            // the stack of open elements does not have an element in table scope
+            // that is an HTML element with the same tag name as the token, this is
+            // a parse error; ignore the token. If the stack of open elements does
+            // not have a tr element in table scope, ignore the token. Otherwise
+            // clear the stack back to a table row context, pop the current node
+            // (which will be a tr element), switch to "in table body", and reprocess.
+            Token::EndTag(tag) if matches!(tag.name.as_str(), "tbody" | "tfoot" | "thead") => {
+                if self.table_scope_has(&[tag.name.as_str()]) {
+                    if self.table_scope_has(&["tr"]) {
+                        self.clear_stack_to_table_row_context();
+                        self.pop_current();
+                        self.mode = InsertionMode::InTableBody;
+                        Action::Reprocess
+                    } else {
+                        // The second "ignore the token" is silent, not a parse
+                        // error, and the distinction is only visible in the error
+                        // count.
+                        Action::Consumed
+                    }
                 } else {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                     Action::Consumed
@@ -2356,14 +2739,12 @@ impl<'a> TreeBuilder<'a> {
             // "If formattingElement is in the stack of open elements, but the
             // element is not in scope, then this is a parse error; return."
             if !self.has_element_in_scope(formatting_element) {
-                if subject == "a" { eprintln!("DBG   not-in-scope errors={}", self.tree_errors.len()); }
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 return;
             }
             if stack_index + 1 != self.open_elements.len() {
                 // "If formattingElement is not the current node, this is a parse
                 // error. (But do not return.)"
-                if subject == "a" { eprintln!("DBG   not-current stack={:?}", self.open_elements.iter().map(|n| self.element_name(*n).unwrap_or("?")).collect::<Vec<_>>()); }
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
             }
             // "Let furthestBlock be the topmost node in the stack of open
@@ -2765,6 +3146,19 @@ impl<'a> TreeBuilder<'a> {
             }
             Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
             Token::EndTag(tag) if tag.name == "html" => {
+                // "If the parser's fragment context element is non-null, this is
+                // a parse error; ignore the token. (fragment case) Otherwise,
+                // switch the insertion mode to 'after after body'."
+                //
+                // A fragment reaches "after body" exactly as a document does,
+                // through a `</body>`, and the difference is not cosmetic: the
+                // "after after body" mode's comment and processing-instruction
+                // rules insert into the `Document` object, which for a fragment
+                // is an element the caller never sees.
+                if self.fragment_context.is_some() {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    return Action::Consumed;
+                }
                 self.mode = InsertionMode::AfterAfterBody;
                 Action::Consumed
             }
@@ -2976,6 +3370,14 @@ impl<'a> TreeBuilder<'a> {
         let node = self
             .dom
             .create_processing_instruction(target.to_owned(), data.to_owned());
+        // The `parent` argument of "insert a processing instruction given" is the
+        // override target of "the appropriate place for inserting a node", not a
+        // place that bypasses it, so it goes through the adjusted insertion
+        // location like every other insertion. A `Document` parent is unaffected
+        // and an `html` parent in the fragment case is redirected to the
+        // fragment, which is what keeps the node from being dropped into an
+        // element the caller never receives.
+        let parent = self.adjusted_parent(parent);
         if self.dom.append_child(parent, node).is_err() {
             self.parse_error(HtmlParseErrorCode::UnexpectedToken);
         }
@@ -3026,9 +3428,12 @@ impl<'a> TreeBuilder<'a> {
     ///
     /// "An HTML parser is parsing template contents if there is a template
     /// element on the stack of open elements" (13.2.4.4), which is
-    /// [`Self::has_open_template`]. The fragment context element is always null
-    /// here: this tree builder only parses whole documents, so that half of the
-    /// condition holds unconditionally.
+    /// [`Self::has_open_template`]. The fragment context element clause holds
+    /// unconditionally for a document parse, and unconditionally *fails* for a
+    /// fragment parse: this is the guard that makes 13.4's form element pointer
+    /// step inert, and a second, independent reason for it is the same-tree test
+    /// below, which a node in a fresh document can never pass against a form in
+    /// the context's own document.
     ///
     /// The association is recorded rather than derived, because the form the
     /// pointer names need not be an ancestor of the element — that is the whole
@@ -3036,6 +3441,10 @@ impl<'a> TreeBuilder<'a> {
     /// element stops being the child it was created for, which is what the
     /// spec's "reset the form owner" does when the ancestor chain changes.
     fn associate_from_form_element_pointer(&mut self, element: NodeId) {
+        // "... the parser's fragment context element is null ..." (13.2.6.1).
+        if self.fragment_context.is_some() {
+            return;
+        }
         let Some(form) = self.form_element_pointer else {
             return;
         };
@@ -3077,9 +3486,10 @@ impl<'a> TreeBuilder<'a> {
         let target = self.current_node();
         let result = if self.foster_parenting_applies_to(target) {
             let (parent, reference) = self.foster_location();
+            let parent = self.adjusted_parent(parent);
             self.dom.insert_before(parent, element, reference)
         } else {
-            let parent = self.insertion_parent(target);
+            let parent = self.adjusted_parent(target);
             self.dom.append_child(parent, element)
         };
         if result.is_err() {
@@ -3176,13 +3586,14 @@ impl<'a> TreeBuilder<'a> {
         }
         let target = self.current_node();
         if !self.foster_parenting_applies_to(target) {
-            let parent = self.insertion_parent(target);
+            let parent = self.adjusted_parent(target);
             if self.dom.append_text(parent, data).is_err() {
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
             }
             return;
         }
         let (parent, reference) = self.foster_location();
+        let parent = self.adjusted_parent(parent);
         if let Some(reference) = reference
             && let Some(previous) = self.dom.previous_sibling(reference)
             && let Some(NodeKind::Text(existing)) =
@@ -3201,11 +3612,8 @@ impl<'a> TreeBuilder<'a> {
 
     fn insert_comment(&mut self, parent: NodeId, data: &str) {
         let comment = self.dom.create_comment(data);
-        if self
-            .dom
-            .append_child(self.insertion_parent(parent), comment)
-            .is_err()
-        {
+        let parent = self.adjusted_parent(parent);
+        if self.dom.append_child(parent, comment).is_err() {
             self.parse_error(HtmlParseErrorCode::UnexpectedToken);
         }
     }
@@ -3283,6 +3691,30 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
+    /// "To compute the adjusted insertion location ... If adjustedInsertionLocation's
+    /// target parent is the first element in the stack of open elements and the
+    /// parser's root insertion target is non-null, then set
+    /// adjustedInsertionLocation to (the parser's root insertion target, null)."
+    /// (13.2.6.1)
+    ///
+    /// This is the third place 13.4 shows through. In a document parse the first
+    /// element in the stack is the document element, and nodes belong inside it;
+    /// in the fragment case it is the root `html` element 13.4 created, which
+    /// the algorithm never puts anything in, so every node whose target is still
+    /// the root goes into the fragment instead. **Characters, comments and
+    /// processing instructions all go through it**, not just elements, which is
+    /// why it lives here rather than in the element-insertion path: a fragment
+    /// whose content is a bare text node and one whose content is a bare comment
+    /// both depend on it.
+    fn adjusted_parent(&self, parent: NodeId) -> NodeId {
+        if let Some(fragment) = self.root_insertion_target
+            && self.open_elements.first().copied() == Some(parent)
+        {
+            return fragment;
+        }
+        self.insertion_parent(parent)
+    }
+
     /// "A node is a MathML text integration point if it is one of the following
     /// elements: A MathML mi element, A MathML mo element, A MathML mn element, A
     /// MathML ms element, A MathML mtext element" (13.2.6).
@@ -3332,9 +3764,7 @@ impl<'a> TreeBuilder<'a> {
     /// foreign element inserted for a token gets ("Insert a foreign element for
     /// the token, with the adjusted current node's namespace").
     fn current_namespace(&self) -> Namespace {
-        self.open_elements
-            .last()
-            .and_then(|node| self.element_namespace(*node))
+        self.element_namespace(self.adjusted_current_node())
             .unwrap_or(Namespace::Html)
     }
 
@@ -3537,6 +3967,48 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
+    /// "To close a p element" (13.2.6.4.7).
+    ///
+    /// The third step is the one that is easy to skip, and it is worth hundreds
+    /// of cases in the suite's *error* counts: `</p>` is a parse error when there
+    /// is no `p` to close, and a second, independent parse error when there is
+    /// one but the current node is something else. `<p>1<s>2<b>3</p>4` is the
+    /// plain case -- the `b` is still open inside the `p`, so the current node is
+    /// not the `p` being closed. **The tree is the same either way**, so nothing
+    /// but the error count would ever have caught it, which is the same sentence
+    /// the "in body" end-of-file rule earned.
+    fn close_p_element(&mut self) {
+        self.generate_implied_end_tags_except(Some("p"));
+        if !self.has_p_in_button_scope() {
+            self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+            return;
+        }
+        if !self.element_matches(self.current_node(), &Namespace::Html, "p") {
+            self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+        }
+        self.pop_through("p");
+    }
+
+    /// "The stack of open elements has a p element in button scope" (13.2.4.2).
+    ///
+    /// Button scope is the default scope with one extra boundary, `button`, so
+    /// it cannot be answered by [`Self::has_element_name_in_scope`]: `<button><p>x
+    /// </button>` has a `p` open and no `p` in *button* scope, which is why the
+    /// `</button>` arm has to build a `p` rather than close one.
+    fn has_p_in_button_scope(&self) -> bool {
+        for node in self.open_elements.iter().rev() {
+            if self.is_html_element(*node) && self.element_name(*node) == Some("p") {
+                return true;
+            }
+            if self.is_scope_boundary(*node)
+                || self.element_matches(*node, &Namespace::Html, "button")
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     fn pop_through(&mut self, name: &str) {
         while let Some(node) = self.open_elements.pop() {
             if self.element_name(node) == Some(name) {
@@ -3636,44 +4108,32 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn clear_stack_to_table_context(&mut self) {
-        while self
-            .current_tag()
-            .is_some_and(|name| !matches!(name, "table" | "template" | "html"))
-        {
+        while !matches!(self.current_html_tag(), Some("table" | "template" | "html")) {
             self.pop_current();
         }
     }
 
     fn clear_stack_to_table_body_context(&mut self) {
-        while self
-            .current_tag()
-            .is_some_and(|name| !matches!(name, "tbody" | "tfoot" | "thead" | "template" | "html"))
-        {
+        while !matches!(
+            self.current_html_tag(),
+            Some("tbody" | "tfoot" | "thead" | "template" | "html")
+        ) {
             self.pop_current();
         }
     }
 
     fn clear_stack_to_table_row_context(&mut self) {
-        while self
-            .current_tag()
-            .is_some_and(|name| !matches!(name, "tr" | "template" | "html"))
-        {
+        while !matches!(self.current_html_tag(), Some("tr" | "template" | "html")) {
             self.pop_current();
         }
     }
 
     fn has_table_body_in_scope(&self) -> bool {
-        self.open_elements.iter().rev().any(|node| {
-            self.element_name(*node)
-                .is_some_and(|name| matches!(name, "tbody" | "tfoot" | "thead"))
-        })
+        self.table_scope_has(&["tbody", "thead", "tfoot"])
     }
 
     fn has_cell_in_scope(&self) -> bool {
-        self.open_elements.iter().rev().any(|node| {
-            self.element_name(*node)
-                .is_some_and(|name| matches!(name, "td" | "th"))
-        })
+        self.table_scope_has(&["td", "th"])
     }
 
     fn close_current_cell(&mut self) {
@@ -3697,37 +4157,101 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
-    /// "Reset the insertion mode appropriately" (13.2.6.6), in the shape this
-    /// tree builder has always used: one downward walk of the stack of open
-    /// elements to the first element that implies a mode.
+    /// "Reset the parser's insertion mode appropriately" (13.2.4.1).
     ///
-    /// A `template` element contributes "the current template insertion mode"
-    /// rather than a mode of its own, so the mode a template switched away from
-    /// is restored when the template is popped. `InTemplate` is the marker for
-    /// that case: no other element in the walk maps to it.
+    /// This is the second of the three steps 13.4 adds, and it is a loop rather
+    /// than a search over the stack of open elements for two reasons that only
+    /// exist in the fragment case:
+    ///
+    /// * the context element is **not on the stack**, so the walk has to
+    ///   substitute it when it reaches the bottom rather than find it there. A
+    ///   `td` context therefore starts in "in cell" and a `table` context starts
+    ///   in "in table", which is the difference between a fragment whose content
+    ///   is table markup and one whose content is a pile of ignored tags.
+    /// * the clauses on `td`, `th` and `head` are disabled once the walk has
+    ///   reached the bottom (`and last is false`), and the walk can pass
+    ///   unrecognised elements on the way down, so "the first element that
+    ///   implies a mode" is not the same answer.
+    ///
+    /// The element names the algorithm names are HTML-namespace names: an SVG
+    /// `title` is not a `head` and an SVG `table` is not a `table`, and matching
+    /// on the local name alone gets both wrong.
     fn reset_insertion_mode(&mut self) {
-        let decided = self.open_elements.iter().rev().find_map(|node| {
-            if self.is_template_element(*node) {
-                return Some(InsertionMode::InTemplate);
+        if self.open_elements.is_empty() {
+            self.mode = InsertionMode::InBody;
+            return;
+        }
+        let mut index = self.open_elements.len() - 1;
+        let mut last = false;
+        loop {
+            if index == 0 {
+                last = true;
             }
-            match self.element_name(*node)? {
-                "td" | "th" => Some(InsertionMode::InCell),
-                "tr" => Some(InsertionMode::InRow),
-                "tbody" | "thead" | "tfoot" => Some(InsertionMode::InTableBody),
-                "table" => Some(InsertionMode::InTable),
-                "caption" => Some(InsertionMode::InCaption),
-                "colgroup" => Some(InsertionMode::InColumnGroup),
-                "head" => Some(InsertionMode::InHead),
-                "body" => Some(InsertionMode::InBody),
-                "html" => Some(InsertionMode::AfterHead),
-                _ => None,
+            // "If the parser's fragment context element is non-null, then set
+            // node to that element (fragment case)."
+            let node = match (last, self.fragment_context) {
+                (true, Some(context)) => context,
+                _ => self.open_elements[index],
+            };
+            if let Some(mode) = self.mode_implied_by(node, last) {
+                self.mode = mode;
+                return;
             }
-        });
-        self.mode = match decided {
-            Some(InsertionMode::InTemplate) => self.current_template_mode(),
-            Some(mode) => mode,
-            None => InsertionMode::InBody,
-        };
+            // "If last is true, then switch the insertion mode to 'in body' and
+            // return. (fragment case)"
+            if last {
+                self.mode = InsertionMode::InBody;
+                return;
+            }
+            // "Let node now be the node before node in the stack of open
+            // elements. Return to the step labeled loop."  `index == 0` always
+            // returns above, so the subtraction cannot go below the bottom.
+            index -= 1;
+        }
+    }
+
+    /// The insertion mode one clause of "reset the insertion mode appropriately"
+    /// implies for one element, or `None` when the walk should carry on.
+    fn mode_implied_by(&self, node: NodeId, last: bool) -> Option<InsertionMode> {
+        // "If node is a template element, then switch the insertion mode to the
+        // current template insertion mode and return."  A template contributes the
+        // mode it switched away from rather than a mode of its own, which is why
+        // `current_template_mode` is consulted here and not a constant.
+        if self.is_template_element(node) {
+            return Some(self.current_template_mode());
+        }
+        if !self.is_html_element(node) {
+            return None;
+        }
+        Some(match self.element_name(node)? {
+            "td" | "th" if !last => InsertionMode::InCell,
+            "tr" => InsertionMode::InRow,
+            "tbody" | "thead" | "tfoot" => InsertionMode::InTableBody,
+            "caption" => InsertionMode::InCaption,
+            "colgroup" => InsertionMode::InColumnGroup,
+            "table" => InsertionMode::InTable,
+            "head" if !last => InsertionMode::InHead,
+            "body" => InsertionMode::InBody,
+            "frameset" => InsertionMode::InFrameset,
+            // "If the head element pointer is null, switch the insertion mode to
+            // 'before head' and return. Otherwise, the head element pointer is
+            // not null, switch the insertion mode to 'after head' and return."
+            "html" => {
+                if self.head_element.is_some() {
+                    InsertionMode::AfterHead
+                } else {
+                    InsertionMode::BeforeHead
+                }
+            }
+            _ => return None,
+        })
+    }
+
+    /// Whether the parser's fragment context element is the named HTML element,
+    /// which is the test 13.2.6.4.7 spells "(fragment case)" in three places.
+    fn fragment_context_is(&self, name: &str) -> bool {
+        self.fragment_context
+            .is_some_and(|context| self.element_matches(context, &Namespace::Html, name))
     }
 
     fn parse_error(&mut self, code: HtmlParseErrorCode) {
@@ -4274,7 +4798,8 @@ fn is_formatting_element_name(name: &str) -> bool {
     )
 }
 
-fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {    if doctype.force_quirks
+fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
+    if doctype.force_quirks
         || !doctype
             .name
             .as_deref()
@@ -4310,6 +4835,30 @@ fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {    if doctype.for
     QuirksMode::NoQuirks
 }
 
+/// "Set the state of the HTML parser's tokenization stage as follows, switching
+/// on context" (13.4).
+///
+/// This is the step that makes `</title>` inside a `title` fragment *text*, and
+/// it has no analogue in a document parse, where the tokenizer is switched by the
+/// start tag that opened the element instead. `scripting_disabled` is the
+/// `noscript` condition: with scripting on, a `noscript` context is RAWTEXT;
+/// with it off the context's contents are markup and the tokenizer stays in the
+/// data state. The names are HTML-namespace names, so a foreign context element
+/// is always the data state.
+fn fragment_content_model(context: &FragmentContext, scripting_disabled: bool) -> ContentModel {
+    if context.namespace != Namespace::Html {
+        return ContentModel::Data;
+    }
+    match context.local_name.as_str() {
+        "title" | "textarea" => ContentModel::Rcdata,
+        "style" | "xmp" | "iframe" | "noembed" | "noframes" => ContentModel::RawText,
+        "noscript" if !scripting_disabled => ContentModel::RawText,
+        "script" => ContentModel::ScriptData,
+        "plaintext" => ContentModel::Plaintext,
+        _ => ContentModel::Data,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use render_dom::{Dom, Namespace, NodeId, NodeKind};
@@ -4317,8 +4866,8 @@ mod tests {
     use super::super::tokenizer::HtmlParseErrorCode;
     use super::{
         FOREIGN_ATTRIBUTE_ADJUSTMENTS, FOREIGN_BREAKOUT_FONT_ATTRIBUTES,
-        FOREIGN_BREAKOUT_START_TAGS, QuirksMode, SVG_ATTRIBUTE_ADJUSTMENTS,
-        SVG_TAG_NAME_ADJUSTMENTS, parse_document,
+        FOREIGN_BREAKOUT_START_TAGS, FragmentContext, QuirksMode, SVG_ATTRIBUTE_ADJUSTMENTS,
+        SVG_TAG_NAME_ADJUSTMENTS, parse_document, parse_html_fragment_with_scripting,
     };
 
     fn find_element(dom: &Dom, root: NodeId, name: &str) -> Option<NodeId> {
@@ -4547,7 +5096,226 @@ mod tests {
         outline(&output.dom, contents)
     }
 
-    fn collect_outline(dom: &Dom, node: NodeId, depth: usize, lines: &mut Vec<String>) {        for child in dom.children(node).unwrap_or_default() {
+    /// The outline of a parsed fragment, which is the fragment's children.
+    fn fragment_outline(input: &str, context: &FragmentContext) -> String {
+        let output = parse_html_fragment_with_scripting(input, context, true);
+        outline(&output.dom, output.fragment)
+    }
+
+    /// A context element in a foreign namespace, which the HTML-namespace
+    /// constructor cannot express.
+    fn foreign_context(namespace: Namespace, local_name: &str) -> FragmentContext {
+        FragmentContext {
+            namespace,
+            local_name: local_name.to_owned(),
+            ..FragmentContext::html(local_name)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The HTML fragment parsing algorithm (13.4)
+    //
+    // One test per step of 13.4 that a document parse does not have. Each of
+    // them is a step whose omission produces a plausible tree rather than an
+    // obvious failure, which is why each is stated as a contrast: the same input
+    // under two contexts, or the same fragment with and without the step.
+    // -----------------------------------------------------------------------
+
+    /// The **context element** step: the context element is the parser's
+    /// *adjusted current node* while nothing has been pushed onto the stack of
+    /// open elements (13.2.4.1), and the rules for parsing tokens in foreign
+    /// content take both their applicability and the namespace of every element
+    /// they insert from it.
+    ///
+    /// `font` is the sharpest element to test with, because it only breaks out of
+    /// foreign content when it carries `color`, `face` or `size` (13.2.6.5), so
+    /// the same element name is foreign or HTML depending on an attribute and on
+    /// what the context element is. `svg desc` is the third case that makes the
+    /// set a test of the context element rather than of the breakout list: it is
+    /// an HTML integration point (13.2.6.5), so content inside it is HTML even
+    /// though the context element is a foreign element.
+    #[test]
+    fn the_context_element_is_the_adjusted_current_node() {
+        let svg_path = foreign_context(Namespace::Svg, "path");
+        let svg_desc = foreign_context(Namespace::Svg, "desc");
+        assert_eq!(
+            fragment_outline("<font></font>x", &svg_path),
+            "font@svg\n#text \"x\"",
+            "a bare `font` under a `path` context stays foreign, and the context \
+             element is where it takes its namespace from"
+        );
+        assert_eq!(
+            fragment_outline("<font></font>x", &svg_desc),
+            "font@html\n#text \"x\"",
+            "an SVG `desc` is an HTML integration point, so the same bare `font` is \
+             HTML content: the context element's *identity*, not just its namespace, \
+             is what the dispatcher reads"
+        );
+        assert_eq!(
+            fragment_outline("<font color=red>x", &svg_path),
+            "font@html\n  #text \"x\"",
+            "a `font` carrying a presentational attribute is in the breakout list, \
+             so it leaves foreign content and is reprocessed in HTML content, and \
+             the text that follows it lands inside the element"
+        );
+        assert_eq!(
+            fragment_outline("<font></font>x", &FragmentContext::html("div")),
+            "font@html\n#text \"x\"",
+            "the same input under an HTML context element is HTML, so the contrast \
+             is about the context element and not about the tokenizer"
+        );
+    }
+
+    /// The **tokenizer-state** step: 13.4 switches the tokenizer according to
+    /// the context element, and there is **no appropriate end tag token** in the
+    /// fragment case, so every text content model runs to the end of the input.
+    ///
+    /// The two models are told apart by what they do with an ampersand, because a
+    /// test using only one of them would not notice a content model left in the
+    /// data state -- which is the state a fragment parse starts in.
+    #[test]
+    fn the_content_model_follows_the_context_element() {
+        assert_eq!(
+            fragment_outline("a&amp;b</title>", &FragmentContext::html("title")),
+            "#text \"a&b</title>\"",
+            "RCDATA resolves the reference and still has no end tag to find"
+        );
+        assert_eq!(
+            fragment_outline("a&amp;b</script>", &FragmentContext::html("script")),
+            "#text \"a&amp;b</script>\"",
+            "script data does not resolve character references, so the contrast \
+             with the `title` line is what makes this about the content model"
+        );
+        assert_eq!(
+            fragment_outline("<!-- in </script> -->", &FragmentContext::html("script")),
+            "#text \"<!-- in </script> -->\"",
+            "inside an HTML-like comment the escaped states still look for an \
+             appropriate end tag, and in the fragment case there is none, so \
+             `</script>` is text (13.2.5.25)"
+        );
+        // The data state is the default, and it is what an ordinary context
+        // element gets: markup is markup there, not text.
+        assert_eq!(
+            fragment_outline("a<span>x", &FragmentContext::html("div")),
+            "#text \"a\"\nspan@html\n  #text \"x\""
+        );
+    }
+
+    /// The **reset-insertion-mode** step: "reset the parser's insertion mode
+    /// appropriately" (13.2.4.1) consults the context element as the *bottom* of
+    /// the stack of open elements, and 13.4 leaves that stack holding nothing but
+    /// the root `html` element, so the walk has to substitute the context element
+    /// rather than find it there.
+    ///
+    /// Each group of assertions differs by a whole table: a `table` context
+    /// starts in "in table", a `tr` context in "in row" and a `div` context in
+    /// "in body", and the same `<td>` comes out as a cell, as a cell inside a
+    /// freshly grown row, and as nothing at all.
+    #[test]
+    fn the_insertion_mode_is_reset_from_the_context_element() {
+        assert_eq!(
+            fragment_outline("<table><tr>", &FragmentContext::html("table")),
+            "tbody@html\n  tr@html",
+            "the `table` context puts the parser in 'in table', where the \
+             `<table>` is a parse error dropped for want of a table in table scope \
+             and the `<tr>` grows a `tbody`"
+        );
+        assert_eq!(
+            fragment_outline("<table><tr>", &FragmentContext::html("div")),
+            "table@html\n  tbody@html\n    tr@html",
+            "the same input under a `div` context builds the whole table, so the \
+             pair is about which mode the context element selects"
+        );
+        assert_eq!(
+            fragment_outline("<td>", &FragmentContext::html("tr")),
+            "td@html",
+            "a `tr` context is 'in row', whose `td` start tag clears back to the \
+             table row context -- which the root `html` element already satisfies -- \
+             and inserts the cell into the fragment"
+        );
+        assert_eq!(
+            fragment_outline("<td>", &FragmentContext::html("table")),
+            "tbody@html\n  tr@html\n    td@html",
+            "a `table` context grows the tbody and the row first"
+        );
+        assert_eq!(
+            fragment_outline("<td>", &FragmentContext::html("div")),
+            "",
+            "a `div` context is 'in body', where a `td` is a parse error dropped \
+             for want of a table in table scope -- so the three assertions above \
+             are about the mode and not about the token"
+        );
+    }
+
+    /// The **form element pointer** step, which is the one step of 13.4 with no
+    /// observable consequence on the tree, and the reason deserves a test of its
+    /// own: "create an element for a token" (13.2.6.1) associates an element with
+    /// the pointer only if the fragment context element is null -- which it is
+    /// not -- *and* only if the intended parent is in the same tree as the form
+    /// the pointer names, which a node in a fresh document never is with respect
+    /// to a form in the context's own document. Either condition alone is enough.
+    ///
+    /// So the first assertion cannot tell a parser that ran the step from one
+    /// that skipped it, and that is the honest description of this test. The
+    /// second assertion is what makes it worth having: it shows the pointer
+    /// machinery works *inside* a fragment, so the contrast in the first
+    /// assertion is about the inherited pointer and not about association being
+    /// broken.
+    #[test]
+    fn a_form_the_context_sits_inside_is_never_a_form_owner() {
+        let inherited =
+            parse_html_fragment_with_scripting("<input>", &FragmentContext::html("div"), true);
+        let control = find_element(&inherited.dom, inherited.fragment, "input").expect("an input");
+        assert_eq!(
+            inherited.dom.form_owner(control),
+            None,
+            "a form element pointer inherited from the context element's own \
+             document can never name an owner for a node in the fragment"
+        );
+        let own = parse_html_fragment_with_scripting(
+            "<form><input>",
+            &FragmentContext::html("div"),
+            true,
+        );
+        let form = find_element(&own.dom, own.fragment, "form").expect("a form");
+        let control = find_element(&own.dom, own.fragment, "input").expect("an input");
+        assert_eq!(
+            own.dom.form_owner(control),
+            Some(form),
+            "a `form` start tag inside the fragment does own the control that \
+             follows it, so the association itself is not what is inert"
+        );
+    }
+
+    /// The **root insertion target** step: "to compute the adjusted insertion
+    /// location", a node whose target is still the root `html` element 13.4
+    /// created goes into the `DocumentFragment` instead (13.2.6.1).
+    ///
+    /// The point of the test is what it says about *characters*: the adjusted
+    /// insertion location is not only about elements, so a fragment whose content
+    /// is a bare text node and one whose content is a bare comment are both
+    /// decided here, and a `div` context is what puts the two side by side in one
+    /// fragment.
+    #[test]
+    fn a_fragment_puts_its_nodes_in_the_fragment_and_not_in_the_root_html() {
+        let output =
+            parse_html_fragment_with_scripting("text<!--c-->", &FragmentContext::html("div"), true);
+        assert_eq!(
+            outline(&output.dom, output.fragment),
+            "#text \"text\"\n#comment \"c\""
+        );
+        let root = output.dom.children(output.dom.document()).unwrap()[0];
+        assert_eq!(
+            element_children(&output.dom, root),
+            Vec::<String>::new(),
+            "the root `html` element 13.4 created is the document element and is \
+             empty: the nodes went to the root insertion target, which is what a \
+             caller splicing them into a target element needs"
+        );
+    }
+
+    fn collect_outline(dom: &Dom, node: NodeId, depth: usize, lines: &mut Vec<String>) {
+        for child in dom.children(node).unwrap_or_default() {
             let indent = "  ".repeat(depth);
             match dom.node(*child).map(render_dom::Node::kind) {
                 Some(NodeKind::Element(data)) => {
@@ -6529,7 +7297,10 @@ em@html
         let output = parse_document("<b><em><foo><foo><aside></b>");
         let ems = find_all_elements(&output.dom, output.dom.document(), "em");
         assert_eq!(ems.len(), 2);
-        assert_eq!(element_children(&output.dom, ems[0]), vec!["foo".to_owned()]);
+        assert_eq!(
+            element_children(&output.dom, ems[0]),
+            vec!["foo".to_owned()]
+        );
     }
 
     #[test]
@@ -6579,9 +7350,10 @@ b@html
         // Three `b` elements all carrying `id="B"` is only possible if the two
         // later ones are new.
         assert!(
-            bolds
-                .iter()
-                .all(|bold| output.dom.attribute(*bold, "id").is_ok_and(|id| id == Some("B"))),
+            bolds.iter().all(|bold| output
+                .dom
+                .attribute(*bold, "id")
+                .is_ok_and(|id| id == Some("B"))),
             "every created b carries the token's id"
         );
         let texts: Vec<String> = bolds
@@ -6622,7 +7394,10 @@ b@html
         // The contrast case, which is what makes the assertion above about the
         // *list* rather than about reporting at end of file: `address` is not
         // on it, and nothing is left open that is.
-        assert_eq!(error_codes("<!doctype html><address><p>foo</address>bar"), vec![]);
+        assert_eq!(
+            error_codes("<!doctype html><address><p>foo</address>bar"),
+            vec![]
+        );
         // A `p` is on the list, so a document that ends inside one is silent.
         // That asymmetry is the whole content of the rule.
         assert_eq!(error_codes("<!doctype html><p>text"), vec![]);

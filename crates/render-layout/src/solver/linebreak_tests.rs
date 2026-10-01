@@ -527,3 +527,92 @@ fn an_inline_block_holding_unspaced_text_still_reports_max_content() {
 
     assert_eq!(box_rect(&layout, find(&output.dom, "#ib")).size.width, 48.0);
 }
+
+#[test]
+fn an_inline_block_narrower_than_its_min_content_keeps_the_min_content_width() {
+    // CSS 2.1 §10.3.9: an `inline-block`'s `width: auto` is "the shrink-to-fit
+    // width as for floating elements", and §10.3.5 defines that as
+    // `min(max(preferred minimum width, available width), preferred width)`.
+    //
+    // The min-content term is a *floor*, not one end of a tie: with a 40px row
+    // and one Latin word of 104px there is nowhere to wrap, so the box has to
+    // stay 104px and let its text stick out. A bare `min(max-content,
+    // available)` would make it 40px and then break the word inside itself,
+    // which is the visible defect this is the floor for. The word is Latin on
+    // purpose: an unspaced ideograph run has a break opportunity between most
+    // of its characters, so its min-content is one character and the same
+    // formula would *not* rescue it.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='row' style='width:40px'>\
+           <span id='ib' style='display:inline-block'>internationalization</span></p></body>",
+        RESET,
+        400.0,
+    );
+    let ib = box_rect(&layout, find(&output.dom, "#ib"));
+    // 20 characters at 8px.
+    assert_eq!(ib.size.width, 160.0, "{ib:?}");
+    // And it overflows its 40px row rather than narrowing to it.
+    assert_eq!(
+        box_rect(&layout, find(&output.dom, "#row")).size.width,
+        40.0
+    );
+}
+
+#[test]
+fn a_float_narrower_than_its_min_content_keeps_the_min_content_width() {
+    // The same formula answers for §10.3.5's floats, which is why both go
+    // through one helper: the float is the case §10.3.9 refers to.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='f' style='float:left;width:auto'>internationalization</div></body>",
+        RESET,
+        400.0,
+    );
+    assert_eq!(box_rect(&layout, find(&output.dom, "#f")).size.width, 160.0);
+}
+
+#[test]
+fn an_inline_blocks_min_content_is_the_widest_run_across_its_inline_boxes() {
+    // §10.3.5's "preferred minimum width" is the width "found by trying all
+    // possible line breaks", and a break opportunity is a property of the
+    // character *sequence*, not of a box: CSS Text 3 §1.5 makes inline box
+    // boundaries invisible to line breaking. `<b>` here puts a box boundary
+    // between "aaa" and "bbb" with no opportunity in it, so the two are one
+    // unbreakable run of nine characters - 72px - and the box may not be
+    // narrower than that.
+    //
+    // Measuring min-content as the widest *child* would answer 24px here and
+    // the box would come out narrower than the word it cannot break.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='row' style='width:20px'>\
+           <span id='ib' style='display:inline-block'>aaa<b>bbb</b>ccc</span></p></body>",
+        RESET,
+        400.0,
+    );
+    let ib = box_rect(&layout, find(&output.dom, "#ib"));
+    assert_eq!(ib.size.width, 72.0, "{ib:?}");
+}
+
+#[test]
+fn an_inline_sequence_measures_a_minimum_across_a_break_it_does_not_take() {
+    // The same floor read through a table cell, which is the other consumer of
+    // min-content: §17.5.2.2 gives an auto column a minimum of the largest cell
+    // min-content width, and the `<b>` boundary is invisible to it for the same
+    // reason.
+    //
+    // §17.5.2.2's second bullet is what the floor is for: an `auto` table
+    // shrink-to-fits its columns to the containing block first, and then grows
+    // to the sum of them, so a table inside a 20px block is still 72px wide
+    // rather than clipping the run it has nowhere to break.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='host' style='width:20px'>\
+           <table id='t'><tr><td id='a'>aaa<b>bbb</b>ccc</td></tr></table></div></body>",
+        &format!("{RESET} table {{ border-collapse: separate; border-spacing: 0 }}"),
+        400.0,
+    );
+    assert_eq!(
+        box_rect(&layout, find(&output.dom, "#host")).size.width,
+        20.0
+    );
+    assert_eq!(box_rect(&layout, find(&output.dom, "#t")).size.width, 72.0);
+    assert_eq!(box_rect(&layout, find(&output.dom, "#a")).size.width, 72.0);
+}

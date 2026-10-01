@@ -281,6 +281,19 @@ impl Solver<'_> {
         };
 
         let basis = containing.size.width;
+        let context = match &node.kind {
+            FormattingNodeKind::BlockContainer { context }
+            | FormattingNodeKind::AtomicInline { context } => *context,
+            _ => FormattingContextKind::Block,
+        };
+        // §17.6.2.1: in the collapsed model the table's own border is what
+        // survives the conflict on the outer grid lines, so it has to be
+        // resolved before the edges and the `non_content` below are read.
+        // Sizing against the *declared* border and collapsing the box's edges
+        // afterwards leaves the grid wider than the table it sits in.
+        if context == FormattingContextKind::Table && forced_content_width.is_none() {
+            self.resolve_table_edge_rules_before_sizing(node_id, style, basis);
+        }
         let mut margin_left = self.resolve_auto_edge(style, "margin-left", basis, node.source);
         let mut margin_right = self.resolve_auto_edge(style, "margin-right", basis, node.source);
         let margin_top = self.resolve_edge(style, "margin-top", basis, node.source);
@@ -291,11 +304,6 @@ impl Solver<'_> {
             _ => BoxSizing::ContentBox,
         };
 
-        let context = match &node.kind {
-            FormattingNodeKind::BlockContainer { context }
-            | FormattingNodeKind::AtomicInline { context } => *context,
-            _ => FormattingContextKind::Block,
-        };
         let css_width = self.resolve_size(style, "width", basis, node.source);
         // CSS 2 §10.5: against an indefinite containing height a percentage
         // height computes to `auto`; it must never resolve against the

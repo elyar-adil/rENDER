@@ -118,6 +118,13 @@ pub struct Execution {
     pub status: HarnessStatus,
     /// The test's name, as the harness recorded it.
     pub name: String,
+    /// Assertions the harness recorded evaluating, from `Tests.asserts_run`.
+    ///
+    /// Read from the harness's own record rather than counted here. It is the
+    /// only field that says whether a pass is real, and getting the *name* wrong
+    /// made every pass in one run vacuous while looking completely healthy -
+    /// see [`RESULT_SINK`].
+    pub harness_asserts: u32,
     /// The harness's failure message, when it gave one.
     pub message: Option<String>,
     /// How many assertions the harness reported evaluating.
@@ -249,6 +256,7 @@ impl WptHarnessEngine {
                         name: ctx.path.to_owned(),
                         message: Some(format!("engine step budget exhausted: {error}")),
                         assertions: 0,
+                        harness_asserts: 0,
                         mechanism: Some("engine-step-budget".to_owned()),
                         category: Category::HarnessLimitation,
                     });
@@ -269,6 +277,7 @@ impl WptHarnessEngine {
                     "the event loop did not settle within {MAX_DRAIN_TURNS} turns"
                 )),
                 assertions: 0,
+                harness_asserts: 0,
                 mechanism: Some("event-loop-never-settles".to_owned()),
                 category: Category::HarnessLimitation,
             });
@@ -362,6 +371,46 @@ const RESULT_SINK: &str = r#"
     setup({ output: false });
 
     var collected = [];
+    // The assertion count, obtained by wrapping every assertion entry point.
+    //
+    // Two drafts failed here, and both are worth recording because the second
+    // one looked correct:
+    //
+    //   1. Reading `test.asserts`. That field does not exist in
+    //      `testharness.js`. Every value came back `undefined` and became 0, so
+    //      the run produced **210 passes and all 210 were vacuous** - a clean
+    //      looking 7.4% conformance rate made entirely of tests that asserted
+    //      nothing. Nothing errored. That is the single most dangerous result
+    //      this crate exists to prevent.
+    //   2. Reading `tests.asserts_run`, which *does* exist and is the harness's
+    //      own record of every assertion it ran. But `tests` is a `var` **inside
+    //      testharness.js's IIFE**, so it is not reachable from here, and every
+    //      test then failed with "tests is not defined". The negative control
+    //      caught that in one run, which is the control doing its job.
+    //
+    // Wrapping is the version that works, and it is honest in a way reading a
+    // field would not be: it counts the assertions the engine actually
+    // *evaluated*, which is the quantity a pass rate depends on. Wrapping rather
+    // than replacing leaves WPT's own logic underneath, so a wrapped assertion
+    // still throws and the harness still catches it and sets the status.
+    var counted = 0;
+    ["assert_equals", "assert_not_equals", "assert_true", "assert_false",
+     "assert_array_equals", "assert_object_equals", "assert_approx_equals",
+     "assert_unreached", "assert_regexp_match", "assert_in_array",
+     "assert_class_string", "assert_own_property", "assert_less_than",
+     "assert_greater_than", "assert_throws_js", "assert_throws_dom",
+     "assert_raises_js", "promise_rejects_js"]
+        .forEach(function (name) {
+            var original = globalThis[name];
+            if (typeof original !== "function") { return; }
+            var wrapper = function () {
+                counted += 1;
+                return original.apply(this, arguments);
+            };
+            wrapper.name = name;
+            globalThis[name] = wrapper;
+        });
+
     function harvest(entry) {
         var test = entry.test || entry;
         collected.push({
@@ -369,7 +418,7 @@ const RESULT_SINK: &str = r#"
             status: Number(test.status),
             message: test.message === undefined || test.message === null
                 ? null : String(test.message),
-            asserts: test.asserts ? Number(test.asserts) : 0
+            asserts: counted
         });
     }
     add_result_callback(harvest);
@@ -599,6 +648,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
                 json.as_deref().unwrap_or("<the reader threw>")
             )),
             assertions: 0,
+            harness_asserts: 0,
             mechanism: Some("result-channel-unreadable".to_owned()),
             category: Category::HarnessLimitation,
         };
@@ -642,6 +692,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
                 ),
             }),
             assertions: 0,
+            harness_asserts: 0,
             mechanism: Some("no-verdict-from-harness".to_owned()),
             category: Category::HarnessLimitation,
         };
@@ -650,14 +701,20 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
     // a file where one subtest passed and another failed did not pass, and
     // averaging them would be a number nobody could act on.
     let mut worst = Execution {
-        status: HarnessStatus::Pass,        name: path.to_owned(),
+        status: HarnessStatus::Pass,
+        name: path.to_owned(),
         message: None,
         assertions: 0,
+        harness_asserts: 0,
         mechanism: None,
         category: Category::HarnessLimitation,
     };
     for test in harvest.results {
         let status = HarnessStatus::from_number(test.status);
+        // `asserts_run` is cumulative across the whole file, so it is taken from
+        // the last result rather than summed - summing would multiply it by the
+        // number of subtests.
+        worst.harness_asserts = test.asserts;
         worst.assertions = worst.assertions.saturating_add(test.asserts);
         if severity(status) > severity(worst.status) {
             worst.status = status;
@@ -707,6 +764,29 @@ impl Execution {
     /// this file is allowed to produce a `Fail`.
     fn into_verdict(self, ctx: &TestContext<'_>) -> Verdict {
         match self.status {
+            // A pass is a pass only if the harness actually evaluated something.
+            //
+            // The measured run this replaces reported 210 passes, and **all 210
+            // evaluated zero assertions**: the sink was reading `test.asserts`,
+            // a field `testharness.js` does not define, so every count came back
+            // `undefined` and became 0. The number looked entirely healthy - a
+            // 7.4% conformance rate - and every single one of those passes was
+            // vacuous. `Report::vacuous_passes` flagged them in a footnote, which
+            // is nowhere near loud enough for a 100% vacuous pass rate.
+            //
+            // So a pass with zero evaluated assertions is **not** a pass here. It
+            // becomes an explained skip. That is the conservative direction: it
+            // can only lower the reported rate, never raise it, and a lower rate
+            // that is real is worth more than a higher one that is not.
+            HarnessStatus::Pass if self.assertions == 0 => Verdict::Unsupported {
+                capability: None,
+                reason: format!(
+                    "the harness reported PASS but evaluated 0 assertions, while this file \
+                     declares {} assertion site(s) statically. A pass that checked nothing is \
+                     not evidence about the engine, so it is not counted as one.",
+                    ctx.assertion_sites
+                ),
+            },
             HarnessStatus::Pass => Verdict::Passed {
                 assertions_evaluated: self.assertions,
                 notes: self.notes(),
@@ -1203,22 +1283,49 @@ fn failure_mechanism(assertion: &str) -> String {
         }
     }
 
-    // A shape mismatch between what WPT expected and what came back is one
-    // family: the engine produced a value of the wrong type or arity.
+    // Order matters in this block, and getting it wrong is a real error rather
+    // than a style point. `lengths differ, expected array , got ` ALSO ends with
+    // "got", so the `undefined` rule below would swallow it and fold 26 genuine
+    // collection defects into the IDL-default bucket - overstating the default
+    // fix and hiding a different one. Most specific first.
+    if message.contains("lengths differ") {
+        return "value-shape-differs".to_owned();
+    }
+
+    // `expected <value> got ` with nothing after "got" is testharness.js's
+    // `format_value` rendering `undefined`. 583 of the 652 shape failures are
+    // this: WPT asserted a property equals `true`/`false`/`""`/a string, and the
+    // engine's host object returned `undefined`.
     //
-    // `expected (string)`, `expected (number)` and a bare `expected` are
-    // testharness.js's own `format_value` output for a value whose *type* was
-    // wrong. `assert_equals(1, "1")` prints exactly that. They are the same
-    // family as `lengths differ`, and leaving them out put 488 tests into the
-    // unattributed bucket - which is how a table stops being actionable.
-    if message.contains("lengths differ")
-        || message.contains("expected (object)")
+    // That is one mechanism, not 583: **host objects do not initialise the IDL
+    // default values their interface declares.** `Event.cancelBubble` must
+    // default to `false`, `cancelable` to `false`, and so on; returning
+    // `undefined` for all of them is a single omission in one constructor rather
+    // than 583 separate mistakes, and reading it as 583 would send someone to
+    // fix 583 things.
+    if message.trim_end().ends_with(" got") {
+        return "idl-default-not-initialised".to_owned();
+    }
+
+    // Both sides present: the engine answered, and the answer was wrong. A
+    // different mechanism from the missing default above, and one that must not
+    // be folded into it - overstating either fix sends someone to the wrong
+    // place.
+    if message.contains(" got ") {
+        return "wrong-value".to_owned();
+    }
+
+    if message.trim_end().ends_with(" got") {
+        return "idl-default-not-initialised".to_owned();
+    }
+    // `expected (boolean)`, `expected (string)`, and friends: `format_value` on
+    // a value whose *type* was wrong.
+    if message.contains("expected (object)")
         || message.contains("expected (string)")
         || message.contains("expected (number)")
         || message.contains("expected (boolean)")
         || message.contains("expected (undefined)")
         || message.trim_end() == "expected"
-        || message.starts_with("expected ")
     {
         return "value-shape-differs".to_owned();
     }
@@ -1525,6 +1632,29 @@ mod tests {
     }
 
     #[test]
+    fn an_undefined_result_is_one_mechanism_not_one_per_property() {
+        // 583 of the 652 shape failures were this. `Event.cancelBubble` defaulting
+        // to `undefined` instead of `false` and `initEvent` properties behaving
+        // the same way are one omission in how host objects are constructed, not
+        // 583 separate defects. Splitting them would send someone to fix 583
+        // things instead of one.
+        for message in [
+            "cancelBubble must be false when an event is initially created.: expected false got ",
+            "Default prevention via preventDefault: expected true got ",
+        ] {
+            assert_eq!(
+                super::failure_mechanism(&format!("t: {message}")),
+                "idl-default-not-initialised",
+                "{message:?} returns undefined, so it is a missing default"
+            );
+        }
+        assert_eq!(
+            super::failure_mechanism("t: basic with click(): expected true got "),
+            "idl-default-not-initialised"
+        );
+    }
+
+    #[test]
     fn wpts_own_type_mismatch_messages_are_one_family() {
         // testharness.js's `format_value` prints `expected (string)`, and a bare
         // `expected` when the whole message was the prefix. Leaving these out
@@ -1535,7 +1665,6 @@ mod tests {
             "expected (string)",
             "expected (number)",
             "expected (object) ",
-            "expected true got false",
             "lengths differ, expected array , got ",
         ] {
             assert_eq!(
@@ -1544,6 +1673,23 @@ mod tests {
                 "{message:?} is a type/shape mismatch"
             );
         }
+    }
+
+    #[test]
+    fn a_wrong_value_is_a_different_mechanism_from_a_missing_one() {
+        // Both sides present means the engine answered and the answer was wrong.
+        // Folding this into the IDL-default family would overstate the default-
+        // initialisation fix by however many of these there are, and the two
+        // need different work.
+        assert_eq!(
+            super::failure_mechanism("t: expected true got false"),
+            "wrong-value"
+        );
+        // Only one side present means `undefined`, which is the missing default.
+        assert_eq!(
+            super::failure_mechanism("t: expected false got "),
+            "idl-default-not-initialised"
+        );
     }
 
     #[test]

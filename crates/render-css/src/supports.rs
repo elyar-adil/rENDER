@@ -197,25 +197,98 @@ fn supports_longhand(property: &str, value: &str) -> bool {
 }
 
 /// Whether this engine has any declared knowledge of `property`: a grammar in
-/// [`properties`] or metadata in [`computed`]. Read once, because a feature
-/// query is evaluated once per `@supports` block and rebuilding the baseline
-/// registry for every feature in it would be wasteful.
+/// [`properties`] or metadata in [`computed`].
+///
+/// This is [`property_support`] collapsed to the question `@supports` asks, so
+/// the two cannot drift: a property is "known" here exactly when it is not
+/// [`PropertySupport::Unsupported`]. §6.1 needs the bool because the answer it
+/// feeds is whether a declaration is supported, and the third state has nowhere
+/// to go in a boolean - it is carried by [`property_support`] for the consumers
+/// that can report it.
 fn is_known_property(property: &str) -> bool {
-    static KNOWN: OnceLock<BTreeSet<String>> = OnceLock::new();
-    KNOWN
-        .get_or_init(|| {
-            let mut names: BTreeSet<String> = DECLARED_GRAMMARS
-                .iter()
-                .map(|name| (*name).to_owned())
-                .collect();
-            names.extend(
-                PropertyRegistry::standard_baseline()
-                    .iter()
-                    .map(|(name, _)| name.to_owned()),
-            );
-            names
-        })
-        .contains(property.to_ascii_lowercase().as_str())
+    property_support(property) != PropertySupport::Unsupported
+}
+
+/// The property names the baseline [`PropertyRegistry`] defines, read once
+/// because a feature query is evaluated once per `@supports` block and
+/// rebuilding the registry for every feature in it would be wasteful.
+fn registry_names() -> &'static BTreeSet<String> {
+    static NAMES: OnceLock<BTreeSet<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        PropertyRegistry::standard_baseline()
+            .iter()
+            .map(|(name, _)| name.to_owned())
+            .collect()
+    })
+}
+
+/// What this engine knows about an ordinary property **name** - with no element,
+/// no declaration and no value in scope.
+///
+/// # Why this is not a state on [`super::computed::ComputedStyle`]
+///
+/// [`ComputedStyle::get`] answers "is there a value here to read?", and its
+/// `Option` has two other answers folded into the same `None`. A consumer that
+/// reaches for it to ask *whether this engine supports the property* gets a
+/// wrong answer in both directions:
+///
+/// - a property the registry defines but this slice has no grammar for reads
+///   back `Some(initial value)`, so "the document said nothing and the engine
+///   cannot read it anyway" is indistinguishable from "here is the value"; and
+/// - a property this engine has never heard of also reads `None`, so "no such
+///   property" is indistinguishable from "no value on this element".
+///
+/// That is the same conflation `docs/visual_fidelity_gaps.md` S22 records for
+/// the *author-intent* question, and it was fixed there by adding a query with
+/// its own name rather than by reinterpreting `get` - [`ComputedStyle::
+/// specified`] is that query. This is the support half of the same pair, and it
+/// gets the same treatment for the same reason: `get` is read by roughly a
+/// hundred call sites that mean "read the value", and a tri-state return would
+/// force all of them to change to learn something none of them asked for.
+///
+/// The other reason is that the answer is a constant. Support does not vary per
+/// element, so a per-element API would return the same answer wrapped in a
+/// varying one, and the temptation to read it off a particular element's style
+/// is exactly the mistake being removed.
+///
+/// Custom properties are not answered here: CSS Variables 1 §2.1 makes every
+/// non-empty value of a valid `<dashed-ident>` a valid value, so a custom
+/// property is supported whenever its name is one. [`supports_declaration`]
+/// already answers that, and it is where a `@supports` condition about one
+/// goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PropertySupport {
+    /// Neither a grammar nor registry metadata: this engine has no such
+    /// property, and a declaration of it is inert. A diagnostic or an oracle
+    /// that reports this is telling the truth.
+    Unsupported,
+    /// Registry metadata only - an inheritance flag and an initial value - and
+    /// no grammar. The property is real and the cascade can hold and inherit
+    /// it, but this slice cannot parse a value for it, so a declaration is
+    /// carried as tokens rather than as a typed value. **This is the state
+    /// `ComputedStyle::get` cannot express.**
+    MetadataOnly,
+    /// A grammar is claimed, so [`parse_typed_property`] returns `Some` and a
+    /// value can be rejected as invalid rather than merely unparsed.
+    Grammar,
+}
+
+/// The honest answer to "does this engine support `property`?", independent of
+/// any element.
+///
+/// Read [`supports_declaration`] for the per-*declaration* question, which adds
+/// the value: this function cannot say whether `width: nonsense` is supported,
+/// because that is a question about the value rather than the name.
+#[must_use]
+pub fn property_support(property: &str) -> PropertySupport {
+    let name = property.to_ascii_lowercase();
+    if DECLARED_GRAMMARS.contains(&name.as_str()) {
+        return PropertySupport::Grammar;
+    }
+    if registry_names().contains(name.as_str()) {
+        return PropertySupport::MetadataOnly;
+    }
+    PropertySupport::Unsupported
 }
 
 /// CSS Variables 1 §2.1's `<dashed-ident> = --<custom-ident>`, and

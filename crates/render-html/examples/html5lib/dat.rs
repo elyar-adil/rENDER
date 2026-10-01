@@ -58,9 +58,32 @@ pub struct DatTest {
     pub data: String,
     /// The number of parse errors the suite expects in the `#errors` section.
     pub expected_error_count: usize,
-    /// The number in the optional `#new-errors` section, which adds to the
-    /// above.
+    /// The number in the optional `#new-errors` section.
+    ///
+    /// **This is a renaming of `#errors`, not a list of extra errors**, and the
+    /// two must not simply be added together. The suite carries the legacy
+    /// diagnostic vocabulary in `#errors` and the current standard's names in
+    /// `#new-errors`, and the same condition appears in both: 20 cases list one
+    /// identical name in both sections, and of the 295 cases carrying a
+    /// `#new-errors` section, 291 have a `#new-errors` at least as short as
+    /// their `#errors`. So a parser that reports each condition once under its
+    /// current name is correct, and a summed count asks it to report the same
+    /// diagnostic twice under two spellings.
+    ///
+    /// The four cases where `#new-errors` is *longer* than `#errors` are
+    /// genuine additions: NUL characters in `plain-text-unsafe.dat`, where
+    /// `unexpected-null-character` is a condition the legacy list did not
+    /// express at all.
     pub expected_new_error_count: usize,
+    /// The `#errors` lines themselves, in order.
+    ///
+    /// Only the **count** is a conformance requirement -- the format says "it
+    /// doesn't matter what those lines are" -- but a count with no names cannot
+    /// be acted on, and the names are what turn "under-reports by one" into a
+    /// rule to look at. They are kept for reporting and never compared.
+    pub expected_error_names: Vec<String>,
+    /// The `#new-errors` lines, for the same reason.
+    pub expected_new_error_names: Vec<String>,
     pub fragment_context: Option<ContextElement>,
     pub scripting: Scripting,
     /// The `#document` tree dump, one entry per line, `| ` prefix included.
@@ -105,6 +128,8 @@ struct PartialTest {
     data: String,
     errors: usize,
     new_errors: usize,
+    error_names: Vec<String>,
+    new_error_names: Vec<String>,
     fragment_context: Option<ContextElement>,
     scripting: Scripting,
     document: Document,
@@ -117,6 +142,8 @@ impl PartialTest {
             data: String::new(),
             errors: 0,
             new_errors: 0,
+            error_names: Vec::new(),
+            new_error_names: Vec::new(),
             fragment_context: None,
             scripting: Scripting::Both,
             document: Document::new(),
@@ -210,11 +237,13 @@ pub fn parse_text(file_name: &str, text: &str) -> Vec<DatTest> {
             Section::Errors => {
                 if !line.is_empty() {
                     test.errors += 1;
+                    test.error_names.push(line.to_owned());
                 }
             }
             Section::NewErrors => {
                 if !line.is_empty() {
                     test.new_errors += 1;
+                    test.new_error_names.push(line.to_owned());
                 }
             }
             Section::DocumentFragment => {
@@ -344,6 +373,8 @@ fn finish(file_name: &str, index: usize, mut test: PartialTest) -> DatTest {
         data: test.data,
         expected_error_count: test.errors,
         expected_new_error_count: test.new_errors,
+        expected_error_names: test.error_names,
+        expected_new_error_names: test.new_error_names,
         fragment_context: test.fragment_context,
         scripting: test.scripting,
         expected_tree: test.document.finish(),

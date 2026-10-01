@@ -1253,6 +1253,20 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::TypedArrayValues => self.dispatch_typed_array_native(
+                dom,
+                NativeFunction::TypedArrayValues,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::PromiseAll
+            | NativeFunction::PromiseAllSettled
+            | NativeFunction::PromiseAny
+            | NativeFunction::PromiseRace
+            | NativeFunction::PromiseCombinatorFulfilled
+            | NativeFunction::PromiseCombinatorRejected => {
+                self.dispatch_promise_native(dom, function, receiver, arguments)
+            }
             NativeFunction::TypedArrayForEach => self.dispatch_typed_array_native(
                 dom,
                 NativeFunction::TypedArrayForEach,

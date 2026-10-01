@@ -633,6 +633,17 @@ pub(crate) enum NativeFunction {
     TypedArrayForEach,
     TypedArrayMap,
     TypedArrayFilter,
+    /// `%TypedArray%.prototype.values`, which the specification also installs
+    /// as `%TypedArray%.prototype[@@iterator]`.
+    TypedArrayValues,
+    PromiseAll,
+    PromiseAllSettled,
+    PromiseAny,
+    PromiseRace,
+    /// One element of a combinator settling. Bound with the combinator's store
+    /// object and the element's index so the handler knows where to record.
+    PromiseCombinatorFulfilled,
+    PromiseCombinatorRejected,
     MutationObserve,
     MutationDisconnect,
     MutationTakeRecords,
@@ -1073,6 +1084,7 @@ pub(crate) enum ObjectHost {
     UserFunction(usize),
     ArrowFunction(usize),
     PromiseConstructor,
+    AggregateErrorConstructor,
     ObjectConstructor,
     FunctionConstructor,
     StringConstructor,
@@ -1298,6 +1310,7 @@ impl ObjectHost {
                 | Self::VideoConstructor
                 | Self::ObjectConstructor
                 | Self::PromiseConstructor
+                | Self::AggregateErrorConstructor
                 | Self::MutationObserverConstructor
                 | Self::UrlConstructor
                 | Self::UrlSearchParamsConstructor
@@ -1697,8 +1710,13 @@ impl Realm {
         let symbol_prototype =
             Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
-        let promise_prototype =
-            Self::install_promise(&mut objects, global, object_prototype, function_prototype);
+        let promise_prototype = Self::install_promise(
+            &mut objects,
+            global,
+            object_prototype,
+            function_prototype,
+            error_prototype,
+        );
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         let (iterator_prototype, iterator_helper_prototype) =
@@ -2578,6 +2596,7 @@ impl Realm {
                 ("forEach", NativeFunction::TypedArrayForEach),
                 ("map", NativeFunction::TypedArrayMap),
                 ("filter", NativeFunction::TypedArrayFilter),
+                ("values", NativeFunction::TypedArrayValues),
             ];
             for &(method_name, function) in methods {
                 let method = ObjectId(objects.len());
@@ -2590,6 +2609,16 @@ impl Realm {
                     method_name.to_owned(),
                     PropertyDescriptor::builtin(JsValue::Object(method)),
                 );
+                // `%TypedArray%.prototype[@@iterator]` is the same function
+                // object as `values`, so spread, `for...of` and array
+                // destructuring all walk a typed array through one iterator.
+                if method_name == "values" {
+                    let symbol = JsSymbol::well_known("@@iterator");
+                    objects[prototype.0].symbols.insert(
+                        symbol.id(),
+                        (symbol, PropertyDescriptor::builtin(JsValue::Object(method))),
+                    );
+                }
             }
             #[allow(
                 clippy::cast_precision_loss,
@@ -5245,6 +5274,7 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
+        error_prototype: ObjectId,
     ) -> ObjectId {
         let promise = ObjectId(objects.len());
         objects.push(JsObject {
@@ -5291,6 +5321,12 @@ impl Realm {
         for (name, function) in [
             ("resolve", NativeFunction::PromiseResolve),
             ("reject", NativeFunction::PromiseReject),
+            // The four combinators take one argument each, which is what their
+            // `length` reports.
+            ("all", NativeFunction::PromiseAll),
+            ("allSettled", NativeFunction::PromiseAllSettled),
+            ("any", NativeFunction::PromiseAny),
+            ("race", NativeFunction::PromiseRace),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -5304,7 +5340,15 @@ impl Realm {
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
+            // Every static on this constructor takes one argument, and `length`
+            // reports that. Without it a feature-detection bundle reading
+            // `Promise.all.length` sees `undefined`.
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Number(1.0)),
+            );
         }
+        Self::install_aggregate_error(objects, global, function_prototype, error_prototype);
         // `Promise.prototype[Symbol.toStringTag] === "Promise"`
         {
             let tag = JsSymbol::well_known("@@toStringTag");
@@ -5328,6 +5372,80 @@ impl Realm {
             },
         );
         prototype
+    }
+
+    /// `AggregateError`, the rejection reason `Promise.any` produces.
+    ///
+    /// `errors` is an own property of each *instance*, not an accessor on the
+    /// prototype: the specification defines it that way, and a prototype
+    /// accessor would need a hidden slot that this engine's objects do not have.
+    /// The prototype hangs off `%Error.prototype%`, so `instanceof Error` and
+    /// `toString()` follow the ordinary error contract and `message` is the
+    /// conventional empty string when none was given.
+    fn install_aggregate_error(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        function_prototype: ObjectId,
+        error_prototype: ObjectId,
+    ) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(error_prototype),
+            ..JsObject::default()
+        });
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::AggregateErrorConstructor,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[constructor.0].properties.insert(
+            "name".to_owned(),
+            PropertyDescriptor::builtin(JsValue::String("AggregateError".to_owned())),
+        );
+        objects[constructor.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Number(2.0)),
+        );
+        for (name, value) in [("name", "AggregateError"), ("message", "")] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(value.to_owned()),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[global.0].properties.insert(
+            "AggregateError".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 
     fn install_array(
@@ -6046,6 +6164,25 @@ impl Realm {
             }
         }
         Some(properties)
+    }
+
+    /// The enumerable own string keys of an object, in property order.
+    ///
+    /// `CopyDataProperties` reads each of these with `Get`, which can run an
+    /// accessor, so the key list is handed back separately rather than paired
+    /// with the descriptor's `value` slot — that slot is `undefined` for an
+    /// accessor, which is how `{ ...source }` used to lose every getter.
+    pub(crate) fn enumerable_own_keys(&self, object: ObjectId) -> Option<Vec<String>> {
+        self.objects.get(object.0)?;
+        let keys = self.own_property_names(object)?;
+        Some(
+            keys.into_iter()
+                .filter(|key| {
+                    self.own_property(object, key)
+                        .is_some_and(|descriptor| descriptor.enumerable)
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn own_property_names(&self, object: ObjectId) -> Option<Vec<String>> {

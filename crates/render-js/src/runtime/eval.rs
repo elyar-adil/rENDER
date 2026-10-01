@@ -22,6 +22,8 @@ use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::Realm;
 use crate::parser::BinaryOp;
+use crate::parser::BindingPattern;
+use crate::parser::BindingTarget;
 use crate::parser::CatchClause;
 use crate::parser::Expr;
 use crate::parser::ObjectAccessorKind;
@@ -109,6 +111,156 @@ pub(super) enum AssignmentReference {
     SuperProperty { property: String },
 }
 
+/// One live iterator being consumed by an array binding pattern.
+///
+/// An array pattern cannot be lowered to indexed member access, because the
+/// specification's `IteratorBindingInitialization` pulls values one at a time
+/// through `@@iterator` and *stops early*: `[a] = fiveThings` calls `next`
+/// once and then closes the iterator. Draining into an array first would call
+/// `next` five times, and would never terminate on an infinite generator. So
+/// the pattern holds this state instead.
+struct ArrayDestructuring {
+    iterator: Option<ObjectId>,
+    next: Option<ObjectId>,
+    done: bool,
+    /// Set instead of `iterator` when the elements are already in hand.
+    values: Option<std::vec::IntoIter<JsValue>>,
+}
+
+impl ArrayDestructuring {
+    /// `GetIterator(value, sync)`. A source with no `@@iterator` is a
+    /// `TypeError`, not an empty list.
+    fn open(runtime: &mut JsRuntime, dom: &mut Dom, value: &JsValue) -> Result<Self, JsError> {
+        // Strings and arrays are the two shapes the engine iterates without a
+        // host `@@iterator` lookup, and a string must be walked by code point
+        // so an astral character binds as one element.
+        match value {
+            JsValue::String(text) => {
+                let values = text
+                    .chars()
+                    .map(|character| JsValue::String(character.to_string()))
+                    .collect();
+                return Ok(Self::over(values));
+            }
+            JsValue::Object(object)
+                if matches!(runtime.realm.host(*object), Some(ObjectHost::Array)) =>
+            {
+                return Ok(Self::over(runtime.array_elements_for(*object)?));
+            }
+            _ => {}
+        }
+        match runtime.get_iterator(dom, value)? {
+            Some((iterator, next)) => Ok(Self {
+                iterator: Some(iterator),
+                next: Some(next),
+                done: false,
+                values: None,
+            }),
+            None => Err(JsError::type_error(format!(
+                "{} is not iterable",
+                describe_source(value)
+            ))),
+        }
+    }
+
+    /// An in-memory value list, used where the engine already knows the
+    /// elements without consulting `@@iterator`.
+    fn over(values: Vec<JsValue>) -> Self {
+        Self {
+            iterator: None,
+            next: None,
+            done: true,
+            values: Some(values.into_iter()),
+        }
+    }
+
+    /// `IteratorStep`, returning `undefined` once the source is exhausted so
+    /// a short source binds `undefined` rather than failing.
+    fn next(&mut self, runtime: &mut JsRuntime, dom: &mut Dom) -> Result<JsValue, JsError> {
+        if let Some(values) = &mut self.values {
+            return Ok(values.next().unwrap_or(JsValue::Undefined));
+        }
+        if self.done {
+            return Ok(JsValue::Undefined);
+        }
+        if let Some(value) = self.iterator_next_value(runtime, dom)? {
+            Ok(value)
+        } else {
+            self.done = true;
+            Ok(JsValue::Undefined)
+        }
+    }
+
+    /// Drain what is left into a real `Array`, which is what a rest element
+    /// binds even when the source was a typed array or a `Set`.
+    fn rest(&mut self, runtime: &mut JsRuntime, dom: &mut Dom) -> Result<ObjectId, JsError> {
+        let mut values = Vec::new();
+        if let Some(remaining) = &mut self.values {
+            values.extend(remaining.by_ref());
+        } else {
+            while let Some(value) = self.iterator_next_value(runtime, dom)? {
+                values.push(value);
+            }
+            self.done = true;
+        }
+        runtime.create_array_from_values(&values)
+    }
+
+    /// `IteratorClose`, for a pattern that finished before the source did.
+    ///
+    /// Never fails: a throwing `return` must not mask the completion that
+    /// prompted the close, which is why both this and the call are discarded.
+    fn close(&mut self, runtime: &mut JsRuntime, dom: &mut Dom) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let (Some(iterator), Some(_)) = (self.iterator, self.next) else {
+            return;
+        };
+        let return_method = runtime
+            .get_member(dom, iterator, "return")
+            .ok()
+            .filter(|value| {
+                matches!(value, JsValue::Object(object)
+                    if JsRuntime::is_callable_object(*object, &runtime.realm))
+            });
+        if let Some(JsValue::Object(return_method)) = return_method {
+            let _ = runtime.call_with_this(dom, return_method, &[], JsValue::Object(iterator));
+        }
+    }
+
+    fn iterator_next_value(
+        &mut self,
+        runtime: &mut JsRuntime,
+        dom: &mut Dom,
+    ) -> Result<Option<JsValue>, JsError> {
+        let (Some(iterator), Some(next)) = (self.iterator, self.next) else {
+            return Ok(None);
+        };
+        let result = runtime.iterator_next(dom, iterator, next)?;
+        if result.is_none() {
+            self.done = true;
+        }
+        Ok(result)
+    }
+}
+
+/// The wording a `TypeError` uses for a non-iterable source. The
+/// specification's own text differs per type, and matching the common cases is
+/// what a bundle's error handling keys on.
+fn describe_source(value: &JsValue) -> String {
+    match value {
+        JsValue::Null => "null".to_owned(),
+        JsValue::Undefined => "undefined".to_owned(),
+        JsValue::Object(_) => "object".to_owned(),
+        JsValue::Number(number) => format!("number {number}"),
+        JsValue::Boolean(value) => format!("boolean {value}"),
+        JsValue::Symbol(_) => "symbol".to_owned(),
+        JsValue::String(text) => text.clone(),
+    }
+}
+
 pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
     match statement {
         Statement::Variable {
@@ -123,8 +275,8 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
             declarations,
             ..
         } => {
-            for (name, _) in declarations {
-                names.insert(name.clone());
+            for (target, _) in declarations {
+                names.extend(target.names());
             }
         }
         Statement::If {
@@ -267,14 +419,16 @@ impl JsRuntime {
                 Statement::VariableList {
                     kind, declarations, ..
                 } => {
-                    for (name, _) in declarations {
-                        if *kind == VariableKind::Var {
-                            var_names.insert(name.clone());
-                        } else if lexical_declarations.insert(name.clone(), *kind).is_some() {
-                            return Err(JsError::syntax(
-                                format!("binding {name:?} is declared more than once"),
-                                0,
-                            ));
+                    for (target, _) in declarations {
+                        for name in target.names() {
+                            if *kind == VariableKind::Var {
+                                var_names.insert(name);
+                            } else if lexical_declarations.insert(name.clone(), *kind).is_some() {
+                                return Err(JsError::syntax(
+                                    format!("binding {name:?} is declared more than once"),
+                                    0,
+                                ));
+                            }
                         }
                     }
                 }
@@ -337,14 +491,16 @@ impl JsRuntime {
                     declarations: variables,
                     ..
                 } => {
-                    for (name, _) in variables {
-                        if *kind != VariableKind::Var
-                            && declarations.insert(name.clone(), *kind).is_some()
-                        {
-                            return Err(JsError::syntax(
-                                format!("binding {name:?} is declared more than once"),
-                                0,
-                            ));
+                    for (target, _) in variables {
+                        for name in target.names() {
+                            if *kind != VariableKind::Var
+                                && declarations.insert(name.clone(), *kind).is_some()
+                            {
+                                return Err(JsError::syntax(
+                                    format!("binding {name:?} is declared more than once"),
+                                    0,
+                                ));
+                            }
                         }
                     }
                 }
@@ -569,12 +725,26 @@ impl JsRuntime {
                 kind, declarations, ..
             } => {
                 let mut value = JsValue::Undefined;
-                for (name, expression) in declarations {
+                for (target, expression) in declarations {
                     if let Some(expression) = expression {
                         value = self.evaluate(dom, expression)?;
-                        self.initialize_binding(name, value.clone(), *kind)?;
+                        match target {
+                            BindingTarget::Name(name) => {
+                                self.initialize_binding(name, value.clone(), *kind)?;
+                            }
+                            BindingTarget::Pattern(pattern) => {
+                                self.initialize_binding_pattern(
+                                    dom,
+                                    pattern,
+                                    value.clone(),
+                                    *kind,
+                                )?;
+                            }
+                        }
                     } else if *kind == VariableKind::Let {
-                        self.initialize_binding(name, JsValue::Undefined, *kind)?;
+                        if let BindingTarget::Name(name) = target {
+                            self.initialize_binding(name, JsValue::Undefined, *kind)?;
+                        }
                     }
                 }
                 Ok(Completion::Normal(value))
@@ -1147,13 +1317,6 @@ impl JsRuntime {
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
             Expr::Spread(expression) => self.evaluate(dom, expression),
-            Expr::ObjectRest {
-                object, excluded, ..
-            } => {
-                let value = self.evaluate(dom, object)?;
-                self.create_object_rest(&value, excluded)
-                    .map(JsValue::Object)
-            }
             Expr::Unary {
                 operator: UnaryOp::Delete,
                 operand,
@@ -1404,6 +1567,118 @@ impl JsRuntime {
         }
     }
 
+    /// `BindingInitialization` (ECMA-262 8.5.3): walk a declaration pattern
+    /// and initialize each leaf binding.
+    ///
+    /// This is deliberately *not* an `assign_destructuring_target` call on a
+    /// synthesized target. The array form draws its values from the iterator
+    /// protocol: `var [a] = map` binds the map's first entry, `var [a] = new
+    /// Uint8Array(..)` goes through `@@iterator`, and a source with no
+    /// `@@iterator` throws a `TypeError` instead of quietly reading indexed
+    /// properties off an object that happens to have them.
+    pub(super) fn initialize_binding_pattern(
+        &mut self,
+        dom: &mut Dom,
+        pattern: &BindingPattern,
+        value: JsValue,
+        kind: VariableKind,
+    ) -> Result<(), JsError> {
+        match pattern {
+            BindingPattern::Identifier(name) => self.initialize_binding(name, value, kind),
+            BindingPattern::Default {
+                pattern,
+                value: fallback,
+            } => {
+                let value = if matches!(value, JsValue::Undefined) {
+                    self.evaluate(dom, fallback)?
+                } else {
+                    value
+                };
+                self.initialize_binding_pattern(dom, pattern, value, kind)
+            }
+            BindingPattern::Object { properties, rest } => {
+                // `BindingInitialization` for an object pattern starts from
+                // `RequireObjectCoercible`: `null` and `undefined` throw,
+                // while a primitive boxes so `var {length} = 'abc'` works.
+                if matches!(value, JsValue::Null | JsValue::Undefined) {
+                    return Err(JsError::type_error(format!(
+                        "Cannot destructure '{}' as it is {}",
+                        value.to_js_string(),
+                        value.to_js_string()
+                    )));
+                }
+                let object = self.to_object(&value)?;
+                let mut excluded: Vec<String> = Vec::new();
+                for (key, pattern) in properties {
+                    let name = match key {
+                        PropertyKey::Static(name) => name.clone(),
+                        PropertyKey::Computed(expression) => {
+                            self.evaluate(dom, expression)?.to_js_string()
+                        }
+                        PropertyKey::Spread => {
+                            unreachable!("the rest element is parsed separately")
+                        }
+                        PropertyKey::Private(_) => {
+                            unreachable!("a binding pattern cannot carry a private name")
+                        }
+                    };
+                    // Read before pushing the exclusion so the getter runs even
+                    // when a later property repeats the key.
+                    let property_value = self.get_member(dom, object, &name)?;
+                    excluded.push(name);
+                    self.initialize_binding_pattern(dom, pattern, property_value, kind)?;
+                }
+                if let Some(rest) = rest {
+                    let object = self.create_object_rest(dom, &value, &excluded)?;
+                    self.initialize_binding_pattern(dom, rest, JsValue::Object(object), kind)?;
+                }
+                Ok(())
+            }
+            BindingPattern::Array { elements, rest } => {
+                let mut iterator = ArrayDestructuring::open(self, dom, &value)?;
+                // An abrupt completion part-way through the pattern still has
+                // to close the iterator, or a source holding a resource leaks
+                // it. The original error wins; `close` never masks it.
+                let outcome = (|| -> Result<(), JsError> {
+                    for element in elements {
+                        match element {
+                            Some(pattern) => {
+                                let element = iterator.next(self, dom)?;
+                                self.initialize_binding_pattern(dom, pattern, element, kind)?;
+                            }
+                            // An elision still consumes a value. `[,,a]` over
+                            // five values reads three of them, not one, and a
+                            // source counting its own steps sees the difference.
+                            None => {
+                                iterator.next(self, dom)?;
+                            }
+                        }
+                    }
+                    match rest {
+                        Some(rest) => {
+                            let remaining = iterator.rest(self, dom)?;
+                            self.initialize_binding_pattern(
+                                dom,
+                                rest,
+                                JsValue::Object(remaining),
+                                kind,
+                            )?;
+                        }
+                        // A pattern that consumed fewer values than the source
+                        // offers must close the iterator rather than drain it,
+                        // or an endless generator would never terminate.
+                        None => iterator.close(self, dom),
+                    }
+                    Ok(())
+                })();
+                if outcome.is_err() {
+                    iterator.close(self, dom);
+                }
+                outcome
+            }
+        }
+    }
+
     pub(super) fn assign_destructuring_target(
         &mut self,
         dom: &mut Dom,
@@ -1448,18 +1723,26 @@ impl JsRuntime {
                 Ok(())
             }
             Expr::Object(properties) => {
-                // `BindingInitialization` for an object pattern starts with
-                // `ToObject`, so a primitive destructuring target boxes into
-                // its wrapper instead of throwing; only `null`/`undefined`
-                // produce a fresh object to assign onto.
-                let object = match &value {
-                    JsValue::Null | JsValue::Undefined => self.realm.create_ordinary_object(),
-                    other => self.to_object(other)?,
-                };
+                // `DestructuringAssignmentEvaluation` for an object pattern
+                // starts with `RequireObjectCoercible`, which throws for
+                // `null` and `undefined` while a primitive boxes into its
+                // wrapper. The earlier version of this comment claimed
+                // `ToObject` and invented a fresh object for the nullish
+                // case; that is not what the specification says, and it left
+                // `({a} = undefined)` silently assigning `undefined` where
+                // every real engine throws.
+                if matches!(value, JsValue::Null | JsValue::Undefined) {
+                    return Err(JsError::type_error(format!(
+                        "Cannot destructure '{}' as it is {}",
+                        value.to_js_string(),
+                        value.to_js_string()
+                    )));
+                }
+                let object = self.to_object(&value)?;
                 let mut excluded = Vec::new();
                 for property in properties {
                     if matches!(&property.key, PropertyKey::Spread) {
-                        let rest = self.create_object_rest(&value, &excluded)?;
+                        let rest = self.create_object_rest(dom, &value, &excluded)?;
                         self.assign_destructuring_target(
                             dom,
                             &property.value,
@@ -2173,11 +2456,12 @@ impl JsRuntime {
                 match self.evaluate(dom, &property.value)? {
                     JsValue::Null | JsValue::Undefined => {}
                     JsValue::Object(source) => {
-                        for (key, value) in self
-                            .realm
-                            .enumerable_own_properties(source)
-                            .unwrap_or_default()
-                        {
+                        // `CopyDataProperties` reads each key with `Get`, so a
+                        // getter on the spread source contributes its result
+                        // rather than the descriptor's empty value slot.
+                        let keys = self.realm.enumerable_own_keys(source).unwrap_or_default();
+                        for key in keys {
+                            let value = self.get_member(dom, source, &key)?;
                             if !self.realm.set_property(object, key, value) {
                                 return Err(JsError::type_error(
                                     "could not define spread object property",
@@ -2302,6 +2586,7 @@ impl JsRuntime {
 
     pub(super) fn create_object_rest(
         &mut self,
+        dom: &mut Dom,
         value: &JsValue,
         excluded: &[String],
     ) -> Result<ObjectId, JsError> {
@@ -2311,16 +2596,20 @@ impl JsRuntime {
         // Object rest starts with `CopyDataProperties`, whose first step is
         // `ToObject`, so a primitive rest source boxes into its wrapper.
         let source = self.to_object(value)?;
-        let properties = self
-            .realm
-            .enumerable_own_properties(source)
-            .unwrap_or_default();
+        let keys = self.realm.enumerable_own_keys(source).unwrap_or_default();
         // Reserve the result before reading the wrapper's keys so no collection
         // can tombstone the wrapper between the two steps.
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
-        for (key, value) in properties {
-            if !excluded.contains(&key) && !self.realm.set_property(result, key, value) {
+        for key in keys {
+            if excluded.contains(&key) {
+                continue;
+            }
+            // `CopyDataProperties` reads each key with `Get`, so a getter on
+            // the source runs and contributes its result. Copying the
+            // descriptor's value slot instead silently dropped every accessor.
+            let property_value = self.get_member(dom, source, &key)?;
+            if !self.realm.set_property(result, key, property_value) {
                 return Err(JsError::type_error("could not define object rest property"));
             }
         }
@@ -3650,6 +3939,7 @@ impl JsRuntime {
                 | ObjectHost::FunctionConstructor
                 | ObjectHost::DateConstructor
                 | ObjectHost::ErrorConstructor(_)
+                | ObjectHost::AggregateErrorConstructor
                 | ObjectHost::PromiseConstructor
                 | ObjectHost::EventConstructor
                 | ObjectHost::DomConstructor
@@ -3842,6 +4132,10 @@ impl JsRuntime {
             }
             Some(ObjectHost::DomExceptionConstructor) => {
                 self.dom_exception_constructor(constructor, arguments)
+            }
+            // Like every `Error` subclass, `AggregateError` needs `new`.
+            Some(ObjectHost::AggregateErrorConstructor) => {
+                self.aggregate_error_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::PromiseConstructor) => {
                 let executor = Self::require_callable_object(
@@ -4688,7 +4982,6 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         Expr::RegexLiteral { offset, .. }
         | Expr::Function { offset, .. }
         | Expr::Arrow { offset, .. }
-        | Expr::ObjectRest { offset, .. }
         | Expr::Unary { offset, .. }
         | Expr::Binary { offset, .. }
         | Expr::Conditional { offset, .. }

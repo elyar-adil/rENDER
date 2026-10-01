@@ -335,10 +335,26 @@ fn describe_mechanism(key: &str, file: &FileResult) -> (String, crate::mechanism
                 .to_owned(),
             Category::AcceptableDifference,
         ),
+        "idl-default-not-initialised" => (
+            "the engine's host objects do not initialise the default values their Web IDL \
+             declares: WPT asserted a property equalled a boolean, a string or a number, and \
+             the engine returned `undefined`. `Event.cancelBubble` must default to `false`, \
+             `cancelable` to `false`, and so on. This is the largest genuine defect family and \
+             it is **one omission**, not hundreds: the defaults live in each interface's IDL, so \
+             the fix is to read the declared default when constructing the host object."
+                .to_owned(),
+            Category::EngineDefect,
+        ),
+        "wrong-value" => (
+            "the engine returned a value and it was not the value WPT expected. Both sides were \
+             present, so this is a wrong answer rather than a missing one - the one category \
+             that is unambiguously a bug."
+                .to_owned(),
+            Category::EngineDefect,
+        ),
         "value-shape-differs" => (
-            "the engine returned a value of the wrong shape: wrong type, or wrong length \
-             where WPT expected an array or collection. This is the largest genuine \
-             defect family in the run, and it is one family, not 2,105."
+            "the engine returned a value of the wrong shape - wrong type, or a collection of \
+             the wrong length where WPT expected an array."
                 .to_owned(),
             Category::EngineDefect,
         ),

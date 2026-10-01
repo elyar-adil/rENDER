@@ -17,4 +17,7 @@ pub use tokenizer::{
     AttributeToken, ContentModel, DoctypeToken, HtmlParseError, HtmlParseErrorCode, TagToken,
     Token, Tokenizer,
 };
-pub use tree_builder::{ParseOutput, QuirksMode, parse_document, parse_document_with_scripting};
+pub use tree_builder::{
+    FragmentContext, FragmentParseOutput, ParseOutput, QuirksMode, parse_document,
+    parse_document_with_scripting, parse_html_fragment_with_scripting,
+};

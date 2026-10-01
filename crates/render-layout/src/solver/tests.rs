@@ -1524,13 +1524,15 @@ fn column_flex_justify_content_positions_items_along_the_vertical_main_axis() {
     );
 }
 
-// A column flex container with `align-items:center` must center an
-// auto-width (max-content) child on the cross axis, and that child's
-// intrinsic width must be clamped to the container line (fit-content) so
-// the centered item stays inside the containing block instead of
-// overflowing symmetrically off-screen.
+// A column flex container with `align-items:center` gives an auto-width child
+// the fit-content size, and `center` is the *unsafe* default, so an item wider
+// than the line overflows both edges. CSS Flexbox §9.4.8 and CSS Sizing 3 §5.2
+// make fit-content `min(max-content, max(min-content, available))`: the
+// available width is the clamp, but the min-content size is a floor under it,
+// so a child whose own content cannot fit in the line keeps its min-content
+// width and overflows, which is what a negative offset below records.
 #[test]
-fn column_flex_align_center_clamps_auto_width_item_to_the_flex_line() {
+fn column_flex_align_center_sizes_an_auto_width_item_to_fit_content() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='column'><div id='panel'><div id='inner'></div><div id='wide'></div></div></div></body>",
         "html, body, div { display:block; margin:0 } \
@@ -1549,12 +1551,13 @@ fn column_flex_align_center_clamps_auto_width_item_to_the_flex_line() {
             .rect
     };
     let panel = fragment_for("#panel");
-    assert!(
-        panel.size.width <= 800.0,
-        "auto-width panel must clamp to the flex line, got {}",
-        panel.size.width
-    );
-    assert!(panel.origin.x >= 0.0, "centered panel must stay on-screen");
+    // Both children have a definite `width`, so the panel's min-content and
+    // max-content main sizes are both 200 + 2000, and fit-content is that.
+    assert_eq!(panel.size.width, 2200.0);
+    // §5.3's `center` is unsafe, so the 700px of overflow is split evenly and
+    // the panel starts off the left edge. `safe center` is what would move it
+    // back, and this document did not ask for it.
+    assert_eq!(panel.origin.x, -700.0);
     let inner = fragment_for("#inner");
     assert_eq!(inner.size.width, 200.0);
     let expected_x = panel.origin.x + (panel.size.width - 200.0) / 2.0;
@@ -1562,6 +1565,36 @@ fn column_flex_align_center_clamps_auto_width_item_to_the_flex_line() {
         (inner.origin.x - expected_x).abs() < 0.5,
         "inner box must be centered within the panel"
     );
+}
+
+// The floor only holds where the content itself cannot shrink. An item whose
+// min-content width fits the line is still clamped by the line's width, which
+// is what §9.4.8's `available` term is for and what keeps a `center`ed item of
+// wrappable content on screen.
+#[test]
+fn column_flex_align_center_still_clamps_wrappable_content_to_the_line() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='column'><div id='panel'>first second third fourth fifth sixth seventh eighth ninth tenth eleventh twelfth</div></div></body>",
+        "html, body, div { display:block; margin:0 } \
+         #column { display:flex; flex-direction:column; align-items:center; width:300px; height:600px } \
+         #panel { display:block; width:auto }",
+        300.0,
+    );
+    let fragment_for = |selector| {
+        layout
+            .fragments
+            .iter()
+            .find(|fragment| fragment.source == Some(find(&output.dom, selector)))
+            .expect("fragment")
+            .rect
+    };
+    let panel = fragment_for("#panel");
+    // max-content is all eleven words on one line, min-content is the widest
+    // single word, and 300 is between them, so fit-content is the available
+    // width.
+    assert_eq!(panel.size.width, 300.0, "{panel:?}");
+    assert!(panel.origin.x >= 0.0, "centered panel must stay on-screen");
+    assert_eq!(panel.origin.x, 0.0);
 }
 
 // CSS 2 §10.5: a percentage height against an indefinite containing height

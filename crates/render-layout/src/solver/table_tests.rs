@@ -549,6 +549,110 @@ fn a_hidden_border_still_wins_when_the_first_claim_alone_would_have_won() {
 }
 
 #[test]
+fn a_wider_cell_border_takes_an_outer_grid_line_from_the_table() {
+    // §17.6.2.1 has no exception for the table at any width. Rule 2 - a wider
+    // border wins - comes before rule 4, and the table is only *last* in rule
+    // 4's colour-only tie, so `table { border: 1px }` beside
+    // `td { border: 8px }` resolves the outer line to the cell's 8px.
+    //
+    // A resolution that gave the table every outer line kept its 1px and
+    // collapsed the cell's 8px to nothing. That paints a 1px line where the
+    // specification resolves an 8px one, and it measured the table at 324
+    // against a grid that needs 338 - the whole of the difference being the two
+    // outer lines the table took by being the table.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse;\
+          border:1px solid'>\
+         <tr><td id='a' style='border:8px solid'>a</td>\
+           <td id='b' style='border:8px solid'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    let table = rect(&layout, find(dom, "#t"));
+    let a = rect(&layout, find(dom, "#a"));
+    let b = rect(&layout, find(dom, "#b"));
+    // The cell keeps the resolved line and the table's own border collapses to
+    // nothing, in both directions and on both outer lines.
+    assert_eq!(border_of(&layout, find(dom, "#a")).left, 8.0);
+    assert_eq!(border_of(&layout, find(dom, "#b")).right, 8.0);
+    assert_eq!(border_of(&layout, find(dom, "#t")).left, 0.0);
+    assert_eq!(border_of(&layout, find(dom, "#t")).right, 0.0);
+    // The grid starts at the table's border edge - a table whose left border
+    // collapsed to nothing puts its first cell at its own left edge - and the
+    // cells tile it exactly.
+    assert!(near(a.origin.x, table.origin.x), "{a:?} {table:?}");
+    assert!(near(b.origin.x, a.right()), "{a:?} {b:?}");
+    assert!(near(b.right(), table.right()), "{b:?} {table:?}");
+}
+
+#[test]
+fn an_equal_outer_claim_does_not_go_to_the_table_by_being_the_table() {
+    // §17.6.2.1 gives the table no exemption, so a cell and the table claiming
+    // the same outer line with the same width and style are decided like any
+    // other tie. What the cell gets is rule 4's type order ("a style set on a
+    // cell wins over ... and, lastly, table") arriving through collection order,
+    // because the cells are collected before the table's own claims.
+    //
+    // What this asserts is the negative, which is the part that was wrong: the
+    // table's own border is *not* kept by fiat. A resolution that short-circuited
+    // on table-ness gave the table 1px here too, and put 2px of border on a grid
+    // line the specification resolves to 1px.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse;\
+          border:1px solid'>\
+         <tr><td id='a' style='border:1px solid'>a</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    assert_eq!(border_of(&layout, find(dom, "#a")).left, 1.0);
+    assert_eq!(border_of(&layout, find(dom, "#t")).left, 0.0);
+    assert!(near(
+        rect(&layout, find(dom, "#a")).origin.x,
+        rect(&layout, find(dom, "#t")).origin.x
+    ));
+}
+
+#[test]
+fn a_fixed_layout_table_is_at_least_as_wide_as_its_columns() {
+    // §17.5.2.1: "The width of the table is then the greater of the value of
+    // the 'width' property for the table element and the sum of the column
+    // widths (plus cell spacing or borders)." A cell's `width` is a *content*
+    // width (§10.4), so three 100px cells with the user-agent sheet's 1px
+    // padding need 102 each - 306 - and a table that declared 300 has to grow
+    // to hold them.
+    //
+    // Answering with the declared width alone left the table 300 wide while its
+    // cells tiled 306, so the last cell hung 6px outside the table box: the
+    // table's own box no longer contained its own grid.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t'>\
+         <tr><td id='a'>a</td><td id='b'>b</td><td id='c'>c</td></tr>\
+         </table></body>",
+        &format!(
+            "{TABLE_CSS} table {{ width: 300px; table-layout: fixed }} \
+                  td {{ width: 100px; padding: 1px }}"
+        ),
+        900.0,
+    );
+    let dom = &output.dom;
+    let table = rect(&layout, find(dom, "#t"));
+    assert!(near(table.size.width, 306.0), "{table:?}");
+    let mut expected_x = table.origin.x;
+    for selector in ["#a", "#b", "#c"] {
+        let cell = rect(&layout, find(dom, selector));
+        assert!(near(cell.size.width, 102.0), "{selector}: {cell:?}");
+        assert!(near(cell.origin.x, expected_x), "{selector}: {cell:?}");
+        expected_x = cell.right();
+    }
+    // Every cell is inside the table, which is the whole of the defect.
+    assert!(near(expected_x, table.right()), "{table:?}");
+}
+
+#[test]
 fn collapsed_borders_remove_the_border_spacing() {
     let (output, _, layout) = pipeline(
         "<!doctype html><body><table id='t' style='width:200px;\
@@ -1492,8 +1596,21 @@ fn zprobe_fixture() {
         };
         if !matches!(
             element.local_name.as_str(),
-            "table" | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup"
-                | "main" | "article" | "aside" | "section" | "div" | "p"
+            "table"
+                | "caption"
+                | "thead"
+                | "tbody"
+                | "tfoot"
+                | "tr"
+                | "td"
+                | "th"
+                | "colgroup"
+                | "main"
+                | "article"
+                | "aside"
+                | "section"
+                | "div"
+                | "p"
         ) {
             continue;
         }
@@ -1509,17 +1626,18 @@ fn zprobe_fixture() {
     println!("--- all divs ---");
     for f in layout.fragments.iter() {
         let Some(source) = f.source else { continue };
-        let Some(node) = output.dom.node(source) else { continue };
-        let render_dom::NodeKind::Element(element) = node.kind() else { continue };
+        let Some(node) = output.dom.node(source) else {
+            continue;
+        };
+        let render_dom::NodeKind::Element(element) = node.kind() else {
+            continue;
+        };
         if element.local_name != "div" {
             continue;
         }
         println!(
             "div x={:.2} y={:.2} w={:.2} h={:.2}",
-            f.rect.origin.x,
-            f.rect.origin.y,
-            f.rect.size.width,
-            f.rect.size.height
+            f.rect.origin.x, f.rect.origin.y, f.rect.size.width, f.rect.size.height
         );
     }
 }

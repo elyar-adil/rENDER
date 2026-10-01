@@ -197,9 +197,25 @@ SITE_TOKEN = re.compile(
     + r"(?:taobao|tmall|alibaba|jd\.com|jingdong|163\.com|netease|163cn|"
     r"bilibili|bilivideo|zhihu|douyin|tiktok|weibo|sina|sohu|tencent|qq\.com|"
     r"baidu|youku|iqiyi|kuaishou|dianping|meituan|ctrip|58\.com|lagou|"
-    r"xiaohongshu|douban|zhuanlan|csdn|jianshu)"
+    r"xiaohongshu|douban|zhuanlan|csdn|jianshu|hao123)"
     + _TOKEN_AFTER,
     re.IGNORECASE,
+)
+
+# Two corpus directory names are deliberately NOT in SITE_TOKEN: a bare `qq` and a
+# bare `163`. Both are unambiguous as a corpus directory and ambiguous as text - `qq`
+# is a routine variable name and `163` occurs in port numbers, byte counts and
+# offsets - so adding them here would flood the gate with false positives and block
+# every agent in the tree. That is a worse outcome than a narrow miss.
+#
+# The real gap is narrower than "the token is missing": it is that a *path literal*
+# naming a corpus directory whose brand token is not a token escapes `site-path`.
+# The fix is to anchor those two to path positions specifically, which is a change
+# to the rule's shape rather than to its list, and it is recorded as open rather
+# than guessed at here. What the list does cover is why
+# `crates/render-js/src/runtime/tests.rs` reading `.diag/bilibili/*` is caught today.
+BARE_SITE_SEGMENT = re.compile(
+    r"(?:^|[/\\.])(?:qq|163)(?:[/\\]|$)", re.IGNORECASE
 )
 
 # A bare IPv4 literal. Loopback and the RFC 5737 documentation range are allowlisted.

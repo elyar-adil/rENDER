@@ -27,10 +27,12 @@ fn main() {
     let bytes = source.len();
     std::thread::Builder::new()
         .stack_size(512 * 1024 * 1024)
-        .spawn(move || match CompiledScript::compile(&source, &RuntimeLimits::default()) {
-            Ok(compiled) => println!("ok {}", compiled.source().len()),
-            Err(error) => println!("err kind={:?} {error}", error.kind()),
-        })
+        .spawn(
+            move || match CompiledScript::compile(&source, &RuntimeLimits::default()) {
+                Ok(compiled) => println!("ok {}", compiled.source().len()),
+                Err(error) => println!("err kind={:?} {error}", error.kind()),
+            },
+        )
         .expect("spawn")
         .join()
         .expect("join");

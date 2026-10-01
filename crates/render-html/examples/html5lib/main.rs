@@ -39,9 +39,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use render_dom::{Dom, Namespace, NodeId, NodeKind};
-use render_html::{parse_document_with_scripting, serialize_html_fragment_with_scripting};
+use render_html::{
+    FragmentContext, QuirksMode, parse_document_with_scripting, parse_html_fragment_with_scripting,
+    serialize_html_fragment_with_scripting,
+};
 
-use dat::DatTest;
+use dat::{ContextElement, DatTest};
 use dump::{DiffEvent, TreeDiff};
 
 /// The maximum number of diff events recorded per test. Enough to see a whole
@@ -297,6 +300,9 @@ struct CaseResult {
     actual_serialization: Option<String>,
     expected_error_count: usize,
     actual_error_count: usize,
+    /// The parser's diagnostics, as its own error-code names, for the cases
+    /// where the count is the interesting part. Reporting only; never compared.
+    actual_error_codes: Vec<String>,
     /// Set when the runner could not evaluate the test at all.
     note: Option<String>,
 }
@@ -387,7 +393,115 @@ impl Report {
             self.print_files();
         }
         self.print_error_gaps(options);
+        if !options.quiet_tables {
+            self.print_fragment_table();
+        }
         self.print_failures(options);
+    }
+
+    /// The `#document-fragment` cases, by context element, with the capability
+    /// each one needs and where that capability lives.
+    ///
+    /// This table exists because the fragment cases were once a tenth of the
+    /// whole suite in a single bucket called "unimplemented", with nothing in it
+    /// ever broken down -- and a count nobody has examined is how a whole class
+    /// of work stays invisible. It is also the only table that answers "what
+    /// should be built next", because a context element names the algorithm step
+    /// it exercises: a `table` context is the insertion-mode reset, an `svg` one
+    /// is the foreign-content dispatcher, a `textarea` one is the tokenizer's
+    /// starting state, and a `select` one is the two `(fragment case)` clauses
+    /// 13.2.6.4.7 hangs on the context element.
+    ///
+    /// The group column is one of four, and the four are the buckets a case the
+    /// engine cannot pass can be in:
+    ///
+    /// | group | meaning |
+    /// | --- | --- |
+    /// | `spec-algorithm` | a specification-defined algorithm, named |
+    /// | `other-crate` | a capability in another crate |
+    /// | `ruled-out` | a browser behaviour this project has ruled out |
+    /// | `harness` | a data shape or comparison convention |
+    ///
+    /// The classification is a rule table keyed on the context element, and its
+    /// fall-through is `spec-algorithm` with the algorithm named, because a
+    /// `#document-fragment` case that reaches an unrecognised rule is still a
+    /// case that needs 13.4. **The other three groups are empty for this corpus
+    /// and that is a fact about the corpus, not luck**: a `.dat` file is a string
+    /// and a tree, so it cannot express a second document, a script that runs, a
+    /// fetch, a media element or a worker, and the `.dat` format's
+    /// `#document-fragment` section names only a namespace and a local name. Any
+    /// case that did need one of those would have to arrive in a different file
+    /// format, and until one does this table would show the group as 0.
+    fn print_fragment_table(&self) {
+        let mut groups: BTreeMap<(String, GapGroup, String), BTreeMap<Outcome, usize>> =
+            BTreeMap::new();
+        let mut context_totals: BTreeMap<String, usize> = BTreeMap::new();
+        for result in &self.results {
+            let Some(context) = &result.test.fragment_context else {
+                continue;
+            };
+            let (group, capability) = fragment_gap(context);
+            *groups
+                .entry((context.to_string(), group, capability))
+                .or_default()
+                .entry(result.outcome)
+                .or_insert(0) += 1;
+            *context_totals.entry(context.to_string()).or_insert(0) += 1;
+        }
+        if context_totals.is_empty() {
+            return;
+        }
+        let total: usize = context_totals.values().sum();
+        let of_all = |wanted: Outcome| {
+            self.results
+                .iter()
+                .filter(|r| r.test.fragment_context.is_some())
+                .filter(|r| r.outcome == wanted)
+                .count()
+        };
+        println!(
+            "fragment cases (13.4), by context element: {total} cases, {} pass, {} acceptable \
+             difference, {} defect",
+            of_all(Outcome::Pass),
+            of_all(Outcome::AcceptableDifference),
+            of_all(Outcome::EngineDefect)
+        );
+        println!(
+            "  {:>6}  {:>5}  {:>5}  {:>5}  {:<14} context element / capability",
+            "cases", "pass", "ok-d", "defect", "group"
+        );
+        let mut rows = groups.into_iter().collect::<Vec<_>>();
+        rows.sort_by(|left, right| {
+            right
+                .1
+                .values()
+                .sum::<usize>()
+                .cmp(&left.1.values().sum::<usize>())
+        });
+        let mut by_group = [0usize; 4];
+        for ((_, group, _), counts) in &rows {
+            by_group[group_index(*group)] += counts.values().sum::<usize>();
+        }
+        for ((context, group, capability), counts) in rows {
+            let cases: usize = counts.values().sum();
+            let of = |outcome: Outcome| counts.get(&outcome).copied().unwrap_or(0);
+            println!(
+                "  {cases:>6}  {:>5}  {:>5}  {:>5}  {:<14} {context}",
+                of(Outcome::Pass),
+                of(Outcome::AcceptableDifference),
+                of(Outcome::EngineDefect),
+                group.label()
+            );
+            println!("           {}", capability);
+        }
+        // All four buckets, so that the three empty ones are *visible* as zero
+        // rather than absent. A bucket nobody can see is a bucket nobody counts.
+        println!();
+        println!("  the same cases by bucket:");
+        for group in GapGroup::ALL {
+            println!("  {:>6}  {}", by_group[group_index(group)], group.label());
+        }
+        println!();
     }
 
     /// The suite's `#errors` sections say only how many parse errors a
@@ -398,9 +512,23 @@ impl Report {
     /// it: a parser can build the right tree and still report the wrong number
     /// of errors, and a reader deciding whether to trust a tree figure has no way
     /// to see that unless the two are apart.
+    ///
+    /// **Two numbers are printed, and the corpus contradicts itself about which
+    /// is right.** `tree-construction/README.md` says `#new-errors` "works like
+    /// the `#errors` section adding more errors to the expected number of errors",
+    /// which is the *sum*. The data says otherwise: 20 cases name one identical
+    /// condition in both sections and 291 of the 295 cases carrying a
+    /// `#new-errors` have one at least as short as their `#errors`, so most of
+    /// them are the same conditions under their current names. The agreement
+    /// figure is therefore reported under both readings, the larger one first as
+    /// the *scored* figure because it is the reading the data supports, and the
+    /// sum beside it so a reader can see exactly how much of the gap is the
+    /// choice of reading rather than the parser. Neither is a conformance claim
+    /// beyond "at least one" and "none", which is what 13.2.2 requires.
     fn print_error_counts(&self) {
         let mut compared = 0usize;
         let mut matching = 0usize;
+        let mut matching_sum = 0usize;
         let mut under = 0usize;
         let mut over = 0usize;
         for result in &self.results {
@@ -408,6 +536,10 @@ impl Report {
                 continue;
             }
             compared += 1;
+            let summed = result.test.expected_error_count + result.test.expected_new_error_count;
+            if summed == result.actual_error_count {
+                matching_sum += 1;
+            }
             match result.actual_error_count.cmp(&result.expected_error_count) {
                 std::cmp::Ordering::Equal => matching += 1,
                 std::cmp::Ordering::Less => under += 1,
@@ -417,14 +549,18 @@ impl Report {
         if compared == 0 {
             return;
         }
+        let percent = |count: usize| {
+            100.0 * f64::from(u32::try_from(count).unwrap_or(u32::MAX)) / compared as f64
+        };
         println!(
-            "  parse-error counts agree      {:>6}  ({}/{}, {:.2}%)   [reported, not part of the tree figure]",
-            matching,
-            matching,
-            compared,
-            100.0 * f64::from(u32::try_from(matching).unwrap_or(u32::MAX)) / compared as f64
+            "  parse-error counts agree      {matching:>6}  ({matching}/{compared}, {:.2}%)   [reported, not part of the tree figure]",
+            percent(matching)
         );
         println!("  reported fewer than expected  {under:>6}   reported more: {over}");
+        println!(
+            "  ... under the other reading of `#new-errors` ({matching_sum}/{compared}, {:.2}%); the gap between the two lines is the choice of reading, not the parser",
+            percent(matching_sum)
+        );
     }
 
     /// The error-count gap, grouped by *how far off* each case is and by
@@ -450,7 +586,11 @@ impl Report {
             if delta == 0 {
                 continue;
             }
-            let id = format!("{} [{}]", result.test.id(), mode_name(result.scripting_enabled));
+            let id = format!(
+                "{} [{}]",
+                result.test.id(),
+                mode_name(result.scripting_enabled)
+            );
             groups
                 .entry((delta, result.outcome == Outcome::Pass))
                 .or_default()
@@ -459,8 +599,8 @@ impl Report {
         println!();
         println!("parse-error gaps, by signed delta (negative = under-reported)");
         println!(
-            "  {:>6}  {:>10}  {:>6}  {}",
-            "delta", "tree right", "cases", "example"
+            "  {:>6}  {:>10}  {:>6}  example",
+            "delta", "tree right", "cases"
         );
         for ((delta, tree_right), cases) in &groups {
             println!(
@@ -594,6 +734,31 @@ impl Report {
                 "  errors:    suite expects {}, parser reported {}",
                 result.expected_error_count, result.actual_error_count
             );
+            if result.test.fragment_context.is_none() {
+                // The suite's own words for its errors, next to the parser's.
+                // Only the *count* is a conformance requirement, so this is
+                // reporting and not a comparison -- but a count with no names
+                // beside it cannot be acted on, and this is what turns "reports
+                // one error too few" into a rule to go and read.
+                if !result.test.expected_error_names.is_empty() {
+                    println!("  suite says:");
+                    for name in &result.test.expected_error_names {
+                        println!("    {name}");
+                    }
+                }
+                if !result.test.expected_new_error_names.is_empty() {
+                    println!("  suite says (current names):");
+                    for name in &result.test.expected_new_error_names {
+                        println!("    {name}");
+                    }
+                }
+                if !result.actual_error_codes.is_empty() {
+                    println!("  parser says:");
+                    for code in &result.actual_error_codes {
+                        println!("    {code}");
+                    }
+                }
+            }
             if let (Some(expected), Some(actual)) =
                 (&result.expected_serialization, &result.actual_serialization)
             {
@@ -741,6 +906,121 @@ fn mode_name(scripting_enabled: bool) -> &'static str {
     }
 }
 
+/// Which of the four buckets a case the engine cannot pass outright is in.
+///
+/// The buckets are the ones a reader needs in order to act: the first is work in
+/// this tree, the second is work in another crate, the third is a decision not to
+/// do the work, and the fourth is a limitation of the measuring instrument
+/// rather than of the engine. Only the first is ever a bug list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum GapGroup {
+    /// A specification-defined algorithm this engine does not implement.
+    SpecAlgorithm,
+    /// A capability in a crate other than this one.
+    OtherCrate,
+    /// A browser behaviour this project has ruled out.
+    RuledOut,
+    /// A data shape or comparison convention the runner does not support.
+    Harness,
+}
+
+impl GapGroup {
+    const ALL: [Self; 4] = [
+        Self::SpecAlgorithm,
+        Self::OtherCrate,
+        Self::RuledOut,
+        Self::Harness,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::SpecAlgorithm => "spec-algorithm",
+            Self::OtherCrate => "other-crate",
+            Self::RuledOut => "ruled-out",
+            Self::Harness => "harness",
+        }
+    }
+}
+
+/// The bucket's position in [`GapGroup::ALL`], so a per-group count can be
+/// accumulated in a fixed array without a map.
+const fn group_index(group: GapGroup) -> usize {
+    match group {
+        GapGroup::SpecAlgorithm => 0,
+        GapGroup::OtherCrate => 1,
+        GapGroup::RuledOut => 2,
+        GapGroup::Harness => 3,
+    }
+}
+
+/// The capability a `#document-fragment` context element exercises, and the
+/// bucket it falls in.
+///
+/// A rule table keyed on the context element, because that is what the `.dat`
+/// format actually varies: the context is a namespace and a local name and
+/// nothing else. The fall-through is [`GapGroup::SpecAlgorithm`] with 13.4 named,
+/// which is the pessimistic direction -- a `#document-fragment` case that this
+/// function does not recognise is still a case that needs 13.4, and calling it
+/// anything else would be a runner inventing an excuse.
+fn fragment_gap(context: &ContextElement) -> (GapGroup, String) {
+    const SPEC: (GapGroup, &str) = (GapGroup::SpecAlgorithm, "");
+    let name = context.local_name.as_str();
+    if context.namespace != "html" {
+        return (
+            GapGroup::SpecAlgorithm,
+            "13.4 with a foreign context element: the adjusted current node, the \
+             foreign-content dispatcher, and the integration-point tests, all of \
+             which read the context element rather than the current node \
+             (13.2.4.1, 13.2.6.5) -- render-html"
+                .to_owned(),
+        );
+    }
+    match name {
+        "table" | "tbody" | "thead" | "tfoot" | "tr" | "td" | "th" | "caption" | "colgroup" => (
+            GapGroup::SpecAlgorithm,
+            "13.4's insertion-mode reset, with the table insertion modes' scope \
+             tests reaching the context element that is not on the stack \
+             (13.2.4.1, 13.2.6.4.9-15) -- render-html"
+                .to_owned(),
+        ),
+        "select" => (
+            GapGroup::SpecAlgorithm,
+            "the two `(fragment case)` clauses 13.2.6.4.7 hangs on the context \
+             element rather than the stack -- render-html"
+                .to_owned(),
+        ),
+        "title" | "textarea" | "style" | "xmp" | "iframe" | "noembed" | "noframes" | "noscript"
+        | "script" | "plaintext" => (
+            GapGroup::SpecAlgorithm,
+            "13.4's tokenizer-state step: the content model comes from the context \
+             element and there is no appropriate end tag token, so a text model \
+             runs to end of input -- render-html"
+                .to_owned(),
+        ),
+        "template" => (
+            GapGroup::SpecAlgorithm,
+            "13.4's push of 'in template' onto the stack of template insertion \
+             modes, so a cloned template's contents land in a fragment of their \
+             own -- render-html"
+                .to_owned(),
+        ),
+        "head" | "html" | "frameset" | "body" => (
+            GapGroup::SpecAlgorithm,
+            "13.4's insertion-mode reset at document level, including the 'before \
+             head' / 'after head' choice that turns on the head element pointer \
+             (13.2.4.1) -- render-html"
+                .to_owned(),
+        ),
+        _ => (
+            SPEC.0,
+            "13.4 in its ordinary form: the context element is the adjusted \
+             current node, the root insertion target takes the nodes, and the \
+             insertion mode is 'in body' -- render-html"
+                .to_owned(),
+        ),
+    }
+}
+
 /// One line describing the first difference, for the compact failure list.
 fn first_difference_text(diff: &TreeDiff) -> String {
     match diff.first() {
@@ -862,7 +1142,8 @@ fn run_suite(suite: &Suite, options: &Options) -> Vec<CaseResult> {
             let _ = test.scripting;
             let (outcome, mechanism, reason) = evaluate(&test, scripting_enabled);
             let (expected, actual, diff, serialization) = trees(&test, scripting_enabled);
-            let (expected_errors, actual_errors) = error_counts(&test, scripting_enabled);
+            let (expected_errors, actual_errors, actual_codes) =
+                error_counts(&test, scripting_enabled);
             results.push(CaseResult {
                 suite: suite.label.clone(),
                 test: test.clone(),
@@ -877,6 +1158,7 @@ fn run_suite(suite: &Suite, options: &Options) -> Vec<CaseResult> {
                 actual_serialization: serialization,
                 expected_error_count: expected_errors,
                 actual_error_count: actual_errors,
+                actual_error_codes: actual_codes,
                 note: None,
             });
         }
@@ -885,19 +1167,32 @@ fn run_suite(suite: &Suite, options: &Options) -> Vec<CaseResult> {
 }
 
 /// Run the engine on the test and collect both trees.
+///
+/// A `#document-fragment` test is run through the HTML fragment parsing
+/// algorithm (13.4) with the context element the test names, and the two trees
+/// are that fragment's children rather than a whole document's. It is the same
+/// `dump` and the same `diff` as a document case, which is the point: the
+/// fragment case is a different starting state for one algorithm, not a
+/// different comparison.
 fn trees(
     test: &DatTest,
     scripting_enabled: bool,
 ) -> (Vec<String>, Vec<String>, TreeDiff, Option<String>) {
-    if test.fragment_context.is_some() {
-        // The engine has no fragment parsing entry point; `evaluate` reports
-        // this as an unimplemented feature, and there is no tree to compare.
-        return (
-            test.expected_tree.clone(),
-            Vec::new(),
-            TreeDiff::default(),
-            None,
+    if let Some(context) = &test.fragment_context {
+        let output = parse_html_fragment_with_scripting(
+            &test.data,
+            &fragment_context(context),
+            scripting_enabled,
         );
+        let dump = dump::dump_fragment(&output.dom, output.fragment);
+        let diff = dump::diff(&test.expected_tree, &dump.lines, MAX_DIFF_EVENTS);
+        // The suite supplies an HTML fragment serialisation for two fragment
+        // cases. It is not compared, and the reason is worth stating rather than
+        // leaving as a silence: it would be a third comparison with nothing in
+        // the negative control covering it, and a `.dat` file states a
+        // serialisation as one opaque line, so a difference in it would name no
+        // mechanism.
+        return (test.expected_tree.clone(), dump.lines, diff, None);
     }
     let output = parse_document_with_scripting(&test.data, scripting_enabled);
     let dump = dump::dump_document(&output.dom);
@@ -913,15 +1208,61 @@ fn trees(
     (test.expected_tree.clone(), dump.lines, diff, serialization)
 }
 
-fn error_counts(test: &DatTest, scripting_enabled: bool) -> (usize, usize) {
+/// The expected and actual parse-error counts, plus the expected count under
+/// the two readings of the suite's `#new-errors` section.
+///
+/// The two sections cannot simply be added: `#new-errors` is the *current*
+/// spelling of diagnostics that `#errors` still lists under legacy names, and
+/// the corpus says so in its own data -- 20 cases name one identical condition
+/// in both sections, and 291 of the 295 cases carrying a `#new-errors` have one
+/// at least as short as their `#errors`. A summed count therefore asks a parser
+/// to report a single condition twice under two spellings, which is why the
+/// summed figure is reported but is not the one to read as conformance.
+///
+/// `max` is the reading in which `#new-errors` only ever renames; `sum` is the
+/// reading in which it adds. The four cases where `#new-errors` is genuinely
+/// longer -- NUL characters in `plain-text-unsafe.dat` -- are the only ones the
+/// two readings score differently, and `max` is the one that matches the
+/// standard's own error table, which defines one code per condition.
+fn error_counts(test: &DatTest, scripting_enabled: bool) -> (usize, usize, Vec<String>) {
     if test.fragment_context.is_some() {
-        return (0, 0);
+        return (0, 0, Vec::new());
     }
     let output = parse_document_with_scripting(&test.data, scripting_enabled);
+    let codes = output
+        .errors
+        .iter()
+        .map(|error| format!("{}: {}", error.offset, error.code.as_str()))
+        .collect();
     (
-        test.expected_error_count + test.expected_new_error_count,
+        test.expected_error_count.max(test.expected_new_error_count),
         output.errors.len(),
+        codes,
     )
+}
+
+/// The `.dat` spelling of a context element as the parser's own description of
+/// one.
+///
+/// The format can only name a namespace and a local name, so a `math
+/// annotation-xml` context element arrives with no attributes, and 13.2.6's HTML
+/// integration point test -- which asks whether the context element's *start tag
+/// token* carried `encoding="text/html"` -- is therefore false for it. That is
+/// the corpus's statement about the context rather than a default this runner
+/// supplies: the attribute is exactly what separates an `annotation-xml` that is
+/// an integration point from one that is not, so inventing one would change the
+/// tree.
+fn fragment_context(context: &ContextElement) -> FragmentContext {
+    FragmentContext {
+        namespace: match context.namespace {
+            "svg" => Namespace::Svg,
+            "math" => Namespace::MathMl,
+            _ => Namespace::Html,
+        },
+        local_name: context.local_name.clone(),
+        attributes: Vec::new(),
+        quirks_mode: QuirksMode::NoQuirks,
+    }
 }
 
 fn body_element(dom: &Dom, node: NodeId) -> Option<NodeId> {
@@ -950,48 +1291,38 @@ fn body_element(dom: &Dom, node: NodeId) -> Option<NodeId> {
 /// The fall-through is [`Outcome::EngineDefect`]: anything the rule table does
 /// not explicitly explain is treated as a defect, because the alternative is a
 /// runner that invents excuses.
+///
+/// There is one rule table here and it is reached the same way for a whole
+/// document and for a `#document-fragment` case, because a fragment case is now
+/// run through the same comparison. The two rules that can excuse a difference
+/// are deliberately narrow and each fires only when **every** difference in the
+/// case matches it, so a real tree error cannot hide behind one.
 fn evaluate(test: &DatTest, scripting_enabled: bool) -> (Outcome, String, String) {
-    if test.fragment_context.is_none() {
-        let (expected, actual, diff, _) = trees(test, scripting_enabled);
-        if diff.is_empty() {
-            return (Outcome::Pass, String::new(), String::new());
-        }
-        if let Some(reason) = is_processing_instruction_spelling(&diff) {
-            return (
-                Outcome::AcceptableDifference,
-                "processing-instruction-dump-spelling".to_owned(),
-                reason,
-            );
-        }
-        if is_null_dropped_in_foreign_content(&diff) {
-            return (
-                Outcome::AcceptableDifference,
-                "null-dropped-in-foreign-content".to_owned(),
-                "the suite drops U+0000 in foreign content, while the standard replaces it \
-                 with U+FFFD in the data state (13.2.5.1) *and* inserts U+FFFD for a NULL \
-                 character token in foreign content (13.2.6.5), and this engine does both; \
-                 U+0000 is invisible in any rendering, so the two trees cannot differ on \
-                 screen"
-                    .to_owned(),
-            );
-        }
-        let (mechanism, reason) = describe_defect(&expected, &actual, &diff);
-        return (Outcome::EngineDefect, mechanism, reason);
+    let (expected, actual, diff, _) = trees(test, scripting_enabled);
+    if diff.is_empty() {
+        return (Outcome::Pass, String::new(), String::new());
     }
-
-    // --- Rules for tests the engine is not expected to pass outright. -------
-
-    // A `#document-fragment` test asks for the HTML fragment parsing algorithm
-    // with a context element (13.4). This engine exposes only whole-document
-    // parsing, so there is nothing to compare and calling it a defect would be
-    // a measurement artefact rather than a finding.
-    (
-        Outcome::Unimplemented,
-        "html-fragment-parsing".to_owned(),
-        "the test sets a #document-fragment context element, so it exercises the \
-         HTML fragment parsing algorithm (13.4); this engine parses whole documents only"
-            .to_owned(),
-    )
+    if let Some(reason) = is_processing_instruction_spelling(&diff) {
+        return (
+            Outcome::AcceptableDifference,
+            "processing-instruction-dump-spelling".to_owned(),
+            reason,
+        );
+    }
+    if is_null_dropped_in_foreign_content(&diff) {
+        return (
+            Outcome::AcceptableDifference,
+            "null-dropped-in-foreign-content".to_owned(),
+            "the suite drops U+0000 in foreign content, while the standard replaces it \
+             with U+FFFD in the data state (13.2.5.1) *and* inserts U+FFFD for a NULL \
+             character token in foreign content (13.2.6.5), and this engine does both; \
+             U+0000 is invisible in any rendering, so the two trees cannot differ on \
+             screen"
+                .to_owned(),
+        );
+    }
+    let (mechanism, reason) = describe_defect(&expected, &actual, &diff);
+    (Outcome::EngineDefect, mechanism, reason)
 }
 
 /// The one difference this engine is allowed to have with the suite, and why.

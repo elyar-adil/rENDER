@@ -28,7 +28,7 @@ const MAX_SCROLL_STEPS: usize = 65_535;
 
 const INDEX_FIXTURE: &str = include_str!("../../../../example/index.html");
 const HN_FIXTURE: &str = include_str!("../../../../example/hn.html");
-const HAO123_FIXTURE: &str = include_str!("../../../../example/hao123.html");
+const PORTAL_FIXTURE: &str = include_str!("../../../../example/portal.html");
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -203,7 +203,7 @@ fn load_fixtures(request: &str) -> Result<Vec<Fixture>, String> {
         }]),
         "index" => Ok(vec![builtin_fixture("index", INDEX_FIXTURE)]),
         "hn" => Ok(vec![builtin_fixture("hn", HN_FIXTURE)]),
-        "hao123" => Ok(vec![builtin_fixture("hao123", HAO123_FIXTURE)]),
+        "portal" => Ok(vec![builtin_fixture("portal", PORTAL_FIXTURE)]),
         "all" => Ok(vec![
             Fixture {
                 name: "generated".to_owned(),
@@ -211,7 +211,7 @@ fn load_fixtures(request: &str) -> Result<Vec<Fixture>, String> {
             },
             builtin_fixture("index", INDEX_FIXTURE),
             builtin_fixture("hn", HN_FIXTURE),
-            builtin_fixture("hao123", HAO123_FIXTURE),
+            builtin_fixture("portal", PORTAL_FIXTURE),
         ]),
         path => {
             let path = PathBuf::from(path);
@@ -457,7 +457,7 @@ fn print_usage() {
     println!(
         "Usage: cargo run --release -p render-browser --bin render-perf -- [OPTIONS]\n\n\
          Options:\n\
-           --fixture <generated|index|hn|hao123|all|PATH>  Fixture to render (default: generated)\n\
+           --fixture <generated|index|hn|portal|all|PATH>  Fixture to render (default: generated)\n\
            --iterations <N>                                Measured samples, 1..={MAX_ITERATIONS} (default: {DEFAULT_ITERATIONS})\n\
            --warmup <N>                                    Unreported warmup samples (default: {DEFAULT_WARMUP_ITERATIONS})\n\
            --scroll-steps <N>                              Renders per measured scroll, 1..={MAX_SCROLL_STEPS} (default: {DEFAULT_SCROLL_STEPS})\n\

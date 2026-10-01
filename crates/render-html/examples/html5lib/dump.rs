@@ -28,6 +28,23 @@ pub fn dump_document(dom: &Dom) -> TreeDump {
     dump
 }
 
+/// Dump a `DocumentFragment`: its children, at depth zero.
+///
+/// The format indents a node "two spaces per parent node that the node has
+/// before the root document node", and the root of a fragment parse is the
+/// `DocumentFragment` rather than a document, so a fragment case's expected tree
+/// is that fragment's children at depth zero. `dump_node` already flattens a
+/// `DocumentFragment` at its own depth, so this is the same walk rooted one node
+/// lower.
+#[must_use]
+pub fn dump_fragment(dom: &Dom, fragment: NodeId) -> TreeDump {
+    let mut dump = TreeDump::default();
+    for child in dom.children(fragment).unwrap_or_default() {
+        dump_node(dom, *child, 0, &mut dump.lines);
+    }
+    dump
+}
+
 /// The line prefix: `| ` followed by two spaces per ancestor, as the format
 /// requires. The root is `| ` with nothing after it.
 fn pad(depth: usize) -> String {

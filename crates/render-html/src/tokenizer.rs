@@ -716,6 +716,18 @@ impl<'a> Tokenizer<'a> {
                 // emit a U+003C character token, a U+002F character token, and a
                 // start tag token whose tag name is the temporary buffer, switch to
                 // the escaped state, and reprocess."
+                // "If the current end tag token is an appropriate end tag token,
+                // then switch to the data state and emit the current tag token.
+                // Otherwise, treat it as per the 'anything else' entry below."
+                //
+                // "Appropriate" is a question about the parser, not about the
+                // word `script`: the appropriate end tag is whatever the tree
+                // builder last switched this content model to, and 13.4's
+                // fragment case has none at all. Testing the name against the
+                // literal `script` is invisible for a `script` element and wrong
+                // for every other use of the script data state, which is how
+                // `</script>` inside an HTML-like comment of a `script` fragment
+                // used to close nothing and lose half the text.
                 ScriptDataState::EscapedEndTagName => {
                     if character.is_ascii_alphabetic() {
                         self.bump_char();
@@ -723,7 +735,7 @@ impl<'a> Tokenizer<'a> {
                     } else if is_ascii_whitespace(character) || matches!(character, '/' | '>') {
                         let name = std::mem::take(&mut self.script_buffer);
                         self.script_state = ScriptDataState::Escaped;
-                        if name.eq_ignore_ascii_case("script") {
+                        if self.is_appropriate_end_tag_name(&name) {
                             self.error_at(self.offset, HtmlParseErrorCode::UnexpectedToken);
                             self.offset -= name.len();
                             self.script_buffer.clear();
@@ -1957,6 +1969,45 @@ mod tests {
         }
         let errors = tokenizer.errors().iter().map(|error| error.code).collect();
         (tokens, errors)
+    }
+
+    #[test]
+    fn a_named_reference_without_a_semicolon_is_reported() {
+        // "This error occurs if the parser encounters a character reference that
+        // is not terminated by a U+003B (;) code point. The parser behaves the
+        // same as if the character reference is terminated by the U+003B (;) code
+        // point." (13.2.2, missing-semicolon-after-character-reference)
+        //
+        // The suite's `entities01.dat` case for `FOO&gtBAR` lists this under both
+        // its legacy name `named-entity-without-semicolon` and its current one,
+        // which is the corpus spelling one condition two ways rather than
+        // reporting it twice.
+        let (tokens, errors) = tokenize("FOO&gtBAR");
+        assert_eq!(
+            errors,
+            vec![HtmlParseErrorCode::MissingSemicolonAfterCharacterReference],
+            "one reference, one diagnostic: {errors:?}"
+        );
+        // "The parser behaves the same as if the character reference is
+        // terminated by the U+003B (;)", so the reference resolves rather than
+        // being left in the input. The tokenizer emits the run before and after
+        // it as separate character tokens; "When the steps below require the
+        // user agent to insert a character" (13.2.6.1) appends to the previous
+        // text node, so the *tree* sees one `FOO>BAR`. That merge is the tree
+        // builder's, not this test's, so only the token stream is asserted here.
+        assert_eq!(
+            tokens[0..3],
+            [
+                Token::Character("FOO".to_owned()),
+                Token::Character(">".to_owned()),
+                Token::Character("BAR".to_owned()),
+            ]
+        );
+        // The semicolon-terminated form is the same text with no diagnostic,
+        // which is what makes the first assertion about the reference and not
+        // about the document.
+        let (_, terminated) = tokenize("FOO&gt;BAR");
+        assert!(terminated.is_empty(), "a terminated reference is silent");
     }
 
     #[test]

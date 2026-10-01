@@ -2818,6 +2818,737 @@ fn destructuring_arrow_parameter_defaults_apply_to_the_whole_pattern() {
     assert_eq!(outcome.value, JsValue::String("7|3".to_owned()));
 }
 
+/// Evaluate `source` and read one expression out of the resulting scope.
+fn eval_read(source: &str, read: &str) -> String {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, source)
+        .expect("destructuring should execute");
+    runtime
+        .execute(&mut parsed.dom, read)
+        .expect("reading the destructured bindings should execute")
+        .value
+        .to_js_string()
+}
+
+#[test]
+fn destructuring_declarations_bind_nested_defaults_rest_and_computed_keys() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var [first, second = 9] = [1];
+                var [, , third] = [1, 2, 3];
+                var [head, ...tail] = [1, 2, 3];
+                var {a: {b}, label = "none"} = {a: {b: 2}};
+                var key = "computed";
+                var {[key]: value, ...others} = {computed: 5, kept: 6};
+            "#,
+            r#"[first, second, third, head, tail.join("-"), b, label, value, others.kept].join("|")"#
+        ),
+        "1|9|3|1|2-3|2|none|5|6"
+    );
+}
+
+#[test]
+fn destructuring_declarations_bind_through_the_iterator_protocol() {
+    // The point of this case is the *source* of the values, not the shape of
+    // the bindings. Each source below yields values that indexed property
+    // access would get wrong or not get at all.
+    assert_eq!(
+        eval_read(
+            r#"
+                var [a, b] = "xyz";
+                var [entry] = new Map([[1, "one"]]);
+                var [only] = new Set([7]);
+                var [p, q] = new Uint8Array([1, 2]);
+                var [first, ...rest] = new Uint8Array([4, 5, 6]);
+                var source = {};
+                source[Symbol.iterator] = function () {
+                    var index = 0;
+                    return {
+                        next: function () {
+                            return index < 3
+                                ? { value: index++, done: false }
+                                : { value: undefined, done: true };
+                        }
+                    };
+                };
+                var [m, n, o, missing] = source;
+            "#,
+            r#"[a, b, entry.join(":"), only, p, q, first, rest.join(","),
+                m, n, o, missing === undefined, rest.length].join("|")"#
+        ),
+        "x|y|1:one|7|1|2|4|5,6|0|1|2|true|2"
+    );
+}
+
+#[test]
+fn a_destructured_string_walks_code_points_while_its_length_counts_code_units() {
+    // The two answers are different on purpose: `length` is a UTF-16 count and
+    // the pattern sees whole code points.
+    assert_eq!(
+        eval_read(
+            "var [first, second] = '😀x';",
+            "[first, second, second.length, first.length].join('|')"
+        ),
+        "😀|x|1|2"
+    );
+}
+
+#[test]
+fn a_destructuring_pattern_pulls_only_as_many_values_as_it_binds() {
+    // Step counts are the observable difference between the iterator protocol
+    // and draining the source into an array first. A rest element drains; a
+    // pattern that finishes early does not, and closes the iterator instead.
+    let counter = r"
+        var steps = 0;
+        var closed = 0;
+        var source = {};
+        source[Symbol.iterator] = function () {
+            var index = 0;
+            return {
+                next: function () {
+                    steps++;
+                    return index < 5
+                        ? { value: index++, done: false }
+                        : { value: undefined, done: true };
+                },
+                return: function () { closed++; return {}; }
+            };
+        };
+    ";
+    assert_eq!(
+        eval_read(
+            &format!("{counter} var [one] = source;"),
+            "steps + '/' + closed"
+        ),
+        // One value read, then closed because the source was not exhausted.
+        "1/1"
+    );
+    assert_eq!(
+        eval_read(
+            &format!("{counter} var [one, two] = source;"),
+            "steps + '/' + closed"
+        ),
+        "2/1"
+    );
+    assert_eq!(
+        eval_read(
+            &format!("{counter} var [, , three] = source;"),
+            "steps + '/' + three"
+        ),
+        // An elision consumes a value rather than skipping the position.
+        "3/2"
+    );
+    assert_eq!(
+        eval_read(
+            &format!("{counter} var [one, ...rest] = source;"),
+            "steps + '/' + rest.length"
+        ),
+        // A rest element drains the source, so five values plus the final
+        // `done` step, and nothing is left to close.
+        "6/4"
+    );
+}
+
+#[test]
+fn a_destructuring_pattern_closes_the_iterator_when_a_binding_throws() {
+    // The default for `b` runs because the source yields `undefined` there,
+    // and it throws. Leaving the iterator open on an abrupt completion would
+    // leak the source's resources, so the pattern must close it.
+    assert_eq!(
+        eval_read(
+            r#"
+                var steps = 0;
+                var closed = 0;
+                var source = {};
+                source[Symbol.iterator] = function () {
+                    var index = 0;
+                    return {
+                        next: function () {
+                            steps++;
+                            return index < 4
+                                ? { value: [0, undefined, 2, 3][index++], done: false }
+                                : { value: undefined, done: true };
+                        },
+                        return: function () { closed++; return {}; }
+                    };
+                };
+                function boom() { throw new Error("late"); }
+                var caught = "none";
+                try {
+                    var [a, b = boom()] = source;
+                } catch (error) { caught = "threw"; }
+            "#,
+            "caught + '/' + steps + '/' + closed"
+        ),
+        "threw/2/1"
+    );
+}
+
+#[test]
+fn a_default_initializer_runs_only_for_an_undefined_value_and_only_once() {
+    assert_eq!(
+        eval_read(
+            r"
+                var present = 0;
+                var missing = 0;
+                var source = [1];
+                var [a = present++] = source;
+                var [b = missing++] = [undefined];
+                var evaluations = 0;
+                function make() { evaluations++; return [1, 2]; }
+                var [x, y] = make();
+            ",
+            "[present, missing, evaluations, a, b, x, y].join('|')"
+        ),
+        "0|1|1|1|0|1|2"
+    );
+}
+
+#[test]
+fn an_object_pattern_reads_properties_in_order_and_excludes_them_from_the_rest() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var order = [];
+                var source = {
+                    get a() { order.push("a"); return 1; },
+                    get b() { order.push("b"); return 2; },
+                    get c() { return 3; }
+                };
+                var {a, b, ...rest} = source;
+            "#,
+            "[order.join(''), rest.c, Object.keys(rest).join('')].join('|')"
+        ),
+        "ab|3|c"
+    );
+}
+
+#[test]
+fn destructuring_sources_that_cannot_iterate_throw_instead_of_binding_undefined() {
+    // Every one of these has no `@@iterator`. Reading indexed properties off
+    // them would quietly produce `undefined`, which is the failure this rules
+    // out: a bundle that destructures a `Map` must not appear to work when the
+    // engine really failed to find the iterator.
+    for source in ["5", "undefined", "null", "true", "{0: 1, length: 1}"] {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let script = format!("var [a] = {source}; a;");
+        let error = runtime
+            .execute(&mut parsed.dom, &script)
+            .expect_err("a non-iterable source must throw");
+        assert_eq!(
+            error.kind(),
+            crate::JsErrorKind::Type,
+            "`{source}` should raise a TypeError, got {error}"
+        );
+        assert!(
+            error.message().contains("not iterable"),
+            "`{source}` should say the source is not iterable, got: {}",
+            error.message()
+        );
+    }
+}
+
+#[test]
+fn an_object_pattern_refuses_a_nullish_source_while_a_primitive_boxes() {
+    for source in ["undefined", "null"] {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let script = format!("var {{a}} = {source}; a;");
+        let error = runtime
+            .execute(&mut parsed.dom, &script)
+            .expect_err("a nullish object pattern source must throw");
+        assert_eq!(error.kind(), crate::JsErrorKind::Type, "got {error}");
+    }
+    // A primitive has no properties to read but is coercible, so it binds
+    // `undefined` rather than throwing. This is the line between the two rules.
+    assert_eq!(
+        eval_read("var {missing} = 5;", "missing === undefined"),
+        "true"
+    );
+    assert_eq!(eval_read("var {length} = 'abc';", "length"), "3");
+}
+
+#[test]
+fn a_duplicate_lexical_binding_inside_a_pattern_is_an_early_error() {
+    // `var` may reuse a name; `let` and `const` may not, and the check has to
+    // see inside the pattern rather than only its declarator.
+    for source in [
+        "let [q, q] = [1, 2];",
+        "const [q, q] = [1, 2];",
+        "let {a: q, b: q} = {a: 1, b: 2};",
+        "let {a: q, ...q} = {a: 1};",
+        "let [q, {b: q}] = [1, {b: 2}];",
+    ] {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let error = runtime
+            .execute(&mut parsed.dom, source)
+            .expect_err("a duplicate lexical binding must be rejected");
+        assert_eq!(
+            error.kind(),
+            crate::JsErrorKind::Syntax,
+            "{source}: {error}"
+        );
+    }
+    // The same name under `var` is legal, and the last write wins.
+    assert_eq!(eval_read("var [q, q] = [1, 2];", "q"), "2");
+}
+
+#[test]
+fn a_malformed_destructuring_declaration_is_rejected_at_parse_time() {
+    for source in [
+        "var [a,,] = ;",
+        "var [a",
+        "var {a: } = {};",
+        "var [...] = [1];",
+        "var [a] =",
+    ] {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime
+            .execute(&mut parsed.dom, source)
+            .expect_err("a malformed destructuring declaration must be rejected");
+    }
+}
+
+#[test]
+fn a_for_of_head_destructures_each_value_and_rebinds_lexical_names_per_iteration() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var collected = "";
+                for (const [key, value] of new Map([[1, 2]])) {
+                    collected += key + ":" + value + ";";
+                }
+                var rows = [];
+                for (let [value] of [[1], [2]]) {
+                    rows.push(value);
+                    value = 99;
+                }
+            "#,
+            "[collected, rows.join(',')].join('|')"
+        ),
+        "1:2;|1,2"
+    );
+}
+
+#[test]
+fn destructuring_assignment_form_binds_members_and_iterator_sources() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var first, second;
+                [first, second] = [1, 2];
+                var holder = {};
+                [holder.value] = [9];
+                ({x: holder.other} = {x: 8});
+                var entry, tail;
+                [entry, ...tail] = new Set(["only"]);
+            "#,
+            r#"[first, second, holder.value, holder.other, entry, tail.length].join("|")"#
+        ),
+        "1|2|9|8|only|0"
+    );
+}
+
+/// Run a script, drain the microtask queue, run a follow-up script, drain
+/// again. Combinator ordering needs the drain to happen *between* two
+/// settlements, which is the whole point of the interleaving cases below.
+fn settle_then_read(set_up: &str, after_first_drain: &str, read: &str) -> String {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, set_up)
+        .expect("the combinator script should execute");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    if !after_first_drain.is_empty() {
+        runtime
+            .execute(&mut parsed.dom, after_first_drain)
+            .expect("the follow-up script should execute");
+        drain_microtasks(&mut runtime, &mut parsed.dom);
+    }
+    runtime
+        .execute(&mut parsed.dom, read)
+        .expect("reading the combinator result should execute")
+        .value
+        .to_js_string()
+}
+
+#[test]
+fn the_four_combinators_answer_the_empty_iterable_four_different_ways() {
+    // These four answers are the usual bug: they collapse into "the empty case
+    // is whatever the non-empty case does once the count reaches zero".
+    assert_eq!(
+        settle_then_read(
+            "var out='pending'; Promise.all([]).then(function(v){out='fulfilled:'+JSON.stringify(v);},function(){out='rejected';});",
+            "",
+            "out",
+        ),
+        "fulfilled:[]"
+    );
+    assert_eq!(
+        settle_then_read(
+            "var out='pending'; Promise.allSettled([]).then(function(v){out='fulfilled:'+JSON.stringify(v);},function(){out='rejected';});",
+            "",
+            "out",
+        ),
+        "fulfilled:[]"
+    );
+    // Nothing can win a race that never starts, so this stays pending.
+    assert_eq!(
+        settle_then_read(
+            "var out='pending'; Promise.race([]).then(function(){out='fulfilled';},function(){out='rejected';});",
+            "",
+            "out",
+        ),
+        "pending"
+    );
+    // Nothing succeeded, which is the one case that produces an `AggregateError`.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out='pending';
+                Promise.any([]).then(function(){out='fulfilled';},function(e){
+                    out = e.name + ':' + JSON.stringify(e.errors) + ':' + e.message;
+                });
+            ",
+            "",
+            "out",
+        ),
+        "AggregateError:[]:All promises were rejected"
+    );
+}
+
+#[test]
+fn promise_all_fulfils_with_every_value_in_iterable_order() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.all([1, Promise.resolve(2), 'three']).then(function (values) {
+                    out = JSON.stringify(values);
+                }, function () { out = 'rejected'; });
+            ",
+            "",
+            "out",
+        ),
+        r#"[1,2,"three"]"#
+    );
+    // A string is iterable and walks code points, so an astral character is one
+    // element rather than two surrogate halves.
+    assert_eq!(
+        settle_then_read(
+            "var out='pending'; Promise.all('a\u{1F600}b').then(function(v){out=JSON.stringify(v);});",
+            "",
+            "out",
+        ),
+        "[\"a\",\"\u{1F600}\",\"b\"]"
+    );
+}
+
+#[test]
+fn a_combinator_adopts_a_thenable_that_is_not_a_promise() {
+    // The element has no `then` on a promise at all, so a combinator that only
+    // understood native promises would bind the object itself.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var thenable = { then: function (resolve) { resolve('adopted'); } };
+                Promise.all([thenable]).then(function (v) { out = JSON.stringify(v); });
+            ",
+            "",
+            "out",
+        ),
+        r#"["adopted"]"#
+    );
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var thenable = { then: function (resolve) { resolve('adopted'); } };
+                Promise.race([thenable]).then(function (v) { out = v; });
+            ",
+            "",
+            "out",
+        ),
+        "adopted"
+    );
+}
+
+#[test]
+fn promise_all_rejects_with_the_first_reason_and_still_settles_the_rest() {
+    // The two halves are what `all` is for: one rejection decides the outcome,
+    // and no element is left pending behind it.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var seen = [];
+                Promise.all([
+                    Promise.reject('first'),
+                    Promise.reject('second')
+                ]).catch(function (reason) { seen.push('caught:' + reason); });
+                globalThis.settled = [];
+                Promise.resolve('a').catch(function () {});
+                Promise.reject('b').catch(function () {});
+            ",
+            "",
+            "seen.join(',')",
+        ),
+        "caught:first"
+    );
+    assert_eq!(
+        settle_then_read(
+            r"
+                var settled = [];
+                var guarded = Promise.all([
+                    Promise.reject('x'),
+                    new Promise(function (_, reject) {
+                        globalThis.finish = function () { reject('y'); };
+                    })
+                ]);
+                guarded.catch(function () {});
+                globalThis.report = function () {
+                    return Promise.all([
+                        Promise.reject('x'),
+                        new Promise(function (resolve) { globalThis.finish2 = resolve; })
+                    ]).catch(function () { return 'caught'; });
+                };
+                globalThis.count = function () { return settled.length; };
+            ",
+            r"
+                var t = 0;
+                Promise.resolve().then(function(){ t++; });
+                Promise.resolve().then(function(){ t++; });
+            ",
+            "String(t)",
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn promise_all_settled_never_rejects_and_reports_each_element_by_index() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.allSettled([
+                    Promise.resolve(1),
+                    Promise.reject('nope')
+                ]).then(function (settled) {
+                    out = JSON.stringify(settled)
+                        + '|keys:' + Object.keys(settled[0]).join('+')
+                        + '|' + Object.keys(settled[1]).join('+');
+                }, function () { out = 'rejected'; });
+            ",
+            "",
+            "out",
+        ),
+        r#"[{"status":"fulfilled","value":1},{"status":"rejected","reason":"nope"}]|keys:status+value|status+reason"#
+    );
+}
+
+#[test]
+fn promise_any_aggregates_every_reason_into_errors_in_index_order() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.any([
+                    Promise.reject('a'),
+                    Promise.reject('b'),
+                    Promise.reject('c')
+                ]).then(function () { out = 'fulfilled'; }, function (error) {
+                    out = JSON.stringify(error.errors) + '|' + error.name + '|' + error.message;
+                });
+            ",
+            "",
+            "out",
+        ),
+        r#"["a","b","c"]|AggregateError|All promises were rejected"#
+    );
+    // Index order, not arrival order: the second element rejects first, but it
+    // still has to appear second in `errors`.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var finishFirst;
+                var first = { then: function (_, reject) { finishFirst = function () { reject('first'); }; } };
+                Promise.any([first, Promise.reject('second')])
+                    .catch(function (error) { out = JSON.stringify(error.errors); });
+                globalThis.releaseFirst = function () { finishFirst(); };
+            ",
+            "releaseFirst();",
+            "out",
+        ),
+        r#"["first","second"]"#
+    );
+    // `any` fulfils on the first success and ignores the later failure.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.any([Promise.resolve('ok'), Promise.reject('late')])
+                    .then(function (v) { out = v; }, function () { out = 'rejected'; });
+            ",
+            "",
+            "out",
+        ),
+        "ok"
+    );
+}
+
+#[test]
+fn promise_race_settles_once_and_the_first_settlement_wins() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var late;
+                var second = new Promise(function (resolve) { late = function () { resolve('second'); }; });
+                Promise.race([Promise.resolve('first'), second])
+                    .then(function (v) { out = v; });
+                globalThis.releaseLate = late;
+            ",
+            "releaseLate();",
+            "out",
+        ),
+        "first"
+    );
+    // The first *rejection* settles a race just as firmly as a fulfilment.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.race([Promise.reject('rejected first'), Promise.resolve('never')])
+                    .then(function () { out = 'fulfilled'; }, function (e) { out = 'rejected:' + e; });
+            ",
+            "",
+            "out",
+        ),
+        "rejected:rejected first"
+    );
+}
+
+#[test]
+fn a_combinator_rejects_a_source_that_cannot_iterate_instead_of_throwing() {
+    // The call itself returns a promise; the failure arrives through it. That is
+    // what makes `Promise.all(responseLike).catch(...)` a working pattern.
+    for (source, expected) in [
+        ("Promise.all(5)", "TypeError"),
+        ("Promise.allSettled(5)", "TypeError"),
+        ("Promise.any(5)", "TypeError"),
+        ("Promise.race(5)", "TypeError"),
+        ("Promise.all(undefined)", "TypeError"),
+        ("Promise.all({0: 1, length: 1})", "TypeError"),
+    ] {
+        assert_eq!(
+            settle_then_read(
+                &format!("var out='pending'; {source}.catch(function(e){{out=e.name;}});"),
+                "",
+                "out",
+            ),
+            expected,
+            "{source} should reject with a TypeError"
+        );
+    }
+}
+
+#[test]
+fn a_throwing_iterator_is_a_distinct_path_from_an_empty_settlement() {
+    // `any` over an iterable that throws rejects with *that* error, not with an
+    // `AggregateError`. Conflating the two is the specific bug this rules out:
+    // the two produce different errors and call sites handle them differently.
+    for combinator in ["all", "allSettled", "any", "race"] {
+        assert_eq!(
+            settle_then_read(
+                &format!(
+                    r"
+                        var out = 'pending';
+                        var bad = {{}};
+                        bad[Symbol.iterator] = function () {{
+                            return {{ next: function () {{ throw new Error('iterator threw'); }} }};
+                        }};
+                        Promise.{combinator}(bad).then(function () {{
+                            out = 'fulfilled';
+                        }}, function (error) {{
+                            out = error.message + ':' + (error.errors ? 'has errors' : 'no errors');
+                        }});
+                    ",
+                ),
+                "",
+                "out",
+            ),
+            "iterator threw:no errors",
+            "Promise.{combinator} over a throwing iterator"
+        );
+    }
+}
+
+#[test]
+fn aggregate_error_carries_its_reasons_as_an_own_non_enumerable_property() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var error = new AggregateError([1, 2], "why");
+            "#,
+            r#"[error.errors.join(","), error.message, error.name, error.toString()].join("|")"#
+        ),
+        "1,2|why|AggregateError|AggregateError: why"
+    );
+    assert_eq!(
+        eval_read(
+            "var error = new AggregateError([1], 'm');",
+            r#"[error instanceof Error, error instanceof AggregateError,
+                Object.prototype.hasOwnProperty.call(error, 'errors'),
+                Object.keys(error).length].join("|")"#
+        ),
+        "true|true|true|0"
+    );
+    // `errors` is writable and non-enumerable, and `JSON.stringify` sees `{}`.
+    assert_eq!(
+        eval_read(
+            "var error = new AggregateError([1], 'm'); error.errors = [9];",
+            r#"[error.errors.join(","), JSON.stringify(error),
+                Object.getOwnPropertyDescriptor(error, 'errors').enumerable].join("|")"#
+        ),
+        "9|{}|false"
+    );
+    // `errors` is required to be iterable, so the constructor throws without it,
+    // and the prototype carries the ordinary error `name`/`message` pair.
+    assert_eq!(
+        eval_read(
+            r"
+                var caught = 'none';
+                try { new AggregateError(); } catch (error) { caught = error.name; }
+            ",
+            "[caught, AggregateError.length, AggregateError.name, AggregateError.prototype.name].join('|')"
+        ),
+        "TypeError|2|AggregateError|AggregateError"
+    );
+}
+
+#[test]
+fn the_combinators_are_constructor_statics_with_a_length_of_one() {
+    assert_eq!(
+        eval_read(
+            r#"
+                var names = ["all", "allSettled", "any", "race"];
+            "#,
+            r#"[Promise.all.length, Promise.allSettled.length, Promise.any.length,
+                Promise.race.length, typeof Promise.prototype.all,
+                Object.getOwnPropertyDescriptor(Promise, "any").enumerable].join("|")"#
+        ),
+        "1|1|1|1|undefined|false"
+    );
+}
+
 #[test]
 fn arrow_default_parameters_see_the_lexical_this() {
     let mut parsed = parse_document("<!doctype html><p></p>");

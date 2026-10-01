@@ -188,6 +188,7 @@ pub(super) fn mark_host(
         | ObjectHost::ErrorInstance
         | ObjectHost::DomExceptionConstructor
         | ObjectHost::DomException { .. }
+        | ObjectHost::AggregateErrorConstructor
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::TypedArray { .. }
