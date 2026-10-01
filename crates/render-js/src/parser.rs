@@ -9,6 +9,9 @@
 use super::lexer::{TemplatePart, Token, TokenKind, tokenize};
 use super::{JsError, JsErrorKind, RuntimeLimits};
 use crate::JsValue;
+use crate::module::{
+    DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, IndirectExport, ModuleInfo,
+};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -446,6 +449,19 @@ pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<St
     Parser::new(tokens, limits).program()
 }
 
+/// Parse a module body: `import`/`export` become tables in the returned
+/// [`ModuleInfo`] and the declarations they wrap stay in the statement list.
+pub(super) fn parse_module(
+    tokens: Vec<Token>,
+    limits: &RuntimeLimits,
+) -> Result<(Vec<Statement>, ModuleInfo), JsError> {
+    let mut parser = Parser::new(tokens, limits);
+    parser.module = Some(ModuleInfo::default());
+    let statements = parser.statement_list(false)?;
+    let info = parser.module.take().unwrap_or_default();
+    Ok((statements, info))
+}
+
 /// Whether the token after a class modifier keyword (`get`, `set`, `async`,
 /// `static`) lets it act as a modifier instead of an element name. A name
 /// followed by `(`/`=`/`;`/`}` (or nothing) is an ordinary element.
@@ -545,6 +561,7 @@ impl Parser {
             switch_depth: 0,
             class_depth: 0,
             no_in: false,
+            module: None,
         }
     }
 }
@@ -563,6 +580,8 @@ struct Parser {
     class_depth: usize,
     /// While set, `in` is not treated as a binary operator (for-heads).
     no_in: bool,
+    /// Present while parsing a module; collects its import/export tables.
+    module: Option<ModuleInfo>,
 }
 
 impl Parser {
@@ -625,6 +644,9 @@ impl Parser {
                 Some(TokenKind::Dot | TokenKind::LeftParen)
             )
         {
+            if self.module.is_some() {
+                return self.module_declaration();
+            }
             self.skip_module_declaration();
             return Ok(Statement::Block(Vec::new()));
         }
@@ -734,6 +756,267 @@ impl Parser {
         let expression = self.expression()?;
         self.end_statement();
         Ok(Statement::Expression(expression))
+    }
+
+    /// One `import` or `export` declaration of a module (ECMA-262 §16.2).
+    fn module_declaration(&mut self) -> Result<Statement, JsError> {
+        let is_import =
+            matches!(&self.advance().kind, TokenKind::Identifier(name) if name == "import");
+        if is_import {
+            self.import_declaration()?;
+            Ok(Statement::Block(Vec::new()))
+        } else {
+            self.export_declaration()
+        }
+    }
+
+    fn module_info(&mut self) -> &mut ModuleInfo {
+        self.module.as_mut().expect("module mode checked by caller")
+    }
+
+    fn at_contextual(&self, word: &str) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if name == word)
+    }
+
+    fn module_specifier(&mut self) -> Result<String, JsError> {
+        let TokenKind::String(specifier) = self.current().kind.clone() else {
+            return Err(self.error("expected a module specifier string"));
+        };
+        self.advance();
+        self.module_info().add_request(&specifier);
+        // Import attributes (`with { type: "json" }`) carry no linking meaning
+        // here; consume the block so the declaration ends cleanly.
+        if (self.at_contextual("with") || self.at_contextual("assert"))
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::LeftBrace)
+            )
+        {
+            self.advance();
+            self.skip_module_declaration();
+        }
+        Ok(specifier)
+    }
+
+    /// An `IdentifierName` or string literal in import/export-name position.
+    fn module_export_name(&mut self) -> Result<String, JsError> {
+        match self.current().kind.clone() {
+            TokenKind::Identifier(name) | TokenKind::String(name) => {
+                self.advance();
+                Ok(name)
+            }
+            TokenKind::Default => {
+                self.advance();
+                Ok("default".to_owned())
+            }
+            _ => Err(self.error("expected an import or export name")),
+        }
+    }
+
+    fn expect_from(&mut self) -> Result<String, JsError> {
+        if !self.at_contextual("from") {
+            return Err(self.error("expected 'from' in module declaration"));
+        }
+        self.advance();
+        self.module_specifier()
+    }
+
+    fn local_identifier(&mut self) -> Result<String, JsError> {
+        let TokenKind::Identifier(name) = self.current().kind.clone() else {
+            return Err(self.error("expected a binding identifier"));
+        };
+        self.advance();
+        Ok(name)
+    }
+
+    fn import_declaration(&mut self) -> Result<(), JsError> {
+        if matches!(self.current().kind, TokenKind::String(_)) {
+            self.module_specifier()?;
+            self.end_statement();
+            return Ok(());
+        }
+        // (imported, local) pairs, resolved against the specifier afterwards.
+        let mut entries: Vec<(ImportName, String)> = Vec::new();
+        if matches!(&self.current().kind, TokenKind::Identifier(_)) {
+            let local = self.local_identifier()?;
+            entries.push((ImportName::Named("default".to_owned()), local));
+            if !self.take(&TokenKind::Comma) {
+                let request = self.expect_from()?;
+                self.finish_import(&request, entries);
+                return Ok(());
+            }
+        }
+        if self.take(&TokenKind::Star) {
+            if !self.at_contextual("as") {
+                return Err(self.error("expected 'as' after '*' in import"));
+            }
+            self.advance();
+            let local = self.local_identifier()?;
+            entries.push((ImportName::Namespace, local));
+        } else if self.take(&TokenKind::LeftBrace) {
+            while !self.at(&TokenKind::RightBrace) {
+                let imported = self.module_export_name()?;
+                let local = if self.at_contextual("as") {
+                    self.advance();
+                    self.local_identifier()?
+                } else {
+                    imported.clone()
+                };
+                entries.push((ImportName::Named(imported), local));
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.require(&TokenKind::RightBrace, "expected '}' in import list")?;
+        } else {
+            return Err(self.error("malformed import declaration"));
+        }
+        let request = self.expect_from()?;
+        self.finish_import(&request, entries);
+        Ok(())
+    }
+
+    fn finish_import(&mut self, request: &str, entries: Vec<(ImportName, String)>) {
+        self.end_statement();
+        for (imported, local) in entries {
+            self.module_info().imports.push(ImportEntry {
+                request: request.to_owned(),
+                imported,
+                local,
+            });
+        }
+    }
+
+    fn export_declaration(&mut self) -> Result<Statement, JsError> {
+        if self.take(&TokenKind::Star) {
+            let exported = if self.at_contextual("as") {
+                self.advance();
+                Some(self.module_export_name()?)
+            } else {
+                None
+            };
+            let request = self.expect_from()?;
+            self.end_statement();
+            match exported {
+                Some(exported) => self.module_info().indirect_exports.push(IndirectExport {
+                    exported,
+                    request,
+                    imported: ImportName::Namespace,
+                }),
+                None => self.module_info().star_exports.push(request),
+            }
+            return Ok(Statement::Block(Vec::new()));
+        }
+        if self.take(&TokenKind::LeftBrace) {
+            let mut names = Vec::new();
+            while !self.at(&TokenKind::RightBrace) {
+                let local = self.module_export_name()?;
+                let exported = if self.at_contextual("as") {
+                    self.advance();
+                    self.module_export_name()?
+                } else {
+                    local.clone()
+                };
+                names.push((local, exported));
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.require(&TokenKind::RightBrace, "expected '}' in export list")?;
+            if self.at_contextual("from") {
+                self.advance();
+                let request = self.module_specifier()?;
+                for (imported, exported) in names {
+                    self.module_info().indirect_exports.push(IndirectExport {
+                        exported,
+                        request: request.clone(),
+                        imported: ImportName::Named(imported),
+                    });
+                }
+            } else {
+                for (local, exported) in names {
+                    self.module_info().local_exports.push((exported, local));
+                }
+            }
+            self.end_statement();
+            return Ok(Statement::Block(Vec::new()));
+        }
+        if self.take(&TokenKind::Default) {
+            return self.export_default();
+        }
+        // `export var|let|const|function|class|async function`: the wrapped
+        // declaration stays in the body and its bound names become exports.
+        let declaration = self.statement()?;
+        let mut names = Vec::new();
+        match &declaration {
+            Statement::Variable { name, .. }
+            | Statement::Function { name, .. }
+            | Statement::Class { name, .. } => names.push(name.clone()),
+            Statement::VariableList { declarations, .. } => {
+                for (target, _) in declarations {
+                    names.extend(target.names());
+                }
+            }
+            _ => return Err(self.error("unsupported export declaration")),
+        }
+        for name in names {
+            self.module_info().local_exports.push((name.clone(), name));
+        }
+        Ok(declaration)
+    }
+
+    fn export_default(&mut self) -> Result<Statement, JsError> {
+        let named_declaration = match &self.current().kind {
+            TokenKind::Function => {
+                matches!(
+                    self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                    Some(TokenKind::Identifier(_))
+                ) || matches!(
+                    (
+                        self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                        self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+                    ),
+                    (Some(TokenKind::Star), Some(TokenKind::Identifier(_)))
+                )
+            }
+            TokenKind::Identifier(word) if word == "class" => matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Identifier(name)) if name != "extends"
+            ),
+            TokenKind::Identifier(word) if word == "async" => matches!(
+                (
+                    self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                    self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+                ),
+                (Some(TokenKind::Function), Some(TokenKind::Identifier(_)))
+            ),
+            _ => false,
+        };
+        if named_declaration {
+            let declaration = self.statement()?;
+            let (Statement::Function { name, .. } | Statement::Class { name, .. }) = &declaration
+            else {
+                return Err(self.error("unsupported default export declaration"));
+            };
+            let local = name.clone();
+            self.module_info()
+                .local_exports
+                .push(("default".to_owned(), local));
+            return Ok(declaration);
+        }
+        // Anonymous function/class declarations and every other expression
+        // are evaluated in place and bound to the hidden default binding.
+        let value = self.assignment()?;
+        self.end_statement();
+        self.module_info()
+            .local_exports
+            .push(("default".to_owned(), DEFAULT_BINDING.to_owned()));
+        Ok(Statement::Variable {
+            kind: VariableKind::Const,
+            name: DEFAULT_BINDING.to_owned(),
+            value: Some(value),
+            offset: self.previous_offset(),
+        })
     }
 
     fn skip_module_declaration(&mut self) {
@@ -1884,6 +2167,19 @@ impl Parser {
                     super_class,
                     elements,
                 })
+            }
+            TokenKind::Identifier(name)
+                if name == "import"
+                    && self.module.is_some()
+                    && self.at(&TokenKind::Dot)
+                    && matches!(
+                        self.tokens.get(self.cursor + 1).map(|next| &next.kind),
+                        Some(TokenKind::Identifier(meta)) if meta == "meta"
+                    ) =>
+            {
+                self.advance();
+                self.advance();
+                Ok(Expr::Identifier(IMPORT_META_BINDING.to_owned()))
             }
             TokenKind::Identifier(name) if name == "super" => self.super_expression(token.offset),
             TokenKind::PrivateName(name) => Err(JsError::syntax(

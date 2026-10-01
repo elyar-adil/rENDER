@@ -46,6 +46,9 @@ mod class;
 mod convert;
 mod eval;
 mod gc;
+mod module;
+#[cfg(test)]
+mod module_tests;
 mod types;
 
 #[cfg(test)]
@@ -66,6 +69,8 @@ pub struct JsRuntime {
     calls_active: usize,
     dom_nodes_created: usize,
     environment: Vec<Environment>,
+    /// Declared modules by key (the module's absolute URL).
+    modules: BTreeMap<String, module::ModuleRecord>,
     functions: Vec<UserFunction>,
     /// Class context of each active user-function call, for `super`,
     /// `new.target`, and field initialization.
@@ -170,6 +175,7 @@ impl JsRuntime {
             calls_active: 0,
             dom_nodes_created: 0,
             environment: Vec::new(),
+            modules: BTreeMap::new(),
             functions: Vec::new(),
             class_frames: Vec::new(),
             new_target_stack: Vec::new(),

@@ -134,6 +134,15 @@ pub(super) struct PendingScripts {
     pub(super) handle: CachedBatchHandle,
     pub(super) since: Instant,
     pub(super) stall_reported: bool,
+    /// Set while the batch is fetching module dependencies rather than the
+    /// scripts themselves: the batch already prepared, and the requests whose
+    /// results are in flight.
+    pub(super) module_phase: Option<ModulePhase>,
+}
+
+pub(super) struct ModulePhase {
+    pub(super) preparation: ScriptBatchPreparation,
+    pub(super) requests: Vec<render_net::FetchRequest>,
 }
 
 pub(super) struct PendingImages {
@@ -277,6 +286,19 @@ impl PageState {
         if let Some(pending) = self.pending_images.take() {
             pending.handle.cancel();
         }
+    }
+
+    /// The next round of module-dependency requests for a prepared batch,
+    /// carrying this page's cookies. Empty once the module graph is closed.
+    pub(super) fn module_round_requests(
+        &self,
+        preparation: &mut ScriptBatchPreparation,
+    ) -> Vec<render_net::FetchRequest> {
+        preparation
+            .pending_module_requests()
+            .into_iter()
+            .map(|request| self.cookies.decorate_request(request))
+            .collect()
     }
 
     pub(super) fn execute_script_batch(&mut self, preparation: ScriptBatchPreparation) -> bool {

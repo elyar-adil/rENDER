@@ -99,7 +99,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 
 | absent | consequence |
 | --- | --- |
-| **ES modules** | `import`/`export` are parsed and **discarded**, and there is no module loader in the browser at all. A module body runs with every imported binding undefined. Real bundles are increasingly modules, so this is a whole class of site failing to initialise |
+| **ES modules** | **Largely closed.** `render-js` parses import/export into tables (`src/module.rs`) and links them with live bindings (`src/runtime/module.rs`): named/default/namespace imports, re-exports, `export *`, `export * as`, cycles for hoisted declarations, `import.meta.url`, evaluate-once ordering, remembered failures. `render-core/src/module_graph.rs` assembles the graph and `render-browser/src/scripts.rs` fetches it in rounds. **Still open:** dynamic `import()` is a stub that resolves an empty object; top-level `await`; import maps (bare specifiers are diagnosed, not resolved); module code runs sloppy, not strict; a namespace object is a snapshot rather than a live exotic object; classic scripts still skip `import`/`export` instead of throwing a SyntaxError; `type=module` `async` scheduling is treated as defer; `<script type=module>` inserted after load goes through the same path as classic follow-up scripts but is untested in a live window |
 | **Line breaking** | there is **no break-opportunity algorithm at all** - text is exploded per character and every character is a wrap opportunity. UAX #14, `kinsoku` and `LineBreak` all have zero occurrences. CJK wrapping is right *by accident*; CJK **kinsoku shori is absent, so punctuation can begin a line**; and `min_content_width` splits on `split_whitespace()`, so **an unspaced Chinese run counts as one unbreakable word** - meaning `width: min-content`, a shrink-to-fit float, an auto table column or a flex item all derive their width from a whole paragraph. Detail in S34 |
 | **`DOMException`** | every Web API error is a plain `Error`, so **`instanceof DOMException` is false for all of them** - and that is the idiom real code branches on. `DataCloneError`, selector `SyntaxError`, `NotFoundError`, `AbortError` and the rest |
 | **`window.matchMedia`** | every responsive site that gates behaviour in script gets nothing |
@@ -237,7 +237,7 @@ list of them would break more real pages than everything else combined:
 
 1. **Form submission** - the search box and the login, on every site. The owner relationship is
    derived and correct; what is missing is the submit event path and the navigation
-2. **ES modules** - any site shipping a modern bundle. The body runs with every import undefined
+2. **ES modules** - static graphs now link and run (see the row above); dynamic `import()` and top-level `await` are what remain for modern bundles
 3. **`matchMedia`** - every responsive site that gates behaviour in script
 4. **Line breaking** - **specific to this project's corpus.** There is no break-opportunity
    algorithm, so kinsoku shori is absent and CJK punctuation can begin a line, and

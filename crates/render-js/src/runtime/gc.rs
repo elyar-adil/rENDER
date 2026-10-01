@@ -464,6 +464,15 @@ impl JsRuntime {
                 }
             }
         }
+        for record in self.modules.values() {
+            mark_environment(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                &record.environment,
+            );
+        }
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.
         for scope in &self.environment {

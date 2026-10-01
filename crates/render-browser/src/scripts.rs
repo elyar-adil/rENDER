@@ -12,6 +12,7 @@ use std::hash::BuildHasher;
 use render_core::document::Document;
 use render_core::dom::{DomRevision, NodeId};
 use render_core::js::{CompiledScript, JsError, RuntimeLimits};
+use render_core::module_graph::{ModuleEntry, ModuleGraph, module_key};
 use render_core::page::PreparedPageScript;
 use render_core::script::{
     ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling, ScriptSource, discover_scripts,
@@ -39,11 +40,14 @@ struct PlannedScript {
     source_order: usize,
     scheduling: ScriptScheduling,
     source: PlannedSource,
+    module: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptFetchPlan {
     pub revision: DomRevision,
+    /// Document base URL; inline module keys and specifiers resolve against it.
+    base_url: Url,
     pub resources: Vec<ScriptFetch>,
     pub discovery_diagnostics: Vec<ScriptDiagnostic>,
     scripts: Vec<PlannedScript>,
@@ -86,6 +90,7 @@ pub enum ScriptResourceDiagnosticCode {
     UnsupportedContentType,
     DecodeReplacement,
     Compile,
+    Module,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -107,6 +112,12 @@ pub struct PreparedClassicScript {
     pub final_url: Option<Url>,
     pub byte_len: usize,
     pub compiled: CompiledScript,
+    /// Key of this script in the batch's module graph; `Some` for
+    /// `type="module"` scripts.
+    pub module_key: Option<String>,
+    /// The linked graph to evaluate, filled in by
+    /// [`ScriptBatchPreparation::finish_modules`].
+    pub module: Option<ModuleEntry>,
 }
 
 impl From<PreparedClassicScript> for PreparedPageScript {
@@ -116,6 +127,7 @@ impl From<PreparedClassicScript> for PreparedPageScript {
             source_order: script.source_order,
             scheduling: script.scheduling,
             compiled: script.compiled,
+            module: script.module,
         }
     }
 }
@@ -126,6 +138,57 @@ pub struct ScriptBatchPreparation {
     pub scripts: Vec<PreparedClassicScript>,
     pub discovery_diagnostics: Vec<ScriptDiagnostic>,
     pub diagnostics: Vec<ScriptResourceDiagnostic>,
+    graph: ModuleGraph,
+}
+
+impl ScriptBatchPreparation {
+    /// Requests for module dependencies the graph has learned about but not
+    /// yet asked for. Empty once the graph is closed.
+    pub fn pending_module_requests(&mut self) -> Vec<FetchRequest> {
+        self.graph
+            .take_pending()
+            .into_iter()
+            .map(|url| FetchRequest::get(url).with_accept(SCRIPT_ACCEPT))
+            .collect()
+    }
+
+    /// Feed the results of [`Self::pending_module_requests`] back, in order.
+    pub fn absorb_module_results(
+        &mut self,
+        requests: &[FetchRequest],
+        results: Vec<FetchResult>,
+        limits: &RuntimeLimits,
+    ) {
+        for (request, result) in requests.iter().zip(results) {
+            let outcome = match result {
+                Ok(response) if !response.status.is_success() => {
+                    Err(format!("HTTP status {}", response.status.as_u16()))
+                }
+                Ok(response) => Ok((
+                    response.final_url,
+                    String::from_utf8_lossy(&response.body).into_owned(),
+                )),
+                Err(error) => Err(error.to_string()),
+            };
+            self.graph.complete(&request.url, outcome, limits);
+        }
+    }
+
+    /// Close the graph: surface its problems as diagnostics and attach each
+    /// module script's linked entry. Call once no requests are pending.
+    pub fn finish_modules(&mut self) {
+        for message in self.graph.take_diagnostics() {
+            self.diagnostics.push(general_diagnostic(
+                ScriptResourceDiagnosticCode::Module,
+                message,
+            ));
+        }
+        for script in &mut self.scripts {
+            if let Some(key) = &script.module_key {
+                script.module = self.graph.entry(key);
+            }
+        }
+    }
 }
 
 #[must_use]
@@ -179,14 +242,66 @@ pub fn plan_unstarted_classic_scripts<S: BuildHasher>(
                 source_order: script.source_order,
                 scheduling,
                 source,
+                module: script.module,
             }
         })
         .collect();
     ScriptFetchPlan {
         revision: discovery.revision,
+        base_url: base_url.clone(),
         resources,
         discovery_diagnostics: discovery.diagnostics,
         scripts,
+    }
+}
+
+/// Compile a `type="module"` script and register it in the batch's graph. An
+/// external module is keyed by its final URL; an inline one by the document
+/// URL plus a per-script fragment, and both resolve specifiers against the
+/// URL they came from.
+fn compile_module_source(
+    script: &PlannedScript,
+    plan_base: &Url,
+    source: &str,
+    final_url: Option<Url>,
+    byte_len: usize,
+    limits: &RuntimeLimits,
+    preparation: &mut ScriptBatchPreparation,
+) {
+    match CompiledScript::compile_module(source, limits) {
+        Ok(compiled) => {
+            let (key, base) = match &final_url {
+                Some(url) => (module_key(url), url.clone()),
+                None => (
+                    format!(
+                        "{}#inline-module-{}",
+                        module_key(plan_base),
+                        script.source_order
+                    ),
+                    plan_base.clone(),
+                ),
+            };
+            preparation.graph.add(&key, base, compiled.clone());
+            preparation.scripts.push(PreparedClassicScript {
+                owner: script.owner,
+                source_order: script.source_order,
+                scheduling: script.scheduling,
+                final_url,
+                byte_len,
+                compiled,
+                module_key: Some(key),
+                module: None,
+            });
+        }
+        Err(error) => preparation.diagnostics.push(ScriptResourceDiagnostic {
+            owner: Some(script.owner),
+            source_order: Some(script.source_order),
+            requested_url: final_url,
+            severity: ScriptResourceSeverity::Error,
+            code: ScriptResourceDiagnosticCode::Compile,
+            message: format!("module script compilation failed: {error}"),
+            compile_error: Some(error),
+        }),
     }
 }
 
@@ -202,6 +317,7 @@ pub fn prepare_script_batch(
         scripts: Vec::new(),
         discovery_diagnostics: plan.discovery_diagnostics.clone(),
         diagnostics: Vec::new(),
+        graph: ModuleGraph::new(),
     };
     let current_revision = document.dom().revision();
     if current_revision != plan.revision {
@@ -219,7 +335,15 @@ pub fn prepare_script_batch(
     for script in &plan.scripts {
         match &script.source {
             PlannedSource::Inline(source) => {
-                compile_source(script, source, None, source.len(), limits, &mut preparation);
+                compile_source(
+                    script,
+                    &plan.base_url,
+                    source,
+                    None,
+                    source.len(),
+                    limits,
+                    &mut preparation,
+                );
             }
             PlannedSource::External { result_index } => {
                 let resource = &plan.resources[*result_index];
@@ -234,7 +358,14 @@ pub fn prepare_script_batch(
                 };
                 match result {
                     Ok(response) => {
-                        apply_response(script, resource, response, limits, &mut preparation);
+                        apply_response(
+                            script,
+                            &plan.base_url,
+                            resource,
+                            response,
+                            limits,
+                            &mut preparation,
+                        );
                     }
                     Err(error) => preparation.diagnostics.push(resource_diagnostic(
                         resource,
@@ -260,6 +391,7 @@ pub fn prepare_script_batch(
 
 fn apply_response(
     script: &PlannedScript,
+    plan_base: &Url,
     resource: &ScriptFetch,
     response: FetchResponse,
     limits: &RuntimeLimits,
@@ -322,6 +454,7 @@ fn apply_response(
     }
     compile_source(
         script,
+        plan_base,
         &source,
         Some(response.final_url),
         response.body.len(),
@@ -332,12 +465,25 @@ fn apply_response(
 
 fn compile_source(
     script: &PlannedScript,
+    plan_base: &Url,
     source: &str,
     final_url: Option<Url>,
     byte_len: usize,
     limits: &RuntimeLimits,
     preparation: &mut ScriptBatchPreparation,
 ) {
+    if script.module {
+        compile_module_source(
+            script,
+            plan_base,
+            source,
+            final_url,
+            byte_len,
+            limits,
+            preparation,
+        );
+        return;
+    }
     match CompiledScript::compile(source, limits) {
         Ok(compiled) => preparation.scripts.push(PreparedClassicScript {
             owner: script.owner,
@@ -346,6 +492,8 @@ fn compile_source(
             final_url,
             byte_len,
             compiled,
+            module_key: None,
+            module: None,
         }),
         Err(error) => preparation.diagnostics.push(ScriptResourceDiagnostic {
             owner: Some(script.owner),
@@ -581,6 +729,114 @@ mod tests {
             .execute(document.dom_mut(), "order;")
             .expect("shared Realm retains source order");
         assert_eq!(outcome.value.to_js_string(), "IEJF");
+    }
+
+    #[test]
+    fn module_graph_is_fetched_in_rounds_then_linked_and_executed() {
+        let (base, server) = serve(2, |path| match path {
+            "/lib/a.js" => response(
+                "200 OK",
+                Some("text/javascript"),
+                b"import { b } from './b.js'; export const a = 'a' + b;",
+            ),
+            "/lib/b.js" => response("200 OK", Some("text/javascript"), b"export const b = 'b';"),
+            _ => response("404 Not Found", Some("text/javascript"), b""),
+        });
+        let mut document = Document::parse(
+            "<script type=module>\
+               import { a } from './lib/a.js'; globalThis.out = a + import.meta.url.length;\
+             </script>",
+        );
+        let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        assert!(
+            plan.resources.is_empty(),
+            "an inline module needs no first-round fetch"
+        );
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let limits = RuntimeLimits::default();
+        let mut preparation = prepare_script_batch(&document, &plan, Vec::new(), &limits);
+        let mut rounds = 0;
+        loop {
+            let requests = preparation.pending_module_requests();
+            if requests.is_empty() {
+                break;
+            }
+            rounds += 1;
+            let results = transport.fetch_batch(
+                requests.clone(),
+                &BatchOptions::default(),
+                &CancelToken::default(),
+            );
+            preparation.absorb_module_results(&requests, results, &limits);
+        }
+        preparation.finish_modules();
+        server.join().expect("server thread");
+
+        assert_eq!(
+            rounds, 2,
+            "a.js is learned first, b.js only after a.js arrives"
+        );
+        assert!(
+            preparation.diagnostics.is_empty(),
+            "{:?}",
+            preparation.diagnostics
+        );
+        let entry = preparation.scripts[0].module.clone().expect("linked entry");
+        assert_eq!(entry.units.len(), 3);
+        let mut runtime = JsRuntime::new(document.dom());
+        for unit in &entry.units {
+            runtime
+                .declare_module(&unit.key, &unit.compiled, unit.resolutions.clone())
+                .expect("declares");
+        }
+        runtime
+            .evaluate_module(document.dom_mut(), &entry.key)
+            .expect("module graph runs");
+        let out = runtime
+            .execute(document.dom_mut(), "out;")
+            .expect("reads result")
+            .value
+            .to_js_string();
+        assert!(out.starts_with("ab"), "{out}");
+    }
+
+    #[test]
+    fn failed_module_dependency_is_diagnosed_and_does_not_hang_the_loop() {
+        let (base, server) = serve(1, |_| {
+            response("404 Not Found", Some("text/javascript"), b"")
+        });
+        let document = Document::parse("<script type=module>import './gone.js';</script>");
+        let plan = plan_classic_scripts(&document, &base, ScriptDiscoveryLimits::default());
+        let transport = HttpTransport::new(FetchConfig {
+            timeout: Duration::from_secs(2),
+            ..FetchConfig::default()
+        });
+        let limits = RuntimeLimits::default();
+        let mut preparation = prepare_script_batch(&document, &plan, Vec::new(), &limits);
+        let requests = preparation.pending_module_requests();
+        let results = transport.fetch_batch(
+            requests.clone(),
+            &BatchOptions::default(),
+            &CancelToken::default(),
+        );
+        preparation.absorb_module_results(&requests, results, &limits);
+        assert!(preparation.pending_module_requests().is_empty());
+        preparation.finish_modules();
+        server.join().expect("server thread");
+        assert!(
+            preparation
+                .diagnostics
+                .iter()
+                .any(
+                    |diagnostic| diagnostic.code == ScriptResourceDiagnosticCode::Module
+                        && diagnostic.message.contains("404")
+                ),
+            "{:?}",
+            preparation.diagnostics
+        );
     }
 
     #[test]

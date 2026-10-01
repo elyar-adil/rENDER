@@ -48,6 +48,8 @@ pub struct ClassicScript {
     pub source_order: usize,
     pub scheduling: ScriptScheduling,
     pub source: ScriptSource,
+    /// `type="module"`: parsed as a module and linked through a module graph.
+    pub module: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,11 +174,14 @@ impl DiscoveryState {
         else {
             return;
         };
+        let module = attribute(element, "type")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("module"));
         self.scripts.push(ClassicScript {
             owner,
             source_order,
             scheduling,
             source,
+            module,
         });
     }
 

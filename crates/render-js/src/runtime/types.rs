@@ -59,6 +59,8 @@ impl ObjectEntryKind {
 pub(super) struct EnvironmentRecord {
     pub(super) bindings: BTreeMap<String, Binding>,
     pub(super) function_scope: bool,
+    /// Live import bindings of a module environment; empty elsewhere.
+    pub(super) imports: BTreeMap<String, super::module::ImportRef>,
 }
 
 pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;
