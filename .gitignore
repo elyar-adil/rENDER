@@ -73,10 +73,26 @@ target/
 .artifacts/
 .diag/
 .zcode/
+
+# WPT conformance runner: the pinned suite checkout and the generated results are
+# both reproducible from `tools/wpt/run.ps1`, and the suite is far too large to commit.
+tools/wpt/.cache/
+tools/wpt/results/
+
+# The WPT runner is its own workspace with its own lock. It is committed rather than
+# ignored, because the rule is "any workspace built with `--locked` in CI must have
+# its lock tracked" - see the note further down.
+# (its lock is currently small; the suite itself lives in tools/wpt/.cache/)
 artifacts/
 crates/render-core/.artifacts/
 bindings/python/python/render_runtime/*.pdb
-tests/real_site_tasks/Cargo.lock
+
+# Lockfiles for the standalone workspace roots are COMMITTED, not ignored.
+# `tests/real_site_tasks` and `tests/wpt_runner` are their own workspace roots, so
+# each has its own `Cargo.lock`, and CI builds the harness with `--locked`. An
+# ignored lockfile plus `--locked` means cargo refuses to resolve on a clean
+# checkout, so the gate fails for a reason that has nothing to do with the code.
+# The rule is: any workspace built with `--locked` in CI must have its lock tracked.
 
 # IPython Notebook
 .ipynb_checkpoints

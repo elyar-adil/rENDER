@@ -46,11 +46,11 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::to_number;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PendingFetch;
-use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::VideoElementState;
@@ -184,7 +184,10 @@ impl JsRuntime {
         }
         let src = self.string_property(receiver, "src");
         if src.is_empty() {
-            let reason = self.type_error_reason("HTMLVideoElement has no src set");
+            let reason = self.media_rejection(
+                DomExceptionName::NotSupported,
+                "HTMLVideoElement has no src set",
+            );
             self.reject_promise(promise, &reason);
             return Ok(value);
         }
@@ -208,8 +211,10 @@ impl JsRuntime {
         let resolved = match self.resolve_fetch_url(&src) {
             Ok(resolved) => resolved,
             Err(message) => {
-                let reason =
-                    self.type_error_reason(&format!("HTMLVideoElement src is invalid: {message}"));
+                let reason = self.media_rejection(
+                    DomExceptionName::NotSupported,
+                    &format!("HTMLVideoElement src is invalid: {message}"),
+                );
                 self.reject_promise(promise, &reason);
                 return Ok(value);
             }
@@ -270,7 +275,10 @@ impl JsRuntime {
             })
             .unwrap_or_default();
         for play_promise in pending {
-            let reason = self.type_error_reason("HTMLVideoElement.load() aborted playback");
+            let reason = self.media_rejection(
+                DomExceptionName::Abort,
+                "HTMLVideoElement.load() aborted playback",
+            );
             self.reject_promise(play_promise.record, &reason);
         }
         for (name, value) in [
@@ -657,7 +665,10 @@ impl JsRuntime {
                 std::mem::take(&mut state.pending_play_promises)
             })
             .unwrap_or_default();
-        let reason = self.type_error_reason(&format!("loading media failed: {message}"));
+        let reason = self.media_rejection(
+            DomExceptionName::NotSupported,
+            &format!("loading media failed: {message}"),
+        );
         for play_promise in pending {
             self.reject_promise(play_promise.record, &reason);
         }
@@ -743,11 +754,22 @@ impl JsRuntime {
         }
     }
 
-    /// A throw-ready `TypeError` value, falling back to a plain string when
-    /// the heap cannot admit the error object.
-    fn type_error_reason(&mut self, message: &str) -> JsValue {
-        self.construct_standard_error(ErrorKind::TypeError, message)
-            .unwrap_or_else(|_| JsValue::String(message.to_owned()))
+    /// A throw-ready rejection reason for `HTMLMediaElement.play()`.
+    ///
+    /// HTML §"media load algorithm" rejects a `play()` promise with a
+    /// `DOMException`, never with a plain `Error`:
+    ///
+    /// - no `src`, or a `src` that does not parse, or media data that cannot
+    ///   be fetched at all: "reject promise with a `NotSupportedError`
+    ///   `DOMException`";
+    /// - a `load()` that supersedes an in-flight one: "reject promise with an
+    ///   `AbortError` `DOMException`".
+    ///
+    /// Both used to be ECMAScript `TypeError`s, which is why the engine could
+    /// not answer `e instanceof DOMException` for any of them.
+    fn media_rejection(&mut self, name: DomExceptionName, message: &str) -> JsValue {
+        self.construct_dom_exception(name, message)
+            .unwrap_or_else(|_| JsValue::String(format!("{}: {message}", name.as_str())))
     }
 }
 

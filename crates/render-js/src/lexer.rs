@@ -958,6 +958,13 @@ impl Lexer<'_> {
             && self.peek() == Some('\\')
             && self.peek_second() == Some('u')
         {
+            // Look ahead at the four hex digits without consuming them, so a
+            // high surrogate that is *not* followed by a trailing one stays a
+            // lone surrogate instead of being replaced. §12.9.4.1 says a
+            // `SurrogatePair` is only formed when a leading surrogate is
+            // followed by `TrailingSurrogate`, and `'\uD83D\uD83D'` is two lone
+            // surrogates of length 2, not one replacement character.
+            let pending = self.offset;
             self.advance();
             self.advance();
             let low = self.hex_escape_value(4)?;
@@ -966,7 +973,7 @@ impl Lexer<'_> {
                 return char::from_u32(scalar)
                     .ok_or_else(|| JsError::syntax("invalid Unicode surrogate pair", start));
             }
-            return Ok('\u{fffd}');
+            self.offset = pending;
         }
         Ok(char::from_u32(high).unwrap_or_else(|| surrogate_placeholder(high)))
     }

@@ -1,5 +1,6 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
+use crate::font::FontRequest;
 use crate::fragment::BoxGeometry;
 use crate::fragment::Fragment;
 use crate::fragment::FragmentId;
@@ -8,8 +9,8 @@ use crate::fragment::FragmentTree;
 use crate::geometry::EdgeSizes;
 use crate::geometry::PhysicalRect;
 use crate::geometry::PhysicalSize;
+use crate::linebreak::LineBreakOptions;
 use crate::scrollport::{ClipMode, ScrollportGeometry};
-use crate::solver::inline::is_wide_character;
 use crate::sticky::{StickyConstraint, StickyInsets};
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
@@ -24,9 +25,11 @@ mod block;
 mod flex;
 mod grid;
 mod inline;
-mod resolve;
+pub(crate) mod resolve;
 mod table;
 
+#[cfg(test)]
+mod linebreak_tests;
 #[cfg(test)]
 mod scrollport_tests;
 #[cfg(test)]
@@ -37,11 +40,34 @@ mod table_tests;
 mod tests;
 #[cfg(test)]
 mod text_tests;
+#[cfg(test)]
+mod vanish_tests;
 
+/// The typographic inputs one text run is measured with.
+///
+/// The family, weight and style are what CSS Fonts 4 §5.2 selects a face with.
+/// They are read from the computed style once per element and borrowed rather
+/// than owned, because this value is rebuilt for every typographic character
+/// unit of an inline run; the owned copy that has to outlive the cascade lives
+/// on [`crate::fragment::TextFragmentData`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TextStyle {
+pub struct TextStyle<'a> {
     pub font_size: f32,
     pub line_height: f32,
+    pub font: FontRequest<'a>,
+}
+
+impl Default for TextStyle<'_> {
+    /// `font-size: 16px`, `line-height: normal`, and the initial font
+    /// request. The two lengths are the values a document with no stylesheet
+    /// and a 16px root font size produces.
+    fn default() -> Self {
+        Self {
+            font_size: 16.0,
+            line_height: 19.2,
+            font: FontRequest::initial(),
+        }
+    }
 }
 
 /// The typographic spacing that changes a text run's advance width.
@@ -123,7 +149,15 @@ pub struct TextMeasure {
 /// Font backends are leaf adapters. The reference solver remains deterministic
 /// and parallel-safe as long as the supplied measurer is.
 pub trait TextMeasurer: Sync {
-    fn measure(&self, text: &str, style: TextStyle) -> TextMeasure;
+    /// Measure `text` in the face `style.font` selects.
+    ///
+    /// The request reaches the measurer inside `TextStyle` rather than as extra
+    /// parameters, so an implementor that already took a `TextStyle` starts
+    /// seeing the axis without its signature changing - but it also cannot
+    /// ignore it without deliberately ignoring it. A backend with no face
+    /// table resolves the request the only way it can, through
+    /// [`crate::font::nominal_face`].
+    fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure;
 
     /// Measure `text` with the CSS Text 3 §7 spacing that applies to it.
     ///
@@ -133,7 +167,12 @@ pub trait TextMeasurer: Sync {
     /// [`is_word_separator`]. A backend only needs to override this when it
     /// shapes whole runs itself and can fold the spacing into the shaped run
     /// rather than adding it to the shaped result.
-    fn measure_spaced(&self, text: &str, style: TextStyle, spacing: TextSpacing) -> TextMeasure {
+    fn measure_spaced(
+        &self,
+        text: &str,
+        style: TextStyle<'_>,
+        spacing: TextSpacing,
+    ) -> TextMeasure {
         let mut metrics = self.measure(text, style);
         metrics.advance = (metrics.advance + spacing.extra_advance(text)).max(0.0);
         metrics
@@ -151,27 +190,33 @@ pub trait ImageResourceProvider: Sync {
     fn intrinsic_size_for_node(&self, node: NodeId) -> Option<(u32, u32)>;
 }
 
+/// The deterministic, font-free measurer the reference path measures with.
+///
+/// It resolves `style.font` through [`crate::font::nominal_face`] and reads
+/// advances from [`crate::font::NominalFace`], which is the same table
+/// `render-core`'s `ReferenceTextShaper` shapes with. That shared table is the
+/// whole reason a reference-path line box matches the reference-path glyph run
+/// it is about to paint: neither half of the path has a font file, and both
+/// halves derive their numbers from the same nominal face.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SimpleTextMeasurer;
 
 impl TextMeasurer for SimpleTextMeasurer {
-    fn measure(&self, text: &str, style: TextStyle) -> TextMeasure {
-        let advance = text
-            .chars()
-            .map(|character| {
-                if character.is_whitespace() {
-                    style.font_size * 0.25
-                } else if is_wide_character(character) {
-                    style.font_size
-                } else {
-                    style.font_size * 0.5
-                }
-            })
-            .sum();
+    fn measure(&self, text: &str, style: TextStyle<'_>) -> TextMeasure {
+        let face = crate::font::nominal_face(&style.font);
+        let ascent = face.ascent_em() * style.font_size;
+        let descent = face.descent_em() * style.font_size;
+        if text.is_empty() {
+            return TextMeasure {
+                advance: 0.0,
+                ascent,
+                descent,
+            };
+        }
         TextMeasure {
-            advance,
-            ascent: style.font_size * 0.8,
-            descent: style.font_size * 0.2,
+            advance: crate::font::nominal_advance(face, text, style.font_size),
+            ascent,
+            descent,
         }
     }
 }
@@ -445,25 +490,39 @@ struct AutoEdge {
 }
 
 #[derive(Clone, Copy)]
-struct InlineAtom {
+pub(super) struct InlineAtom<'a> {
     formatting_node: FormattingNodeId,
     source: Option<NodeId>,
     character: char,
     forced_break: bool,
-    wrap_allowed: bool,
+    /// Whether a line may end immediately before this unit.
+    ///
+    /// This is the output of the UAX #14 line breaking algorithm in
+    /// [`crate::linebreak`], narrowed by `word-break`, `line-break` and
+    /// `white-space`, and it is what CSS Text 3 §5 means by "Wrapping is only
+    /// performed at an allowed break point". Kinsoku shori is *not* a separate
+    /// pass over it: a position the forbidden-line-start or forbidden-line-end
+    /// classes prohibit is simply not an opportunity, so the line filler below
+    /// moves to the next one and no measurement changes.
+    break_before: bool,
     atomic: Option<FormattingNodeId>,
-    style: TextStyle,
+    /// The text properties that decide this unit's own break opportunities.
+    /// CSS Text 3 §1.5 ignores inline box boundaries when determining adjacency
+    /// for line breaking, so the opportunities are computed over the whole
+    /// inline sequence while these stay per unit.
+    line_breaking: LineBreakOptions,
+    style: TextStyle<'a>,
     spacing: TextSpacing,
 }
 
-struct TextRun {
+struct TextRun<'a> {
     formatting_node: FormattingNodeId,
     source: Option<NodeId>,
     text: String,
     x: f32,
     y: f32,
     width: f32,
-    typography: inline::InlineTextStyle,
+    typography: inline::InlineTextStyle<'a>,
 }
 
 /// The typographic character unit immediately before the one being placed on
@@ -474,8 +533,8 @@ struct TextRun {
 /// inserted at the beginning or end of a line. That makes the previous unit -
 /// not just the current one - part of the measurement.
 #[derive(Clone, Copy)]
-struct PreviousUnit {
-    typography: inline::InlineTextStyle,
+struct PreviousUnit<'a> {
+    typography: inline::InlineTextStyle<'a>,
     /// Part of a consecutive run of atomic inlines, which §7.2 treats as a
     /// single typographic character unit.
     atomic: bool,

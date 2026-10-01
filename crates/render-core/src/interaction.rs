@@ -1305,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn get_form_submission_builds_a_baidu_style_search_navigation() {
+    fn get_form_submission_builds_a_search_navigation_for_an_inline_search_form() {
         let parsed = parse_document(
             "<!doctype html><form id=search action='/s?old=discarded' method=get>\
              <input type=hidden name=ie value=utf-8>\

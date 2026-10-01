@@ -254,8 +254,11 @@ fn a_fixed_layout_table_measures_no_cells() {
     // The unspecified column takes the rest equally instead of being measured.
     assert!(near(b.size.width, 150.0), "{b:?}");
     assert!(near(b.origin.x, 50.0), "{b:?}");
-    // The content that would have widened the column now wraps inside it.
-    assert!(near(a.size.height, 38.4), "{a:?}");
+    // The content is not measured, so it overflows the 50px cell rather than
+    // widening it. UAX #14 rule LB28 gives "aaaaaaaaaa" no break opportunity, so
+    // CSS 2.1 §9.4.2 says the run "overflows the line box" and the cell is one
+    // line tall.
+    assert!(near(a.size.height, 19.2), "{a:?}");
     // A fixed-layout table takes its width from `width`, not from its content.
     assert!(near(rect(&layout, find(dom, "#t")).size.width, 200.0));
 }
@@ -275,6 +278,35 @@ fn a_fixed_layout_table_divides_the_remaining_width_equally() {
         assert!(near(cell.origin.x, x), "{cell:?}");
         assert!(near(cell.size.width, 100.0), "{cell:?}");
     }
+}
+
+#[test]
+fn a_fixed_layout_table_reserves_a_border_spacing_at_each_table_edge() {
+    // §17.5.2.1: the fixed algorithm divides "the remaining horizontal table
+    // space (minus borders or cell spacing)", and §17.6.1 says the spacing
+    // precedes every column *and* the table's own edges, so a two-column table
+    // spends three of them and not two. The auto-layout counterpart of this is
+    // `border_spacing_separates_every_column_and_the_table_edges`; fixed layout
+    // is where data-heavy pages live and it is the branch that had no coverage.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t'>\
+           <tr><td id='a' style='width:40px'>a</td><td id='b'>b</td></tr>\
+         </table></body>",
+        &format!("{TABLE_CSS} table {{ width: 200px; table-layout: fixed; border-spacing: 7px }}"),
+        900.0,
+    );
+    let dom = &output.dom;
+    let a = rect(&layout, find(dom, "#a"));
+    let b = rect(&layout, find(dom, "#b"));
+    // One spacing still precedes the first column and still follows the last.
+    assert!(near(a.origin.x, 7.0), "{a:?}");
+    assert!(near(b.origin.x, 54.0), "{b:?}");
+    assert!(near(a.size.width, 40.0), "{a:?}");
+    // 200 - 3 * 7 = 179 is what the columns divide, so the auto column takes
+    // 179 - 40. Charging two spacings instead would hand it 186 - 40.
+    assert!(near(b.size.width, 139.0), "{b:?}");
+    assert!(near(b.right(), 200.0 - 7.0), "{b:?}");
+    assert!(near(rect(&layout, find(dom, "#t")).size.width, 200.0));
 }
 
 #[test]
@@ -409,6 +441,111 @@ fn the_table_border_wins_the_outer_grid_lines() {
     assert_eq!(border_of(&layout, find(dom, "#a")).top, 0.0);
     // The cell starts below the table's border, not below its own.
     assert!(near(a.origin.y, table.origin.y + 4.0), "{a:?} {table:?}");
+}
+
+#[test]
+fn the_wider_border_wins_a_shared_line_even_when_it_is_the_second_claim() {
+    // §17.6.2.1: "narrow borders are discarded in favor of wider ones". The
+    // wider claim is deliberately the *second* one collected, so a
+    // first-claim-wins resolution would keep the 1px and this would fail.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+           <tr><td id='a' style='border-right-width:1px;border-right-style:solid'>a</td>\
+             <td id='b' style='border-left-width:3px;border-left-style:solid'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    let a = rect(&layout, find(dom, "#a"));
+    let b = rect(&layout, find(dom, "#b"));
+    assert_eq!(border_of(&layout, find(dom, "#a")).right, 0.0);
+    assert_eq!(border_of(&layout, find(dom, "#b")).left, 3.0);
+    // The surviving border is 3px wide on the shared line, not 1px + 3px, and
+    // the loser is flush against the winner.
+    assert!(near(b.origin.x, a.right()), "{a:?} {b:?}");
+}
+
+#[test]
+fn equal_widths_are_decided_by_the_border_style_precedence_order() {
+    // §17.6.2.1: "If several have the same 'border-width' then styles are
+    // preferred in this order: 'double', 'solid', 'dashed', 'dotted', ..."
+    // `dashed` outranks `dotted` and `solid` outranks `dashed`, and the losing
+    // side is whichever happens to be collected first, so both directions of
+    // the order are exercised here.
+    for (left_style, right_style, winner) in [
+        // `a` is first and declares the weaker style.
+        ("dotted", "dashed", "#b"),
+        ("dashed", "dotted", "#a"),
+        ("dashed", "solid", "#b"),
+        ("solid", "dashed", "#a"),
+        ("dotted", "double", "#b"),
+    ] {
+        let (output, _, layout) = pipeline(
+            &format!(
+                "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+                   <tr><td id='a' style='border-right-width:2px;border-right-style:{left_style}'>a</td>\
+                     <td id='b' style='border-left-width:2px;border-left-style:{right_style}'>b</td></tr>\
+                 </table></body>"
+            ),
+            TABLE_CSS,
+            900.0,
+        );
+        let dom = &output.dom;
+        let a_border = border_of(&layout, find(dom, "#a")).right;
+        let b_border = border_of(&layout, find(dom, "#b")).left;
+        if winner == "#a" {
+            assert_eq!(a_border, 2.0, "{left_style} vs {right_style}");
+            assert_eq!(b_border, 0.0, "{left_style} vs {right_style}");
+        } else {
+            assert_eq!(b_border, 2.0, "{left_style} vs {right_style}");
+            assert_eq!(a_border, 0.0, "{left_style} vs {right_style}");
+        }
+    }
+}
+
+#[test]
+fn border_width_is_compared_before_border_style() {
+    // §17.6.2.1 reads the two criteria in order: width first, style only among
+    // equal widths. `double` is the highest-ranked style, so a resolution that
+    // compared the style first would hand the line to the 1px `double` and give
+    // the 3px `dotted` nothing.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+           <tr><td id='a' style='border-right-width:1px;border-right-style:double'>a</td>\
+             <td id='b' style='border-left-width:3px;border-left-style:dotted'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    assert_eq!(border_of(&layout, find(dom, "#a")).right, 0.0);
+    assert_eq!(border_of(&layout, find(dom, "#b")).left, 3.0);
+    assert!(near(
+        rect(&layout, find(dom, "#b")).origin.x,
+        rect(&layout, find(dom, "#a")).right()
+    ));
+}
+
+#[test]
+fn a_hidden_border_still_wins_when_the_first_claim_alone_would_have_won() {
+    // The `hidden` trump has to beat the width rule as well as document order:
+    // here the first claim is 6px and the second is a `hidden`, so a resolution
+    // that only compared widths would leave the 6px in place.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+           <tr><td id='a' style='border-right-width:6px;border-right-style:solid'>a</td>\
+             <td id='b' style='border-left-style:hidden'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    let a = rect(&layout, find(dom, "#a"));
+    let b = rect(&layout, find(dom, "#b"));
+    assert_eq!(border_of(&layout, find(dom, "#a")).right, 0.0);
+    assert_eq!(border_of(&layout, find(dom, "#b")).left, 0.0);
+    assert!(near(b.origin.x, a.right()), "{a:?} {b:?}");
 }
 
 #[test]
@@ -683,8 +820,10 @@ fn a_fixed_layout_table_can_be_sized_by_column_boxes_alone() {
     assert!(near(b.origin.x, 50.0), "{b:?}");
     assert!(near(b.size.width, 150.0), "{b:?}");
     // The long word is not measured, so it overflows its column instead of
-    // widening it: it wraps onto several lines inside the 50px column.
-    assert!(rect(&layout, find(dom, "#a")).size.height > 19.2);
+    // widening it. UAX #14 rule LB28 disallows a break between two Latin
+    // letters, so the run has no opportunity inside it and CSS 2.1 §9.4.2 says
+    // it "overflows the line box": one line, not several.
+    assert!(near(rect(&layout, find(dom, "#a")).size.height, 19.2));
 }
 
 #[test]
@@ -1252,4 +1391,135 @@ fn a_table_outside_a_table_structure_box_still_lays_out_as_a_block() {
         "the text inside a stray cell must not be lost"
     );
     assert!(near(cell.origin.x, 0.0), "{cell:?}");
+}
+
+#[test]
+fn zprobe_two_cell_collapse() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+           <tr><td id='a' style='border:1px solid'>a</td>\
+             <td id='b' style='border:1px solid'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    for id in ["#t", "#a", "#b"] {
+        let r = rect(&layout, find(dom, id));
+        let g = geometry_of(&layout, find(dom, id));
+        println!(
+            "{id}: rect={:?} border={:?} padding={:?} content_rect={:?}",
+            r, g.border, g.padding, g.content_rect
+        );
+    }
+    println!("text a at {:?}", text_rect(&layout, "a"));
+}
+
+#[test]
+fn zprobe_table_vs_td_border() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse;\
+           border-left-width:1px;border-left-style:solid'>\
+           <tr><td id='a' style='border-left-width:8px;border-left-style:solid'>a</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    for id in ["#t", "#a"] {
+        let r = rect(&layout, find(dom, id));
+        let g = geometry_of(&layout, find(dom, id));
+        println!("{id}: rect={:?} border={:?}", r, g.border);
+    }
+    println!("text a at {:?}", text_rect(&layout, "a"));
+}
+
+#[test]
+fn zprobe_fixed_layout_overflow() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse;\
+           width:200px;table-layout:fixed'>\
+           <tr><td id='a' style='border:1px solid'>a</td>\
+             <td id='b' style='border:1px solid'>b</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    for id in ["#t", "#a", "#b"] {
+        let r = rect(&layout, find(dom, id));
+        let g = geometry_of(&layout, find(dom, id));
+        println!("{id}: rect={:?} border={:?}", r, g.border);
+    }
+}
+
+#[test]
+fn zprobe_row_border_ignored() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t' style='border-collapse:collapse'>\
+           <tr id='r' style='border-left-width:8px;border-left-style:solid'>\
+           <td id='a' style='border-left-width:1px;border-left-style:solid'>a</td></tr>\
+         </table></body>",
+        TABLE_CSS,
+        900.0,
+    );
+    let dom = &output.dom;
+    for id in ["#t", "#a"] {
+        let r = rect(&layout, find(dom, id));
+        let g = geometry_of(&layout, find(dom, id));
+        println!("{id}: rect={:?} border={:?}", r, g.border);
+    }
+}
+
+#[test]
+fn zprobe_fixture() {
+    let html = std::fs::read_to_string(
+        r"C:\Users\Elyar\Desktop\rENDER\tests\fixtures\real_sites\spec_data_table.html",
+    )
+    .unwrap();
+    let css = std::fs::read_to_string(
+        r"C:\Users\Elyar\Desktop\rENDER\tests\fixtures\real_sites\spec_data_table.css",
+    )
+    .unwrap();
+    let (output, _, layout) = pipeline(&html, &css, 1280.0);
+    for f in layout.fragments.iter() {
+        let Some(source) = f.source else { continue };
+        let Some(node) = output.dom.node(source) else {
+            continue;
+        };
+        let render_dom::NodeKind::Element(element) = node.kind() else {
+            continue;
+        };
+        if !matches!(
+            element.local_name.as_str(),
+            "table" | "caption" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup"
+                | "main" | "article" | "aside" | "section" | "div" | "p"
+        ) {
+            continue;
+        }
+        println!(
+            "{} x={:.2} y={:.2} w={:.2} h={:.2}",
+            element.local_name,
+            f.rect.origin.x,
+            f.rect.origin.y,
+            f.rect.size.width,
+            f.rect.size.height
+        );
+    }
+    println!("--- all divs ---");
+    for f in layout.fragments.iter() {
+        let Some(source) = f.source else { continue };
+        let Some(node) = output.dom.node(source) else { continue };
+        let render_dom::NodeKind::Element(element) = node.kind() else { continue };
+        if element.local_name != "div" {
+            continue;
+        }
+        println!(
+            "div x={:.2} y={:.2} w={:.2} h={:.2}",
+            f.rect.origin.x,
+            f.rect.origin.y,
+            f.rect.size.width,
+            f.rect.size.height
+        );
+    }
 }

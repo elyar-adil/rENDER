@@ -385,15 +385,24 @@ fn substitute_nesting<'i, 't>(
             // inside one is still the nesting selector: `:not(&)` is
             // `:not(:is(parent))`.
             Token::Function(name) => NestingStep::Function(name.clone()),
-            // An attribute selector's brackets, a string, and a `{}` block are
-            // opaque: a `&` inside them is a literal character, not the
-            // nesting selector.
-            Token::ParenthesisBlock
-            | Token::SquareBracketBlock
-            | Token::CurlyBracketBlock
-            | Token::QuotedString(_)
-            | Token::UnquotedUrl(_)
-            | Token::BadUrl(_) => NestingStep::Block,
+            // An attribute selector's brackets and a `{}` block are opaque: a
+            // `&` inside them is a literal character, not the nesting selector.
+            // These are the only tokens `parse_nested_block` accepts, because
+            // they are the only ones the tokenizer hands back whole.
+            Token::ParenthesisBlock | Token::SquareBracketBlock | Token::CurlyBracketBlock => {
+                NestingStep::Block
+            }
+            // A string and a url are opaque for the same reason - a `&` inside
+            // one is a literal character - but they are *not* blocks. The
+            // tokenizer has already consumed their contents, so there is
+            // nothing inside to substitute and nothing to open. Routing them
+            // through `parse_nested_block` asks for a nested parser at a token
+            // that did not open one, and cssparser panics on that: so
+            // `a { b:not("x") { color: red } }`, a nested rule with an ordinary
+            // attribute selector in it, took the process down.
+            Token::QuotedString(_) | Token::UnquotedUrl(_) | Token::BadUrl(_) => {
+                NestingStep::Literal
+            }
             _ => NestingStep::Literal,
         };
         let next = parser.position();
@@ -1790,6 +1799,47 @@ mod tests {
         MatchContext, Specificity, matches_selector_list, matching_specificity,
         parse_nested_selector_list, parse_selector_list, select_all,
     };
+
+    /// A string and a `url()` are opaque to nesting substitution for the same
+    /// reason `[]` and `{}` are - a `&` inside one is a literal character - but
+    /// they are not blocks, and the substitution used to route them through the
+    /// block path. That asked `cssparser` for a nested parser at a token that
+    /// had not opened one, and it panics there rather than returning an error,
+    /// so `a { b:not("x") { color: red } }` took the process down. A nested
+    /// rule with a string in its selector is neither malformed CSS nor even a
+    /// discard: whether the selector is one this engine can evaluate is a
+    /// separate question, and it has to be answerable without ending the run.
+    ///
+    /// So the property pinned here is that these inputs are *decided*, one way
+    /// or the other, and that a string stays opaque when the surrounding
+    /// selector is one this engine does accept - which is the part that shows
+    /// the token is being read as a literal and not as a block boundary.
+    #[test]
+    fn strings_and_urls_in_a_nested_selector_are_decided_rather_than_panicking() {
+        for input in [
+            r#"b:not("x")"#,
+            "b:has('x')",
+            "b:has(url(x))",
+            r#"b[href="&"]"#,
+            "b:not(&)",
+        ] {
+            // No panic, and the answer is one the caller can act on.
+            let _ = parse_nested_selector_list(input, ".foo");
+        }
+        // The two this crate's selector grammar accepts, checked for the
+        // substitution itself: a `&` inside a string is a literal character,
+        // and a `&` as a pseudo-class argument is the nesting selector.
+        assert_eq!(
+            parse_nested_selector_list(r#"b[href="&"]"#, ".foo")
+                .unwrap()
+                .css,
+            r#":is(.foo) b[href="&"]"#
+        );
+        assert_eq!(
+            parse_nested_selector_list("b:not(&)", ".foo").unwrap().css,
+            "b:not(:is(.foo))"
+        );
+    }
 
     /// CSS Nesting §3.1: `&` desugars to `:is(<parent>)`, and §3.2's examples
     /// pin each form the spec spells out.

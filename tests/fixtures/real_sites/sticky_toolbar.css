@@ -1,0 +1,137 @@
+/*
+ * Deterministic stand-in for a documentation site's framework and page
+ * stylesheets.
+ *
+ * Served in place of both external slots on the page:
+ *   https://kubernetes.io/css/bootstrap.min.4c8d90.css
+ *   https://kubernetes.io/css/docs.9d2f33.css
+ *
+ * The live page really does split it that way - a framework bundle and a page
+ * sheet - and the harness serves identical bytes for both, so each diagnostic
+ * this file provokes is produced twice and the diagnostic assertions use that
+ * as an exactness check.
+ *
+ * Two rules here are load-bearing rather than decorative, and the reason is the
+ * engine, not the page:
+ *
+ *   `.site-head { position: sticky; top: 0 }` - the header is the sticky box.
+ *   `.navbar-scroll { overflow: auto }`     - and the nav inside it is a
+ *   *nested* scrollport, because its own content is wider than its box. The
+ *   first chip is `position: sticky; left: 0` against *that* scrollport, which
+ *   is the interaction the layout code records as unresolved.
+ *
+ * Both are asserted from the fragment tree, not from pixels, and neither
+ * assertion depends on a displacement having been applied: sticky positioning
+ * does not move a box during layout, so the fragment's rectangle is the same
+ * whether or not anything consumes the constraint.
+ *
+ * Nothing here declares geometry inside a nested block; the static Python gate
+ * reads single-compound rules with a regex that cannot see into a nested `{ }`.
+ */
+
+/* Two at-rules this engine parses and cannot use, exactly as a real page's
+ * self-hosted webfont declaration and keyframe block does. Their diagnostics
+ * appearing is the correct behaviour, and the assertions say so. */
+@font-face {
+  font-family: "Docs Sans";
+  src: url("https://kubernetes.io/fonts/docs-sans.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Docs Serif";
+  src: url("https://kubernetes.io/fonts/docs-serif.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Docs Mono";
+  src: url("https://kubernetes.io/fonts/docs-mono.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Docs Icons";
+  src: url("https://kubernetes.io/fonts/docs-icons.woff2") format("woff2");
+}
+
+@keyframes toast-fade {
+  from { opacity: 1 }
+  to { opacity: 1 }
+}
+@-webkit-keyframes toast-fade {
+  from { opacity: 1 }
+  to { opacity: 1 }
+}
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #ffffff; color: #1b1f23; font-size: 15px; line-height: 24px; }
+
+/* The sticky bar. `position: sticky` never moves the box during layout, so the
+ * fragment rectangle here is the rectangle at scroll offset zero. */
+.site-head { position: sticky; top: 0; display: block; width: 1280px; height: 124px; background-color: #326ce5; }
+.navbar { display: block; width: 1280px; height: 124px; }
+.brand { display: inline-block; width: 200px; height: 40px; margin-top: 10px; margin-left: 20px; color: #ffffff; }
+.brand-mark { display: inline-block; width: 40px; height: 12px; }
+.brand-text { display: inline-block; width: 150px; height: 24px; margin-left: 8px; color: #ffffff; font-size: 18px; line-height: 24px; }
+
+/* The nested scrollport. Its content is 1300 wide inside a 1240 box, so it can
+ * scroll horizontally; `max_scroll_offset().x` is therefore positive, which is
+ * what distinguishes a scrollport from a clip. */
+.navbar-scroll { overflow: auto; display: block; width: 1240px; height: 34px; margin-top: 8px; margin-left: 20px; }
+.tab-strip { display: block; width: 1300px; height: 34px; margin-top: 0; margin-left: 0; padding-left: 0; }
+/* Sticky against the nested scrollport rather than the page. */
+.tab-sticky { position: sticky; left: 0; }
+.tab { display: inline-block; width: 100px; height: 34px; background-color: #326ce5; }
+.tab a { display: inline-block; width: 100px; height: 34px; color: #ffffff; }
+
+.site-search { display: block; width: 400px; height: 32px; margin-top: 8px; margin-left: 840px; }
+.site-search input { display: inline-block; width: 314px; height: 32px; }
+.site-search button { display: inline-block; width: 80px; height: 32px; background-color: #ffffff; color: #326ce5; }
+
+.page-grid { display: block; width: 1280px; margin-top: 0; }
+.side-nav { display: block; width: 1240px; height: 96px; margin-top: 0; margin-left: 20px; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #d6dce5; }
+.side-list { display: block; width: 1240px; margin-top: 8px; margin-left: 0; padding-left: 0; }
+.side-list li { display: inline-block; width: 240px; height: 28px; }
+.side-list a { display: inline-block; width: 240px; height: 28px; color: #326ce5; }
+
+.page-main { display: block; width: 1240px; margin-top: 12px; margin-left: 20px; }
+.breadcrumbs { display: block; width: 1240px; height: 32px; margin-top: 0; }
+.crumbs { display: block; width: 1240px; height: 32px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.crumbs li { display: inline-block; width: 260px; height: 32px; color: #5f6b7a; }
+.crumbs a { display: inline-block; width: 260px; height: 32px; color: #326ce5; }
+.crumb-current { color: #1b1f23; }
+
+.doc-body { display: block; width: 1240px; }
+.doc-section { display: block; width: 1240px; height: 96px; margin-top: 0; margin-bottom: 8px; padding-top: 8px; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #e6e9ee; }
+.doc-title { display: block; width: 1224px; height: 32px; margin-top: 0; margin-bottom: 4px; font-size: 21px; line-height: 32px; }
+.doc-prose { display: block; width: 1224px; height: 48px; color: #1b1f23; }
+.doc-list { display: block; width: 1224px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.doc-list li { display: block; width: 1224px; height: 20px; }
+.doc-figure { display: block; width: 1224px; height: 340px; padding-top: 8px; padding-bottom: 8px; }
+.doc-figure img { display: block; width: 640px; height: 300px; }
+.doc-caption { display: block; width: 640px; height: 24px; color: #5f6b7a; font-size: 12px; line-height: 24px; }
+
+.site-foot { display: block; width: 1280px; height: 72px; margin-top: 28px; padding-top: 12px; background-color: #f6f8fa; }
+.site-foot a { display: inline-block; width: 180px; height: 22px; margin-right: 8px; }
+.foot-note { display: block; width: 1000px; height: 22px; color: #5f6b7a; font-size: 12px; line-height: 22px; }
+
+.page-rail { display: block; width: 1240px; margin-top: 20px; margin-left: 20px; padding-top: 12px; border-top-width: 2px; border-top-style: solid; border-top-color: #d6dce5; }
+.rail-toc { display: block; width: 1240px; }
+.rail-title { display: block; width: 1240px; height: 26px; margin-top: 0; margin-bottom: 8px; font-size: 15px; line-height: 26px; }
+.rail-title a { color: #326ce5; }
+.rail-list { display: block; width: 1240px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: inline-block; width: 300px; height: 26px; }
+.rail-list a { display: inline-block; width: 300px; height: 26px; color: #326ce5; }
+.rail-card { display: block; width: 1240px; margin-top: 12px; }
+.rail-prose { display: block; width: 1240px; height: 26px; color: #5f6b7a; }
+
+/* Decoration inside a conditional group rule. The geometry above does not
+ * depend on either of them, so the fixture is not asserting how this engine
+ * answers - the diagnostic assertions are. */
+@supports (position: sticky) {
+  .doc-prose { color: #1b1f23 }
+}
+@supports at-rule(@font-face) {
+  .site-foot { height: 80px }
+}
+@media (min-width: 1000px) {
+  .doc-prose { color: #1b1f23 }
+}
+@-moz-document url-prefix() {
+  .site-head { background-color: #326ce5 }
+}

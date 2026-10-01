@@ -288,6 +288,125 @@ fn a_left_inset_constrains_the_box_horizontally_and_leaves_it_vertical() {
 }
 
 #[test]
+fn a_bottom_inset_holds_the_sticky_box_above_the_bottom_of_the_scrollport() {
+    // §4.1: `bottom` constrains the box's *end* edge. A box with `bottom: 0`
+    // further down the page than the scrollport reaches is displaced up, so it
+    // sits against the bottom of the scrollport instead of below it. This is
+    // the end-axis half of the rule; every other sticky fixture here writes
+    // `top` or `left`, so the `(None, Some(_))` arm had no test at all.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='page'>\
+           <div id='lead'>body</div><div id='foot'>footer</div></div></body>",
+        &format!(
+            "{RESET} #page {{ height: 2000px }} #lead {{ height: 1400px }}\
+             #foot {{ position: sticky; bottom: 0; height: 50px }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+    let foot = constraint(&layout, find(dom, "#foot"));
+    assert_eq!(foot.insets.bottom, Some(0.0));
+    assert_eq!(foot.insets.top, None);
+    // Layout left the box where it flows, at 1400..1450 in the document.
+    assert!(near(foot.margin_rect.origin.y, 1400.0), "{foot:?}");
+    assert!(near(foot.containing_block.size.height, 2000.0), "{foot:?}");
+
+    // Unscrolled the footer is 850px past the bottom of the 600px scrollport,
+    // so it is pulled up by exactly that much and its bottom edge lands on
+    // 600, the bottom of the view rectangle.
+    let unpainted = foot.margin_rect;
+    let pulled = painted(&foot, scrolled(0.0, 0.0));
+    assert!(near(pulled.origin.y, 550.0), "{pulled:?} {unpainted:?}");
+    assert!(
+        near(pulled.origin.y + pulled.size.height, 600.0),
+        "{pulled:?}"
+    );
+    assert!(
+        near(sticky_offset(&foot, scrolled(0.0, 0.0)).y, -850.0),
+        "{foot:?}"
+    );
+
+    // At 850 the scrollport's bottom edge has reached the footer's own, so the
+    // displacement is exactly zero and the two agree.
+    assert!(
+        near(painted(&foot, scrolled(0.0, 850.0)).origin.y, 1400.0),
+        "{foot:?}"
+    );
+
+    // Past that the footer is entirely inside the scrollport and has nothing
+    // left to be constrained against: an end inset only ever pulls a box back
+    // towards the view, it must never push it further down. A resolution that
+    // resolved the end edge in the wrong direction would add 50px here.
+    assert!(
+        near(painted(&foot, scrolled(0.0, 900.0)).origin.y, 1400.0),
+        "{foot:?}"
+    );
+    assert!(
+        near(painted(&foot, scrolled(0.0, 1400.0)).origin.y, 1400.0),
+        "{foot:?}"
+    );
+
+    // The containing block still bounds the travel: once the page's own bottom
+    // is above the scrollport's top the box is left entirely alone.
+    assert!(
+        near(painted(&foot, scrolled(0.0, 2000.0)).origin.y, 1400.0),
+        "{foot:?}"
+    );
+}
+
+#[test]
+fn a_right_inset_holds_the_sticky_box_against_the_right_of_the_scrollport() {
+    // §4.1: `right` is `left`'s mirror on the horizontal axis, and it is the
+    // horizontal `(None, Some(_))` arm - a right rail that stays put while the
+    // page is scrolled sideways.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='page'>\
+           <div id='rail'>rail</div></div></body>",
+        &format!(
+            "{RESET} #page {{ width: 900px; height: 600px }}\
+             #rail {{ position: sticky; right: 0; float: right; width: 120px; height: 400px }}"
+        ),
+        400.0,
+    );
+    let dom = &output.dom;
+    let rail = constraint(&layout, find(dom, "#rail"));
+    assert_eq!(rail.insets.right, Some(0.0));
+    assert_eq!(rail.insets.left, None);
+    // A box as wide as its containing block could never move, so the rail is
+    // given a margin that leaves room to be pulled left.
+    assert!(near(rail.margin_rect.origin.x, 780.0), "{rail:?}");
+
+    // Unscrolled the rail's right edge is 900, 500px past the right of the
+    // 400px scrollport, so it is pulled left to 400 - 120 = 280.
+    let pulled = painted(&rail, scrolled(0.0, 0.0));
+    assert!(near(pulled.origin.x, 280.0), "{pulled:?}");
+    assert!(
+        near(pulled.origin.x + pulled.size.width, 400.0),
+        "{pulled:?}"
+    );
+
+    // At 500 the scrollport's right edge has reached the rail's own.
+    assert!(
+        near(painted(&rail, scrolled(500.0, 0.0)).origin.x, 780.0),
+        "{rail:?}"
+    );
+    // Past that the rail is inside the scrollport and is never pushed further
+    // right, which is the direction the end inset must not act in.
+    assert!(
+        near(painted(&rail, scrolled(600.0, 0.0)).origin.x, 780.0),
+        "{rail:?}"
+    );
+
+    // The other axis is unconstrained: a vertical scroll moves it not at all.
+    for x in [0.0_f32, 200.0, 500.0] {
+        assert!(
+            near(painted(&rail, scrolled(x, 250.0)).origin.y, 0.0),
+            "x={x}: {rail:?}"
+        );
+    }
+}
+
+#[test]
 fn a_box_whose_computed_position_is_not_sticky_is_never_moved() {
     // `top` on a static or relatively positioned box is not a sticky inset, so
     // there is no constraint to apply at all.

@@ -1,10 +1,18 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
+use crate::font::{
+    FontRequest, FontStyle, computed_font_style, computed_font_synthesis, computed_font_weight,
+};
 use crate::fragment::FragmentId;
 use crate::fragment::FragmentKind;
+use crate::fragment::StoredFontRequest;
 use crate::fragment::TextFragmentData;
 use crate::geometry::PhysicalRect;
 use crate::geometry::PhysicalSize;
+use crate::linebreak::Break;
+use crate::linebreak::LineBreakOptions;
+use crate::linebreak::LineBreakStrictness;
+use crate::linebreak::WordBreak;
 use crate::solver::FloatArea;
 use crate::solver::InlineAtom;
 use crate::solver::LayoutDiagnostic;
@@ -20,16 +28,20 @@ use crate::solver::resolve::count_as_f32;
 use crate::tree::FormattingNodeId;
 use crate::tree::FormattingNodeKind;
 use render_css::computed::ComputedStyle;
+use render_css::computed::ComputedValue;
 use render_css::properties::AlignItems;
 use render_css::properties::BoxSizing;
 use render_css::properties::Float;
 use render_css::properties::JustifyContent;
+use render_css::properties::LineBreak;
 use render_css::properties::Overflow;
 use render_css::properties::TextAlign;
 use render_css::properties::TypedPropertyValue;
+use render_css::properties::WordBreak as WordBreakProperty;
 use render_dom::Node;
 use render_dom::NodeId;
 use render_dom::NodeKind;
+use std::collections::BTreeMap;
 
 #[allow(
     clippy::cast_precision_loss,
@@ -142,9 +154,7 @@ pub(super) fn inline_segment_end(atoms: &[InlineAtom], start: usize) -> usize {
             || next.atomic.is_some()
             || previous.atomic.is_some()
             || next.character.is_whitespace()
-            || (previous.wrap_allowed
-                && next.wrap_allowed
-                && is_soft_line_break(previous.character, next.character))
+            || next.break_before
         {
             break;
         }
@@ -153,88 +163,25 @@ pub(super) fn inline_segment_end(atoms: &[InlineAtom], start: usize) -> usize {
     end
 }
 
-pub(super) fn is_soft_line_break(previous: char, next: char) -> bool {
-    if is_prohibited_line_end(previous) || is_prohibited_line_start(next) {
-        return false;
-    }
-    is_wide_character(previous)
-        || is_wide_character(next)
-        || matches!(previous, '-' | '/' | '\u{2010}')
-}
-
-pub(super) const fn is_prohibited_line_end(character: char) -> bool {
-    matches!(
-        character,
-        '(' | '['
-            | '{'
-            | '\u{00ab}'
-            | '\u{2018}'
-            | '\u{201c}'
-            | '\u{3008}'
-            | '\u{300a}'
-            | '\u{300c}'
-            | '\u{300e}'
-            | '\u{3010}'
-            | '\u{3014}'
-            | '\u{3016}'
-            | '\u{3018}'
-            | '\u{301a}'
-            | '\u{ff08}'
-            | '\u{ff3b}'
-            | '\u{ff5b}'
-            | '\u{ff5f}'
-    )
-}
-
-pub(super) const fn is_prohibited_line_start(character: char) -> bool {
-    matches!(
-        character,
-        '!' | '%' | ')' | ','
-            ..='.'
-                | ':'
-                | ';'
-                | '?'
-                | ']'
-                | '}'
-                | '\u{00bb}'
-                | '\u{2019}'
-                | '\u{201d}'
-                | '\u{3001}'
-                | '\u{3002}'
-                | '\u{3009}'
-                | '\u{300b}'
-                | '\u{300d}'
-                | '\u{300f}'
-                | '\u{3011}'
-                | '\u{3015}'
-                | '\u{3017}'
-                | '\u{3019}'
-                | '\u{301b}'
-                | '\u{ff01}'
-                | '\u{ff09}'
-                | '\u{ff0c}'
-                | '\u{ff0e}'
-                | '\u{ff1a}'
-                | '\u{ff1b}'
-                | '\u{ff1f}'
-                | '\u{ff3d}'
-                | '\u{ff5d}'
-                | '\u{ff60}'
-    )
-}
-
-pub(super) const fn is_wide_character(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x1100..=0x115f
-            | 0x2e80..=0xa4cf
-            | 0xac00..=0xd7a3
-            | 0xf900..=0xfaff
-            | 0xfe10..=0xfe6f
-            | 0xff00..=0xff60
-            | 0xffe0..=0xffe6
-            | 0x1f300..=0x1faff
-    )
+/// The soft wrap opportunities of a whole inline sequence, as one flag per atom.
+///
+/// CSS Text 3 §1.5: "For the purpose of determining adjacency for text
+/// processing (such as ... line-breaking ...), intervening inline box boundaries
+/// and out-of-flow elements must be ignored." So the opportunity before a
+/// character depends on the character before it even when the two are in
+/// different elements, which is why this runs over the atom sequence rather than
+/// over each text node.
+///
+/// The `<br>` and atomic-inline placeholders stay in the sequence so that the
+/// indices line up; their own boundaries are decided by the surrounding rules
+/// anyway, and the two `is_some` arms of [`inline_segment_end`] are what the
+/// solver uses for them.
+pub(super) fn inline_break_opportunities(atoms: &[InlineAtom]) -> Vec<bool> {
+    let characters: Vec<char> = atoms.iter().map(|atom| atom.character).collect();
+    crate::linebreak::opportunities_with(&characters, |index| atoms[index].line_breaking)
+        .into_iter()
+        .map(Break::is_break)
+        .collect()
 }
 
 /// The character CSS Overflow 3 §3.1 substitutes for clipped inline text.
@@ -244,8 +191,8 @@ const ELLIPSIS: char = '\u{2026}';
 /// the measurer resolves glyph advances from, plus the CSS Text 3 §7 spacing
 /// that changes the run's total advance.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct InlineTextStyle {
-    pub style: TextStyle,
+pub(super) struct InlineTextStyle<'a> {
+    pub style: TextStyle<'a>,
     pub spacing: TextSpacing,
 }
 
@@ -312,7 +259,7 @@ fn indented_line_band(
 }
 
 /// The typography one inline atom contributes to measurement.
-fn inline_typography(atom: &InlineAtom) -> InlineTextStyle {
+fn inline_typography<'a>(atom: &InlineAtom<'a>) -> InlineTextStyle<'a> {
     InlineTextStyle {
         style: atom.style,
         spacing: atom.spacing,
@@ -332,10 +279,10 @@ fn inline_typography(atom: &InlineAtom) -> InlineTextStyle {
 /// character unit in its own right.
 fn spacing_before(
     character: char,
-    style: InlineTextStyle,
+    style: InlineTextStyle<'_>,
     advance: f32,
     atomic: bool,
-    previous: Option<&PreviousUnit>,
+    previous: Option<&PreviousUnit<'_>>,
 ) -> f32 {
     let mut spacing = 0.0;
     if is_word_separator(character) && advance > 0.0 {
@@ -463,7 +410,14 @@ impl Solver<'_> {
     }
 }
 
-impl Solver<'_> {
+// The lifetime cannot be elided: `inline_text_style` returns a `TextStyle` that
+// borrows the computed style, so the impl needs to name the solver's lifetime to
+// say so.
+#[allow(
+    clippy::elidable_lifetime_names,
+    reason = "the methods below return values borrowing the solver's lifetime"
+)]
+impl<'a> Solver<'a> {
     #[allow(clippy::too_many_lines)]
     pub(super) fn layout_inline_content(
         &mut self,
@@ -474,7 +428,7 @@ impl Solver<'_> {
         depth: usize,
         floats: &[FloatArea],
     ) -> (Vec<FragmentId>, f32) {
-        let atoms = self.collect_inline_content_atoms(roots, depth);
+        let mut atoms = self.collect_inline_content_atoms(roots, depth);
         if atoms.is_empty()
             || atoms.iter().all(|atom| {
                 atom.atomic.is_none() && !atom.forced_break && atom.character.is_whitespace()
@@ -482,6 +436,16 @@ impl Solver<'_> {
         {
             return (Vec::new(), 0.0);
         }
+        // The UAX #14 opportunities for the whole sequence, which is what CSS
+        // Text 3 §1.5 asks for: adjacency ignores the inline box boundaries
+        // between the atoms. `break_before` is a field rather than a separate
+        // array so that the line filler below reads the opportunity and the
+        // character from one place.
+        let opportunities = inline_break_opportunities(&atoms);
+        for (atom, break_before) in atoms.iter_mut().zip(opportunities) {
+            atom.break_before = break_before;
+        }
+        let atoms = atoms;
         let ends_with_forced_break = atoms
             .iter()
             .rev()
@@ -493,6 +457,7 @@ impl Solver<'_> {
             style: TextStyle {
                 font_size: self.options.root_font_size,
                 line_height: self.options.default_line_height,
+                font: FontRequest::initial(),
             },
             spacing: TextSpacing::default(),
         };
@@ -678,7 +643,25 @@ impl Solver<'_> {
                         previous_unit.as_ref(),
                     )
                 });
-            if segment.first().is_some_and(|atom| atom.wrap_allowed)
+            // CSS 2.1 §9.4.2 and CSS Text 3 §5: when a line cannot take the
+            // whole of an unbreakable run it overflows rather than breaking it.
+            // The run here is `segment`, which ends at the first break
+            // opportunity, so it is unbreakable exactly when nothing inside it
+            // is one. A run that *does* contain an opportunity is left to the
+            // character loop below, which breaks at the last candidate that
+            // fits - which is what kinsoku requires, because a forbidden line
+            // start simply is not a candidate and the break moves on to the
+            // next one.
+            //
+            // A `white-space` that forbids wrapping is not a wrapping
+            // opportunity at all (§3: `pre` and `nowrap` "do not allow
+            // wrapping"), so it must not reach this at all: the run overflows
+            // rather than starting a new line.
+            let breakable_inside = atoms[cursor + 1..segment_end]
+                .iter()
+                .any(|atom| atom.break_before);
+            if segment[0].line_breaking.wrap
+                && !breakable_inside
                 && line_x > line_left
                 && line_x + space_width + segment_width > line_right
             {
@@ -758,7 +741,7 @@ impl Solver<'_> {
                     (line_right - ellipsis).max(line_left)
                 });
                 let overflows = line_x + bare + extra > limit;
-                let wraps = atom.wrap_allowed && overflows && line_x > line_left;
+                let wraps = atom.break_before && overflows && line_x > line_left;
                 let width;
                 if wraps {
                     self.flush_text_run(&mut current_run, &mut fragments);
@@ -858,6 +841,67 @@ impl Solver<'_> {
         (fragments, height)
     }
 
+    /// The three text properties that decide where a line may break, read off
+    /// the element the text belongs to.
+    ///
+    /// * `white-space` is CSS Text 3 §3. `pre` and `nowrap` "do not allow
+    ///   wrapping"; `normal`, `pre-line`, `pre-wrap` and `break-spaces` do.
+    /// * `word-break` is §5.1 and `line-break` is §5.2; both are read as the
+    ///   registered typed value, and both inherit, so a descendant of a
+    ///   `word-break: keep-all` ancestor keeps it without a declaration.
+    ///
+    /// The three are read together because §5 and §5.1 do not treat them
+    /// independently: §5.1's `keep-all` is stated to hold "regardless of
+    /// line-break settings other than anywhere", and §5.2's `anywhere`
+    /// disregards what `word-break` mandates. Returning one value keeps that
+    /// relationship in one place instead of in the line filler.
+    pub(super) fn line_break_options(&self, source: Option<NodeId>) -> LineBreakOptions {
+        let Some(style) = source.and_then(|source| self.styles.get(&source)) else {
+            return LineBreakOptions::default();
+        };
+        let word_break = match style.typed("word-break") {
+            Some(TypedPropertyValue::WordBreak(WordBreakProperty::KeepAll)) => WordBreak::KeepAll,
+            Some(TypedPropertyValue::WordBreak(WordBreakProperty::BreakAll)) => WordBreak::BreakAll,
+            Some(TypedPropertyValue::WordBreak(WordBreakProperty::BreakWord)) => {
+                WordBreak::BreakWord
+            }
+            // §5.1's initial value, and the value of a `word-break` this
+            // document declared that the grammar rejected: the computed stage
+            // falls back to the initial value in that case.
+            Some(TypedPropertyValue::WordBreak(WordBreakProperty::Normal)) | None => {
+                WordBreak::Normal
+            }
+            _ => WordBreak::Normal,
+        };
+        let line_break = match style.typed("line-break") {
+            Some(TypedPropertyValue::LineBreak(LineBreak::Loose)) => LineBreakStrictness::Loose,
+            Some(TypedPropertyValue::LineBreak(LineBreak::Strict)) => LineBreakStrictness::Strict,
+            Some(TypedPropertyValue::LineBreak(LineBreak::Anywhere)) => {
+                LineBreakStrictness::Anywhere
+            }
+            // §5.2's initial value is `auto`, and `auto` is resolved here rather
+            // than in the line breaker because §5.2 says the UA "may vary the
+            // restrictions based on the length of the line" and this engine has
+            // no length-dependent tailoring, so `auto` is the common set.
+            Some(TypedPropertyValue::LineBreak(LineBreak::Normal)) | None => {
+                LineBreakStrictness::Auto
+            }
+            _ => LineBreakStrictness::Auto,
+        };
+        // §3: `pre` and `nowrap` are the two values whose "Text Wrapping" cell
+        // in §3's informative table reads "No wrap". A `white-space` the
+        // document did not declare, or one the grammar rejected, is the initial
+        // value `normal`, which wraps.
+        let wrap = style
+            .get("white-space")
+            .is_none_or(|value| !matches!(value.css_text().trim(), "pre" | "nowrap"));
+        LineBreakOptions {
+            word_break,
+            line_break,
+            wrap,
+        }
+    }
+
     pub(super) fn text_align(&self, style_source: Option<NodeId>) -> TextAlign {
         match style_source.and_then(|source| self.styles.get(&source)) {
             Some(style) => match style.typed("text-align") {
@@ -926,7 +970,7 @@ impl Solver<'_> {
         &mut self,
         roots: &[FormattingNodeId],
         depth: usize,
-    ) -> Vec<InlineAtom> {
+    ) -> Vec<InlineAtom<'a>> {
         let mut atoms = Vec::new();
         for root in roots {
             self.collect_inline_atoms(*root, &mut atoms, depth);
@@ -936,8 +980,8 @@ impl Solver<'_> {
 
     pub(super) fn measure_inline_segment(
         &self,
-        segment: &[InlineAtom],
-        previous: Option<&PreviousUnit>,
+        segment: &[InlineAtom<'a>],
+        previous: Option<&PreviousUnit<'a>>,
     ) -> f32 {
         let mut previous = previous.copied();
         let mut width = 0.0;
@@ -956,7 +1000,7 @@ impl Solver<'_> {
         width
     }
 
-    pub(super) fn measure_inline_character(&self, character: char, style: TextStyle) -> f32 {
+    pub(super) fn measure_inline_character(&self, character: char, style: TextStyle<'_>) -> f32 {
         let mut encoded = [0_u8; 4];
         self.text_measurer
             .measure(character.encode_utf8(&mut encoded), style)
@@ -968,9 +1012,9 @@ impl Solver<'_> {
     pub(super) fn measure_inline_unit(
         &self,
         character: char,
-        style: InlineTextStyle,
+        style: InlineTextStyle<'a>,
         atomic: bool,
-        previous: Option<&PreviousUnit>,
+        previous: Option<&PreviousUnit<'a>>,
     ) -> f32 {
         let advance = self.measure_inline_character(character, style.style);
         let spacing = spacing_before(character, style, advance, atomic, previous);
@@ -981,7 +1025,7 @@ impl Solver<'_> {
         &self,
         text: &str,
         source: Option<NodeId>,
-        style: InlineTextStyle,
+        style: InlineTextStyle<'a>,
     ) -> f32 {
         let preserves_whitespace = source
             .and_then(|source| self.styles.get(&source))
@@ -1001,7 +1045,7 @@ impl Solver<'_> {
         let mut width = 0.0;
         let mut pending_space = false;
         let mut has_content = false;
-        let mut previous: Option<PreviousUnit> = None;
+        let mut previous: Option<PreviousUnit<'a>> = None;
         for character in text.chars() {
             if character.is_whitespace() {
                 pending_space |= has_content;
@@ -1031,8 +1075,12 @@ impl Solver<'_> {
     /// The typography text measurement needs for `source`: the font inputs the
     /// measurer resolves advances from, plus the CSS Text 3 §7 spacing that
     /// changes the total.
-    pub(super) fn inline_text_style(&mut self, source: Option<NodeId>) -> InlineTextStyle {
-        let computed = source.and_then(|source| self.styles.get(&source));
+    pub(super) fn inline_text_style(&mut self, source: Option<NodeId>) -> InlineTextStyle<'a> {
+        // Copied out of `self` so the resulting borrows carry `'a` rather than
+        // the `&mut self` this method holds: the style outlives the call, and
+        // `text_spacing` below still needs the receiver mutably.
+        let styles: &'a BTreeMap<NodeId, ComputedStyle> = self.styles;
+        let computed = source.and_then(|source| styles.get(&source));
         let font_size = computed
             .and_then(|style| style.get("font-size"))
             .and_then(|value| parse_font_size(value.css_text(), self.options.root_font_size))
@@ -1047,9 +1095,78 @@ impl Solver<'_> {
             style: TextStyle {
                 font_size,
                 line_height,
+                font: self.font_request(computed, source),
             },
             spacing: self.text_spacing(computed, source, font_size),
         }
+    }
+
+    /// The CSS Fonts 4 font request for `source`.
+    ///
+    /// §2.1.1 makes `font-family`, §2.2 `font-weight`, §2.4 `font-style` and
+    /// §2.8 the `font-synthesis` longhands all inherited, and the cascade
+    /// resolves none of them into the value this needs: `font-family` keeps the
+    /// author's list, `font-weight` keeps the `bolder`/`lighter` keyword that
+    /// §2.2 defines relative to the parent's weight, and `font-synthesis` is
+    /// not registered at all. So all four are read from the computed values
+    /// here, in the same place and from the same `ComputedStyle` as
+    /// `font-size` and `line-height`, which is what keeps measurement and paint
+    /// from disagreeing about which face a run belongs to.
+    fn font_request(
+        &self,
+        computed: Option<&'a ComputedStyle>,
+        source: Option<NodeId>,
+    ) -> FontRequest<'a> {
+        let declared = |property: &str| {
+            computed
+                .and_then(|style| style.get(property))
+                .map(ComputedValue::css_text)
+        };
+        let family = match declared("font-family") {
+            Some(family) if !family.trim().is_empty() => family,
+            // §2.1's initial value is user-agent defined; an element that
+            // declared none, and one whose declaration is only whitespace, both
+            // arrive at the same request.
+            _ => FontRequest::INITIAL_FAMILY,
+        };
+        let weight = declared("font-weight")
+            .map(|value| (value, self.inherited_font_weight(source)))
+            .and_then(|(value, inherited)| computed_font_weight(value, inherited))
+            .unwrap_or(400);
+        let style = declared("font-style")
+            .and_then(computed_font_style)
+            .unwrap_or(FontStyle::Normal);
+        let synthesis = computed_font_synthesis(
+            declared("font-synthesis-weight"),
+            declared("font-synthesis-style"),
+        );
+        FontRequest {
+            family,
+            weight,
+            style,
+            synthesis,
+        }
+    }
+
+    /// §2.2.1's relative weights are defined against "the inherited
+    /// font-weight value", so `bolder` has to be resolved against the nearest
+    /// ancestor element that declares one. A chain with no declaration anywhere
+    /// resolves at the initial 400, which is what `font-weight: normal`
+    /// computes to.
+    fn inherited_font_weight(&self, source: Option<NodeId>) -> u16 {
+        let styles: &'a BTreeMap<NodeId, ComputedStyle> = self.styles;
+        let mut node = source.and_then(|source| self.dom.parent(source));
+        while let Some(current) = node {
+            let inherited = styles
+                .get(&current)
+                .and_then(|style| style.get("font-weight"))
+                .and_then(|value| computed_font_weight(value.css_text(), 400));
+            if let Some(inherited) = inherited {
+                return inherited;
+            }
+            node = self.dom.parent(current);
+        }
+        400
     }
 
     /// CSS Text 3 §7.1/§7.2 `word-spacing` and `letter-spacing`.
@@ -1094,7 +1211,7 @@ impl Solver<'_> {
     pub(super) fn collect_inline_atoms(
         &mut self,
         node_id: FormattingNodeId,
-        atoms: &mut Vec<InlineAtom>,
+        atoms: &mut Vec<InlineAtom<'a>>,
         depth: usize,
     ) {
         if depth > self.options.limits.max_depth {
@@ -1110,11 +1227,7 @@ impl Solver<'_> {
         };
         if let FormattingNodeKind::Text(text) = node.kind {
             let typography = self.inline_text_style(node.style_source);
-            let wrap_allowed = node
-                .style_source
-                .and_then(|source| self.styles.get(&source))
-                .and_then(|style| style.get("white-space"))
-                .is_none_or(|value| !value.css_text().eq_ignore_ascii_case("nowrap"));
+            let line_breaking = self.line_break_options(node.style_source);
             for character in text.chars() {
                 if self.inline_characters >= self.options.limits.max_inline_characters {
                     self.diagnostics.push(LayoutDiagnostic {
@@ -1130,8 +1243,9 @@ impl Solver<'_> {
                     source: node.source,
                     character,
                     forced_break: false,
-                    wrap_allowed,
+                    break_before: false,
                     atomic: None,
+                    line_breaking,
                     style: typography.style,
                     spacing: typography.spacing,
                 });
@@ -1139,6 +1253,7 @@ impl Solver<'_> {
             return;
         }
         let typography = self.inline_text_style(node.style_source);
+        let line_breaking = self.line_break_options(node.style_source);
         if node.source.is_some_and(|source| {
             matches!(
                 self.dom.node(source).map(Node::kind),
@@ -1150,8 +1265,9 @@ impl Solver<'_> {
                 source: node.source,
                 character: '\n',
                 forced_break: true,
-                wrap_allowed: false,
+                break_before: false,
                 atomic: None,
+                line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
             });
@@ -1163,8 +1279,9 @@ impl Solver<'_> {
                 source: node.source,
                 character: '\0',
                 forced_break: false,
-                wrap_allowed: true,
+                break_before: true,
                 atomic: Some(node_id),
+                line_breaking,
                 style: typography.style,
                 spacing: typography.spacing,
             });
@@ -1242,10 +1359,7 @@ impl Solver<'_> {
             .replaced_size(source, css_width, css_height)
             .map(|size| size.width);
         let width = css_width.or(replaced_width).map_or_else(
-            || {
-                self.atomic_inline_intrinsic_width(node_id)
-                    .min(containing_width)
-            },
+            || self.shrink_to_fit_width(node_id, containing_width),
             |width| match (css_width.is_some(), box_sizing) {
                 (true, BoxSizing::BorderBox) => (width - padding - border).max(0.0),
                 _ => width,
@@ -1328,6 +1442,52 @@ impl Solver<'_> {
             .map(image_dimension_to_f32)
     }
 
+    /// CSS 2.1 §10.3.5: a float's used width is the shrink-to-fit width,
+    /// `min(max(preferred minimum width, available width), preferred width)`.
+    /// The min-content floor is the "preferred minimum width" - §10.3.5's "width
+    /// found by trying all possible line breaks" - and it is not merely a tie
+    /// between the two ends of the clamp: without it a shrink-to-fit box
+    /// narrower than its own min-content comes out narrower than any line it
+    /// could hold, and its text wraps inside itself instead of the box growing
+    /// to fit the longest word.
+    ///
+    /// §10.3.9 makes an `inline-block`'s `width: auto` "the shrink-to-fit width
+    /// as for floating elements", so the same formula answers for both, and this
+    /// is where they are answered.
+    fn shrink_to_fit_width(&mut self, node_id: FormattingNodeId, available: f32) -> f32 {
+        let preferred = self.atomic_inline_intrinsic_width(node_id);
+        let preferred_minimum = self.atomic_inline_min_content_width(node_id);
+        f32::min(preferred, f32::max(preferred_minimum, available))
+    }
+
+    /// The "preferred minimum width" of an `inline-block`, as a content width:
+    /// the same walk as [`Self::atomic_inline_intrinsic_width`] with each
+    /// in-flow child measured by its min-content width instead of its
+    /// max-content one.
+    pub(super) fn atomic_inline_min_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        let children = self
+            .formatting
+            .get(node_id)
+            .map(|node| node.children.clone())
+            .unwrap_or_default();
+        let mut widest = 0.0_f32;
+        let mut float_run = 0.0_f32;
+        for child in children {
+            let child_float = self.float_side(child);
+            let child_width = self.min_content_width(child);
+            if child_float == Float::None {
+                if child_width > f32::EPSILON {
+                    float_run = 0.0;
+                    widest = widest.max(child_width);
+                }
+            } else {
+                float_run += self.atomic_outer_intrinsic_width(child, true);
+                widest = widest.max(float_run);
+            }
+        }
+        widest
+    }
+
     pub(super) fn atomic_inline_intrinsic_width(&mut self, node_id: FormattingNodeId) -> f32 {
         let children = self
             .formatting
@@ -1408,23 +1568,38 @@ impl Solver<'_> {
     }
 
     /// CSS 2.1 §10.3.5: the narrowest width a box can take without overflowing
-    /// is the widest of its unbreakable runs. A soft wrap opportunity splits a
-    /// text run at every word and a forced break ends a line outright, so
-    /// neither raises the minimum above the widest single word.
+    /// is the width of the widest content that cannot be broken, which the
+    /// specification describes as the width "found by trying all possible line
+    /// breaks". That is [`crate::linebreak::widest_unbreakable_run`] over the
+    /// text's own soft wrap opportunities, so a run that has none - a Latin word,
+    /// or a whole paragraph under `white-space: nowrap` - measures as itself and
+    /// an unspaced run measures per character, because UAX #14 gives it an
+    /// opportunity between most of its characters.
+    ///
+    /// §10.3.5's preferred *width* is the other half of the same pair, and
+    /// [`Self::max_content_width`] is it: a line with no break taken at all, so
+    /// the two only differ where there is an opportunity to take.
     pub(super) fn min_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        self.min_content_width_at(node_id, 0)
+    }
+
+    fn min_content_width_at(&mut self, node_id: FormattingNodeId, depth: usize) -> f32 {
+        if depth > self.options.limits.max_depth {
+            return 0.0;
+        }
         let Some(node) = self.formatting.get(node_id).cloned() else {
             return 0.0;
         };
         if let FormattingNodeKind::Text(text) = &node.kind {
             let style = self.inline_text_style(node.style_source);
-            return text
-                .split_whitespace()
-                .map(|word| {
-                    self.text_measurer
-                        .measure_spaced(word, style.style, style.spacing)
-                        .advance
-                })
-                .fold(0.0_f32, f32::max);
+            let options = self.line_break_options(node.style_source);
+            let spacing = style.spacing;
+            let measurer = self.text_measurer;
+            return crate::linebreak::widest_unbreakable_run(
+                &text.chars().collect::<Vec<char>>(),
+                options,
+                |run| measurer.measure_spaced(run, style.style, spacing).advance,
+            );
         }
         if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
             // A replaced box cannot be broken, so its minimum is its used
@@ -1441,10 +1616,173 @@ impl Solver<'_> {
                 .and_then(|source| self.styles.get(&source));
             return self.table_intrinsic_widths(node_id, style, self.options.viewport.width, true);
         }
+        if matches!(
+            node.kind,
+            FormattingNodeKind::AnonymousBlock | FormattingNodeKind::Inline
+        ) {
+            // §10.3.5's "preferred minimum width" is a property of the whole
+            // sequence, not of its widest child: two adjacent inline boxes with
+            // no break opportunity between them form one unbreakable run, and a
+            // fold over the children would measure each of them alone. That is
+            // invisible on a single text node and visible on
+            // `<p>aaa<b>bbb</b>ccc</p>`, where UAX #14 forbids the break before
+            // the `<b>` and the answer is all nine characters wide.
+            return self.inline_sequence_min_content_width(&node.children, depth);
+        }
         node.children
             .into_iter()
-            .map(|child| self.min_content_width(child))
+            .map(|child| self.min_content_width_at(child, depth.saturating_add(1)))
             .fold(0.0_f32, f32::max)
+    }
+
+    /// The atoms an inline sequence contributes to an intrinsic width
+    /// measurement.
+    ///
+    /// [`Self::collect_inline_atoms`] cannot be reused here: it charges the
+    /// layout pass's inline character budget and reports a diagnostic once that
+    /// budget is spent, and an intrinsic measurement must do neither. Layout
+    /// runs the same measurement again afterwards, so spending the budget here
+    /// would make a document that merely *fits* report a limit it never hit.
+    fn collect_measurement_atoms(
+        &mut self,
+        node_id: FormattingNodeId,
+        atoms: &mut Vec<InlineAtom<'a>>,
+        depth: usize,
+    ) {
+        if depth > self.options.limits.max_depth {
+            return;
+        }
+        let Some(node) = self.formatting.get(node_id).cloned() else {
+            return;
+        };
+        let typography = self.inline_text_style(node.style_source);
+        let line_breaking = self.line_break_options(node.style_source);
+        if let FormattingNodeKind::Text(text) = node.kind {
+            for character in text.chars() {
+                atoms.push(InlineAtom {
+                    formatting_node: node_id,
+                    source: node.source,
+                    character,
+                    forced_break: false,
+                    break_before: false,
+                    atomic: None,
+                    line_breaking,
+                    style: typography.style,
+                    spacing: typography.spacing,
+                });
+            }
+            return;
+        }
+        if self.is_forced_break(node_id) {
+            atoms.push(InlineAtom {
+                formatting_node: node_id,
+                source: node.source,
+                character: '\n',
+                forced_break: true,
+                break_before: false,
+                atomic: None,
+                line_breaking,
+                style: typography.style,
+                spacing: typography.spacing,
+            });
+            return;
+        }
+        if matches!(node.kind, FormattingNodeKind::AtomicInline { .. }) {
+            atoms.push(InlineAtom {
+                formatting_node: node_id,
+                source: node.source,
+                // The placeholder character takes the atomic box's own width,
+                // so its class never decides an opportunity that matters: an
+                // atomic inline ends every run it is in and starts the next.
+                character: '\0',
+                forced_break: false,
+                break_before: true,
+                atomic: Some(node_id),
+                line_breaking,
+                style: typography.style,
+                spacing: typography.spacing,
+            });
+            return;
+        }
+        for child in node.children {
+            self.collect_measurement_atoms(child, atoms, depth.saturating_add(1));
+        }
+    }
+
+    /// The width of the widest unbreakable run of an inline sequence, which is
+    /// §10.3.5's "preferred minimum width" of that sequence.
+    pub(super) fn inline_sequence_min_content_width(
+        &mut self,
+        children: &[FormattingNodeId],
+        depth: usize,
+    ) -> f32 {
+        if depth > self.options.limits.max_depth {
+            return 0.0;
+        }
+        let mut atoms: Vec<InlineAtom<'a>> = Vec::new();
+        for child in children.iter().copied() {
+            self.collect_measurement_atoms(child, &mut atoms, depth.saturating_add(1));
+        }
+        self.atoms_min_content_width(&atoms)
+    }
+
+    /// The width of the widest run of `atoms` that no soft wrap opportunity can
+    /// split.
+    ///
+    /// §10.3.5 describes the preferred minimum width as what "trying all
+    /// possible line breaks" leaves behind, which is exactly this: the runs
+    /// between consecutive opportunities, plus a forced break and an atomic
+    /// inline boundary, both of which end a run whatever UAX #14 says.
+    fn atoms_min_content_width(&mut self, atoms: &[InlineAtom<'a>]) -> f32 {
+        if atoms.is_empty() {
+            return 0.0;
+        }
+        let opportunities = inline_break_opportunities(atoms);
+        let mut widest = 0.0_f32;
+        let mut start = 0_usize;
+        for at in 1..atoms.len() {
+            if opportunities[at]
+                || atoms[at].forced_break
+                || atoms[at].atomic.is_some()
+                || atoms[at - 1].atomic.is_some()
+            {
+                widest = widest.max(self.unbreakable_run_width(atoms, start, at));
+                start = at;
+            }
+        }
+        widest.max(self.unbreakable_run_width(atoms, start, atoms.len()))
+    }
+
+    /// The width of `atoms[start..end]`, with its trailing white space hanging.
+    fn unbreakable_run_width(&mut self, atoms: &[InlineAtom<'a>], start: usize, end: usize) -> f32 {
+        // CSS Text 3 §3: "end-of-line spaces hang", so the white space that
+        // follows the last opportunity is not part of the run it ends. A forced
+        // break ends the run too and occupies none of it.
+        let mut trimmed = end;
+        while trimmed > start
+            && (atoms[trimmed - 1].forced_break
+                || (atoms[trimmed - 1].atomic.is_none()
+                    && atoms[trimmed - 1].character.is_whitespace()))
+        {
+            trimmed -= 1;
+        }
+        let mut width = 0.0_f32;
+        let mut previous: Option<PreviousUnit<'a>> = None;
+        for atom in &atoms[start..trimmed] {
+            let typography = inline_typography(atom);
+            let atomic = atom.atomic;
+            width += match atomic {
+                // §7.2 treats a consecutive run of atomic inlines as a single
+                // typographic character unit, so nothing goes inside one.
+                Some(node) => self.atomic_outer_max_content_width(node),
+                None => self.measure_inline_unit(atom.character, typography, false, previous.as_ref()),
+            };
+            previous = Some(PreviousUnit {
+                typography,
+                atomic: atomic.is_some(),
+            });
+        }
+        width
     }
 
     /// CSS 2.1 §10.3.5 / CSS Overflow 3 §3.1: the max-content width of an
@@ -1486,6 +1824,20 @@ impl Solver<'_> {
     }
 
     pub(super) fn atomic_outer_max_content_width(&mut self, node_id: FormattingNodeId) -> f32 {
+        self.atomic_outer_intrinsic_width(node_id, false)
+    }
+
+    /// The outer (margin box) max-content width of a replaced or atomic box,
+    /// or its min-content width when `minimum` is set.
+    ///
+    /// §10.3.5's two halves of a shrink-to-fit width share every step of this
+    /// measurement except the one that picks the intrinsic width of the content,
+    /// so the flag is the only thing that differs.
+    pub(super) fn atomic_outer_intrinsic_width(
+        &mut self,
+        node_id: FormattingNodeId,
+        minimum: bool,
+    ) -> f32 {
         let node = self.formatting.get(node_id).cloned();
         let source = node.as_ref().and_then(|node| node.source);
         let style = node
@@ -1506,14 +1858,19 @@ impl Solver<'_> {
             _ => BoxSizing::ContentBox,
         };
         let specified = self.resolve_size(style.as_ref(), "width", basis, source);
+        let children = node.map(|node| node.children).unwrap_or_default();
         let content_width = specified.map_or_else(
             || {
-                node.map_or(0.0, |node| {
-                    node.children
-                        .into_iter()
-                        .map(|child| self.max_content_width(child))
-                        .fold(0.0_f32, f32::max)
-                })
+                children
+                    .into_iter()
+                    .map(|child| {
+                        if minimum {
+                            self.min_content_width_at(child, 0)
+                        } else {
+                            self.max_content_width(child)
+                        }
+                    })
+                    .fold(0.0_f32, f32::max)
             },
             |width| match box_sizing {
                 BoxSizing::ContentBox => width,
@@ -1534,9 +1891,9 @@ impl Solver<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn push_character(
         &mut self,
-        run: &mut Option<TextRun>,
+        run: &mut Option<TextRun<'a>>,
         fragments: &mut Vec<FragmentId>,
-        atom: InlineAtom,
+        atom: InlineAtom<'a>,
         character: char,
         x: f32,
         y: f32,
@@ -1565,7 +1922,7 @@ impl Solver<'_> {
 
     pub(super) fn flush_text_run(
         &mut self,
-        run: &mut Option<TextRun>,
+        run: &mut Option<TextRun<'a>>,
         fragments: &mut Vec<FragmentId>,
     ) {
         let Some(run) = run.take() else {
@@ -1585,6 +1942,7 @@ impl Solver<'_> {
                 text: run.text,
                 baseline: run.y + metrics.ascent,
                 font_size: run.typography.style.font_size,
+                font: StoredFontRequest::new(run.typography.style.font),
             }),
         ) {
             fragments.push(fragment);

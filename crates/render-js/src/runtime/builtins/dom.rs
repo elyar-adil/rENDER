@@ -17,6 +17,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
 use crate::runtime::types::ElementRect;
@@ -50,8 +51,7 @@ impl JsRuntime {
             NativeFunction::QuerySelector => {
                 let root = self.query_root(receiver)?;
                 let selector = required_argument(arguments, 0, "querySelector")?.to_js_string();
-                let selectors = parse_selector_list(&selector)
-                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let selectors = self.parse_selectors(&selector, "querySelector")?;
                 match select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .next()
@@ -63,8 +63,7 @@ impl JsRuntime {
             NativeFunction::QuerySelectorAll => {
                 let root = self.query_root(receiver)?;
                 let selector = required_argument(arguments, 0, "querySelectorAll")?.to_js_string();
-                let selectors = parse_selector_list(&selector)
-                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let selectors = self.parse_selectors(&selector, "querySelectorAll")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .map(|node| self.wrap_node(node))
@@ -76,8 +75,7 @@ impl JsRuntime {
                 let tag = required_argument(arguments, 0, "getElementsByTagName")?.to_js_string();
                 // Type selectors match case-insensitively for HTML elements,
                 // which is exactly the legacy API contract.
-                let selectors = parse_selector_list(&tag)
-                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let selectors = self.parse_selectors(&tag, "getElementsByTagName")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .map(|node| self.wrap_node(node))
@@ -98,8 +96,7 @@ impl JsRuntime {
                 if selector.is_empty() {
                     return Ok(JsValue::Object(self.create_array_from_values(&[])?));
                 }
-                let selectors = parse_selector_list(&selector)
-                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let selectors = self.parse_selectors(&selector, "getElementsByClassName")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .map(|node| self.wrap_node(node))
@@ -177,9 +174,10 @@ impl JsRuntime {
                 self.require_document(receiver)?;
                 let name = required_argument(arguments, 0, "createElement")?.to_js_string();
                 if !valid_html_local_name(&name) {
-                    return Err(JsError::dom(format!(
-                        "{name:?} is not a supported HTML local name"
-                    )));
+                    return Err(self.dom_exception(
+                        DomExceptionName::InvalidCharacter,
+                        format!("{name:?} is not a supported HTML local name"),
+                    ));
                 }
                 if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
                     return Err(JsError::resource("DOM node creation limit exceeded"));
@@ -244,8 +242,7 @@ impl JsRuntime {
             NativeFunction::Matches => {
                 let node = self.require_node(receiver)?;
                 let selector = required_argument(arguments, 0, "matches")?.to_js_string();
-                let selectors = parse_selector_list(&selector)
-                    .map_err(|error| JsError::dom(format!("invalid selector: {error}")))?;
+                let selectors = self.parse_selectors(&selector, "matches")?;
                 Ok(JsValue::Boolean(matches_selector_list(
                     dom,
                     node,
@@ -591,10 +588,16 @@ impl JsRuntime {
         source: &str,
     ) -> Result<(), JsError> {
         if target == dom.document() {
-            return Err(JsError::dom("outerHTML cannot replace the document node"));
+            return Err(self.dom_exception(
+                DomExceptionName::NoModificationAllowed,
+                "outerHTML cannot replace the document node",
+            ));
         }
         let Some(parent) = dom.parent(target) else {
-            return Err(JsError::dom("outerHTML requires a parent to splice into"));
+            return Err(self.dom_exception(
+                DomExceptionName::NoModificationAllowed,
+                "outerHTML requires a parent to splice into",
+            ));
         };
         let scratch = render_html::parse_document(source);
         let body = find_body_node(&scratch.dom, scratch.dom.document())
@@ -645,7 +648,16 @@ impl JsRuntime {
             Some(NodeKind::Text(data)) => CloneSource::Text(data.clone()),
             Some(NodeKind::Comment(data)) => CloneSource::Comment(data.clone()),
             Some(NodeKind::DocumentFragment) => CloneSource::Fragment,
-            _ => return Err(JsError::dom("this node type cannot be cloned here")),
+            // The DOM Standard's `clone a node` step: a `Document` and a
+            // `DocumentType` both throw here ("if node is a document or
+            // document type, throw a `NotSupportedError` `DOMException`"), and
+            // every other node kind this engine models is cloneable.
+            _ => {
+                return Err(self.dom_exception(
+                    DomExceptionName::NotSupported,
+                    "this node type cannot be cloned here",
+                ));
+            }
         };
         let copy = match source {
             CloneSource::Element {
@@ -736,6 +748,33 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// The DOM Standard's "parse a selector" step, shared by every API that
+    /// takes one.
+    ///
+    /// Selectors §"parse a selector" is a single step that either yields a
+    /// selector list or fails, and each API that calls it says what to do on
+    /// failure: `querySelector`/`querySelectorAll`/`matches`/`closest`/
+    /// `getElementsByTagName` all say "throw a `SyntaxError` `DOMException`".
+    /// One helper rather than five keeps them from drifting, and it is also the
+    /// only way to get `e.name === "SyntaxError"` and
+    /// `e instanceof DOMException` to agree: `WebIDL` §2.8.1 warns that this
+    /// `SyntaxError` is "used to report parsing errors in web APIs, for example
+    /// when parsing selectors, while the JavaScript `SyntaxError` is reserved for
+    /// the JavaScript parser", so `instanceof SyntaxError` must be **false** here
+    /// even though the name says `SyntaxError`.
+    pub(in crate::runtime) fn parse_selectors(
+        &mut self,
+        selector: &str,
+        function: &str,
+    ) -> Result<render_css::selector::SelectorList, JsError> {
+        parse_selector_list(selector).map_err(|error| {
+            self.dom_exception(
+                DomExceptionName::Syntax,
+                format!("{function}: {selector:?} is not a valid selector: {error}"),
+            )
+        })
+    }
+
     pub(in crate::runtime) fn query_root(&self, object: ObjectId) -> Result<NodeId, JsError> {
         match self.realm.host(object) {
             Some(ObjectHost::Document(document) | ObjectHost::Node(document)) => Ok(document),
@@ -791,15 +830,17 @@ impl JsRuntime {
     /// `dataset.member = value` write-through: stores a stringified copy in
     /// the mapped `data-*` attribute so `getAttribute` observes the write.
     pub(in crate::runtime) fn set_dataset_member(
+        &mut self,
         dom: &mut Dom,
         node: NodeId,
         property: &str,
         value: &JsValue,
     ) -> Result<(), JsError> {
         let Some(name) = dataset_attribute_from_member(property) else {
-            return Err(JsError::dom(format!(
-                "{property:?} is not a valid dataset property name"
-            )));
+            return Err(self.dom_exception(
+                DomExceptionName::Syntax,
+                format!("{property:?} is not a valid dataset property name"),
+            ));
         };
         Ok(dom.set_attribute(node, &name, value.to_js_string())?)
     }
@@ -831,7 +872,11 @@ impl JsRuntime {
         }
     }
 
+    /// The `DOMTokenList` argument check: DOM Standard §"validate and extract"
+    /// throws an `InvalidCharacterError` `DOMException` "if token is the empty
+    /// string or contains ASCII whitespace".
     pub(in crate::runtime) fn class_list_token(
+        &mut self,
         arguments: &[JsValue],
         index: usize,
         function: &str,
@@ -842,9 +887,10 @@ impl JsRuntime {
                 .chars()
                 .any(|character| character.is_ascii_whitespace())
         {
-            return Err(JsError::dom(format!(
-                "{function} token must be non-empty and contain no ASCII whitespace"
-            )));
+            return Err(self.dom_exception(
+                DomExceptionName::InvalidCharacter,
+                format!("{function} token must be non-empty and contain no ASCII whitespace"),
+            ));
         }
         Ok(token)
     }
@@ -859,7 +905,7 @@ impl JsRuntime {
         let mut tokens = Self::class_list_tokens(dom, node)?;
         let mut changed = false;
         for index in 0..arguments.len() {
-            let token = Self::class_list_token(arguments, index, "classList.add")?;
+            let token = self.class_list_token(arguments, index, "classList.add")?;
             if !tokens.contains(&token) {
                 tokens.push(token);
                 changed = true;
@@ -881,7 +927,7 @@ impl JsRuntime {
         let mut tokens = Self::class_list_tokens(dom, node)?;
         let original_len = tokens.len();
         for index in 0..arguments.len() {
-            let token = Self::class_list_token(arguments, index, "classList.remove")?;
+            let token = self.class_list_token(arguments, index, "classList.remove")?;
             tokens.retain(|candidate| candidate != &token);
         }
         if tokens.len() != original_len {
@@ -901,7 +947,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let token = Self::class_list_token(arguments, 0, "classList.toggle")?;
+        let token = self.class_list_token(arguments, 0, "classList.toggle")?;
         let mut tokens = Self::class_list_tokens(dom, node)?;
         let present = tokens.iter().any(|candidate| candidate == &token);
         let next = match arguments.get(1) {
@@ -923,13 +969,13 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn class_list_contains(
-        &self,
+        &mut self,
         dom: &Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let token = Self::class_list_token(arguments, 0, "classList.contains")?;
+        let token = self.class_list_token(arguments, 0, "classList.contains")?;
         Ok(JsValue::Boolean(
             Self::class_list_tokens(dom, node)?
                 .iter()

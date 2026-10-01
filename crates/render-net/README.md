@@ -39,16 +39,48 @@ render-net SLOW GET https://cdn.example/app.js 200 91823 bytes in 2036.4ms (slow
 
 ## Bounds
 
+Every network phase has its own budget, because a transfer can die in three
+different ways and each needs a different bound. A phase with no budget of its
+own is a phase nobody can tune or reason about: it either borrows another
+phase's budget (so changing one silently changes the other) or goes unbounded.
+
+| Phase | Knob | Default | Protects against |
+| --- | --- | --- | --- |
+| resolve / send / redirect chain | `FetchConfig::timeout` | 30s | a resolver or a peer that stops mid-handshake, and a redirect chain that multiplies per-stage budgets |
+| connect (+ TLS) | `FetchConfig::connect_timeout` | 5s | one unresponsive address eating the whole request |
+| response status + headers | `FetchConfig::response_timeout` | follows `timeout` (30s) | an origin or proxy that accepts the connection and then says nothing |
+| response body | `FetchConfig::body_idle_timeout` | follows `timeout` (30s) | a connection that delivered part of a body and then went quiet forever |
+
 - `FetchConfig::timeout` is a per-phase budget (resolve, send, header
-  reception), not a whole-transfer cap; the body phase is bounded by
-  `max_body_bytes`, a per-read idle bound, and a minimum-progress floor, so a
-  large resource that keeps making progress is never killed.
+  reception), not a whole-transfer cap. It is the fallback for the two budgets
+  below: leaving them `None` keeps "one number bounds everything", which is what
+  the defaults do.
 - `FetchConfig::connect_timeout` (5s by default) bounds the connect phase only.
   ureq 3.3 walks the resolved addresses in order and gives each one a slice of
   that budget taken from a geometric series, so the first address receives about
   two thirds of it for a dual-stack host. A dedicated budget is what keeps one
   unresponsive AAAA record from costing ~16s of a 30s request; a zero value
-  disables the bound.
+  falls back to `timeout` rather than to "unbounded".
+- `FetchConfig::response_timeout` bounds the wait for the status line and
+  headers. **It is not a body budget.** It used to have no field of its own and
+  borrowed ureq's send-request budget, so it could not be tuned without also
+  changing the request write, and the phase it belonged to was only correct
+  because of a rewrite in `fetch_transfer` that exists to disambiguate. A
+  single `timeout_recv_response`-style value would additionally cap total body
+  time and fail every large download, so ureq's that knob is deliberately left
+  unset and this budget is carried on the send side, which is what actually
+  bounds the header wait.
+- `FetchConfig::body_idle_timeout` is an **idle-read** bound: time since the
+  last byte arrived, not total transfer time. A 2 MB stylesheet trickling in
+  over a slow link is fine; a connection that delivered 40 KB and then went
+  quiet is not. Nothing here has a total body budget - a body that keeps
+  arriving is bounded only by `max_body_bytes`, this idle bound, and a
+  minimum-progress floor. Because it is an idle bound it is also the one body
+  budget that is safe to push to the socket, so a stalled read fails inside ureq
+  and the connection is released rather than left held.
+- A timeout is a terminal outcome like any other: it is reported through the
+  observer against the phase it stalled in, carrying the time it waited, and a
+  connection that stalled is never returned to the pool as usable.
 - `BatchOptions::timeout` (30s by default, matching the shell's stall report)
   bounds a whole batch. Requests that had not completed are reported as
   `FetchPhase::Queued` failures carrying the time the batch ran for, instead of

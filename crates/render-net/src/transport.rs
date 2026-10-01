@@ -16,7 +16,8 @@ use crate::CookieJar;
 use crate::diagnostics::{FetchEvent, FetchObserver, FetchPhase, StderrObserver};
 use crate::{DEFAULT_PER_ORIGIN_CONCURRENCY, ORIGINS_BEFORE_TOTAL_CEILING};
 
-/// Minimum average body throughput once [`FetchConfig::timeout`] has elapsed.
+/// Minimum average body throughput once [`FetchConfig::body_idle_timeout`]
+/// has elapsed.
 ///
 /// The body transfer has no whole-transfer wall clock (a large resource that
 /// keeps making progress must not spuriously fail), so this floor bounds how
@@ -373,14 +374,18 @@ pub struct FetchConfig {
     ///
     /// The DNS lookup, the connection, sending the request (headers and
     /// body), and receiving the response headers each take up to this long
-    /// before the transfer fails with [`FetchError::Timeout`]. The response
-    /// body has no wall clock: a body that keeps making progress may
-    /// legitimately run longer than this budget overall (a CDN stylesheet
-    /// trickling in over a slow link, for example). Such transfers remain
-    /// bounded by `max_body_bytes`, by a per-read idle bound of this budget,
-    /// and by a minimum average rate of [`MIN_BODY_BYTES_PER_SECOND`] once
-    /// this budget has elapsed. The budget is also enforced across the whole
-    /// redirect chain.
+    /// before the transfer fails with [`FetchError::Timeout`], and the whole
+    /// redirect chain shares it. The response body has no wall clock: a body
+    /// that keeps making progress may legitimately run longer than this budget
+    /// overall (a CDN stylesheet trickling in over a slow link, for example).
+    ///
+    /// This is the **fallback** for the two phase budgets below, not a
+    /// substitute for them. It exists so that a caller who wants every request
+    /// bounded sets one number, and so that the phases which genuinely have no
+    /// budget of their own (name resolution, request write) have one. Set
+    /// [`FetchConfig::response_timeout`] or [`FetchConfig::body_idle_timeout`]
+    /// to decouple a phase from it; leaving them `None` keeps "one number
+    /// bounds everything", which is what the defaults do.
     pub timeout: Duration,
     /// Budget for the connect phase only: the TCP connect and, for `https`,
     /// the TLS handshake over the socket it opened.
@@ -403,9 +408,69 @@ pub struct FetchConfig {
     ///
     /// The TLS handshake shares this budget in ureq, but it runs *after*
     /// address selection on the socket that connected, so a high-latency link
-    /// is not penalised by the geometric split. A zero value disables the
-    /// bound and lets the connect phase run on [`FetchConfig::timeout`].
+    /// is not penalised by the geometric split. A zero value is the opt-out:
+    /// the connect phase then runs on [`FetchConfig::timeout`] rather than with
+    /// no bound at all. See [`FetchConfig::effective_connect_timeout`].
     pub connect_timeout: Duration,
+    /// Budget for the response phase: how long to wait for the status line and
+    /// headers once the request has been written. `None` follows
+    /// [`FetchConfig::timeout`].
+    ///
+    /// **What the default protects against:** an origin (or a proxy in front of
+    /// it) that accepts the connection, swallows the request, and then says
+    /// nothing at all. This is the most common way a page load dies, and the
+    /// failure is reported as [`FetchPhase::ResponseHeaders`].
+    ///
+    /// The wait was bounded before this field existed, but only by borrowing
+    /// ureq's send-request budget, so it had no budget of its own, no name, and
+    /// no way to be tuned without also changing how the request write behaves.
+    ///
+    /// **Why it is a separate knob and not just `timeout`:** the wait is not
+    /// the only thing `timeout` is used for, and the two need different values
+    /// in practice. A page load wants a short bound here (a subresource that
+    /// gets no headers is a lost subresource, and the sooner it is given up on
+    /// the sooner the rest of the page proceeds) while the same page's body
+    /// transfer may legitimately need a long one. Conflating them is what made
+    /// the original hang invisible: the phase that needed a bound had none of
+    /// its own and had to borrow one, so tuning it for the body silently
+    /// changed the header behaviour, and nothing documented which was which.
+    ///
+    /// ureq has no `recv_headers` knob: the header wait is bounded by the
+    /// send-request budget, because `Timeout::RecvResponse`'s deadline is
+    /// re-derived from the recorded send time. This transport therefore sets
+    /// `timeout_send_request` to this budget, which is what actually bounds the
+    /// wait. The consequence is that a timeout here is reported by ureq as a
+    /// send-phase reason; for a bodyless request the loop in `fetch_transfer`
+    /// rewrites that to [`FetchPhase::ResponseHeaders`], because a `GET` that
+    /// wrote a few hundred bytes and left the send phase can only have expired
+    /// while waiting for the origin to answer.
+    pub response_timeout: Option<Duration>,
+    /// **Idle-read** bound for the response body: how long a body read may wait
+    /// for the *next* byte once the previous one arrived. `None` follows
+    /// [`FetchConfig::timeout`].
+    ///
+    /// This is an idle bound and must stay one. **What the default protects
+    /// against** is a connection that delivered part of a body and then went
+    /// quiet forever - a half-open socket, a proxy that dropped the upstream,
+    /// an origin that stopped writing mid-resource. Such a transfer otherwise
+    /// holds its worker thread, its socket, and its pool slot until the process
+    /// exits, and the engine cannot tell that asset from one that is merely
+    /// slow.
+    ///
+    /// It is deliberately **not** a total transfer budget. A 2 MB stylesheet on
+    /// a slow link is fine, and a large stylesheet corpus is exactly what this
+    /// engine struggles with, so a wall clock on the body would fail the
+    /// transfers that matter most while fixing the ones that do not. Nothing
+    /// here has a total body budget: a body that keeps arriving is bounded only
+    /// by `max_body_bytes`, by this idle bound, and by the
+    /// [`MIN_BODY_BYTES_PER_SECOND`] floor.
+    ///
+    /// Because it is an idle bound it is also the one body budget that is safe
+    /// to push to the socket as a read deadline, and doing so is what stops the
+    /// transport from leaving a thread blocked on a dead socket: see
+    /// `HttpTransport::with_proxy` for why `timeout_recv_body` is set here and
+    /// `timeout_recv_response` is not.
+    pub body_idle_timeout: Option<Duration>,
     /// Idle connections the pool keeps for one origin (scheme, host, port and
     /// proxy together).
     ///
@@ -443,7 +508,13 @@ impl Default for FetchConfig {
             max_body_bytes: 16 * 1024 * 1024,
             max_header_bytes: 64 * 1024,
             timeout: Duration::from_secs(30),
-            connect_timeout: Duration::from_secs(5),
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
+            // Left `None` on purpose, so all three phases follow `timeout` and
+            // one number still bounds a whole request. Each field names the
+            // failure it protects against, for a caller that needs to pull one
+            // phase out of the shared budget.
+            response_timeout: None,
+            body_idle_timeout: None,
             idle_connections_per_origin: DEFAULT_PER_ORIGIN_CONCURRENCY,
             idle_connections_total: DEFAULT_PER_ORIGIN_CONCURRENCY * ORIGINS_BEFORE_TOTAL_CEILING,
             user_agent: format!(
@@ -454,6 +525,52 @@ impl Default for FetchConfig {
             ),
             observer: Arc::new(StderrObserver::from_environment()),
         }
+    }
+}
+
+impl FetchConfig {
+    /// Default connect budget: [`FetchConfig::DEFAULT_TIMEOUT`], sized for the
+    /// address-failure walk described on [`FetchConfig::connect_timeout`].
+    ///
+    /// A connect either succeeds in well under this or is failing; nothing
+    /// legitimate needs longer, and a shorter bound is what keeps one
+    /// unreachable address from eating a whole request.
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Default overall per-phase budget, and the fallback for
+    /// [`FetchConfig::response_timeout`] and
+    /// [`FetchConfig::body_idle_timeout`] when they are `None`.
+    ///
+    /// Sized for the slowest phase that has no budget of its own - name
+    /// resolution and the request write. It is generous because a page load
+    /// that fails at 30s per asset has already lost, and because a slow but
+    /// healthy origin must not be mistaken for a broken one.
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// The connect budget this config will actually enforce.
+    ///
+    /// A zero [`FetchConfig::connect_timeout`] is the documented opt-out, and
+    /// resolves to the overall budget rather than to "unbounded", so the
+    /// connect phase is never the one phase with no bound at all.
+    #[must_use]
+    pub fn effective_connect_timeout(&self) -> Duration {
+        if self.connect_timeout > Duration::ZERO {
+            self.connect_timeout.min(self.timeout)
+        } else {
+            self.timeout
+        }
+    }
+
+    /// The response-header budget this config will actually enforce.
+    #[must_use]
+    pub fn effective_response_timeout(&self) -> Duration {
+        self.response_timeout.unwrap_or(self.timeout)
+    }
+
+    /// The body idle-read budget this config will actually enforce.
+    #[must_use]
+    pub fn effective_body_idle_timeout(&self) -> Duration {
+        self.body_idle_timeout.unwrap_or(self.timeout)
     }
 }
 
@@ -706,9 +823,15 @@ impl HttpTransport {
     ///
     /// This is the injection point for callers with their own proxy policy;
     /// [`HttpTransport::new`] resolves the proxy from the environment and the
-    /// platform instead.
+    /// platform instead. **Both constructors funnel through this one function**,
+    /// so the proxy and non-proxy paths cannot drift apart in their phase
+    /// budgets: the only thing `new` adds is the `implicit_proxy` flag that
+    /// decides whether a loopback target bypasses the proxy.
     #[must_use]
     pub fn with_proxy(config: FetchConfig, proxy: Option<ureq::Proxy>) -> Self {
+        let connect_timeout = config.effective_connect_timeout();
+        let response_timeout = config.effective_response_timeout();
+        let body_idle_timeout = config.effective_body_idle_timeout();
         let agent_config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             // Redirects are handled here so intermediate response headers are
@@ -716,28 +839,50 @@ impl HttpTransport {
             .max_redirects(0)
             .max_redirects_will_error(true)
             .max_response_header_size(config.max_header_bytes)
-            // Split header/body timeout design. There is deliberately no
-            // end-to-end wall clock (`timeout_global`/`timeout_per_call`) and
-            // no `timeout_recv_response`/`timeout_recv_body` either: in ureq
-            // those two are absolute phase budgets whose deadline keeps
-            // ticking into the body read, so any value here would kill large
-            // transfers that keep making progress. Instead the request phases
-            // (resolve, send, and header reception, which stays bounded by the
-            // send-request deadline) each get `config.timeout`, the connect
-            // phase gets its own smaller `config.connect_timeout` budget (see
-            // that field for why), and the body phase is bounded by
-            // `read_bounded_body`: a per-read idle bound of `config.timeout`,
-            // the minimum-progress floor, and `max_body_bytes`.
+            // ---- Phase budgets. Three separate bounds, three separate jobs. ----
+            //
+            // There is deliberately no end-to-end wall clock
+            // (`timeout_global`/`timeout_per_call`): a large stylesheet corpus
+            // over a slow link outlives any total budget, and a total budget
+            // fails the transfers that matter most.
             .timeout_global(None)
             .timeout_resolve(Some(config.timeout))
-            .timeout_connect(
-                (config.connect_timeout > Duration::ZERO)
-                    .then_some(config.connect_timeout.min(config.timeout)),
-            )
-            .timeout_send_request(Some(config.timeout))
-            .timeout_send_body(Some(config.timeout))
+            // Connect: the TCP connect, the per-address fallback walk, and (for
+            // `https`) the TLS handshake on the socket that connected. Own
+            // budget because one black-holed address must not cost a whole
+            // request; see `FetchConfig::connect_timeout`.
+            .timeout_connect(Some(connect_timeout))
+            // Response: the wait for the status line and headers. ureq has no
+            // dedicated knob for this, and `Timeout::RecvResponse`'s deadline is
+            // re-derived from the recorded *send* time, so the send budget is
+            // what actually bounds it. Both send budgets take the same value so
+            // a bodyless request and a body-carrying one are bounded identically
+            // before and after their write completes; `fetch_transfer` then
+            // names the phase. See `FetchConfig::response_timeout`.
+            .timeout_send_request(Some(response_timeout))
+            .timeout_send_body(Some(response_timeout))
+            // `timeout_recv_response` stays `None` on purpose, and this is the
+            // one non-obvious knob in the whole agent. It is NOT symmetric with
+            // `timeout_recv_body`: `CallTimings::next_timeout` derives
+            // `RecvBody`'s deadline from *now* on every read (so it is an
+            // idle-read bound), but derives `RecvResponse`'s from the instant
+            // the headers completed (so it is a total budget covering headers
+            // *and* the entire body). Setting it would therefore cap total body
+            // time and fail every large download, which is the exact confusion
+            // this layout exists to avoid. The header wait is bounded above
+            // instead.
             .timeout_recv_response(None)
-            .timeout_recv_body(None)
+            // Body: an idle-read bound, and the only body budget that is safe
+            // to push all the way down to the socket. Setting it here means a
+            // stalled body read fails inside ureq as
+            // `Error::Timeout(RecvBody)` - a real socket deadline, reported as
+            // `FetchPhase::BodyTransfer` - rather than only being noticed by
+            // `read_bounded_body` watching a channel while its pump thread
+            // stays blocked on a dead socket. `read_bounded_body` still applies
+            // the same bound independently, so the two must agree, and the
+            // pump's is the one that stays authoritative for cancellation and
+            // the minimum-progress floor.
+            .timeout_recv_body(Some(body_idle_timeout))
             // ureq 3.3's Brotli reader can finish decoding before it drains
             // the length-delimited wire body, so the connection never returns
             // to its pool. Gzip keeps compression and reliably reuses the
@@ -893,8 +1038,8 @@ impl HttpTransport {
                     let (error, mut phase) = classify_ureq_error(&error, &self.config);
                     // ureq reports a `SendRequest` timeout against the send-request
                     // budget, which this transport deliberately also uses to bound
-                    // the wait for the response headers (see the timeout layout in
-                    // `HttpTransport::with_proxy`), so that reason is ambiguous by
+                    // the wait for the response headers (see the phase-budget layout
+                    // in `HttpTransport::with_proxy`), so that reason is ambiguous by
                     // itself. A request without a body writes a few hundred bytes
                     // and leaves the send phase immediately, so for those the budget
                     // can only have expired while waiting for the origin to answer.
@@ -1065,22 +1210,25 @@ impl HttpTransport {
     ///
     /// There is deliberately no whole-body wall clock: a transfer that keeps
     /// making progress must finish regardless of total duration (a large CDN
-    /// stylesheet over a slow link). Instead, once the configured budget has
-    /// elapsed overall the transfer must average at least
+    /// stylesheet over a slow link). Instead, once the idle bound has elapsed
+    /// overall the transfer must average at least
     /// [`MIN_BODY_BYTES_PER_SECOND`], and each individual read may idle at most
-    /// that budget before the transfer fails.
+    /// that bound - [`FetchConfig::body_idle_timeout`], the same value handed to
+    /// ureq as `timeout_recv_body` - before the transfer fails.
     ///
-    /// ureq applies no socket deadline during the body phase (its remaining
-    /// timeouts are all absolute phase budgets), so the blocking reader is
-    /// pumped on a dedicated thread and this loop bounds every read via a
-    /// channel receive timeout. A pump left behind on a timeout or
-    /// cancellation stays blocked on its socket until the peer closes the
-    /// connection, then unwinds on its own.
+    /// ureq's body budget is a socket read deadline, so a stalled read normally
+    /// surfaces here as a ureq `RecvBody` timeout and the pump unwinds on its
+    /// own. This loop applies the same bound again, independently, because it is
+    /// the thing that also serves cancellation and the minimum-progress floor,
+    /// and because a decoder that stalls without touching the socket (a gzip
+    /// member that never completes) would otherwise be unbounded. Whichever
+    /// fires first wins, and both produce the same terminal outcome.
     fn read_bounded_body(
         &self,
         reader: impl Read + Send + 'static,
         cancel: &CancelToken,
     ) -> Result<Vec<u8>, FetchError> {
+        let idle_timeout = self.config.effective_body_idle_timeout();
         let (chunk_tx, chunk_rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
         let pump = thread::Builder::new()
             .name("render-net-body-pump".to_owned())
@@ -1112,7 +1260,7 @@ impl HttpTransport {
             if cancel.is_cancelled() {
                 break Err(FetchError::Cancelled);
             }
-            let chunk = match chunk_rx.recv_timeout(self.config.timeout) {
+            let chunk = match chunk_rx.recv_timeout(idle_timeout) {
                 Ok(Ok(chunk)) => chunk,
                 Ok(Err(error)) => break Err(self.map_body_read_error(&error)),
                 // A read that idles past the budget is a stalled transfer; the
@@ -1134,7 +1282,7 @@ impl HttpTransport {
             }
             body.extend_from_slice(&chunk);
             let elapsed = started.elapsed();
-            if elapsed > self.config.timeout {
+            if elapsed > idle_timeout {
                 let elapsed_seconds = usize::try_from(elapsed.as_secs()).unwrap_or(usize::MAX);
                 if body.len() < MIN_BODY_BYTES_PER_SECOND.saturating_mul(elapsed_seconds) {
                     break Err(FetchError::Timeout);

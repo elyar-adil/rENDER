@@ -894,6 +894,25 @@ keyword_enum!(TextAlign {
     Center => "center",
     Justify => "justify",
 });
+// CSS Text 3 §5.1. Every value is a keyword §5.1 names, and the grammar is a
+// single keyword, so the enum is the whole definition.
+keyword_enum!(WordBreak {
+    Normal => "normal",
+    KeepAll => "keep-all",
+    BreakAll => "break-all",
+    BreakWord => "break-word",
+});
+// CSS Text 3 §5.2. `strict`, `normal` and `loose` are the three levels of
+// kinsoku shori, `auto` is the initial value and "may vary the restrictions
+// based on the length of the line", and `anywhere` disregards the
+// prohibitions.
+keyword_enum!(LineBreak {
+    Auto => "auto",
+    Loose => "loose",
+    Normal => "normal",
+    Strict => "strict",
+    Anywhere => "anywhere",
+});
 keyword_enum!(BorderStyle {
     None => "none",
     Hidden => "hidden",
@@ -1286,6 +1305,8 @@ pub enum TypedPropertyValue {
     AlignSelf(AlignSelf),
     AlignContent(AlignContent),
     TextAlign(TextAlign),
+    WordBreak(WordBreak),
+    LineBreak(LineBreak),
     Order(i32),
     Gap(Gap),
     GridTemplate(GridTemplate),
@@ -1339,6 +1360,8 @@ impl TypedPropertyValue {
             Self::AlignSelf(_) => "align-self",
             Self::AlignContent(_) => "align-content",
             Self::TextAlign(_) => "text-align",
+            Self::WordBreak(_) => "word-break",
+            Self::LineBreak(_) => "line-break",
             Self::Order(_) => "order",
             Self::Gap(_) => "gap",
             Self::GridTemplate(_) => "grid-template",
@@ -1391,6 +1414,8 @@ impl TypedPropertyValue {
             Self::AlignSelf(value) => value.as_str().to_owned(),
             Self::AlignContent(value) => value.as_str().to_owned(),
             Self::TextAlign(value) => value.as_str().to_owned(),
+            Self::WordBreak(value) => value.as_str().to_owned(),
+            Self::LineBreak(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
             Self::Gap(value) => value.to_css(),
             Self::GridTemplate(value) => value.to_css(),
@@ -1618,6 +1643,98 @@ fn serialize_grid_tracks(tracks: &[GridTrack]) -> String {
         .join(" ")
 }
 
+/// The properties this crate claims a grammar for, which is what makes
+/// `parse_typed_property` return `Some`.
+///
+/// It is a `const` list rather than a `match` arm so that the set of properties
+/// with a grammar is a *declared* thing another module can read. The CSS feature
+/// query oracle in [`crate::supports`] has to answer "does this engine support
+/// `display: grid`" from the same answer the cascade gives, and a list it can
+/// read is what stops the two from drifting the way a second, weaker parse
+/// would.
+pub const DECLARED_GRAMMARS: &[&str] = &[
+    "display",
+    "color",
+    "background-color",
+    "background-image",
+    "background-repeat",
+    "background-position",
+    "background-size",
+    "position",
+    "float",
+    "clear",
+    "box-sizing",
+    "overflow-x",
+    "overflow-y",
+    "visibility",
+    "object-fit",
+    "opacity",
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "margin-top",
+    "margin-right",
+    "margin-bottom",
+    "margin-left",
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+    "border-top-width",
+    "border-right-width",
+    "border-bottom-width",
+    "border-left-width",
+    "border-top-style",
+    "border-right-style",
+    "border-bottom-style",
+    "border-left-style",
+    "border-top-color",
+    "border-right-color",
+    "border-bottom-color",
+    "border-left-color",
+    "border-spacing",
+    "border-collapse",
+    "empty-cells",
+    "table-layout",
+    "caption-side",
+    "vertical-align",
+    "text-decoration-line",
+    "text-decoration-style",
+    "text-decoration-color",
+    "text-decoration-thickness",
+    "flex-direction",
+    "flex-wrap",
+    "flex-basis",
+    "flex-grow",
+    "flex-shrink",
+    "justify-content",
+    "align-items",
+    "align-self",
+    "align-content",
+    "text-align",
+    "word-break",
+    "line-break",
+    "order",
+    "row-gap",
+    "column-gap",
+    "grid-template-columns",
+    "grid-template-rows",
+    "grid-column-start",
+    "grid-column-end",
+    "grid-row-start",
+    "grid-row-end",
+    "aspect-ratio",
+    "transform",
+    "transform-origin",
+];
+
 /// Parse a supported layout-facing property. `None` means that this slice does
 /// not yet claim the property's grammar; `Some(Err(_))` means the property is
 /// supported but the value is invalid at computed-value time.
@@ -1626,88 +1743,7 @@ pub fn parse_typed_property(
     property: &str,
     css: &str,
 ) -> Option<Result<TypedPropertyValue, PropertyParseError>> {
-    let supported = matches!(
-        property,
-        "display"
-            | "color"
-            | "background-color"
-            | "background-image"
-            | "background-repeat"
-            | "background-position"
-            | "background-size"
-            | "position"
-            | "float"
-            | "clear"
-            | "box-sizing"
-            | "overflow-x"
-            | "overflow-y"
-            | "visibility"
-            | "object-fit"
-            | "opacity"
-            | "width"
-            | "height"
-            | "min-width"
-            | "min-height"
-            | "max-width"
-            | "max-height"
-            | "top"
-            | "right"
-            | "bottom"
-            | "left"
-            | "margin-top"
-            | "margin-right"
-            | "margin-bottom"
-            | "margin-left"
-            | "padding-top"
-            | "padding-right"
-            | "padding-bottom"
-            | "padding-left"
-            | "border-top-width"
-            | "border-right-width"
-            | "border-bottom-width"
-            | "border-left-width"
-            | "border-top-style"
-            | "border-right-style"
-            | "border-bottom-style"
-            | "border-left-style"
-            | "border-top-color"
-            | "border-right-color"
-            | "border-bottom-color"
-            | "border-left-color"
-            | "border-spacing"
-            | "border-collapse"
-            | "empty-cells"
-            | "table-layout"
-            | "caption-side"
-            | "vertical-align"
-            | "text-decoration-line"
-            | "text-decoration-style"
-            | "text-decoration-color"
-            | "text-decoration-thickness"
-            | "flex-direction"
-            | "flex-wrap"
-            | "flex-basis"
-            | "flex-grow"
-            | "flex-shrink"
-            | "justify-content"
-            | "align-items"
-            | "align-self"
-            | "align-content"
-            | "text-align"
-            | "order"
-            | "row-gap"
-            | "column-gap"
-            | "grid-template-columns"
-            | "grid-template-rows"
-            | "grid-column-start"
-            | "grid-column-end"
-            | "grid-row-start"
-            | "grid-row-end"
-            | "aspect-ratio"
-            | "transform"
-            | "transform-origin"
-    );
-    if !supported {
+    if !DECLARED_GRAMMARS.contains(&property) {
         return None;
     }
 
@@ -1777,6 +1813,8 @@ fn parse_property<'i>(
             parse_keyword(input, AlignContent::parse).map(TypedPropertyValue::AlignContent)
         }
         "text-align" => parse_keyword(input, TextAlign::parse).map(TypedPropertyValue::TextAlign),
+        "word-break" => parse_keyword(input, WordBreak::parse).map(TypedPropertyValue::WordBreak),
+        "line-break" => parse_keyword(input, LineBreak::parse).map(TypedPropertyValue::LineBreak),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
         "row-gap" | "column-gap" => parse_gap(input).map(TypedPropertyValue::Gap),
         "grid-template-columns" | "grid-template-rows" => {

@@ -145,6 +145,109 @@ Text Decoration 3 再加 `-thickness`。修法只有一处:`expanded_declaration
 6. **已知未修(NET,均已报告)**:① `max_idle_connections_per_host` 默认 **3**,对 40 个同源资源的 HTTP/1.1 页面是**很低的 ceiling**;② ureq 的 `Connection::age()` 恒返回 0,所以 `max_idle_age` 永不淘汰。这两条都指向一个待做项:**同源并发上限目前由第三方默认值决定,不是我们选的**。
 7. **CSS2 的嵌套工作当前让工作区编译不过**(`crates/render-css/src/selector.rs` 16 个 + `stylesheet.rs` 11 个错误:`NestedSelectors`、`parse_nested_selector_list`、重复的 `impl AtRuleParser for PropertyParser`、`Parser` 名字冲突)。**这是预期内的在途状态**——NET 正确地没有去"修"它,只上报。八个 agent 并行时看到别的 crate 编译不过,先确认是不是别人改到一半,再决定要不要管。
 
+## 门禁现状(阻塞提交,不是阻塞工作)
+
+`tools/check_site_neutrality.py` 规则数 4 → **9**,现在 **exit 1**:9 blocking + 28 advisory,
+173 个文件。self-test 60 项(25 must-flag / 31 must-pass / 4 exit-status / 1 coverage)。
+
+**做法上值得学的一点**:它先把每个文件**词法分析成 code / string / comment 三种 span**
+(注释、raw string、byte string、char 字面量、嵌套块注释,18 条单元用例),因为**行正则无法区分
+代码里的 token 和字符串或注释里的同一个 token,而这个区分正是全部要点**。只有 `SITE_TOKEN` 用在
+决策位置之外——`DOMAIN` 会匹配 `track.info`,`IPV4` 会匹配树里每一条规范引用
+(`ECMA-262 20.1.3.6`,211 行)。
+
+**它同时抓出两个既有 bug,而这两个 bug 会让新规则静默失效:**
+- `SITE_TOKEN` 用了 `\b`,而 **`\b` 在 `_` 旁边不触发** —— 所以 `\bbilibili\b` **从来没匹配过
+  `temp_diag_bilibili`,也就是那条规则唯一要抓的东西**。现在用 `(?<![A-Za-z0-9])` /
+  `(?![A-Za-z0-9])`:`_` 是连接符,不是单词字符。
+- `EXTERNAL_SWITCH` 的 env-var 那半边用的是裸名,所以 `let _ = "RENDER_SITE is not read here";`
+  被报成站点开关。**提到不等于开关。**
+
+**防退化机制**:`check_rule_coverage` 断言每条规则**同时**有 must-flag 和 must-pass 用例,
+缺一条就 fail。**没有 allowlist 条目被新增**——中途出现过约 28 个过宽命中,**全部改成修规则而不是
+加豁免**,最后过宽 blocking 命中为零。它还明确拒绝把 `hao123`/`163`/裸 `qq` 加进 `SITE_TOKEN`
+来让那些捕获可见,理由是"那是对拥有那些 crate 的人的 token 列表决定,也是我被警告过的失败形态"。
+
+### 9 个 blocking 的处置(需要排期,两个 crate 都被占)
+
+| 位置 | 规则 | 判断 |
+|---|---|---|
+| `render-core/src/interaction.rs:1308` | identifier | 真:活的 `#[test]` 名叫 `..._a_baidu_style_...` |
+| `render-core/src/media.rs:584` | identifier | 真:活测试 `discovers_bilibili_style_...` |
+| `render-js/examples/bilibili_diag.rs:58,248` | path | 真:按站点做的回放工具 |
+| `render-js/examples/check_compile.rs:7` | path | 真:读 `.diag/bilibili/video.js` |
+| `render-js/src/runtime/tests.rs:2205,2238,2641,2660` | path | 真:`temp_diag_mutual_recursion` / `temp_read_5073_state` |
+
+`render-core` 归 FONT,`render-js` 归 SURFACE。**在 CI 上是红的,但只有 push 才触发,而推送由我
+控制**,所以不阻塞工作。
+
+**那两个 `render-js` 测试应该删掉而不是修**——变异审计已经独立发现它们**只 `eprintln!`、不断言
+任何东西、且是活的并计入测试数**。一条什么都不测的测试还违反门禁,两条理由指向同一个动作。
+
+### 一条我要写死的判断:按站点命名的**诊断工具**是允许的
+
+28 个 advisory 里有 3 个是文件名(`baidu_diag.rs`、`bilibili_layout_diag.rs`、`bilibili_diag.rs`)。
+**我不打算改这些**,理由是审计自己给出的那句:一个以"它诊断什么"命名的诊断工具,**比一个引擎内部
+以站点命名的分支弱得多**。
+
+这个项目的工作方法就是测量真实页面,所以语料工具必须能指向它测的页面。**被禁止的是引擎里的
+按站点分支,不是按站点的工具。** 写死这条是为了防止下一个 agent 看到 advisory 就把语料工具删掉。
+
+## 规则裁决:测试期望与"不得断言缺陷"冲突时,后者赢
+
+PARSER 改了**两条既有测试**,理由是它们断言了一个已知错误的 DOM:`<![CDATA[x]]>y` 产生**两个**
+注释节点。规范里 bogus comment 状态会转入 comment 状态,html5lib 也一致,所以**一个注释才是正确的,
+而且永远不可能再变回两个**。
+
+**裁决:`不得断言缺陷` 优先于 `既有测试必须未修改通过`。**
+
+理由:规则的职责是防止交付已知错误的行为。为了保住一条错误的测试绿,而去为一个真实页面交付
+**已知错误的 DOM**——那个代价比改测试大得多。而且这不是"可以随便改测试"的先例,先例仅限于
+**改掉一条断言了缺陷的测试**;改机制时该测试必须同时改名并保留(`..._is_one_bogus_comment`)。
+
+**记录在此,以免下一个 agent 把"改测试"读成通用许可。**
+
+## WPT runner 已建成,但**跑不了任何一个测试**——而这是正确的结论
+
+`tools/wpt/run.ps1` 一条命令走通:自检 → 按固定修订版取套件 → 普查 → 运行 → 写
+`tools/wpt/results/wpt-results.json`。**32,576 个计分测试**(css 26,614 / dom 559 / html 5,403),
+静态可执行 20,986(**64.4%**),**实际跑起来 0 个**。
+
+**原因结构性:WPT 的 CSS 测试是 `testcss.js` 测试,而 `testcss.js` 是一个 iframe 驱动器。
+`render-core` 没有嵌套浏览上下文。**
+
+**所以:引擎里唯一拥有真实层叠、真实选择器匹配器和真实布局引擎的那块面积,恰好是它的测试工具跑不起来的
+那一块。**
+
+**它拒绝报符合率,而且 runner 里根本没有能报符合率的代码路径**——`Rate` 在零分母上返回 `None`,
+所以空跑**什么都不打印而不是打印 `0%`**。它也**拒绝报引擎缺陷清单**,并把这一点标为
+**"blocked, not empty" 而不是"零缺陷"**——因为什么都没被求值,任何缺陷清单都只是工具的产物。
+
+**这改变了 S11 的权重。**iframe 不再是十二个缺口里的一个:**它堵住了对其他一切的外部测量**。
+不能承载嵌套文档的引擎**无法被现存最大的 CSS 一致性套件评分**。仅这一项就阻塞了
+**1,772** 个看起来静态可执行的测试。**代价不是一种页面类型,是项目"知道自己 CSS 对不对"的能力。**
+
+**它在自己仪器里找出两个缺陷,和本项目反复遇到的那一类完全相同:**
+- **引用身份指标静默坏了**——两个集合存在不同键空间里,所以报告读作"两边都是 0;命名规则本会漏掉
+  8,748 个引用并丢掉 8,695 个真实测试"——**不可能的数字,没有报错,没有失败测试**。**只靠读数字才发现。**
+- **取件 bug 把总体翻倍**——`Copy-Item -Recurse` 覆盖已有缓存产生 `css/css/`,数量 46,325 → 92,650,
+  **而那棵树看起来仍像一个合法检出**。现在普查**拒绝自嵌套检出**。
+
+**一个值得记住的校准数字:32,576 个测试里 6,466 个(19.8%)根本没有断言点**——静态和运行时双重检测,
+方法调用和函数声明在自检抓出分类器把它们算进去之后被排除。**参考套件里五分之一的测试根本没有失败
+的可能**,这对任何会读符合率的人是必要的校准。
+
+**待接线的引擎契约(三条,带签名,在 `tools/wpt/FINDINGS.md`)。最高杠杆的一条:
+CSS 解析器在 `stylesheet.rs:1270` 算出了 `line`/`column`,然后在 `stylesheet.rs:35` 把它们
+扔掉了——`Declaration` 没有位置字段,所以一个失败**根本无法**被报成引擎的 `file:line`。
+给 `Declaration` 加 `line`/`column` 几乎零成本,而它正是把"WPT 测试挂了"变成"这个函数错了"的东西。
+另两条:`ComputedStyle::get` 把"不适用"和"未实现"混为一谈;没有 `file://` 样式表加载器。
+
+`tests/wpt_runner/` 的 `--features engine` 适配器**写好了但从未编译过**(当时 `render-js` 非编译),
+**按未经证明的草稿对待**。另外 772 个测试被 legacy `setup()` 挡住(不是引擎,是它自己能关的),
+535 个缺失 fixture 是跨区域引用。`docs/wpt.md` 可能要更正:本机 `pwsh` 不存在(只有 5.1),
+而全局 git 配置指向一个死掉的 SOCKS5 代理,所以 `tools/fetch-wpt.ps1` 在这台机器上跑不起来。
+
 ## 排队中(等 crate 归属释放后开工)
 
 ### S1 字体轴 —— 最高价值剩余项,**同时被三个 crate 阻塞**

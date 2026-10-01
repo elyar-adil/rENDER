@@ -37,9 +37,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          # Only the engine workspace. The standalone roots under tests/ are their own
+          # workspace roots and their own target directories - they do NOT share this
+          # one, and claiming otherwise here would under-cache a build that never
+          # happened and document something false. Sharing would need a
+          # .cargo/config.toml with build.target-dir, which is deliberately not done
+          # because it would also queue those builds behind the engine's.
           workspaces: |
             . -> target
-            tests/real_site_tasks -> target
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -63,6 +68,11 @@ jobs:
       # workspace, so it does not run as part of `cargo test --workspace`. It is
       # guarded on the manifest existing so that CI stays green while the harness
       # is being built.
+      #
+      # `--locked` requires a tracked lockfile: this crate is its own workspace root
+      # and its own `Cargo.lock` is committed for exactly that reason. An ignored
+      # lockfile here would make this step fail on a clean checkout for a reason
+      # that has nothing to do with the code under test.
       - name: Real-site acceptance harness
         if: runner.os == 'ubuntu-latest' && hashFiles('tests/real_site_tasks/Cargo.toml') != ''
         run: cargo test --manifest-path tests/real_site_tasks/Cargo.toml --locked

@@ -1,0 +1,70 @@
+# Offline WPT conformance runner for the rENDER engine.
+#
+# This crate is deliberately NOT a member of the root workspace. It is invoked as
+#
+#     cargo run --manifest-path tests/wpt_runner/Cargo.toml -- <subcommand>
+#
+# Keeping it out of the workspace means it never touches the root `Cargo.lock`.
+# The empty `[workspace]` table makes it its own workspace root, exactly as
+# `tests/real_site_tasks/Cargo.toml` does.
+#
+# Do NOT set CARGO_TARGET_DIR and do NOT add a `.cargo/config.toml` pointing at
+# the repository `target/`. Because this crate is its own workspace root, cargo
+# compiles the dependency graph a second time into `tests/wpt_runner/target/`.
+# That duplicate compile is the deliberate lesser evil: sharing the directory
+# would queue this build behind six other agents' builds.
+# `target/` is matched at any depth by the root `.gitignore`.
+[workspace]
+
+[package]
+name = "render-wpt-runner"
+description = "Official Web Platform Tests conformance runner for the rENDER engine"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "LicenseRef-rENDER-Non-Commercial-1.0"
+publish = false
+
+[lib]
+name = "wpt_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wpt-runner"
+path = "src/bin/wpt_runner.rs"
+
+# Intentionally zero dependencies. Every requirement here - walking a
+# directory tree, reading UTF-8 text, tokenising HTML and JavaScript closely
+# enough to classify a test, and emitting JSON - is met by `std`. A JSON
+# *writer* is ~80 lines and is auditable in a way a third-party crate is not, so
+# there is no `serde_json`, and no HTTP client: the fetch is a PowerShell script
+# under `tools/wpt/`, which keeps the network stack out of the measurement path
+# entirely. `render-core` and `url` are the only dependencies in the manifest and
+# both are optional, behind the `engine` feature below, so the default build has
+# none.
+
+# The engine adapter is optional and OFF by default, for a reason that is not
+# stylistic. `render-core` is under active concurrent edit, and when it does not
+# compile every subcommand becomes unrunnable - including the census and the
+# harness self-check, which are the parts that must keep working so the suite's
+# own trustworthiness can be audited without the engine. With the feature off
+# this crate builds and runs against `std` alone and reports the engine as
+# unavailable instead of failing to compile.
+#
+# `cargo run --manifest-path tests/wpt_runner/Cargo.toml --features engine -- run`
+# builds the adapter. See tools/wpt/FINDINGS.md for the capabilities the
+# adapter needs from render-core and which of them exist.
+[features]
+default = []
+engine = ["dep:render-core", "dep:url"]
+
+[dependencies]
+render-core = { path = "../../crates/render-core", optional = true }
+url = { version = "2.5.4", optional = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }

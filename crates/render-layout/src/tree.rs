@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use render_css::computed::ComputedStyle;
 use render_css::properties::{
-    Display, DisplayBox, DisplayInside, DisplayInternal, DisplayOutside, Float, TypedPropertyValue,
+    Display, DisplayBox, DisplayInside, DisplayInternal, DisplayOutside, Float, Position,
+    TypedPropertyValue,
 };
 use render_dom::{Dom, DomRevision, NodeId, NodeKind};
 
@@ -248,12 +249,30 @@ pub fn build_formatting_tree(
             FormattingNodeId(0)
         });
     builder.append_dom_children(dom.document(), root, None, 0);
+    // §9.2.1.1 can only be applied once an inline box's whole child list is
+    // known, because the split has to know what is left on each side of the
+    // block-level box that caused it.
+    builder.split_block_in_inlines(root);
     FormattingTree {
         dom_revision: dom.revision(),
         root,
         nodes: builder.nodes,
         diagnostics: builder.diagnostics,
     }
+}
+
+/// One step of CSS 2.1 §9.2.1.1's split. §9.2.1.1 breaks an inline box "into two
+/// boxes (even if either side is empty), one on each side of the block-level
+/// box(es)", and the two halves are what `Half` carries while `Block` is the
+/// in-flow block-level box that became their sibling. A half names the box that
+/// holds it and not only a child list, because the box the inline already owns
+/// is the first half rather than a copy of it.
+#[derive(Clone, Debug)]
+enum InlineSplit {
+    /// One half of a split box: the box itself, and the children it keeps.
+    Half(FormattingNodeId, Vec<FormattingNodeId>),
+    /// An in-flow block-level box lifted out to the enclosing block container.
+    Block(FormattingNodeId),
 }
 
 struct Builder<'a> {
@@ -585,10 +604,17 @@ impl Builder<'_> {
                     );
                 } else {
                     if !parent_accepts_inline && !inline_level {
+                        // §9.2.1.1: the enclosing inline box is broken around
+                        // this one once the whole tree is built, by
+                        // `split_block_in_inlines`. The diagnostic still
+                        // fires, because a block-level box inside an inline is
+                        // what a reader needs to be able to find.
                         self.diagnostics.push(FormattingDiagnostic {
                             node: Some(dom_node),
                             code: FormattingDiagnosticCode::BlockInsideInline,
-                            message: "block-in-inline splitting is not implemented yet".to_owned(),
+                            message: "in-flow block-level box inside an inline box; the inline \
+                                 box is split around it"
+                                .to_owned(),
                         });
                     }
                     *anonymous = None;
@@ -791,6 +817,340 @@ impl Builder<'_> {
             .and_then(|index| self.nodes.get_mut(index))
     }
 
+    /// CSS 2.1 §9.2.1.1: give every inline box that contains an in-flow
+    /// block-level box the split the specification describes.
+    ///
+    /// §9.2.1.1 says "when an inline box contains an in-flow block-level box,
+    /// the inline box (and its inline ancestors within the same line box) are
+    /// broken around the block-level box", so the break propagates outwards
+    /// through every enclosing inline, and "the block-level box becomes a
+    /// sibling of those anonymous boxes", so the block ends up beside the
+    /// anonymous blocks rather than inside the inline. That is the difference
+    /// between the block dissolving - its children being re-parented into the
+    /// surrounding inline run, because the inline solver walks past any
+    /// non-inline child - and the block being laid out as a block.
+    ///
+    /// The anonymous block boxes the engine already generates around a block
+    /// container's inline content are part of the chain for the same reason:
+    /// §9.2.1.1 is talking about the box that holds the line boxes, and that is
+    /// what one of these is. Splitting it as well is what puts the lifted block
+    /// beside the anonymous block rather than inside it - inside it, the block
+    /// solver would route the anonymous block to the inline path and the block
+    /// would dissolve all the same.
+    ///
+    /// This runs over the finished tree rather than during the build because a
+    /// split has to know both sides of the break, and the content after the
+    /// block is not known until the inline's children have all been appended.
+    fn split_block_in_inlines(&mut self, root: FormattingNodeId) {
+        // A rewrite can push a node back on the stack, so the walk is bounded
+        // rather than assumed to converge. Twice the node count is enough for
+        // every node to be visited before and after its parent is rewritten.
+        let mut budget = self.nodes.len().saturating_mul(2).saturating_add(8);
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if budget == 0 {
+                self.diagnostics.push(FormattingDiagnostic {
+                    node: None,
+                    code: FormattingDiagnosticCode::BlockInsideInline,
+                    message: "block-in-inline splitting did not converge".to_owned(),
+                });
+                return;
+            }
+            budget = budget.saturating_sub(1);
+            let Some(formatting) = self.get(node) else {
+                continue;
+            };
+            if formatting.children.is_empty() {
+                continue;
+            }
+            let children = formatting.children.clone();
+            let mut rebuilt: Vec<FormattingNodeId> = Vec::with_capacity(children.len());
+            let mut rewritten = false;
+            for child in children {
+                let split = if self.is_block_container(node) {
+                    self.split_around_blocks(child)
+                } else {
+                    None
+                };
+                if let Some(segments) = split {
+                    let was_first = self.get(child).is_some_and(|node| node.is_first_child);
+                    let emitted = self.split_halves(child, segments, was_first);
+                    // The lifted boxes are new children of this block
+                    // container, so whatever they contain has to be reached too.
+                    stack.extend(&emitted);
+                    rebuilt.extend(emitted);
+                    rewritten = true;
+                } else {
+                    stack.push(child);
+                    rebuilt.push(child);
+                }
+            }
+            if rewritten && let Some(formatting) = self.get_mut(node) {
+                formatting.children = rebuilt;
+            }
+        }
+    }
+
+    /// A box the block solver lays out as a block container, so a split has to
+    /// place its result here for the block inside it to be laid out as one. An
+    /// `Inline` or an `AnonymousBlock` establishes an inline formatting context
+    /// for its whole subtree, which is exactly what §9.2.1.1 says must not
+    /// survive a block-level box.
+    fn is_block_container(&self, node: FormattingNodeId) -> bool {
+        matches!(
+            self.get(node).map(|node| &node.kind),
+            Some(
+                FormattingNodeKind::Root
+                    | FormattingNodeKind::BlockContainer { .. }
+                    | FormattingNodeKind::AtomicInline { .. }
+            )
+        )
+    }
+
+    /// An inline or anonymous block box with an in-flow block-level box inside
+    /// it, which is what §9.2.1.1 breaks. The question is asked through the
+    /// boxes a break does *not* cross - inline boxes, and the anonymous block
+    /// boxes that hold their line boxes - because those are the ones the
+    /// specification splits.
+    fn is_inline_holding_a_block(&self, node: FormattingNodeId) -> bool {
+        self.is_inline_or_anonymous(node)
+            && self.get(node).is_some_and(|node| {
+                node.children.iter().any(|child| {
+                    self.is_in_flow_block(*child) || self.is_inline_holding_a_block(*child)
+                })
+            })
+    }
+
+    fn is_inline_or_anonymous(&self, node: FormattingNodeId) -> bool {
+        matches!(
+            self.get(node).map(|node| &node.kind),
+            Some(FormattingNodeKind::Inline | FormattingNodeKind::AnonymousBlock)
+        )
+    }
+
+    /// §9.2.1.1 is about an *in-flow* block-level box. An out-of-flow box is
+    /// explicitly not one of the "block-level siblings that are consecutive"
+    /// that break an inline, and an atomic inline-level box is inline-level
+    /// however much like a block it lays out.
+    fn is_in_flow_block(&self, node: FormattingNodeId) -> bool {
+        let Some(formatting) = self.get(node) else {
+            return false;
+        };
+        if !matches!(formatting.kind, FormattingNodeKind::BlockContainer { .. }) {
+            return false;
+        }
+        let Some(style) = formatting
+            .source
+            .and_then(|source| self.styles.get(&source))
+        else {
+            return true;
+        };
+        float(style) == Float::None
+            && !matches!(
+                crate::solver::resolve::position(Some(style)),
+                Position::Absolute | Position::Fixed
+            )
+    }
+
+    /// Split one inline box around every in-flow block-level box inside it,
+    /// innermost inlines included, and report the sequence in document order.
+    /// Returns `None` when there was nothing to break, in which case no node
+    /// has been touched.
+    fn split_around_blocks(&mut self, node: FormattingNodeId) -> Option<Vec<InlineSplit>> {
+        if !self.is_inline_holding_a_block(node) {
+            return None;
+        }
+        let mut segments: Vec<InlineSplit> = Vec::new();
+        let mut run: Vec<FormattingNodeId> = Vec::new();
+        // The box the inline already owns becomes its first half; every later
+        // half is a second box for the same element, and an element that is
+        // only ever half a box is not a thing §9.2.1.1 describes.
+        let mut claimed = false;
+        let mut leading = true;
+        let mut broken = false;
+        for child in self
+            .get(node)
+            .map(|node| node.children.clone())
+            .unwrap_or_default()
+        {
+            if self.is_in_flow_block(child) {
+                broken = true;
+                self.close_inline_run(
+                    node,
+                    &mut claimed,
+                    &mut leading,
+                    false,
+                    &mut segments,
+                    &mut run,
+                );
+                segments.push(InlineSplit::Block(child));
+            } else if self.is_inline_holding_a_block(child)
+                && let Some(inner) = self.split_around_blocks(child)
+            {
+                broken = true;
+                // Every break below this box is a break of this one too, so the
+                // inner halves are spliced into this one's sequence. The inner
+                // call has already decided which of its boxes is which.
+                for (index, segment) in inner.into_iter().enumerate() {
+                    match segment {
+                        InlineSplit::Half(half, children) => {
+                            self.set_children(half, children);
+                            if index > 0 {
+                                self.close_inline_run(
+                                    node,
+                                    &mut claimed,
+                                    &mut leading,
+                                    false,
+                                    &mut segments,
+                                    &mut run,
+                                );
+                            }
+                            run.push(half);
+                        }
+                        InlineSplit::Block(block) => {
+                            self.close_inline_run(
+                                node,
+                                &mut claimed,
+                                &mut leading,
+                                false,
+                                &mut segments,
+                                &mut run,
+                            );
+                            segments.push(InlineSplit::Block(block));
+                        }
+                    }
+                }
+            } else {
+                run.push(child);
+            }
+        }
+        if !broken {
+            return None;
+        }
+        self.close_inline_run(
+            node,
+            &mut claimed,
+            &mut leading,
+            true,
+            &mut segments,
+            &mut run,
+        );
+        Some(segments)
+    }
+
+    /// Close the run of inline children accumulated since the last break.
+    ///
+    /// The first and the last runs are closed even when they are empty, because
+    /// that is where the two halves come from: §9.2.1.1 splits "even if either
+    /// side is empty". A run *between* two lifted boxes is only a half when it
+    /// holds something, because §9.2.1.1 breaks the inline around blocks "that
+    /// are consecutive", which is a statement that there is nothing between
+    /// them.
+    fn close_inline_run(
+        &mut self,
+        node: FormattingNodeId,
+        claimed: &mut bool,
+        leading: &mut bool,
+        last: bool,
+        segments: &mut Vec<InlineSplit>,
+        run: &mut Vec<FormattingNodeId>,
+    ) {
+        if run.is_empty() && !*leading && !last {
+            return;
+        }
+        let children = std::mem::take(run);
+        let half = if *claimed {
+            self.copy_box(node, children.clone())
+        } else {
+            *claimed = true;
+            Some(node)
+        };
+        *leading = false;
+        if let Some(half) = half {
+            self.set_children(half, children.clone());
+            segments.push(InlineSplit::Half(half, children));
+        }
+    }
+
+    fn set_children(&mut self, node: FormattingNodeId, children: Vec<FormattingNodeId>) {
+        if let Some(node) = self.get_mut(node) {
+            node.children = children;
+        }
+    }
+
+    /// A second box for the same inline element or anonymous box, holding
+    /// `children`. §9.2.1.1 splits one box into several, so the halves are
+    /// distinct boxes that all carry the same source and style.
+    fn copy_box(
+        &mut self,
+        node: FormattingNodeId,
+        children: Vec<FormattingNodeId>,
+    ) -> Option<FormattingNodeId> {
+        let prototype = self.get(node)?;
+        let (source, style_source, kind) = (
+            prototype.source,
+            prototype.style_source,
+            prototype.kind.clone(),
+        );
+        let id = self.allocate(source, style_source, kind)?;
+        if let Some(copy) = self.get_mut(id) {
+            copy.children = children;
+        }
+        Some(id)
+    }
+
+    /// The nodes that take `node`'s place in its block container:
+    /// "The line boxes before the break and after the break are enclosed in
+    /// anonymous block boxes, and the block-level box becomes a sibling of
+    /// those anonymous boxes."
+    ///
+    /// A half that is already an anonymous block box is that anonymous block
+    /// box; one that is an inline box is enclosed in one. The new anonymous
+    /// box takes the split box's style as its own, because §9.2.1.1 says "the
+    /// properties of anonymous boxes are inherited from the enclosing
+    /// non-anonymous box", and the inline element is what it was generated
+    /// for.
+    fn split_halves(
+        &mut self,
+        node: FormattingNodeId,
+        segments: Vec<InlineSplit>,
+        was_first_child: bool,
+    ) -> Vec<FormattingNodeId> {
+        let style_source = self.get(node).and_then(|node| node.style_source);
+        let anonymous = matches!(
+            self.get(node).map(|node| &node.kind),
+            Some(FormattingNodeKind::AnonymousBlock)
+        );
+        let mut out = Vec::with_capacity(segments.len());
+        for segment in segments {
+            match segment {
+                InlineSplit::Half(half, _) => {
+                    if anonymous {
+                        out.push(half);
+                        continue;
+                    }
+                    let Some(wrapper) =
+                        self.allocate(None, style_source, FormattingNodeKind::AnonymousBlock)
+                    else {
+                        // Out of nodes: keeping the half is better than
+                        // dropping the content it holds.
+                        out.push(half);
+                        continue;
+                    };
+                    self.append_child(wrapper, half);
+                    out.push(wrapper);
+                }
+                InlineSplit::Block(block) => out.push(block),
+            }
+        }
+        if let Some(first) = out.first().copied()
+            && let Some(first) = self.get_mut(first)
+        {
+            first.is_first_child = was_first_child;
+        }
+        out
+    }
+
     /// The casing transform that applies to text read for `style_source`.
     fn text_transform_of(&self, style_source: Option<NodeId>) -> TextTransform {
         style_source
@@ -935,7 +1295,8 @@ mod tests {
     use render_html::parse_document;
 
     use super::{
-        FormattingContextKind, FormattingLimits, FormattingNodeKind, build_formatting_tree,
+        FormattingContextKind, FormattingDiagnosticCode, FormattingLimits, FormattingNode,
+        FormattingNodeId, FormattingNodeKind, build_formatting_tree,
     };
 
     fn styles(
@@ -1096,6 +1457,288 @@ mod tests {
                 context: FormattingContextKind::Block
             }
         ));
+    }
+
+    #[test]
+    fn a_block_inside_an_inline_becomes_a_sibling_of_the_split_inline_halves() {
+        // §9.2.1.1: "The line boxes before the break and after the break are
+        // enclosed in anonymous block boxes, and the block-level box becomes a
+        // sibling of those anonymous boxes."
+        let output = parse_document(
+            "<!doctype html><body><p id='p'>before<span id='b'></span>after</p></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "html, body { display:block } p { display:inline } #b { display:block }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let body = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "body")))
+            .expect("body formatting node");
+        let block = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#b")))
+            .expect("block formatting node");
+
+        // The block is a child of the block container, not of the inline.
+        assert_eq!(body.children.len(), 3);
+        let (first, middle, last) = (
+            tree.get(body.children[0]).unwrap(),
+            tree.get(body.children[1]).unwrap(),
+            tree.get(body.children[2]).unwrap(),
+        );
+        assert_eq!(middle.id, block.id, "the block is a sibling of the halves");
+        assert!(matches!(first.kind, FormattingNodeKind::AnonymousBlock));
+        assert!(matches!(last.kind, FormattingNodeKind::AnonymousBlock));
+
+        // Both halves are boxes of the same `p` element, one on each side, and
+        // each holds the inline content from its own side of the break.
+        let halves: Vec<&FormattingNode> = [first, last]
+            .iter()
+            .map(|half| tree.get(half.children[0]).unwrap())
+            .collect();
+        assert!(
+            halves
+                .iter()
+                .all(|half| half.source == Some(find(&output.dom, "#p"))),
+            "both halves are the p element"
+        );
+        assert!(
+            halves
+                .iter()
+                .all(|half| matches!(half.kind, FormattingNodeKind::Inline)),
+            "{:?}",
+            halves.iter().map(|half| &half.kind).collect::<Vec<_>>()
+        );
+        let text: Vec<String> = halves
+            .iter()
+            .map(|half| {
+                half.children
+                    .iter()
+                    .filter_map(|child| match &tree.get(*child).unwrap().kind {
+                        FormattingNodeKind::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(text, vec!["before".to_owned(), "after".to_owned()]);
+
+        // The split is still reported: a block-level box inside an inline box
+        // has to stay findable, and the diagnosis now says what happened to it.
+        let reported = tree
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == FormattingDiagnosticCode::BlockInsideInline)
+            .expect("the split is diagnosed");
+        assert_eq!(reported.node, Some(find(&output.dom, "#b")));
+    }
+
+    #[test]
+    fn every_enclosing_inline_is_broken_around_the_block() {
+        // §9.2.1.1: "the inline box (and its inline ancestors within the same
+        // line box) are broken around the block-level box". The break
+        // propagates outwards, so the `em` splits and so does the `span` around
+        // it - and each half of the `em` stays inside the corresponding half of
+        // the `span`, because it is the same break for both.
+        let output = parse_document(
+            "<!doctype html><body><span id='s'>a<em id='e'>b<i id='b'></i>c</em>d</span></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "html, body { display:block } span, em, i { display:inline } #b { display:block }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let body = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "body")))
+            .expect("body formatting node");
+        let block = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#b")))
+            .expect("block formatting node");
+
+        // anonymous block, block, anonymous block.
+        assert_eq!(body.children.len(), 3);
+        assert_eq!(body.children[1], block.id);
+        let is_anonymous = |id: FormattingNodeId| {
+            matches!(
+                tree.get(id).map(|node| &node.kind),
+                Some(FormattingNodeKind::AnonymousBlock)
+            )
+        };
+        assert!(is_anonymous(body.children[0]));
+        assert!(is_anonymous(body.children[2]));
+
+        // Each half of the `span` keeps the chain, so the `em` half stays
+        // inside the `span` half on the same side of the break rather than
+        // being flattened onto the block container.
+        let span = find(&output.dom, "#s");
+        let em = find(&output.dom, "#e");
+        let text_of = |node: &FormattingNode| -> String {
+            node.children
+                .iter()
+                .filter_map(|child| match &tree.get(*child).unwrap().kind {
+                    FormattingNodeKind::Text(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        for (half, own, nested) in [(body.children[0], "a", "b"), (body.children[2], "d", "c")] {
+            let span_half = tree.get(half).unwrap().children[0];
+            assert_eq!(tree.get(span_half).and_then(|node| node.source), Some(span));
+            // The `em` half is the child of the `span` half on this side of the
+            // break, and the `span`'s own text sits beside it in document order.
+            let em_half = tree
+                .get(span_half)
+                .unwrap()
+                .children
+                .iter()
+                .copied()
+                .find(|child| tree.get(*child).and_then(|node| node.source) == Some(em))
+                .unwrap_or_else(|| panic!("the span half holds an em half"));
+            assert_eq!(text_of(tree.get(em_half).unwrap()), nested);
+            assert!(
+                text_of(tree.get(span_half).unwrap()).ends_with(own),
+                "the span's own {own:?} is on the same side of the break"
+            );
+        }
+    }
+
+    #[test]
+    fn consecutive_blocks_in_an_inline_become_consecutive_siblings() {
+        // §9.2.1.1 breaks the inline "around the block-level box (and any
+        // block-level siblings that are consecutive or separated only by
+        // collapsible whitespace and/or out-of-flow elements)", so two blocks in
+        // a row are both lifted and the line box between them is gone.
+        let output = parse_document(
+            "<!doctype html><body><p id='p'>a<i id='one'></i><i id='two'></i>b</p></body>",
+        );
+        let styles = styles(
+            &output.dom,
+            "html, body { display:block } p { display:inline } #one, #two { display:block }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let body = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "body")))
+            .expect("body formatting node");
+
+        assert_eq!(
+            body.children.len(),
+            4,
+            "a, one, two, b: the two blocks are siblings with no line box between"
+        );
+        assert!(matches!(
+            tree.get(body.children[0]).map(|node| &node.kind),
+            Some(FormattingNodeKind::AnonymousBlock)
+        ));
+        assert_eq!(
+            tree.get(body.children[1]).and_then(|node| node.source),
+            Some(find(&output.dom, "#one"))
+        );
+        assert_eq!(
+            tree.get(body.children[2]).and_then(|node| node.source),
+            Some(find(&output.dom, "#two"))
+        );
+        assert!(matches!(
+            tree.get(body.children[3]).map(|node| &node.kind),
+            Some(FormattingNodeKind::AnonymousBlock)
+        ));
+    }
+
+    #[test]
+    fn a_block_at_either_end_of_an_inline_still_splits_it() {
+        // §9.2.1.1 splits the inline "even if either side is empty", so a block
+        // that is the inline's first or only child still leaves two boxes of the
+        // element, and the empty one is where the element's start of line was.
+        for (html, before) in [
+            ("<p id='p'><i id='b'></i>after</p>", ""),
+            ("<p id='p'>before<i id='b'></i></p>", "before"),
+        ] {
+            let output = parse_document(&format!("<!doctype html><body>{html}</body>"));
+            let styles = styles(
+                &output.dom,
+                "html, body { display:block } p { display:inline } #b { display:block }",
+            );
+            let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+            let body = tree
+                .iter()
+                .find(|node| node.source == Some(find(&output.dom, "body")))
+                .expect("body formatting node");
+            let block = tree
+                .iter()
+                .find(|node| node.source == Some(find(&output.dom, "#b")))
+                .expect("block formatting node");
+            let p = find(&output.dom, "#p");
+
+            // anonymous block, block, anonymous block - the empty side keeps
+            // its box even though it has no line boxes in it.
+            assert_eq!(
+                body.children.len(),
+                3,
+                "{html}: {:?}",
+                body.children
+                    .iter()
+                    .map(|id| tree.get(*id).map(|node| &node.kind))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(body.children[1], block.id, "{html}");
+            let halves: Vec<&FormattingNode> = [body.children[0], body.children[2]]
+                .iter()
+                .map(|half| tree.get(tree.get(*half).unwrap().children[0]).unwrap())
+                .collect();
+            assert!(
+                halves.iter().all(|half| half.source == Some(p)
+                    && matches!(half.kind, FormattingNodeKind::Inline)),
+                "{html}: the p has a box on each side of the break"
+            );
+            let text = |node: &FormattingNode| -> String {
+                node.children
+                    .iter()
+                    .filter_map(|child| match &tree.get(*child).unwrap().kind {
+                        FormattingNodeKind::Text(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+            };
+            assert_eq!(text(halves[0]), before, "{html}");
+            assert_eq!(
+                halves[1].children.is_empty(),
+                before == "before",
+                "{html}: exactly one side is empty"
+            );
+        }
+    }
+    #[test]
+    fn an_out_of_flow_box_does_not_break_the_inline_around_it() {
+        // §9.2.1.1 is about an *in-flow* block-level box, and it lists
+        // out-of-flow elements among the things that do not make two blocks
+        // "consecutive", so a float between two runs of text leaves the inline
+        // in one piece.
+        let output = parse_document("<!doctype html><body><p id='p'>a<i id='f'></i>b</p></body>");
+        let styles = styles(
+            &output.dom,
+            "html, body { display:block } p { display:inline } #f { display:block; float:left }",
+        );
+        let tree = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+        let body = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "body")))
+            .expect("body formatting node");
+        let inline = tree
+            .iter()
+            .find(|node| node.source == Some(find(&output.dom, "#p")))
+            .expect("p formatting node");
+
+        // The `p` was not split, so the float is still its child and the block
+        // container still holds the single anonymous box the build created.
+        assert_eq!(body.children.len(), 1);
+        assert_eq!(
+            tree.get(body.children[0]).unwrap().children,
+            vec![inline.id]
+        );
     }
 
     #[test]

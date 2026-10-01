@@ -1962,6 +1962,42 @@ mod tests {
         );
     }
 
+    /// The same §2.6 rule for the *other* three initials, and specifically for a
+    /// shorthand value that omits the line slot entirely.
+    ///
+    /// `text-decoration: none` does not reach the omitted-value path: `none` is
+    /// itself a `text-decoration-line` value, so it fills that slot and the
+    /// `unwrap_or_else` is never asked for it. A shorthand that mentions only a
+    /// style, a thickness or a colour is what does, and the line it has to write
+    /// is `none` - the initial of `text-decoration-line` - not any line keyword.
+    ///
+    /// This is the slot that makes the project work: `a { text-decoration:
+    /// none }` in the reported bug had to beat a user-agent
+    /// `text-decoration-line: underline`, and a shorthand that wrote a line
+    /// keyword of its own into an omitted slot would underline whatever it
+    /// touched.
+    #[test]
+    fn a_shorthand_that_omits_the_line_slot_writes_the_line_initial() {
+        for (value, thickness, style, color) in [
+            ("solid", "auto", "solid", "currentcolor"),
+            ("wavy", "auto", "wavy", "currentcolor"),
+            ("2px", "2px", "solid", "currentcolor"),
+            ("blue", "auto", "solid", "blue"),
+            ("2px wavy blue", "2px", "wavy", "blue"),
+        ] {
+            assert_eq!(
+                super::expanded_declaration("text-decoration", value),
+                vec![
+                    ("text-decoration-line".to_owned(), "none".to_owned()),
+                    ("text-decoration-thickness".to_owned(), thickness.to_owned()),
+                    ("text-decoration-style".to_owned(), style.to_owned()),
+                    ("text-decoration-color".to_owned(), color.to_owned()),
+                ],
+                "{value:?}: an omitted text-decoration-line is its initial, `none`"
+            );
+        }
+    }
+
     /// Text Decoration 4 §2.6's `||` production, all four slots in one value
     /// and in an order that differs from the grammar's. `||` permits each slot
     /// at most once, so a second style keyword would be invalid.

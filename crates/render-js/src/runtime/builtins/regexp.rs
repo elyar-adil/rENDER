@@ -19,6 +19,7 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::RegexRecord;
+use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -106,10 +107,17 @@ impl JsRuntime {
         Ok((index, false))
     }
 
+    /// `RegExpBuiltinExec`'s result array.
+    ///
+    /// The matcher walks code points, but `index` is a position in a String
+    /// value, so it is reported in code units: `'\u{1F600}a'.match(/a/).index`
+    /// is 2, not 1. `input` is the same String the caller passed rather than a
+    /// rebuild, so it cannot drift from what was matched.
     pub(in crate::runtime) fn regex_exec_value(
         &mut self,
         index: usize,
         input: &[char],
+        text: &str,
         start: usize,
     ) -> Result<Option<JsValue>, JsError> {
         let Some(found) = self.regexes[index].compiled.find(input, start) else {
@@ -130,14 +138,11 @@ impl JsRuntime {
             clippy::cast_precision_loss,
             reason = "string lengths stay far below any precision boundary"
         )]
-        let index_number = found.start as f64;
+        let index_number = utf16::utf16_offset_of_char(text, found.start) as f64;
         self.realm
             .set_property(array, "index".to_owned(), JsValue::Number(index_number));
-        self.realm.set_property(
-            array,
-            "input".to_owned(),
-            JsValue::String(input.iter().collect()),
-        );
+        self.realm
+            .set_property(array, "input".to_owned(), JsValue::String(text.to_owned()));
         Ok(Some(JsValue::Object(array)))
     }
 
@@ -147,38 +152,49 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
-        let input: Vec<char> = required_argument(arguments, 0, "exec")?
-            .to_js_string()
-            .chars()
-            .collect();
+        let text = required_argument(arguments, 0, "exec")?.to_js_string();
+        let input: Vec<char> = text.chars().collect();
         let flags = self.regexes[index].compiled.flags();
         let track_last_index = flags.global || flags.sticky;
+        // `lastIndex` is a String index, so it counts code units, while the
+        // matcher walks characters: convert on the way in and on the way out.
         let from = if track_last_index {
-            self.regexes[index].last_index.min(input.len())
+            utf16::char_offset_of_utf16(&text, self.regexes[index].last_index).min(input.len())
         } else {
             0
         };
         let found = self.regexes[index].compiled.find(&input, from);
-        if let Some(value) = self.regex_exec_value(index, &input, from)? {
+        if let Some(value) = self.regex_exec_value(index, &input, &text, from)? {
             if track_last_index && let Some(found) = found {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "string lengths stay far below any precision boundary"
-                )]
-                let last = found.end as f64;
-                self.regexes[index].last_index = found.end;
-                self.realm
-                    .set_property(receiver, "lastIndex".to_owned(), JsValue::Number(last));
+                self.store_regex_last_index(receiver, index, &text, found.end);
             }
             Ok(value)
         } else {
             if track_last_index {
-                self.regexes[index].last_index = 0;
-                self.realm
-                    .set_property(receiver, "lastIndex".to_owned(), JsValue::Number(0.0));
+                self.store_regex_last_index(receiver, index, &text, 0);
             }
             Ok(JsValue::Null)
         }
+    }
+
+    /// Record `character_end` as the regex's `lastIndex`, in the code units
+    /// script reads back.
+    fn store_regex_last_index(
+        &mut self,
+        receiver: ObjectId,
+        index: usize,
+        text: &str,
+        character_end: usize,
+    ) {
+        let last = utf16::utf16_offset_of_char(text, character_end);
+        self.regexes[index].last_index = last;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "string lengths stay far below any precision boundary"
+        )]
+        let stored = last as f64;
+        self.realm
+            .set_property(receiver, "lastIndex".to_owned(), JsValue::Number(stored));
     }
 
     pub(in crate::runtime) fn regexp_test(
@@ -187,38 +203,24 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
-        let input: Vec<char> = required_argument(arguments, 0, "test")?
-            .to_js_string()
-            .chars()
-            .collect();
+        let text = required_argument(arguments, 0, "test")?.to_js_string();
+        let input: Vec<char> = text.chars().collect();
         let flags = self.regexes[index].compiled.flags();
         let track_last_index = flags.global || flags.sticky;
         let from = if track_last_index {
-            self.regexes[index].last_index.min(input.len())
+            utf16::char_offset_of_utf16(&text, self.regexes[index].last_index).min(input.len())
         } else {
             0
         };
         Ok(
             if let Some(found) = self.regexes[index].compiled.find(&input, from) {
                 if track_last_index {
-                    self.regexes[index].last_index = found.end;
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "string lengths stay far below any precision boundary"
-                    )]
-                    let last = found.end as f64;
-                    self.realm.set_property(
-                        receiver,
-                        "lastIndex".to_owned(),
-                        JsValue::Number(last),
-                    );
+                    self.store_regex_last_index(receiver, index, &text, found.end);
                 }
                 JsValue::Boolean(true)
             } else {
                 if track_last_index {
-                    self.regexes[index].last_index = 0;
-                    self.realm
-                        .set_property(receiver, "lastIndex".to_owned(), JsValue::Number(0.0));
+                    self.store_regex_last_index(receiver, index, &text, 0);
                 }
                 JsValue::Boolean(false)
             },

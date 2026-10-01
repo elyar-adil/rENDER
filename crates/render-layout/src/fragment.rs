@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use render_dom::{DomRevision, NodeId};
 
+use super::font::{FontRequest, FontStyle, FontSynthesis};
 use super::geometry::{EdgeSizes, PhysicalRect, PhysicalSize};
 use super::scrollport::ScrollportGeometry;
 use super::sticky::StickyConstraint;
@@ -73,11 +74,72 @@ impl BoxGeometry {
     }
 }
 
+/// The font request a text run was measured with, owned.
+///
+/// [`TextFragmentData`] outlives the cascade it was built from, so the family's
+/// name is copied into it. Paint reads this rather than re-reading the
+/// computed style: layout may have measured a run whose source is not the
+/// element the fragment box belongs to, and a second parse of the same
+/// declarations at paint time is a second answer waiting to disagree.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredFontRequest {
+    family: String,
+    weight: u16,
+    style: FontStyle,
+    synthesis: FontSynthesis,
+}
+
+impl StoredFontRequest {
+    /// Takes ownership of a borrowed request.
+    #[must_use]
+    pub fn new(request: FontRequest<'_>) -> Self {
+        Self {
+            family: request.family.to_owned(),
+            weight: request.weight,
+            style: request.style,
+            synthesis: request.synthesis,
+        }
+    }
+
+    /// Borrows the owned request again.
+    #[must_use]
+    pub fn request(&self) -> FontRequest<'_> {
+        FontRequest {
+            family: &self.family,
+            weight: self.weight,
+            style: self.style,
+            synthesis: self.synthesis,
+        }
+    }
+
+    /// The `font-family` list this run asked for.
+    #[must_use]
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    /// The `font-weight` this run asked for, on §2.2's 1 to 1000 scale.
+    #[must_use]
+    pub const fn weight(&self) -> u16 {
+        self.weight
+    }
+
+    /// The `font-style` this run asked for.
+    #[must_use]
+    pub const fn style(&self) -> FontStyle {
+        self.style
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextFragmentData {
     pub text: String,
     pub baseline: f32,
     pub font_size: f32,
+    /// The request [`font_size`](Self::font_size) and this run's advances came
+    /// from. The painter selects a face from exactly this value, which is what
+    /// keeps a measure/draw mismatch from being possible.
+    pub font: StoredFontRequest,
 }
 
 #[derive(Clone, Debug, PartialEq)]

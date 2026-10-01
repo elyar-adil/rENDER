@@ -1,4 +1,4 @@
-﻿use render_dom::{Dom, Namespace, NodeId, NodeKind};
+use render_dom::{Dom, Namespace, NodeId, NodeKind};
 
 use super::tokenizer::{
     AttributeToken, ContentModel, DoctypeToken, HtmlParseError, HtmlParseErrorCode, TagToken,
@@ -50,6 +50,9 @@ enum InsertionMode {
     InTemplate,
     AfterBody,
     AfterAfterBody,
+    InFrameset,
+    AfterFrameset,
+    AfterAfterFrameset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,6 +131,16 @@ struct TreeBuilder<'a> {
     foster_parenting: bool,
     ignore_next_line_feed: bool,
     temporary_head: Option<NodeId>,
+    /// The parser's frameset-ok flag (13.2.4.5), initially "ok".
+    ///
+    /// It is the only thing standing between a document that is allowed to
+    /// become a frameset and one that is not: a single character, an `<img>`, a
+    /// `<table>`, or a `<body>` start tag sets it to "not ok", and only the
+    /// "after head" mode's catch-all resets it to "ok". So `<frameset>` is
+    /// honoured for a document that has said nothing yet and ignored for every
+    /// document that has said anything at all, which is what makes
+    /// `<body>x</body><frameset>` keep its body and `<frameset>` replace one.
+    frameset_ok: bool,
 }
 
 /// An entry in the list of active formatting elements: either a marker, or a
@@ -170,6 +183,7 @@ impl<'a> TreeBuilder<'a> {
             foster_parenting: false,
             ignore_next_line_feed: false,
             temporary_head: None,
+            frameset_ok: true,
         }
     }
 
@@ -291,6 +305,9 @@ impl<'a> TreeBuilder<'a> {
             InsertionMode::InTemplate => self.process_in_template(token),
             InsertionMode::AfterBody => self.process_after_body(token),
             InsertionMode::AfterAfterBody => self.process_after_after_body(token),
+            InsertionMode::InFrameset => self.process_in_frameset(token),
+            InsertionMode::AfterFrameset => self.process_after_frameset(token),
+            InsertionMode::AfterAfterFrameset => self.process_after_after_frameset(token),
         }
     }
 
@@ -537,9 +554,25 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
+            // "A start tag whose tag name is 'body': insert an HTML element for
+            // the token, set the frameset-ok flag to 'not ok', and switch the
+            // insertion mode to 'in body'."
             Token::StartTag(tag) if tag.name == "body" => {
                 self.body_element = self.insert_element(tag, true);
+                self.frameset_ok = false;
                 self.mode = InsertionMode::InBody;
+                Action::Consumed
+            }
+            // "A start tag whose tag name is 'frameset': insert an HTML element
+            // for the token and switch the insertion mode to 'in frameset'."
+            //
+            // Unlike the "in body" rule below, this one does not consult the
+            // frameset-ok flag: a `<frameset>` written where only a `<head>` may
+            // appear is a frameset, and the flag was "ok" unless something
+            // already said otherwise.
+            Token::StartTag(tag) if tag.name == "frameset" => {
+                self.insert_element(tag, true);
+                self.mode = InsertionMode::InFrameset;
                 Action::Consumed
             }
             Token::StartTag(tag)
@@ -582,7 +615,15 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             _ => {
+                // "Insert an HTML element for a 'body' start tag token with no
+                // attributes, set the frameset-ok flag to 'ok', switch the
+                // insertion mode to 'in body', and reprocess the current token."
+                //
+                // This is the only place the flag goes back to "ok", and it is
+                // why a document that reaches the body without having said
+                // anything can still become a frameset.
                 self.body_element = self.insert_element(&empty_tag("body"), true);
+                self.frameset_ok = true;
                 self.mode = InsertionMode::InBody;
                 Action::Reprocess
             }
@@ -636,21 +677,36 @@ impl<'a> TreeBuilder<'a> {
             // elements, if any. Insert the token's character." and "Any other
             // character token: Reconstruct the active formatting elements, if any.
             // Insert the token's character."
+            // The two character-token rules differ in one step: "Any other
+            // character token" also sets the frameset-ok flag to "not ok", which
+            // is what makes a document that has produced any content at all
+            // ineligible to become a frameset.
             Token::Character(data) | Token::Cdata(data) => {
-                let data = if self.ignore_next_line_feed {
+                let (data, whitespace) = if self.ignore_next_line_feed {
                     self.ignore_next_line_feed = false;
-                    data.strip_prefix('\n').unwrap_or(data)
+                    (
+                        data.strip_prefix('\n').unwrap_or(data),
+                        is_all_html_whitespace(data.strip_prefix('\n').unwrap_or(data)),
+                    )
                 } else {
-                    data
+                    (data.as_str(), is_all_html_whitespace(data))
                 };
                 if !data.is_empty() {
                     self.reconstruct_active_formatting_elements();
                     self.insert_text(data);
                 }
+                if !whitespace {
+                    self.frameset_ok = false;
+                }
                 Action::Consumed
             }
             Token::Comment(data) => {
                 self.insert_comment(self.current_node(), data);
+                Action::Consumed
+            }
+            // "A processing instruction token: Insert a processing instruction."
+            Token::ProcessingInstruction { target, data } => {
+                self.insert_processing_instruction(self.current_node(), target, data);
                 Action::Consumed
             }
             Token::Doctype(_) => {
@@ -695,9 +751,50 @@ impl<'a> TreeBuilder<'a> {
                 if self.has_open_template() {
                     return Action::Consumed;
                 }
+                // "Otherwise, set the frameset-ok flag to 'not ok'; then, for
+                // each attribute on the token, check to see if the attribute is
+                // already present on the body element (the second element) on
+                // the stack of open elements, and if it is not, add the
+                // attribute and its corresponding value to that element."
+                self.frameset_ok = false;
                 if let Some(body) = self.body_element {
                     self.merge_attributes(body, tag);
                 }
+                Action::Consumed
+            }
+            // "A start tag whose tag name is 'frameset'" (13.2.6.4.7).
+            //
+            // This is the rule that makes a body element give way to a frameset,
+            // and it is the only rule in the whole algorithm that *removes* a
+            // node it did not create: the body is unhooked from the document
+            // element and everything still open inside it is thrown away, so
+            // `<body>text<frameset>` is a frameset document and the text goes
+            // with the body.
+            Token::StartTag(tag) if tag.name == "frameset" => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                if self.open_elements.len() < 2
+                    || self.element_name(self.open_elements[1]) != Some("body")
+                {
+                    return Action::Consumed;
+                }
+                if !self.frameset_ok {
+                    return Action::Consumed;
+                }
+                // "Remove the second element on the stack of open elements from
+                // its parent node, if it has one."
+                if let Some(body) = self.body_element
+                    && let Some(parent) = self.dom.parent(body)
+                    && self.dom.remove_child(parent, body).is_err()
+                {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                }
+                // "Pop all the nodes from the bottom of the stack of open
+                // elements, from the current node up to, but not including, the
+                // root html element."
+                let root = self.open_elements.first().copied();
+                self.open_elements.retain(|node| Some(*node) == root);
+                self.insert_element(tag, true);
+                self.mode = InsertionMode::InFrameset;
                 Action::Consumed
             }
             // "A start tag whose tag name is one of: 'address', 'article',
@@ -732,6 +829,7 @@ impl<'a> TreeBuilder<'a> {
                 self.close_p_if_open();
                 self.insert_element(tag, true);
                 self.ignore_next_line_feed = true;
+                self.frameset_ok = false;
                 Action::Consumed
             }
             // "A start tag whose tag name is 'form'" (13.2.6.4.7). If the form
@@ -758,12 +856,14 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::StartTag(tag) if tag.name == "li" => {
+                self.frameset_ok = false;
                 self.close_matching_list_item("li");
                 self.close_p_if_open();
                 self.insert_element(tag, true);
                 Action::Consumed
             }
             Token::StartTag(tag) if matches!(tag.name.as_str(), "dd" | "dt") => {
+                self.frameset_ok = false;
                 self.close_definition_item();
                 self.close_p_if_open();
                 self.insert_element(tag, true);
@@ -776,12 +876,20 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::StartTag(tag) if tag.name == "table" => {
+                self.frameset_ok = false;
                 self.close_p_if_open();
                 self.insert_element(tag, true);
                 self.mode = InsertionMode::InTable;
                 Action::Consumed
             }
             Token::StartTag(tag) if matches!(tag.name.as_str(), "textarea" | "title") => {
+                // "Set the frameset-ok flag to 'not ok'" is only in the
+                // `textarea` rule; a `title` is already too late for it to
+                // matter, but the spec does not set it there and neither does
+                // this.
+                if tag.name == "textarea" {
+                    self.frameset_ok = false;
+                }
                 self.enter_text_element(tag, ContentModel::Rcdata);
                 self.ignore_next_line_feed = tag.name == "textarea";
                 Action::Consumed
@@ -790,6 +898,7 @@ impl<'a> TreeBuilder<'a> {
             // reconstruct the active formatting elements, then follow the generic
             // raw text element parsing algorithm.
             Token::StartTag(tag) if matches!(tag.name.as_str(), "xmp" | "iframe" | "noembed") => {
+                self.frameset_ok = false;
                 self.close_p_if_open();
                 if tag.name == "xmp" {
                     self.reconstruct_active_formatting_elements();
@@ -808,6 +917,7 @@ impl<'a> TreeBuilder<'a> {
             // current standard, so `option` and `optgroup` are handled below
             // rather than by a mode of their own.
             Token::StartTag(tag) if tag.name == "select" => {
+                self.frameset_ok = false;
                 if self.has_select_in_scope() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 } else {
@@ -866,15 +976,53 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_foreign_start_tag(tag, &Namespace::Svg);
                 Action::Consumed
             }
+            // "A start tag whose tag name is one of: 'rb', 'rtc'" (13.2.6.4.7):
+            // if there is a ruby element in scope, generate implied end tags; if
+            // the current node is not then a ruby element, report a parse error;
+            // insert the element.
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "rb" | "rtc") => {
+                if self.has_element_name_in_scope("ruby") {
+                    self.generate_implied_end_tags_except(None);
+                    if self.current_tag() != Some("ruby") {
+                        self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    }
+                }
+                self.insert_element(tag, true);
+                Action::Consumed
+            }
+            // "A start tag whose tag name is one of: 'rp', 'rt'": the same, except
+            // that an `rtc` survives the implied end tags, and a current node that
+            // is an `rtc` is not an error either.
+            //
+            // Spareing `rtc` is what makes a run of annotations a sibling of the
+            // container they annotate rather than a child of it, and the current
+            // standard does **not** create a fresh `ruby` element when the
+            // current node is something else: an earlier revision did, and it
+            // nested `<ruby><div><span><rp>` one level deeper than every other
+            // implementation puts it.
+            Token::StartTag(tag) if matches!(tag.name.as_str(), "rp" | "rt") => {
+                if self.has_element_name_in_scope("ruby") {
+                    self.generate_implied_end_tags_except(Some("rtc"));
+                    if !matches!(self.current_tag(), Some("rtc" | "ruby")) {
+                        self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    }
+                }
+                self.insert_element(tag, true);
+                Action::Consumed
+            }
             // "A start tag whose tag name is one of: 'area', 'br', 'embed',
             // 'img', 'keygen', 'wbr'": reconstruct the active formatting
-            // elements, insert, and pop immediately.
+            // elements, insert, pop, acknowledge the self-closing flag, and set
+            // the frameset-ok flag to 'not ok'. The flag is easy to miss here
+            // because the element is popped again immediately: `<area>` is still
+            // a statement that the document has content.
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
                     "area" | "br" | "embed" | "img" | "keygen" | "wbr"
                 ) =>
             {
+                self.frameset_ok = false;
                 self.reconstruct_active_formatting_elements();
                 self.insert_element(tag, false);
                 Action::Consumed
@@ -888,6 +1036,14 @@ impl<'a> TreeBuilder<'a> {
                 if self.has_select_in_scope() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                     self.pop_through("select");
+                }
+                // "If the token does not have an attribute with the name 'type',
+                // or if it does, but that attribute's value is not an ASCII
+                // case-insensitive match for 'hidden', then set the frameset-ok
+                // flag to 'not ok'." A hidden input is the one start tag that
+                // does not make the document ineligible to become a frameset.
+                if !has_attribute_matching_ascii_case_insensitive(tag, "type", "hidden") {
+                    self.frameset_ok = false;
                 }
                 self.reconstruct_active_formatting_elements();
                 self.insert_element(tag, false);
@@ -991,10 +1147,15 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             // "A start tag whose tag name is one of: 'applet', 'marquee',
-            // 'object'": reconstruct, insert, and insert a marker.
+            // 'object'": reconstruct, insert, insert a marker, and set the
+            // frameset-ok flag to 'not ok'. The flag is on the *start* tag rule,
+            // not the end tag one, which is easy to get backwards: it is
+            // `<object>` appearing that disqualifies a document from becoming a
+            // frameset, not `</object>`.
             Token::StartTag(tag)
                 if matches!(tag.name.as_str(), "applet" | "marquee" | "object") =>
             {
+                self.frameset_ok = false;
                 self.reconstruct_active_formatting_elements();
                 self.insert_element(tag, true);
                 self.push_active_formatting_marker();
@@ -1059,16 +1220,27 @@ impl<'a> TreeBuilder<'a> {
             // then insert an HTML element for the token. This element will be an
             // ordinary element.
             Token::StartTag(tag) => {
+                self.frameset_ok = false;
                 self.reconstruct_active_formatting_elements();
                 self.insert_element(tag, true);
                 Action::Consumed
             }
             Token::EndTag(tag) if tag.name == "body" => {
-                if self.has_open_element("body") {
-                    self.mode = InsertionMode::AfterBody;
-                } else {
+                // "If the stack of open elements does not have a body element in
+                // scope, this is a parse error; ignore the token. Otherwise, if
+                // there is a node in the stack of open elements that is not
+                // either a dd, dt, li, optgroup, option, p, rb, rp, rt, rtc,
+                // tbody, td, tfoot, th, thead, tr, body, or html element, then
+                // this is a parse error." Both halves report rather than change
+                // the tree, and the mode still switches either way.
+                let unclosed_content = self
+                    .open_elements
+                    .iter()
+                    .any(|node| !is_body_closer(self.element_name(*node)));
+                if !self.has_element_name_in_scope("body") || unclosed_content {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 }
+                self.mode = InsertionMode::AfterBody;
                 Action::Consumed
             }
             Token::EndTag(tag) if tag.name == "html" => {
@@ -1167,6 +1339,7 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::EndTag(tag) if tag.name == "br" => {
+                self.frameset_ok = false;
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 self.process_in_body(&Token::StartTag(empty_tag("br")))
             }
@@ -1185,7 +1358,32 @@ impl<'a> TreeBuilder<'a> {
             // process the token using the rules for the 'in template' insertion
             // mode." (13.2.6.4.7)
             Token::Eof if !self.template_modes.is_empty() => self.process_in_template(token),
-            Token::Eof => Action::Consumed,
+            // "An end-of-file token: If the stack of template insertion modes is
+            // not empty, then process the token using the rules for the 'in
+            // template' insertion mode. Otherwise, follow these steps: If there
+            // is a node in the stack of open elements that is not either a dd
+            // element, a dt element, an li element, an optgroup element, an
+            // option element, a p element, an rb element, an rp element, an rt
+            // element, an rtc element, a tbody element, a td element, a tfoot
+            // element, a th element, a thead element, a tr element, the body
+            // element, or the html element, then this is a parse error. Stop
+            // parsing." (13.2.6.4.7)
+            //
+            // The tree is the same either way -- stopping is stopping -- so this
+            // is the whole observable effect of the rule, and it is the single
+            // largest source of parse-error disagreement in the suite: a
+            // document that ends with an unclosed `<p>`, `<div>` or `<table>`
+            // reports one error fewer than the standard says it should.
+            Token::Eof => {
+                if self
+                    .open_elements
+                    .iter()
+                    .any(|node| !is_body_closer(self.element_name(*node)))
+                {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                }
+                Action::Consumed
+            }
         }
     }
 
@@ -1782,10 +1980,13 @@ impl<'a> TreeBuilder<'a> {
     fn process_in_template(&mut self, token: &Token) -> Action {
         match token {
             // "A character token", "A comment token", and "A DOCTYPE token" are
-            // processed using the rules for the "in body" insertion mode.
-            Token::Character(_) | Token::Cdata(_) | Token::Comment(_) | Token::Doctype(_) => {
-                self.process_in_body(token)
-            }
+            // processed using the rules for the "in body" insertion mode, and so
+            // is a processing instruction.
+            Token::Character(_)
+            | Token::Cdata(_)
+            | Token::Comment(_)
+            | Token::Doctype(_)
+            | Token::ProcessingInstruction { .. } => self.process_in_body(token),
             Token::StartTag(tag)
                 if matches!(
                     tag.name.as_str(),
@@ -1836,15 +2037,18 @@ impl<'a> TreeBuilder<'a> {
                 // stack. Clear the list of active formatting elements up to the
                 // last marker. Pop the current template insertion mode off the
                 // stack of template insertion modes. Reset the insertion mode
-                // appropriately. Reprocess the token."  An end-of-file token
-                // ends the parse either way, so the reprocess only has to leave
-                // the insertion mode consistent.
+                // appropriately. Reprocess the token."
+                //
+                // The reprocess is not a formality. Resetting can land the parser
+                // back in "after head", and that mode's catch-all is what creates
+                // the body element: a document whose last token lands inside a
+                // template still has a body, and only reprocessing puts it there.
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 self.pop_through_template();
                 self.clear_active_formatting_up_to_last_marker();
                 self.pop_current_template_mode();
                 self.reset_insertion_mode();
-                self.process_in_body(token)
+                Action::Reprocess
             }
         }
     }
@@ -1854,9 +2058,6 @@ impl<'a> TreeBuilder<'a> {
     /// switch to "in template", push it onto the stack of template insertion
     /// modes, and insert the element.
     ///
-    /// "Set the frameset-ok flag to 'not ok'" is not run: this tree builder does
-    /// not track that flag because no frameset insertion mode is implemented.
-    ///
     /// The insertion mode changes before the element is inserted, so the element
     /// lands where the document is being built while its contents will be parsed
     /// by the new mode.
@@ -1865,6 +2066,9 @@ impl<'a> TreeBuilder<'a> {
         // elements." The marker is what stops formatting from leaking into or out
         // of a template's contents.
         self.push_active_formatting_marker();
+        // "Set the frameset-ok flag to 'not ok'." A template is content, and a
+        // document that has content cannot still become a frameset.
+        self.frameset_ok = false;
         self.mode = InsertionMode::InTemplate;
         self.template_modes.push(InsertionMode::InTemplate);
         self.insert_element(tag, true);
@@ -2130,9 +2334,8 @@ impl<'a> TreeBuilder<'a> {
             });
             let Some(formatting_index) = formatting_index else {
                 // "If there is no such element, then act as described in the
-                // 'any other end tag' entry above and return."
-                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
-                self.pop_through_if_open(subject);
+                // 'any other end tag' entry above and return." (13.2.6.4.7)
+                self.any_other_end_tag(subject);
                 return;
             };
             let Some(formatting_element) = self.active_formatting[formatting_index].node() else {
@@ -2153,12 +2356,14 @@ impl<'a> TreeBuilder<'a> {
             // "If formattingElement is in the stack of open elements, but the
             // element is not in scope, then this is a parse error; return."
             if !self.has_element_in_scope(formatting_element) {
+                if subject == "a" { eprintln!("DBG   not-in-scope errors={}", self.tree_errors.len()); }
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 return;
             }
             if stack_index + 1 != self.open_elements.len() {
                 // "If formattingElement is not the current node, this is a parse
                 // error. (But do not return.)"
+                if subject == "a" { eprintln!("DBG   not-current stack={:?}", self.open_elements.iter().map(|n| self.element_name(*n).unwrap_or("?")).collect::<Vec<_>>()); }
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
             }
             // "Let furthestBlock be the topmost node in the stack of open
@@ -2173,7 +2378,11 @@ impl<'a> TreeBuilder<'a> {
                 // the nodes from the bottom of the stack of open elements, from
                 // the current node up to and including formattingElement, then
                 // remove formattingElement from the list of active formatting
-                // elements, and finally return."
+                // elements, and finally return." (13.2.6.4.7)
+                //
+                // "The current node is the bottommost node in this stack", so
+                // popping from the current node up to and including
+                // formattingElement truncates at formattingElement's position.
                 let target = self
                     .open_elements
                     .iter()
@@ -2192,29 +2401,49 @@ impl<'a> TreeBuilder<'a> {
             // algorithm, so the bookmark is the index it notes, and the algorithm
             // moves it when a new element takes the slot.
             let mut bookmark = formatting_index;
-            let mut node = furthest_block;
+            // "Let node and lastNode be furthestBlock. Let innerLoopCounter be 0."
+            // `node`'s initial value is consumed by the first step, which
+            // reassigns it to the element above, so it is declared rather than
+            // seeded.
+            //
+            // The walk is an *index* into the stack of open elements, not a
+            // search for `node`, and that is the whole reason the spec words the
+            // step as it does: "Let node be the element immediately above node in
+            // the stack of open elements, or if node is no longer in the stack of
+            // open elements (e.g. because it got removed by this algorithm), the
+            // element that was immediately above node in the stack of open
+            // elements before node was removed." A removed node cannot be found
+            // by searching, and a node replaced by a new element has two
+            // different identities, so neither identity survives a pass. The
+            // index does: the algorithm only ever removes or replaces the slot
+            // it is standing on, and the element above that slot never moves.
+            let mut node;
             let mut last_node = furthest_block;
             let mut inner_loop_counter = 0;
+            let mut cursor = self
+                .open_elements
+                .iter()
+                .position(|open| *open == furthest_block);
             loop {
                 inner_loop_counter += 1;
-                let Some(node_index) = self.open_elements.iter().position(|n| *n == node) else {
-                    return;
-                };
-                // "Let node be the element immediately above node in the stack of
-                // open elements, or if node is no longer in the stack of open
-                // elements ... the element that was immediately above node in the
-                // stack of open elements before node was removed."
-                if node_index == 0 {
+                let Some(above) = cursor.filter(|cursor| *cursor > 0) else {
                     break;
-                }
-                let above = self.open_elements[node_index - 1];
-                if above == formatting_element {
+                };
+                // The spec reassigns `node` to the element immediately above it,
+                // so from here on `node` *is* that element and occupies slot
+                // `above - 1`. Shadowing it under another name, which this loop
+                // used to do, is what let the slot of the element *below* be
+                // popped or overwritten instead: the replacement `<i>` in
+                // `<b>1<i>2<p>3</b>4` landed on top of the `<p>` rather than
+                // replacing the `<i>`.
+                node = self.open_elements[above - 1];
+                if node == formatting_element {
                     break;
                 }
                 let list_index = self
                     .active_formatting
                     .iter()
-                    .position(|entry| entry.node() == Some(above));
+                    .position(|entry| entry.node() == Some(node));
                 if inner_loop_counter > 3 {
                     // "If innerLoopCounter is greater than 3 and node is in the
                     // list of active formatting elements, then remove node from
@@ -2225,18 +2454,20 @@ impl<'a> TreeBuilder<'a> {
                 }
                 let Some(list_index) =
                     list_index.filter(|_| inner_loop_counter <= 3).or_else(|| {
-                        // Having just been removed from the list, `above` is no longer
-                        // in it, so the next step's condition holds.
+                        // Having just been removed from the list, `node` is no
+                        // longer in it, so the next step's condition holds.
                         self.active_formatting
                             .iter()
-                            .position(|entry| entry.node() == Some(above))
+                            .position(|entry| entry.node() == Some(node))
                     })
                 else {
                     // "If node is not in the list of active formatting elements,
                     // then remove node from the stack of open elements and
-                    // continue."
-                    self.open_elements.remove(node_index);
-                    node = above;
+                    // continue." The removal empties slot `above - 1`, and the
+                    // element above it does not move, so the next pass starts
+                    // from the same index.
+                    self.open_elements.remove(above - 1);
+                    cursor = Some(above - 1);
                     continue;
                 };
                 // "Create an element for the token for which the element node was
@@ -2248,9 +2479,11 @@ impl<'a> TreeBuilder<'a> {
                 let Some(ActiveFormattingEntry::Element { token, .. }) =
                     self.active_formatting.get(list_index).cloned()
                 else {
-                    // A marker cannot be the node the algorithm is walking past.
-                    self.open_elements.remove(node_index);
-                    node = above;
+                    // A marker cannot be the node the algorithm is walking past,
+                    // and the spec's "not in the list of active formatting
+                    // elements" step is the one that applies.
+                    self.open_elements.remove(above - 1);
+                    cursor = Some(above - 1);
                     continue;
                 };
                 let new_node = self
@@ -2261,9 +2494,10 @@ impl<'a> TreeBuilder<'a> {
                     node: new_node,
                     token,
                 };
-                if let Some(entry) = self.open_elements.get_mut(node_index) {
+                if let Some(entry) = self.open_elements.get_mut(above - 1) {
                     *entry = new_node;
                 }
+                // "and let node be the new element."
                 node = new_node;
                 // "If lastNode is furthestBlock, then move the aforementioned
                 // bookmark to be immediately after the new node in the list of
@@ -2280,7 +2514,10 @@ impl<'a> TreeBuilder<'a> {
                 if self.dom.append_child(node, last_node).is_err() {
                     self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 }
+                // "Set lastNode to node." The next pass steps to the element above
+                // the new one, which the replacement left in place.
                 last_node = node;
+                cursor = Some(above - 1);
             }
             // "Let (target, refNode) be the adjusted insertion location given
             // (commonAncestor, null). If lastNode's parent is non-null, then
@@ -2288,15 +2525,29 @@ impl<'a> TreeBuilder<'a> {
             // parent is null; lastNode is not a host-including inclusive
             // ancestor of target; target is not a Document node, or it does not
             // have an element child; and refNode is null or its parent is target,
-            // then insert lastNode into target before refNode."
+            // then insert lastNode into target before refNode." (13.2.6.4.7)
             //
-            // `refNode` is null, so the conditions reduce to the cycle check,
-            // and appending to `commonAncestor` is what detaches lastNode from
-            // its old parent: `Dom::append_child` refuses an insertion that
-            // would make a node its own inclusive ancestor, so the "not a
-            // host-including inclusive ancestor of target" condition is enforced
-            // by the DOM rather than re-checked here.
-            if self.dom.append_child(common_ancestor, last_node).is_err() {
+            // The adjusted insertion location of `(commonAncestor, null)` is the
+            // appropriate place for inserting a node with `commonAncestor` as the
+            // override target, so a `commonAncestor` that is a table element
+            // while foster parenting is enabled is foster parented rather than
+            // appended to, and a `commonAncestor` that is a template element
+            // receives the node in its template contents (13.2.6.1).
+            let (target, ref_node) = if self.foster_parenting_applies_to(common_ancestor) {
+                self.foster_location()
+            } else {
+                (self.insertion_parent(common_ancestor), None)
+            };
+            if let Some(parent) = self.dom.parent(last_node)
+                && self.dom.remove_child(parent, last_node).is_err()
+            {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+            }
+            // The remaining conditions are the pre-insert validity checks, and
+            // `Dom::insert_before` enforces them: it refuses a cycle, so "not a
+            // host-including inclusive ancestor of target" is the DOM's answer
+            // rather than a second walk of the tree here.
+            if self.dom.insert_before(target, last_node, ref_node).is_err() {
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
             }
             // "Create an element for the token for which formattingElement was
@@ -2365,6 +2616,50 @@ impl<'a> TreeBuilder<'a> {
             if let Some(index) = self.open_elements.iter().position(|n| *n == furthest_block) {
                 self.open_elements
                     .insert(index.saturating_add(1), new_formatting_element);
+            }
+        }
+    }
+
+    /// "Any other end tag" (13.2.6.4.7), which the adoption agency algorithm
+    /// falls back to when the list of active formatting elements holds no entry
+    /// for the subject.
+    ///
+    /// "Initialize node to be the current node (the bottommost node of the
+    /// stack). Loop: If node is an HTML element with the same tag name as the
+    /// token: generate implied end tags, except for HTML elements with the same
+    /// tag name as the token. If node is not the current node, then this is a
+    /// parse error. Pop all the nodes from the current node up to node,
+    /// including node, then stop these steps. Otherwise, if node is in the
+    /// special category, then this is a parse error; ignore the token, and
+    /// return. Set node to the previous entry in the stack of open elements.
+    /// Return to the step labeled loop."
+    ///
+    /// The walk is the whole stack, not a pop-through: a special element met
+    /// before the match ends the algorithm with the token ignored, which is what
+    /// stops `</b>` closing a `<b>` that sits under a `<div>`.
+    fn any_other_end_tag(&mut self, name: &str) {
+        let mut index = self.open_elements.len();
+        while index > 0 {
+            index -= 1;
+            let node = self.open_elements[index];
+            if self.is_html_element(node) && self.element_name(node) == Some(name) {
+                // "Generate implied end tags, except for HTML elements with the
+                // same tag name as the token."
+                self.generate_implied_end_tags_except(Some(name));
+                // "If node is not the current node, then this is a parse error.
+                // Pop all the nodes from the current node up to node, including
+                // node, then stop these steps."
+                if index + 1 != self.open_elements.len() {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                }
+                self.open_elements.truncate(index);
+                return;
+            }
+            if self.is_special_element(node) {
+                // "Otherwise, if node is in the special category, then this is a
+                // parse error; ignore the token, and return."
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                return;
             }
         }
     }
@@ -2456,6 +2751,14 @@ impl<'a> TreeBuilder<'a> {
                 }
                 Action::Consumed
             }
+            // "Insert a processing instruction given (the first element in the
+            // stack of open elements (the html element), null)."
+            Token::ProcessingInstruction { target, data } => {
+                if let Some(html) = self.open_elements.first().copied() {
+                    self.insert_processing_instruction(html, target, data);
+                }
+                Action::Consumed
+            }
             Token::Doctype(_) => {
                 self.parse_error(HtmlParseErrorCode::UnexpectedToken);
                 Action::Consumed
@@ -2480,6 +2783,13 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_comment(self.dom.document(), data);
                 Action::Consumed
             }
+            // "Insert a processing instruction given (the Document object,
+            // null)." After the document has ended, this is one of the few nodes
+            // that still belongs to the document rather than to an element.
+            Token::ProcessingInstruction { target, data } => {
+                self.insert_processing_instruction(self.dom.document(), target, data);
+                Action::Consumed
+            }
             Token::Doctype(_) => self.process_in_body(token),
             Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
             Token::Character(data) if is_all_html_whitespace(data) => self.process_in_body(token),
@@ -2492,12 +2802,181 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
+    /// The "in frameset" insertion mode (13.2.6.4.18).
+    ///
+    /// This is the mode a document lands in the moment a `<frameset>` start tag
+    /// is honoured, and it is almost entirely a mode that refuses things: only
+    /// whitespace, comments, more framesets, `frame`, `noframes`, `html`, and
+    /// `frameset` end tags do anything at all, and everything else is a parse
+    /// error that is dropped. That is deliberate. A frameset document's content
+    /// is a fixed shape, and content that arrived after the frameset is not part
+    /// of it.
+    fn process_in_frameset(&mut self, token: &Token) -> Action {
+        match token {
+            Token::Character(data) if is_all_html_whitespace(data) => {
+                self.insert_text(data);
+                Action::Consumed
+            }
+            Token::Comment(data) => {
+                self.insert_comment(self.current_node(), data);
+                Action::Consumed
+            }
+            // "A processing instruction token: Insert a processing instruction."
+            Token::ProcessingInstruction { target, data } => {
+                self.insert_processing_instruction(self.current_node(), target, data);
+                Action::Consumed
+            }
+            Token::Doctype(_) => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+            Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
+            Token::StartTag(tag) if tag.name == "frameset" => {
+                self.insert_element(tag, true);
+                Action::Consumed
+            }
+            Token::EndTag(tag) if tag.name == "frameset" => {
+                // "If the current node is the root html element, then this is a
+                // parse error; ignore the token. (fragment case) Otherwise, pop
+                // the current node from the stack of open elements. If the
+                // parser's fragment context element is null and the current node
+                // is no longer a frameset element, then switch the insertion
+                // mode to 'after frameset'."
+                //
+                // This tree builder never parses a fragment, so the fragment
+                // case cannot arise and only the "no longer a frameset" test
+                // matters: it is what makes `</frameset>` close the outermost
+                // frameset and switch, while an inner one leaves the mode alone.
+                if self.current_tag() == Some("html") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                    return Action::Consumed;
+                }
+                self.pop_current();
+                if self.current_tag() != Some("frameset") {
+                    self.mode = InsertionMode::AfterFrameset;
+                }
+                Action::Consumed
+            }
+            // "Insert an HTML element for the token. Immediately pop the current
+            // node off the stack of open elements. Acknowledge the token's
+            // self-closing flag, if it is set."
+            //
+            // A `frame` has no contents, so the pop is unconditional rather than
+            // conditional on the tag having a `/>`: this is one of the two places
+            // in the whole algorithm where the self-closing flag is
+            // acknowledged, and it is acknowledged for both spellings.
+            Token::StartTag(tag) if tag.name == "frame" => {
+                self.insert_element(tag, false);
+                Action::Consumed
+            }
+            Token::StartTag(tag) if tag.name == "noframes" => self.process_in_head(token),
+            Token::EndTag(tag) if tag.name == "frame" => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+            Token::Eof => {
+                if self.current_tag() != Some("html") {
+                    self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                }
+                Action::Consumed
+            }
+            _ => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+        }
+    }
+
+    /// The "after frameset" insertion mode (13.2.6.4.19).
+    ///
+    /// Reached by the `</frameset>` that closed the outermost frameset. Only
+    /// whitespace, comments, `html`, and `noframes` are accepted; everything
+    /// else is a parse error that is dropped, so content written after the
+    /// frameset does not reappear in the document.
+    fn process_after_frameset(&mut self, token: &Token) -> Action {
+        match token {
+            Token::Character(data) if is_all_html_whitespace(data) => {
+                self.insert_text(data);
+                Action::Consumed
+            }
+            Token::Comment(data) => {
+                self.insert_comment(self.current_node(), data);
+                Action::Consumed
+            }
+            // "A processing instruction token: Insert a processing instruction."
+            Token::ProcessingInstruction { target, data } => {
+                self.insert_processing_instruction(self.current_node(), target, data);
+                Action::Consumed
+            }
+            Token::Doctype(_) => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+            Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
+            Token::EndTag(tag) if tag.name == "html" => {
+                self.mode = InsertionMode::AfterAfterFrameset;
+                Action::Consumed
+            }
+            Token::StartTag(tag) if tag.name == "noframes" => self.process_in_head(token),
+            Token::Eof => Action::Consumed,
+            _ => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+        }
+    }
+
+    /// The "after after frameset" insertion mode (13.2.6.4.21).
+    ///
+    /// The end of a frameset document. Unlike "after after body" it does *not*
+    /// fall back to the "in body" rules for an unexpected token: a frameset
+    /// document cannot become a body document after the fact, so anything else is
+    /// a parse error that is dropped.
+    fn process_after_after_frameset(&mut self, token: &Token) -> Action {
+        match token {
+            Token::Comment(data) => {
+                self.insert_comment(self.dom.document(), data);
+                Action::Consumed
+            }
+            // "Insert a processing instruction given (the Document object,
+            // null)."
+            Token::ProcessingInstruction { target, data } => {
+                self.insert_processing_instruction(self.dom.document(), target, data);
+                Action::Consumed
+            }
+            Token::Doctype(_) | Token::Eof => Action::Consumed,
+            Token::StartTag(tag) if tag.name == "html" => self.process_in_body(token),
+            Token::StartTag(tag) if tag.name == "noframes" => self.process_in_head(token),
+            _ => {
+                self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+                Action::Consumed
+            }
+        }
+    }
+
     fn insert_html_root(&mut self, tag: &TagToken) {
         let element = self.dom.create_element("html");
         self.apply_attributes(element, tag);
         if self.dom.append_child(self.dom.document(), element).is_ok() {
             self.open_elements.push(element);
         } else {
+            self.parse_error(HtmlParseErrorCode::UnexpectedToken);
+        }
+    }
+
+    /// "Insert a processing instruction" (13.2.6.1), given the parent the
+    /// insertion mode named: the current node, the first element in the stack of
+    /// open elements, or the document.
+    ///
+    /// The node is a DOM `ProcessingInstruction`, not a comment. A
+    /// `ProcessingInstruction` is not an `Element`, so it is not in the
+    /// list of active formatting elements and never becomes a stack of open
+    /// elements entry; only the parent it is appended to matters.
+    fn insert_processing_instruction(&mut self, parent: NodeId, target: &str, data: &str) {
+        let node = self
+            .dom
+            .create_processing_instruction(target.to_owned(), data.to_owned());
+        if self.dom.append_child(parent, node).is_err() {
             self.parse_error(HtmlParseErrorCode::UnexpectedToken);
         }
     }
@@ -2924,6 +3403,12 @@ impl<'a> TreeBuilder<'a> {
                 Action::Consumed
             }
             Token::EndTag(_) => self.process_in_foreign_end_tag(token),
+            // "Any other token: Process the token according to the rules given
+            // in the section corresponding to the current insertion mode in HTML
+            // content."  A processing instruction is an XML construct with no
+            // place in a foreign subtree, so it is handled by the HTML rules
+            // rather than inserted here.
+            Token::ProcessingInstruction { .. } => self.process_in_html_content(token),
             // The dispatcher sends an end-of-file token to the current
             // insertion mode, so this arm is unreachable.
             Token::Eof => Action::Consumed,
@@ -2931,23 +3416,28 @@ impl<'a> TreeBuilder<'a> {
     }
 
     /// "A character token that is U+0000 NULL: Parse error. Insert a U+FFFD
-    /// REPLACEMENT CHARACTER character." followed by "Any other character
-    /// token: Insert the token's character." (13.2.6.5).
-    ///
-    /// The second step also sets the frameset-ok flag to "not ok", which this
-    /// tree builder does not track because no frameset insertion mode is
-    /// implemented.
+    /// REPLACEMENT CHARACTER character." followed by "Any other character token:
+    /// Insert the token's character." (13.2.6.5).
     ///
     /// The CDATA section state passes U+0000 through untouched (13.2.5.69), so
-    /// the replacement genuinely belongs here rather than in the tokenizer.
+    /// the replacement genuinely belongs here rather than in the tokenizer. The
+    /// data state, by contrast, already emits U+FFFD, so a NULL that arrives
+    /// through it is indistinguishable from a literal replacement character.
     fn insert_foreign_character(&mut self, data: &str) {
         if data.contains('\0') {
             self.parse_error(HtmlParseErrorCode::UnexpectedNullCharacter);
             let replaced = data.replace('\0', "\u{fffd}");
             self.insert_text(&replaced);
-            return;
+        } else {
+            self.insert_text(data);
         }
-        self.insert_text(data);
+        // "Set the frameset-ok flag to 'not ok'" is in the *any other character
+        // token* clause, so a document whose only content is a foreign subtree
+        // with text in it is still ineligible to become a frameset. The CDATA
+        // section state is not a character token, so it does not set the flag.
+        if !is_all_html_whitespace(data) {
+            self.frameset_ok = false;
+        }
     }
 
     fn is_svg_script(&self) -> bool {
@@ -3619,8 +4109,52 @@ fn is_void_element(name: &str) -> bool {
     )
 }
 
-/// The HTML elements in the special category (13.2.4.2), as far as the
-/// adoption agency algorithm's "furthest block" search needs.
+/// The elements the "in body" and "after body" end-of-file and `</body>` rules
+/// allow to be left open (13.2.6.4.7): "a node in the stack of open elements
+/// that is not either a dd element, a dt element, an li element, an optgroup
+/// element, an option element, a p element, an rb element, an rp element, an rt
+/// element, an rtc element, a tbody element, a td element, a tfoot element, a th
+/// element, a thead element, a tr element, the body element, or the html
+/// element".
+///
+/// So a document ending with an unclosed `<div>` is reported and one ending with
+/// an unclosed `<p>` is not, which is the whole of the difference between the
+/// two rules' error counts.
+fn is_body_closer(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "dd" | "dt"
+                | "li"
+                | "optgroup"
+                | "option"
+                | "p"
+                | "rb"
+                | "rp"
+                | "rt"
+                | "rtc"
+                | "tbody"
+                | "td"
+                | "tfoot"
+                | "th"
+                | "thead"
+                | "tr"
+                | "body"
+                | "html"
+        )
+    )
+}
+
+/// Whether `tag` carries an attribute named `name` whose value is an ASCII
+/// case-insensitive match for `value`. Used for the one attribute the parser
+/// tests by value rather than by presence: an `input` with `type=hidden` is the
+/// only start tag that leaves a document eligible to become a frameset.
+fn has_attribute_matching_ascii_case_insensitive(tag: &TagToken, name: &str, value: &str) -> bool {
+    tag.attributes.iter().any(|attribute| {
+        attribute.name.eq_ignore_ascii_case(name) && attribute.value.eq_ignore_ascii_case(value)
+    })
+}
+
 fn is_special_html_element_name(name: &str) -> bool {
     matches!(
         name,
@@ -3740,8 +4274,7 @@ fn is_formatting_element_name(name: &str) -> bool {
     )
 }
 
-fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {
-    if doctype.force_quirks
+fn doctype_quirks_mode(doctype: &DoctypeToken) -> QuirksMode {    if doctype.force_quirks
         || !doctype
             .name
             .as_deref()
@@ -4014,8 +4547,7 @@ mod tests {
         outline(&output.dom, contents)
     }
 
-    fn collect_outline(dom: &Dom, node: NodeId, depth: usize, lines: &mut Vec<String>) {
-        for child in dom.children(node).unwrap_or_default() {
+    fn collect_outline(dom: &Dom, node: NodeId, depth: usize, lines: &mut Vec<String>) {        for child in dom.children(node).unwrap_or_default() {
             let indent = "  ".repeat(depth);
             match dom.node(*child).map(render_dom::Node::kind) {
                 Some(NodeKind::Element(data)) => {
@@ -4499,17 +5031,378 @@ math@mathml
 
     #[test]
     fn a_cdata_section_in_html_content_stays_a_comment() {
+        // One comment, not two: the `[CDATA[` and the rest of the declaration
+        // are the data of the single token the markup declaration open state
+        // creates. It ends at the `>` of `]]>`, and that `>` is not part of the
+        // data, so the `y` after it is character data again (13.2.5.41).
+        //
+        // This test previously asserted that the comment runs to `-->`, which was
+        // the behaviour of a superseded revision of the standard; it was
+        // corrected against the current text and the html5lib suite.
         assert_eq!(
             body_outline("<!doctype html><p><![CDATA[x]]>y</p>"),
             "\
 p@html
-  #comment \"[CDATA[\"
-  #comment \"x]]\"
+  #comment \"[CDATA[x]]\"
   #text \"y\""
+        );
+        // A `-->` later in the stream has no effect on where a bogus comment
+        // ends: only the next `>` does.
+        assert_eq!(
+            body_outline("<!doctype html><p><![CDATA[x]]>y-->z</p>"),
+            "\
+p@html
+  #comment \"[CDATA[x]]\"
+  #text \"y-->z\""
         );
         assert!(
             error_codes("<!doctype html><p><![CDATA[x]]></p>")
                 .contains(&HtmlParseErrorCode::CdataInHtmlContent)
+        );
+    }
+
+    /// The real-world version of the case above. A page that ships a
+    /// `//<![CDATA[ ... //]]>` script wrapper without its opening `<script>` tag
+    /// leaves the CDATA declaration sitting in the body. The bogus comment state
+    /// then ends it at the first `>`, which is the `>` of the `//]]>` a couple of
+    /// lines later, so the rest of the document is markup again.
+    ///
+    /// This test previously asserted the opposite: that the declaration opened a
+    /// comment running to the end of the input, which was the behaviour of a
+    /// superseded revision of the standard and hid everything after it.
+    #[test]
+    fn a_cdata_wrapper_without_its_script_ends_at_the_declaration() {
+        let markup = "<!doctype html><body>\
+            <div id=before>visible</div>\
+            <script src=a.js></script></script>\
+            //<![CDATA[\
+              document.body.className += ' js-enabled';\
+            //]]>\
+            </script>\
+            <div id=after>reached again</div>";
+        let output = parse_document(markup);
+        let body = find_element(&output.dom, output.dom.document(), "body").unwrap();
+        let codes: Vec<HtmlParseErrorCode> = output.errors.iter().map(|error| error.code).collect();
+        assert!(codes.contains(&HtmlParseErrorCode::CdataInHtmlContent));
+        // One comment, holding the declaration up to the `>` of `]]>` and nothing
+        // past it.
+        let comments = comments_of(&output.dom, body);
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].starts_with("[CDATA["));
+        assert!(!comments[0].contains('>'));
+        // The markup on both sides of the declaration is in the tree: before,
+        // because the declaration is a parse error and not a marker, and after,
+        // because the comment ends at the first `>`.
+        assert!(find_element_by_id(&output.dom, body, "before").is_some());
+        let after = find_element_by_id(&output.dom, body, "after")
+            .expect("the markup after the CDATA declaration is still parsed");
+        assert_eq!(text_content(&output.dom, after), "reached again");
+    }
+
+    /// The element and processing-instruction children of `root`, in tree order,
+    /// as `element:name` and `processing-instruction:target:data`, so that a test
+    /// can assert on the *kind* of node and not only on an element's name. A
+    /// processing instruction is the one node the outline helper does not print,
+    /// so it needs its own way in.
+    fn collect_named_nodes(dom: &Dom, root: NodeId, out: &mut Vec<String>) {
+        for child in dom.children(root).unwrap_or_default() {
+            match dom.node(*child).map(render_dom::Node::kind) {
+                Some(NodeKind::Element(data)) => {
+                    out.push(format!("element:{}", data.local_name));
+                    collect_named_nodes(dom, *child, out);
+                }
+                Some(NodeKind::ProcessingInstruction { target, data }) => {
+                    out.push(format!("processing-instruction:{target}:{data}"));
+                }
+                _ => collect_named_nodes(dom, *child, out),
+            }
+        }
+    }
+
+    fn comments_of(dom: &Dom, root: NodeId) -> Vec<String> {
+        let mut found = Vec::new();
+        collect_comments(dom, root, &mut found);
+        found
+    }
+
+    fn collect_comments(dom: &Dom, root: NodeId, out: &mut Vec<String>) {
+        for child in dom.children(root).unwrap_or_default() {
+            if let Some(NodeKind::Comment(data)) = dom.node(*child).map(render_dom::Node::kind) {
+                out.push(data.clone());
+            }
+            collect_comments(dom, *child, out);
+        }
+    }
+
+    /// An icon exported by a drawing tool and pasted into a page, which is what
+    /// almost all real inline SVG is: a `viewBox` written in lower case, both
+    /// namespace declarations, `xml:space`, an `xlink:href` reference, a `<title>`
+    /// and a `<desc>` before anything else, and several levels of `<g>`. The
+    /// namespaces and the capital letter have to survive all of it, because the
+    /// serialiser writes the element and attribute names back out.
+    #[test]
+    fn an_exported_icon_keeps_its_namespaces_and_its_attribute_case() {
+        let markup = "<!doctype html><body>\
+            <svg viewbox='0 0 14 14' version='1.1' \
+               xmlns='http://www.w3.org/2000/svg' \
+               xmlns:xlink='http://www.w3.org/1999/xlink' \
+               xml:space='preserve'>\
+              <title>ic_close_normal</title><desc>Created with Sketch.</desc>\
+              <defs><rect id='path-1' x='0' y='0' width='18' height='18'></rect></defs>\
+              <g id='outer' stroke='none'>\
+                <g id='inner' transform='translate(100, 1103)'>\
+                  <mask id='mask-2' fill='white'><use xlink:href='#path-1'></use></mask>\
+                  <g id='empty'></g>\
+                  <path d='M3 3L9 8' id='Combined-Shape' fill='#99A2AA' mask='url(#mask-2)'></path>\
+                </g>\
+              </g>\
+            </svg>";
+        let output = parse_document(markup);
+        let body = find_element(&output.dom, output.dom.document(), "body").unwrap();
+        let svg = find_element(&output.dom, body, "svg").unwrap();
+        assert_eq!(
+            outline(&output.dom, body),
+            "\
+svg@svg
+  title@svg
+    #text \"ic_close_normal\"
+  desc@svg
+    #text \"Created with Sketch.\"
+  defs@svg
+    rect@svg
+  g@svg
+    g@svg
+      mask@svg
+        use@svg
+      g@svg
+      path@svg"
+        );
+        // `viewbox` is lower cased by the tokenizer and put back by the SVG
+        // attribute table; the three namespaced attributes are in three
+        // different namespaces with the prefixes the standard gives them.
+        assert_eq!(
+            attributes(&output.dom, svg)
+                .into_iter()
+                .filter(|(_, _, name, _)| name == "viewBox")
+                .map(|(_, _, _, value)| value)
+                .collect::<Vec<_>>(),
+            vec!["0 0 14 14".to_owned()]
+        );
+        let use_element = find_element(&output.dom, svg, "use").unwrap();
+        assert_eq!(
+            output
+                .dom
+                .attribute_ns(use_element, Some("http://www.w3.org/1999/xlink"), "href"),
+            Ok(Some("#path-1"))
+        );
+        assert_eq!(
+            output
+                .dom
+                .attribute_ns(svg, Some("http://www.w3.org/XML/1998/namespace"), "space"),
+            Ok(Some("preserve"))
+        );
+        assert_eq!(
+            output
+                .dom
+                .attribute_ns(svg, Some("http://www.w3.org/2000/xmlns/"), "xlink"),
+            Ok(Some("http://www.w3.org/1999/xlink"))
+        );
+        // None of it is a parse error, and it all serialises back with the
+        // capital letter and the prefixes restored.
+        assert!(!error_codes_of(&output).contains(&HtmlParseErrorCode::UnexpectedToken));
+        assert_eq!(
+            super::super::serialize_html_fragment(&output.dom, body),
+            "<svg viewBox=\"0 0 14 14\" version=\"1.1\" \
+             xmlns=\"http://www.w3.org/2000/svg\" \
+             xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
+             xml:space=\"preserve\">\
+              <title>ic_close_normal</title><desc>Created with Sketch.</desc>\
+              <defs><rect id=\"path-1\" x=\"0\" y=\"0\" width=\"18\" height=\"18\"></rect></defs>\
+              <g id=\"outer\" stroke=\"none\">\
+                <g id=\"inner\" transform=\"translate(100, 1103)\">\
+                  <mask id=\"mask-2\" fill=\"white\"><use xlink:href=\"#path-1\"></use></mask>\
+                  <g id=\"empty\"></g>\
+                  <path d=\"M3 3L9 8\" id=\"Combined-Shape\" fill=\"#99A2AA\" mask=\"url(#mask-2)\"></path>\
+                </g>\
+              </g>\
+            </svg>"
+        );
+    }
+
+    /// `foreignObject` is an HTML integration point, so HTML written inside it
+    /// is HTML. A page that measures or rasterises part of itself by building a
+    /// `data:image/svg+xml` URL writes exactly this shape, including the
+    /// `xmlns` on the inner element.
+    #[test]
+    fn a_foreign_object_carries_html_content() {
+        let output = parse_document(
+            "<!doctype html><body>\
+             <svg xmlns='http://www.w3.org/2000/svg' width='10' height='10'>\
+               <foreignObject width='10' height='10'>\
+                 <div xmlns='http://www.w3.org/1999/xhtml' style='width:10'>sup</div>\
+                 <span>still html</span>\
+               </foreignObject>\
+             </svg>",
+        );
+        let body = find_element(&output.dom, output.dom.document(), "body").unwrap();
+        let svg = find_element(&output.dom, body, "svg").unwrap();
+        let foreign_object = find_element(&output.dom, svg, "foreignObject").unwrap();
+        assert_eq!(
+            outline(&output.dom, foreign_object),
+            "\
+div@html
+  #text \"sup\"
+span@html
+  #text \"still html\""
+        );
+        let div = find_element(&output.dom, foreign_object, "div").unwrap();
+        // The `xmlns` here is an ordinary attribute: the foreign attribute
+        // adjustment runs in the rules for foreign content, and this start tag
+        // was processed by the "in body" rules because `foreignObject` is an
+        // integration point, so the name is never namespaced.
+        assert_eq!(
+            attributes(&output.dom, div),
+            vec![
+                (
+                    None,
+                    None,
+                    "xmlns".to_owned(),
+                    "http://www.w3.org/1999/xhtml".to_owned()
+                ),
+                (None, None, "style".to_owned(), "width:10".to_owned()),
+            ]
+        );
+        // And the round trip keeps the integration point, so the `div` is still
+        // an HTML element when the serialisation is read back.
+        let serialized = super::super::serialize_html_fragment(&output.dom, body);
+        let reparsed = parse_document(&serialized);
+        let reparsed_body = find_element(&reparsed.dom, reparsed.dom.document(), "body").unwrap();
+        assert_eq!(
+            super::super::serialize_html_fragment(&reparsed.dom, reparsed_body),
+            serialized
+        );
+    }
+
+    /// A page that keeps a chunk of markup for a client-side template library
+    /// puts it in a `template` and fills in placeholders afterwards. The
+    /// placeholders are ordinary text wherever they appear, the inline SVG
+    /// inside the contents is real namespaced content, and none of it is
+    /// reachable from the document: it is inert, which is what stops a
+    /// stylesheet or a selector from seeing it.
+    #[test]
+    fn a_client_side_template_keeps_its_svg_and_its_placeholder_text_inert() {
+        let output = parse_document(
+            "<!doctype html><body>\
+             <template class='js-flash-template'>\
+               <div class='flash {{ className }}'>\
+                 <button type='button' aria-label='Dismiss'>\
+                   <svg aria-hidden='true' viewbox='0 0 16 16' height='16'>\
+                     <path d='M3.72 3.72a.75.75 0 0 1 1.06 0'></path>\
+                   </svg>\
+                 </button>\
+                 <div role='alert'><div>{{ message }}</div></div>\
+               </div>\
+             </template>\
+             <p id=after>after</p>",
+        );
+        let body = find_element(&output.dom, output.dom.document(), "body").unwrap();
+        // The template element itself is in the body and holds no children.
+        let template = find_element(&output.dom, body, "template").unwrap();
+        assert!(output.dom.children(template).unwrap().is_empty());
+        assert_eq!(element_children(&output.dom, body), vec!["template", "p"]);
+
+        let contents = output
+            .dom
+            .template_contents(template)
+            .expect("template contents");
+        assert_eq!(
+            outline(&output.dom, contents),
+            "\
+div@html
+  button@html
+    svg@svg
+      path@svg
+  div@html
+    div@html
+      #text \"{{ message }}\""
+        );
+
+        // The placeholders are text, not attributes the parser interpreted: the
+        // one in an attribute value is part of the value, braces and all.
+        let flash = find_element(&output.dom, contents, "div").unwrap();
+        assert_eq!(
+            output.dom.attribute(flash, "class"),
+            Ok(Some("flash {{ className }}"))
+        );
+        // The contents are a separate fragment with no parent, so a walk from the
+        // document cannot reach them.
+        assert_eq!(output.dom.parent(contents), None);
+        // `viewBox` is adjusted inside the contents, and the contents serialise
+        // back as the template's own markup.
+        let svg = find_element(&output.dom, contents, "svg").unwrap();
+        assert_eq!(output.dom.attribute(svg, "viewBox"), Ok(Some("0 0 16 16")));
+        assert!(
+            super::super::serialize_html_fragment(&output.dom, template)
+                .contains("viewBox=\"0 0 16 16\"")
+        );
+    }
+
+    /// A server-rendered page that closes its `head` and then keeps writing
+    /// `link` and `meta` start tags before it writes the `body`. The insertion
+    /// mode at that point is "after head", and the standard has a list of ten
+    /// element names for it: "Parse error. Push the node pointed to by the head
+    /// element pointer onto the stack of open elements. Process the token using
+    /// the rules for the 'in head' insertion mode. Remove the node pointed to by
+    /// the head element pointer from the stack of open elements." So these
+    /// elements are not dropped and not put in the body — the `head` goes back on
+    /// the stack for the duration of the token, and they become its children.
+    ///
+    /// A `body` start tag in the same position is *not* a parse error, and a
+    /// `link` written after the body has started is neither misplaced nor an
+    /// error, because "in body" hands it to the "in head" rules with the current
+    /// node being whatever the markup is inside.
+    #[test]
+    fn head_only_elements_written_after_the_head_go_back_into_the_head() {
+        let markup = "<!doctype html><head><title>T</title></head>\
+             <link rel=stylesheet href=n.css>\
+             <meta name=robots content=noindex>\
+             <body><div class=nav><link rel=icon href=f.ico></div>";
+        let output = parse_document(markup);
+        let html = find_element(&output.dom, output.dom.document(), "html").unwrap();
+        let head = find_element(&output.dom, html, "head").unwrap();
+        let body = find_element(&output.dom, html, "body").unwrap();
+        assert_eq!(element_children(&output.dom, html), vec!["head", "body"]);
+        // The `head` is still a child of `html` and the `body` is still its
+        // sibling: pushing the `head` back does not unmake either.
+        assert_eq!(output.dom.parent(head), Some(html));
+        assert_eq!(
+            element_children(&output.dom, head),
+            vec!["title", "link", "meta"]
+        );
+        assert_eq!(element_children(&output.dom, body), vec!["div"]);
+        let nav = find_element(&output.dom, body, "div").unwrap();
+        assert_eq!(element_children(&output.dom, nav), vec!["link"]);
+
+        // One parse error for each of the two elements written in "after head",
+        // and none for the `body` or for the `link` inside the `div`. A tree
+        // construction rule runs with the tokenizer positioned just past the
+        // token it is handling, so the offsets are the ends of the two offending
+        // tags rather than their starts.
+        let offsets: Vec<usize> = output
+            .errors
+            .iter()
+            .filter(|error| error.code == HtmlParseErrorCode::UnexpectedToken)
+            .map(|error| error.offset)
+            .collect();
+        let end_of = |needle: &str| markup.find(needle).expect("a tag") + needle.len();
+        assert_eq!(
+            offsets,
+            vec![
+                end_of("<link rel=stylesheet href=n.css>"),
+                end_of("<meta name=robots content=noindex>")
+            ],
+            "{:?}",
+            error_codes_of(&output)
         );
     }
 
@@ -4841,6 +5734,108 @@ svg@svg
             super::super::serialize_html_fragment(&output.dom, template),
             "<svg viewBox=\"0 0 1 1\"><clipPath><path d=\"M0 0\"></path></clipPath><use xlink:href=\"#i\"></use></svg>"
         );
+    }
+
+    #[test]
+    fn a_frameset_start_tag_replaces_the_body_and_changes_the_insertion_mode() {
+        // `<frameset>` in the body removes the body element, throws away
+        // everything still open inside it, and switches to the "in frameset"
+        // insertion mode, which is the only mode in which a `frame` and a second
+        // `frameset` mean anything. The frameset-ok flag is still "ok" here
+        // because nothing but the implicit body has been produced yet.
+        assert_eq!(
+            document_outline("<!doctype html><frameset><frame><frameset><frame>"),
+            "\
+html@html
+  head@html
+  frameset@html
+    frame@html
+    frameset@html
+      frame@html"
+        );
+        // The flag is "not ok" as soon as the document has said anything, so a
+        // `frameset` after a body is ignored and the body stays.
+        assert_eq!(
+            document_outline("<!doctype html><body><frameset>"),
+            "\
+html@html
+  head@html
+  body@html"
+        );
+        // `<object>` sets the flag on its *start* tag, so this is a body
+        // document and not a frameset document even though nothing else was in
+        // the body.
+        let output = parse_document("<!doctype html><object><frameset>");
+        assert!(find_element(&output.dom, output.dom.document(), "body").is_some());
+        assert!(find_element(&output.dom, output.dom.document(), "frameset").is_none());
+    }
+
+    #[test]
+    fn a_processing_instruction_is_its_own_node_and_xml_is_not_one() {
+        // `<?php ... ?>` is a processing instruction, a node kind of its own,
+        // and it is a child of the body rather than a comment.
+        let output = parse_document("<!doctype html><body><?php echo 1; ?><span>");
+        let body = find_element(&output.dom, output.dom.document(), "body").unwrap();
+        let mut found: Vec<String> = Vec::new();
+        collect_named_nodes(&output.dom, body, &mut found);
+        assert_eq!(
+            found,
+            vec![
+                "processing-instruction:php:echo 1; ".to_owned(),
+                "element:span".to_owned()
+            ]
+        );
+        // A target that is an ASCII case-insensitive match for `xml` is a
+        // disallowed one, and becomes a comment that keeps its `?`.
+        assert_eq!(
+            body_outline("<!doctype html><body><?xml version=\"1.0\">"),
+            "#comment \"?xml version=\\\"1.0\\\"\""
+        );
+    }
+
+    #[test]
+    fn ruby_annotations_are_generated_implied_end_tags() {
+        // `rb` and `rtc` are in the implied end tag list, so an annotation start
+        // tag closes the previous one; `rp` and `rt` spare `rtc` from that, so a
+        // run of annotations inside a container stays inside it.
+        assert_eq!(
+            body_outline("<html><ruby>a<rb>b<rt>c</ruby></html>"),
+            "\
+ruby@html
+  #text \"a\"
+  rb@html
+    #text \"b\"
+  rt@html
+    #text \"c\""
+        );
+        // A block element between the `ruby` and the annotation is closed by the
+        // implied end tags, so the annotation is a sibling of the block rather
+        // than a child of it.
+        assert_eq!(
+            body_outline("<!doctype html><ruby><p><rp>"),
+            "\
+ruby@html
+  p@html
+  rp@html"
+        );
+    }
+
+    #[test]
+    fn a_document_ending_inside_a_template_still_gets_a_body() {
+        // The end-of-file token in the "in template" mode pops the template and
+        // resets the insertion mode, and the reprocess that follows is what runs
+        // the "after head" mode's catch-all. Without the reprocess the document
+        // ends with no body at all.
+        let output = parse_document("<template><div>");
+        assert_eq!(
+            document_outline("<template><div>"),
+            "\
+html@html
+  head@html
+    template@html
+  body@html"
+        );
+        assert!(find_element(&output.dom, output.dom.document(), "body").is_some());
     }
 
     #[test]
@@ -5391,6 +6386,250 @@ b@html
             bolds
                 .iter()
                 .all(|node| namespace_of(&output.dom, *node) == Namespace::Html)
+        );
+    }
+
+    #[test]
+    fn the_adoption_agency_replaces_the_half_built_element_and_not_the_one_below_it() {
+        // The reconstruction step of the inner loop (13.2.6.4.7). "Let node be
+        // the element immediately above node in the stack of open elements ...
+        // Create an element for the token for which the element node was
+        // created ... replace the entry for node in the list of active
+        // formatting elements with an entry for the new element, replace the
+        // entry for node in the stack of open elements with an entry for the
+        // new element".
+        //
+        // The step is written as a *reassignment* of `node`. An implementation
+        // that keeps `node` and reads the new value under another name operates
+        // on one element while writing to the other's slot, and this input is
+        // where the two elements are distinguishable: the `<i>` is in the list
+        // of active formatting elements and the `<p>` is not, and both are on
+        // the stack with the `<p>` above the `<i>`.
+        //
+        // The trimmed fixture is the `adoption02.dat#0` case from the reference
+        // suite. The `<p>` is the furthest block, so the walk starts there,
+        // steps to the `<i>`, and creates a *replacement* `<i>` which takes the
+        // original's place in both the list and the stack. The replacement
+        // receives the `<p>` as its child and is then moved to the common
+        // ancestor, which is the `<body>`: "Let commonAncestor be the element
+        // immediately above formattingElement" and "Insert lastNode into
+        // target". The `<p>` is not a formatting element, so it is never
+        // replaced, and the original `<i>` keeps its text and stays where it
+        // was.
+        assert_eq!(
+            afe_outline("<b>1<i>2<p>3</b>4"),
+            "\
+b@html
+  #text \"1\"
+  i@html
+    #text \"2\"
+i@html
+  p@html
+    b@html
+      #text \"3\"
+    #text \"4\""
+        );
+        // The two `<i>` elements are distinct nodes, which is the point: the
+        // algorithm *replaces* the misnested one rather than re-using it.
+        let output = parse_document("<b>1<i>2<p>3</b>4");
+        let italics = find_all_elements(&output.dom, output.dom.document(), "i");
+        assert_eq!(italics.len(), 2);
+        assert_ne!(italics[0], italics[1]);
+        // The second `<i>` holds the `<p>`, and the first holds the original
+        // text: a re-used element would have emptied the first `<i>`.
+        assert_eq!(text_content(&output.dom, italics[0]), "2");
+        assert_eq!(text_content(&output.dom, italics[1]), "34");
+    }
+
+    #[test]
+    fn the_adoption_agency_algorithm_takes_the_any_other_end_tag_path_when_the_list_has_no_entry() {
+        // "If there is no such element, then act as described in the 'any other
+        // end tag' entry above and return." (13.2.6.4.7)
+        //
+        // The search runs over the *list of active formatting elements*, not
+        // over the stack of open elements, so an end tag whose name is open but
+        // which has no entry in that list never reaches the rest of the
+        // algorithm. The fallback is then a walk of the stack: "Initialize node
+        // to be the current node ... If node is an HTML element with the same
+        // tag name as the token: ... Otherwise, if node is in the special
+        // category, then this is a parse error; ignore the token, and return."
+        //
+        // The trimmed fixture is the `tests1.dat#58` case from the reference
+        // suite. `<b>` is open and `<i>` never was, so the list holds only the
+        // `b`; the walk starts at the current node, finds the `b`, which is
+        // *special* and not a match for `i`, and returns. The `b` is therefore
+        // never closed and both texts stay inside it. An implementation that
+        // popped through to a matching name, or one that reported no error at
+        // all, would differ on both counts.
+        assert_eq!(
+            afe_outline("<b>Test</i>Test"),
+            "\
+b@html
+  #text \"TestTest\""
+        );
+        // The ignored token is a parse error, which is the other half of that
+        // clause. The suite's `#errors` section for this case names it
+        // `unexpected-end-tag`, so the count matters as much as the tree.
+        let output = parse_document("<b>Test</i>Test");
+        let end_tag_errors = output
+            .errors
+            .iter()
+            .filter(|error| error.code == HtmlParseErrorCode::UnexpectedToken)
+            .count();
+        assert!(
+            end_tag_errors >= 1,
+            "the ignored end tag must be reported: {end_tag_errors} errors"
+        );
+        // The contrast case, so the assertion above is about the fallback rather
+        // than about end tags generally being ignored: with a matching entry in
+        // the list, the same tag name *is* honoured and does close the element.
+        assert_eq!(
+            afe_outline("<b>Test</b>Test"),
+            "\
+b@html
+  #text \"Test\"
+#text \"Test\""
+        );
+    }
+
+    #[test]
+    fn the_adoption_agency_furthest_block_path_walks_past_a_formatting_element() {
+        // "Let furthestBlock be the topmost node in the stack of open elements
+        // that is lower in the stack than formattingElement, and is an element
+        // in the special category." (13.2.6.4.7)
+        //
+        // The furthest block is what the innermost special element is, and the
+        // walk from it to the formatting element passes the `<i>`, which *is* in
+        // the list of active formatting elements and so is replaced rather than
+        // dropped. The two cases differ in exactly one step: an `<i>` that is in
+        // the list is replaced, one that is not is removed from the stack of
+        // open elements, and `<foo>` is not a formatting element, so it is never
+        // in the list.
+        //
+        // The trimmed fixture is the `webkit02.dat#12` case from the reference
+        // suite. The replacement `<i>` is what carries the `<aside>` out to the
+        // common ancestor, and the fresh `<b>` is created "with furthestBlock as
+        // the intended parent" so the `<aside>` ends up inside it.
+        assert_eq!(
+            afe_outline("<b><em><foo><foo><aside></b>"),
+            "\
+b@html
+  em@html
+    foo@html
+      foo@html
+em@html
+  aside@html
+    b@html"
+        );
+        // `<foo>` is an ordinary element, so it is not in the list of active
+        // formatting elements and the two of them are dropped from the stack of
+        // open elements by "If node is not in the list of active formatting
+        // elements, then remove node from the stack of open elements and
+        // continue". The `<em>` above them survives, and holds the `<foo>`s.
+        let output = parse_document("<b><em><foo><foo><aside></b>");
+        let ems = find_all_elements(&output.dom, output.dom.document(), "em");
+        assert_eq!(ems.len(), 2);
+        assert_eq!(element_children(&output.dom, ems[0]), vec!["foo".to_owned()]);
+    }
+
+    #[test]
+    fn the_adoption_agency_common_ancestor_path_is_the_element_above_the_subject() {
+        // "Let commonAncestor be the element immediately above
+        // formattingElement in the stack of open elements" (13.2.6.4.7), and
+        // "Insert lastNode into target before refNode", where target comes from
+        // the adjusted insertion location given (commonAncestor, null).
+        //
+        // The common ancestor is what the replacement is moved *to*, and it is
+        // one level above the subject, not the subject's own position. When the
+        // subject has been closed off by a block element in between -- here the
+        // `</p>` closes the paragraph the `<b>` was inside -- the common ancestor
+        // is the body, and both the replacement `<s>` and the fresh `<b>` have to
+        // end up as siblings of the original `<b>` rather than inside it.
+        //
+        // The trimmed fixture is the `adoption01.dat#10` case from the reference
+        // suite. The `id` attributes are kept because the Noah's Ark clause
+        // compares attributes, and because they are what shows that a *new*
+        // element is created from the subject's token rather than the subject
+        // being re-used.
+        assert_eq!(
+            afe_outline("<p>1<s id=\"A\">2<b id=\"B\">3</p>4</s>5</b>"),
+            "\
+p@html
+  #text \"1\"
+  s@html
+    #text \"2\"
+    b@html
+      #text \"3\"
+s@html
+  b@html
+    #text \"4\"
+b@html
+  #text \"5\""
+        );
+        // Three `b` elements: the original, the one created for the furthest
+        // block, and the one the second `</b>` produces after the list is walked
+        // again. Each holds exactly one of the three texts, which is the
+        // observable consequence of the walk visiting each of them once.
+        let output = parse_document("<p>1<s id=\"A\">2<b id=\"B\">3</p>4</s>5</b>");
+        let bolds = find_all_elements(&output.dom, output.dom.document(), "b");
+        assert_eq!(bolds.len(), 3);
+        // The two created elements carry the subject token's attributes: "Create
+        // an element for the token for which formattingElement was created", and
+        // creating an element for a token appends the token's attributes to it.
+        // Three `b` elements all carrying `id="B"` is only possible if the two
+        // later ones are new.
+        assert!(
+            bolds
+                .iter()
+                .all(|bold| output.dom.attribute(*bold, "id").is_ok_and(|id| id == Some("B"))),
+            "every created b carries the token's id"
+        );
+        let texts: Vec<String> = bolds
+            .iter()
+            .map(|bold| text_content(&output.dom, *bold))
+            .collect();
+        assert_eq!(texts, vec!["3", "4", "5"]);
+    }
+
+    #[test]
+    fn an_end_of_file_with_unclosed_content_is_a_parse_error() {
+        // "An end-of-file token: ... If there is a node in the stack of open
+        // elements that is not either a dd element, a dt element, an li element,
+        // an optgroup element, an option element, a p element, an rb element, an
+        // rp element, an rt element, an rtc element, a tbody element, a td
+        // element, a tfoot element, a th element, a thead element, a tr element,
+        // the body element, or the html element, then this is a parse error.
+        // Stop parsing." (13.2.6.4.7)
+        //
+        // The tree is identical whether the error is reported or not, so this
+        // is the rule's entire observable effect and nothing else in the test
+        // suite would catch its absence: it is a conformance requirement about
+        // the *number* of errors (13.2.2), not about the tree.
+        //
+        // The trimmed fixtures are the `blocks.dat#0` and `blocks.dat#1` cases
+        // from the reference suite, which are the pair that isolates the rule:
+        // same elements, one ending with an unclosed `<p>` and one not, and the
+        // suite's `#errors` section says one error and no errors respectively.
+        let unclosed = error_codes("<!doctype html><p>foo<address>bar<p>baz");
+        assert_eq!(
+            unclosed
+                .iter()
+                .filter(|code| **code == HtmlParseErrorCode::UnexpectedToken)
+                .count(),
+            1,
+            "an unclosed address is one error: {unclosed:?}"
+        );
+        // The contrast case, which is what makes the assertion above about the
+        // *list* rather than about reporting at end of file: `address` is not
+        // on it, and nothing is left open that is.
+        assert_eq!(error_codes("<!doctype html><address><p>foo</address>bar"), vec![]);
+        // A `p` is on the list, so a document that ends inside one is silent.
+        // That asymmetry is the whole content of the rule.
+        assert_eq!(error_codes("<!doctype html><p>text"), vec![]);
+        // A `div` is not on it.
+        assert_eq!(
+            error_codes("<!doctype html><div>text"),
+            vec![HtmlParseErrorCode::UnexpectedToken]
         );
     }
 

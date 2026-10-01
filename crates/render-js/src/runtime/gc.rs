@@ -186,9 +186,18 @@ pub(super) fn mark_host(
         | ObjectHost::Location(_)
         | ObjectHost::ErrorConstructor(_)
         | ObjectHost::ErrorInstance
+        | ObjectHost::DomExceptionConstructor
+        | ObjectHost::DomException { .. }
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::TypedArray { .. }
+        | ObjectHost::DataView { .. }
+        | ObjectHost::DataViewConstructor
+        | ObjectHost::ArrayBufferHost(_)
+        | ObjectHost::ArrayBufferConstructor
+        | ObjectHost::TextDecoder { .. }
+        | ObjectHost::TextEncoderConstructor
+        | ObjectHost::TextDecoderConstructor
         | ObjectHost::UrlConstructor
         | ObjectHost::UrlSearchParamsConstructor
         | ObjectHost::UrlInstance(_)
@@ -244,6 +253,11 @@ pub(super) fn mark_host(
         ObjectHost::IntersectionObserver { callback, .. }
         | ObjectHost::MutationObserver { callback, .. } => {
             mark_object(runtime, marked, work, marked_environments, *callback);
+        }
+        ObjectHost::MediaQueryList { listeners, .. } => {
+            for listener in listeners {
+                mark_object(runtime, marked, work, marked_environments, *listener);
+            }
         }
         ObjectHost::Promise(index) | ObjectHost::PromiseSettler { promise: index, .. } => {
             mark_promise(runtime, marked, work, marked_environments, *index);
@@ -407,7 +421,8 @@ impl JsRuntime {
                     );
                 }
                 JsMicrotask::IntersectionObserver(observer)
-                | JsMicrotask::MutationObserver(observer) => {
+                | JsMicrotask::MutationObserver(observer)
+                | JsMicrotask::MediaQueryListChange(observer) => {
                     mark_object(
                         self,
                         &mut marked,

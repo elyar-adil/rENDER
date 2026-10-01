@@ -1,14 +1,28 @@
-//! Headless offline replay for the saved bilibili.com home page.
+//! Headless offline replay for a saved script-driven home page.
 //!
-//! Usage: `cargo run -p render-js --example bilibili_diag -- [saved.html] [assets-dir]`
+//! The page shape this tool diagnoses: an HTML shell whose visible content is
+//! produced by external bundles. The markup alone has nothing in it, so the
+//! only way to know whether the engine can run the page is to run the captured
+//! scripts against the captured DOM. That is what this does, and it is
+//! deliberately site-neutral — the corpus is whatever directory you point it
+//! at, because the capability being measured ("can this engine execute a
+//! production bundle, and where does it stop") is a property of the engine,
+//! not of any one page.
 //!
-//! Defaults to `../../.diag/bilibili/page.html` plus its `assets/` directory.
-//! The assets directory must contain a `manifest.txt` whose lines map an
-//! absolute resource URL to a local file name ("url<TAB>file") so external
-//! scripts replay exactly as the browser fetched them. Execution mirrors the
-//! browser: parser-blocking inline/classic scripts run in DOM order, while
-//! `defer`, `type=module`, and `async` scripts run after parsing (module and
-//! defer in document order). Microtasks drain after each script task.
+//! Usage:
+//! `cargo run -p render-js --example offline_page_replay -- <corpus-dir> [base-url]`
+//!
+//! `<corpus-dir>` must contain `page.html` plus an `assets/` directory. The
+//! assets directory must contain a `manifest.txt` whose lines map an absolute
+//! resource URL to a local file name ("url<TAB>file") so external scripts
+//! replay exactly as the browser fetched them. `<base-url>` defaults to
+//! `https://example.com/` and sets the document URL used for relative
+//! resolution, which matters because bundles read `location`.
+//!
+//! Execution mirrors the browser: parser-blocking inline/classic scripts run
+//! in DOM order, while `defer`, `type=module`, and `async` scripts run after
+//! parsing (module and defer in document order). Microtasks drain after each
+//! script task.
 //!
 //! Diagnostics:
 //! - `RENDER_DIAG_STACK=1` installs a `TypeError` wrapper before the page
@@ -26,7 +40,7 @@ use render_html::parse_document;
 use render_js::JsRuntime;
 use url::Url;
 
-const DEFAULT_BASE_URL: &str = "https://www.bilibili.com/";
+const DEFAULT_BASE_URL: &str = "https://example.com/";
 
 #[allow(clippy::too_many_lines, reason = "offline replay reads as one listing")]
 fn main() -> ExitCode {
@@ -55,14 +69,19 @@ enum Scheduling {
 
 #[allow(clippy::too_many_lines, reason = "offline replay reads as one listing")]
 fn diag_main() -> ExitCode {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.diag/bilibili");
     let mut arguments = std::env::args().skip(1);
-    let html_path = arguments
+    let Some(corpus_dir) = arguments.next().map(PathBuf::from) else {
+        eprintln!(
+            "usage: offline_page_replay <corpus-dir> [base-url]\n\
+             <corpus-dir> holds page.html and assets/manifest.txt"
+        );
+        return ExitCode::FAILURE;
+    };
+    let base_url = arguments
         .next()
-        .map_or_else(|| repo_root.join("page.html"), PathBuf::from);
-    let assets_dir = arguments
-        .next()
-        .map_or_else(|| repo_root.join("assets"), PathBuf::from);
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
+    let html_path = corpus_dir.join("page.html");
+    let assets_dir = corpus_dir.join("assets");
 
     let manifest = load_manifest(&assets_dir).unwrap_or_default();
     let Ok(html) = fs::read_to_string(&html_path) else {
@@ -75,7 +94,15 @@ fn diag_main() -> ExitCode {
 
     let mut blocking = Vec::new();
     let mut deferred = Vec::new();
-    collect_scripts(dom, dom.document(), &manifest, &mut blocking, &mut deferred);
+    collect_scripts(
+        dom,
+        dom.document(),
+        &manifest,
+        &assets_dir,
+        &base_url,
+        &mut blocking,
+        &mut deferred,
+    );
     println!(
         "document: {} parser-blocking scripts, {} deferred/module scripts, {} manifest entries",
         blocking.len(),
@@ -83,7 +110,7 @@ fn diag_main() -> ExitCode {
         manifest.len(),
     );
 
-    let base = Url::parse(DEFAULT_BASE_URL).expect("base URL");
+    let base = Url::parse(&base_url).expect("base URL");
     let mut runtime = JsRuntime::with_url(dom, &base);
     // Optional diagnostic prelude: wrap global `TypeError` so every thrown
     // TypeError logs its JS stack before propagating (RENDER_DIAG_STACK=1).
@@ -144,6 +171,9 @@ fn diag_main() -> ExitCode {
         println!("    pending fetch {} {}", fetch.method, fetch.url);
     }
 
+    // App-shell probe: how far the bundles got. These are the globals and
+    // mount points a single-page shell publishes, checked by shape rather than
+    // by site, so the same probe works on any captured SPA home page.
     let probe = runtime.execute(
         dom,
         r"[typeof window.__HOME_PAGE_PERFORMANCE__,
@@ -212,10 +242,13 @@ fn has_attribute(element: &render_dom::ElementData, name: &str) -> bool {
         .any(|attribute| attribute.local_name == name)
 }
 
+#[allow(clippy::too_many_arguments, reason = "replay threads the corpus through the walk")]
 fn collect_scripts(
     dom: &render_dom::Dom,
     node: NodeId,
     manifest: &HashMap<String, String>,
+    assets_dir: &Path,
+    base_url: &str,
     blocking: &mut Vec<PendingScript>,
     deferred: &mut Vec<PendingScript>,
 ) {
@@ -241,12 +274,10 @@ fn collect_scripts(
                     Scheduling::Deferred => &mut *deferred,
                 };
                 if let Some(src) = attribute(element, "src") {
-                    let url = resolve(&src);
+                    let url = resolve(&src, base_url);
                     match url.as_ref().and_then(|url| manifest.get(url.as_str())) {
                         Some(file) => {
-                            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                                .join("../../.diag/bilibili/assets")
-                                .join(file);
+                            let path = assets_dir.join(file);
                             match fs::read_to_string(&path) {
                                 Ok(source) => {
                                     let label = format!("{src} [{file}]");
@@ -271,7 +302,15 @@ fn collect_scripts(
         }
     }
     for child in dom.children(node).unwrap_or_default() {
-        collect_scripts(dom, *child, manifest, blocking, deferred);
+        collect_scripts(
+            dom,
+            *child,
+            manifest,
+            assets_dir,
+            base_url,
+            blocking,
+            deferred,
+        );
     }
 }
 
@@ -287,14 +326,14 @@ fn inline_text(dom: &render_dom::Dom, node: NodeId) -> String {
     text
 }
 
-fn resolve(reference: &str) -> Option<String> {
+fn resolve(reference: &str, base_url: &str) -> Option<String> {
     let expanded = if let Some(rest) = reference.strip_prefix("//") {
         format!("https://{rest}")
     } else {
         reference.to_owned()
     };
     Url::options()
-        .base_url(Some(&Url::parse(DEFAULT_BASE_URL).expect("base")))
+        .base_url(Some(&Url::parse(base_url).expect("base")))
         .parse(&expanded)
         .ok()
         .map(|url| url.to_string())

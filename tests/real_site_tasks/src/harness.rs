@@ -29,6 +29,7 @@ use render_core::layout::{FragmentTree, LayoutOptions, PhysicalSize, SimpleTextM
 use render_core::paint::{Color, DisplayList, NoGlyphMasks, ReferenceTextShaper};
 use render_core::script::{ScriptDiscovery, ScriptDiscoveryLimits, discover_scripts};
 
+use crate::diagnostics::{self, Entry, Stage, Stream, coded_entry};
 use crate::fixture::{
     CONTRACT_VIEWPORT_HEIGHT, CONTRACT_VIEWPORT_WIDTH, FixtureSource, RealSiteFixture,
 };
@@ -253,6 +254,168 @@ impl Session {
             .map(|discovered| (discovered.key.source, discovered))
             .collect()
     }
+
+    /// The load's stylesheet diagnostics split by which sheet produced them: the
+    /// user-agent's own, and the page's.
+    ///
+    /// The user-agent sheet is collected with no owning node, while every author
+    /// sheet is collected with the `<link>` or `<style>` element that declared it. So
+    /// the owning node is exactly what separates the two sources, which is what lets
+    /// a fixture put its declaration-list error in an embedded `<style>` and its
+    /// at-rules in an external sheet and have the difference be observable rather
+    /// than assumed.
+    #[must_use]
+    pub fn stylesheet_diagnostics_by_source(&self) -> (Vec<Entry>, Vec<Entry>) {
+        let mut user_agent = Vec::new();
+        let mut author = Vec::new();
+        for reported in &self.output.diagnostics.style_sheets {
+            let kind = diagnostics::classify_stylesheet_message(&reported.diagnostic.message);
+            let entry = Entry::new(
+                Stage::StyleSheet,
+                kind,
+                reported.node,
+                reported.diagnostic.message.clone(),
+            );
+            if reported.node.is_none() {
+                user_agent.push(entry);
+            } else {
+                author.push(entry);
+            }
+        }
+        (user_agent, author)
+    }
+
+    /// Every diagnostic the load produced, from every stage, in stage order.
+    ///
+    /// Collected eagerly on each `Session` so the expected-set assertions read
+    /// one value rather than seven, and so the per-fixture counts in a failure
+    /// message are the same numbers the assertions compared. The stages are
+    /// listed in the order the pipeline runs them, which is also the order a
+    /// reader wants them in: what went wrong while reading the bytes, then while
+    /// parsing, then in the stylesheets, then in the cascade, then in layout,
+    /// paint, and the resource plans.
+    #[must_use]
+    pub fn diagnostics(&self) -> Stream {
+        let mut entries = Vec::new();
+        for diagnostic in &self.decoded.diagnostics {
+            entries.push(coded_entry(
+                Stage::HtmlDecode,
+                code_name(&format!("{:?}", diagnostic.code)),
+                None,
+                &format!("{:?}", diagnostic.code),
+            ));
+        }
+        for error in self.document.html_errors() {
+            entries.push(coded_entry(
+                Stage::HtmlParse,
+                code_name(&format!("{:?}", error.code)),
+                None,
+                &format!("{:?} at offset {}", error.code, error.offset),
+            ));
+        }
+        for diagnostic in &self.style_diagnostics {
+            entries.push(coded_entry(
+                Stage::StyleDiscovery,
+                code_name(&format!("{:?}", diagnostic.code)),
+                diagnostic.node,
+                &format!("{:?}: {}", diagnostic.code, diagnostic.message),
+            ));
+        }
+        for reported in &self.output.diagnostics.style_sheets {
+            entries.push(Entry::new(
+                Stage::StyleSheet,
+                diagnostics::classify_stylesheet_message(&reported.diagnostic.message),
+                reported.node,
+                reported.diagnostic.message.clone(),
+            ));
+        }
+        for reported in &self.output.diagnostics.computed_styles {
+            entries.push(diagnostics::computed_style_entry(
+                code_name(&format!(
+                    "dropped {}",
+                    reported
+                        .diagnostic
+                        .property
+                        .as_deref()
+                        .unwrap_or("<unspecified>")
+                )),
+                &reported.diagnostic.message,
+            ));
+        }
+        for reported in &self.output.diagnostics.formatting {
+            entries.push(coded_entry(
+                Stage::Formatting,
+                formatting_code_name(reported.code),
+                reported.node,
+                &format!("{:?}: {}", reported.code, reported.message),
+            ));
+        }
+        for reported in &self.output.diagnostics.layout {
+            entries.push(coded_entry(
+                Stage::Layout,
+                layout_code_name(reported.code),
+                reported.node,
+                &format!("{:?}: {}", reported.code, reported.message),
+            ));
+        }
+        for reported in &self.output.diagnostics.display_list {
+            entries.push(coded_entry(
+                Stage::DisplayList,
+                display_list_code_name(reported.code),
+                reported.node,
+                &format!("{:?}: {}", reported.code, reported.message),
+            ));
+        }
+        for reported in &self.output.diagnostics.raster {
+            let code = code_name(&format!("{:?}", reported.code));
+            entries.push(diagnostics::raster_entry(code, &reported.message));
+        }
+        for diagnostic in &self.image_discovery.diagnostics {
+            entries.push(coded_entry(
+                Stage::Image,
+                code_name(&format!("{:?}", diagnostic.code)),
+                diagnostic.node,
+                &format!("{:?}: {}", diagnostic.code, diagnostic.message),
+            ));
+        }
+        for diagnostic in &self.script_discovery.diagnostics {
+            entries.push(coded_entry(
+                Stage::Script,
+                code_name(&format!("{:?}", diagnostic.code)),
+                diagnostic.owner,
+                &format!("{:?}: {}", diagnostic.code, diagnostic.message),
+            ));
+        }
+        Stream::new(entries)
+    }
+}
+
+/// A stable name for a formatting diagnostic code.
+///
+/// The code enums are not re-exported with a `&'static str`, and the point of
+/// this table is that a *code* is the comparable identity, so the name is taken
+/// from the code's own `Debug` spelling rather than invented here. Inventing a
+/// separate vocabulary would give the harness two names for one thing and let
+/// them drift.
+fn formatting_code_name(code: render_core::layout::FormattingDiagnosticCode) -> &'static str {
+    code_name(&format!("{code:?}"))
+}
+
+fn layout_code_name(code: render_core::layout::LayoutDiagnosticCode) -> &'static str {
+    code_name(&format!("{code:?}"))
+}
+
+fn display_list_code_name(code: render_core::paint::DisplayListDiagnosticCode) -> &'static str {
+    code_name(&format!("{code:?}"))
+}
+
+/// Intern a code's spelling so an `Entry`'s kind is `&'static str`.
+///
+/// Leaked deliberately and bounded by the number of distinct codes in the
+/// engine, which is a fixed and small set; the alternative is threading an owned
+/// `String` through every comparison key.
+fn code_name(debug: &str) -> &'static str {
+    Box::leak(debug.to_owned().into_boxed_str())
 }
 
 /// Answer every eligible external stylesheet slot with the same local bytes.

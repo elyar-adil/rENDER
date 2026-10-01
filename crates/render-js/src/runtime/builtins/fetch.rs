@@ -27,6 +27,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::builtins::json::JsonParser;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::FetchOutcome;
@@ -300,18 +301,16 @@ impl JsRuntime {
         Ok(JsValue::Undefined)
     }
 
+    /// The rejection reason for an aborted request. Fetch Standard §"abort a
+    /// fetch": "reject promise with an `AbortError` `DOMException`", so this is
+    /// now a real one: `e.name`, `e.code` (20) and `e instanceof DOMException`
+    /// all answer, and `AbortSignal`'s `onabort` sees the same object a
+    /// `fetch` catch block does.
     fn abort_reason(&mut self) -> JsValue {
-        let reason = self
-            .construct_standard_error(ErrorKind::TypeError, "The request was aborted")
-            .unwrap_or(JsValue::String("The request was aborted".to_owned()));
-        if let JsValue::Object(error) = reason {
-            self.realm.set_property(
-                error,
-                "name".to_owned(),
-                JsValue::String("AbortError".to_owned()),
-            );
-        }
-        reason
+        self.construct_dom_exception(DomExceptionName::Abort, "The user aborted a request.")
+            .unwrap_or_else(|_| {
+                JsValue::String("AbortError: The user aborted a request.".to_owned())
+            })
     }
 
     pub(in crate::runtime) fn form_data_constructor(

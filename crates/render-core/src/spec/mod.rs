@@ -352,6 +352,13 @@ mod tests {
 
     /// The status has to distinguish "nothing" from "half of something", and the
     /// note has to be about this feature rather than a copy of another one.
+    ///
+    /// `css.font-face` moved out of this list when `@font-face` stopped being
+    /// parsed-and-discarded: the descriptors are read, the resource is decoded, and
+    /// the face is in the table §5 searches. That is a working half, so `Partial`
+    /// is the honest status and the assertion below is what keeps the distinction
+    /// sharp - the invariant is "a feature with no implementation at all must say
+    /// Missing", and it is checked against the features that still have none.
     #[test]
     fn statuses_say_which_half_is_built() {
         let registry = FeatureRegistry::current();
@@ -361,8 +368,16 @@ mod tests {
             .map(|feature| feature.id.as_str())
             .collect();
         assert!(
-            absent.contains(&"css.font-face") && absent.contains(&"css.animations"),
+            absent.contains(&"css.animations") && absent.contains(&"css.transitions"),
             "a feature with no implementation at all must say Missing, not Partial: {absent:?}"
+        );
+        assert!(
+            !absent.contains(&"css.font-face"),
+            "and @font-face is not one of them any more: a document face is \
+             fetched, registered with a document's lifetime, reachable through the \
+             §5 matcher, and measured and painted with its own metrics. Saying \
+             Missing would underclaim, which is the same error as the overclaim it \
+             replaced."
         );
         let partial: Vec<&str> = registry
             .iter()
@@ -372,6 +387,10 @@ mod tests {
         assert!(
             partial.contains(&"css.tables") && partial.contains(&"media.video-decode"),
             "a feature with a working half must say Partial: {partial:?}"
+        );
+        assert!(
+            partial.contains(&"css.font-face"),
+            "and so must the one this round built: {partial:?}"
         );
         // `fetch.runtime` was the only non-Partial entry before this round and
         // it underclaimed: `fetch` and `XMLHttpRequest` are implemented.

@@ -56,13 +56,16 @@ use crate::paint::{
 ///   property below is written out physically. This sheet is therefore
 ///   left-to-right; the block direction and RTL mirror need `direction` support
 ///   in the layout solver (render-layout) first.
-/// * `font-weight`, `font-style`, `font-family`, `small-caps`, `text-transform`,
-///   `letter-spacing`, `text-indent` and `vertical-align` reach the computed
-///   style but no consumer downstream of render-core reads them: the layout
-///   solver's `TextStyle` carries only `font_size` and `line_height`. The rules
-///   are correct and kept, but headings, emphasis, and monospace blocks render
-///   in the inherited face and weight today. See `docs/` and the render-layout
-///   `TextStyle` struct for the unblock.
+/// * `font-weight`, `font-style` and `font-family` reach layout and paint through
+///   the layout solver's `TextStyle` and the text fragment it is measured into,
+///   so a heading renders at its own weight, emphasis at its own slant, and
+///   `pre`/`code` in a monospace face. What is still missing is everything
+///   `font-synthesis` and `@font-face` would add on top; see
+///   `docs/visual_fidelity_gaps.md` S1.
+/// * `small-caps`, `text-transform`, `letter-spacing`, `text-indent` and
+///   `vertical-align` reach the computed style. `text-transform`,
+///   `letter-spacing`, `text-indent` and `vertical-align` have consumers;
+///   `small-caps` does not yet.
 /// * `q` has no rule here on purpose: §15.3.4 styles it through
 ///   `q::before { content: open-quote }` and `q::after { content: close-quote }`,
 ///   and this engine does not generate content. Substituting a font change
@@ -342,10 +345,8 @@ form { margin-bottom: 1em; }
 
 /* §15.3.8 Tables, "In quirks mode": a table element's font, line height,
    white-space and text alignment all reset to their initial values, so they
-   are inherited from no ancestor. `line-height`, `white-space` and
-   `text-align` have consumers; `font-weight`, `font-style` and `font-size`
-   reach the computed style but no paint or layout consumer reads them yet
-   (the S1 font-axis gap), so those three are correct CSS and currently inert. */
+   are inherited from no ancestor. All five have a consumer, and the three font
+   properties are the ones `docs/visual_fidelity_gaps.md` S1 gave consumers. */
 table {
   font-weight: initial;
   font-style: initial;

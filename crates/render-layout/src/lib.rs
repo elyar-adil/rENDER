@@ -4,20 +4,33 @@
 //! consumes a specific [`render_dom::DomRevision`] and produces immutable trees
 //! whose independent formatting contexts can be scheduled in parallel.
 
+mod font;
 mod fragment;
 mod geometry;
 mod grid;
+mod linebreak;
 mod scrollport;
 mod solver;
 mod sticky;
 mod tree;
 
+pub use font::{
+    FamilyName, FontRequest, FontStyle, FontSynthesis, GenericFamily, NominalFace, caseless_match,
+    computed_font_style, computed_font_synthesis, computed_font_weight, family_entries,
+    family_entry, generic_family, is_wide_character, nominal_advance, nominal_face,
+    unquote_family_name,
+};
 pub use fragment::{
-    BoxGeometry, Fragment, FragmentId, FragmentKind, FragmentTree, TextFragmentData,
+    BoxGeometry, Fragment, FragmentId, FragmentKind, FragmentTree, StoredFontRequest,
+    TextFragmentData,
 };
 pub use geometry::{
     Direction, EdgeSizes, LogicalPoint, LogicalRect, LogicalSize, PhysicalPoint, PhysicalRect,
     PhysicalSize, WritingMode,
+};
+pub use linebreak::{
+    Break, LineBreakClass, LineBreakOptions, LineBreakStrictness, WordBreak, opportunities,
+    widest_unbreakable_run,
 };
 pub use scrollport::{ClipMode, ScrollportGeometry};
 pub use solver::{

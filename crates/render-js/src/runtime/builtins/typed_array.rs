@@ -106,6 +106,22 @@ impl JsRuntime {
                 prototype,
             )));
         };
+        // `new Uint8Array(buffer[, byteOffset[, length]])` shares the buffer, so
+        // a `DataView` write over the same buffer is visible through the typed
+        // array. The offset and length are byte positions the spec requires to
+        // be element-aligned.
+        if let Some(ObjectHost::ArrayBufferHost(buffer)) = match first {
+            JsValue::Object(object) => self.realm.host(*object),
+            _ => None,
+        } {
+            return self.typed_array_over_buffer(
+                kind,
+                buffer.clone(),
+                arguments.get(1),
+                arguments.get(2),
+                prototype,
+            );
+        }
         let elements = match first {
             JsValue::Undefined | JsValue::Null => Vec::new(),
             JsValue::Object(_) => self.typed_array_source_values(dom, first)?,
@@ -115,6 +131,85 @@ impl JsRuntime {
             }
         };
         self.create_typed_array_from_values(kind, &elements, prototype)
+    }
+
+    /// A typed-array view over an existing `ArrayBuffer`.
+    ///
+    /// The buffer holds one slot per byte, so a view is byte-exact only when one
+    /// element is one byte *and* the stored representation is that byte:
+    /// `Uint8Array` and `Uint8ClampedArray` qualify, because their element
+    /// values are the bytes themselves. `Int8Array` stores signed values, and
+    /// the wider kinds store decoded numbers rather than bytes, so a view of
+    /// those over a shared buffer would have to compose each element from
+    /// several byte slots. That composition is not implemented, so it is
+    /// refused here rather than answered with a plausible-looking wrong number.
+    fn typed_array_over_buffer(
+        &mut self,
+        kind: TypedArrayKind,
+        buffer: TypedBuffer,
+        byte_offset: Option<&JsValue>,
+        length: Option<&JsValue>,
+        prototype: Option<ObjectId>,
+    ) -> Result<JsValue, JsError> {
+        if !matches!(kind, TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped) {
+            return Err(JsError::type_error(format!(
+                "{} cannot view a shared ArrayBuffer in this engine; \
+                 only Uint8Array and Uint8ClampedArray can",
+                kind.name()
+            )));
+        }
+        let total_bytes = buffer.0.borrow().len();
+        let element_size = kind.element_size();
+        let offset = match byte_offset {
+            None | Some(JsValue::Undefined) => 0.0,
+            Some(value) => to_number(value)?,
+        };
+        if !offset.is_finite() || offset < 0.0 || offset.trunc() != offset {
+            return Err(self.range_error("byteOffset must be a non-negative integer"));
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "buffer lengths stay far below any precision boundary"
+        )]
+        let offset_value = offset as usize;
+        if offset_value % element_size != 0 {
+            return Err(self.range_error("byteOffset must be a multiple of the element size"));
+        }
+        if offset_value > total_bytes {
+            return Err(self.range_error("byteOffset is past the end of the buffer"));
+        }
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "buffer lengths stay far below any precision boundary"
+        )]
+        let available = (total_bytes - offset_value) / element_size;
+        let count = match length {
+            None | Some(JsValue::Undefined) => available,
+            Some(value) => {
+                let requested = to_number(value)?;
+                if !requested.is_finite() || requested < 0.0 || requested.trunc() != requested {
+                    return Err(self.range_error("length must be a non-negative integer"));
+                }
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "the value is validated as a non-negative integer"
+                )]
+                let requested = requested as usize;
+                if requested > available {
+                    return Err(self.range_error("length is past the end of the buffer"));
+                }
+                requested
+            }
+        };
+        self.ensure_heap_capacity(1)?;
+        Ok(JsValue::Object(self.realm.typed_array(
+            kind,
+            buffer,
+            offset_value / element_size,
+            count,
+            prototype,
+        )))
     }
 
     /// Element values of a typed-array constructor/`from` source object: an

@@ -9,6 +9,7 @@ mod lexer;
 mod parser;
 mod regex;
 mod runtime;
+mod utf16;
 mod value;
 
 /// Self-contained MP4/H.264 pipeline used by the `HTMLVideoElement` bindings.

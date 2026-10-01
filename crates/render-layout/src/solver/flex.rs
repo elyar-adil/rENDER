@@ -475,7 +475,22 @@ impl Solver<'_> {
                 .and_then(|style| style.typed(property))
                 .is_none_or(|value| matches!(value, TypedPropertyValue::Size(Size::Auto)));
             if automatic_minimum {
-                let intrinsic = self.intrinsic_flex_size(node, horizontal, main_size, 0);
+                // Flexbox §4.5: the used value of an `auto` main-axis minimum
+                // size on a non-scrollable flex item is its content-based
+                // minimum size, and §4.5's content size suggestion is "the
+                // min-content size in the main axis". Max-content is the wrong
+                // number here and the error is visible: a row of items whose
+                // text can wrap would each hold their whole unwrapped line as a
+                // floor, so nothing ever shrank and a narrow container overflowed
+                // instead of wrapping. `flex_intrinsic_size` also keeps §4.5's
+                // "capped by the specified size suggestion", which is what the
+                // definite-size branch at the bottom of this function already
+                // did for the max-content measurement.
+                let intrinsic = if horizontal {
+                    self.flex_intrinsic_size(node, horizontal, main_size, 0, true)
+                } else {
+                    self.intrinsic_flex_size(node, horizontal, main_size, 0)
+                };
                 item.min_outer = (intrinsic
                     + self.flex_outer_extras(
                         style.as_ref(),
@@ -783,39 +798,69 @@ impl Solver<'_> {
         basis: f32,
         depth: usize,
     ) -> f32 {
+        self.flex_intrinsic_size(node, horizontal, basis, depth, false)
+    }
+
+    /// Flexbox §9.9: a box's main-axis intrinsic size, which `minimum` selects
+    /// between the two halves of the pair - the max-content size (§10.3.5's
+    /// "preferred width") and the min-content size (§10.3.5's "preferred
+    /// minimum width").
+    ///
+    /// They are different numbers wherever there is a soft wrap opportunity to
+    /// take, so a consumer that wants the smaller one must ask for it: §9.9.1's
+    /// max-content main size is the preferred width of a flex item, while §4.5's
+    /// content-based minimum size is its min-content width.
+    pub(super) fn flex_intrinsic_size(
+        &mut self,
+        node: FormattingNodeId,
+        horizontal: bool,
+        basis: f32,
+        depth: usize,
+        minimum: bool,
+    ) -> f32 {
         if depth > self.options.limits.max_depth {
             return 0.0;
         }
-        let Some(node) = self.formatting.get(node) else {
+        let Some(entry) = self.formatting.get(node) else {
             return 0.0;
         };
-        if let FormattingNodeKind::Text(text) = &node.kind {
-            let style = self.inline_text_style(node.style_source);
+        if let FormattingNodeKind::Text(text) = &entry.kind {
+            let style_source = entry.style_source;
+            let style = self.inline_text_style(style_source);
             return if horizontal {
-                self.intrinsic_text_width(text, node.style_source, style)
+                if minimum {
+                    // §4.5's content size suggestion is "the min-content size
+                    // in the main axis", which for a text run is the width of
+                    // its widest unbreakable run - the same measurement §10.3.5
+                    // defines, so the helper answers rather than a second one.
+                    self.min_content_width(node)
+                } else {
+                    self.intrinsic_text_width(text, style_source, style)
+                }
             } else if text.chars().all(char::is_whitespace) {
                 0.0
             } else {
                 style.style.line_height
             };
         }
-        let style = node
+        let style = entry
             .style_source
             .and_then(|source| self.styles.get(&source))
             .cloned();
         let is_flex = matches!(
-            node.kind,
+            entry.kind,
             FormattingNodeKind::BlockContainer {
                 context: FormattingContextKind::Flex
             }
         );
-        let children = node.children.clone();
+        let children = entry.children.clone();
         let mut line: f32 = 0.0;
         let mut widest: f32 = 0.0;
+        let mut broadest: f32 = 0.0;
         let mut total: f32 = 0.0;
         for child in children.iter().copied() {
             let child_size =
-                self.intrinsic_flex_size(child, horizontal, basis, depth.saturating_add(1));
+                self.flex_intrinsic_size(child, horizontal, basis, depth.saturating_add(1), minimum);
             let child_size = if is_flex {
                 let child_node = self.formatting.get(child);
                 let child_source = child_node.and_then(|node| node.source);
@@ -835,12 +880,26 @@ impl Solver<'_> {
             } else {
                 child_size
             };
+            broadest = broadest.max(child_size);
             line += child_size;
             total += child_size;
         }
         // A non-flex inline sequence reports the widest of its lines; the flex
-        // case keeps its sum and adds the gap below.
-        let content = if !is_flex && horizontal {
+        // case keeps its sum and adds the gap below. Under the min-content
+        // measurement the same sequence reports the width of its widest
+        // unbreakable run, which is a property of the sequence rather than of
+        // any one of its children, and a non-flex block container reports the
+        // widest of its block children.
+        let content = if !is_flex && horizontal && minimum {
+            if matches!(
+                entry.kind,
+                FormattingNodeKind::AnonymousBlock | FormattingNodeKind::Inline
+            ) {
+                self.inline_sequence_min_content_width(&children, depth)
+            } else {
+                broadest
+            }
+        } else if !is_flex && horizontal {
             widest.max(line)
         } else {
             total
@@ -851,7 +910,7 @@ impl Solver<'_> {
                     style.as_ref(),
                     if horizontal { "column-gap" } else { "row-gap" },
                     basis,
-                    node.source,
+                    entry.source,
                 ) * count_as_f32(children.len().saturating_sub(1))
         } else {
             content
@@ -861,9 +920,11 @@ impl Solver<'_> {
         // percentage basis would itself depend on content (CSS Sizing §5),
         // so a `width:100%` descendant must not resolve against the
         // available space here. A definite size caps the box's intrinsic
-        // contribution: the max-content size of a box with a definite size
-        // is that size, however wide its contents are.
-        self.resolve_size_against(style.as_ref(), property, None, node.source)
+        // contribution, which is §4.5's "capped by the specified size
+        // suggestion" for the min-content measurement and the max-content
+        // counterpart for the other: the intrinsic size of a box with a
+        // definite size is that size, however wide its contents are.
+        self.resolve_size_against(style.as_ref(), property, None, entry.source)
             .unwrap_or(content)
     }
 
@@ -956,16 +1017,21 @@ impl Solver<'_> {
         } else {
             self.resolve_size(style, "width", available, source)
                 .unwrap_or_else(|| {
-                    // Non-stretch items with an auto cross size use their
-                    // fit-content size: the max-content intrinsic clamped to
-                    // the flex line (CSS Flexbox §9.4.8 uses fit-content;
-                    // the min-content floor is not modeled yet). Without the
-                    // clamp, an auto-width child of a `flex-direction:column;
-                    // align-items:center` container keeps its full
-                    // max-content width and is centered into negative
-                    // coordinates, pushing it off-screen (zhihu signin card).
-                    self.intrinsic_flex_size(node, true, available, 0)
-                        .min((available - extras).max(0.0))
+                    // CSS Flexbox §9.4.8: an auto cross size is the fit-content
+                    // size, `min(max-content, max(min-content, available))`.
+                    // Without the min-content floor the clamp is a bare
+                    // `min`, and an item whose longest unbreakable run is wider
+                    // than the flex line comes out narrower than that run and
+                    // wraps inside itself instead of overflowing the line. The
+                    // clamp is also what keeps a non-stretch item of an
+                    // `align-items:center` column from keeping its full
+                    // max-content width and being centered into negative
+                    // coordinates (zhihu signin card).
+                    let available = (available - extras).max(0.0);
+                    f32::min(
+                        self.intrinsic_flex_size(node, true, available, 0),
+                        self.flex_intrinsic_size(node, true, available, 0, true).max(available),
+                    )
                 })
                 + extras
         }

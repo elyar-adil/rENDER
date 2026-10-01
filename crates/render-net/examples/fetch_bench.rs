@@ -3,7 +3,8 @@
 //!
 //! Flags: `-v` (ureq logs), `raw` (legacy raw-ureq probe), `--no-proxy`
 //! (bypass an environment/system proxy), `--timeout <ms>`, `--connect <ms>`
-//! (connect-phase budget), `--repeat <n>`.
+//! (connect-phase budget), `--response <ms>` (response-header budget),
+//! `--body-idle <ms>` (body idle-read budget), `--repeat <n>`.
 
 use std::io::Read;
 use std::time::Instant;
@@ -57,6 +58,8 @@ fn main() {
     let mut repeat = 1;
     let mut timeout = None;
     let mut connect = None;
+    let mut response = None;
+    let mut body_idle = None;
     let mut urls = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -71,6 +74,18 @@ fn main() {
             "--connect" => {
                 let value = args.next().expect("--connect needs a value");
                 connect = Some(std::time::Duration::from_millis(
+                    value.parse().expect("milliseconds"),
+                ));
+            }
+            "--response" => {
+                let value = args.next().expect("--response needs a value");
+                response = Some(std::time::Duration::from_millis(
+                    value.parse().expect("milliseconds"),
+                ));
+            }
+            "--body-idle" => {
+                let value = args.next().expect("--body-idle needs a value");
+                body_idle = Some(std::time::Duration::from_millis(
                     value.parse().expect("milliseconds"),
                 ));
             }
@@ -95,6 +110,14 @@ fn main() {
     let mut config = FetchConfig::default();
     config.timeout = timeout.unwrap_or(config.timeout);
     config.connect_timeout = connect.unwrap_or(config.connect_timeout);
+    config.response_timeout = response;
+    config.body_idle_timeout = body_idle;
+    eprintln!(
+        "render-net budgets: connect {:?}, response {:?}, body idle {:?}",
+        config.effective_connect_timeout(),
+        config.effective_response_timeout(),
+        config.effective_body_idle_timeout()
+    );
     let transport = if no_proxy {
         HttpTransport::with_proxy(config, None)
     } else {

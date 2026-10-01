@@ -13,6 +13,7 @@ pub mod dom {
     pub use render_dom::*;
 }
 pub mod event_loop;
+pub mod font_face;
 pub mod html {
     pub use render_html::*;
 }

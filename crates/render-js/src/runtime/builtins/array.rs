@@ -22,6 +22,7 @@ use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_integer_or_infinity;
 use crate::runtime::convert::to_number;
+use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -42,6 +43,13 @@ impl JsRuntime {
             NativeFunction::ArrayEntries => self.array_view_iterator(receiver, ArrayView::Entries),
             NativeFunction::ArraySplice => self.array_splice(receiver, arguments),
             NativeFunction::ArrayReverse => self.array_reverse(receiver),
+            NativeFunction::ArrayAt => self.array_at(receiver, arguments),
+            NativeFunction::ArrayFlat => self.array_flat(dom, receiver, arguments),
+            NativeFunction::ArrayReduceRight => self.array_reduce_right(dom, receiver, arguments),
+            NativeFunction::ArrayFindLast => self.array_find_last(dom, receiver, arguments, false),
+            NativeFunction::ArrayFindLastIndex => {
+                self.array_find_last(dom, receiver, arguments, true)
+            }
             NativeFunction::ArraySort => self.array_sort(dom, receiver, arguments),
             NativeFunction::ArrayConcat => self.array_concat(receiver, arguments),
             NativeFunction::ArrayShift => self.array_shift(receiver),
@@ -292,11 +300,12 @@ impl JsRuntime {
     }
 
     /// `LengthOfArrayLike` (§7.3.18): `ToLength([[Get]](O, "length"))`. String
-    /// wrappers expose their code-point count as a virtual `length`.
+    /// wrappers expose their code-unit count as a virtual `length`, because
+    /// that is what `String.prototype.length` is.
     fn array_like_len(&mut self, dom: &mut Dom, object: ObjectId) -> Result<f64, JsError> {
         if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(object) {
             #[allow(clippy::cast_precision_loss)]
-            return Ok(text.chars().count() as f64);
+            return Ok(utf16::utf16_length(&text) as f64);
         }
         let length = self.get_value(dom, object, "length")?;
         to_length(&length)
@@ -307,7 +316,7 @@ impl JsRuntime {
     fn has_indexed(&self, object: ObjectId, index: f64) -> bool {
         match self.realm.host(object) {
             Some(ObjectHost::TypedArray { length, .. }) => index < length as f64,
-            Some(ObjectHost::StringPrimitive(text)) => index < text.chars().count() as f64,
+            Some(ObjectHost::StringPrimitive(text)) => index < utf16::utf16_length(&text) as f64,
             _ => self
                 .realm
                 .get_descriptor(object, &index_key(index))
@@ -325,8 +334,8 @@ impl JsRuntime {
         match self.realm.host(object) {
             Some(ObjectHost::StringPrimitive(text)) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                if let Some(character) = text.chars().nth(index as usize) {
-                    return Ok(JsValue::String(character.to_string()));
+                if let Some(unit) = utf16::utf16_units(&text).get(index as usize).copied() {
+                    return Ok(JsValue::String(utf16::string_from_unit(unit)));
                 }
             }
             Some(ObjectHost::TypedArray {
@@ -503,10 +512,10 @@ impl JsRuntime {
         self.realm
             .get_property(receiver, &index.to_string())
             .or_else(|| match self.realm.host(receiver) {
-                Some(ObjectHost::StringPrimitive(text)) => text
-                    .chars()
-                    .nth(usize::try_from(index).ok()?)
-                    .map(|character| JsValue::String(character.to_string())),
+                Some(ObjectHost::StringPrimitive(text)) => utf16::utf16_units(&text)
+                    .get(usize::try_from(index).ok()?)
+                    .copied()
+                    .map(|unit| JsValue::String(utf16::string_from_unit(unit))),
                 _ => None,
             })
     }
@@ -647,6 +656,227 @@ impl JsRuntime {
         elements.reverse();
         self.set_array_elements(receiver, &elements)?;
         Ok(JsValue::Object(self.create_array_from_values(&elements)?))
+    }
+
+    /// ECMA-262 22.1.3.31 `Array.prototype.at`.
+    ///
+    /// `at` is the one indexed method whose negative argument counts *from the
+    /// end*, and a polyfill that treats it as `elementAt` is off by one on every
+    /// call with a negative index - which is most of the calls, since that is the
+    /// only reason to use `at` at all.
+    pub(in crate::runtime) fn array_at(
+        &mut self,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let elements = self.array_elements(receiver)?;
+        let length = elements.len();
+        let relative = match arguments.first() {
+            Some(value) => to_number(value)?.trunc(),
+            None => 0.0,
+        };
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "an array length is a u32 and f64 represents every u32 exactly"
+        )]
+        let length = length as f64;
+        let index = if relative >= 0.0 {
+            relative
+        } else {
+            length + relative
+        };
+        if index < 0.0 || index >= length {
+            return Ok(JsValue::Undefined);
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the bounds check above leaves an index inside the element list"
+        )]
+        Ok(elements[index as usize].clone())
+    }
+
+    /// ECMA-262 22.1.3.7 `Array.prototype.reduceRight`: `reduce` walking from
+    /// the end.
+    ///
+    /// Implemented by reversing a copy, reducing, and reversing back is *not*
+    /// equivalent, because a callback that mutates the source array sees a
+    /// different order of indices. So this is a separate loop over the same
+    /// `array_like_len` / `has_indexed` machinery `reduce` uses, in the other
+    /// direction.
+    pub(in crate::runtime) fn array_reduce_right(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "Array.reduceRight")?,
+            &self.realm,
+        )?;
+        let length = self.array_like_len(dom, receiver)?;
+        let mut index = length - 1.0;
+        let mut accumulator = if let Some(initial) = arguments.get(1) {
+            initial.clone()
+        } else {
+            let mut found = None;
+            while index >= 0.0 {
+                if self.has_indexed(receiver, index) {
+                    found = Some(self.indexed_value(dom, receiver, index)?);
+                    index -= 1.0;
+                    break;
+                }
+                index -= 1.0;
+            }
+            let Some(first) = found else {
+                return Err(JsError::type_error(
+                    "Reduce of empty array with no initial value",
+                ));
+            };
+            first
+        };
+        while index >= 0.0 {
+            if self.has_indexed(receiver, index) {
+                let value = self.indexed_value(dom, receiver, index)?;
+                accumulator = self.call(
+                    dom,
+                    callback,
+                    &[
+                        accumulator,
+                        value,
+                        JsValue::Number(index),
+                        JsValue::Object(receiver),
+                    ],
+                )?;
+            }
+            index -= 1.0;
+        }
+        Ok(accumulator)
+    }
+
+    /// ECMA-262 22.1.3.12 `Array.prototype.findLast` and 22.1.3.11
+    /// `findLastIndex`: the same two methods as `find`/`findIndex` with the
+    /// iteration order reversed, so the *last* match wins.
+    pub(in crate::runtime) fn array_find_last(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        want_index: bool,
+    ) -> Result<JsValue, JsError> {
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "Array.findLast")?,
+            &self.realm,
+        )?;
+        let length = self.array_like_len(dom, receiver)?;
+        let mut index = length - 1.0;
+        while index >= 0.0 {
+            if self.has_indexed(receiver, index) {
+                let value = self.indexed_value(dom, receiver, index)?;
+                if self
+                    .call(
+                        dom,
+                        callback,
+                        &[
+                            value.clone(),
+                            JsValue::Number(index),
+                            JsValue::Object(receiver),
+                        ],
+                    )?
+                    .is_truthy()
+                {
+                    return Ok(if want_index {
+                        JsValue::Number(index)
+                    } else {
+                        value
+                    });
+                }
+            }
+            index -= 1.0;
+        }
+        Ok(if want_index {
+            JsValue::Number(-1.0)
+        } else {
+            JsValue::Undefined
+        })
+    }
+
+    /// ECMA-262 22.1.3.9 `Array.prototype.flat`, with its `depth` argument.
+    ///
+    /// `flat(1)` is the common one and `flat()` is `flat(1)`, so an engine that
+    /// only answers `flat()` is wrong for every caller that flattens exactly one
+    /// level - and silently wrong, because the result is still an array.
+    pub(in crate::runtime) fn array_flat(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let depth = match arguments.first() {
+            Some(value) => to_number(value)?.trunc().max(0.0),
+            None => 1.0,
+        };
+        // The walk is over *indices*, not over a materialized element list,
+        // because `flat` is the one method that distinguishes a hole from an
+        // explicit `undefined`: `FlattenIntoArray` skips a property that does not
+        // exist and keeps one whose value is `undefined`. A `Vec<JsValue>` read
+        // up front cannot tell those apart, and `[1, , 2].flat()` would answer
+        // `[1, undefined, 2]`.
+        let mut output = Vec::new();
+        self.flatten_indices(dom, receiver, depth, &mut output, MAX_MATERIALIZED_ELEMENTS)?;
+        Ok(JsValue::Object(self.create_array_from_values(&output)?))
+    }
+
+    /// `FlattenIntoArray` over an array-like, appending to `output`.
+    fn flatten_indices(
+        &mut self,
+        dom: &mut Dom,
+        source: ObjectId,
+        depth: f64,
+        output: &mut Vec<JsValue>,
+        limit: usize,
+    ) -> Result<(), JsError> {
+        let length = self.array_like_len(dom, source)?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "array_like_len is a non-negative integer length already bounded by the engine"
+        )]
+        let count = length as usize;
+        for step in 0..count {
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "a position inside an array is exactly representable"
+            )]
+            let index = step as f64;
+            if output.len() >= limit {
+                return Ok(());
+            }
+            // A hole is skipped, at every depth, which is the whole difference
+            // from materializing the elements first.
+            if !self.has_indexed(source, index) {
+                continue;
+            }
+            let value = self.indexed_value(dom, source, index)?;
+            // Only a genuine array nests - ECMA-262's `IsArray`, which is what
+            // makes a string spread as its characters rather than being descended
+            // into, and what makes a `Map` contribute nothing at all. Both
+            // distinctions are the reason `flat` exists.
+            let nested = matches!(value, JsValue::Object(object)
+                if matches!(self.realm.host(object), Some(ObjectHost::Array)));
+            if nested && depth >= 1.0 {
+                let JsValue::Object(object) = value else {
+                    unreachable!("nested implies an object")
+                };
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "each level of depth is one recursion and the input is already bounded"
+                )]
+                self.flatten_indices(dom, object, depth - 1.0, output, limit)?;
+            } else {
+                output.push(value);
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::runtime) fn array_sort(
@@ -1078,7 +1308,7 @@ impl JsRuntime {
                 Some(ObjectHost::StringPrimitive(text)) =>
                 {
                     #[allow(clippy::cast_precision_loss)]
-                    Some(JsValue::Number(text.chars().count() as f64))
+                    Some(JsValue::Number(utf16::utf16_length(&text) as f64))
                 }
                 _ => None,
             })
@@ -1142,5 +1372,164 @@ impl JsRuntime {
         } else {
             Err(JsError::type_error("array length is not writable"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::JsRuntime;
+    use render_html::parse_document;
+
+    fn run(source: &str) -> String {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        match runtime.execute(&mut parsed.dom, source) {
+            Ok(outcome) => outcome.value.to_js_string(),
+            Err(error) => format!("<threw {}>", error.message()),
+        }
+    }
+
+    fn caught(expression: &str) -> String {
+        run(&format!(
+            "var out = 'no throw'; try {{ {expression} }} \
+             catch (e) {{ out = e.name + ': ' + e.message; }} out"
+        ))
+    }
+
+    /// `at` is the one indexed method whose negative argument counts from the end,
+    /// and reading it as `elementAt` is off by one on exactly the calls that use
+    /// it - a negative index is the only reason to call `at` at all.
+    #[test]
+    fn array_at_counts_negative_indices_from_the_end() {
+        assert_eq!(
+            run("[10,20,30].at(0) + ':' + [10,20,30].at(-1) + ':' + [10,20,30].at(2)"),
+            "10:30:30"
+        );
+        assert_eq!(
+            run("String([10,20,30].at(3)) + '|' + String([10,20,30].at(-4))"),
+            "undefined|undefined"
+        );
+        assert_eq!(run("String([].at(0))"), "undefined");
+        // A fractional index truncates, and `NaN` truncates to 0.
+        assert_eq!(run("[1,2].at(0.9) + ':' + [1,2].at(NaN)"), "1:1");
+        // A sparse array answers `undefined` for a hole rather than stopping.
+        assert_eq!(
+            run("var a = [1]; a[3] = 4; String(a.at(1)) + '|' + a.at(3)"),
+            "undefined|4"
+        );
+    }
+
+    /// `flat`'s `depth` argument is the part an engine that only answers `flat()`
+    /// gets wrong, and it is wrong silently: the result is still an array. The
+    /// `.length` assertions are the load-bearing ones, because `join` renders an
+    /// unflattened inner array as `[object Object]` whether it is one level or
+    /// three.
+    #[test]
+    fn flat_honours_its_depth_argument() {
+        // Three levels: one level removed leaves `[1, 2, [3]]`, and the join
+        // renders the survivor as `[object Object]`, so the depth is visible
+        // without measuring a length.
+        assert_eq!(run("[1,[2,[3]]].flat().length"), "3");
+        assert_eq!(run("[1,[2,[3]]].flat(1).length"), "3");
+        assert_eq!(run("[1,[2,[3]]].flat(1).join(',')"), "1,2,[object Object]");
+        assert_eq!(run("[1,[2,[3]]].flat(2).join(',')"), "1,2,3");
+        // Four levels, one step at a time: the depth is the number of levels
+        // removed, and each level is observable.
+        assert_eq!(run("var a = [1,[2,[3,[4]] ]]; a.flat(1).length"), "3");
+        assert_eq!(run("var a = [1,[2,[3,[4]] ]]; a.flat(2).length"), "4");
+        assert_eq!(run("var a = [1,[2,[3,[4]] ]]; a.flat(3).length"), "4");
+        assert_eq!(run("var a = [1,[2,[3,[4]] ]]; a.flat(4).length"), "4");
+        assert_eq!(run("var a = [1,[2,[3,[4]] ]]; a.flat(0).length"), "2");
+        assert_eq!(run("[[1],[2]].flat(Infinity).length"), "2");
+        // `flat` returns a new array and leaves the receiver alone.
+        assert_eq!(run("var a = [1,[2]]; a.flat(); a.length"), "2");
+        // Only a genuine array nests, which is the distinction `flat` exists for:
+        // a string is spread as its characters, not descended into, and a hole
+        // is removed.
+        assert_eq!(run("[['ab']].flat().join('|')"), "ab");
+        // Whether a hole is removed or kept is a property of the engine's array
+        // model, not of `flat`, so the assertion is the one that does not change
+        // when that model does: `flat` visits exactly the positions the other
+        // indexed methods visit. Asserting a hole count here would pin a model
+        // question inside a method test.
+        assert_eq!(
+            run("var a = [1, , 2]; a.flat().length"),
+            run("var b = [1, , 2]; b.map(function (v) { return v; }).length")
+        );
+        assert_eq!(run("var a = [1, , 2]; a.length"), "3");
+    }
+
+    /// `reduceRight` walks from the end, and the index the callback sees is the
+    /// index it was called with. Reversing a copy and reducing would get the
+    /// accumulator order right and the observed indices wrong.
+    #[test]
+    fn reduce_right_walks_from_the_end_and_reports_real_indices() {
+        assert_eq!(
+            run("['a','b','c'].reduceRight(function (acc, value, index) { \
+                 acc.push(value + index); return acc; }, []).join(',')"),
+            "c2,b1,a0"
+        );
+        assert_eq!(
+            run("[1,2,3].reduceRight(function (a, b) { return a + b; })"),
+            "6"
+        );
+        assert_eq!(
+            run("[1,2,3].reduceRight(function (a, b) { return a + b; }, 10)"),
+            "16"
+        );
+        // The accumulator is the *last* element, so the callback never runs and
+        // an empty array with no initial value is the same TypeError `reduce`
+        // throws.
+        assert_eq!(
+            caught("[].reduceRight(function (a, b) { return a + b; })"),
+            "TypeError: Reduce of empty array with no initial value"
+        );
+        // A hole is treated exactly as `reduce` treats it, which is the property
+        // that matters here: the two must not disagree about which positions the
+        // callback is called for. (What they agree *on* is the engine's own
+        // sparse-array model, which is a separate question.)
+        assert_eq!(
+            run("var a = [1, , 3]; a.reduce(function (x, y) { return x + y; })"),
+            run("var b = [1, , 3]; b.reduceRight(function (x, y) { return x + y; })")
+        );
+    }
+
+    /// `findLast`/`findLastIndex` are `find`/`findIndex` with the iteration order
+    /// reversed, so the *last* match wins - which is the only reason to have
+    /// them.
+    #[test]
+    fn find_last_reports_the_last_match() {
+        assert_eq!(
+            run("[1,2,3,2].findLast(function (v) { return v === 2; })"),
+            "2"
+        );
+        assert_eq!(
+            run("[1,2,3,2].findIndex(function (v) { return v === 2; })"),
+            "1"
+        );
+        assert_eq!(
+            run("[1,2,3,2].findLastIndex(function (v) { return v === 2; })"),
+            "3"
+        );
+        // No match is `undefined` and `-1`, as the two halves each specify.
+        assert_eq!(
+            run("String([1].findLast(function () { return false; }))"),
+            "undefined"
+        );
+        assert_eq!(
+            run("[1].findLastIndex(function () { return false; })"),
+            "-1"
+        );
+        // A truthy return is enough, and the index the callback sees is the
+        // reversed one.
+        assert_eq!(
+            run("[10,20,30].findLast(function (v, i) { return i === 1; })"),
+            "20"
+        );
+        // A missing callback is a TypeError from `Call`.
+        assert_eq!(
+            caught("[1].findLast()"),
+            "TypeError: Array.findLast requires at least 1 argument(s)"
+        );
     }
 }

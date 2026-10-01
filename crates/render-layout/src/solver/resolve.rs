@@ -24,7 +24,7 @@ use render_css::properties::Size;
 use render_css::properties::TypedPropertyValue;
 use render_dom::NodeId;
 
-pub(super) fn position(style: Option<&ComputedStyle>) -> Position {
+pub(crate) fn position(style: Option<&ComputedStyle>) -> Position {
     match style.and_then(|style| style.typed("position")) {
         Some(TypedPropertyValue::Position(position)) => *position,
         _ => Position::Static,

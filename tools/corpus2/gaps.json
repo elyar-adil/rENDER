@@ -1,0 +1,335 @@
+{
+ "combined_corpus_pages": 27,
+ "corpus2_pages": 18,
+ "existing_pages": 9,
+ "gaps": {
+  "S1": {
+   "font_display": {
+    "measured": true,
+    "occurrences": 192,
+    "pages": 9
+   },
+   "font_face": {
+    "measured": true,
+    "occurrences": 295,
+    "pages": 21
+   },
+   "unicode_range": {
+    "measured": true,
+    "occurrences": 221,
+    "pages": 7
+   }
+  },
+  "S10": {
+   "inline_script_binds_load": {
+    "measured": true,
+    "occurrences": 32,
+    "pages": 14
+   },
+   "template_containing_row": {
+    "measured": true,
+    "occurrences": 13,
+    "pages": 1
+   }
+  },
+  "S14": {
+   "template": {
+    "measured": true,
+    "occurrences": 29,
+    "pages": 4
+   },
+   "template_containing_row": {
+    "measured": true,
+    "occurrences": 13,
+    "pages": 1
+   }
+  },
+  "S16": {
+   "button": {
+    "measured": true,
+    "occurrences": 282,
+    "pages": 19
+   },
+   "input_type_checkbox": {
+    "measured": true,
+    "occurrences": 1544,
+    "pages": 8
+   },
+   "input_type_search": {
+    "measured": true,
+    "occurrences": 14,
+    "pages": 7
+   },
+   "label": {
+    "measured": true,
+    "occurrences": 1574,
+    "pages": 12
+   },
+   "listed_control_outside_form": {
+    "measured": true,
+    "occurrences": 314,
+    "pages": 20
+   }
+  },
+  "S24": {
+   "control_with_form_attr": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "fieldset": {
+    "measured": true,
+    "occurrences": 4,
+    "pages": 2
+   },
+   "form": {
+    "measured": true,
+    "occurrences": 25,
+    "pages": 14
+   },
+   "input_type_password": {
+    "measured": true,
+    "occurrences": 2,
+    "pages": 2
+   },
+   "listed_control_outside_form": {
+    "measured": true,
+    "occurrences": 314,
+    "pages": 20
+   },
+   "nested_form_token": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "select": {
+    "measured": true,
+    "occurrences": 9,
+    "pages": 2
+   },
+   "textarea": {
+    "measured": true,
+    "occurrences": 7,
+    "pages": 3
+   }
+  },
+  "S4": {
+   "font_feature_settings": {
+    "measured": true,
+    "occurrences": 10,
+    "pages": 4
+   },
+   "font_variation_settings": {
+    "measured": true,
+    "occurrences": 8,
+    "pages": 3
+   }
+  },
+  "S5": {
+   "cdata": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "foreign_object": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "svg": {
+    "measured": true,
+    "occurrences": 679,
+    "pages": 12
+   },
+   "svg_use": {
+    "measured": true,
+    "occurrences": 39,
+    "pages": 1
+   },
+   "svg_viewbox": {
+    "measured": true,
+    "occurrences": 657,
+    "pages": 12
+   },
+   "xlink_href": {
+    "measured": true,
+    "occurrences": 32,
+    "pages": 1
+   },
+   "xml_space": {
+    "measured": true,
+    "occurrences": 44,
+    "pages": 1
+   },
+   "xmlns_declared": {
+    "measured": true,
+    "occurrences": 427,
+    "pages": 10
+   }
+  },
+  "S6-columns": {
+   "clear": {
+    "measured": true,
+    "occurrences": 368,
+    "pages": 22
+   },
+   "column_count": {
+    "measured": true,
+    "occurrences": 27,
+    "pages": 7
+   },
+   "column_gap": {
+    "measured": true,
+    "occurrences": 355,
+    "pages": 17
+   },
+   "column_width": {
+    "measured": true,
+    "occurrences": 33,
+    "pages": 6
+   },
+   "columns": {
+    "measured": true,
+    "occurrences": 19,
+    "pages": 2
+   },
+   "float": {
+    "measured": true,
+    "occurrences": 1184,
+    "pages": 23
+   }
+  },
+  "S6-stacking": {
+   "isolation": {
+    "measured": true,
+    "occurrences": 19,
+    "pages": 4
+   },
+   "mix_blend_mode": {
+    "measured": true,
+    "occurrences": 33,
+    "pages": 9
+   },
+   "position_absolute": {
+    "measured": true,
+    "occurrences": 2310,
+    "pages": 25
+   },
+   "position_fixed": {
+    "measured": true,
+    "occurrences": 262,
+    "pages": 23
+   },
+   "position_sticky": {
+    "measured": true,
+    "occurrences": 111,
+    "pages": 15
+   },
+   "transform": {
+    "measured": true,
+    "occurrences": 1768,
+    "pages": 24
+   },
+   "will_change": {
+    "measured": true,
+    "occurrences": 35,
+    "pages": 4
+   },
+   "z_index": {
+    "measured": true,
+    "occurrences": 1576,
+    "pages": 25
+   }
+  },
+  "S8": {
+   "audio": {
+    "measured": true,
+    "occurrences": 201,
+    "pages": 2
+   },
+   "audio_poster": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "source_with_type": {
+    "measured": true,
+    "occurrences": 1536,
+    "pages": 4
+   },
+   "video": {
+    "measured": true,
+    "occurrences": 205,
+    "pages": 3
+   },
+   "video_controls": {
+    "measured": true,
+    "occurrences": 200,
+    "pages": 1
+   },
+   "video_poster": {
+    "measured": true,
+    "occurrences": 200,
+    "pages": 1
+   },
+   "video_preload": {
+    "measured": true,
+    "occurrences": 203,
+    "pages": 2
+   }
+  },
+  "data_table": {
+   "cell_colspan": {
+    "measured": true,
+    "occurrences": 55,
+    "pages": 7
+   },
+   "cell_rowspan": {
+    "measured": true,
+    "occurrences": 314,
+    "pages": 3
+   },
+   "colgroup": {
+    "measured": true,
+    "occurrences": 9,
+    "pages": 1
+   },
+   "row_group_tbody": {
+    "measured": true,
+    "occurrences": 109,
+    "pages": 9
+   },
+   "row_group_tfoot": {
+    "measured": true,
+    "occurrences": 1,
+    "pages": 1
+   },
+   "row_group_thead": {
+    "measured": true,
+    "occurrences": 25,
+    "pages": 4
+   },
+   "table": {
+    "measured": true,
+    "occurrences": 107,
+    "pages": 9
+   },
+   "table_caption": {
+    "measured": true,
+    "occurrences": 13,
+    "pages": 6
+   },
+   "table_with_rules_attr": {
+    "measured": true,
+    "occurrences": 0,
+    "pages": 0
+   },
+   "th_with_scope": {
+    "measured": true,
+    "occurrences": 333,
+    "pages": 6
+   }
+  }
+ },
+ "measured_by": "matrix.py -> matrix.json; this file adds the per-gap grouping. Regenerate with `python tools/corpus2/gaps.py`"
+}

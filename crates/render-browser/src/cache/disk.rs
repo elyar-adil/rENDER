@@ -1220,15 +1220,36 @@ mod tests {
         ));
     }
 
+    /// How long `next_worker_event` waits for the worker thread to produce an event.
+    ///
+    /// This is a scheduling allowance and nothing else. The worker does real
+    /// filesystem I/O, so it has to be scheduled, and on a machine where several
+    /// compilers are running that takes longer than a person would guess - the
+    /// previous budget was a fixed 500 iterations of a 1 ms sleep, which reported
+    /// "did not produce an event" for a perfectly healthy worker.
+    ///
+    /// The behavioural bound is separate and is not here: a worker that *stopped*
+    /// reports `Disconnected`, which `next_worker_event` treats as a hard failure
+    /// immediately, and every claim about what the worker does is made by its
+    /// callers. A worker that is alive but silent past this budget is reported as
+    /// such.
+    const WORKER_EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+
     fn next_worker_event(worker: &DiskCacheWorker) -> DiskCacheEvent {
-        for _ in 0..500 {
+        let deadline = std::time::Instant::now() + WORKER_EVENT_TIMEOUT;
+        loop {
             match worker.poll() {
                 Ok(event) => return event,
-                Err(TryRecvError::Empty) => thread::sleep(Duration::from_millis(1)),
                 Err(TryRecvError::Disconnected) => panic!("disk cache worker stopped"),
+                Err(TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "disk cache worker produced no event within {WORKER_EVENT_TIMEOUT:?}"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
             }
         }
-        panic!("disk cache worker did not produce an event")
     }
 
     #[test]

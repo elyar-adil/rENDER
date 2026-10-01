@@ -9,7 +9,10 @@ pub use encoding::{
     DecodedHtml, EncodingDeclarationSource, HtmlDecodeDiagnostic, HtmlDecodeDiagnosticCode,
     HtmlDecodeError, HtmlDecodeLimits, HtmlDecodeOptions, HtmlEncodingSource, decode_html_bytes,
 };
-pub use serialization::{serialize_html_fragment, serialize_html_node};
+pub use serialization::{
+    serialize_html_fragment, serialize_html_fragment_with_scripting, serialize_html_node,
+    serialize_html_node_with_scripting,
+};
 pub use tokenizer::{
     AttributeToken, ContentModel, DoctypeToken, HtmlParseError, HtmlParseErrorCode, TagToken,
     Token, Tokenizer,

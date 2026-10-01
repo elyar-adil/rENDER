@@ -44,24 +44,38 @@ pub(super) fn optional_index(value: Option<&JsValue>) -> Result<f64, JsError> {
     }
 }
 
-/// Resolve a slice/substring range: negative bounds count from the end and
-/// are clamped. When `swap` is set (slice semantics) reversed bounds clamp to
-/// an empty range; otherwise they are swapped (substring semantics).
+/// Resolve a slice/substring range over a collection of `length` elements:
+/// negative bounds count from the end and are clamped. When `swap` is set
+/// (slice semantics) reversed bounds clamp to an empty range; otherwise they
+/// are swapped (substring semantics).
+///
+/// `length` is a count, not a slice, so the same resolution serves an array of
+/// elements and a string of UTF-16 code units.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "bounds are clamped before casting to usize"
 )]
 pub(super) fn slice_range(
-    characters: &[char],
+    length: usize,
     start: f64,
     end: Option<f64>,
     swap: bool,
 ) -> std::ops::Range<usize> {
-    let length = characters.len();
     let resolve = |value: f64| -> usize {
+        // §7.1.25 `ToAbsoluteIndex` then §7.1.26 `ToClampedIndex`:
+        // `ToIntegerOrInfinity` maps `NaN` to 0 and keeps `±∞` as infinities, and
+        // only then is a finite negative offset taken from the end. Treating
+        // `NaN` as "no bound" would be wrong: `'ab'.slice(NaN, 1)` is `'a'`
+        // because `NaN` becomes 0, not the whole string.
+        if value.is_nan() {
+            return 0;
+        }
         if !value.is_finite() {
-            return usize::MAX;
+            // `-∞` clamps to 0 and `+∞` to the length; the caller repairs the
+            // upper bound, and a start of `-∞` has to become 0 here or the
+            // range would start past its own end.
+            return if value > 0.0 { usize::MAX } else { 0 };
         }
         let mut value = value.floor();
         #[allow(clippy::cast_precision_loss, reason = "length fits exactly")]

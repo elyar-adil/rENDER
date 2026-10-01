@@ -1,0 +1,5 @@
+# The fetched tree-construction suite is pinned by revision in
+# tools/html5lib/fetch-html5lib.ps1 and is never committed: it is a few hundred
+# kilobytes of third-party test data and a committed copy would rot out of sync
+# with the pin.
+.cache/

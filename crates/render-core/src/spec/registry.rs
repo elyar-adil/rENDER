@@ -454,16 +454,37 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         family: StandardFamily::Css,
         specification: "CSS Fonts Level 4",
         section: "5 @font-face",
-        status: SupportStatus::Missing,
-        notes: "Nothing. An `@font-face` block is parsed and then discarded, with no \
-                descriptor stored and **no diagnostic emitted** - the at-rule is \
-                swallowed by the same arm as an unknown at-rule, so a page using a \
-                webfont gets no warning that the font was dropped. 223 `@font-face` \
-                blocks occur in the production corpus. Registering this entry is what \
-                makes that absence trackable; it is not a claim that anything is \
-                implemented. The surrounding axis is missing too: `render-layout`'s \
-                `TextStyle` carries no `font-weight`, `font-style` or `font-family`, so \
-                bold and italic are physically impossible today.",
+        status: SupportStatus::Partial,
+        notes: "A `@font-face` block's descriptors are parsed and resolved (§4.1 \
+                requires a `font-family` and a `src` and a rule without either is not \
+                considered, with a diagnostic), §4.2/§4.4's `font-family`, \
+                `font-weight` and `font-style` become the matcher's axes, §4.5's \
+                `unicode-range` narrows the effective character map and orders a \
+                family's rules last-declared-first (§4.5.1), §4.3.3 skips a `src` \
+                item whose format or technology this engine cannot use *before* \
+                requesting it, and §4.3.3.1's `local()` is resolved against \
+                installed face names ahead of any URL. A fetched body is decoded and \
+                registered, the faces are in the *same* table §5 searches, and §5.2's \
+                shadowing is implemented, so a document family replaces an installed \
+                family of the same name even when its faces have not arrived. The \
+                faces are document-scoped and dropped with the document; a change of \
+                table mints new `FontInstanceId`s, so a memo entry or a rasterised \
+                mask can never outlive the table it was made against. A face that \
+                has not arrived is treated as not present in its family - §5.2's own \
+                rule - and because that is the whole of the state, measurement and \
+                painting cannot disagree about it. `font-display` is validated and \
+                recorded and changes nothing, because this engine has no font \
+                download timer and therefore no block, swap or failure period to act \
+                on. NOT implemented: §4.6's feature and variation settings, §4.7's \
+                `font-named-instance`, §4.11's `*-override` metrics descriptors, any \
+                font technology (a `tech()` item is skipped), and any compressed font \
+                container. The last is what the corpus measures: 217 of the 223 \
+                `@font-face` blocks reference `woff2`, the rasteriser reads raw sfnt \
+                only, and so 218 of the 223 blocks name no format this engine can \
+                decode. NOT wired: the browser's network loop does not yet submit the \
+                URLs `DocumentFonts::plan_fetches` produces, so a document face is \
+                not yet fetched on a real page - the store's plan and install paths \
+                are implemented and tested, and what is missing is the submission.",
         dependencies: &[CSS_SYNTAX],
         tests: &[],
     },

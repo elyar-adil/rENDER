@@ -581,7 +581,7 @@ mod tests {
     };
 
     #[test]
-    fn discovers_bilibili_style_video_metadata() {
+    fn discovers_video_metadata_from_multiple_typed_sources() {
         let parsed = parse_document(
             "<video controls preload=metadata poster='/assets/poster.png'>\
              <source src='/media/bilibili-init.mp4' type='video/mp4'></video>",

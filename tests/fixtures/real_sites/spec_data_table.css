@@ -1,0 +1,171 @@
+/*
+ * Deterministic stand-in for a specification page's stylesheet, with the
+ * normative-table rules separated out.
+ *
+ * Served in place of both external slots on the page:
+ *   https://www.w3.org/StyleSheets/TR/2021/base.css
+ *   https://www.w3.org/StyleSheets/TR/2021/normative-tables.css
+ *
+ * The live page really does split it that way - a base sheet and a normative
+ * table sheet - which is why the fixture declares two external slots on one
+ * origin. The harness serves identical bytes for both, so each diagnostic this
+ * file provokes is produced twice; the diagnostic assertions use that as an
+ * exactness check.
+ *
+ * Every table box is given an explicit pixel width or height. CSS 2.1 section
+ * 17.5's automatic table layout is implemented, but automatic layout is the
+ * one part of it that depends on the text in the cells, and the reference
+ * measurer is font-independent, so a fixture that left the widths to it would
+ * be asserting an accident rather than a contract.
+ *
+ * `border-collapse: collapse` is on both tables, because section 17.6's
+ * winner-takes-all conflict resolution is where a table goes wrong quietly:
+ * a shared edge painted from two different winners looks like a one-pixel
+ * mistake in a raster and like nothing at all in a fragment tree.
+ *
+ * Nothing here declares geometry inside a nested block; the static Python gate
+ * reads single-compound rules with a regex that cannot see into a nested `{ }`.
+ */
+
+/* Two at-rules this engine parses and cannot use, exactly as a real page's
+ * self-hosted webfont declaration and keyframe block does. Their diagnostics
+ * appearing is the correct behaviour, and the assertions say so. */
+@font-face {
+  font-family: "Spec Serif";
+  src: url("https://www.w3.org/StyleSheets/TR/2021/spec-serif.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Spec Mono";
+  src: url("https://www.w3.org/StyleSheets/TR/2021/spec-mono.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Spec Sans";
+  src: url("https://www.w3.org/StyleSheets/TR/2021/spec-sans.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Spec Icons";
+  src: url("https://www.w3.org/StyleSheets/TR/2021/spec-icons.woff2") format("woff2");
+}
+
+@keyframes table-highlight {
+  from { background-color: #ffffcc }
+  to { background-color: #ffffff }
+}
+@-webkit-keyframes table-highlight {
+  from { background-color: #ffffcc }
+  to { background-color: #ffffff }
+}
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #ffffff; color: #000000; font-size: 15px; line-height: 24px; }
+
+.spec-head { display: block; width: 1280px; height: 92px; background-color: #005a9c; }
+.spec-logo { display: inline-block; width: 72px; height: 48px; margin-top: 12px; margin-left: 20px; }
+.spec-logo img { display: block; width: 72px; height: 48px; }
+.spec-eyebrow { display: inline-block; width: 380px; height: 24px; margin-top: 20px; margin-left: 16px; color: #ffffff; font-size: 17px; line-height: 24px; }
+.spec-search { display: inline-block; width: 360px; height: 32px; margin-top: 14px; margin-left: 470px; }
+.spec-search input { display: inline-block; width: 274px; height: 32px; }
+.spec-search button { display: inline-block; width: 80px; height: 32px; background-color: #ffffff; color: #005a9c; }
+.spec-nav { display: block; width: 900px; height: 28px; margin-top: 10px; margin-left: 20px; }
+.spec-nav a { display: inline-block; width: 150px; height: 28px; color: #ffffff; }
+
+.page-main { display: block; width: 1264px; margin-top: 20px; margin-left: 8px; }
+/* The article and the rail sit side by side, in a flex row, which is how a
+ * specification page's own layout does it. The row is the *only* thing that puts
+ * the rail beside the text: without it the two are ordinary blocks and stack,
+ * and the contract's side-rail check says so - which is what happened the first
+ * time this fixture was written. */
+.spec-columns { display: flex; width: 1264px; }
+.spec-article { width: 940px; }
+.page-rail { width: 300px; margin-left: 24px; }
+
+.spec-clause { display: block; width: 940px; height: 96px; margin-top: 0; margin-bottom: 8px; }
+/* The two clauses that carry a table are tall enough to contain one, which is
+ * the point: a clause shorter than its table would have the table overflow it,
+ * and the next clause would then overlap it. The height is declared rather than
+ * auto so the scroll-region arithmetic in the static gate is readable. */
+.spec-clause-tall { height: 640px; }
+/* The figure clause holds a 200px image plus its caption, so it also has to be
+ * taller than the 96px every other clause declares. */
+.spec-clause-figure { height: 264px; }
+.clause-title { display: block; width: 940px; height: 30px; margin-top: 0; margin-bottom: 4px; font-size: 20px; line-height: 30px; }
+.clause-title a { color: #034575; }
+.clause-prose { display: block; width: 940px; height: 48px; color: #000000; }
+.clause-code { display: inline-block; width: 110px; height: 20px; background-color: #f5f5f5; color: #0b5fff; }
+.clause-figure { display: block; width: 940px; height: 236px; padding-top: 8px; padding-bottom: 8px; border-top-width: 1px; border-top-style: solid; border-top-color: #cccccc; }
+.clause-figure img { display: block; width: 480px; height: 200px; }
+.clause-caption { display: block; width: 480px; height: 20px; color: #666666; font-size: 12px; line-height: 20px; }
+
+.rail-toc { display: block; width: 300px; }
+.rail-title { display: block; width: 300px; height: 26px; margin-top: 0; margin-bottom: 8px; font-size: 15px; line-height: 26px; }
+.rail-title a { color: #034575; }
+.rail-list { display: block; width: 300px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: block; width: 300px; height: 24px; }
+.rail-list a { color: #034575; }
+.rail-card { display: block; width: 300px; margin-top: 20px; padding-top: 10px; padding-bottom: 10px; border-top-width: 2px; border-top-style: solid; border-top-color: #cccccc; }
+.rail-prose { display: block; width: 300px; height: 40px; color: #333333; }
+
+.spec-foot { display: block; width: 1280px; height: 68px; margin-top: 28px; padding-top: 10px; background-color: #f5f5f5; }
+.spec-foot a { display: inline-block; width: 180px; height: 22px; margin-right: 8px; }
+.foot-note { display: block; width: 1000px; height: 20px; color: #666666; font-size: 12px; line-height: 20px; }
+
+/* Section 17.4: the caption is a block of its own, above the table box. */
+/* The `dir=ltr` writing mode the caption names. Without it the spec's own
+ * over-constrained rule (ignore the end-ward inset for the writing mode) has
+ * nothing to act on, and a page that claims `dir=ltr` in its caption but does
+ * not set it is asserting a direction it is not using. */
+.data { direction: ltr; display: table; width: 440px; border-collapse: collapse; border-spacing: 0; margin-top: 0; margin-left: 0; }
+.data caption { display: table-caption; width: 440px; height: 32px; text-align: left; font-size: 15px; line-height: 32px; }
+.data thead { display: table-header-group; width: 440px; }
+.data tbody { display: table-row-group; width: 440px; }
+.data tfoot { display: table-footer-group; width: 440px; }
+.data tr { display: table-row; width: 440px; }
+.data th { display: table-cell; width: 68px; height: 28px; padding-top: 4px; padding-bottom: 4px; background-color: #e8f0f7; font-weight: normal; }
+.data td { display: table-cell; width: 68px; height: 28px; padding-top: 4px; padding-bottom: 4px; vertical-align: top; }
+/* Section 17.5.1: the two colgroups carry the widths, so column x is declared
+ * rather than solved. Five columns from the first, one from the second, which is
+ * how the captured page writes them. The six widths sum to the table's 900,
+ * which is the whole point of declaring them: with automatic table layout the
+ * used widths depend on the text in the cells, and the reference measurer is
+ * font-independent, so leaving them to be solved would make the fixture's
+ * geometry a statement about the measurer rather than about the page.
+ *
+ * `colgroup span` is the mechanism, so the rule is written on the colgroup and
+ * on its own `span` count is what a real page writes; a bare `col` selector
+ * would not match anything, because the captured page has no `col` children.
+ */
+.data colgroup { display: table-column-group; }
+.data colgroup.first { width: 340px; }
+.data colgroup.last { width: 100px; }
+.data colgroup.first col { width: 68px; }
+.data colgroup.last col { width: 100px; }
+/* A cell that has to sit at the bottom of its own box, which is the case
+ * section 17.5.3's `vertical-align` exists for and the case a border-box-based
+ * implementation gets wrong. */
+.data .cell-tall { height: 200px; vertical-align: bottom; }
+.data .cell-list { display: block; width: 100px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.data .cell-list li { display: block; width: 100px; height: 20px; }
+
+.index { display: table; width: 440px; border-collapse: collapse; border-spacing: 0; margin-top: 0; margin-left: 0; }
+.index caption { display: table-caption; width: 440px; height: 30px; text-align: left; font-size: 15px; line-height: 30px; }
+.index thead { display: table-header-group; width: 440px; }
+.index tbody { display: table-row-group; width: 440px; }
+.index tr { display: table-row; width: 440px; }
+.index th { display: table-cell; width: 55px; height: 30px; padding-top: 4px; padding-bottom: 4px; background-color: #e8f0f7; vertical-align: bottom; font-weight: normal; }
+.index td { display: table-cell; width: 55px; height: 30px; padding-top: 4px; padding-bottom: 4px; vertical-align: top; }
+
+/* Decoration inside a conditional group rule. The geometry above does not
+ * depend on either of them, so the fixture is not asserting how this engine
+ * answers - the diagnostic assertions are. */
+@supports (border-collapse: collapse) {
+  .data th { background-color: #e8f0f7 }
+}
+@supports at-rule(@font-face) {
+  .spec-foot { height: 76px }
+}
+@media (min-width: 1100px) {
+  .clause-prose { color: #000000 }
+}
+@-moz-document url-prefix() {
+  .spec-head { background-color: #005a9c }
+}

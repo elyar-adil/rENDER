@@ -81,6 +81,13 @@ impl PropertyRegistry {
             ("text-transform", "none"),
             ("visibility", "visible"),
             ("white-space", "normal"),
+            // CSS Text 3 §5.1 and §5.2, both `Inherited: yes`. Their initial
+            // values are `normal` and `auto` respectively, and §5.2's `auto` is
+            // the one whose restrictions "may vary based on the length of the
+            // line", so a reader cannot infer `normal` from the initial value
+            // alone and must look at the property.
+            ("word-break", "normal"),
+            ("line-break", "auto"),
             ("word-spacing", "normal"),
             // The CSS 2.1 table properties that *inherit*: `border-spacing`
             // (§17.6.1), `border-collapse` (§17.6), `empty-cells` (§17.6.2)
@@ -208,7 +215,13 @@ impl PropertyRegistry {
         registry
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&String, &PropertyDefinition)> {
+    /// Every property this registry has metadata for, which is the declared
+    /// set of properties the engine knows about as more than an untyped token
+    /// stream. Public because the CSS feature query oracle in
+    /// [`crate::supports`] answers `at-rule`-independent support questions from
+    /// this same set, and a second private copy of it is how two answers to the
+    /// same question would drift.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &PropertyDefinition)> {
         self.definitions.iter()
     }
 }

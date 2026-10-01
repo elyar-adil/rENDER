@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of a documentation *reference page*: a main column of
+  sections with a real side rail - a table of contents and two reference
+  cards - beside it rather than below it.
+
+  The shape was taken from a live MDN reference page
+  (https://developer.mozilla.org/en-US/docs/Web/CSS/position, captured
+  2026-09-28), whose markup is `main.layout__content` beside
+  `aside.layout__right-sidebar.reference-layout__toc`, with a 41-link table
+  of contents and a second "sidebar about" card. What is kept here is the
+  structure, the class names, and the two-column split; what is dropped is the
+  left sidebar's shadow-DOM web component, the baseline indicator, the
+  compatibility widget's inline `<style>`, and the tracking parameters on
+  every link. The prose is fabricated, as it is in the other five fixtures.
+
+  Why this page shape exists in the harness: every one of the original five
+  fixtures stacks its side column *below* the main feed, so document order and
+  vertical order agree everywhere. That is what let the "page text is painted in
+  document order" contract be written as a single unconditional assertion. A
+  two-column page makes that assertion false for a correct render, so the
+  contract now scopes it per column - see `contract::reading_order_columns`.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see reference_two_column.css).
+
+  This comment sits AFTER the charset declaration on purpose, as in the other
+  fixtures: the HTML encoding prescan reads only the first 1024 bytes, so a long
+  comment in front of <meta charset> would push the declaration out of range.
+-->
+<title>position 属性 - CSS 参考 | 开发者文档</title>
+<meta name="description" content="CSS position 属性的取值、初始值、适用元素与计算值。">
+<link rel="stylesheet" href="https://static.devdocs.example/reference.4b1e0c.css">
+<link rel="stylesheet" href="https://static.devdocs.example/reference-rail.9d2f33.css">
+<script defer src="https://static.devdocs.example/reference.77c0a1.js"></script>
+<style>
+  /* An embedded sheet, so the diagnostic-set assertion can tell the two
+   * sources apart: everything in the two external sheets is reported once per
+   * slot, and everything here exactly once. The legacy star hack below is the
+   * declaration-list error a real page carries and CSS Syntax 5.4.4 requires a
+   * browser to drop; its diagnostic is the one that must never go missing,
+   * because a silent drop here takes the whole declaration block with it. */
+  .ref-article { *zoom: 1; background-color: #ffffff }
+  .rail-toc { position: static; }
+</style>
+</head>
+<body>
+<header class="site-head">
+  <a class="site-logo" href="https://developer.mozilla.org/zh-CN/"><img src="https://static.devdocs.example/img/favicon-32.e6d1f0.png" width="32" height="32" alt="开发者文档首页"></a>
+  <form class="site-search" role="search" action="https://developer.mozilla.org/zh-CN/search" method="get">
+    <input type="search" name="q" placeholder="在文档中搜索">
+    <button type="submit">搜索</button>
+  </form>
+  <nav class="site-nav" aria-label="站点导航">
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web">Web 技术</a>
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS">CSS</a>
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web/JavaScript">JavaScript</a>
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web/HTML">HTML</a>
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web/API">Web API</a>
+    <a href="https://developer.mozilla.org/zh-CN/docs/Web/Accessibility">无障碍</a>
+  </nav>
+</header>
+<main class="page-main">
+  <div class="ref-columns">
+    <article class="ref-article">
+      <section class="ref-block" id="syntax">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#syntax">语法</a></h2>
+        <p class="ref-prose"><code class="ref-code">position</code> 属性设置一个元素的位置方式：静态定位、相对定位、绝对定位、粘性定位或者固定定位。</p>
+        <p class="ref-note">继承性：不继承。初始值：<code class="ref-code">static</code>。适用于：除表列组和表列之外的所有元素。</p>
+      </section>
+      <section class="ref-block" id="static">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#static">static（静态定位）</a></h2>
+        <p class="ref-prose">元素按照它在普通流中的位置排布，不相对于任何位置偏移。绝对定位的后代元素以它为包含块。</p>
+        <p class="ref-note">用绝对定位将一个静态定位的元素从文档流中移走，会使它成为该位置上最后一个仍然占位的盒。</p>
+      </section>
+      <section class="ref-block" id="relative">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#relative">relative（相对定位）</a></h2>
+        <p class="ref-prose">元素偏移相对于它自己的正常位置。偏移后的视觉位置不改变它为后代元素保留的空间，其偏移后的外边距边界称为它的包含块。</p>
+        <p class="ref-note">相对定位的盒可以与它的绝对定位后代共享一个包含块，这两个盒子在布局完成后才发生位移。</p>
+      </section>
+      <section class="ref-block" id="absolute">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#absolute">absolute（绝对定位）</a></h2>
+        <p class="ref-prose">元素被移除出文档流，并相对于它的包含块定位。除非另有指定，否则它的包含块由最近的具有定位属性的祖先的填充框建立。</p>
+        <p class="ref-note">绝对定位的盒不参与它任何祖先的高度计算，因此一个自动高度的定位块报告高度为零的情况并不罕见。</p>
+      </section>
+      <section class="ref-block" id="sticky">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#sticky">sticky（粘性定位）</a></h2>
+        <p class="ref-prose">元素先按普通流定位，然后相对最近的滚动容器偏移，被约束在包含块之内。粘性定位不建立层叠上下文，也不影响元素自己的布局位置。</p>
+        <p class="ref-note">滚动容器的偏移量在布局期不可知，因此粘性约束是在布局之后解析的，而不是在布局之中。</p>
+      </section>
+      <section class="ref-block" id="fixed">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#fixed">fixed（固定定位）</a></h2>
+        <p class="ref-prose">元素被移除出文档流，相对于视口定位，不随文档滚动。固定定位的盒在滚动时保持不动，除非它的祖先具有变换、透视或滤镜。</p>
+        <p class="ref-note">固定定位的包含块是视口，与文档是否可滚动无关：视口的尺寸不随内容溢出而改变。</p>
+      </section>
+      <section class="ref-block" id="inset">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#inset">四边偏移量</a></h2>
+        <p class="ref-prose">当 <code class="ref-code">position</code> 不是 <code class="ref-code">static</code> 时，四个偏移属性共同决定元素在包含块中的位置。至少设置一个，否则元素保持在它的静态位置。</p>
+        <p class="ref-note">逻辑属性 <code class="ref-code">inset-block</code> 与 <code class="ref-code">inset-inline</code> 是四个偏移属性的简写形式。</p>
+      </section>
+      <section class="ref-block" id="containing-block">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#containing-block">包含块的确定</a></h2>
+        <p class="ref-prose">定位元素的包含块由最近的、已建立绝对定位包含块的祖先建立；网格容器为绝对定位子项提供网格区域作为包含块。</p>
+        <figure class="ref-figure">
+          <img src="https://static.devdocs.example/img/containing-block.a13c07.png" width="600" height="260" alt="包含块层级示意图：div1 的包含块由 body 建立，p1 的由 div1 建立">
+          <figcaption class="ref-caption">图 1：由外到内的包含块层级</figcaption>
+        </figure>
+      </section>
+      <section class="ref-block" id="compatibility">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#compatibility">浏览器兼容性</a></h2>
+        <p class="ref-prose">全部主流引擎自 2015 年 7 月起支持粘性定位。表格中的每一行是一个引擎，每一列是一个特性。</p>
+        <p class="ref-note">数据来自兼容性数据库，与本文一同更新，不在本页固化。</p>
+      </section>
+      <section class="ref-block" id="see-also">
+        <h2 class="ref-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#see-also">参见</a></h2>
+        <p class="ref-prose">层叠上下文、包含块的形成、盒模型与外边距合并。</p>
+        <p class="ref-note">本页所述的偏移量在书写时同时接受逻辑属性与物理属性，两者不可混用于同一条边。</p>
+      </section>
+    </article>
+    <aside class="page-rail">
+      <nav class="rail-toc" aria-label="本文目录">
+        <h2 class="rail-title">本文目录</h2>
+        <ul class="rail-list">
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#syntax">语法</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#static">静态定位</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#relative">相对定位</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#absolute">绝对定位</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#sticky">粘性定位</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#fixed">固定定位</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#inset">四边偏移量</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#containing-block">包含块的确定</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#compatibility">浏览器兼容性</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position#see-also">参见</a></li>
+        </ul>
+      </nav>
+      <section class="rail-card" id="rail-related">
+        <h2 class="rail-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Reference/Properties/top">相关属性</a></h2>
+        <ul class="rail-list">
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Reference/Properties/top">top</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Reference/Properties/right">right</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Reference/Properties/bottom">bottom</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Reference/Properties/left">left</a></li>
+        </ul>
+      </section>
+      <section class="rail-card" id="rail-guides">
+        <h2 class="rail-title"><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Guides/Positioned_layout/Stacking_context">定位指南</a></h2>
+        <ul class="rail-list">
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Guides/Positioned_layout/Stacking_context">层叠上下文</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Guides/Display/Containing_block#identifying_the_containing_block">识别包含块</a></li>
+          <li><a href="https://developer.mozilla.org/zh-CN/docs/Web/CSS/Guides/Box_model/Margin_collapsing">外边距合并</a></li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+</main>
+<footer class="site-foot">
+  <a href="https://developer.mozilla.org/zh-CN/about">关于本站</a>
+  <a href="https://developer.mozilla.org/zh-CN/contribute">参与贡献</a>
+  <a href="https://github.com/mdn/content">内容仓库</a>
+  <a href="https://developer.mozilla.org/zh-CN/feedback">反馈问题</a>
+  <p class="foot-note">本页为离线夹具，内容经过裁剪；所有资源响应都由本地确定性字节提供。</p>
+</footer>
+</body>
+</html>

@@ -11,8 +11,8 @@ use crate::css::properties::{
 use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
 use crate::layout::{
-    EdgeSizes, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind, FragmentTree,
-    PhysicalPoint, PhysicalRect, PhysicalSize,
+    EdgeSizes, FontRequest, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind,
+    FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, nominal_face,
 };
 
 use super::color::{Color, SystemPalette};
@@ -516,26 +516,66 @@ pub struct DisplayListBuildOutput {
     pub diagnostics: Vec<DisplayListDiagnostic>,
 }
 
+/// Turns a run of text and a CSS Fonts 4 font request into positioned glyphs.
 pub trait TextShaper: Sync {
     fn shape(&self, text: &str, font_size: f32, origin: PhysicalPoint, color: Color) -> GlyphRun;
+
+    /// Shape `text` in the face `font` selects.
+    ///
+    /// The default body delegates to [`TextShaper::shape`], which is the whole
+    /// of the axis-free contract: a shaper with one face and no table to select
+    /// from has nothing to do with the request, and an implementor that has
+    /// never heard of the font axis keeps compiling and keeps being correct for
+    /// the requests it can satisfy. A backend that *does* have a face table
+    /// overrides this, and that is the only reason bold and a second family are
+    /// possible at all - the request is otherwise dropped one metre from the
+    /// glyphs, which is the defect this method exists to close.
+    ///
+    /// `font` is the request the layout solver measured the run with, carried
+    /// through on the fragment. Nothing re-reads the cascade here, so the face
+    /// painted is the face measured.
+    fn shape_font(
+        &self,
+        text: &str,
+        _font: &FontRequest<'_>,
+        font_size: f32,
+        origin: PhysicalPoint,
+        color: Color,
+    ) -> GlyphRun {
+        self.shape(text, font_size, origin, color)
+    }
 }
 
+/// The deterministic, font-free shaper the reference path paints with.
+///
+/// It is the mirror image of `render_layout`'s `SimpleTextMeasurer`: both resolve
+/// `font` through [`nominal_face`] and both take their advances from the same
+/// nominal table, so a reference-path line box is exactly as wide as the glyph
+/// run that is later painted into it. There is no letterform here - the
+/// reference raster emits no glyph masks at all - so the run's
+/// [`FontInstanceId`] names the single nominal face it has no outlines for.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReferenceTextShaper;
 
 impl TextShaper for ReferenceTextShaper {
     fn shape(&self, text: &str, font_size: f32, origin: PhysicalPoint, color: Color) -> GlyphRun {
+        self.shape_font(text, &FontRequest::initial(), font_size, origin, color)
+    }
+
+    fn shape_font(
+        &self,
+        text: &str,
+        font: &FontRequest<'_>,
+        font_size: f32,
+        origin: PhysicalPoint,
+        color: Color,
+    ) -> GlyphRun {
+        let face = nominal_face(font);
         let mut x = origin.x;
         let glyphs = text
             .chars()
             .map(|character| {
-                let advance = if is_wide_character(character) {
-                    font_size
-                } else if character.is_whitespace() {
-                    font_size * 0.25
-                } else {
-                    font_size * 0.5
-                };
+                let advance = face.advance_em(character) * font_size;
                 let glyph = GlyphInstance {
                     glyph: GlyphId(character as u32),
                     position: PhysicalPoint { x, y: origin.y },
@@ -1164,6 +1204,13 @@ impl Builder<'_> {
     /// Order follows CSS Text Decoration Level 3 §4: the shadow paints first so
     /// it stays behind the glyphs, and the decoration lines follow the glyphs
     /// so an underline is not erased by the descenders it crosses.
+    ///
+    /// The font request is the one the solver measured the run with, carried on
+    /// the fragment. Passing it here rather than re-reading `font-family`,
+    /// `font-weight` and `font-style` off the computed style is what makes a
+    /// measure/draw mismatch impossible rather than merely unlikely: there is
+    /// one request per run, it is written once, and both halves of the pipeline
+    /// are handed the same one.
     fn paint_text(
         &mut self,
         fragment: &Fragment,
@@ -1172,8 +1219,9 @@ impl Builder<'_> {
         current_color: Color,
         coordinate_space: PaintCoordinateSpace,
     ) {
-        let run = self.shaper.shape(
+        let run = self.shaper.shape_font(
             &text.text,
+            &text.font.request(),
             text.font_size,
             PhysicalPoint {
                 x: fragment.rect.origin.x,
@@ -2819,20 +2867,6 @@ fn border_paint(
     }
 }
 
-const fn is_wide_character(character: char) -> bool {
-    matches!(
-        character as u32,
-        0x1100..=0x115f
-            | 0x2e80..=0xa4cf
-            | 0xac00..=0xd7a3
-            | 0xf900..=0xfaff
-            | 0xfe10..=0xfe6f
-            | 0xff00..=0xff60
-            | 0xffe0..=0xffe6
-            | 0x1f300..=0x1faff
-    )
-}
-
 #[cfg(test)]
 mod tests {
     // Decoration, marker and shadow geometry is resolved from exact font-size
@@ -2858,9 +2892,88 @@ mod tests {
         Builder, ClipShape, CompositingReason, DisplayCommand, DisplayListBuildOutput,
         DisplayListBuilderOptions, GlyphRun, ImagePaint, ListMarkerPaint, ListMarkerShape,
         ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
-        TextDecorationStyle, TextShadowPaint, Transform2D, build_display_list,
+        TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D, build_display_list,
         build_display_list_with_images,
     };
+
+    /// The one thing that must never be true of the reference path: the width
+    /// layout measured a run at and the width the shaper gives its glyphs are
+    /// different numbers.
+    ///
+    /// Both halves read the request off the same [`crate::layout::TextStyle`]
+    /// and both resolve it through the same nominal face, so this holds for
+    /// every request - which is the property worth having, because a text run's
+    /// fragment rect and its glyph run are produced by two different functions
+    /// that could each be right about a different font.
+    #[test]
+    fn the_reference_path_measures_and_shapes_with_the_same_face() {
+        use crate::layout::SimpleTextMeasurer;
+        use crate::layout::{
+            FontRequest, FontStyle, FontSynthesis, TextMeasure, TextMeasurer, TextStyle,
+            nominal_advance, nominal_face,
+        };
+
+        for family in [
+            "sans-serif",
+            "monospace",
+            "serif",
+            "system-ui",
+            "\"No Such Font\"",
+        ] {
+            for style in [
+                FontStyle::Normal,
+                FontStyle::Italic,
+                FontStyle::Oblique(14.0),
+                FontStyle::Oblique(-20.0),
+            ] {
+                for weight in [100_u16, 400, 500, 700, 900] {
+                    let request = FontRequest {
+                        family,
+                        weight,
+                        style,
+                        synthesis: FontSynthesis::default(),
+                    };
+                    for text in [
+                        "Rendering",
+                        "Rendering \u{6e32}\u{67d3}",
+                        "a b  c",
+                        "iiii WWWW",
+                    ] {
+                        let measured: TextMeasure = SimpleTextMeasurer.measure(
+                            text,
+                            TextStyle {
+                                font_size: 32.0,
+                                line_height: 38.4,
+                                font: request,
+                            },
+                        );
+                        let shaped = ReferenceTextShaper.shape_font(
+                            text,
+                            &request,
+                            32.0,
+                            PhysicalPoint { x: 0.0, y: 0.0 },
+                            Color::BLACK,
+                        );
+                        let drawn: f32 = shaped.glyphs.iter().map(|glyph| glyph.advance).sum();
+                        assert!(
+                            (measured.advance - drawn).abs() < 1e-4,
+                            "{family} {style:?} {weight} measured {text:?} at {} but \
+                             shaped it at {drawn}",
+                            measured.advance
+                        );
+                        // And the two must be the nominal face's own number, so a
+                        // future change to either half cannot quietly disagree.
+                        assert!(
+                            (measured.advance
+                                - nominal_advance(nominal_face(&request), text, 32.0))
+                            .abs()
+                                < 1e-4
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn gradient_background_layers_clip_to_their_own_rounded_areas() {

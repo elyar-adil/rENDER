@@ -186,6 +186,98 @@ FIXTURES: tuple[Fixture, ...] = (
         required_image_hosts=("nimg.ws.126.net",),
         required_static_hosts=("static.ws.126.net",),
     ),
+    # -- the four page shapes added once table layout, sticky positioning, the
+    # derived form owner, @supports evaluation and the stylesheet diagnostics
+    # had landed and none of them had ever met a real page. All five original
+    # fixtures are single-column, so all four new ones are shapes the first
+    # group structurally cannot express.
+    Fixture(
+        label="reference_two_column",
+        html_file="reference_two_column.html",
+        css_file="reference_two_column.css",
+        base_url="https://developer.mozilla.org/zh-CN/docs/Web/CSS/position",
+        expected_title="position 属性 - CSS 参考 | 开发者文档",
+        expected_stylesheets=2,
+        expected_images=2,
+        expected_deferred_images=0,
+        expected_srcset_images=0,
+        expected_video_posters=0,
+        expected_scripts=1,
+        min_links=34,
+        min_channel_sections=2,
+        min_scroll_blocks=10,
+        scroll_item_class="ref-block",
+        required_image_hosts=("static.devdocs.example",),
+        required_static_hosts=("static.devdocs.example",),
+    ),
+    Fixture(
+        label="spec_data_table",
+        html_file="spec_data_table.html",
+        css_file="spec_data_table.css",
+        base_url="https://www.w3.org/TR/css-position-3/",
+        expected_title="CSS 定位布局 第 3 级规范 - 绝对定位盒模型取值汇总",
+        expected_stylesheets=2,
+        expected_images=2,
+        expected_deferred_images=0,
+        expected_srcset_images=0,
+        expected_video_posters=0,
+        expected_scripts=1,
+        min_links=30,
+        min_channel_sections=2,
+        min_scroll_blocks=12,
+        scroll_item_class="spec-clause",
+        required_image_hosts=("www.w3.org",),
+        required_static_hosts=("www.w3.org",),
+    ),
+    Fixture(
+        label="sticky_toolbar",
+        html_file="sticky_toolbar.html",
+        css_file="sticky_toolbar.css",
+        base_url="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-memory-resource/",
+        expected_title="为容器和 Pod 分配内存资源 - Kubernetes 文档",
+        expected_stylesheets=2,
+        expected_images=1,
+        expected_deferred_images=0,
+        expected_srcset_images=0,
+        expected_video_posters=0,
+        expected_scripts=1,
+        min_links=26,
+        min_channel_sections=0,
+        min_scroll_blocks=11,
+        scroll_item_class="doc-section",
+        required_image_hosts=("kubernetes.io",),
+        required_static_hosts=("kubernetes.io",),
+    ),
+    Fixture(
+        label="form_heavy_signin",
+        html_file="form_heavy_signin.html",
+        css_file="form_heavy_signin.css",
+        base_url="https://passport.csdn.net/login?code=public",
+        expected_title="登录 - 会员中心",
+        expected_stylesheets=2,
+        expected_images=1,
+        expected_deferred_images=0,
+        expected_srcset_images=0,
+        expected_video_posters=0,
+        expected_scripts=1,
+        min_links=26,
+        min_channel_sections=2,
+        min_scroll_blocks=14,
+        scroll_item_class="faq-item",
+        required_image_hosts=("static.member.example",),
+        required_static_hosts=("static.member.example",),
+    ),
+)
+
+#: The fixtures ``docs/real_site_acceptance.md`` named when the harness was
+#: written. Kept so a change to the first five and an addition to the set are
+#: different things in a diff.
+ORIGINAL_FIXTURES: tuple[str, ...] = (
+    "baidu_home",
+    "baidu_results",
+    "zhihu_home",
+    "zhihu_article",
+    "netease_163_home",
 )
 
 

@@ -37,6 +37,13 @@ pub enum FetchPhase {
     /// covers "this address never answered".
     TcpConnect,
     /// The TLS handshake over an open connection.
+    ///
+    /// Note that a handshake over a proxied connection is usually *not* reported
+    /// here. ureq runs the handshake lazily, on the first write to the socket,
+    /// under the send budget, so a tunnel that establishes and then never
+    /// handshakes is reported against [`FetchPhase::ResponseHeaders`] - the
+    /// budget that actually covered it. This variant covers the handshakes that
+    /// do sit in the connect phase.
     TlsHandshake,
     /// Writing the request line, headers, and body. ureq bounds the wait for
     /// the response headers with the same budget, so this also covers a request

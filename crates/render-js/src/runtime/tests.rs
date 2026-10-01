@@ -2196,81 +2196,6 @@ fn promise_prototype_is_real_and_overridable() {
 }
 
 #[test]
-fn temp_diag_mutual_recursion() {
-    let handle = std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(|| {
-            let Ok(html) = std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../.diag/bilibili/page.html"
-            )) else {
-                eprintln!("skipped: saved bilibili page not present");
-                return;
-            };
-            let mut parsed = parse_document(&html);
-            let url = Url::parse("https://www.bilibili.com/").expect("base URL");
-            let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
-            let shim = r"
-                globalThis.__dpErr = 'none';
-                var __origDP = Object.defineProperty;
-                Object.defineProperty = function (target, key, desc) {
-                    try {
-                        return __origDP.call(Object, target, key, desc);
-                    } catch (e) {
-                        if (globalThis.__dpErr === 'none') { globalThis.__dpErr = '' + e; }
-                        throw e;
-                    }
-                };
-            ";
-            runtime.execute(&mut parsed.dom, shim).expect("shim");
-            let pre = runtime
-                .execute(
-                    &mut parsed.dom,
-                    r"var n = {}; n[Symbol.toStringTag] = 'z';
-                       [String(n), n[Symbol.toStringTag], Object.prototype.toString.call(n)].join('|');
-                    ",
-                )
-                .map(|o| o.value.to_js_string())
-                .unwrap_or_else(|e| format!("pre failed: {e}"));
-            eprintln!("PRE PROBE: {pre}");
-            let source = std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../.diag/bilibili/assets/a001_log-reporter.js"
-            ))
-            .expect("log-reporter source");
-            match runtime.execute(&mut parsed.dom, &source) {
-                Ok(_) => eprintln!("NO ERROR"),
-                Err(error) => {
-                    eprintln!("ERR: {error}");
-                    for index in [668usize, 692] {
-                        let Some(function) = runtime.functions.get(index) else {
-                            eprintln!("fn #{index}: missing");
-                            continue;
-                        };
-                        let body = format!("{:?}", function.body);
-                        let body = if body.len() > 700 {
-                            format!("{}…", &body[..700])
-                        } else {
-                            body
-                        };
-                        eprintln!(
-                            "fn #{index} name={:?} params={:?} body={body}",
-                            function.name, function.parameters
-                        );
-                    }
-                    let report = runtime
-                        .execute(&mut parsed.dom, "globalThis.__dpErr")
-                        .map(|o| o.value.to_js_string())
-                        .unwrap_or_else(|e| format!("report failed: {e}"));
-                    eprintln!("DP ERR: {report}");
-                }
-            }
-        })
-        .expect("spawn");
-    handle.join().expect("join");
-}
-
-#[test]
 fn fetch_queues_exactly_one_pending_request_with_method_headers_and_body() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
@@ -2629,54 +2554,6 @@ fn response_constructor_text_settles_without_a_transfer() {
         .execute(&mut parsed.dom, "parts.join('#')")
         .expect("parts read executes");
     assert_eq!(outcome.value, JsValue::String("200,true#ready".to_owned()));
-}
-
-#[test]
-fn temp_read_5073_state() {
-    let handle = std::thread::Builder::new()
-        .stack_size(512 * 1024 * 1024)
-        .spawn(|| {
-            let Ok(html) = std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../.diag/bilibili/page.html"
-            )) else {
-                eprintln!("skipped: saved bilibili page not present");
-                return;
-            };
-            let mut parsed = parse_document(&html);
-            let url = Url::parse("https://www.bilibili.com/").expect("base URL");
-            let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
-            let shim = r"
-                globalThis.__dpErr = 'none';
-                var __origDP = Object.defineProperty;
-                Object.defineProperty = function (target, key, desc) {
-                    try { return __origDP.call(Object, target, key, desc); }
-                    catch (e) { throw e; }
-                };
-            ";
-            runtime.execute(&mut parsed.dom, shim).expect("shim");
-            let source = std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../.diag/bilibili/assets/a001_patched.js"
-            ))
-            .expect("patched bundle");
-            match runtime.execute(&mut parsed.dom, &source) {
-                Ok(_) => eprintln!("NO ERROR"),
-                Err(error) => eprintln!("ERR: {error}"),
-            }
-            let report = runtime
-                .execute(
-                    &mut parsed.dom,
-                    r"var t = {}; t[Symbol.toStringTag] = 'z';
-                       [typeof Symbol, typeof Symbol.toStringTag, String(t), String({})].join(' ; ');
-                    ",
-                )
-                .map(|o| o.value.to_js_string())
-                .unwrap_or_else(|e| format!("report failed: {e}"));
-            eprintln!("5073 STATE: {report}");
-        })
-        .expect("spawn");
-    handle.join().expect("join");
 }
 
 #[test]

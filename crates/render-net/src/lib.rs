@@ -12,6 +12,15 @@
 //! reported through [`FetchConfig::observer`]. A batch that outlives
 //! [`BatchOptions::timeout`] reports the requests that had not completed
 //! instead of leaving its handle open forever.
+//!
+//! Every network phase is bounded, because an unbounded phase is a request that
+//! never reports anything: [`FetchConfig::connect_timeout`] for the connection,
+//! [`FetchConfig::response_timeout`] for the status line and headers, and
+//! [`FetchConfig::body_idle_timeout`] for the body. The body bound is an
+//! **idle-read** bound - time since the last byte - not a whole-transfer budget,
+//! so a large resource trickling in over a slow link still completes. A stalled
+//! transfer is reported against the phase it stalled in and is never returned to
+//! the connection pool as usable.
 
 mod batch;
 mod cookie;

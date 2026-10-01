@@ -59,6 +59,7 @@ use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::NavigationRequest;
 use crate::runtime::types::UserFunction;
+use crate::utf16;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -618,7 +619,7 @@ impl JsRuntime {
                     {
                         JsError::thrown_with_message(
                             value,
-                            self.error_to_string(object).to_js_string(),
+                            self.error_to_string(dom, object).to_js_string(),
                         )
                     }
                     value => JsError::thrown(value),
@@ -1985,11 +1986,11 @@ impl JsRuntime {
         match operator {
             BinaryOp::Add => {
                 if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
-                    Ok(JsValue::String(format!(
-                        "{}{}",
-                        left.to_js_string(),
-                        right.to_js_string()
-                    )))
+                    // Same `StringAdd` as the plain binary path, so `x += y` and
+                    // `x = x + y` agree on a pair split across the operator.
+                    let mut units = utf16::utf16_units(&left.to_js_string());
+                    units.extend(utf16::utf16_units(&right.to_js_string()));
+                    Ok(JsValue::String(utf16::string_from_utf16(&units)))
                 } else {
                     Ok(JsValue::Number(to_number(left)? + to_number(right)?))
                 }
@@ -2468,11 +2469,18 @@ impl JsRuntime {
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => Ok(right),
             BinaryOp::Add => {
                 if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
-                    Ok(JsValue::String(format!(
-                        "{}{}",
-                        left.to_js_string(),
-                        right.to_js_string()
-                    )))
+                    // `+` on strings is §13.15.2 `StringAdd`, which concatenates
+                    // two code-unit sequences. The engine holds a lone surrogate
+                    // as a private-use placeholder, so a plain `format!` would
+                    // keep two halves of a pair as two separate placeholders and
+                    // `'\uD83D' + '\uDE00'` would not equal `'\u{1F600}'`.
+                    // Decoding through the code units re-joins them, which is
+                    // what makes `charAt(0) + charAt(1)` and
+                    // `String.fromCharCode(0xD83D) + String.fromCharCode(0xDE00)`
+                    // both answer the original pair.
+                    let mut units = utf16::utf16_units(&left.to_js_string());
+                    units.extend(utf16::utf16_units(&right.to_js_string()));
+                    Ok(JsValue::String(utf16::string_from_utf16(&units)))
                 } else {
                     Ok(JsValue::Number(to_number(&left)? + to_number(&right)?))
                 }
@@ -2531,9 +2539,11 @@ impl JsRuntime {
                     return Ok(true);
                 }
                 if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(*object) {
-                    let characters: Vec<char> = text.chars().collect();
+                    // A String exotic object's indexed properties are numbered
+                    // in code units, so `2 in '\u{1F600}'` is false and
+                    // `1 in '\u{1F600}'` is true.
                     if let Ok(index) = name.parse::<usize>() {
-                        return Ok(index < characters.len());
+                        return Ok(index < utf16::utf16_length(&text));
                     }
                     return Ok(name == "length");
                 }
@@ -3571,7 +3581,7 @@ impl JsRuntime {
             Some(ObjectHost::DataSet(node)) => {
                 // DOMStringMap writes go straight to the element's `data-*`
                 // attributes (stringified, like the IDL DOMString setter).
-                return JsRuntime::set_dataset_member(dom, node, property, &value);
+                return self.set_dataset_member(dom, node, property, &value);
             }
             // String exotic objects are ordinary apart from their virtual
             // indexed characters and `length`; writes to those are ignored,
@@ -3581,7 +3591,7 @@ impl JsRuntime {
                     return Ok(());
                 }
                 if let Ok(index) = property.parse::<usize>()
-                    && index < text.chars().count()
+                    && index < utf16::utf16_length(&text)
                 {
                     return Ok(());
                 }
@@ -3830,6 +3840,9 @@ impl JsRuntime {
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(constructor, kind, arguments)
             }
+            Some(ObjectHost::DomExceptionConstructor) => {
+                self.dom_exception_constructor(constructor, arguments)
+            }
             Some(ObjectHost::PromiseConstructor) => {
                 let executor = Self::require_callable_object(
                     required_argument(arguments, 0, "Promise")?,
@@ -3866,6 +3879,16 @@ impl JsRuntime {
                 self.abort_controller_constructor(constructor)
             }
             Some(ObjectHost::FormDataConstructor) => self.form_data_constructor(constructor),
+            Some(ObjectHost::TextEncoderConstructor) => self.text_encoder_constructor(constructor),
+            Some(ObjectHost::TextDecoderConstructor) => {
+                self.text_decoder_constructor(constructor, arguments)
+            }
+            Some(ObjectHost::DataViewConstructor) => {
+                self.data_view_constructor(constructor, arguments)
+            }
+            Some(ObjectHost::ArrayBufferConstructor) => {
+                self.array_buffer_constructor(constructor, arguments)
+            }
             Some(ObjectHost::ResponseConstructor) => {
                 self.response_constructor(constructor, arguments)
             }
@@ -4092,6 +4115,20 @@ impl JsRuntime {
             Some(ObjectHost::FormDataConstructor) => {
                 Err(JsError::type_error("FormData constructor requires 'new'"))
             }
+            // §25.2.5 `DataView`, §10.2.4 `TextEncoder` and
+            // §10.2.4.1 `TextDecoder` are all `new`-only.
+            Some(ObjectHost::TextEncoderConstructor) => Err(JsError::type_error(
+                "TextEncoder constructor requires 'new'",
+            )),
+            Some(ObjectHost::TextDecoderConstructor) => Err(JsError::type_error(
+                "TextDecoder constructor requires 'new'",
+            )),
+            Some(ObjectHost::DataViewConstructor) => {
+                Err(JsError::type_error("DataView constructor requires 'new'"))
+            }
+            Some(ObjectHost::ArrayBufferConstructor) => Err(JsError::type_error(
+                "ArrayBuffer constructor requires 'new'",
+            )),
             Some(ObjectHost::ResponseConstructor) => {
                 Err(JsError::type_error("Response constructor requires 'new'"))
             }
@@ -4123,6 +4160,12 @@ impl JsRuntime {
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(callee, kind, arguments)
+            }
+            // WebIDL §4.4's interface object has a constructor operation, so
+            // `DOMException("m", "NotFoundError")` without `new` constructs one
+            // exactly as `new DOMException("m", "NotFoundError")` does.
+            Some(ObjectHost::DomExceptionConstructor) => {
+                self.dom_exception_constructor(callee, arguments)
             }
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeToString)) => {
                 // `toString.call(primitive)` never materializes an object.
@@ -4568,44 +4611,7 @@ impl JsRuntime {
     }
 
     pub(super) fn is_callable_object(object: ObjectId, realm: &Realm) -> bool {
-        matches!(
-            realm.host(object),
-            Some(
-                ObjectHost::NativeFunction(_)
-                    | ObjectHost::BoundFunction { .. }
-                    | ObjectHost::BoundCallable { .. }
-                    | ObjectHost::UserFunction(_)
-                    | ObjectHost::ArrowFunction(_)
-                    | ObjectHost::FunctionConstructor
-                    | ObjectHost::StringConstructor
-                    | ObjectHost::NumberConstructor
-                    | ObjectHost::BooleanConstructor
-                    | ObjectHost::DateConstructor
-                    | ObjectHost::SymbolConstructor
-                    | ObjectHost::ArrayConstructor
-                    | ObjectHost::RegExpConstructor
-                    | ObjectHost::EventConstructor
-                    | ObjectHost::DomConstructor
-                    | ObjectHost::ImageConstructor
-                    | ObjectHost::VideoConstructor
-                    | ObjectHost::ObjectConstructor
-                    | ObjectHost::PromiseConstructor
-                    | ObjectHost::MutationObserverConstructor
-                    | ObjectHost::UrlConstructor
-                    | ObjectHost::UrlSearchParamsConstructor
-                    | ObjectHost::XmlHttpRequestConstructor
-                    | ObjectHost::AbortControllerConstructor
-                    | ObjectHost::FormDataConstructor
-                    | ObjectHost::ResponseConstructor
-                    | ObjectHost::BlobConstructor
-                    | ObjectHost::ProxyConstructor
-                    | ObjectHost::IntersectionObserverConstructor
-                    | ObjectHost::CollectionConstructor(_)
-                    | ObjectHost::TypedArrayConstructor(_)
-                    | ObjectHost::ErrorConstructor(_)
-                    | ObjectHost::PromiseSettler { .. }
-            )
-        )
+        realm.host(object).is_some_and(|host| host.is_callable())
     }
 
     /// Accept an object receiver for member access, wrapping primitives that

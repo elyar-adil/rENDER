@@ -7,6 +7,8 @@ use std::num::FpCategory;
 use render_dom::NodeId;
 use url::Url;
 
+use crate::utf16;
+
 /// Stable identity for an object allocated in a [`Realm`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(usize);
@@ -300,7 +302,7 @@ fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
             reason = "string lengths stay far below any precision boundary"
         )]
         return Some(PropertyDescriptor {
-            value: JsValue::Number(text.chars().count() as f64),
+            value: JsValue::Number(utf16::utf16_length(text) as f64),
             writable: false,
             getter: None,
             setter: None,
@@ -317,9 +319,9 @@ fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
         clippy::cast_sign_loss,
         reason = "the canonical index form bounds the value at u32::MAX"
     )]
-    let character = text.chars().nth(index as usize)?;
+    let unit = utf16::utf16_units(text).get(index as usize).copied()?;
     Some(PropertyDescriptor {
-        value: JsValue::String(character.to_string()),
+        value: JsValue::String(utf16::string_from_unit(unit)),
         writable: false,
         getter: None,
         setter: None,
@@ -409,6 +411,19 @@ pub(crate) enum NativeFunction {
     RegExpToString,
     StrCharAt,
     StrCharCodeAt,
+    /// ECMA-262 22.1.3.12. The sibling of `charCodeAt` that answers the scalar
+    /// value of the code point *starting* at a position, so a surrogate pair
+    /// reports the astral scalar rather than a half.
+    StrCodePointAt,
+    /// ECMA-262 22.1.3.3, the shared `at` used by every indexed collection.
+    StrAt,
+    StrPadStart,
+    StrPadEnd,
+    StrTrimStart,
+    StrTrimEnd,
+    StrRepeat,
+    StrLocaleCompare,
+    StrReplaceAll,
     StringFromCharCode,
     StringFromCodePoint,
     StringRaw,
@@ -482,6 +497,11 @@ pub(crate) enum NativeFunction {
     ArraySome,
     ArrayFind,
     ArrayFindIndex,
+    ArrayFindLast,
+    ArrayFindLastIndex,
+    ArrayAt,
+    ArrayFlat,
+    ArrayReduceRight,
     ArrayEvery,
     ArrayIncludes,
     ArrayReduce,
@@ -568,6 +588,24 @@ pub(crate) enum NativeFunction {
     DateValueOf,
     DateToString,
     ErrorPrototypeToString,
+    /// The `name`, `message` and `code` accessors of `DOMException.prototype`.
+    /// One native per member because `WebIDL` attributes are separate accessors,
+    /// and the three read different internal slots.
+    DomExceptionNameGetter,
+    DomExceptionMessageGetter,
+    DomExceptionCodeGetter,
+    /// `window.matchMedia(query)`, the `MediaQueryList` `media`/`matches`
+    /// accessors, `addEventListener` / `removeEventListener` and the deprecated
+    /// `addListener` / `removeListener`. One native per member because the
+    /// attributes are separate accessors and the last two are legacy aliases
+    /// with their own arities and their own "return the listener" contract.
+    WindowMatchMedia,
+    MediaQueryListMediaGetter,
+    MediaQueryListMatchesGetter,
+    MediaQueryListAddEventListener,
+    MediaQueryListRemoveEventListener,
+    MediaQueryListAddListener,
+    MediaQueryListRemoveListener,
     JsonParse,
     JsonStringify,
     PerformanceNow,
@@ -655,6 +693,27 @@ pub(crate) enum NativeFunction {
     FormDataHas,
     FormDataDelete,
     FormDataEntries,
+    TextEncoderEncode,
+    TextEncoderEncodeInto,
+    TextDecoderDecode,
+    DataViewGetInt8,
+    DataViewGetUint8,
+    DataViewGetInt16,
+    DataViewGetUint16,
+    DataViewGetInt32,
+    DataViewGetUint32,
+    DataViewGetFloat32,
+    DataViewGetFloat64,
+    DataViewSetInt8,
+    DataViewSetUint8,
+    DataViewSetInt16,
+    DataViewSetUint16,
+    DataViewSetInt32,
+    DataViewSetUint32,
+    DataViewSetFloat32,
+    DataViewSetFloat64,
+    ArrayBufferSlice,
+    GlobalStructuredClone,
     VideoPlay,
     VideoPause,
     VideoLoad,
@@ -820,6 +879,31 @@ impl CollectionKind {
     }
 }
 
+/// The encodings this engine implements for `TextEncoder`/`TextDecoder`
+/// (Encoding Standard). A label the Encoding Standard knows but that is not in
+/// this set is a `RangeError` at construction, which is a loud failure rather
+/// than a silent mis-decode; see `runtime::builtins::encoding`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextEncoding {
+    Utf8,
+    /// ISO-8859-1's practical superset: the `latin1`/`iso-8859-1`/`ascii`
+    /// labels all name this, so `0x80` is EURO SIGN and not U+0080.
+    Windows1252,
+    XUserDefined,
+}
+
+impl TextEncoding {
+    /// The value `TextDecoder.prototype.encoding` reports, which is the
+    /// Encoding Standard's canonical name rather than the supplied label.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Windows1252 => "windows-1252",
+            Self::XUserDefined => "x-user-defined",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
     Error,
@@ -853,6 +937,99 @@ impl ErrorKind {
             Self::UriError => "URIError",
         }
     }
+}
+
+/// The legacy numeric codes `WebIDL` §4.4 declares as `DOMException`'s
+/// constants, and §2.8.1's names table, in one place.
+///
+/// The two lists are not the same, and keeping them apart is the point:
+///
+/// - The IDL declares 25 constants, `INDEX_SIZE_ERR = 1` through
+///   `DATA_CLONE_ERR = 25`, and all 25 are exposed on both the interface object
+///   and the interface prototype object (`WebIDL` §2.5.1: "the constant value can
+///   be accessed in JavaScript either as `A.rambaldi` or `instanceOfA.rambaldi`").
+///   Three of them - `DOMSTRING_SIZE_ERR = 2`, `NO_DATA_ALLOWED_ERR = 6` and
+///   `VALIDATION_ERR = 16` - name a legacy code with **no** entry in the names
+///   table, so `new DOMException("m", "NoDataAllowedError").code` is `0` while
+///   `DOMException.NO_DATA_ALLOWED_ERR` is `6`.
+/// - §4.4's code getter is defined purely by the names table, so eleven names
+///   that have no legacy code (`EncodingError`, `NotAllowedError`, and the nine
+///   IndexedDB-era ones) all report `0`, and so does any name a caller made
+///   up.
+///
+/// One table would be a smaller thing to get wrong and a bigger thing to have
+/// wrong silently, because a `code` that disagrees with the constant of the same
+/// name is exactly the kind of defect no test in this crate would notice. So the
+/// two are separate lists and the test asserts both the code and the constant.
+const DOM_EXCEPTION_LEGACY_CODES: [(&str, u16); 25] = [
+    ("INDEX_SIZE_ERR", 1),
+    ("DOMSTRING_SIZE_ERR", 2),
+    ("HIERARCHY_REQUEST_ERR", 3),
+    ("WRONG_DOCUMENT_ERR", 4),
+    ("INVALID_CHARACTER_ERR", 5),
+    ("NO_DATA_ALLOWED_ERR", 6),
+    ("NO_MODIFICATION_ALLOWED_ERR", 7),
+    ("NOT_FOUND_ERR", 8),
+    ("NOT_SUPPORTED_ERR", 9),
+    ("INUSE_ATTRIBUTE_ERR", 10),
+    ("INVALID_STATE_ERR", 11),
+    ("SYNTAX_ERR", 12),
+    ("INVALID_MODIFICATION_ERR", 13),
+    ("NAMESPACE_ERR", 14),
+    ("INVALID_ACCESS_ERR", 15),
+    ("VALIDATION_ERR", 16),
+    ("TYPE_MISMATCH_ERR", 17),
+    ("SECURITY_ERR", 18),
+    ("NETWORK_ERR", 19),
+    ("ABORT_ERR", 20),
+    ("URL_MISMATCH_ERR", 21),
+    ("QUOTA_EXCEEDED_ERR", 22),
+    ("TIMEOUT_ERR", 23),
+    ("INVALID_NODE_TYPE_ERR", 24),
+    ("DATA_CLONE_ERR", 25),
+];
+
+/// `WebIDL` §2.8.1's `DOMException` names table, restricted to the rows that
+/// carry a legacy code. The names with no code are absent, and §4.4 defines
+/// `code` as "0 if no such entry exists in the table", so listing them with a
+/// zero would be indistinguishable from a name nobody has heard of - which is
+/// the same answer, so the shorter list is the honest one.
+const DOM_EXCEPTION_NAME_CODES: [(&str, u16); 22] = [
+    ("IndexSizeError", 1),
+    ("HierarchyRequestError", 3),
+    ("WrongDocumentError", 4),
+    ("InvalidCharacterError", 5),
+    ("NoModificationAllowedError", 7),
+    ("NotFoundError", 8),
+    ("NotSupportedError", 9),
+    ("InUseAttributeError", 10),
+    ("InvalidStateError", 11),
+    // Not JavaScript's `SyntaxError`. §2.8.1 says so explicitly: this name
+    // reports parsing errors in web APIs - a selector, a date, a colour - while
+    // the ECMAScript `SyntaxError` is reserved for the JavaScript parser, and
+    // `instanceof SyntaxError` must not become true for a bad selector.
+    ("SyntaxError", 12),
+    ("InvalidModificationError", 13),
+    ("NamespaceError", 14),
+    ("InvalidAccessError", 15),
+    ("TypeMismatchError", 17),
+    ("SecurityError", 18),
+    ("NetworkError", 19),
+    ("AbortError", 20),
+    ("URLMismatchError", 21),
+    ("QuotaExceededError", 22),
+    ("TimeoutError", 23),
+    ("InvalidNodeTypeError", 24),
+    ("DataCloneError", 25),
+];
+
+/// The legacy code for a `DOMException` name, or `0` for a name §2.8.1 does not
+/// list.
+pub(crate) fn dom_exception_code(name: &str) -> u16 {
+    DOM_EXCEPTION_NAME_CODES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map_or(0, |(_, code)| *code)
 }
 
 /// The behavior of one lazy iterator helper.
@@ -936,6 +1113,33 @@ pub(crate) enum ObjectHost {
     ErrorConstructor(ErrorKind),
     /// An error instance; the stand-in for the spec's `[[ErrorData]]` slot.
     ErrorInstance,
+    /// The `DOMException` constructor object (`WebIDL` §4.4).
+    DomExceptionConstructor,
+    /// defines: its name and its message. `code` is *derived* from the name by
+    /// §4.4's "code getter steps ... the legacy code indicated in the
+    /// `DOMException` names table for this's name", so it is not stored: a
+    /// `DOMException` whose name is not in that table reports `0`, and storing a
+    /// third field would let the two disagree.
+    DomException {
+        name: String,
+        message: String,
+    },
+    /// One `MediaQueryList` (CSSOM View). `media` is the query as
+    /// `matchMedia` was given it and `matches` is its **last evaluated**
+    /// value, which is what makes the `change` event a diff rather than a
+    /// re-read: `queue_media_query_list_changes` compares the new evaluation
+    /// against this field and fires only on a flip.
+    MediaQueryList {
+        media: String,
+        matches: bool,
+        /// The `change` listeners registered through `addEventListener`. Stored
+        /// on the host rather than in a side table because a `MediaQueryList` is
+        /// an `EventTarget` that is not a node, and the node-keyed
+        /// `event_listeners` map cannot hold it. `onchange` is *not* here: it
+        /// is an ordinary own data property, because CSSOM declares it as an
+        /// `EventHandler` attribute and script reads and writes it directly.
+        listeners: Vec<ObjectId>,
+    },
     Promise(usize),
     PromiseSettler {
         promise: usize,
@@ -978,6 +1182,35 @@ pub(crate) enum ObjectHost {
         /// Element count of this view.
         length: usize,
     },
+    /// A `DataView` over a byte-granular shared buffer. `byte_offset` and
+    /// `byte_length` are byte positions. There is deliberately no endianness
+    /// field: ECMAScript 25.2.5.1 gives the constructor three parameters, so
+    /// every accessor carries its own `littleEndian` and the default is
+    /// big-endian.
+    DataView {
+        buffer: TypedBuffer,
+        /// Byte offset of the view within the shared buffer.
+        byte_offset: usize,
+        /// Byte length of the view.
+        byte_length: usize,
+    },
+    /// An `ArrayBuffer`: a byte-granular buffer the typed-array and `DataView`
+    /// families view. The engine's typed arrays store decoded element values in
+    /// an `Rc<RefCell<Vec<f64>>>`, so a buffer is one slot per *byte* and every
+    /// view over it is byte-exact.
+    ArrayBufferHost(TypedBuffer),
+    TextDecoder {
+        encoding: TextEncoding,
+        fatal: bool,
+        /// A truncated multi-byte sequence held back for the next `decode`
+        /// call, and whether a leading BOM has already been consumed.
+        pending: Vec<u8>,
+        bom_seen: bool,
+    },
+    TextEncoderConstructor,
+    TextDecoderConstructor,
+    DataViewConstructor,
+    ArrayBufferConstructor,
     UrlConstructor,
     UrlSearchParamsConstructor,
     UrlInstance(Url),
@@ -1032,6 +1265,60 @@ pub(crate) enum ObjectHost {
     /// visible fields (`src`, `duration`, ...) are plain properties updated
     /// in place, mirroring the `XMLHttpRequest` pattern.
     VideoElement(VideoElementState),
+}
+
+impl ObjectHost {
+    /// Whether an object carrying this host is callable, i.e. whether `typeof`
+    /// answers `"function"` and a call is attempted rather than refused.
+    ///
+    /// This is the *single* answer. It used to be written down twice - once
+    /// here for `install_builtin_metadata` and once in the interpreter for
+    /// `typeof` - and the two copies had drifted in the same direction, which
+    /// is how four installed constructors came to report `typeof` `"object"`.
+    /// One function cannot drift from itself, so this is the one.
+    pub(crate) const fn is_callable(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeFunction(_)
+                | Self::BoundFunction { .. }
+                | Self::BoundCallable { .. }
+                | Self::UserFunction(_)
+                | Self::ArrowFunction(_)
+                | Self::FunctionConstructor
+                | Self::StringConstructor
+                | Self::NumberConstructor
+                | Self::BooleanConstructor
+                | Self::DateConstructor
+                | Self::SymbolConstructor
+                | Self::ArrayConstructor
+                | Self::RegExpConstructor
+                | Self::EventConstructor
+                | Self::DomConstructor
+                | Self::ImageConstructor
+                | Self::VideoConstructor
+                | Self::ObjectConstructor
+                | Self::PromiseConstructor
+                | Self::MutationObserverConstructor
+                | Self::UrlConstructor
+                | Self::UrlSearchParamsConstructor
+                | Self::XmlHttpRequestConstructor
+                | Self::AbortControllerConstructor
+                | Self::FormDataConstructor
+                | Self::ResponseConstructor
+                | Self::BlobConstructor
+                | Self::ProxyConstructor
+                | Self::IntersectionObserverConstructor
+                | Self::CollectionConstructor(_)
+                | Self::TypedArrayConstructor(_)
+                | Self::ErrorConstructor(_)
+                | Self::DomExceptionConstructor
+                | Self::ArrayBufferConstructor
+                | Self::DataViewConstructor
+                | Self::TextEncoderConstructor
+                | Self::TextDecoderConstructor
+                | Self::PromiseSettler { .. }
+        )
+    }
 }
 
 /// Playback machinery of one `HTMLVideoElement` instance.
@@ -1260,6 +1547,10 @@ pub struct Realm {
     iterator_prototype: ObjectId,
     /// `%Storage.prototype%` shared by `localStorage` and `sessionStorage`.
     storage_prototype: ObjectId,
+    /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
+    /// every reference to a list still gets a live list that must keep
+    /// evaluating, so the prototype outlives the lists too.
+    media_query_list_prototype: ObjectId,
     /// `%IteratorHelperPrototype%` shared by helper result objects.
     iterator_helper_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -1388,7 +1679,9 @@ impl Realm {
         Self::install_navigator(&mut objects, global, object_prototype);
         Self::install_screen(&mut objects, global, object_prototype);
         Self::install_performance(&mut objects, global, object_prototype, function_prototype);
-        Self::install_errors(&mut objects, global, object_prototype, function_prototype);
+        let error_prototype =
+            Self::install_errors(&mut objects, global, object_prototype, function_prototype);
+        Self::install_dom_exception(&mut objects, global, error_prototype, function_prototype);
         Self::install_event(&mut objects, global, object_prototype, function_prototype);
         let string_prototype =
             Self::install_string(&mut objects, global, object_prototype, function_prototype);
@@ -1417,6 +1710,7 @@ impl Realm {
         }
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
+        Self::install_encoding(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
         Self::install_proxy_reflect(&mut objects, global, object_prototype, function_prototype);
@@ -1826,6 +2120,139 @@ impl Realm {
                 configurable: true,
             },
         );
+        // `MediaQueryList` (CSSOM View). The interface is
+        // `[Exposed=Window] interface MediaQueryList : EventTarget`, and
+        // `matchMedia` is its only producer, so there is no global constructor:
+        // a script can obtain one and read its prototype, but cannot
+        // `new MediaQueryList(...)`. That is the same shape the platform has,
+        // and it is why `MediaQueryList.prototype` is installed here and the
+        // constructor is not.
+        let media_query_list_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            (
+                "addEventListener",
+                NativeFunction::MediaQueryListAddEventListener,
+            ),
+            (
+                "removeEventListener",
+                NativeFunction::MediaQueryListRemoveEventListener,
+            ),
+            ("addListener", NativeFunction::MediaQueryListAddListener),
+            (
+                "removeListener",
+                NativeFunction::MediaQueryListRemoveListener,
+            ),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[media_query_list_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        // `media` and `matches` are WebIDL §2.5.2 `readonly attribute`s, so
+        // they are accessors on the prototype reading internal slots, not own
+        // data properties on the list. That is not a formality here: `matches`
+        // changes when the viewport does, and an own data property would have to
+        // be rewritten on every frame, which is exactly the kind of thing that
+        // silently goes stale. Reading through the accessor cannot.
+        for (name, getter) in [
+            ("media", NativeFunction::MediaQueryListMediaGetter),
+            ("matches", NativeFunction::MediaQueryListMatchesGetter),
+        ] {
+            let accessor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(getter),
+                ..JsObject::default()
+            });
+            objects[media_query_list_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(accessor),
+                    setter: None,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
+        objects[media_query_list_prototype.0].properties.insert(
+            "onchange".to_owned(),
+            // CSSOM declares `onchange` as an `EventHandler` *attribute*, so it
+            // is a writable data property rather than an accessor, and it starts
+            // `null`.
+            PropertyDescriptor::builtin(JsValue::Null),
+        );
+        // WebIDL §2.7.2: an interface prototype's `@@toStringTag` is the interface
+        // name, which is what a polyfill branching on
+        // `Object.prototype.toString.call(mql)` reads.
+        let media_query_list_tag = JsSymbol::well_known("@@toStringTag");
+        objects[media_query_list_prototype.0].symbols.insert(
+            media_query_list_tag.id(),
+            (
+                media_query_list_tag,
+                PropertyDescriptor::builtin(JsValue::String("MediaQueryList".to_owned())),
+            ),
+        );
+        // The interface object exists even though the interface has no
+        // constructor operation: CSSOM View declares
+        // `[Exposed=Window] interface MediaQueryList : EventTarget`, and an
+        // exposed interface gets a global object, so `mql instanceof
+        // MediaQueryList` and `Object.getPrototypeOf(mql) ===
+        // MediaQueryList.prototype` both work. `new MediaQueryList()` is a
+        // `TypeError`, as it is in a browser.
+        let media_query_list_constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            // `EventTarget` is a non-constructible interface and so is
+            // `MediaQueryList`'s own constructor operation being absent; the
+            // engine models the "illegal constructor" case with the same host the
+            // DOM interface uses, because the observable behaviour is identical.
+            host: ObjectHost::DomConstructor,
+            ..JsObject::default()
+        });
+        objects[media_query_list_constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(media_query_list_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[media_query_list_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(media_query_list_constructor)),
+        );
+        objects[global.0].properties.insert(
+            "MediaQueryList".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(media_query_list_constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        Self::define_global_function(
+            &mut objects,
+            global,
+            "matchMedia",
+            NativeFunction::WindowMatchMedia,
+        );
         Self::install_console(&mut objects, global);
         Self::install_timers(&mut objects, global);
         for (index, object) in objects.iter_mut().enumerate() {
@@ -1877,6 +2304,7 @@ impl Realm {
             iterator_prototype,
             iterator_helper_prototype,
             storage_prototype,
+            media_query_list_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
@@ -2235,6 +2663,237 @@ impl Realm {
         }
     }
 
+    /// Install an interface whose instances carry an `ObjectHost` state, with
+    /// the given prototype methods and a `Symbol.toStringTag` naming the host.
+    /// Shared by `DataView` and `TextDecoder`.
+    #[allow(clippy::too_many_arguments)]
+    fn install_host_interface(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+        name: &'static str,
+        constructor_host: ObjectHost,
+        methods: &[(&str, NativeFunction)],
+        tag: &str,
+    ) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (method_name, native) in methods {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(*native),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                (*method_name).to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        // §20.1.3.6 step 7: a string-valued `Symbol.toStringTag` names the host,
+        // so a polyfill can branch on it.
+        let symbol = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol,
+                PropertyDescriptor::builtin(JsValue::String(tag.to_owned())),
+            ),
+        );
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: constructor_host,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(prototype)),
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[global.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
+    /// `TextEncoder`, `TextDecoder` (Encoding Standard) and `DataView`
+    /// (ECMAScript 25.2.5).
+    ///
+    /// `TextEncoder` is UTF-8 only, so its instances carry no state. `TextDecoder`
+    /// keeps its label, its `fatal` flag, and the bytes a streaming decode held
+    /// back; `DataView` keeps the shared buffer and its byte window. All three
+    /// are installed here so a page that feature-detects them finds all or the
+    /// one it asked for, never a half-present interface.
+    #[allow(clippy::too_many_lines)]
+    fn install_encoding(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        // `ArrayBuffer` comes first because it is the buffer every binary
+        // format constructs a `DataView` over, and a `DataView` a script cannot
+        // build is a global that exists and cannot be used.
+        Self::install_host_interface(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "ArrayBuffer",
+            ObjectHost::ArrayBufferConstructor,
+            &[("slice", NativeFunction::ArrayBufferSlice)],
+            "ArrayBuffer",
+        );
+
+        let encoder_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (method, native) in [
+            ("encode", NativeFunction::TextEncoderEncode),
+            ("encodeInto", NativeFunction::TextEncoderEncodeInto),
+        ] {
+            let function = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(native),
+                ..JsObject::default()
+            });
+            objects[encoder_prototype.0].properties.insert(
+                method.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(function)),
+            );
+        }
+        // `TextEncoder.prototype.encoding` is always "utf-8": the constructor
+        // takes no arguments, and a UTF-8-only encoder is the whole interface.
+        objects[encoder_prototype.0].properties.insert(
+            "encoding".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::String("utf-8".to_owned()),
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        let encoder = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::TextEncoderConstructor,
+            ..JsObject::default()
+        });
+        objects[encoder.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(encoder_prototype)),
+        );
+        objects[encoder_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(encoder)),
+        );
+        objects[global.0].properties.insert(
+            "TextEncoder".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(encoder),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+
+        // `TextDecoder.prototype.encoding` and `.fatal` are read-only accessor
+        // properties in the spec whose answers depend on the label the
+        // constructor was given, so the prototype carries no value for them: the
+        // constructor installs an own non-writable data property per instance.
+        // A prototype default would be a lie for every non-default label.
+        let decoder_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let decode = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::TextDecoderDecode),
+            ..JsObject::default()
+        });
+        objects[decoder_prototype.0].properties.insert(
+            "decode".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(decode)),
+        );
+        let decoder = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::TextDecoderConstructor,
+            ..JsObject::default()
+        });
+        objects[decoder.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(decoder_prototype)),
+        );
+        objects[decoder_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(decoder)),
+        );
+        objects[global.0].properties.insert(
+            "TextDecoder".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(decoder),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+
+        Self::install_host_interface(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "DataView",
+            ObjectHost::DataViewConstructor,
+            &[
+                ("getInt8", NativeFunction::DataViewGetInt8),
+                ("getUint8", NativeFunction::DataViewGetUint8),
+                ("getInt16", NativeFunction::DataViewGetInt16),
+                ("getUint16", NativeFunction::DataViewGetUint16),
+                ("getInt32", NativeFunction::DataViewGetInt32),
+                ("getUint32", NativeFunction::DataViewGetUint32),
+                ("getFloat32", NativeFunction::DataViewGetFloat32),
+                ("getFloat64", NativeFunction::DataViewGetFloat64),
+                ("setInt8", NativeFunction::DataViewSetInt8),
+                ("setUint8", NativeFunction::DataViewSetUint8),
+                ("setInt16", NativeFunction::DataViewSetInt16),
+                ("setUint16", NativeFunction::DataViewSetUint16),
+                ("setInt32", NativeFunction::DataViewSetInt32),
+                ("setUint32", NativeFunction::DataViewSetUint32),
+                ("setFloat32", NativeFunction::DataViewSetFloat32),
+                ("setFloat64", NativeFunction::DataViewSetFloat64),
+            ],
+            "DataView",
+        );
+    }
+
     /// Installs the `console` object with the standard logging methods.
     ///
     /// Messages are buffered in the runtime and drained by the embedding; the
@@ -2374,38 +3033,15 @@ impl Realm {
         let mut prototype_owner: Vec<Option<ObjectId>> = vec![None; objects.len()];
         let mut callable: Vec<bool> = vec![false; objects.len()];
         for (index, object) in objects.iter().enumerate() {
-            callable[index] = matches!(
-                object.host,
-                ObjectHost::NativeFunction(_)
-                    | ObjectHost::BoundFunction { .. }
-                    | ObjectHost::ObjectConstructor
-                    | ObjectHost::FunctionConstructor
-                    | ObjectHost::ArrayConstructor
-                    | ObjectHost::StringConstructor
-                    | ObjectHost::NumberConstructor
-                    | ObjectHost::BooleanConstructor
-                    | ObjectHost::DateConstructor
-                    | ObjectHost::SymbolConstructor
-                    | ObjectHost::RegExpConstructor
-                    | ObjectHost::PromiseConstructor
-                    | ObjectHost::ErrorConstructor(_)
-                    | ObjectHost::EventConstructor
-                    | ObjectHost::DomConstructor
-                    | ObjectHost::ImageConstructor
-                    | ObjectHost::VideoConstructor
-                    | ObjectHost::XmlHttpRequestConstructor
-                    | ObjectHost::AbortControllerConstructor
-                    | ObjectHost::FormDataConstructor
-                    | ObjectHost::ResponseConstructor
-                    | ObjectHost::BlobConstructor
-                    | ObjectHost::ProxyConstructor
-                    | ObjectHost::IntersectionObserverConstructor
-                    | ObjectHost::MutationObserverConstructor
-                    | ObjectHost::CollectionConstructor(_)
-                    | ObjectHost::TypedArrayConstructor(_)
-                    | ObjectHost::UrlConstructor
-                    | ObjectHost::UrlSearchParamsConstructor
-            );
+            // One answer, from one list. This used to be a second hand-written
+            // copy of the callable-host set, and it had drifted from the first:
+            // `ArrayBuffer`, `DataView`, `TextEncoder` and `TextDecoder` were
+            // missing from *both* copies at the same time, so `typeof
+            // ArrayBuffer` answered `"object"` and the constructor had no `name`
+            // and no `length`. Two lists cannot be kept in agreement by review;
+            // one [`Self::is_callable_host`] can, because a new constructor
+            // variant now fails to compile in exactly one place.
+            callable[index] = object.host.is_callable();
             for (key, descriptor) in &object.properties {
                 let JsValue::Object(target) = &descriptor.value else {
                     continue;
@@ -2485,6 +3121,24 @@ impl Realm {
 
     /// Spec arity for the common built-in names; unknown names fall back to
     /// zero. A wrong arity only affects `length` assertions.
+    ///
+    /// **Every name here is a name the engine installs.** That is a checked
+    /// invariant rather than a hope: the arity-table test in
+    /// `runtime::tests` walks the realm and fails if a name in this table is not
+    /// a callable the engine put there. The table used to carry forty names
+    /// nothing installed - `String.prototype.codePointAt`, `Promise.all`,
+    /// `Array.prototype.flat`, `Object.is`, and thirty-six more - which had no
+    /// runtime effect at all (an absent name is never looked up) and a large
+    /// documentation effect: it read as a capability list, so `codePointAt` looked
+    /// implemented to anyone scanning the source, and an agent briefed that "the
+    /// platform surface is mostly there" would believe it. A list of things that
+    /// do not exist is worse than no list, so the list is now only the things
+    /// that do.
+    ///
+    /// Adding a member means adding it here, and the test is what makes that
+    /// necessary rather than optional: a method implemented and not listed gets a
+    /// `length` of `0`, which is wrong but harmless, and a method listed and not
+    /// implemented is a lie, which is not.
     #[allow(
         clippy::match_same_arms,
         clippy::too_many_lines,
@@ -2512,10 +3166,6 @@ impl Realm {
             | "repeat"
             | "resolve"
             | "reject"
-            | "all"
-            | "race"
-            | "allSettled"
-            | "any"
             | "catch"
             | "finally"
             | "get"
@@ -2538,10 +3188,8 @@ impl Realm {
             | "test"
             | "toFixed"
             | "toPrecision"
-            | "toExponential"
             | "match"
             | "search"
-            | "matchAll"
             | "localeCompare"
             | "startsWith"
             | "endsWith"
@@ -2550,22 +3198,17 @@ impl Realm {
             | "reduceRight"
             | "fill"
             | "flatMap"
-            | "toSorted"
-            | "isView"
             | "freeze"
             | "seal"
             | "preventExtensions"
             | "isFrozen"
             | "isSealed"
             | "isExtensible"
-            | "is"
             | "getOwnPropertyNames"
             | "setPrototypeOf"
             | "trim"
             | "trimStart"
-            | "trimEnd"
-            | "copyWithin"
-            | "toReversed" => 1,
+            | "trimEnd" => 1,
             "then"
             | "set"
             | "apply"
@@ -2579,31 +3222,24 @@ impl Realm {
             | "splice"
             | "padStart"
             | "padEnd"
-            | "with"
-            | "toSpliced"
-            | "groupBy"
-            | "fromAsync"
             | "parseInt"
             | "assign"
             | "getOwnPropertyDescriptor" => 2,
             "defineProperty" => 3,
             "construct" => 2,
             "toString" | "valueOf" | "toISOString" | "toJSON" | "toUTCString" | "toDateString"
-            | "toTimeString" | "now" | "getTime" | "getFullYear" | "getUTCFullYear"
-            | "getMonth" | "getUTCMonth" | "getDate" | "getUTCDate" | "getDay" | "getUTCDay"
-            | "getHours" | "getUTCHours" | "getMinutes" | "getUTCMinutes" | "getSeconds"
-            | "getUTCSeconds" | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset"
-            | "pop" | "shift" | "clear" | "next" | "return" | "throw" | "random" | "flat"
-            | "normalize" | "keys" | "values" | "entries" | "of" | "toArray" | "toLocaleString"
-            | "toLocaleDateString" | "toLocaleTimeString" | "toLocaleLowerCase"
-            | "toLocaleUpperCase" | "toLowerCase" | "toUpperCase" | "isWellFormed"
-            | "toWellFormed" => 0,
+            | "now" | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
+            | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
+            | "getMinutes" | "getUTCMinutes" | "getSeconds" | "getUTCSeconds"
+            | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset" | "pop" | "shift"
+            | "clear" | "next" | "return" | "random" | "flat" | "keys" | "values" | "entries"
+            | "toArray" | "toLowerCase" | "toUpperCase" => 0,
             "Object" | "Function" | "Array" | "String" | "Number" | "Boolean" | "Error"
             | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError"
-            | "URIError" | "AggregateError" | "Promise" | "ArrayBuffer" | "DataView" | "Symbol"
-            | "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" | "Uint8Array"
-            | "Uint8ClampedArray" | "Int8Array" | "Uint16Array" | "Int16Array" | "Uint32Array"
-            | "Int32Array" | "Float32Array" | "Float64Array" => 1,
+            | "URIError" | "Promise" | "ArrayBuffer" | "DataView" | "Symbol" | "Map" | "Set"
+            | "WeakMap" | "WeakSet" | "Iterator" | "Uint8Array" | "Uint8ClampedArray"
+            | "Int8Array" | "Uint16Array" | "Int16Array" | "Uint32Array" | "Int32Array"
+            | "Float32Array" | "Float64Array" => 1,
             "Date" | "UTC" => 7,
             "RegExp" => 2,
             _ => 0,
@@ -3205,6 +3841,8 @@ impl Realm {
         for (name, function) in [
             ("charAt", NativeFunction::StrCharAt),
             ("charCodeAt", NativeFunction::StrCharCodeAt),
+            ("codePointAt", NativeFunction::StrCodePointAt),
+            ("at", NativeFunction::StrAt),
             ("indexOf", NativeFunction::StrIndexOf),
             ("lastIndexOf", NativeFunction::StrLastIndexOf),
             ("includes", NativeFunction::StrIncludes),
@@ -3213,11 +3851,18 @@ impl Realm {
             ("slice", NativeFunction::StrSlice),
             ("substring", NativeFunction::StrSubstring),
             ("substr", NativeFunction::StringSubstr),
+            ("padStart", NativeFunction::StrPadStart),
+            ("padEnd", NativeFunction::StrPadEnd),
             ("toLowerCase", NativeFunction::StrToLowerCase),
             ("toUpperCase", NativeFunction::StrToUpperCase),
             ("trim", NativeFunction::StrTrim),
+            ("trimStart", NativeFunction::StrTrimStart),
+            ("trimEnd", NativeFunction::StrTrimEnd),
+            ("repeat", NativeFunction::StrRepeat),
+            ("localeCompare", NativeFunction::StrLocaleCompare),
             ("split", NativeFunction::StrSplit),
             ("replace", NativeFunction::StrReplace),
+            ("replaceAll", NativeFunction::StrReplaceAll),
             ("match", NativeFunction::StrMatch),
             ("search", NativeFunction::StrSearch),
             ("concat", NativeFunction::StrConcat),
@@ -3785,12 +4430,16 @@ impl Realm {
         );
     }
 
+    /// The ECMAScript error hierarchy, returning the `%Error.prototype%` the
+    /// derived constructors hang off. `DOMException` installs against that
+    /// object rather than against `Object.prototype`, which is the whole of
+    /// `WebIDL` §3.14.1's JavaScript binding for it.
     fn install_errors(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) {
+    ) -> ObjectId {
         let error_prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -3865,6 +4514,137 @@ impl Realm {
                 },
             );
         }
+        error_prototype
+    }
+
+    /// `DOMException` (`WebIDL` §4.4) and the `Error` prototype it hangs off.
+    ///
+    /// The heritage is the part worth being explicit about, because the IDL and
+    /// the JavaScript binding disagree on purpose. The IDL fragment declares
+    /// `interface DOMException` with **no** inheritance clause, so in the
+    /// specification's own type system a `DOMException` is not an `Error` and
+    /// nothing about `Error`'s members is inherited by it. But `WebIDL`
+    /// §3.14.1 overrides that for the JavaScript binding: "the interface
+    /// prototype object for `DOMException` has its [[Prototype]] internal slot set
+    /// to the intrinsic object %Error.prototype%" and "It also has [[`ErrorData`]]
+    /// and [[Stack]] slots, like all built-in exceptions."
+    ///
+    /// The binding wins at runtime, and it wins deliberately: `instanceof Error`
+    /// is the check real code writes when it wants to know whether a rejection or
+    /// a thrown value is an exception at all, and a `DOMException` that reported
+    /// `false` there would be a worse answer than the heritage difference it
+    /// papers over. So the prototype chain is `DOMException.prototype ->
+    /// Error.prototype -> Object.prototype`, and `String(e)` is
+    /// `Error.prototype.toString`'s `"name: message"`, both of which real code
+    /// relies on. What the binding does *not* do is make `DOMException` a
+    /// subclass in the IDL sense: there is no `DOMException` in
+    /// `TypeError.prototype`'s chain, and no error constructor derives from
+    /// `DOMException`.
+    fn install_dom_exception(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        error_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(error_prototype),
+            ..JsObject::default()
+        });
+        // WebIDL §2.7.2: an interface prototype object's @@toStringTag is the
+        // interface name, and ECMA-262 `Object.prototype.toString` step 20 reads
+        // it, so this is what makes
+        // `Object.prototype.toString.call(new DOMException())` answer
+        // `"[object DOMException]"` rather than the `[[ErrorData]]` fallback
+        // `"Error"`. Both answers are real - the object is an error and it is a
+        // DOMException - and the tag is the one the binding specifies.
+        let to_string_tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            to_string_tag.id(),
+            (
+                to_string_tag,
+                PropertyDescriptor::builtin(JsValue::String("DOMException".to_owned())),
+            ),
+        );
+        // WebIDL §2.5.2: a `readonly attribute` is an accessor on the prototype
+        // backed by an internal slot, so these are accessors and not own data
+        // properties. `Object.getOwnPropertyNames(new DOMException())` is
+        // therefore empty apart from `stack`, and a write to `e.name` is refused
+        // rather than quietly shadowing the slot.
+        for (name, getter) in [
+            ("name", NativeFunction::DomExceptionNameGetter),
+            ("message", NativeFunction::DomExceptionMessageGetter),
+            ("code", NativeFunction::DomExceptionCodeGetter),
+        ] {
+            let accessor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(getter),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(accessor),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DomExceptionConstructor,
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        // WebIDL §2.5.1: a constant is readable through the interface object and
+        // through instances, is enumerable, and is neither writable nor
+        // configurable.
+        for (constant, code) in DOM_EXCEPTION_LEGACY_CODES {
+            let value = PropertyDescriptor {
+                value: JsValue::Number(f64::from(code)),
+                writable: false,
+                getter: None,
+                setter: None,
+                enumerable: true,
+                configurable: false,
+            };
+            objects[constructor.0]
+                .properties
+                .insert(constant.to_owned(), value.clone());
+            objects[prototype.0]
+                .properties
+                .insert(constant.to_owned(), value);
+        }
+        objects[global.0].properties.insert(
+            "DOMException".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
     }
 
     fn install_function(
@@ -4043,6 +4823,12 @@ impl Realm {
         function_prototype: ObjectId,
     ) {
         Self::define_global_function(objects, global, "fetch", NativeFunction::GlobalFetch);
+        Self::define_global_function(
+            objects,
+            global,
+            "structuredClone",
+            NativeFunction::GlobalStructuredClone,
+        );
 
         Self::install_network_constructor(
             objects,
@@ -4573,9 +5359,14 @@ impl Realm {
             ("some", NativeFunction::ArraySome),
             ("find", NativeFunction::ArrayFind),
             ("findIndex", NativeFunction::ArrayFindIndex),
+            ("findLast", NativeFunction::ArrayFindLast),
+            ("findLastIndex", NativeFunction::ArrayFindLastIndex),
             ("every", NativeFunction::ArrayEvery),
             ("includes", NativeFunction::ArrayIncludes),
+            ("at", NativeFunction::ArrayAt),
+            ("flat", NativeFunction::ArrayFlat),
             ("reduce", NativeFunction::ArrayReduce),
+            ("reduceRight", NativeFunction::ArrayReduceRight),
             ("toString", NativeFunction::ArrayPrototypeToString),
             ("values", NativeFunction::ArrayValues),
             ("keys", NativeFunction::ArrayKeys),
@@ -4770,6 +5561,13 @@ impl Realm {
     #[must_use]
     pub(crate) const fn object_prototype(&self) -> ObjectId {
         self.object_prototype
+    }
+
+    /// The realm's `%MediaQueryList.prototype%`, which `matchMedia` stamps onto
+    /// each list it creates.
+    #[must_use]
+    pub(crate) const fn media_query_list_prototype(&self) -> ObjectId {
+        self.media_query_list_prototype
     }
 
     /// Make a class constructor's `prototype` property non-writable, as
@@ -5003,6 +5801,7 @@ impl Realm {
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
         roots.push(self.storage_prototype);
+        roots.push(self.media_query_list_prototype);
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
@@ -5269,7 +6068,7 @@ impl Realm {
             // ECMA-262 §10.4.3: a String exotic object lists its characters as
             // ascending integer indices ahead of the ordinary string keys.
             indices.extend(
-                (0..text.chars().count())
+                (0..utf16::utf16_length(text))
                     .map(|index| index.to_string())
                     .filter(|key| !target.properties.contains_key(key)),
             );
@@ -5315,7 +6114,7 @@ impl Realm {
             // A String exotic object only contributes its enumerable indexed
             // characters here; `length` is not enumerable.
             if first && let ObjectHost::StringPrimitive(text) = &current.host {
-                for index in 0..text.chars().count() {
+                for index in 0..utf16::utf16_length(text) {
                     let key = index.to_string();
                     if !current.properties.contains_key(&key) && seen.insert(key.clone()) {
                         names.push(key);
@@ -5717,6 +6516,24 @@ impl Realm {
                 configurable: false,
             },
         );
+        // `byteLength` is `length * BYTES_PER_ELEMENT`, which is what binary
+        // format code reads before sizing a `DataView`.
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "byte counts stay far below any precision boundary"
+        )]
+        let byte_length = (length * kind.element_size()) as f64;
+        self.objects[object.0].properties.insert(
+            "byteLength".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Number(byte_length),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         object
     }
 
@@ -5766,6 +6583,268 @@ mod tests {
     use super::{JsValue, PropertyDescriptor, Realm};
     use render_dom::Dom;
     use url::Url;
+
+    /// Every name in [`Realm::builtin_arity`] resolves to a callable the realm
+    /// actually installed.
+    ///
+    /// The arity table reads, to anyone scanning this file, like a list of the
+    /// built-ins this engine has. It was not one: it carried forty names nothing
+    /// installed, including `String.prototype.codePointAt` and `Promise.all`,
+    /// which is how a later agent concluded `codePointAt` existed. The table has
+    /// no runtime effect for a name the engine does not install - nothing ever
+    /// looks it up - so the defect was invisible to every test and visible only
+    /// to a reader. This test is what makes it visible to a machine instead.
+    ///
+    /// The direction matters. Asserting "these forty are absent" would pin the
+    /// absence and block the feature; asserting "everything listed is present"
+    /// passes the moment the feature lands, provided the arity entry is added
+    /// with it, and fails today for a claim rather than for a gap.
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the claimed-name list is the assertion; splitting it out would hide it"
+    )]
+    fn the_arity_table_only_names_the_engine_installs() {
+        let dom = Dom::new();
+        let realm = Realm::bootstrap(
+            dom.document(),
+            &Url::parse("about:blank").expect("test URL"),
+        );
+        let mut installed = std::collections::BTreeSet::new();
+        for object in realm.objects() {
+            for (key, descriptor) in &object.properties {
+                // A name is "installed" when some callable in the realm answers
+                // to it. Checking the descriptor's own value is not enough: a
+                // method on a prototype is the normal case, and `Function.prototype`
+                // methods are one hop further.
+                if descriptor.is_accessor() {
+                    continue;
+                }
+                if let JsValue::Object(target) = descriptor.value
+                    && let Some(target) = realm.object(target)
+                    && target.host.is_callable()
+                {
+                    installed.insert(key.clone());
+                }
+            }
+        }
+        let mut claims = std::collections::BTreeSet::new();
+        for name in [
+            // The arity table's own vocabulary, kept as a literal list here
+            // rather than by re-parsing the match: a test that reads the
+            // implementation cannot fail when the implementation is wrong.
+            "push",
+            "map",
+            "filter",
+            "forEach",
+            "some",
+            "every",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "includes",
+            "indexOf",
+            "lastIndexOf",
+            "charAt",
+            "charCodeAt",
+            "codePointAt",
+            "at",
+            "repeat",
+            "resolve",
+            "reject",
+            "catch",
+            "finally",
+            "get",
+            "has",
+            "add",
+            "bind",
+            "isArray",
+            "from",
+            "getOwnPropertyDescriptors",
+            "getOwnPropertySymbols",
+            "getPrototypeOf",
+            "hasOwnProperty",
+            "isPrototypeOf",
+            "propertyIsEnumerable",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "parse",
+            "exec",
+            "test",
+            "toFixed",
+            "toPrecision",
+            "match",
+            "search",
+            "localeCompare",
+            "startsWith",
+            "endsWith",
+            "sort",
+            "reduce",
+            "reduceRight",
+            "fill",
+            "flatMap",
+            "freeze",
+            "seal",
+            "preventExtensions",
+            "isFrozen",
+            "isSealed",
+            "isExtensible",
+            "getOwnPropertyNames",
+            "setPrototypeOf",
+            "trim",
+            "trimStart",
+            "trimEnd",
+            "then",
+            "set",
+            "apply",
+            "create",
+            "defineProperties",
+            "replace",
+            "replaceAll",
+            "slice",
+            "substring",
+            "substr",
+            "splice",
+            "padStart",
+            "padEnd",
+            "parseInt",
+            "assign",
+            "getOwnPropertyDescriptor",
+            "defineProperty",
+            "construct",
+            "toString",
+            "valueOf",
+            "toISOString",
+            "toJSON",
+            "toUTCString",
+            "toDateString",
+            "now",
+            "getTime",
+            "getFullYear",
+            "getUTCFullYear",
+            "getMonth",
+            "getUTCMonth",
+            "getDate",
+            "getUTCDate",
+            "getDay",
+            "getUTCDay",
+            "getHours",
+            "getUTCHours",
+            "getMinutes",
+            "getUTCMinutes",
+            "getSeconds",
+            "getUTCSeconds",
+            "getMilliseconds",
+            "getUTCMilliseconds",
+            "getTimezoneOffset",
+            "pop",
+            "shift",
+            "clear",
+            "next",
+            "return",
+            "random",
+            "flat",
+            "keys",
+            "values",
+            "entries",
+            "toArray",
+            "toLowerCase",
+            "toUpperCase",
+            "Object",
+            "Function",
+            "Array",
+            "String",
+            "Number",
+            "Boolean",
+            "Error",
+            "TypeError",
+            "RangeError",
+            "SyntaxError",
+            "ReferenceError",
+            "EvalError",
+            "URIError",
+            "Promise",
+            "ArrayBuffer",
+            "DataView",
+            "Symbol",
+            "Map",
+            "Set",
+            "WeakMap",
+            "WeakSet",
+            "Iterator",
+            "Uint8Array",
+            "Uint8ClampedArray",
+            "Int8Array",
+            "Uint16Array",
+            "Int16Array",
+            "Uint32Array",
+            "Int32Array",
+            "Float32Array",
+            "Float64Array",
+            "Date",
+            "UTC",
+            "RegExp",
+        ] {
+            claims.insert(name.to_owned());
+        }
+        let unbacked: Vec<&String> = claims
+            .iter()
+            .filter(|name| !installed.contains(*name))
+            .collect();
+        assert!(
+            unbacked.is_empty(),
+            "the arity table claims {} name(s) the engine does not install; \
+             either implement the member or drop the entry, because a listed \
+             name that does not exist reads to the next reader as a capability \
+             that does.",
+            unbacked.len()
+        );
+        assert!(unbacked.is_empty(), "not installed: {unbacked:?}");
+    }
+
+    /// Every installed constructor reports `typeof "function"`.
+    ///
+    /// `ArrayBuffer`, `DataView`, `TextEncoder` and `TextDecoder` were all
+    /// installed and all reported `"object"`, because the callable-host set was
+    /// written down twice and both copies had the same four variants missing. The
+    /// shape of the assertion is the point: a global that owns a `prototype` and
+    /// is not a function is what a broken callable set looks like from script, and
+    /// `typeof X === "function"` is the gate every feature-detection idiom in a
+    /// production bundle passes through.
+    #[test]
+    fn an_installed_constructor_reports_a_function_typeof() {
+        let dom = Dom::new();
+        let realm = Realm::bootstrap(
+            dom.document(),
+            &Url::parse("about:blank").expect("test URL"),
+        );
+        let global = realm.global_object();
+        let mut wrong = Vec::new();
+        let global_object = realm.object(global).expect("the global object exists");
+        for (key, descriptor) in &global_object.properties {
+            let JsValue::Object(value) = descriptor.value else {
+                continue;
+            };
+            // A global that owns an object-valued `prototype` is a constructor,
+            // and a constructor whose `typeof` is not `"function"` breaks every
+            // `typeof X === "function"` feature probe that guards it.
+            let Some(host) = realm.host(value) else {
+                continue;
+            };
+            let looks_like_a_constructor = realm
+                .get_property(value, "prototype")
+                .is_some_and(|property| matches!(property, JsValue::Object(_)));
+            if looks_like_a_constructor && !host.is_callable() {
+                wrong.push(key.clone());
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "these globals own a prototype but do not report `typeof \"function\"`: {wrong:?}"
+        );
+    }
 
     #[test]
     fn ordinary_properties_follow_the_prototype_chain() {

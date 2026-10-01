@@ -14,7 +14,8 @@ use url::Url;
 
 use crate::dom::{Dom, DomRevision, Namespace, NodeId, NodeKind};
 use crate::layout::{
-    FragmentId, FragmentKind, FragmentTree, PhysicalPoint, PhysicalRect, TextMeasurer, TextStyle,
+    FragmentId, FragmentKind, FragmentTree, PhysicalPoint, PhysicalRect, StoredFontRequest,
+    TextMeasurer, TextStyle,
 };
 
 use super::{BoundaryPoint, DomRange, InteractionError, Selection, compare_boundary_points};
@@ -572,6 +573,7 @@ impl<'a> InteractionScene<'a> {
                     advance: measure_character(
                         self.text_measurer,
                         rendered,
+                        &text_fragment.font,
                         text_fragment.font_size,
                         fragment.rect.size.height,
                     ),
@@ -890,9 +892,18 @@ fn match_rendered_character(
     Some((start, end))
 }
 
+/// The advance of one rendered character in the face it was painted in.
+///
+/// The request comes from the fragment the character was painted from, not from
+/// a fresh `TextStyle` built here. That is the only way a click can land on the
+/// glyph the user actually sees: the fragment's request is the one the solver
+/// measured the run's width with, and rebuilding one would let a second parse of
+/// the same declarations answer differently - which is exactly how hit testing
+/// and painting would drift apart.
 fn measure_character(
     measurer: &dyn TextMeasurer,
     character: char,
+    font: &StoredFontRequest,
     font_size: f32,
     line_height: f32,
 ) -> f32 {
@@ -903,6 +914,7 @@ fn measure_character(
             TextStyle {
                 font_size,
                 line_height,
+                font: font.request(),
             },
         )
         .advance;
@@ -1069,6 +1081,7 @@ mod tests {
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::interaction::{BoundaryPoint, SelectionDirection};
     use crate::layout::{FragmentKind, PhysicalPoint, PhysicalSize, SimpleTextMeasurer};
+    use crate::paint::TextShaper as _;
 
     use super::{
         ActivationIntent, BoundaryBias, HitTestError, InteractionLimits, InteractionResource,
@@ -1230,6 +1243,103 @@ mod tests {
         let cjk = scene.word_range_at(BoundaryPoint::new(text, 1)).unwrap();
         assert_eq!(cjk.start(), BoundaryPoint::new(text, 1));
         assert_eq!(cjk.end(), BoundaryPoint::new(text, 2));
+    }
+
+    #[test]
+    fn a_caret_boundary_lands_on_the_glyph_the_painter_drew() {
+        // The half of the axis that would be easy to get wrong: hit testing
+        // measures each character to turn an x coordinate into a DOM offset, and
+        // the painter shapes the same characters to turn the same run into
+        // glyphs. If the two disagree about the font - a `code` element is
+        // monospace by HTML §15.3.3 - then a click lands between glyphs instead
+        // of on one, and nothing else in the pipeline notices.
+        let (document, output) = render(
+            "<!doctype html><body><p id='p'><code id='c'>abcd</code></p></body>",
+            PhysicalSize {
+                width: 320.0,
+                height: 100.0,
+            },
+        );
+        let text = first_text(document.dom(), find_by_id(document.dom(), "c"));
+        let scene = InteractionScene::new(
+            document.dom(),
+            &output.layout.fragments,
+            &SimpleTextMeasurer,
+            PhysicalPoint::default(),
+            InteractionLimits::default(),
+        )
+        .unwrap();
+        let order = scene.paint_order().unwrap();
+        let maps = scene.text_maps(&order).unwrap();
+        let map = maps.iter().find(|map| map.node == text).unwrap();
+
+        // The display list's glyph run for the same fragment, which is what the
+        // rasterizer will place on the canvas.
+        let shaper = crate::paint::ReferenceTextShaper;
+        let run = {
+            let fragment = output
+                .layout
+                .fragments
+                .get(map.fragment)
+                .expect("the text map names a fragment");
+            let FragmentKind::Text(data) = &fragment.kind else {
+                panic!("a text map only names a text fragment");
+            };
+            shaper.shape_font(
+                &data.text,
+                &data.font.request(),
+                data.font_size,
+                PhysicalPoint {
+                    x: fragment.rect.origin.x,
+                    y: data.baseline,
+                },
+                crate::paint::Color::BLACK,
+            )
+        };
+        assert_eq!(
+            run.glyphs.len(),
+            map.characters.len(),
+            "the run and the text map must describe the same characters"
+        );
+        for (index, (glyph, character)) in run.glyphs.iter().zip(&map.characters).enumerate() {
+            let painted_start = map.rect.origin.x
+                + run.glyphs[..index]
+                    .iter()
+                    .map(|glyph| glyph.advance)
+                    .sum::<f32>();
+            let hit_start = map.rect.origin.x
+                + map.characters[..index]
+                    .iter()
+                    .map(|character| character.advance)
+                    .sum::<f32>();
+            assert!(
+                (painted_start - hit_start).abs() < 1e-3,
+                "character {index} is painted from x={painted_start} but hit \
+                 testing measures it from x={hit_start}"
+            );
+            assert!(
+                (glyph.advance - character.advance).abs() < 1e-3,
+                "character {index} advances {glyph_advance} when painted and {} \
+                 when hit tested",
+                character.advance,
+                glyph_advance = glyph.advance
+            );
+        }
+
+        // And the run is genuinely monospace, so the agreement above is not two
+        // copies of the same wrong answer.
+        let cell = run.glyphs[0].advance;
+        assert!(
+            run.glyphs
+                .iter()
+                .all(|glyph| (glyph.advance - cell).abs() < 1e-3),
+            "HTML §15.3.3 makes `code` monospace, so every glyph of the run is \
+             one cell wide"
+        );
+        assert!(
+            (map.rect.size.width - cell * 4.0).abs() < 1e-3,
+            "and the fragment is four cells wide, not four proportional advances"
+        );
     }
 
     #[test]

@@ -1,0 +1,145 @@
+/*
+ * Deterministic stand-in for a member centre's stylesheet, with the form rules
+ * separated out.
+ *
+ * Served in place of both external slots on the page:
+ *   https://static.member.example/member.4c8d90.css
+ *   https://static.member.example/member-form.9d2f33.css
+ *
+ * The live page really does split it that way, and the harness serves identical
+ * bytes for both, so each diagnostic this file provokes is produced twice and
+ * the diagnostic assertions use that as an exactness check.
+ *
+ * Every control has an explicit pixel width and height. A form control whose
+ * size came from the shrink-to-fit algorithm would make the fixture's geometry
+ * a function of the reference measurer, which is font-independent, so the
+ * numbers would describe the backend rather than the page.
+ *
+ * Nothing here declares geometry inside a nested block; the static Python gate
+ * reads single-compound rules with a regex that cannot see into a nested `{ }`.
+ */
+
+/* Two at-rules this engine parses and cannot use, exactly as a real page's
+ * self-hosted webfont declaration and keyframe block does. Their diagnostics
+ * appearing is the correct behaviour, and the assertions say so. */
+@font-face {
+  font-family: "Member Sans";
+  src: url("https://static.member.example/font/member-sans.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Member Serif";
+  src: url("https://static.member.example/font/member-serif.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Member Mono";
+  src: url("https://static.member.example/font/member-mono.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Member Icons";
+  src: url("https://static.member.example/font/member-icons.woff2") format("woff2");
+}
+
+@keyframes field-focus {
+  from { border-color: #d0d7de }
+  to { border-color: #d0d7de }
+}
+@-webkit-keyframes field-focus {
+  from { border-color: #d0d7de }
+  to { border-color: #d0d7de }
+}
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #f6f8fa; color: #1f2328; font-size: 15px; line-height: 24px; }
+
+.site-head { display: block; width: 1280px; height: 88px; background-color: #24292f; }
+.site-logo { display: inline-block; width: 120px; height: 36px; margin-top: 12px; margin-left: 20px; }
+.site-logo img { display: block; width: 120px; height: 36px; }
+.site-search { display: inline-block; width: 400px; height: 32px; margin-top: 12px; margin-left: 560px; }
+.site-search input { display: inline-block; width: 314px; height: 32px; }
+.site-search button { display: inline-block; width: 80px; height: 32px; background-color: #ffffff; color: #24292f; }
+.site-nav { display: block; width: 900px; height: 30px; margin-top: 10px; margin-left: 20px; }
+.site-nav a { display: inline-block; width: 140px; height: 30px; color: #ffffff; }
+
+/* The card and the rail sit side by side in a flex row, which is the only thing
+ * that puts the rail beside the card. Without the row they are ordinary blocks
+ * and stack - which is what happened the first time, and which the contract's
+ * side-rail check reported.
+ *
+ * The row is 1264 wide starting at x=8, and the content column is 940 wide
+ * inside it. Both numbers are declared here and asserted after layout, so a
+ * stylesheet that stopped reaching the engine would fail on geometry rather
+ * than on a text comparison. */
+.page-row { display: flex; width: 1264px; margin-top: 20px; margin-left: 8px; }
+.page-main { width: 940px; }
+.page-rail { width: 300px; margin-left: 24px; }
+.signin-card { display: block; width: 940px; padding-top: 16px; padding-bottom: 16px; background-color: #ffffff; border-top-width: 1px; border-top-style: solid; border-top-color: #d0d7de; }
+.card-title { display: block; width: 908px; height: 34px; margin-top: 0; margin-bottom: 8px; font-size: 24px; line-height: 34px; }
+.card-note { display: block; width: 908px; height: 26px; }
+.forgot { color: #0969da; }
+
+.form-login { display: block; width: 908px; }
+.form-news { display: block; width: 908px; margin-top: 16px; padding-top: 12px; border-top-width: 1px; border-top-style: solid; border-top-color: #d0d7de; }
+.form-quick { display: block; width: 300px; }
+.form-title { display: block; width: 908px; height: 28px; margin-top: 0; margin-bottom: 6px; font-size: 17px; line-height: 28px; }
+.orphan-block { display: block; width: 908px; margin-top: 16px; padding-top: 12px; border-top-width: 1px; border-top-style: solid; border-top-color: #d0d7de; }
+
+.form-row { display: block; width: 908px; height: 40px; margin-top: 0; }
+.row-label { display: inline-block; width: 160px; height: 30px; color: #1f2328; }
+.row-inline { display: inline-block; width: 300px; height: 30px; color: #57606a; }
+.row-field { display: inline-block; width: 280px; height: 30px; border-top-width: 1px; border-top-style: solid; border-top-color: #d0d7de; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #d0d7de; }
+.row-note { display: inline-block; width: 260px; height: 30px; color: #57606a; font-size: 13px; line-height: 30px; }
+.row-submit { display: inline-block; width: 120px; height: 32px; background-color: #1f883d; color: #ffffff; }
+
+/* The quick-add grid. Two columns whose widths are declared, so the `th` really
+ * is the narrow label column a real page's is. The form inside the table is
+ * foster-parented out by the parser, which is the case this page exists for, so
+ * the table's *used* width is measured against the cells and not against a
+ * declared total. */
+.quick-grid { display: table; width: 700px; border-collapse: collapse; border-spacing: 0; margin-top: 16px; }
+.quick-grid caption { display: table-caption; width: 700px; height: 28px; text-align: left; font-size: 14px; line-height: 28px; }
+.quick-grid thead { display: table-header-group; width: 700px; }
+.quick-grid tbody { display: table-row-group; width: 700px; }
+.quick-grid tr { display: table-row; width: 700px; }
+.quick-grid th { display: table-cell; width: 160px; height: 36px; background-color: #f6f8fa; vertical-align: middle; }
+.quick-grid td { display: table-cell; width: 520px; height: 36px; vertical-align: middle; }
+
+.panel-extra { display: block; width: 940px; height: 120px; margin-top: 20px; padding-top: 12px; border-top-width: 2px; border-top-style: solid; border-top-color: #d0d7de; }
+.panel-docs { display: block; width: 940px; height: 120px; margin-top: 20px; padding-top: 12px; border-top-width: 2px; border-top-style: solid; border-top-color: #d0d7de; }
+.panel-faq { display: block; width: 940px; margin-top: 20px; padding-top: 12px; border-top-width: 2px; border-top-style: solid; border-top-color: #d0d7de; }
+.panel-title { display: block; width: 940px; height: 30px; margin-top: 0; margin-bottom: 6px; font-size: 19px; line-height: 30px; }
+.panel-title a { color: #0969da; }
+.panel-list { display: block; width: 940px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.panel-list li { display: block; width: 940px; height: 22px; }
+.panel-list a { color: #0969da; }
+.faq-list { display: block; width: 940px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.faq-item { display: block; width: 940px; height: 46px; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #eaeef2; }
+.faq-q { color: #0969da; }
+.faq-a { display: block; width: 940px; height: 22px; color: #57606a; font-size: 13px; line-height: 22px; }
+
+.rail-toc { display: block; width: 300px; }
+.rail-title { display: block; width: 300px; height: 26px; margin-top: 0; margin-bottom: 8px; font-size: 15px; line-height: 26px; }
+.rail-title a { color: #0969da; }
+.rail-list { display: block; width: 300px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: block; width: 300px; height: 24px; }
+.rail-list a { color: #0969da; }
+.rail-card { display: block; width: 300px; margin-top: 20px; padding-top: 10px; border-top-width: 2px; border-top-style: solid; border-top-color: #d0d7de; }
+
+.site-foot { display: block; width: 1280px; height: 68px; margin-top: 28px; padding-top: 10px; background-color: #eaeef2; }
+.site-foot a { display: inline-block; width: 180px; height: 22px; margin-right: 8px; }
+.foot-note { display: block; width: 1000px; height: 20px; color: #57606a; font-size: 12px; line-height: 20px; }
+
+/* Decoration inside a conditional group rule. The geometry above does not
+ * depend on either of them, so the fixture is not asserting how this engine
+ * answers - the diagnostic assertions are. */
+@supports (selector(:focus-visible)) {
+  .row-field { border-top-color: #d0d7de }
+}
+@supports at-rule(@font-face) {
+  .site-foot { height: 76px }
+}
+@media (min-width: 1000px) {
+  .faq-a { color: #57606a }
+}
+@-moz-document url-prefix() {
+  .site-head { background-color: #24292f }
+}

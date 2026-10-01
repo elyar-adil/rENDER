@@ -22,10 +22,14 @@ use cssparser::{
     AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
     RuleBodyItemParser, RuleBodyParser, StyleSheetParser,
 };
+use render_css::at_rules::{
+    AtRuleSupport, at_rule_diagnostic, at_rule_specification, at_rule_support,
+};
 use render_css::cascade::{expand_shorthand, media_query_list_matches};
 use render_css::properties::parse_typed_property;
 use render_css::selector::{MatchContext, parse_selector_list};
 use render_css::stylesheet::parse_stylesheet;
+use render_css::supports::{SupportsCondition, evaluate_supports_condition};
 
 /// At-rules whose block is a rule list of style rules (css-cascade-5 §6,
 /// css-syntax §5.4.2) and which this engine evaluates. A rule reached through
@@ -80,10 +84,14 @@ struct Tally {
     declarations: Vec<DeclSite>,
     nested: Vec<NestedSite>,
     at_rules: BTreeMap<String, usize>,
+    /// Every `@supports` prelude, taken from the tokenizer so a comment or a
+    /// string is not counted.
+    supports: Vec<String>,
 }
 
 struct AtPrelude {
     name: String,
+    value: String,
 }
 
 struct TallyParser<'a> {
@@ -132,9 +140,10 @@ impl<'i> AtRuleParser<'i> for TallyParser<'_> {
     ) -> Result<AtPrelude, ParseError<'i, ()>> {
         // The prelude must be consumed: cssparser's `parse_entirely` rejects a
         // closure that leaves input behind, which would drop the whole at-rule.
-        let _ = consume_raw(input);
+        let value = consume_raw(input);
         Ok(AtPrelude {
             name: name.to_ascii_lowercase(),
+            value,
         })
     }
 
@@ -160,7 +169,16 @@ impl<'i> AtRuleParser<'i> for TallyParser<'_> {
         }
         let mut container = self.container.clone();
         container.push(name.clone());
-        let active = self.active && RULE_LIST_AT_RULES.contains(&name.as_str());
+        // A rule reached through a `@supports` block only counts as active when
+        // the condition is met, which is the same evaluation the engine makes
+        // when it flattens the block. Asking this walk the same question is what
+        // keeps the corpus's "inert" column from contradicting the engine.
+        let active = if name == "supports" {
+            self.tally.supports.push(prelude.value.clone());
+            self.active && evaluate_supports_condition(&prelude.value).applies()
+        } else {
+            self.active && RULE_LIST_AT_RULES.contains(&name.as_str())
+        };
         parse_nested(input, self.tally, &container, active);
         Ok(())
     }
@@ -346,11 +364,14 @@ struct FileReport {
     nested: Vec<NestedSite>,
     media_gated: usize,
     media_active: usize,
-    supports_rules: usize,
+    supports: SupportsTally,
     at_rules: BTreeMap<String, usize>,
     dropped_rules: Vec<String>,
     dropped_decls: Vec<String>,
     dropped_decl_sites: Vec<String>,
+    /// Byte offset and source text of every declaration this file discarded, so
+    /// each one can be looked up rather than counted.
+    discarded: Vec<(usize, String)>,
     reasons: BTreeMap<String, usize>,
     diagnostics: BTreeMap<String, usize>,
     blocked_features: BTreeMap<String, usize>,
@@ -376,6 +397,62 @@ struct DecorationTally {
     unexpanded: usize,
     line_none: usize,
     by_value: BTreeMap<String, usize>,
+}
+
+/// What the corpus's `@supports` conditions evaluate to, so the report can say
+/// which of the ways a block is dropped is happening and how much source each
+/// way accounts for.
+#[derive(Default)]
+struct SupportsTally {
+    seen: usize,
+    true_conditions: usize,
+    false_conditions: usize,
+    invalid: usize,
+    undecidable: usize,
+    /// Style rules the tokenizer found inside some `@supports` block.
+    rules_inside: usize,
+    /// How many of those the condition let through.
+    rules_kept: usize,
+    by_subject: BTreeMap<String, usize>,
+}
+
+/// Evaluate one corpus `@supports` condition and record what happened, keyed by
+/// the thing the condition asks about so the report names it.
+fn classify_supports(condition: &str) -> (SupportsTally, &'static str) {
+    let subject = condition
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .map_or_else(
+            || truncate(condition, 40),
+            |(name, _)| truncate(name.trim(), 40),
+        );
+    let mut by_subject = BTreeMap::new();
+    *by_subject.entry(subject).or_default() += 1;
+    let outcome = evaluate_supports_condition(condition);
+    let mut tally = SupportsTally {
+        seen: 1,
+        by_subject,
+        ..SupportsTally::default()
+    };
+    let bucket = match outcome {
+        SupportsCondition::Evaluated(true) => {
+            tally.true_conditions = 1;
+            "true"
+        }
+        SupportsCondition::Evaluated(false) => {
+            tally.false_conditions = 1;
+            "false"
+        }
+        SupportsCondition::Invalid => {
+            tally.invalid = 1;
+            "invalid"
+        }
+        SupportsCondition::Undecidable(_) => {
+            tally.undecidable = 1;
+            "undecidable"
+        }
+    };
+    (tally, bucket)
 }
 
 /// Every `(feature)` name in a media query list, so the report can attribute
@@ -457,16 +534,24 @@ fn report(path: &Path, source: &str) -> FileReport {
     let mut dropped_rules = Vec::new();
     let mut rules_seen = 0_usize;
     let mut rules_inert = 0_usize;
-    let mut supports_rules = 0_usize;
+    // How much of the corpus sat inside a `@supports` block, and how much of
+    // that survives the condition. Before the condition was evaluated at all,
+    // every rule in both groups reached the cascade, so this is the number that
+    // says how much the two were overlapping.
+    let mut supports_rules_total = 0_usize;
+    let mut supports_rules_kept = 0_usize;
     for rule in &tally.rules {
+        if rule.container.iter().any(|name| name == "supports") {
+            supports_rules_total += 1;
+            if rule.active {
+                supports_rules_kept += 1;
+            }
+        }
         if !rule.active {
             rules_inert += 1;
             continue;
         }
         rules_seen += 1;
-        if rule.container.iter().any(|name| name == "supports") {
-            supports_rules += 1;
-        }
         if let Err(error) = parse_selector_list(&rule.prelude) {
             let reason = normalize(&error.to_string());
             *reasons.entry(reason.clone()).or_default() += 1;
@@ -526,6 +611,19 @@ fn report(path: &Path, source: &str) -> FileReport {
     let mut diagnostics: BTreeMap<String, usize> = BTreeMap::new();
     for diagnostic in &sheet.diagnostics {
         *diagnostics.entry(diagnostic.message.clone()).or_default() += 1;
+    }
+    // Where each discarded declaration was reported, so the offsets can be
+    // looked up in the source. The declaration's own byte offset is what has to
+    // be readable, so the line/column the diagnostic carries is turned back into
+    // one; a report that only said "134 of these" could not be checked against
+    // the sheet at all.
+    let mut discarded: Vec<(usize, String)> = Vec::new();
+    for diagnostic in &sheet.diagnostics {
+        if !diagnostic.message.starts_with("invalid declaration:") {
+            continue;
+        }
+        let offset = byte_offset(source, diagnostic.line, diagnostic.column);
+        discarded.push((offset, source[offset..].chars().take(28).collect()));
     }
 
     // The `text-decoration` shorthand, measured by asking the engine's own
@@ -622,6 +720,23 @@ fn report(path: &Path, source: &str) -> FileReport {
         }
     }
 
+    let mut supports = SupportsTally {
+        rules_inside: supports_rules_total,
+        rules_kept: supports_rules_kept,
+        ..SupportsTally::default()
+    };
+    for condition in &tally.supports {
+        let (one, _) = classify_supports(condition);
+        supports.seen += one.seen;
+        supports.true_conditions += one.true_conditions;
+        supports.false_conditions += one.false_conditions;
+        supports.invalid += one.invalid;
+        supports.undecidable += one.undecidable;
+        for (subject, count) in one.by_subject {
+            *supports.by_subject.entry(subject).or_default() += count;
+        }
+    }
+
     FileReport {
         path: path.display().to_string(),
         bytes: source.len(),
@@ -633,11 +748,12 @@ fn report(path: &Path, source: &str) -> FileReport {
         nested: std::mem::take(&mut tally.nested),
         media_gated,
         media_active,
-        supports_rules,
+        supports,
         at_rules: tally.at_rules,
         dropped_rules,
         dropped_decls,
         dropped_decl_sites,
+        discarded,
         reasons,
         diagnostics,
         blocked_features,
@@ -655,6 +771,29 @@ fn normalize(message: &str) -> String {
         Some(index) => message[..index].to_owned(),
         None => message.to_owned(),
     }
+}
+
+/// The byte offset a diagnostic's 1-based `(line, column)` names.
+///
+/// `cssparser` counts a line from 1 and a column from 1 (CSS Syntax §3.2), and
+/// the column counts characters rather than bytes, so this walks the source
+/// rather than adding the two up. A diagnostic that cannot be turned back into
+/// an offset is clamped to the end of the source, which keeps the report
+/// readable instead of panicking on a column past the last line.
+fn byte_offset(source: &str, line: u32, column: u32) -> usize {
+    let mut offset = 0;
+    for _ in 1..line.max(1) {
+        match source[offset..].find('\n') {
+            Some(index) => offset += index + 1,
+            None => return source.len(),
+        }
+    }
+    let rest = &source[offset..];
+    let end = rest
+        .char_indices()
+        .nth(column.max(1) as usize - 1)
+        .map_or(rest.len(), |(index, _)| index);
+    offset + end
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -708,12 +847,14 @@ fn main() {
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
     let mut diagnostics: BTreeMap<String, usize> = BTreeMap::new();
     let mut lost_decls: BTreeMap<String, usize> = BTreeMap::new();
+    let mut discarded_total = 0_usize;
+    let mut discarded_by_file: Vec<(String, Vec<(usize, String)>)> = Vec::new();
     let mut blocked_features: BTreeMap<String, usize> = BTreeMap::new();
     let mut invalid_values: BTreeMap<String, usize> = BTreeMap::new();
     let mut untyped_values: BTreeMap<String, usize> = BTreeMap::new();
     let mut shorthand_values: BTreeMap<String, usize> = BTreeMap::new();
     let mut invalid_samples: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut supports_rules = 0_usize;
+    let mut supports = SupportsTally::default();
     let mut media_gated = 0_usize;
     let mut media_active = 0_usize;
     let mut nested_total = 0_usize;
@@ -758,6 +899,10 @@ fn main() {
         for (message, count) in &file.diagnostics {
             *diagnostics.entry(message.clone()).or_default() += count;
         }
+        if !file.discarded.is_empty() {
+            discarded_total += file.discarded.len();
+            discarded_by_file.push((file.path.clone(), file.discarded.clone()));
+        }
         for (feature, count) in &file.blocked_features {
             *blocked_features.entry(feature.clone()).or_default() += count;
         }
@@ -778,7 +923,16 @@ fn main() {
                 }
             }
         }
-        supports_rules += file.supports_rules;
+        supports.seen += file.supports.seen;
+        supports.true_conditions += file.supports.true_conditions;
+        supports.false_conditions += file.supports.false_conditions;
+        supports.invalid += file.supports.invalid;
+        supports.undecidable += file.supports.undecidable;
+        supports.rules_inside += file.supports.rules_inside;
+        supports.rules_kept += file.supports.rules_kept;
+        for (subject, count) in &file.supports.by_subject {
+            *supports.by_subject.entry(subject.clone()).or_default() += count;
+        }
         media_gated += file.media_gated;
         media_active += file.media_active;
         nested_total += file.nested.len();
@@ -833,6 +987,21 @@ fn main() {
     );
     let _ = writeln!(
         out,
+        "declarations the syntax layer discarded (CSS Syntax §5.4.4/§5.4.5), \
+         each reported at its own first token: {}",
+        discarded_total
+    );
+    for (path, sites) in &discarded_by_file {
+        let _ = writeln!(out, "  {} ({}):", path, sites.len());
+        for (offset, text) in sites.iter().take(6) {
+            let _ = writeln!(out, "    byte {offset:>7}  {}", truncate(text, 60));
+        }
+        if sites.len() > 6 {
+            let _ = writeln!(out, "    ... and {} more", sites.len() - 6);
+        }
+    }
+    let _ = writeln!(
+        out,
         "nested rules (CSS Nesting §3.1): {nested_total} covering {nested_bytes} bytes",
     );
     if nested_total > 0 {
@@ -846,12 +1015,46 @@ fn main() {
     );
     let _ = writeln!(
         out,
-        "@supports: {supports_rules} rules applied unconditionally (query never evaluated)"
+        "@supports: {} blocks, evaluated against CSS Conditional 3 §6: \
+         {} true (applied), {} false (dropped), {} invalid, {} unanswerable here",
+        supports.seen,
+        supports.true_conditions,
+        supports.false_conditions,
+        supports.invalid,
+        supports.undecidable
+    );
+    for (subject, count) in supports.by_subject.iter().rev() {
+        let _ = writeln!(out, "    {count:>6}  {subject}");
+    }
+    let _ = writeln!(
+        out,
+        "  {} style rules sat inside those blocks; {} of them survive a met condition \
+         and {} are dropped by an unmet one (before the condition was read, all {} applied)",
+        supports.rules_inside,
+        supports.rules_kept,
+        supports.rules_inside.saturating_sub(supports.rules_kept),
+        supports.rules_inside
     );
 
     let _ = writeln!(out, "\nat-rule occurrences (whole corpus):");
     for (name, count) in at_rules.iter().rev() {
         let _ = writeln!(out, "  {name:<24} {count:>6}");
+    }
+
+    let _ = writeln!(
+        out,
+        "\nat-rules this engine parses and then discards, each with the section that defines it \
+         and the diagnostic it now reports:"
+    );
+    for (name, count) in at_rules.iter().rev() {
+        if at_rule_support(name) == AtRuleSupport::Unimplemented {
+            let _ = writeln!(
+                out,
+                "  {count:>6}  @{name}  [{}]  -> \"{}\"",
+                at_rule_specification(name).unwrap_or("?"),
+                at_rule_diagnostic(name)
+            );
+        }
     }
 
     let _ = writeln!(

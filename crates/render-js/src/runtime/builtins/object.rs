@@ -292,7 +292,7 @@ impl JsRuntime {
             NativeFunction::ObjectLookupSetter => {
                 self.object_lookup_accessor(receiver, arguments, false)
             }
-            NativeFunction::ErrorPrototypeToString => Ok(self.error_to_string(receiver)),
+            NativeFunction::ErrorPrototypeToString => Ok(self.error_to_string(dom, receiver)),
             other => self.dispatch_math_native(dom, other, receiver, arguments),
         }
     }
@@ -447,23 +447,54 @@ impl JsRuntime {
         Ok(JsValue::Object(object))
     }
 
-    pub(in crate::runtime) fn error_to_string(&self, receiver: ObjectId) -> JsValue {
-        let name = self
-            .realm
-            .get_property(receiver, "name")
-            .unwrap_or_else(|| JsValue::String("Error".to_owned()))
-            .to_js_string();
-        let message = self
-            .realm
-            .get_property(receiver, "message")
-            .unwrap_or_else(|| JsValue::String(String::new()))
-            .to_js_string();
+    /// ECMA-262 §20.1.3.1 `Error.prototype.toString`, read through `Get` so an
+    /// accessor counts.
+    ///
+    /// `Get`, not the descriptor's value slot: `DOMException.prototype`'s `name`
+    /// and `message` are `WebIDL` §2.5.2 readonly attributes, which are accessors
+    /// reading internal slots, so a read that skipped the accessor would see the
+    /// accessor's unused value slot and answer `undefined` for a perfectly good
+    /// exception. The same is true of a user-written `class MyError extends Error
+    /// { get name() { return "My"; } }`, which this now also honours.
+    pub(in crate::runtime) fn error_to_string(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> JsValue {
+        let name = self.error_string_member(dom, receiver, "name", "Error");
+        let message = self.error_string_member(dom, receiver, "message", "");
         let result = match (name.is_empty(), message.is_empty()) {
             (true, _) => message,
             (_, true) => name,
             (false, false) => format!("{name}: {message}"),
         };
         JsValue::String(result)
+    }
+
+    /// One `Get(this, name)` of `Error.prototype.toString`, with the
+    /// `Error.prototype` default the specification gives for a missing member.
+    fn error_string_member(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        key: &str,
+        fallback: &str,
+    ) -> String {
+        let value = self
+            .realm
+            .get_descriptor(receiver, key)
+            .map(|descriptor| {
+                if descriptor.is_accessor() {
+                    self.get_value(dom, receiver, key)
+                } else {
+                    Ok(descriptor.value)
+                }
+            })
+            .unwrap_or(Ok(JsValue::Undefined));
+        match value {
+            Ok(JsValue::Undefined) | Err(_) => fallback.to_owned(),
+            Ok(value) => value.to_js_string(),
+        }
     }
 
     pub(in crate::runtime) fn object_assign(
@@ -1041,6 +1072,16 @@ impl JsRuntime {
             Some(ObjectHost::SymbolInstance(_)) => "Symbol",
             Some(ObjectHost::DateInstance(_)) => "Date",
             Some(ObjectHost::ErrorConstructor(_) | ObjectHost::ErrorInstance) => "Error",
+            // WebIDL §2.7.2 gives the interface prototype a @@toStringTag of the
+            // interface name, and ECMA-262 `Object.prototype.toString` step 20
+            // reads it through the prototype chain, so the tag above already
+            // answers "DOMException" for an instance. This arm is the fallback
+            // for the case where that tag has been deleted off the prototype
+            // chain - and "Error" is right there, because §3.14.1 gives the
+            // object an [[ErrorData]] slot like any other built-in exception.
+            Some(ObjectHost::DomExceptionConstructor | ObjectHost::DomException { .. }) => {
+                "DOMException"
+            }
             Some(ObjectHost::Promise(_) | ObjectHost::PromiseSettler { .. }) => "Promise",
             Some(ObjectHost::Collection { kind, .. } | ObjectHost::CollectionConstructor(kind)) => {
                 kind.tag()

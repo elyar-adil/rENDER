@@ -4,6 +4,8 @@ pub mod cache;
 pub mod chrome;
 pub mod editor;
 pub mod font_backend;
+pub mod font_faces;
+pub mod font_matching;
 pub mod home;
 pub mod images;
 pub mod model;

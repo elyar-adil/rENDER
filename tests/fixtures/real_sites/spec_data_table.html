@@ -1,0 +1,400 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of a specification page whose centrepiece is a *dense
+  normative table*: row groups, a caption, `colspan`/`rowspan` merged cells,
+  two `colgroup`s written with `span`, and a second, wider index table with
+  `th scope=row` row headers.
+
+  The shape was taken from a live W3C Technical Report
+  (https://www.w3.org/TR/css-position-3/, captured 2026-09-28). The captured
+  `table.data#abspos-auto` is exactly this shape:
+
+      <table class="data" id="abspos-auto">
+        <caption> Summary of rules for <code>dir=ltr</code> ... </caption>
+        <colgroup span="5"><colgroup span="1">
+        <thead><tr><th colspan="5">Is auto?<th rowspan="2">Result</thead>
+        <tbody><tr><td>?<td>?<td>?<td colspan="2">any ... </tbody>
+
+  with cells such as `<td colspan="2" rowspan="3">any`, and a companion
+  `table.index` whose `thead` carries ten column headers over `th scope=row`
+  row headers. What is dropped here: the ReSpec-generated ids and `ref-for-`
+  cross-reference attributes, the bikeshed `data-*` payloads, the diff
+  highlighting, and the embedded bikeshed stylesheet. The prose is fabricated,
+  as it is in the other five fixtures.
+
+  The title is the Chinese translation of the captured page's title, which is
+  what a Chinese-language mirror of a Technical Report serves. It is non-ASCII
+  on purpose: the static gate reads the title to observe the encoding path, and
+  an all-ASCII title would make that unobservable.
+
+  Why this page shape exists in the harness: CSS 2.1 section 17 landed this
+  session with 34 unit tests and had never seen a table that was not a
+  single-row grid. Merged cells, a caption and multiple row groups interact
+  with section 17.5.2 column widths and section 17.5.3 row heights, and none of
+  that interaction is reachable from a unit test alone.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see spec_data_table.css).
+-->
+<title>CSS 定位布局 第 3 级规范 - 绝对定位盒模型取值汇总</title>
+<meta name="description" content="CSS Positioned Layout Module Level 3 的绝对定位盒模型取值汇总表。">
+<link rel="stylesheet" href="https://www.w3.org/StyleSheets/TR/2021/base.css">
+<link rel="stylesheet" href="https://www.w3.org/StyleSheets/TR/2021/normative-tables.css">
+<script defer src="https://www.w3.org/scripts/bikeshed-init.0a1b2c.js"></script>
+<style>
+  /* An embedded sheet, so the diagnostic-set assertion can tell the two sources
+   * apart: everything in the two external sheets is reported once per slot, and
+   * everything here exactly once. The legacy star hack below is the
+   * declaration-list error a real page carries and CSS Syntax 5.4.4 requires a
+   * browser to drop; its diagnostic is the one that must never go missing,
+   * because a silent drop here takes the whole declaration block with it. */
+  .spec-article { *zoom: 1; background-color: #ffffff }
+</style>
+</head>
+<body>
+<header class="spec-head">
+  <a class="spec-logo" href="https://www.w3.org/"><img src="https://www.w3.org/I/m/tr/logos/20081108/W3C" width="72" height="48" alt="万维网联盟"></a>
+  <p class="spec-eyebrow">CSS 定位布局模块 第 3 级</p>
+  <form class="spec-search" role="search" action="https://www.w3.org/Search/" method="get">
+    <input type="search" name="q" placeholder="搜索本规范">
+    <button type="submit">搜索</button>
+  </form>
+  <nav class="spec-nav" aria-label="规范导航">
+    <a href="https://www.w3.org/TR/css-position-3/">本规范</a>
+    <a href="https://www.w3.org/TR/css-position/#abspos-overflow">最新草案</a>
+    <a href="https://www.w3.org/TR/css2/">CSS 2.1</a>
+    <a href="https://www.w3.org/TR/css-values-3/">CSS 值</a>
+    <a href="https://www.w3.org/TR/css-display-3/">CSS 显示</a>
+    <a href="https://www.w3.org/TR/2021/CR-css-position-3-20211115/">候选推荐</a>
+  </nav>
+</header>
+<main class="page-main">
+  <div class="spec-columns">
+  <article class="spec-article">
+    <section class="spec-clause" id="summary">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#abspos-auto">绝对定位的取值汇总</a></h2>
+      <p class="clause-prose">下表汇总水平书写模式下绝对定位盒的取值规则。表头中的问号表示该值可以是 <code class="clause-code">auto</code>，也可以是长度。</p>
+    </section>
+    <section class="spec-clause spec-clause-tall" id="rules">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#abspos-rules">规则表</a></h2>
+      <p class="clause-prose">每一行是一组取值组合，最后一列是四个偏移量的求解结果。若某一项的 <code class="clause-code">auto</code> 之外还允许任意长度，该单元格跨越两列。</p>
+      <div class="table-scroll">
+        <table class="data" id="abspos-auto">
+          <caption>水平书写模式下 <code class="clause-code">dir=ltr</code> 的取值汇总</caption>
+          <colgroup class="first" span="5"></colgroup>
+          <colgroup class="last" span="1"></colgroup>
+          <thead>
+            <tr>
+              <th colspan="5" scope="colgroup">是否为 auto</th>
+              <th rowspan="2" scope="col">结果</th>
+            </tr>
+            <tr>
+              <th scope="col">left</th>
+              <th scope="col">width</th>
+              <th scope="col">right</th>
+              <th scope="col">margin-left</th>
+              <th scope="col">margin-right</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td colspan="2">任意
+                <ul class="cell-list">
+                  <li>auto 外边距为零</li>
+                  <li>left 取静态位置</li>
+                  <li>width 取收缩到适应</li>
+                  <li>right 求解</li>
+                </ul>
+              </td>
+              <td rowspan="7" class="cell-tall">由 left 与 width 求解，或由 right 与 width 求解</td>
+            </tr>
+            <tr>
+              <td rowspan="4">?</td>
+              <td rowspan="4">?</td>
+              <td rowspan="4">?</td>
+              <td>?</td>
+              <td>?</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>auto 外边距分走剩余空间</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>右外边距取得负的剩余空间</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>把 right 当作 auto</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td colspan="2">任意
+                <ul class="cell-list">
+                  <li>auto 外边距为零</li>
+                  <li>left 取静态位置</li>
+                  <li>width 按指定值</li>
+                  <li>right 求解</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td colspan="2">任意
+                <ul class="cell-list">
+                  <li>auto 外边距为零</li>
+                  <li>left 求解</li>
+                  <li>width 取收缩到适应</li>
+                  <li>right 按指定值</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td colspan="2" rowspan="3">任意
+                <ul class="cell-list">
+                  <li>left 与 right 同时按指定值</li>
+                  <li>width 求解</li>
+                  <li>auto 外边距分走剩余空间</li>
+                </ul>
+              </td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+              <td>?</td>
+            </tr>
+            <tr>
+              <td>长度</td>
+              <td>?</td>
+              <td>?</td>
+              <td colspan="2">auto 外边距为零</td>
+              <td rowspan="4">由 left 与 right 求解 width，over-constrained 时忽略 right</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>长度</td>
+              <td>?</td>
+              <td colspan="2">auto 外边距分走剩余空间</td>
+            </tr>
+            <tr>
+              <td>?</td>
+              <td>?</td>
+              <td>长度</td>
+              <td colspan="2">auto 外边距分走剩余空间</td>
+            </tr>
+            <tr>
+              <td>auto</td>
+              <td>auto</td>
+              <td>auto</td>
+              <td>静态位置</td>
+              <td>静态位置</td>
+            </tr>
+          </tbody>
+          <tfoot>
+            <tr>
+              <th colspan="5" scope="row">over-constrained 时忽略的边由书写模式决定</th>
+              <td>从右向左书写时忽略 left</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </section>
+    <section class="spec-clause spec-clause-tall" id="index">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#property-index">属性索引</a></h2>
+      <p class="clause-prose">本节引用的每个属性，连同其取值、初始值、适用元素与计算值。</p>
+      <div class="table-scroll">
+        <table class="index" id="property-index">
+          <caption>属性索引，按字母顺序排列</caption>
+          <thead>
+            <tr>
+              <th scope="col">属性</th>
+              <th scope="col">取值</th>
+              <th scope="col">初始值</th>
+              <th scope="col">适用于</th>
+              <th scope="col">继承</th>
+              <th scope="col">百分比</th>
+              <th scope="col">动画类型</th>
+              <th scope="col">规范顺序</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-bottom">bottom</a></th>
+              <td>auto | 长度或百分比</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>参照包含块的尺寸</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-inset">inset</a></th>
+              <td>一到四个偏移量</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>见各个偏移属性</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-inset-block">inset-block</a></th>
+              <td>一到两个块向偏移量</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>见各个偏移属性</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-left">left</a></th>
+              <td>auto | 长度或百分比</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>参照包含块的尺寸</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-position">position</a></th>
+              <td>static | relative | absolute | sticky | fixed</td>
+              <td>static</td>
+              <td>除表列组和表列外的所有元素</td>
+              <td>否</td>
+              <td>不适用</td>
+              <td>离散</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-right">right</a></th>
+              <td>auto | 长度或百分比</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>参照包含块的尺寸</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+            <tr>
+              <th scope="row"><a href="https://www.w3.org/TR/css-position-3/#propdef-top">top</a></th>
+              <td>auto | 长度或百分比</td>
+              <td>auto</td>
+              <td>定位元素</td>
+              <td>否</td>
+              <td>参照包含块的尺寸</td>
+              <td>按计算值类型</td>
+              <td>按文法</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="spec-clause" id="stacking">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#stacking">层叠上下文</a></h2>
+      <p class="clause-prose">定位元素的绘制顺序由层叠上下文决定，与它在文档中的位置无关。表格单元格的层叠顺序由其层叠层决定。</p>
+    </section>
+    <section class="spec-clause" id="absolute-sizes">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#absolute-sizes">绝对定位盒的尺寸</a></h2>
+      <p class="clause-prose">既非 left 也非 right 为 auto 时，width 按指定值使用；两者皆为 auto 时，width 取收缩到适应。</p>
+    </section>
+    <section class="spec-clause" id="over-constrained">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#over-constrained">过度约束</a></h2>
+      <p class="clause-prose">当 left、width 与 right 三者都非 auto 且方程无解时，忽略书写模式方向上末端的那一项。</p>
+    </section>
+    <section class="spec-clause" id="table-cell">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#table-cell">表格单元格</a></h2>
+      <p class="clause-prose">表格单元格上的相对定位是相对于表格的，而不是相对于包含块。定位表格本身不影响任何单元格的布局。</p>
+    </section>
+    <section class="spec-clause" id="direction">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#direction">书写方向</a></h2>
+      <p class="clause-prose">在从右向左的书写方向中，上表的对称关系左右互换，忽略的边也随之改变。</p>
+    </section>
+    <section class="spec-clause" id="references">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#references">参考文献</a></h2>
+      <p class="clause-prose">层叠与绘制、盒模型、外边距、逻辑属性。</p>
+    </section>
+    <section class="spec-clause" id="index-exports">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#index-exports">术语索引</a></h2>
+      <p class="clause-prose">本规范使用的每一个术语，及其定义所在的章节。</p>
+    </section>
+    <section class="spec-clause" id="box-decoration">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#box-decoration">盒修饰与绝对定位</a></h2>
+      <p class="clause-prose">一个绝对定位的盒如果带有分隔线，其分隔线画在其外边距盒之外，位置不受偏移量影响。</p>
+    </section>
+    <section class="spec-clause spec-clause-figure" id="acknowledgements">
+      <h2 class="clause-title"><a href="https://www.w3.org/TR/css-position-3/#acknowledgements">致谢</a></h2>
+      <p class="clause-prose">本节记录对本规范提出过编辑意见的人。</p>
+      <figure class="clause-figure">
+        <img src="https://www.w3.org/TR/css-position-3/images/contributing.png" width="480" height="200" alt="参与本规范编辑的组织徽标">
+        <figcaption class="clause-caption">图 1：参与本规范编辑的组织</figcaption>
+      </figure>
+    </section>
+  </article>
+  <aside class="page-rail">
+    <nav class="rail-toc" aria-label="本文目录">
+      <h2 class="rail-title">本文目录</h2>
+      <ul class="rail-list">
+        <li><a href="https://www.w3.org/TR/css-position-3/#summary">取值汇总</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#rules">规则表</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#index">属性索引</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#stacking">层叠上下文</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#absolute-sizes">绝对定位盒的尺寸</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#over-constrained">过度约束</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#table-cell">表格单元格</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#direction">书写方向</a></li>
+      </ul>
+    </nav>
+    <section class="rail-card" id="rail-status">
+      <h2 class="rail-title"><a href="https://www.w3.org/TR/css-position-3/#status">本规范状态</a></h2>
+      <p class="rail-prose">本文为工作草案，不构成任何形式的建议。</p>
+      <ul class="rail-list">
+        <li><a href="https://www.w3.org/TR/2021/CR-css-position-3-20211115/">候选推荐</a></li>
+        <li><a href="https://www.w3.org/TR/2021/WD-css-position-3-20211115/">工作草案</a></li>
+        <li><a href="https://www.w3.org/TR/css-position-3/#changes">修订历史</a></li>
+      </ul>
+    </section>
+    <section class="rail-card" id="rail-related">
+      <h2 class="rail-title"><a href="https://www.w3.org/TR/css2/">相关规范</a></h2>
+      <ul class="rail-list">
+        <li><a href="https://www.w3.org/TR/css-values-3/">CSS 值与单位</a></li>
+        <li><a href="https://www.w3.org/TR/css-display-3/">CSS 显示</a></li>
+        <li><a href="https://www.w3.org/TR/css2/#visuren">CSS 2.1 定位</a></li>
+      </ul>
+    </section>
+  </aside>
+  </div>
+</main>
+<footer class="spec-foot">
+  <a href="https://www.w3.org/policies/#copyright">版权</a>
+  <a href="https://www.w3.org/policies/#w3c_terms">条款</a>
+  <a href="https://www.w3.org/TR/css-position-3/#acknowledgements">贡献者</a>
+  <a href="https://www.w3.org/TR/css-position-3/">规范首页</a>
+  <p class="foot-note">本页为离线夹具，内容经过裁剪；所有资源响应都由本地确定性字节提供。</p>
+</footer>
+</body>
+</html>

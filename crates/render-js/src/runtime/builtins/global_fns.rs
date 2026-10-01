@@ -17,6 +17,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
 use crate::runtime::types::ConsoleLevel;
@@ -24,6 +25,7 @@ use crate::runtime::types::ConsoleMessage;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::MAX_BUFFERED_CONSOLE_MESSAGES;
 use crate::runtime::types::TimerKind;
+use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -54,7 +56,21 @@ impl JsRuntime {
         output
     }
 
-    fn base64_decode(text: &str) -> Result<String, JsError> {
+    /// Infra §"forgiving-base64 decode".
+    ///
+    /// Every rejection in the algorithm is the same exception: "throw an
+    /// `InvalidCharacterError` `DOMException`". Making that a `DOMException`
+    /// rather than the engine's generic `Error` is what lets
+    /// `catch (e) { if (e.name === "InvalidCharacterError") ... }` - the form
+    /// every base64 wrapper in the wild uses - take the right branch, and what
+    /// makes `e instanceof DOMException` true instead of false.
+    fn base64_decode(&mut self, text: &str) -> Result<String, JsError> {
+        let invalid = |runtime: &mut Self| {
+            runtime.dom_exception(
+                DomExceptionName::InvalidCharacter,
+                "The string to be decoded contains invalid characters",
+            )
+        };
         let compact = text
             .chars()
             .filter(|character| !character.is_ascii_whitespace())
@@ -63,7 +79,7 @@ impl JsRuntime {
             return Ok(String::new());
         }
         if compact.len() % 4 != 0 {
-            return Err(JsError::dom("Invalid character in string"));
+            return Err(invalid(self));
         }
         let value = |character: u8| -> Option<u8> {
             match character {
@@ -78,18 +94,22 @@ impl JsRuntime {
         let bytes = compact.as_bytes();
         let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
         for chunk in bytes.chunks_exact(4) {
-            let first =
-                value(chunk[0]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
-            let second =
-                value(chunk[1]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
+            let Some(first) = value(chunk[0]) else {
+                return Err(invalid(self));
+            };
+            let Some(second) = value(chunk[1]) else {
+                return Err(invalid(self));
+            };
             decoded.push((first << 2) | (second >> 4));
             if chunk[2] != b'=' {
-                let third =
-                    value(chunk[2]).ok_or_else(|| JsError::dom("Invalid character in string"))?;
+                let Some(third) = value(chunk[2]) else {
+                    return Err(invalid(self));
+                };
                 decoded.push((second << 4) | (third >> 2));
                 if chunk[3] != b'=' {
-                    let fourth = value(chunk[3])
-                        .ok_or_else(|| JsError::dom("Invalid character in string"))?;
+                    let Some(fourth) = value(chunk[3]) else {
+                        return Err(invalid(self));
+                    };
                     decoded.push((third << 6) | fourth);
                 }
             }
@@ -105,6 +125,24 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            NativeFunction::DomExceptionNameGetter
+            | NativeFunction::DomExceptionMessageGetter
+            | NativeFunction::DomExceptionCodeGetter => {
+                self.dom_exception_accessor(receiver, function)
+            }
+            // `matchMedia` and the `MediaQueryList` listener methods are
+            // observer machinery, so they are dispatched from `observers.rs`;
+            // listing them here is what makes a missing arm a compile error
+            // rather than a `TypeError` at runtime.
+            NativeFunction::WindowMatchMedia
+            | NativeFunction::MediaQueryListMediaGetter
+            | NativeFunction::MediaQueryListMatchesGetter
+            | NativeFunction::MediaQueryListAddEventListener
+            | NativeFunction::MediaQueryListRemoveEventListener
+            | NativeFunction::MediaQueryListAddListener
+            | NativeFunction::MediaQueryListRemoveListener => {
+                self.dispatch_observers_native(dom, function, receiver, arguments)
+            }
             NativeFunction::CreateComment
             | NativeFunction::ReflectGet
             | NativeFunction::ReflectSet
@@ -153,6 +191,33 @@ impl JsRuntime {
             | NativeFunction::FormDataDelete
             | NativeFunction::FormDataEntries => {
                 self.dispatch_fetch_native(dom, function, receiver, arguments)
+            }
+            // The Encoding Standard and `DataView` share one dispatcher so the
+            // chain has a single entry point for the buffer-oriented globals.
+            NativeFunction::TextEncoderEncode
+            | NativeFunction::TextEncoderEncodeInto
+            | NativeFunction::TextDecoderDecode
+            | NativeFunction::DataViewGetInt8
+            | NativeFunction::DataViewGetUint8
+            | NativeFunction::DataViewGetInt16
+            | NativeFunction::DataViewGetUint16
+            | NativeFunction::DataViewGetInt32
+            | NativeFunction::DataViewGetUint32
+            | NativeFunction::DataViewGetFloat32
+            | NativeFunction::DataViewGetFloat64
+            | NativeFunction::DataViewSetInt8
+            | NativeFunction::DataViewSetUint8
+            | NativeFunction::DataViewSetInt16
+            | NativeFunction::DataViewSetUint16
+            | NativeFunction::DataViewSetInt32
+            | NativeFunction::DataViewSetUint32
+            | NativeFunction::DataViewSetFloat32
+            | NativeFunction::DataViewSetFloat64
+            | NativeFunction::ArrayBufferSlice => {
+                self.dispatch_encoding_native(dom, function, receiver, arguments)
+            }
+            NativeFunction::GlobalStructuredClone => {
+                self.dispatch_structured_clone_native(dom, function, receiver, arguments)
             }
             NativeFunction::UrlCreateObjectUrl | NativeFunction::UrlRevokeObjectUrl => {
                 self.dispatch_url_native(dom, function, receiver, arguments)
@@ -309,6 +374,22 @@ impl JsRuntime {
             NativeFunction::StrToLowerCase => self.string_to_case(receiver, arguments, false),
             NativeFunction::StrToUpperCase => self.string_to_case(receiver, arguments, true),
             NativeFunction::StrTrim => self.string_trim(receiver),
+            NativeFunction::ArrayAt
+            | NativeFunction::ArrayFlat
+            | NativeFunction::ArrayReduceRight
+            | NativeFunction::ArrayFindLast
+            | NativeFunction::ArrayFindLastIndex
+            | NativeFunction::StrCodePointAt
+            | NativeFunction::StrAt
+            | NativeFunction::StrPadStart
+            | NativeFunction::StrPadEnd
+            | NativeFunction::StrTrimStart
+            | NativeFunction::StrTrimEnd
+            | NativeFunction::StrRepeat
+            | NativeFunction::StrLocaleCompare
+            | NativeFunction::StrReplaceAll => {
+                self.dispatch_string_native(dom, function, receiver, arguments)
+            }
             NativeFunction::StrSplit => self.string_split(receiver, arguments),
             NativeFunction::StrReplace => self.string_replace(dom, receiver, arguments),
             NativeFunction::StrMatch => self.string_match(receiver, arguments),
@@ -323,9 +404,18 @@ impl JsRuntime {
                     required_argument(arguments, 0, "String.forEach")?,
                     &self.realm,
                 )?;
-                for (index, character) in text.chars().enumerate() {
+                // This is an engine extension rather than a specified method,
+                // so it *walks* the string the way the iterator does and
+                // yields code points - but the index it reports has to be a
+                // position in the string, so it is the code-unit offset of
+                // each code point rather than a running counter.
+                for (offset, character) in text.chars().scan(0usize, |offset, character| {
+                    let start = *offset;
+                    *offset += character.len_utf16();
+                    Some((start, character))
+                }) {
                     #[allow(clippy::cast_precision_loss)]
-                    let index = JsValue::Number(index as f64);
+                    let index = JsValue::Number(offset as f64);
                     self.call(
                         dom,
                         callback,
@@ -338,9 +428,9 @@ impl JsRuntime {
                 }
                 Ok(JsValue::Undefined)
             }
-            NativeFunction::StrPush => Ok(JsValue::Number(
-                self.require_string_receiver(receiver)?.chars().count() as f64,
-            )),
+            NativeFunction::StrPush => Ok(JsValue::Number(utf16::utf16_length(
+                &self.require_string_receiver(receiver)?,
+            ) as f64)),
             NativeFunction::StrIterator => self.string_iterator(receiver),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
@@ -366,7 +456,7 @@ impl JsRuntime {
                 Ok(result)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
-            NativeFunction::CssSupports => Ok(JsValue::Boolean(true)),
+            NativeFunction::CssSupports => css_supports(arguments),
             NativeFunction::GlobalEscape => {
                 let text = required_argument(arguments, 0, "escape")?.to_js_string();
                 let mut output = String::with_capacity(text.len());
@@ -397,12 +487,18 @@ impl JsRuntime {
             }
             NativeFunction::GlobalAtob => {
                 let text = required_argument(arguments, 0, "atob")?.to_js_string();
-                Self::base64_decode(&text).map(JsValue::String)
+                self.base64_decode(&text).map(JsValue::String)
             }
             NativeFunction::GlobalBtoa => {
                 let text = required_argument(arguments, 0, "btoa")?.to_js_string();
+                // Infra §"base64 encode": "If the code point value of any
+                // character in data is greater than 255, then throw an
+                // `InvalidCharacterError` `DOMException`."
                 if text.chars().any(|character| character as u32 > 0xff) {
-                    return Err(JsError::dom("String contains an invalid character"));
+                    return Err(self.dom_exception(
+                        DomExceptionName::InvalidCharacter,
+                        "The string to be encoded contains characters outside of the Latin1 range",
+                    ));
                 }
                 Ok(JsValue::String(Self::base64_encode(
                     &text.bytes().collect::<Vec<_>>(),
@@ -1266,6 +1362,45 @@ impl JsRuntime {
     }
 }
 
+/// CSSOM §"supports": the two overloads of the `CSS` namespace's static
+/// `supports`, dispatched by argument count.
+///
+/// CSSOM declares
+///
+/// ```idl
+/// partial interface CSS {
+///   static boolean supports(DOMString property, DOMString value);
+///   static boolean supports(DOMString conditionText);
+/// };
+/// ```
+///
+/// and `WebIDL` §3.6 overload resolution picks the first alternative whose
+/// required-argument count the call satisfies, so two arguments select the
+/// declaration form and one selects the condition form. The two forms answer
+/// different questions and a hardcoded `true` answers both wrongly, which is the
+/// failure `@supports` exists to prevent: an author writes
+/// `@supports (backdrop-filter: blur(2px))` precisely to reach a fallback this
+/// engine does not implement, and answering `true` tells the page the fallback
+/// is unnecessary.
+///
+/// The answers come from `render-css`, which is the crate that already decides
+/// whether a declaration survives a style rule, so one parser and one
+/// evaluator answer both the stylesheet question and the script question.
+fn css_supports(arguments: &[JsValue]) -> Result<JsValue, JsError> {
+    let first = required_argument(arguments, 0, "CSS.supports")?;
+    if let Some(second) = arguments.get(1) {
+        return Ok(JsValue::Boolean(
+            render_css::supports::supports_declaration(
+                &first.to_js_string(),
+                &second.to_js_string(),
+            ),
+        ));
+    }
+    Ok(JsValue::Boolean(
+        render_css::supports::supports_condition_text(&first.to_js_string()),
+    ))
+}
+
 impl JsRuntime {
     /// Format `console.*` arguments the way engines join them: one space
     /// between arguments, objects through their string coercion.
@@ -1292,5 +1427,83 @@ impl JsRuntime {
         }
         self.console_messages.push(ConsoleMessage { level, text });
         Ok(JsValue::Undefined)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::css_supports;
+    use crate::JsValue;
+
+    fn supports(arguments: &[&str]) -> String {
+        let values: Vec<JsValue> = arguments
+            .iter()
+            .map(|argument| JsValue::String((*argument).to_owned()))
+            .collect();
+        css_supports(&values)
+            .expect("CSS.supports should answer")
+            .to_js_string()
+    }
+
+    /// `CSS.supports` was a hardcoded `true`, which is the failure
+    /// `@supports` exists to prevent. The decisive assertion is the *false*
+    /// side: a query for a feature this engine does not implement has to answer
+    /// `false`, because that is the answer that makes an author's fallback apply.
+    /// A test that only asserted the `true` side would pass against the stub.
+    #[test]
+    fn css_supports_answers_false_for_a_feature_the_engine_lacks() {
+        assert_eq!(supports(&["backdrop-filter", "blur(2px)"]), "false");
+        assert_eq!(supports(&["(backdrop-filter: blur(2px))"]), "false");
+        assert_eq!(supports(&["(text-overflow: ellipsis)"]), "false");
+        assert_eq!(supports(&["(-moz-box-shadow: 0 0 2px black)"]), "false");
+        // A feature no specification defines.
+        assert_eq!(supports(&["(nonesuch-property: 1)"]), "false");
+        // A named condition this engine does not define, and a general-enclosed
+        // one, are both `false` rather than an error: CSS Conditional Rules 3 §6
+        // fixes that production at false precisely so new syntax does not
+        // invalidate too much of a condition.
+        assert_eq!(supports(&["(some-named-condition)"]), "false");
+        assert_eq!(supports(&["(some future feature)"]), "false");
+    }
+
+    /// The `true` side, and the part of it that is a capability claim: a
+    /// declaration the engine's own cascade accepts is a declaration it supports,
+    /// because the answer comes from `render-css`'s declaration oracle rather
+    /// than from a list.
+    #[test]
+    fn css_supports_answers_from_the_cascade_for_the_true_side_too() {
+        assert_eq!(supports(&["display", "grid"]), "true");
+        assert_eq!(supports(&["display", "flex"]), "true");
+        assert_eq!(supports(&["(display: grid)"]), "true");
+        assert_eq!(supports(&["(color: rgb(1, 2, 3))"]), "true");
+        // `render-layout`'s text carries no family, so no engine grammar for
+        // `font-family` exists and §6.1 says that is unsupported.
+        assert_eq!(supports(&["(font-family: Arial)"]), "false");
+        // A shorthand is the conjunction over its longhands, so `font` is
+        // unsupported for exactly that reason.
+        assert_eq!(supports(&["(font: 12px/1.5 Arial)"]), "false");
+    }
+
+    /// CSS Conditional Rules 3 §7.5's two overloads and the wrapped retry, which
+    /// is a second parse and not the first answer reused.
+    #[test]
+    fn css_supports_keeps_the_sevenths_five_wrapped_retry_and_overload_split() {
+        // The retry: bare `display: grid` is not a `<supports-condition>`, and
+        // wrapping it in parentheses is.
+        assert_eq!(supports(&["display: grid"]), "true");
+        assert_eq!(supports(&["(display: grid)"]), "true");
+        // `not (display: grid)` is false, and wrapping it does not make it true.
+        assert_eq!(supports(&["not (display: grid)"]), "false");
+        assert_eq!(supports(&["not (backdrop-filter: blur(2px))"]), "true");
+        // The two-argument form is the declaration one even when the text looks
+        // like a condition, because WebIDL §3.6 picks the first overload the
+        // argument count satisfies.
+        assert_eq!(supports(&["display: grid", ""]), "false");
+        assert_eq!(supports(&["display", "grid"]), "true");
+        // An undecidable condition is not true, and the retry does not make it
+        // true either: `at-rule(@font-face)` needs a font backend this tree
+        // does not have, so the honest answer is `false`.
+        assert_eq!(supports(&["at-rule(@font-face)"]), "false");
+        assert_eq!(supports(&["at-rule(@media)"]), "true");
     }
 }

@@ -404,7 +404,17 @@ fn ordinary_words_wrap_at_spaces_instead_of_splitting_to_fill_a_line() {
 }
 
 #[test]
-fn a_single_overlong_word_uses_the_existing_emergency_character_wrap() {
+fn an_overlong_word_overflows_its_line_because_no_break_opportunity_is_inside_it() {
+    // CSS 2.1 §9.4.2: "if the inline box cannot be split (e.g. if the inline box
+    // contains a single character, or language specific word breaking rules
+    // disallow a break within the inline box, or if the inline box is affected
+    // by a white-space value of nowrap or pre), then the inline box overflows
+    // the line box." UAX #14 rule LB28 disallows a break between two Latin
+    // letters, so a Latin word has no opportunity inside it. The alternative -
+    // breaking between any two characters of a word that does not fit - is the
+    // emergency mode UAX #14 §3 leaves "outside the scope of this
+    // specification", and it is what `word-break: break-all` (CSS Text 3 §5.1)
+    // asks for explicitly instead.
     let (output, _, layout) = pipeline(
         "<!doctype html><body><p id='p'>abcdefgh</p></body>",
         "html, body, p { display:block; margin-left:0; margin-right:0 }",
@@ -417,13 +427,16 @@ fn a_single_overlong_word_uses_the_existing_emergency_character_wrap() {
         .iter()
         .filter(|fragment| fragment.source == Some(text))
         .filter_map(|fragment| match &fragment.kind {
-            FragmentKind::Text(text) => Some(text.text.as_str()),
+            FragmentKind::Text(text) => Some((text.text.as_str(), fragment.rect)),
             FragmentKind::Box(_) => None,
         })
         .collect::<Vec<_>>();
 
-    assert!(fragments.len() > 1);
-    assert_eq!(fragments.concat(), "abcdefgh");
+    assert_eq!(fragments.len(), 1, "{fragments:?}");
+    assert_eq!(fragments[0].0, "abcdefgh");
+    // One line box, so one line, and the run is wider than the 40px it was given.
+    assert_eq!(fragments[0].1.origin.y, 0.0, "{fragments:?}");
+    assert!(fragments[0].1.size.width > 40.0, "{fragments:?}");
 }
 
 #[test]
@@ -1961,4 +1974,68 @@ fn flex_column_centering_centers_the_login_card() {
     // ...and justify-content:center centers it within the flex item's used
     // main size, which `min-height:688px` lifts above the 600px viewport.
     assert_eq!(card.origin.y, (688.0 - card.size.height) / 2.0);
+}
+#[test]
+fn a_block_inside_an_inline_is_laid_out_as_a_block_between_the_two_halves() {
+    // §9.2.1.1: the enclosing inline box is broken around the block-level box,
+    // so the two runs of text become line boxes on either side of a real block
+    // box rather than one line with the block missing from it.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>before<span id='box'></span>after</p></body>",
+        "html, body { display: block; margin: 0; padding: 0 } p { display: inline } \
+         #box { display: block; width: 40px; height: 10px }",
+        400.0,
+    );
+    let dom = &output.dom;
+    let box_rect = fragment(&layout, find(dom, "#box")).rect;
+    // The block has the box it asked for, on the band between the two lines.
+    assert!((box_rect.origin.x - 0.0).abs() < 0.01, "{box_rect:?}");
+    assert!((box_rect.origin.y - 19.2).abs() < 0.01, "{box_rect:?}");
+    assert!((box_rect.size.width - 40.0).abs() < 0.01, "{box_rect:?}");
+    assert!((box_rect.size.height - 10.0).abs() < 0.01, "{box_rect:?}");
+
+    // Each run of text is a line box of its own: "before" above the block and
+    // "after" below it, not one line reading "beforeafter" beside a void.
+    let text = |needle: &str| {
+        layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Text(text) if text.text.contains(needle) => Some(fragment.rect),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no text fragment containing {needle:?}"))
+    };
+    let before = text("before");
+    let after = text("after");
+    assert!((before.origin.y - 0.0).abs() < 0.01, "{before:?}");
+    assert!((after.origin.y - 29.2).abs() < 0.01, "{after:?}");
+    // The line boxes are full width, so "after" starts at the left edge rather
+    // than where "before" ended.
+    assert!((after.origin.x - 0.0).abs() < 0.01, "{after:?}");
+
+    // 19.2 of line, then the 10px block, then 19.2 of line.
+    let body = fragment(&layout, find(dom, "body")).rect;
+    assert!((body.size.height - 48.4).abs() < 0.01, "{body:?}");
+}
+
+#[test]
+fn the_same_class_gets_the_same_box_as_a_direct_child_of_a_block() {
+    // The control for the test above: the element is not special, and the only
+    // thing that changed for it is where the block container sits.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><p id='p'>before<span id='box'></span>after</p>\
+           <div id='side'><span id='side-box'></span></div></body>",
+        "html, body, div { display: block; margin: 0; padding: 0 } p { display: inline } \
+         #box, #side-box { display: block; width: 40px; height: 10px }",
+        400.0,
+    );
+    let dom = &output.dom;
+    let inline_box = fragment(&layout, find(dom, "#box")).rect;
+    let side_box = fragment(&layout, find(dom, "#side-box")).rect;
+    assert!(
+        (inline_box.size.width - side_box.size.width).abs() < 0.01
+            && (inline_box.size.height - side_box.size.height).abs() < 0.01,
+        "{inline_box:?} {side_box:?}"
+    );
 }

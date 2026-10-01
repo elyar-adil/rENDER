@@ -115,6 +115,12 @@ pub struct JsRuntime {
     viewport: ElementRect,
     intersection_observers: Vec<ObjectId>,
     mutation_observers: Vec<ObjectId>,
+    /// Every `MediaQueryList` this realm has produced, kept so a viewport change
+    /// can re-evaluate them. The list is a *registry*, not a root: a list script
+    /// has dropped is still evaluated (CSSOM says `matches` tracks the viewport
+    /// for as long as the object exists) but collects like any other object, and
+    /// `gc_identity_roots` does not include it.
+    media_query_lists: Vec<ObjectId>,
     /// Highest DOM revision already copied into observer queues.
     mutation_seen_revision: DomRevision,
 }
@@ -208,6 +214,7 @@ impl JsRuntime {
             },
             intersection_observers: Vec::new(),
             mutation_observers: Vec::new(),
+            media_query_lists: Vec::new(),
             mutation_seen_revision: dom.revision(),
             limits,
         }
@@ -421,6 +428,13 @@ impl JsRuntime {
             height: height.max(0.0),
         };
         self.queue_intersection_observers();
+        // A `MediaQueryList` is a *subscription* to the viewport, so the same
+        // call that tells intersection observers where the viewport is has to
+        // tell a `MediaQueryList` whether it still matches. Without this a
+        // `matchMedia` would be correct once and then never again, which is the
+        // failure this project treats as worst: a global that exists, looks
+        // right, and is silently wrong for the case that matters.
+        self.queue_media_query_list_changes();
     }
 
     /// Whether at least one timer is still registered from script. Intervals
@@ -533,6 +547,7 @@ impl JsRuntime {
                 self.notify_intersection_observer(dom, observer)
             }
             JsMicrotask::MutationObserver(observer) => self.notify_mutation_observer(dom, observer),
+            JsMicrotask::MediaQueryListChange(list) => self.notify_media_query_list(dom, list),
             JsMicrotask::PromiseReaction {
                 handler,
                 argument,

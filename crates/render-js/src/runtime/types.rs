@@ -185,6 +185,12 @@ pub enum JsMicrotask {
     Callback(ObjectId),
     IntersectionObserver(ObjectId),
     MutationObserver(ObjectId),
+    /// A `MediaQueryList` whose `matches` flipped, so its `change` listeners
+    /// have to run. Not an observer and not a callback: the invocation is a
+    /// dispatch to whichever of `onchange`, `change` listeners and the deprecated
+    /// `addListener` callbacks are present, and the embedding owns the choice of
+    /// when in the frame that happens.
+    MediaQueryListChange(ObjectId),
     PromiseReaction {
         handler: Option<ObjectId>,
         argument: JsValue,

@@ -1,0 +1,114 @@
+/*
+ * Deterministic stand-in for a documentation site's reference stylesheet.
+ *
+ * Served in place of both external slots on the page:
+ *   https://static.devdocs.example/reference.4b1e0c.css
+ *   https://static.devdocs.example/reference-rail.9d2f33.css
+ *
+ * The live page splits its styling the same way: one sheet for the reference
+ * body, one for the rail. Because the harness serves identical bytes for both,
+ * every diagnostic this file provokes is produced twice - once per slot - and
+ * the diagnostic assertions use that as an exactness check.
+ *
+ * The two columns are laid out with `display: flex` and fixed widths, so the
+ * used width and the used x of the main column are both exactly the declared
+ * values. That is what `content_width` / `content_left` in the fixture table
+ * assert, and it is why the rail is not floated or absolutely positioned: both
+ * of those would make the contract's geometric expectation a guess.
+ *
+ * Nothing here declares geometry inside a nested block. The static Python gate
+ * reads single-compound rules with a regex that cannot see into a nested
+ * `{ }`, so a `@media` or `@supports` body would be invisible to it. Both
+ * constructs are present - as decoration only - so the engine's at-rule and
+ * conditional evaluation is exercised on a real page, and the fixture comment
+ * says why nothing depends on the answer.
+ */
+
+/* Two at-rules this engine parses and cannot use, exactly as every real site's
+ * self-hosted webfont declaration and keyframe block does. Their diagnostics
+ * appearing is the correct behaviour, and the assertions say so. */
+@font-face {
+  font-family: "Fixture Sans";
+  src: url("https://static.devdocs.example/font/fixture-sans-regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Fixture Serif";
+  src: url("https://static.devdocs.example/font/fixture-serif-bold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Fixture Mono";
+  src: url("https://static.devdocs.example/font/fixture-mono.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Fixture Icons";
+  src: url("https://static.devdocs.example/font/fixture-icons.woff2") format("woff2");
+}
+
+@keyframes rail-fade {
+  from { opacity: 1 }
+  to { opacity: 1 }
+}
+@-webkit-keyframes rail-fade {
+  from { opacity: 1 }
+  to { opacity: 1 }
+}
+
+html, body { display: block; margin-top: 0; margin-right: 0; margin-bottom: 0; margin-left: 0; }
+body { background-color: #ffffff; color: #202124; font-size: 15px; line-height: 24px; }
+
+.site-head { display: block; width: 1280px; height: 88px; background-color: #0b5fff; }
+.site-logo { display: inline-block; width: 32px; height: 32px; margin-top: 14px; margin-left: 20px; }
+.site-logo img { display: block; width: 32px; height: 32px; }
+.site-search { display: inline-block; width: 420px; height: 32px; margin-top: 14px; margin-left: 500px; }
+.site-search input { display: inline-block; width: 330px; height: 32px; }
+.site-search button { display: inline-block; width: 84px; height: 32px; background-color: #ffffff; color: #0b5fff; }
+.site-nav { display: block; width: 900px; height: 32px; margin-top: 10px; margin-left: 20px; }
+.site-nav a { display: inline-block; width: 140px; height: 32px; color: #ffffff; }
+
+/* The two-column split. `.page-main` is the contract's content column: 1264
+ * wide, starting at x=8, both declared here and asserted after layout. */
+.page-main { display: block; width: 1264px; margin-top: 20px; margin-left: 8px; }
+.ref-columns { display: flex; width: 1264px; }
+.ref-article { width: 940px; }
+.page-rail { width: 300px; margin-left: 24px; }
+
+.ref-block { display: block; width: 940px; height: 96px; margin-top: 0; margin-bottom: 12px; border-bottom-width: 1px; border-bottom-style: solid; border-bottom-color: #e4e7ea; }
+.ref-title { display: block; width: 940px; height: 30px; margin-top: 0; margin-bottom: 4px; font-size: 19px; line-height: 30px; }
+.ref-title a { color: #0b5fff; }
+.ref-prose { display: block; width: 940px; height: 28px; color: #3c4043; }
+.ref-note { display: block; width: 940px; height: 28px; color: #5f6368; font-size: 13px; line-height: 22px; }
+.ref-code { display: inline-block; width: 120px; height: 22px; background-color: #f1f3f4; color: #c5221f; }
+.ref-figure { display: block; width: 940px; height: 292px; margin-top: 0; padding-top: 8px; padding-bottom: 8px; border-top-width: 1px; border-top-style: solid; border-top-color: #e4e7ea; }
+.ref-figure img { display: block; width: 600px; height: 260px; }
+.ref-caption { display: block; width: 600px; height: 24px; color: #5f6368; font-size: 12px; line-height: 24px; }
+
+.rail-toc { display: block; width: 300px; }
+.rail-title { display: block; width: 300px; height: 28px; margin-top: 0; margin-bottom: 8px; font-size: 15px; line-height: 28px; }
+.rail-title a { color: #0b5fff; }
+.rail-list { display: block; width: 300px; margin-top: 0; margin-left: 0; padding-left: 0; }
+.rail-list li { display: block; width: 300px; height: 26px; }
+.rail-list a { color: #202124; }
+.rail-card { display: block; width: 300px; margin-top: 24px; padding-top: 12px; padding-bottom: 12px; border-top-width: 2px; border-top-style: solid; border-top-color: #e4e7ea; }
+
+.site-foot { display: block; width: 1280px; height: 72px; margin-top: 32px; padding-top: 12px; background-color: #f1f3f4; }
+.site-foot a { display: inline-block; width: 180px; height: 22px; margin-right: 8px; }
+.foot-note { display: block; width: 1000px; height: 22px; color: #5f6368; font-size: 12px; line-height: 22px; }
+
+/* Decoration inside a conditional group rule. The geometry above does not
+ * depend on either of them, so the fixture is not asserting how this engine
+ * answers - the diagnostic assertions are. */
+@supports (position: sticky) {
+  .ref-note { color: #80868b }
+}
+@supports (position: sticky) and (display: grid) {
+  .rail-card { border-top-color: #0b5fff }
+}
+@supports at-rule(@font-face) {
+  .site-foot { height: 80px }
+}
+@media (min-width: 1000px) {
+  .ref-note { color: #5f6368 }
+}
+@-moz-document url-prefix() {
+  .site-head { background-color: #0b5fff }
+}

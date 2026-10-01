@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of a documentation page with a *sticky* top bar that itself
+  contains a nested horizontal scroll region, over content long enough to
+  scroll several screens.
+
+  The shape was taken from a live Kubernetes documentation page
+  (https://kubernetes.io/docs/tasks/configure-pod-container/assign-memory-resource/,
+  captured 2026-09-28). Two things on that page are the reason this fixture
+  exists:
+
+    * the top bar is `<header><nav class="js-navbar-scroll navbar ...">`, a
+      navbar that is its own horizontal scroller, plus a second scroller
+      (`td-navbar-nav-scroll`) - so a scrollport nested *inside* a sticky
+      element is a real page shape and not a contrived one; and
+    * the bar holds a login/console link strip, a sidebar search form, and the
+      page body below is long, with breadcrumbs in `main` and a collapsible
+      section nav beside it.
+
+  What is dropped: Bootstrap's utility class soup beyond the handful that carry
+  the shape, the `data-bs-*` attributes, the inline `<svg>`'s `<defs><style>`
+  (kept separately below, minus its own stylesheet), the language dropdown, and
+  the search overlay. The prose is fabricated, as it is in the other five
+  fixtures.
+
+  Why this page shape exists in the harness: `position: sticky` landed this
+  session with 12 unit tests for its geometry and 8 for scrollport
+  representation, and no fixture had ever put a sticky box in a document. The
+  open interaction the layout code records for itself - a sticky box resolving
+  against the *nearest* scrollport, which is not knowable at layout time - is
+  only reachable from a page like this one. See the two ignored tests at the
+  bottom of tests/real_site_capabilities.rs.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see sticky_toolbar.css).
+-->
+<title>为容器和 Pod 分配内存资源 - Kubernetes 文档</title>
+<meta name="description" content="如何为一个容器设置内存请求量与内存限制量。">
+<link rel="stylesheet" href="https://kubernetes.io/css/bootstrap.min.4c8d90.css">
+<link rel="stylesheet" href="https://kubernetes.io/css/docs.9d2f33.css">
+<script defer src="https://kubernetes.io/js/docs.77c0a1.js"></script>
+<style>
+  /* An embedded sheet, so the diagnostic-set assertion can tell the two
+   * sources apart: everything in the two external sheets is reported once per
+   * slot, and everything here exactly once. */
+  .doc-body { *zoom: 1; background-color: #ffffff }
+</style>
+</head>
+<body>
+<header class="site-head">
+  <div class="navbar">
+    <a class="brand" href="https://kubernetes.io/zh-cn/">
+      <!-- The captured page draws its logo as an inline SVG with a viewBox and
+           no width/height, which is the shape that forces the viewBox fallback
+           for sizing. -->
+      <svg class="brand-mark" viewBox="-6.09 -6.09 446.94 115.94" aria-hidden="true"><path d="M139.583 53.815c.823-.926 1.646-1.852 2.572-2.778q1.29-1.436 2.572-2.88c.823-1.03 1.646-1.956 2.367-2.78s1.44-1.645 1.954-2.262h9.98c-1.955 2.263-3.91 4.527-5.864 6.584q-2.778 3.087-6.173 6.482a41.554 41.554.0 013.498 3.704c1.234 1.44 2.366 2.88 3.498 4.32a43.93 43.93.0 013.086 4.528c.926 1.543 1.75 2.88 2.367 4.115h-9.67c-.619-1.03-1.339-2.058-2.059-3.19a37.46 37.46.0 00-2.47-3.6 29.584 29.584.0 00-2.777-3.498 17.678 17.678.0 00-2.778-2.778v12.963h-8.436v-42.49l8.436-1.338v24.898" class="cls-1"></path></svg>
+      <span class="brand-text">Kubernetes</span>
+    </a>
+    <!-- The nested scrollport. Its own content is wider than its box, which is
+         what makes it a scrollport rather than a clip, and the first chip is
+         sticky against *its* scrollport - the open interaction. -->
+    <nav class="navbar-scroll" aria-label="主导航">
+      <ul class="tab-strip">
+        <li class="tab tab-sticky"><a href="https://kubernetes.io/zh-cn/docs/">文档</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/docs/tutorials/">教程</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/docs/reference/">参考</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/docs/concepts/">概念</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/docs/tasks/">任务</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/docs/setup/">安装</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/community/">社区</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/case-studies/">案例</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/blog/">博客</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/training/">培训</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/contribute/">参与</a></li>
+        <li class="tab"><a href="https://kubernetes.io/zh-cn/releases/">版本</a></li>
+      </ul>
+    </nav>
+    <form class="site-search" role="search" action="https://kubernetes.io/zh-cn/search" method="get">
+      <input type="search" name="q" placeholder="搜索本站">
+      <button type="submit">搜索</button>
+    </form>
+  </div>
+</header>
+<div class="page-grid">
+  <nav class="side-nav" aria-label="本节目录">
+    <ul class="side-list">
+      <li><a href="https://kubernetes.io/zh-cn/docs/tasks/">任务</a></li>
+      <li><a href="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/">配置 Pod 与容器</a></li>
+      <li><a href="https://kubernetes.io/zh-cn/docs/concepts/configuration/">配置最佳实践</a></li>
+    </ul>
+  </nav>
+  <main class="page-main">
+    <nav class="breadcrumbs" aria-label="面包屑">
+      <ol class="crumbs">
+        <li><a href="https://kubernetes.io/zh-cn/docs/">Kubernetes 文档</a></li>
+        <li><a href="https://kubernetes.io/zh-cn/docs/tasks/">任务</a></li>
+        <li><a href="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/">配置 Pod 与容器</a></li>
+        <li class="crumb-current" aria-current="page">为容器和 Pod 分配内存资源</li>
+      </ol>
+    </nav>
+    <article class="doc-body">
+      <section class="doc-section" id="overview">
+        <h2 class="doc-title">概述</h2>
+        <p class="doc-prose">本页说明如何为一个容器设置内存请求量与内存限制量。容器保证拥有它所请求的内存量，但不允许使用超过其限制量的内存。</p>
+      </section>
+      <section class="doc-section" id="before-you-begin">
+        <h2 class="doc-title">开始之前</h2>
+        <p class="doc-prose">你需要一个 Kubernetes 集群，以及已经配置好与之通信的 kubectl 命令行工具。建议在至少有两个节点的集群上完成本教程。</p>
+      </section>
+      <section class="doc-section" id="limits">
+        <h2 class="doc-title">限制量与请求量</h2>
+        <p class="doc-prose">限制量是容器可以使用的内存量上限。超过限制量时，容器会被 OOMKilled 终止。请求量用于调度：调度器把请求量当作容器可用的最小内存量。</p>
+        <ul class="doc-list">
+          <li>请求量等于限制量时，容器进入 Guaranteed  QoS 等级。</li>
+          <li>没有设置任何请求量时，请求量取节点上可分配的内存量的一部分。</li>
+          <li>没有设置限制量时，容器可以使用节点上的全部内存量。</li>
+        </ul>
+      </section>
+      <section class="doc-section" id="units">
+        <h2 class="doc-title">单位</h2>
+        <p class="doc-prose">内存量使用十进制或二进制后缀：E、P、T、G、M、k 表示十进制，Ei、Pi、Ti、Gi、Mi、ki 表示二进制。</p>
+      </section>
+      <section class="doc-section" id="example">
+        <h2 class="doc-title">示例</h2>
+        <p class="doc-prose">下面的 Pod 声明了请求量与限制量，两者都使用二进制后缀，并声明了资源请求与限制在 Pod 级别上相等。</p>
+        <figure class="doc-figure">
+          <img src="https://kubernetes.io/images/docs/tasks/manage-resources/container-resources.png" width="640" height="300" alt="容器资源请求量与限制量的关系示意图">
+          <figcaption class="doc-caption">图 1：请求量决定调度，限制量决定终止</figcaption>
+        </figure>
+      </section>
+      <section class="doc-section" id="pod-level">
+        <h2 class="doc-title">Pod 级别</h2>
+        <p class="doc-prose">可以为 Pod 声明资源请求量与限制量，其语义与容器级别相同。Pod 的限制量是其中所有容器限制量之和的期望值。</p>
+      </section>
+      <section class="doc-section" id="scheduling">
+        <h2 class="doc-title">调度与节点可用资源</h2>
+        <p class="doc-prose">调度器依据请求量而不是限制量来选择节点。一个没有声明请求量的容器使用节点可分配内存量的百分之百参与调度。</p>
+      </section>
+      <section class="doc-section" id="eviction">
+        <h2 class="doc-title">驱逐与内存压力</h2>
+        <p class="doc-prose">当节点出现内存压力时，kubelet 会按请求量从低到高驱逐 Pod。使用 BestEffort QoS 的 Pod 最先被驱逐。</p>
+      </section>
+      <section class="doc-section" id="qos">
+        <h2 class="doc-title">QoS 等级</h2>
+        <p class="doc-prose">Guaranteed、 Burstable 与 BestEffort 三个等级由每个容器的请求量与限制量是否相等决定，而不是由节点或集群配置决定。</p>
+      </section>
+      <section class="doc-section" id="go">
+        <h2 class="doc-title">继续</h2>
+        <p class="doc-prose">了解如何为容器分配 CPU 资源，以及如何使用资源配额为命名空间设定上限。</p>
+      </section>
+      <section class="doc-section" id="feedback">
+        <h2 class="doc-title">反馈</h2>
+        <p class="doc-prose">本页由社区维护。如果你发现问题，请在页面上提交反馈，或者在文档仓库中发起一个议题。</p>
+      </section>
+      <section class="doc-section" id="whats-next">
+        <h2 class="doc-title">接下来</h2>
+        <p class="doc-prose">为容器分配 CPU 资源、定义临时存储、为 Pod 指定服务质量等级、配置资源限额。</p>
+      </section>
+    </article>
+  </main>
+</div>
+<aside class="page-rail">
+  <nav class="rail-toc" aria-label="相关文档">
+    <h2 class="rail-title">相关文档</h2>
+    <ul class="rail-list">
+      <li><a href="https://kubernetes.io/zh-cn/docs/tasks/configure-pod-container/assign-cpu-resource/">为容器分配 CPU 资源</a></li>
+      <li><a href="https://kubernetes.io/zh-cn/docs/concepts/configuration/manage-resources-containers/">管理容器资源</a></li>
+      <li><a href="https://kubernetes.io/zh-cn/docs/concepts/policy/resource-quotas/">资源配额</a></li>
+      <li><a href="https://kubernetes.io/zh-cn/docs/concepts/policy/limit-range/">限制范围</a></li>
+    </ul>
+  </nav>
+  <section class="rail-card" id="rail-feedback">
+    <h2 class="rail-title"><a href="https://kubernetes.io/zh-cn/contribute/">参与改进本文</a></h2>
+    <p class="rail-prose">文档仓库是公开的，每一次修订都以合并请求的形式记录。</p>
+  </section>
+</aside>
+<footer class="site-foot">
+  <a href="https://kubernetes.io/zh-cn/">Kubernetes</a>
+  <a href="https://kubernetes.io/zh-cn/community/">社区</a>
+  <a href="https://kubernetes.io/zh-cn/contribute/">参与</a>
+  <a href="https://kubernetes.io/zh-cn/docs/">文档</a>
+  <a href="https://kubernetes.io/zh-cn/blog/">博客</a>
+  <a href="https://kubernetes.io/zh-cn/releases/">版本</a>
+  <p class="foot-note">本页为离线夹具，内容经过裁剪；所有资源响应都由本地确定性字节提供。</p>
+</footer>
+</body>
+</html>

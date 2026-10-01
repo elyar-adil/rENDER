@@ -345,13 +345,16 @@ pub struct OrderedLine {
 
 /// Every text line in the tree, ordered the way a reader sees it: top to
 /// bottom, then left to right.
+///
+/// A fragment is attributed to the DOM node it came from, and a text fragment's
+/// source is a **text node**, not the element containing it. So the document
+/// rank of a line is the rank of its own text node, and the ranks come from
+/// [`document_order_ranks`] over the whole tree rather than from
+/// [`elements`]: ranking elements only would give every text node rank zero and
+/// make the ordering assertion vacuous.
 #[must_use]
 pub fn lines_in_reading_order(dom: &Dom, fragments: &FragmentTree) -> Vec<OrderedLine> {
-    let ranks: BTreeMap<NodeId, usize> = elements(dom)
-        .into_iter()
-        .enumerate()
-        .map(|(index, node)| (node, index))
-        .collect();
+    let ranks = document_order_ranks(dom);
     let mut lines: Vec<OrderedLine> = fragments
         .iter()
         .filter_map(|fragment| {
@@ -379,6 +382,36 @@ pub fn lines_in_reading_order(dom: &Dom, fragments: &FragmentTree) -> Vec<Ordere
             .then(left.dom_rank.cmp(&right.dom_rank))
     });
     lines
+}
+
+/// Position of every node in the document - elements *and* text nodes - in
+/// tree order.
+///
+/// Element-only ranking is the obvious mistake and a silent one: a text
+/// fragment's source is a text node, so ranking elements alone leaves every
+/// line's rank undefined, the ordering check sees no lines, and it passes
+/// vacuously. The [`crate::contract`] counting check is what catches it, and
+/// this function is the one place the ranking is built.
+#[must_use]
+pub fn document_order_ranks(dom: &Dom) -> BTreeMap<NodeId, usize> {
+    let mut found = Vec::new();
+    collect_tree_nodes(dom, dom.document(), &mut found);
+    found
+        .into_iter()
+        .enumerate()
+        .map(|(index, node)| (node, index))
+        .collect()
+}
+
+fn collect_tree_nodes(dom: &Dom, node: NodeId, found: &mut Vec<NodeId>) {
+    for child in dom.children(node).unwrap_or_default() {
+        // A child id the DOM cannot resolve is a hole in the arena, not a
+        // reason to abandon the rest of the subtree, so the walk records what it
+        // can and carries on.
+        let _ = dom.node(*child);
+        found.push(*child);
+        collect_tree_nodes(dom, *child, found);
+    }
 }
 
 /// The document-space bottom edge of everything the layout produced.

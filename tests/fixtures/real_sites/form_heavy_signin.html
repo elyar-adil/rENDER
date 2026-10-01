@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of a *sign-in and account* page: a site search, a login
+  form, a second form, and several controls that are in no form, in one form,
+  or in a form other than the one that owns them.
+
+  The shape was taken from a live forum sign-in page
+  (https://news.ycombinator.com/login, captured 2026-09-28), whose markup is
+  two `form method=post` elements, each laying its label and field out in a
+  `table border=0`, with a `type=hidden` input, an `autocomplete` on every
+  credential field, and an `autofocus` on the first one - and from a member
+  centre sign-in page, which adds a register/renew form, a preference form with
+  a select, radios and a textarea, and a "forgot password" link outside every
+  form.
+
+  What is added on top of the capture, and why, is recorded on each element
+  below. The short version: the derived form owner landed this session with 13
+  unit tests, and nothing on the browser side consumes it yet, so the only thing
+  worth pinning from a page is the *structure* - who owns what, and which of the
+  three spec steps decided it. A fixture is the only way to pin that against a
+  realistic tree rather than a six-element string.
+
+  Real-site URL shapes are kept; every response is replaced by deterministic
+  local values (see form_heavy_signin.css).
+-->
+<title>登录 - 会员中心</title>
+<meta name="description" content="登录会员中心，或注册一个新账号。">
+<link rel="stylesheet" href="https://static.member.example/member.4c8d90.css">
+<link rel="stylesheet" href="https://static.member.example/member-form.9d2f33.css">
+<script defer src="https://static.member.example/member.77c0a1.js"></script>
+<style>
+  /* An embedded sheet, so the diagnostic-set assertion can tell the two
+   * sources apart: everything in the two external sheets is reported once per
+   * slot, and everything here exactly once. */
+  .signin-card { *zoom: 1; background-color: #ffffff }
+</style>
+</head>
+<body>
+<header class="site-head">
+  <a class="site-logo" href="https://www.example.com/"><img src="https://static.member.example/img/logo.9f3a11.png" width="120" height="36" alt="会员中心首页"></a>
+  <form class="site-search" role="search" action="https://www.example.com/search" method="get">
+    <input type="search" name="q" placeholder="搜索全站">
+    <button type="submit">搜索</button>
+  </form>
+  <nav class="site-nav" aria-label="站点导航">
+    <a href="https://www.example.com/">首页</a>
+    <a href="https://www.example.com/news/">资讯</a>
+    <a href="https://www.example.com/board/">讨论区</a>
+    <a href="https://www.example.com/jobs/">招聘</a>
+    <a href="https://www.example.com/help/">帮助</a>
+    <a href="https://www.example.com/member/register">注册</a>
+  </nav>
+</header>
+<div class="page-row">
+<main class="page-main">
+  <article class="signin-card">
+    <h1 class="card-title">登录</h1>
+
+    <!-- The login form. Every control inside it is owned by it through the
+         nearest-ancestor step of 4.10.18.3. -->
+    <form id="login" class="form-login" action="https://www.example.com/session" method="post">
+      <input type="hidden" name="referer" value="https://www.example.com/">
+      <div class="form-row">
+        <label class="row-label" for="acct">用户名</label>
+        <input id="acct" class="row-field" type="text" name="acct" size="24" autocomplete="username" autofocus>
+      </div>
+      <div class="form-row">
+        <label class="row-label" for="pw">密码</label>
+        <input id="pw" class="row-field" type="password" name="pw" size="24" autocomplete="current-password">
+      </div>
+      <div class="form-row">
+        <input id="remember" type="checkbox" name="remember" value="1">
+        <label class="row-inline" for="remember">在这台设备上保持登录</label>
+      </div>
+      <div class="form-row">
+        <input id="code" class="row-field" type="text" name="code" size="10" inputmode="numeric" placeholder="验证码">
+        <span class="row-note">验证码在邮件中发送</span>
+      </div>
+      <!-- 4.10.18.3 step 2 is an `if`/`else`, not a fallback: a `form`
+           attribute that names nothing leaves the control with *no* owner, even
+           though a form is right here. Asserting the derived fallback instead
+           would assert the bug. -->
+      <div class="form-row">
+        <label class="row-label" for="broken-ref">无效的 form 引用</label>
+        <input id="broken-ref" class="row-field" type="text" name="broken" form="no-such-form" size="20">
+      </div>
+      <div class="form-row">
+        <button class="row-submit" type="submit">登录</button>
+      </div>
+    </form>
+    <p class="card-note"><a class="forgot" href="https://www.example.com/member/forgot">忘记密码？</a></p>
+
+    <!-- A second form, next to the login form and not inside it. -->
+    <form id="newsletter" class="form-news" action="https://www.example.com/subscribe" method="post">
+      <h2 class="form-title">订阅更新</h2>
+      <div class="form-row">
+        <label class="row-label" for="news-email">邮箱</label>
+        <!-- `form="login"`: this control is inside #newsletter, and its owner is
+             #login, which is not its ancestor. Derived from the attribute, not
+             recorded by the parser. -->
+        <input id="news-email" class="row-field" type="email" name="email" form="login" size="28">
+      </div>
+      <div class="form-row">
+        <label class="row-label" for="news-topic">主题</label>
+        <select id="news-topic" class="row-field" name="topic">
+          <option value="all">全部</option>
+          <option value="release">版本发布</option>
+          <option value="security">安全通告</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <input id="news-weekly" type="radio" name="cadence" value="weekly">
+        <label class="row-inline" for="news-weekly">每周一封</label>
+        <input id="news-monthly" type="radio" name="cadence" value="monthly">
+        <label class="row-inline" for="news-monthly">每月一封</label>
+      </div>
+      <div class="form-row">
+        <label class="row-label" for="news-note">补充说明</label>
+        <textarea id="news-note" class="row-field" name="note" rows="3" cols="40"></textarea>
+      </div>
+      <div class="form-row">
+        <button class="row-submit" type="submit">订阅</button>
+      </div>
+    </form>
+
+    <!-- Controls in no form at all. Their owner is `None`, which is the answer
+         the standard gives and the answer a "nearest ancestor, else None" walk
+         that forgets to check listed-ness would get right by accident. -->
+    <div class="orphan-block">
+      <h2 class="form-title">未登录时的偏好开关</h2>
+      <div class="form-row">
+        <input id="orphan-locale" type="text" name="locale" size="8" placeholder="语言">
+        <select id="orphan-theme" name="theme">
+          <option value="light">浅色</option>
+          <option value="dark">深色</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <input id="orphan-digest" type="checkbox" name="digest" value="1">
+        <label class="row-inline" for="orphan-digest">接收每日摘要</label>
+      </div>
+    </div>
+
+    <!-- The parser's form element pointer, on a page shape that is real rather
+         than contrived. A `form` start tag inside a `table` is processed with the
+         "in body" rules, so the form element stays where the parser put it while
+         the *control inside it* is foster-parented out of the table and lands
+         before it. The hidden field below is therefore a sibling of the form, not
+         a child, and nothing in the finished tree says which form it belongs to:
+         the only record is the association the parser made through the form
+         element pointer. This is the worked example in 4.10.18.3, reached from
+         markup nobody would think twice about.
+
+         The controls in the cells, by contrast, have **no** form owner at all -
+         the pointer is cleared by the form's end tag before they are inserted.
+         That is the correct answer and it is a different answer, so both are
+         asserted. -->
+    <table class="quick-grid">
+      <caption>快速添加标签</caption>
+      <form id="quick-tag" class="form-quick" action="https://www.example.com/tag" method="post"><input id="scope" type="hidden" name="scope" value="thread"></form>
+      <tr>
+        <th scope="row"><label class="row-label" for="tag-name">标签名</label></th>
+        <td><input id="tag-name" class="row-field" type="text" name="name" size="18"></td>
+      </tr>
+      <tr>
+        <th scope="row"><label class="row-label" for="tag-note">备注</label></th>
+        <td><input id="tag-note" class="row-field" type="text" name="note" size="18"></td>
+      </tr>
+    </table>
+  </article>
+
+  <section class="panel-extra" id="panel-extra">
+    <h2 class="panel-title"><a href="https://www.example.com/help/login">登录遇到问题</a></h2>
+    <ul class="panel-list">
+      <li><a href="https://www.example.com/help/reset">重置密码</a></li>
+      <li><a href="https://www.example.com/help/2fa">两步验证</a></li>
+      <li><a href="https://www.example.com/help/sso">企业单点登录</a></li>
+      <li><a href="https://www.example.com/help/device">登录设备管理</a></li>
+    </ul>
+  </section>
+
+  <section class="panel-docs" id="panel-docs">
+    <h2 class="panel-title"><a href="https://www.example.com/docs/account">账号设置说明</a></h2>
+    <ul class="panel-list">
+      <li><a href="https://www.example.com/docs/account/email">更换绑定邮箱</a></li>
+      <li><a href="https://www.example.com/docs/account/name">修改显示名称</a></li>
+      <li><a href="https://www.example.com/docs/account/privacy">隐私设置</a></li>
+      <li><a href="https://www.example.com/docs/account/delete">注销账号</a></li>
+    </ul>
+  </section>
+
+  <section class="panel-faq" id="panel-faq">
+    <h2 class="panel-title">常见问题</h2>
+    <ul class="faq-list">
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q1">为什么收不到验证码邮件？</a><p class="faq-a">确认地址栏中的域名与注册时一致，并把会员邮件加入收件人列表。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q2">密码可以包含中文吗？</a><p class="faq-a">可以。密码按字节比较，长度上限为 72 个字节，超出部分不参与比较。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q3">如何退出所有设备？</a><p class="faq-a">在账号设置中选择退出所有设备，当前设备也会一并退出。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q4">换手机号后如何登录？</a><p class="faq-a">先用旧号码登录，再在账号设置中更换绑定号码。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q5">忘记用户名怎么办？</a><p class="faq-a">使用注册邮箱找回，系统会列出与该邮箱关联的用户名。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q6">登录状态多久失效？</a><p class="faq-a">勾选保持登录时为三十天，否则为一次会话。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q7">可以同时登录几台设备？</a><p class="faq-a">默认两台，可以在账号设置中调整上限。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q8">两步验证的备用码在哪里？</a><p class="faq-a">启用时一次性展示，请离线保存。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q9">企业邮箱需要额外验证吗？</a><p class="faq-a">需要由管理员在组织设置中开启域名验证。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q10">注销后数据保留多久？</a><p class="faq-a">账号信息保留三十天，之后不可恢复。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q11">如何导出我的数据？</a><p class="faq-a">在账号设置中申请导出，链接在生成后二十四小时内有效。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q12">未成年人可以注册吗？</a><p class="faq-a">需要监护人同意并提供证明材料。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q13">为什么被要求重新验证？</a><p class="faq-a">更换设备、清除 Cookie 或长时间未登录都会触发重新验证。</p></li>
+      <li class="faq-item"><a class="faq-q" href="https://www.example.com/faq/q14">举报账号在哪里提交？</a><p class="faq-a">在用户主页选择举报，并说明理由。</p></li>
+    </ul>
+  </section>
+</main>
+<aside class="page-rail">
+  <nav class="rail-toc" aria-label="本页导航">
+
+    <h2 class="rail-title">本页导航</h2>
+    <ul class="rail-list">
+      <li><a href="https://www.example.com/member/login">登录</a></li>
+      <li><a href="https://www.example.com/member/register">注册</a></li>
+      <li><a href="https://www.example.com/member/settings">账号设置</a></li>
+      <li><a href="https://www.example.com/member/oauth">第三方登录</a></li>
+    </ul>
+  </nav>
+  <section class="rail-card" id="rail-agreements">
+    <h2 class="rail-title"><a href="https://www.example.com/about/terms">协议与政策</a></h2>
+    <ul class="rail-list">
+      <li><a href="https://www.example.com/about/terms">服务条款</a></li>
+      <li><a href="https://www.example.com/about/privacy">隐私政策</a></li>
+      <li><a href="https://www.example.com/about/cookies">Cookie 说明</a></li>
+    </ul>
+  </section>
+</aside>
+</div>
+<footer class="site-foot">
+  <a href="https://www.example.com/about">关于我们</a>
+  <a href="https://www.example.com/contact">联系我们</a>
+  <a href="https://www.example.com/help">帮助中心</a>
+  <a href="https://www.example.com/copyright">版权声明</a>
+  <p class="foot-note">本页为离线夹具，内容经过裁剪；所有资源响应都由本地确定性字节提供。</p>
+</footer>
+</body>
+</html>
