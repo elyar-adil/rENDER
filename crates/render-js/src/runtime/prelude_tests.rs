@@ -132,3 +132,131 @@ fn immediate_and_idle_callbacks_exist() {
         "functionfunctionfunctionfunction"
     );
 }
+
+const CUSTOM: &str = "var log = [];
+class XA extends HTMLElement {
+  static get observedAttributes() { return ['k']; }
+  constructor() { super(); log.push('ctor'); }
+  connectedCallback() { log.push('conn'); }
+  disconnectedCallback() { log.push('disc'); }
+  attributeChangedCallback(n, o, v) { log.push('attr:' + n + ':' + o + ':' + v); }
+}";
+
+fn custom(body: &str) -> String {
+    ok(&format!("{CUSTOM}\n{body}\nlog.join()"))
+}
+
+#[test]
+fn custom_element_registry_and_validation() {
+    assert_eq!(ok("typeof customElements.define"), "function");
+    assert_eq!(
+        ok(
+            "class A extends HTMLElement {}; customElements.define('x-a', A); [customElements.get('x-a') === A, customElements.getName(A), customElements.get('x-b')].join()"
+        ),
+        "true,x-a,"
+    );
+    assert_eq!(
+        ok(
+            "class A extends HTMLElement {}; try { customElements.define('nodash', A) } catch (e) { e.name }"
+        ),
+        "SyntaxError"
+    );
+    assert_eq!(
+        ok(
+            "class A extends HTMLElement {}; class B extends HTMLElement {}; customElements.define('x-a', A); try { customElements.define('x-a', B) } catch (e) { e.name }"
+        ),
+        "NotSupportedError"
+    );
+}
+
+#[test]
+fn custom_element_constructor_and_create_element() {
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); var e = document.createElement('x-a'); log.push(e instanceof XA, e instanceof HTMLElement, e.localName); var n = new XA(); log.push(n.localName, n.isConnected)"
+        ),
+        "ctor,true,true,x-a,ctor,x-a,false"
+    );
+    assert_eq!(
+        ok("try { new HTMLElement() } catch (e) { e.name }"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn custom_element_upgrade_on_define_and_connection() {
+    assert_eq!(
+        custom(
+            "var e = document.createElement('x-a'); e.setAttribute('k', 'v'); document.body.appendChild(e); customElements.define('x-a', XA); log.push(e instanceof XA)"
+        ),
+        "ctor,attr:k:null:v,conn,true"
+    );
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); document.getElementById('a').innerHTML = '<x-a></x-a>'"
+        ),
+        "ctor,conn"
+    );
+}
+
+#[test]
+fn custom_element_lifecycle_callbacks() {
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); var e = document.createElement('x-a'); log.length = 0; var host = document.getElementById('a'); host.appendChild(e); e.setAttribute('k', '1'); e.setAttribute('other', '1'); e.setAttribute('k', '2'); e.removeAttribute('k'); host.removeChild(e)"
+        ),
+        "conn,attr:k:null:1,attr:k:1:2,attr:k:2:null,disc"
+    );
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); var host = document.getElementById('a'); host.innerHTML = '<p><x-a></x-a></p>'; host.innerHTML = ''"
+        ),
+        "ctor,conn,disc"
+    );
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); var e = document.createElement('x-a'); log.length = 0; document.body.appendChild(e); e.remove()"
+        ),
+        "conn,disc"
+    );
+}
+
+#[test]
+fn custom_element_when_defined_resolves() {
+    assert_eq!(
+        ok(
+            "var r = 'no'; customElements.whenDefined('x-w').then(function (c) { r = typeof c; }); class W extends HTMLElement {}; customElements.define('x-w', W); r"
+        ),
+        "no"
+    );
+}
+
+#[test]
+fn super_passes_the_derived_new_target_to_a_plain_function_parent() {
+    assert_eq!(
+        ok(
+            "var seen; function B() { seen = new.target; } class D extends B {} class E extends D {} new E(); seen === E"
+        ),
+        "true"
+    );
+    assert_eq!(
+        ok("var seen; function B() { seen = new.target; } new B(); seen === B"),
+        "true"
+    );
+}
+
+#[test]
+fn custom_element_reflecting_property_writes_react() {
+    assert_eq!(
+        custom(
+            "customElements.define('x-a', XA); var e = document.createElement('x-a'); log.length = 0; e.id = 'z'; document.body.appendChild(e); e.textContent = 'hi'"
+        ),
+        "conn"
+    );
+    assert_eq!(
+        ok(
+            "var log = []; class Y extends HTMLElement { static get observedAttributes() { return ['id', 'class']; } attributeChangedCallback(n, o, v) { log.push(n + ':' + o + ':' + v); } } customElements.define('x-y', Y); var e = document.createElement('x-y'); e.id = 'z'; e.className = 'c'; log.join()"
+        ),
+        "id:null:z,class:null:c"
+    );
+}

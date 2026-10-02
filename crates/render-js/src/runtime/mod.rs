@@ -99,6 +99,8 @@ pub struct JsRuntime {
     class_frames: Vec<ClassFrame>,
     /// `new.target` of each active construction, `Undefined` for plain calls.
     new_target_stack: Vec<JsValue>,
+    /// Set across the `construct` of a `super()` call; see `dispatch_new_target`.
+    super_call_pending: bool,
     /// Counter allocating class-unique private-name ids.
     next_private_id: u64,
     promises: Vec<PromiseRecord>,
@@ -211,6 +213,7 @@ impl JsRuntime {
             functions: Vec::new(),
             class_frames: Vec::new(),
             new_target_stack: Vec::new(),
+            super_call_pending: false,
             next_private_id: 1,
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
