@@ -85,6 +85,10 @@ pub struct JsError {
     offset: Option<usize>,
     position: Option<(usize, usize)>,
     thrown: Option<JsValue>,
+    /// Internal control-flow marker for `?.`: the chain ended early at a
+    /// nullish base. Never observable: the enclosing optional chain turns it
+    /// into `undefined` before any script can see it.
+    optional_short_circuit: bool,
 }
 
 impl JsError {
@@ -143,7 +147,18 @@ impl JsError {
             offset,
             position: None,
             thrown: None,
+            optional_short_circuit: false,
         }
+    }
+
+    pub(crate) fn optional_short_circuit() -> Self {
+        let mut error = Self::new(JsErrorKind::Throw, "optional chain short-circuit", None);
+        error.optional_short_circuit = true;
+        error
+    }
+
+    pub(crate) const fn is_optional_short_circuit(&self) -> bool {
+        self.optional_short_circuit
     }
 
     pub(crate) fn syntax(message: impl Into<String>, offset: usize) -> Self {
@@ -176,6 +191,7 @@ impl JsError {
             offset: None,
             position: None,
             thrown: Some(value),
+            optional_short_circuit: false,
         }
     }
 
@@ -186,6 +202,7 @@ impl JsError {
             offset: None,
             position: None,
             thrown: Some(value),
+            optional_short_circuit: false,
         }
     }
 }

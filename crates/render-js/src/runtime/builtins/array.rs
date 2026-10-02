@@ -1089,41 +1089,14 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        // §23.1.2.1: iterables go through their iterator (Set, Map, generators,
+        // array iterators, user-defined); everything else is read as an
+        // array-like. `iterate_values` implements exactly that split.
         let mut values = match source {
-            JsValue::Object(object)
-                if matches!(self.realm.host(object), Some(ObjectHost::Array)) =>
-            {
-                self.array_elements_for(object)?
-            }
-            JsValue::String(text) => text
-                .chars()
-                .map(|character| JsValue::String(character.to_string()))
-                .collect(),
-            JsValue::Object(object) => {
-                let length = self
-                    .realm
-                    .get_property(object, "length")
-                    .map(|value| to_length(&value))
-                    .transpose()?
-                    .unwrap_or(0.0);
-                if length > MAX_MATERIALIZED_ELEMENTS as f64 {
-                    return Err(JsError::resource(
-                        "Array.from source length exceeds the materialization bound",
-                    ));
-                }
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let count = length as usize;
-                let mut values = Vec::new();
-                values.try_reserve_exact(count).map_err(|_| {
-                    JsError::resource("Array.from source exceeds the available heap")
-                })?;
-                for index in 0..count {
-                    values.push(self.get_member(dom, object, &index.to_string())?);
-                }
-                values
-            }
             JsValue::Null | JsValue::Undefined => Vec::new(),
-            value => vec![value],
+            JsValue::Object(_) | JsValue::String(_) => self.iterate_values(dom, &source)?,
+            // A number or boolean has no `length`, so as an array-like it is empty.
+            _ => Vec::new(),
         };
         if let Some(mapper) = arguments.get(1)
             && let JsValue::Object(mapper) = mapper

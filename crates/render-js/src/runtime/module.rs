@@ -161,6 +161,7 @@ impl JsRuntime {
     ///
     /// Returns the link error or the first uncaught error of the graph.
     pub fn evaluate_module(&mut self, dom: &mut Dom, key: &str) -> Result<ScriptOutcome, JsError> {
+        self.ensure_prelude(dom);
         let from_revision = dom.revision();
         self.transient_roots.clear();
         self.collect_garbage();

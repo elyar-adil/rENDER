@@ -95,6 +95,8 @@ pub(super) enum TokenKind {
     Tilde,
     Question,
     QuestionQuestion,
+    /// `?.` (not when a digit follows: `a?.5:1` is a conditional).
+    QuestionDot,
     QuestionQuestionEqual,
     Arrow,
     Eof,
@@ -216,6 +218,13 @@ impl Lexer<'_> {
                     } else {
                         TokenKind::QuestionQuestion
                     }
+                }
+                '?' if self.peek_second() == Some('.')
+                    && !self.peek_third().is_some_and(|next| next.is_ascii_digit()) =>
+                {
+                    self.advance();
+                    self.advance();
+                    TokenKind::QuestionDot
                 }
                 '?' => self.single(TokenKind::Question),
                 '~' => self.single(TokenKind::Tilde),
@@ -1159,6 +1168,10 @@ impl Lexer<'_> {
         let mut characters = self.source[self.offset..].chars();
         characters.next()?;
         characters.next()
+    }
+
+    fn peek_third(&self) -> Option<char> {
+        self.source[self.offset..].chars().nth(2)
     }
 
     fn advance(&mut self) {

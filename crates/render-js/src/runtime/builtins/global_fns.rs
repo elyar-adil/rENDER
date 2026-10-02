@@ -965,6 +965,9 @@ impl JsRuntime {
             NativeFunction::Matches => {
                 self.dispatch_dom_native(dom, NativeFunction::Matches, receiver, arguments)
             }
+            NativeFunction::MathOp(_) | NativeFunction::NumberOp(_) => {
+                self.dispatch_math_native(dom, function, receiver, arguments)
+            }
             NativeFunction::MathAbs => {
                 self.dispatch_math_native(dom, NativeFunction::MathAbs, receiver, arguments)
             }

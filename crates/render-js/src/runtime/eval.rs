@@ -1317,6 +1317,17 @@ impl JsRuntime {
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
             Expr::Spread(expression) => self.evaluate(dom, expression),
+            Expr::OptionalChain(inner) => match self.evaluate(dom, inner) {
+                Err(error) if error.is_optional_short_circuit() => Ok(JsValue::Undefined),
+                other => other,
+            },
+            Expr::OptionalGuard(inner) => {
+                let value = self.evaluate(dom, inner)?;
+                if matches!(value, JsValue::Null | JsValue::Undefined) {
+                    return Err(JsError::optional_short_circuit());
+                }
+                Ok(value)
+            }
             Expr::Unary {
                 operator: UnaryOp::Delete,
                 operand,
@@ -2326,6 +2337,14 @@ impl JsRuntime {
             _ => String::new(),
         };
         let (callee_value, receiver) = match callee {
+            // `f?.()` / `o.m?.()`: resolve the inner callee with its receiver;
+            // a callee that is nullish ends the whole chain.
+            Expr::OptionalGuard(inner) => {
+                return match self.resolve_call_target(dom, inner)? {
+                    Some(target) => Ok(Some(target)),
+                    None => Err(JsError::optional_short_circuit()),
+                };
+            }
             Expr::SuperMember { property, .. } => {
                 let value = self.read_super_property(dom, property)?;
                 let receiver = self.current_this()?;
@@ -5013,6 +5032,8 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         | Expr::Object(_)
         | Expr::Array(_)
         | Expr::Spread(_)
+        | Expr::OptionalChain(_)
+        | Expr::OptionalGuard(_)
         | Expr::NewTarget
         | Expr::Sequence(_) => None,
     }

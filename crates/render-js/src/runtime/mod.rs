@@ -46,9 +46,13 @@ mod class;
 mod convert;
 mod eval;
 mod gc;
+#[cfg(test)]
+mod language_tests;
 mod module;
 #[cfg(test)]
 mod module_tests;
+#[cfg(test)]
+mod prelude_tests;
 mod types;
 
 #[cfg(test)]
@@ -71,6 +75,10 @@ pub struct JsRuntime {
     environment: Vec<Environment>,
     /// Declared modules by key (the module's absolute URL).
     modules: BTreeMap<String, module::ModuleRecord>,
+    /// Whether the self-hosted built-ins in `prelude.js` have been installed.
+    prelude_installed: bool,
+    /// The error the prelude failed with, if it did; a test pins this to `None`.
+    prelude_error: Option<JsError>,
     functions: Vec<UserFunction>,
     /// Class context of each active user-function call, for `super`,
     /// `new.target`, and field initialization.
@@ -176,6 +184,8 @@ impl JsRuntime {
             dom_nodes_created: 0,
             environment: Vec::new(),
             modules: BTreeMap::new(),
+            prelude_installed: false,
+            prelude_error: None,
             functions: Vec::new(),
             class_frames: Vec::new(),
             new_target_stack: Vec::new(),
@@ -693,6 +703,7 @@ impl JsRuntime {
     /// Returns a typed syntax/runtime/DOM/resource-limit error. Unsupported
     /// syntax is never silently ignored.
     pub fn execute(&mut self, dom: &mut Dom, source: &str) -> Result<ScriptOutcome, JsError> {
+        self.ensure_prelude(dom);
         self.source_line_starts = build_line_starts(source);
         let script = match super::CompiledScript::compile(source, &self.limits) {
             Ok(script) => script,
@@ -703,6 +714,40 @@ impl JsRuntime {
             }
         };
         self.execute_compiled(dom, &script)
+    }
+
+    /// Install the built-ins that are written in JavaScript (`prelude.js`).
+    ///
+    /// Engines commonly self-host the parts of the standard library that are
+    /// simplest to state in the language itself; doing the same here keeps the
+    /// Rust surface small. It runs once, lazily, before the first script, with
+    /// its own execution budget, and never reports to `window.onerror`.
+    pub(super) fn ensure_prelude(&mut self, dom: &mut Dom) {
+        if self.prelude_installed {
+            return;
+        }
+        self.prelude_installed = true;
+        let source = include_str!("../prelude.js");
+        let outcome = super::CompiledScript::compile(source, &self.limits).and_then(|script| {
+            self.source_line_starts = build_line_starts(source);
+            self.steps_remaining = self.limits.max_execution_steps;
+            self.calls_active = 0;
+            self.environment.clear();
+            let from_revision = dom.revision();
+            self.run_compiled_script(dom, &script.statements, from_revision)
+        });
+        if let Err(error) = outcome {
+            if std::env::var_os("RENDER_JS_TRACE").is_some() {
+                eprintln!("[render-js prelude failed: {error}]");
+            }
+            self.prelude_error = Some(error);
+        }
+    }
+
+    /// The error the self-hosted prelude failed with, if any.
+    #[must_use]
+    pub fn prelude_error(&self) -> Option<&JsError> {
+        self.prelude_error.as_ref()
     }
 
     /// Resolve an error's byte offset into a line/column pair using the
@@ -729,6 +774,7 @@ impl JsRuntime {
         dom: &mut Dom,
         script: &super::CompiledScript,
     ) -> Result<ScriptOutcome, JsError> {
+        self.ensure_prelude(dom);
         self.source_line_starts = build_line_starts(script.source());
         let from_revision = dom.revision();
         // Nothing from the previous script can still be held by an interpreter

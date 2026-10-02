@@ -330,8 +330,51 @@ fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
     })
 }
 
+/// The `Math` functions that are a single pure `f64` operation, so one native
+/// variant covers them all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MathOp {
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Sinh,
+    Cosh,
+    Tanh,
+    Asinh,
+    Acosh,
+    Atanh,
+    Log,
+    Log2,
+    Log10,
+    Log1p,
+    Exp,
+    Expm1,
+    Sign,
+    Trunc,
+    Cbrt,
+    Fround,
+    Clz32,
+    Imul,
+    Atan2,
+    Hypot,
+}
+
+/// `Number.isInteger` and its siblings (ECMA-262 §21.1.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NumberOp {
+    IsInteger,
+    IsFinite,
+    IsNaN,
+    IsSafeInteger,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
+    MathOp(MathOp),
+    NumberOp(NumberOp),
     GetElementById,
     QuerySelector,
     QuerySelectorAll,
@@ -4072,6 +4115,22 @@ impl Realm {
                 },
             );
         }
+        for (name, function) in [
+            ("isInteger", NumberOp::IsInteger),
+            ("isFinite", NumberOp::IsFinite),
+            ("isNaN", NumberOp::IsNaN),
+            ("isSafeInteger", NumberOp::IsSafeInteger),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(NativeFunction::NumberOp(function)),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         objects[global.0].properties.insert(
             "Number".to_owned(),
             PropertyDescriptor {
@@ -4762,6 +4821,32 @@ impl Realm {
             ("random", NativeFunction::MathRandom),
             ("round", NativeFunction::MathRound),
             ("sqrt", NativeFunction::MathSqrt),
+            ("sin", NativeFunction::MathOp(MathOp::Sin)),
+            ("cos", NativeFunction::MathOp(MathOp::Cos)),
+            ("tan", NativeFunction::MathOp(MathOp::Tan)),
+            ("asin", NativeFunction::MathOp(MathOp::Asin)),
+            ("acos", NativeFunction::MathOp(MathOp::Acos)),
+            ("atan", NativeFunction::MathOp(MathOp::Atan)),
+            ("sinh", NativeFunction::MathOp(MathOp::Sinh)),
+            ("cosh", NativeFunction::MathOp(MathOp::Cosh)),
+            ("tanh", NativeFunction::MathOp(MathOp::Tanh)),
+            ("asinh", NativeFunction::MathOp(MathOp::Asinh)),
+            ("acosh", NativeFunction::MathOp(MathOp::Acosh)),
+            ("atanh", NativeFunction::MathOp(MathOp::Atanh)),
+            ("log", NativeFunction::MathOp(MathOp::Log)),
+            ("log2", NativeFunction::MathOp(MathOp::Log2)),
+            ("log10", NativeFunction::MathOp(MathOp::Log10)),
+            ("log1p", NativeFunction::MathOp(MathOp::Log1p)),
+            ("exp", NativeFunction::MathOp(MathOp::Exp)),
+            ("expm1", NativeFunction::MathOp(MathOp::Expm1)),
+            ("sign", NativeFunction::MathOp(MathOp::Sign)),
+            ("trunc", NativeFunction::MathOp(MathOp::Trunc)),
+            ("cbrt", NativeFunction::MathOp(MathOp::Cbrt)),
+            ("fround", NativeFunction::MathOp(MathOp::Fround)),
+            ("clz32", NativeFunction::MathOp(MathOp::Clz32)),
+            ("imul", NativeFunction::MathOp(MathOp::Imul)),
+            ("atan2", NativeFunction::MathOp(MathOp::Atan2)),
+            ("hypot", NativeFunction::MathOp(MathOp::Hypot)),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -4777,6 +4862,28 @@ impl Realm {
                     writable: true,
                     enumerable: false,
                     configurable: true,
+                },
+            );
+        }
+        for (name, value) in [
+            ("PI", std::f64::consts::PI),
+            ("E", std::f64::consts::E),
+            ("LN2", std::f64::consts::LN_2),
+            ("LN10", std::f64::consts::LN_10),
+            ("LOG2E", std::f64::consts::LOG2_E),
+            ("LOG10E", std::f64::consts::LOG10_E),
+            ("SQRT2", std::f64::consts::SQRT_2),
+            ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+        ] {
+            objects[math.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Number(value),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
                 },
             );
         }

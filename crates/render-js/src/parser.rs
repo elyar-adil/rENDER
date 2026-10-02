@@ -443,6 +443,13 @@ pub(super) enum Expr {
         offset: usize,
     },
     Sequence(Vec<Self>),
+    /// The extent of an optional chain (`a?.b.c(d)`): a nullish base reached
+    /// at an [`Self::OptionalGuard`] inside ends the whole chain with
+    /// `undefined`.
+    OptionalChain(Box<Self>),
+    /// The `?.` itself: evaluates its operand and short-circuits the
+    /// enclosing [`Self::OptionalChain`] when the value is `null`/`undefined`.
+    OptionalGuard(Box<Self>),
 }
 
 pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
@@ -2068,8 +2075,48 @@ impl Parser {
     }
 
     fn postfix_tail(&mut self, mut expression: Expr) -> Result<Expr, JsError> {
+        let mut optional = false;
         loop {
-            if self.take(&TokenKind::Dot) {
+            if self.take(&TokenKind::QuestionDot) {
+                optional = true;
+                expression = Expr::OptionalGuard(Box::new(expression));
+                if self.take(&TokenKind::LeftParen) {
+                    let arguments = self.arguments_after_left_paren()?;
+                    expression = Expr::Call {
+                        offset: self.previous_offset(),
+                        callee: Box::new(expression),
+                        arguments,
+                    };
+                } else if self.take(&TokenKind::LeftBracket) {
+                    let property = self.assignment()?;
+                    self.require(
+                        &TokenKind::RightBracket,
+                        "expected ']' after computed property",
+                    )?;
+                    expression = Expr::ComputedMember {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        property: Box::new(property),
+                    };
+                } else if let TokenKind::PrivateName(name) = self.current().kind.clone() {
+                    if self.class_depth == 0 {
+                        return Err(self.error("private names are only allowed in class bodies"));
+                    }
+                    self.advance();
+                    expression = Expr::PrivateMember {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        name,
+                    };
+                } else {
+                    let property = self.property_name()?;
+                    expression = Expr::Member {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        property,
+                    };
+                }
+            } else if self.take(&TokenKind::Dot) {
                 if let TokenKind::PrivateName(name) = self.current().kind.clone() {
                     if self.class_depth == 0 {
                         return Err(self.error("private names are only allowed in class bodies"));
@@ -2107,6 +2154,9 @@ impl Parser {
                     arguments,
                 };
             } else if matches!(self.current().kind, TokenKind::Template(_)) {
+                if optional {
+                    return Err(self.error("tagged templates are not allowed in an optional chain"));
+                }
                 // ECMA-262 13.3.11 `TaggedTemplate`: the tag is handed a
                 // template object and the substitution values, not the
                 // concatenated string an untagged template literal produces.
@@ -2118,6 +2168,9 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        if optional {
+            expression = Expr::OptionalChain(Box::new(expression));
         }
         Ok(expression)
     }
@@ -2510,6 +2563,7 @@ impl Parser {
         )?;
         let mut parameters = Vec::new();
         let mut defaults: Vec<Statement> = Vec::new();
+        let mut patterns = Vec::new();
         let mut bound = BTreeSet::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
@@ -2523,17 +2577,15 @@ impl Parser {
                     parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                     break;
                 }
-                // Destructuring parameters are accepted and lowered to their
-                // bound names. The compact runtime does not yet materialize
-                // a separate pattern environment, but retaining the names
-                // keeps modern framework bundles parseable and callable.
+                // A destructuring parameter binds an anonymous argument slot;
+                // the pattern itself is lowered to a `var` declaration at the
+                // top of the body, exactly as arrow functions do.
                 let mut bound_names = Vec::new();
                 if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
                     let pattern = self.binding_pattern()?;
-                    collect_binding_names(&pattern, &mut bound_names);
-                    if bound_names.is_empty() {
-                        bound_names.push(format!("__arg{}", parameters.len()));
-                    }
+                    let temporary = format!("\0param_{}", parameters.len());
+                    patterns.push((temporary.clone(), pattern));
+                    bound_names.push(temporary);
                 } else {
                     // `undefined` is an ordinary identifier in parameter position.
                     let parameter = match self.advance().kind {
@@ -2584,6 +2636,20 @@ impl Parser {
         if !defaults.is_empty() {
             defaults.extend(body);
             body = defaults;
+        }
+        if !patterns.is_empty() {
+            let mut declarations = Vec::new();
+            for (temporary, pattern) in patterns {
+                Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
+            }
+            body.insert(
+                0,
+                Statement::VariableList {
+                    offset: self.previous_offset(),
+                    kind: VariableKind::Var,
+                    declarations,
+                },
+            );
         }
         Ok((parameters, body))
     }
@@ -3120,7 +3186,9 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(&property.value)
         }),
         Expr::Array(elements) => elements.iter().try_for_each(validate_strict_expression),
-        Expr::Spread(expression) => validate_strict_expression(expression),
+        Expr::Spread(expression)
+        | Expr::OptionalChain(expression)
+        | Expr::OptionalGuard(expression) => validate_strict_expression(expression),
 
         Expr::Unary {
             operator: UnaryOp::Delete,
@@ -3533,7 +3601,9 @@ fn validate_reserved_expression(
                 validate_reserved_expression(element, context)?;
             }
         }
-        Expr::Spread(inner) => validate_reserved_expression(inner, context)?,
+        Expr::Spread(inner) | Expr::OptionalChain(inner) | Expr::OptionalGuard(inner) => {
+            validate_reserved_expression(inner, context)?;
+        }
         Expr::Unary { operand, .. } => validate_reserved_expression(operand, context)?,
         Expr::Binary { left, right, .. } => {
             validate_reserved_expression(left, context)?;
