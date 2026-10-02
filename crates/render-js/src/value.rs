@@ -330,6 +330,83 @@ fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
     })
 }
 
+/// Which kind of node a `new Text()` / `new Comment()` / `new DocumentFragment()`
+/// makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DomNodeKind {
+    Text,
+    Comment,
+    Fragment,
+}
+
+/// HTML element interfaces and the tag names they cover (HTML Standard §3.2.8,
+/// the elements that have an interface of their own).
+pub(crate) const HTML_ELEMENT_INTERFACES: &[(&str, &[&str])] = &[
+    ("HTMLAnchorElement", &["a"]),
+    ("HTMLAreaElement", &["area"]),
+    ("HTMLAudioElement", &["audio"]),
+    ("HTMLBRElement", &["br"]),
+    ("HTMLBaseElement", &["base"]),
+    ("HTMLBodyElement", &["body"]),
+    ("HTMLButtonElement", &["button"]),
+    ("HTMLCanvasElement", &["canvas"]),
+    ("HTMLDListElement", &["dl"]),
+    ("HTMLDataElement", &["data"]),
+    ("HTMLDataListElement", &["datalist"]),
+    ("HTMLDetailsElement", &["details"]),
+    ("HTMLDialogElement", &["dialog"]),
+    ("HTMLDivElement", &["div"]),
+    ("HTMLEmbedElement", &["embed"]),
+    ("HTMLFieldSetElement", &["fieldset"]),
+    ("HTMLFormElement", &["form"]),
+    ("HTMLHRElement", &["hr"]),
+    ("HTMLHeadElement", &["head"]),
+    ("HTMLHeadingElement", &["h1", "h2", "h3", "h4", "h5", "h6"]),
+    ("HTMLHtmlElement", &["html"]),
+    ("HTMLIFrameElement", &["iframe"]),
+    ("HTMLImageElement", &["img"]),
+    ("HTMLInputElement", &["input"]),
+    ("HTMLLIElement", &["li"]),
+    ("HTMLLabelElement", &["label"]),
+    ("HTMLLegendElement", &["legend"]),
+    ("HTMLLinkElement", &["link"]),
+    ("HTMLMapElement", &["map"]),
+    ("HTMLMediaElement", &[]),
+    ("HTMLMetaElement", &["meta"]),
+    ("HTMLMeterElement", &["meter"]),
+    ("HTMLModElement", &["ins", "del"]),
+    ("HTMLOListElement", &["ol"]),
+    ("HTMLObjectElement", &["object"]),
+    ("HTMLOptGroupElement", &["optgroup"]),
+    ("HTMLOptionElement", &["option"]),
+    ("HTMLOutputElement", &["output"]),
+    ("HTMLParagraphElement", &["p"]),
+    ("HTMLParamElement", &["param"]),
+    ("HTMLPictureElement", &["picture"]),
+    ("HTMLPreElement", &["pre"]),
+    ("HTMLProgressElement", &["progress"]),
+    ("HTMLQuoteElement", &["blockquote", "q"]),
+    ("HTMLScriptElement", &["script"]),
+    ("HTMLSelectElement", &["select"]),
+    ("HTMLSlotElement", &["slot"]),
+    ("HTMLSourceElement", &["source"]),
+    ("HTMLSpanElement", &["span"]),
+    ("HTMLStyleElement", &["style"]),
+    ("HTMLTableCaptionElement", &["caption"]),
+    ("HTMLTableCellElement", &["td", "th"]),
+    ("HTMLTableColElement", &["col", "colgroup"]),
+    ("HTMLTableElement", &["table"]),
+    ("HTMLTableRowElement", &["tr"]),
+    ("HTMLTableSectionElement", &["thead", "tbody", "tfoot"]),
+    ("HTMLTemplateElement", &["template"]),
+    ("HTMLTextAreaElement", &["textarea"]),
+    ("HTMLTimeElement", &["time"]),
+    ("HTMLTitleElement", &["title"]),
+    ("HTMLTrackElement", &["track"]),
+    ("HTMLUListElement", &["ul"]),
+    ("HTMLVideoElement", &["video"]),
+];
+
 /// The `Math` functions that are a single pure `f64` operation, so one native
 /// variant covers them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,6 +517,9 @@ pub(crate) enum NativeFunction {
     RemoveEventListener,
     DispatchEvent,
     EventPreventDefault,
+    EventStopPropagation,
+    EventStopImmediatePropagation,
+    EventComposedPath,
     ClassListAdd,
     ClassListRemove,
     ClassListToggle,
@@ -1203,6 +1283,9 @@ pub(crate) enum ObjectHost {
         promise: usize,
         fulfilled: bool,
     },
+    /// `Text`, `Comment` and `DocumentFragment`: the DOM interfaces a script can
+    /// construct with `new`.
+    DomNodeConstructor(DomNodeKind),
     /// A generator object; the index names its coroutine.
     Generator(usize),
     /// The callback an `await` registers on a promise to continue its
@@ -1360,6 +1443,7 @@ impl ObjectHost {
                 | Self::RegExpConstructor
                 | Self::EventConstructor
                 | Self::DomConstructor
+                | Self::DomNodeConstructor(_)
                 | Self::ImageConstructor
                 | Self::VideoConstructor
                 | Self::ObjectConstructor
@@ -1611,6 +1695,8 @@ pub struct Realm {
     symbol_prototype: ObjectId,
     promise_prototype: ObjectId,
     element_prototype: ObjectId,
+    /// The prototype of every DOM interface, by interface name.
+    dom_prototypes: BTreeMap<&'static str, ObjectId>,
     /// `%IteratorPrototype%` carrying the iterator-helper methods.
     iterator_prototype: ObjectId,
     /// `%GeneratorPrototype%`: `next`, `return` and `throw` of every generator.
@@ -1695,7 +1781,7 @@ impl Realm {
         );
         let object_prototype = Self::install_object(&mut objects, global);
         let function_prototype = Self::install_function(&mut objects, global, object_prototype);
-        let element_prototype = Self::install_dom_interfaces(
+        let (element_prototype, dom_prototypes) = Self::install_dom_interfaces(
             &mut objects,
             global,
             object_prototype,
@@ -1707,7 +1793,7 @@ impl Realm {
         // remains intentionally non-constructible.
         let document_prototype = ObjectId(objects.len());
         objects.push(JsObject {
-            prototype: Some(object_prototype),
+            prototype: Some(element_prototype),
             ..JsObject::default()
         });
         let document_constructor = ObjectId(objects.len());
@@ -2351,6 +2437,7 @@ impl Realm {
                     | ObjectHost::RegExpConstructor
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
+                    | ObjectHost::DomNodeConstructor(_)
                     | ObjectHost::ImageConstructor
                     | ObjectHost::VideoConstructor
                     | ObjectHost::IntersectionObserverConstructor
@@ -2380,6 +2467,7 @@ impl Realm {
             symbol_prototype,
             promise_prototype,
             element_prototype,
+            dom_prototypes,
             iterator_prototype,
             generator_prototype,
             iterator_helper_prototype,
@@ -2420,15 +2508,38 @@ impl Realm {
         );
     }
 
+    /// Build the DOM interface objects with their real inheritance:
+    ///
+    /// ```text
+    /// (EventTarget) -> Node -> CharacterData -> Text | Comment
+    ///                       -> Element -> HTMLElement -> HTML<Tag>Element
+    ///                                  -> SVGElement
+    ///                       -> DocumentFragment
+    /// ```
+    ///
+    /// `Node.prototype` is the object that carries the methods shared by every
+    /// wrapper. `EventTarget.prototype` exists as a prototype only; the script
+    /// level `EventTarget` constructor is attached to it by the prelude.
+    /// Returns `Node.prototype` and the prototype of every interface by name.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat table of interface wiring reads better than fragments"
+    )]
     fn install_dom_interfaces(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) -> ObjectId {
-        let prototype = ObjectId(objects.len());
+    ) -> (ObjectId, BTreeMap<&'static str, ObjectId>) {
+        let mut prototypes: BTreeMap<&'static str, ObjectId> = BTreeMap::new();
+        let event_target = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(event_target),
             ..JsObject::default()
         });
         for (name, function) in [
@@ -2468,10 +2579,149 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Number(0.0)),
             );
         }
+        let node = Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "Node",
+            prototype,
+            None,
+            ObjectHost::DomConstructor,
+        );
+        for (name, value) in [
+            ("ELEMENT_NODE", 1.0),
+            ("ATTRIBUTE_NODE", 2.0),
+            ("TEXT_NODE", 3.0),
+            ("CDATA_SECTION_NODE", 4.0),
+            ("ENTITY_REFERENCE_NODE", 5.0),
+            ("ENTITY_NODE", 6.0),
+            ("PROCESSING_INSTRUCTION_NODE", 7.0),
+            ("COMMENT_NODE", 8.0),
+            ("DOCUMENT_NODE", 9.0),
+            ("DOCUMENT_TYPE_NODE", 10.0),
+            ("DOCUMENT_FRAGMENT_NODE", 11.0),
+            ("NOTATION_NODE", 12.0),
+            ("DOCUMENT_POSITION_DISCONNECTED", 1.0),
+            ("DOCUMENT_POSITION_PRECEDING", 2.0),
+            ("DOCUMENT_POSITION_FOLLOWING", 4.0),
+            ("DOCUMENT_POSITION_CONTAINS", 8.0),
+            ("DOCUMENT_POSITION_CONTAINED_BY", 16.0),
+            ("DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC", 32.0),
+        ] {
+            for target in [node, prototype] {
+                objects[target.0].properties.insert(
+                    name.to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Number(value),
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                    },
+                );
+            }
+        }
+        prototypes.insert("Node", prototype);
+
+        let mut derive = |name: &'static str,
+                          parent: &'static str,
+                          host: ObjectHost,
+                          objects: &mut Vec<JsObject>|
+         -> ObjectId {
+            let parent_prototype = prototypes[parent];
+            let proto = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(parent_prototype),
+                ..JsObject::default()
+            });
+            let parent_constructor = objects[parent_prototype.0]
+                .properties
+                .get("constructor")
+                .and_then(|descriptor| match descriptor.value {
+                    JsValue::Object(object) => Some(object),
+                    _ => None,
+                });
+            Self::dom_interface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                proto,
+                parent_constructor,
+                host,
+            );
+            prototypes.insert(name, proto);
+            proto
+        };
+        derive("CharacterData", "Node", ObjectHost::DomConstructor, objects);
+        derive(
+            "Text",
+            "CharacterData",
+            ObjectHost::DomNodeConstructor(DomNodeKind::Text),
+            objects,
+        );
+        derive(
+            "Comment",
+            "CharacterData",
+            ObjectHost::DomNodeConstructor(DomNodeKind::Comment),
+            objects,
+        );
+        derive(
+            "DocumentFragment",
+            "Node",
+            ObjectHost::DomNodeConstructor(DomNodeKind::Fragment),
+            objects,
+        );
+        derive("Element", "Node", ObjectHost::DomConstructor, objects);
+        derive(
+            "HTMLElement",
+            "Element",
+            ObjectHost::DomConstructor,
+            objects,
+        );
+        derive("SVGElement", "Element", ObjectHost::DomConstructor, objects);
+        derive(
+            "SVGSVGElement",
+            "SVGElement",
+            ObjectHost::DomConstructor,
+            objects,
+        );
+        derive(
+            "HTMLMediaElement",
+            "HTMLElement",
+            ObjectHost::DomConstructor,
+            objects,
+        );
+        for (interface, _) in HTML_ELEMENT_INTERFACES {
+            if *interface == "HTMLMediaElement" {
+                continue;
+            }
+            let parent = if matches!(*interface, "HTMLVideoElement" | "HTMLAudioElement") {
+                "HTMLMediaElement"
+            } else {
+                "HTMLElement"
+            };
+            derive(interface, parent, ObjectHost::DomConstructor, objects);
+        }
+        (prototype, prototypes)
+    }
+
+    /// Create the interface object (constructor) for `prototype` and register
+    /// it as the global `name`.
+    fn dom_interface(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        function_prototype: ObjectId,
+        name: &str,
+        prototype: ObjectId,
+        parent_constructor: Option<ObjectId>,
+        host: ObjectHost,
+    ) -> ObjectId {
         let constructor = ObjectId(objects.len());
         objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::DomConstructor,
+            prototype: Some(parent_constructor.unwrap_or(function_prototype)),
+            host,
             ..JsObject::default()
         });
         objects[constructor.0].properties.insert(
@@ -2485,35 +2735,53 @@ impl Realm {
                 configurable: false,
             },
         );
-        objects[prototype.0].properties.insert(
-            "constructor".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(constructor)),
-        );
-        for (name, value) in [
-            ("ELEMENT_NODE", 1.0),
-            ("TEXT_NODE", 3.0),
-            ("DOCUMENT_NODE", 9.0),
-            ("DOCUMENT_FRAGMENT_NODE", 11.0),
+        for (key, value) in [
+            ("name", JsValue::String(name.to_owned())),
+            ("length", JsValue::Number(0.0)),
         ] {
             objects[constructor.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Number(value)),
-            );
-        }
-        for name in ["Element", "HTMLElement", "Node", "DocumentFragment"] {
-            objects[global.0].properties.insert(
-                name.to_owned(),
+                key.to_owned(),
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::Object(constructor),
-                    writable: true,
+                    value,
+                    writable: false,
                     enumerable: false,
                     configurable: true,
                 },
             );
         }
-        prototype
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(name.to_owned()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        objects[global.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        constructor
     }
 
     fn install_collections(
@@ -4552,6 +4820,43 @@ impl Realm {
             "preventDefault".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(prevent_default)),
         );
+        for (name, function) in [
+            ("stopPropagation", NativeFunction::EventStopPropagation),
+            (
+                "stopImmediatePropagation",
+                NativeFunction::EventStopImmediatePropagation,
+            ),
+            ("composedPath", NativeFunction::EventComposedPath),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        for (name, value) in [
+            ("NONE", 0.0),
+            ("CAPTURING_PHASE", 1.0),
+            ("AT_TARGET", 2.0),
+            ("BUBBLING_PHASE", 3.0),
+        ] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Number(value),
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            );
+        }
 
         let constructor = ObjectId(objects.len());
         objects.push(JsObject {
@@ -6496,12 +6801,19 @@ impl Realm {
         true
     }
 
-    pub(crate) fn node_wrapper(&mut self, node: NodeId) -> ObjectId {
+    /// The wrapper object of `node`, created on first use with the prototype of
+    /// its DOM `interface` (`"HTMLDivElement"`, `"Text"`, …).
+    pub(crate) fn node_wrapper(&mut self, node: NodeId, interface: &str) -> ObjectId {
         if let Some(wrapper) = self.node_wrappers.get(&node) {
             return *wrapper;
         }
+        let prototype = self
+            .dom_prototypes
+            .get(interface)
+            .copied()
+            .unwrap_or(self.element_prototype);
         let wrapper = self.allocate(JsObject {
-            prototype: Some(self.element_prototype),
+            prototype: Some(prototype),
             host: ObjectHost::Node(node),
             ..JsObject::default()
         });

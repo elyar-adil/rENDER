@@ -1446,6 +1446,17 @@ impl JsRuntime {
                         "super constructor returned a non-object",
                     ));
                 };
+                // A built-in parent builds its instance from its own prototype;
+                // `super()` must re-parent it onto `new.target.prototype`, or a
+                // subclass of `Error`, `Map`, `Array`, `Event`… would not be an
+                // instance of itself (ECMA-262 `OrdinaryCreateFromConstructor`).
+                if let Some(JsValue::Object(new_target)) = self.new_target_stack.last().cloned()
+                    && let Some(JsValue::Object(prototype)) =
+                        self.realm.get_property(new_target, "prototype")
+                    && self.realm.get_prototype(instance) != Some(prototype)
+                {
+                    self.realm.set_prototype(instance, Some(prototype));
+                }
                 self.initialize_this(JsValue::Object(instance));
                 self.run_instance_fields(dom, &class, instance)?;
                 Ok(JsValue::Object(instance))
@@ -3389,9 +3400,43 @@ impl JsRuntime {
                         _ => "head",
                     };
                     return match self.find_element_by_tag(dom, document, tag)? {
-                        Some(node) => self.wrap_node(node),
+                        Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
                     };
+                }
+                "parentNode" | "parentElement" | "nextSibling" | "previousSibling"
+                | "ownerDocument" => return Ok(JsValue::Null),
+                "firstChild" | "lastChild" => {
+                    let child = dom.children(document).and_then(|children| {
+                        if property == "firstChild" {
+                            children.first()
+                        } else {
+                            children.last()
+                        }
+                        .copied()
+                    });
+                    return match child {
+                        Some(child) => self.wrap_node(dom, child),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "childNodes" | "children" => {
+                    let elements_only = property == "children";
+                    let values = dom
+                        .children(document)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|child| {
+                            !elements_only
+                                || matches!(
+                                    dom.node(*child).map(render_dom::Node::kind),
+                                    Some(NodeKind::Element(_))
+                                )
+                        })
+                        .map(|child| self.wrap_node(dom, child))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
                 "readyState" => return Ok(JsValue::String("complete".to_owned())),
                 "cookie" => {
@@ -3403,7 +3448,7 @@ impl JsRuntime {
                 }
                 "activeElement" => {
                     return match self.find_element_by_tag(dom, document, "body")? {
-                        Some(node) => self.wrap_node(node),
+                        Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3473,7 +3518,7 @@ impl JsRuntime {
                             )
                     });
                     return match parent {
-                        Some(parent) => self.wrap_node(parent),
+                        Some(parent) => self.wrap_node(dom, parent),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3491,7 +3536,7 @@ impl JsRuntime {
                         _ => dom.previous_sibling(node),
                     };
                     return match related {
-                        Some(related) => self.wrap_node(related),
+                        Some(related) => self.wrap_node(dom, related),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3510,7 +3555,7 @@ impl JsRuntime {
                                     Some(NodeKind::Element(_))
                                 )
                         })
-                        .map(|child| self.wrap_node(child))
+                        .map(|child| self.wrap_node(dom, child))
                         .collect::<Result<Vec<_>, _>>()?;
                     return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
@@ -4347,6 +4392,9 @@ impl JsRuntime {
                 Ok(value)
             }
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
+            Some(ObjectHost::DomNodeConstructor(kind)) => {
+                self.construct_dom_node(dom, kind, arguments)
+            }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             Some(ObjectHost::VideoConstructor) => self.video_constructor(constructor, arguments),
@@ -4580,6 +4628,9 @@ impl JsRuntime {
                 Err(JsError::type_error("Event constructor requires 'new'"))
             }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
+            Some(ObjectHost::DomNodeConstructor(_)) => Err(JsError::type_error(
+                "Failed to construct a DOM node: please use the 'new' operator",
+            )),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             // Legacy web compatibility: `Video()` without `new` constructs,
             // exactly like `Image()`.

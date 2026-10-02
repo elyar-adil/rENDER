@@ -48,7 +48,11 @@ mod coroutine;
 mod coroutine_run;
 #[cfg(test)]
 mod coroutine_tests;
+#[cfg(test)]
+mod dom_tests;
 mod eval;
+#[cfg(test)]
+mod event_tests;
 mod gc;
 #[cfg(test)]
 mod language_tests;
@@ -99,7 +103,9 @@ pub struct JsRuntime {
     next_private_id: u64,
     promises: Vec<PromiseRecord>,
     pending_microtasks: Vec<JsMicrotask>,
-    event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<ObjectId>>>,
+    event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<types::Listener>>>,
+    /// Per-event dispatch state, present only while the event is dispatched.
+    event_flags: BTreeMap<ObjectId, types::EventFlags>,
     event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
     global_bindings: BTreeMap<String, GlobalBinding>,
     timers: BTreeMap<u64, TimerEntry>,
@@ -118,7 +124,7 @@ pub struct JsRuntime {
     next_fetch_id: u64,
     regexes: Vec<RegexRecord>,
     console_messages: Vec<ConsoleMessage>,
-    window_event_handlers: BTreeMap<String, Vec<ObjectId>>,
+    window_event_handlers: BTreeMap<String, Vec<types::Listener>>,
     next_symbol_id: u64,
     /// `Symbol.for` registry: registry key -> symbol id.
     global_symbol_registry: BTreeMap<String, u64>,
@@ -153,6 +159,9 @@ impl From<DomError> for JsError {
         Self::new(JsErrorKind::Dom, error.to_string(), None)
     }
 }
+
+/// The self-hosted standard library; see `JsRuntime::ensure_prelude`.
+const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
 
 impl JsRuntime {
     #[must_use]
@@ -206,6 +215,7 @@ impl JsRuntime {
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
             event_listeners: BTreeMap::new(),
+            event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
             global_bindings: BTreeMap::new(),
             timers: BTreeMap::new(),
@@ -514,33 +524,7 @@ impl JsRuntime {
         cancelable: bool,
         extra_properties: &[(&str, JsValue)],
     ) -> Result<bool, JsError> {
-        let prototype = self
-            .realm
-            .global("Event")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            })
-            .and_then(|constructor| {
-                self.realm
-                    .get_property(constructor, "prototype")
-                    .and_then(|value| match value {
-                        JsValue::Object(object) => Some(object),
-                        _ => None,
-                    })
-            });
-        self.ensure_heap_capacity(1)?;
-        let event = self.realm.create_object(prototype);
-        for (name, value) in [
-            ("type", JsValue::String(event_type.to_owned())),
-            ("bubbles", JsValue::Boolean(bubbles)),
-            ("cancelable", JsValue::Boolean(cancelable)),
-            ("defaultPrevented", JsValue::Boolean(false)),
-            ("target", JsValue::Null),
-            ("currentTarget", JsValue::Null),
-        ] {
-            self.realm.set_property(event, name.to_owned(), value);
-        }
+        let event = self.create_event_object(event_type, bubbles, cancelable, false, true)?;
         for (name, value) in extra_properties {
             self.realm
                 .set_property(event, (*name).to_owned(), value.clone());
@@ -740,9 +724,25 @@ impl JsRuntime {
             return;
         }
         self.prelude_installed = true;
-        let source = include_str!("../prelude.js");
-        let outcome = super::CompiledScript::compile(source, &self.limits).and_then(|script| {
-            self.source_line_starts = build_line_starts(source);
+        thread_local! {
+            // Parsing the prelude is most of its cost, and a thread's runtimes
+            // can all run the same tree.
+            static COMPILED: std::cell::RefCell<Option<std::rc::Rc<super::CompiledScript>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let compiled = COMPILED.with(|cell| {
+            if let Some(script) = cell.borrow().as_ref() {
+                return Ok(script.clone());
+            }
+            let script = std::rc::Rc::new(super::CompiledScript::compile(
+                PRELUDE_SOURCE,
+                &self.limits,
+            )?);
+            *cell.borrow_mut() = Some(script.clone());
+            Ok(script)
+        });
+        let outcome = compiled.and_then(|script| {
+            self.source_line_starts = build_line_starts(PRELUDE_SOURCE);
             self.steps_remaining = self.limits.max_execution_steps;
             self.calls_active = 0;
             self.environment.clear();

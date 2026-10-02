@@ -70,6 +70,28 @@ pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;
 /// when script logs past it so a chatty page cannot exhaust memory.
 pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
 
+/// One registration made with `addEventListener` (DOM Standard §2.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Listener {
+    /// A function, or an object whose `handleEvent` method is called.
+    pub(super) callback: ObjectId,
+    pub(super) capture: bool,
+    pub(super) once: bool,
+    pub(super) passive: bool,
+}
+
+/// Dispatch state that belongs to an `Event` while it is being dispatched
+/// (DOM Standard §2.2 "stop propagation flag" and friends).
+#[derive(Clone, Debug, Default)]
+pub(super) struct EventFlags {
+    pub(super) stop_propagation: bool,
+    pub(super) stop_immediate: bool,
+    /// Set while a passive listener runs, where `preventDefault` is ignored.
+    pub(super) in_passive_listener: bool,
+    /// What `composedPath()` returns: the objects the event travels through.
+    pub(super) path: Vec<ObjectId>,
+}
+
 /// How a user function is created, beyond its name, parameters and body.
 pub(super) struct FunctionFlags {
     /// Arrow functions bind no `this` of their own.

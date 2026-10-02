@@ -270,3 +270,48 @@ fn static_blocks_can_name_their_class() {
         "2,undefined"
     );
 }
+
+#[test]
+fn subclasses_of_built_ins_are_instances_of_themselves() {
+    assert_eq!(
+        ok(
+            "class E extends Error { constructor(m) { super(m); this.name = 'E'; } } var e = new E('hi'); \
+            [e instanceof E, e instanceof Error, e.message, e.name, String(e), Object.prototype.toString.call(e)].join()"
+        ),
+        "true,true,hi,E,E: hi,[object Error]"
+    );
+    assert_eq!(
+        ok(
+            "class M extends Map { get2(k) { return this.get(k) * 2; } } var m = new M([[1, 5]]); \
+            [m instanceof M, m instanceof Map, m.get2(1), m.size].join()"
+        ),
+        "true,true,10,1"
+    );
+    assert_eq!(
+        ok(
+            "class A extends Array { sum() { return this.reduce(function (a, b) { return a + b; }, 0); } } \
+            var a = new A(); a.push(1, 2, 3); [a instanceof A, Array.isArray(a), a.length, a.sum()].join()"
+        ),
+        "true,true,3,6"
+    );
+    assert_eq!(
+        ok(
+            "class P extends Promise {} var p = new P(function (r) { r(1); }); [p instanceof P, p instanceof Promise].join()"
+        ),
+        "true,true"
+    );
+    assert_eq!(
+        ok(
+            "class CE extends Event { constructor(t, d) { super(t); this.detail = d; } } var e = new CE('x', 7); \
+            [e instanceof CE, e instanceof Event, e.type, e.detail].join()"
+        ),
+        "true,true,x,7"
+    );
+    assert_eq!(
+        ok(
+            "class T extends TypeError {} class U extends T {} var u = new U('z'); \
+            [u instanceof U, u instanceof T, u instanceof TypeError, u instanceof Error, u.message].join()"
+        ),
+        "true,true,true,true,z"
+    );
+}

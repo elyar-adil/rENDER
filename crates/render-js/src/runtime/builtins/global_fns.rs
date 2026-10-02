@@ -915,12 +915,12 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
-            NativeFunction::EventPreventDefault => self.dispatch_events_native(
-                dom,
-                NativeFunction::EventPreventDefault,
-                receiver,
-                arguments,
-            ),
+            NativeFunction::EventPreventDefault
+            | NativeFunction::EventStopPropagation
+            | NativeFunction::EventStopImmediatePropagation
+            | NativeFunction::EventComposedPath => {
+                self.dispatch_events_native(dom, function, receiver, arguments)
+            }
             NativeFunction::GetAttribute => {
                 self.dispatch_dom_native(dom, NativeFunction::GetAttribute, receiver, arguments)
             }

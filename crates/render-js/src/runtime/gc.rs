@@ -32,9 +32,9 @@ pub(super) fn gc_trace_enabled() -> bool {
 }
 
 pub(super) fn listener_values(
-    entry: &BTreeMap<String, Vec<ObjectId>>,
+    entry: &BTreeMap<String, Vec<super::types::Listener>>,
 ) -> impl Iterator<Item = &ObjectId> {
-    entry.values().flatten()
+    entry.values().flatten().map(|listener| &listener.callback)
 }
 
 pub(super) fn mark_value(
@@ -182,6 +182,7 @@ pub(super) fn mark_host(
         | ObjectHost::RegExpConstructor
         | ObjectHost::EventConstructor
         | ObjectHost::DomConstructor
+        | ObjectHost::DomNodeConstructor(_)
         | ObjectHost::ImageConstructor
         | ObjectHost::IntersectionObserverConstructor
         | ObjectHost::MutationObserverConstructor
@@ -365,7 +366,12 @@ impl JsRuntime {
                 *handler,
             );
         }
-        for handler in self.window_event_handlers.values().flatten() {
+        for handler in self
+            .window_event_handlers
+            .values()
+            .flatten()
+            .map(|listener| &listener.callback)
+        {
             mark_object(
                 self,
                 &mut marked,

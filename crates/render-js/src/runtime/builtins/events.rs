@@ -18,10 +18,23 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
+use crate::runtime::types::{EventFlags, Listener};
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
 use render_dom::NodeId;
+
+/// The phases of an event's travel (DOM Standard §2.2 `eventPhase`).
+const AT_TARGET: f64 = 2.0;
+const CAPTURING_PHASE: f64 = 1.0;
+const BUBBLING_PHASE: f64 = 3.0;
+
+/// One stop on an event's path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stop {
+    Node(NodeId),
+    Window,
+}
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_events_native(
@@ -33,6 +46,43 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::EventPreventDefault => Ok(self.event_prevent_default(receiver)),
+            NativeFunction::EventStopPropagation => {
+                self.event_flags
+                    .entry(receiver)
+                    .or_default()
+                    .stop_propagation = true;
+                self.realm.set_property(
+                    receiver,
+                    "cancelBubble".to_owned(),
+                    JsValue::Boolean(true),
+                );
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::EventStopImmediatePropagation => {
+                let flags = self.event_flags.entry(receiver).or_default();
+                flags.stop_propagation = true;
+                flags.stop_immediate = true;
+                self.realm.set_property(
+                    receiver,
+                    "cancelBubble".to_owned(),
+                    JsValue::Boolean(true),
+                );
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::EventComposedPath => {
+                let path: Vec<JsValue> = self
+                    .event_flags
+                    .get(&receiver)
+                    .map(|flags| {
+                        flags
+                            .path
+                            .iter()
+                            .map(|object| JsValue::Object(*object))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(JsValue::Object(self.create_array_from_values(&path)?))
+            }
             NativeFunction::WindowAddEventListener => self.add_window_listener(receiver, arguments),
             NativeFunction::WindowRemoveEventListener => {
                 self.remove_window_listener(receiver, arguments)
@@ -43,24 +93,19 @@ impl JsRuntime {
 }
 
 impl JsRuntime {
-    pub(in crate::runtime) fn event_constructor(
+    /// A new `Event` object with the standard data properties.
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the four flags are the Event initialisation dictionary's own booleans"
+    )]
+    pub(in crate::runtime) fn create_event_object(
         &mut self,
-        arguments: &[JsValue],
-    ) -> Result<JsValue, JsError> {
-        let event_type = required_argument(arguments, 0, "Event")?.to_js_string();
-        if event_type.is_empty() {
-            return Err(JsError::type_error("Event type must not be empty"));
-        }
-        let options = arguments.get(1).and_then(|value| match value {
-            JsValue::Object(object) => Some(*object),
-            _ => None,
-        });
-        let bubbles = options
-            .and_then(|object| self.realm.get_property(object, "bubbles"))
-            .is_some_and(|value| value.is_truthy());
-        let cancelable = options
-            .and_then(|object| self.realm.get_property(object, "cancelable"))
-            .is_some_and(|value| value.is_truthy());
+        event_type: &str,
+        bubbles: bool,
+        cancelable: bool,
+        composed: bool,
+        trusted: bool,
+    ) -> Result<ObjectId, JsError> {
         let constructor = self
             .realm
             .global("Event")
@@ -79,15 +124,49 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         let event = self.realm.create_object(prototype);
         for (name, value) in [
-            ("type", JsValue::String(event_type)),
+            ("type", JsValue::String(event_type.to_owned())),
             ("bubbles", JsValue::Boolean(bubbles)),
             ("cancelable", JsValue::Boolean(cancelable)),
+            ("composed", JsValue::Boolean(composed)),
             ("defaultPrevented", JsValue::Boolean(false)),
+            ("eventPhase", JsValue::Number(0.0)),
+            ("isTrusted", JsValue::Boolean(trusted)),
+            ("timeStamp", JsValue::Number(Self::monotonic_now_ms())),
             ("target", JsValue::Null),
+            ("srcElement", JsValue::Null),
             ("currentTarget", JsValue::Null),
+            ("returnValue", JsValue::Boolean(true)),
+            ("cancelBubble", JsValue::Boolean(false)),
         ] {
             self.realm.set_property(event, name.to_owned(), value);
         }
+        Ok(event)
+    }
+
+    pub(in crate::runtime) fn event_constructor(
+        &mut self,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let event_type = required_argument(arguments, 0, "Event")?.to_js_string();
+        if event_type.is_empty() {
+            return Err(JsError::type_error("Event type must not be empty"));
+        }
+        let options = arguments.get(1).and_then(|value| match value {
+            JsValue::Object(object) => Some(*object),
+            _ => None,
+        });
+        let flag = |runtime: &Self, name: &str| {
+            options
+                .and_then(|object| runtime.realm.get_property(object, name))
+                .is_some_and(|value| value.is_truthy())
+        };
+        let event = self.create_event_object(
+            &event_type,
+            flag(self, "bubbles"),
+            flag(self, "cancelable"),
+            flag(self, "composed"),
+            false,
+        )?;
         Ok(JsValue::Object(event))
     }
 
@@ -103,6 +182,54 @@ impl JsRuntime {
         }
     }
 
+    /// The `callback` and options of an `addEventListener` /
+    /// `removeEventListener` call. `Ok(None)` means "no callback": a no-op.
+    fn listener_from_arguments(
+        &self,
+        arguments: &[JsValue],
+        method: &str,
+    ) -> Result<Option<Listener>, JsError> {
+        let callback = match arguments.get(1) {
+            None | Some(JsValue::Null | JsValue::Undefined) => return Ok(None),
+            Some(JsValue::Object(object)) => *object,
+            Some(_) => {
+                return Err(JsError::type_error(format!(
+                    "{method}: the callback provided is not a function or an object"
+                )));
+            }
+        };
+        let (mut capture, mut once, mut passive) = (false, false, false);
+        match arguments.get(2) {
+            Some(JsValue::Object(options)) => {
+                let read = |name: &str| {
+                    self.realm
+                        .get_property(*options, name)
+                        .is_some_and(|value| value.is_truthy())
+                };
+                capture = read("capture");
+                once = read("once");
+                passive = read("passive");
+            }
+            Some(other) => capture = other.is_truthy(),
+            None => {}
+        }
+        Ok(Some(Listener {
+            callback,
+            capture,
+            once,
+            passive,
+        }))
+    }
+
+    /// Insert unless an identical (callback, capture) registration exists.
+    fn insert_listener(listeners: &mut Vec<Listener>, listener: Listener) {
+        if !listeners.iter().any(|existing| {
+            existing.callback == listener.callback && existing.capture == listener.capture
+        }) {
+            listeners.push(listener);
+        }
+    }
+
     pub(in crate::runtime) fn add_event_listener(
         &mut self,
         receiver: ObjectId,
@@ -110,19 +237,16 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let target = self.event_target_node(receiver)?;
         let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
-        let callback = match arguments.get(1) {
-            None | Some(JsValue::Null | JsValue::Undefined) => return Ok(JsValue::Undefined),
-            Some(value) => Self::require_callable_object(value, &self.realm)?,
+        let Some(listener) = self.listener_from_arguments(arguments, "addEventListener")? else {
+            return Ok(JsValue::Undefined);
         };
-        let callbacks = self
+        let listeners = self
             .event_listeners
             .entry(target)
             .or_default()
             .entry(event_type)
             .or_default();
-        if !callbacks.contains(&callback) {
-            callbacks.push(callback);
-        }
+        Self::insert_listener(listeners, listener);
         Ok(JsValue::Undefined)
     }
 
@@ -133,15 +257,17 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let target = self.event_target_node(receiver)?;
         let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
-        let Some(JsValue::Object(callback)) = arguments.get(1) else {
+        let Some(listener) = self.listener_from_arguments(arguments, "removeEventListener")? else {
             return Ok(JsValue::Undefined);
         };
-        if let Some(callbacks) = self
+        if let Some(listeners) = self
             .event_listeners
             .get_mut(&target)
             .and_then(|listeners| listeners.get_mut(&event_type))
         {
-            callbacks.retain(|candidate| candidate != callback);
+            listeners.retain(|candidate| {
+                !(candidate.callback == listener.callback && candidate.capture == listener.capture)
+            });
         }
         Ok(JsValue::Undefined)
     }
@@ -180,14 +306,11 @@ impl JsRuntime {
             ));
         }
         let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
-        let callback = Self::require_callable_object(
-            required_argument(arguments, 1, "addEventListener")?,
-            &self.realm,
-        )?;
-        self.window_event_handlers
-            .entry(event_type)
-            .or_default()
-            .push(callback);
+        let Some(listener) = self.listener_from_arguments(arguments, "addEventListener")? else {
+            return Ok(JsValue::Undefined);
+        };
+        let listeners = self.window_event_handlers.entry(event_type).or_default();
+        Self::insert_listener(listeners, listener);
         Ok(JsValue::Undefined)
     }
 
@@ -202,14 +325,177 @@ impl JsRuntime {
             ));
         }
         let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
-        let callback = Self::require_callable_object(
-            required_argument(arguments, 1, "removeEventListener")?,
-            &self.realm,
-        )?;
+        let Some(listener) = self.listener_from_arguments(arguments, "removeEventListener")? else {
+            return Ok(JsValue::Undefined);
+        };
         if let Some(listeners) = self.window_event_handlers.get_mut(&event_type) {
-            listeners.retain(|candidate| *candidate != callback);
+            listeners.retain(|candidate| {
+                !(candidate.callback == listener.callback && candidate.capture == listener.capture)
+            });
         }
         Ok(JsValue::Undefined)
+    }
+
+    fn stop_wrapper(&mut self, dom: &Dom, stop: Stop) -> Result<ObjectId, JsError> {
+        match stop {
+            Stop::Window => Ok(self.realm.global_object()),
+            Stop::Node(node) if node == dom.document() => Ok(self.realm.document_object()),
+            Stop::Node(node) => {
+                self.ensure_heap_capacity(1)?;
+                let interface = super::dom::dom_interface_name(dom, node);
+                Ok(self.realm.node_wrapper(node, interface))
+            }
+        }
+    }
+
+    fn stop_listeners(&self, stop: Stop, event_type: &str) -> Vec<Listener> {
+        match stop {
+            Stop::Window => self.window_event_handlers.get(event_type),
+            Stop::Node(node) => self
+                .event_listeners
+                .get(&node)
+                .and_then(|listeners| listeners.get(event_type)),
+        }
+        .cloned()
+        .unwrap_or_default()
+    }
+
+    /// Whether `listener` is still registered on `stop`: a listener removed by
+    /// an earlier listener of the same dispatch must not run.
+    fn listener_is_registered(&self, stop: Stop, event_type: &str, listener: &Listener) -> bool {
+        self.stop_listeners(stop, event_type)
+            .iter()
+            .any(|candidate| {
+                candidate.callback == listener.callback && candidate.capture == listener.capture
+            })
+    }
+
+    fn remove_listener_record(&mut self, stop: Stop, event_type: &str, listener: &Listener) {
+        let listeners = match stop {
+            Stop::Window => self.window_event_handlers.get_mut(event_type),
+            Stop::Node(node) => self
+                .event_listeners
+                .get_mut(&node)
+                .and_then(|listeners| listeners.get_mut(event_type)),
+        };
+        if let Some(listeners) = listeners {
+            listeners.retain(|candidate| {
+                !(candidate.callback == listener.callback && candidate.capture == listener.capture)
+            });
+        }
+    }
+
+    /// Run the listeners of one stop for one phase. `capture_pass` selects the
+    /// capture-flagged ones; at the target both kinds run (capturing first).
+    fn invoke_stop(
+        &mut self,
+        dom: &mut Dom,
+        stop: Stop,
+        event: ObjectId,
+        event_type: &str,
+        phase: f64,
+        capture_pass: bool,
+    ) -> Result<(), JsError> {
+        let current = self.stop_wrapper(dom, stop)?;
+        self.realm
+            .set_property(event, "currentTarget".to_owned(), JsValue::Object(current));
+        self.realm
+            .set_property(event, "eventPhase".to_owned(), JsValue::Number(phase));
+        for listener in self.stop_listeners(stop, event_type) {
+            if listener.capture != capture_pass {
+                continue;
+            }
+            if self
+                .event_flags
+                .get(&event)
+                .is_some_and(|flags| flags.stop_immediate)
+                || !self.listener_is_registered(stop, event_type, &listener)
+            {
+                continue;
+            }
+            if listener.once {
+                self.remove_listener_record(stop, event_type, &listener);
+            }
+            self.call_listener(dom, &listener, event, current, event_type)?;
+        }
+        // The `on…` content/IDL attribute handler runs with the non-capturing
+        // listeners.
+        if !capture_pass
+            && let Stop::Node(node) = stop
+            && let Some(callback) = self
+                .event_handlers
+                .get(&node)
+                .and_then(|handlers| handlers.get(event_type))
+                .copied()
+            && !self
+                .event_flags
+                .get(&event)
+                .is_some_and(|flags| flags.stop_immediate)
+        {
+            let listener = Listener {
+                callback,
+                capture: false,
+                once: false,
+                passive: false,
+            };
+            self.call_listener(dom, &listener, event, current, event_type)?;
+        }
+        Ok(())
+    }
+
+    /// Call one listener. A listener that throws is reported and the dispatch
+    /// carries on (DOM Standard §2.10 "inner invoke"); only an exhausted
+    /// resource budget aborts it.
+    fn call_listener(
+        &mut self,
+        dom: &mut Dom,
+        listener: &Listener,
+        event: ObjectId,
+        current: ObjectId,
+        event_type: &str,
+    ) -> Result<(), JsError> {
+        self.event_flags
+            .entry(event)
+            .or_default()
+            .in_passive_listener = listener.passive;
+        let outcome = if Self::is_callable_object(listener.callback, &self.realm) {
+            self.call_with_this(
+                dom,
+                listener.callback,
+                &[JsValue::Object(event)],
+                JsValue::Object(current),
+            )
+            .map(|_| ())
+        } else {
+            match self.get_member(dom, listener.callback, "handleEvent") {
+                Ok(JsValue::Object(method)) if Self::is_callable_object(method, &self.realm) => {
+                    self.call_with_this(
+                        dom,
+                        method,
+                        &[JsValue::Object(event)],
+                        JsValue::Object(listener.callback),
+                    )
+                    .map(|_| ())
+                }
+                Ok(_) => Ok(()),
+                Err(error) => Err(error),
+            }
+        };
+        self.event_flags
+            .entry(event)
+            .or_default()
+            .in_passive_listener = false;
+        match outcome {
+            Err(error) if error.kind() == crate::JsErrorKind::ResourceLimit => Err(error),
+            Err(error) => {
+                // An `error` listener that itself throws would recurse forever.
+                if event_type != "error" {
+                    self.report_uncaught_error(dom, &error);
+                }
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
     }
 
     pub(in crate::runtime) fn dispatch_prepared_event(
@@ -220,91 +506,92 @@ impl JsRuntime {
         event_type: &str,
         bubbles: bool,
     ) -> Result<bool, JsError> {
-        let receiver_wrapper = if target == dom.document() {
-            self.realm.document_object()
-        } else {
-            self.ensure_heap_capacity(1)?;
-            self.realm.node_wrapper(target)
-        };
+        let target_wrapper = self.stop_wrapper(dom, Stop::Node(target))?;
+        self.realm
+            .set_property(event, "target".to_owned(), JsValue::Object(target_wrapper));
         self.realm.set_property(
             event,
-            "target".to_owned(),
-            JsValue::Object(receiver_wrapper),
+            "srcElement".to_owned(),
+            JsValue::Object(target_wrapper),
         );
 
-        let mut path = vec![target];
-        if bubbles {
-            let mut ancestor = dom.parent(target);
-            while let Some(node) = ancestor {
-                path.push(node);
-                ancestor = dom.parent(node);
-            }
+        // The path: the target, its ancestors up to the document, and then the
+        // window. An event aimed at the document itself without bubbling (the
+        // embedder's `load`) still reaches the window, as it always has here.
+        let mut path = vec![Stop::Node(target)];
+        let mut ancestor = dom.parent(target);
+        while let Some(node) = ancestor {
+            path.push(Stop::Node(node));
+            ancestor = dom.parent(node);
         }
-        for node in path {
-            let current_target = if node == dom.document() {
-                self.realm.document_object()
-            } else {
-                self.ensure_heap_capacity(1)?;
-                self.realm.node_wrapper(node)
-            };
-            self.realm.set_property(
-                event,
-                "currentTarget".to_owned(),
-                JsValue::Object(current_target),
-            );
-            let callbacks = self
-                .event_listeners
-                .get(&node)
-                .and_then(|listeners| listeners.get(event_type))
-                .cloned()
-                .unwrap_or_default();
-            for callback in callbacks {
-                self.call_with_this(
-                    dom,
-                    callback,
-                    &[JsValue::Object(event)],
-                    JsValue::Object(current_target),
-                )?;
-            }
-            if let Some(callback) = self
-                .event_handlers
-                .get(&node)
-                .and_then(|handlers| handlers.get(event_type))
-                .copied()
-            {
-                self.call_with_this(
-                    dom,
-                    callback,
-                    &[JsValue::Object(event)],
-                    JsValue::Object(current_target),
-                )?;
-            }
+        let attached = path
+            .last()
+            .is_some_and(|stop| *stop == Stop::Node(dom.document()));
+        if attached {
+            path.push(Stop::Window);
         }
-        // Events bubble to the window object last.
-        let window_callbacks = self
-            .window_event_handlers
-            .get(event_type)
-            .cloned()
-            .unwrap_or_default();
-        for callback in window_callbacks {
-            self.realm.set_property(
-                event,
-                "currentTarget".to_owned(),
-                JsValue::Object(self.realm.global_object()),
-            );
-            self.call_with_this(
-                dom,
-                callback,
-                &[JsValue::Object(event)],
-                JsValue::Object(self.realm.global_object()),
-            )?;
+        let bubbles_to_window = bubbles || target == dom.document();
+        let mut wrappers = Vec::with_capacity(path.len());
+        for stop in &path {
+            wrappers.push(self.stop_wrapper(dom, *stop)?);
         }
+        self.event_flags.insert(
+            event,
+            EventFlags {
+                path: wrappers,
+                ..EventFlags::default()
+            },
+        );
+
+        let stopped = |runtime: &Self| {
+            runtime
+                .event_flags
+                .get(&event)
+                .is_some_and(|flags| flags.stop_propagation)
+        };
+
+        let result = (|| -> Result<(), JsError> {
+            // Capture: from the outermost stop down to the target's parent.
+            for stop in path.iter().skip(1).rev() {
+                if stopped(self) {
+                    return Ok(());
+                }
+                self.invoke_stop(dom, *stop, event, event_type, CAPTURING_PHASE, true)?;
+            }
+            // At the target: capturing listeners, then the others.
+            if stopped(self) {
+                return Ok(());
+            }
+            self.invoke_stop(dom, path[0], event, event_type, AT_TARGET, true)?;
+            if stopped(self) {
+                return Ok(());
+            }
+            self.invoke_stop(dom, path[0], event, event_type, AT_TARGET, false)?;
+            // Bubble: outward, only for events that bubble.
+            for stop in path.iter().skip(1) {
+                if stopped(self) {
+                    return Ok(());
+                }
+                if !(bubbles || bubbles_to_window && *stop == Stop::Window) {
+                    continue;
+                }
+                self.invoke_stop(dom, *stop, event, event_type, BUBBLING_PHASE, false)?;
+            }
+            Ok(())
+        })();
+
+        self.event_flags.remove(&event);
         self.realm
             .set_property(event, "currentTarget".to_owned(), JsValue::Null);
+        self.realm
+            .set_property(event, "eventPhase".to_owned(), JsValue::Number(0.0));
+        result?;
         let canceled = self
             .realm
             .get_property(event, "defaultPrevented")
             .is_some_and(|value| value.is_truthy());
+        self.realm
+            .set_property(event, "returnValue".to_owned(), JsValue::Boolean(!canceled));
         Ok(!canceled)
     }
 
@@ -313,7 +600,12 @@ impl JsRuntime {
             .realm
             .get_property(receiver, "cancelable")
             .is_some_and(|value| value.is_truthy());
-        if cancelable {
+        // Inside a passive listener, `preventDefault` is ignored (§2.10).
+        let passive = self
+            .event_flags
+            .get(&receiver)
+            .is_some_and(|flags| flags.in_passive_listener);
+        if cancelable && !passive {
             self.realm.set_property(
                 receiver,
                 "defaultPrevented".to_owned(),
