@@ -158,3 +158,115 @@ fn array_from_and_collections_use_the_iteration_protocol() {
     assert_eq!(ok("new Set('aab').size"), "2");
     assert_eq!(eval("new Set(5)").unwrap_err().kind(), JsErrorKind::Type);
 }
+
+#[test]
+fn regexp_named_groups_and_lookbehind_at_the_script_level() {
+    assert_eq!(
+        ok(
+            "var m = /(?<y>\\d{4})-(?<m>\\d\\d)/.exec('on 2020-05'); m.groups.y + '/' + m.groups.m + '/' + m.index"
+        ),
+        "2020/05/3"
+    );
+    assert_eq!(ok("String(/a/.exec('a').groups)"), "undefined");
+    assert_eq!(
+        ok("'2020-05'.replace(/(?<y>\\d+)-(?<m>\\d+)/, '$<m>/$<y>')"),
+        "05/2020"
+    );
+    assert_eq!(
+        ok(
+            "'a1'.replace(/(?<d>\\d)/, function (m, p1, offset, whole, groups) { return '[' + groups.d + offset + ']'; })"
+        ),
+        "a[11]"
+    );
+    assert_eq!(ok("'$10 $20'.match(/(?<=\\$)\\d+/g).join()"), "10,20");
+    assert_eq!(
+        ok("'abcdefghijkl'.replace(/(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)(k)/, '$11-$1')"),
+        "k-al"
+    );
+    assert_eq!(ok("/\\p{L}+/u.exec('héllo!')[0]"), "héllo");
+}
+
+#[test]
+fn long_inputs_do_not_overflow_the_native_stack() {
+    // A run of one character class is matched iteratively, however long.
+    assert_eq!(ok("'a'.repeat(200000).replace(/a*/, 'x')"), "x");
+    assert_eq!(ok("/^[^\\n]*$/.test('line '.repeat(40000))"), "true");
+    // A group body recurses, so it has a bound; inside it the answer is right...
+    assert_eq!(ok("/^(?:a|b)*$/.test('ab'.repeat(4000))"), "true");
+    // ...and beyond it the match fails instead of taking the process down.
+    assert_eq!(
+        ok("typeof /^(?:a|b)*$/.test('ab'.repeat(200000))"),
+        "boolean"
+    );
+}
+
+#[test]
+fn for_let_gives_each_iteration_its_own_binding() {
+    assert_eq!(
+        ok(
+            "var fs = []; for (let i = 0; i < 3; i++) fs.push(function () { return i; }); fs.map(function (f) { return f(); }).join()"
+        ),
+        "0,1,2"
+    );
+    assert_eq!(
+        ok(
+            "var fs = []; for (let i = 0, j = 10; i < 2; i++, j++) fs.push(function () { return i + j; }); fs.map(function (f) { return f(); }).join()"
+        ),
+        "10,12"
+    );
+    assert_eq!(
+        ok(
+            "var fs = []; for (var i = 0; i < 3; i++) fs.push(function () { return i; }); fs.map(function (f) { return f(); }).join()"
+        ),
+        "3,3,3"
+    );
+}
+
+#[test]
+fn labeled_continue_and_break_target_the_labeled_loop() {
+    assert_eq!(
+        ok(
+            "var n = 0; outer: for (var i = 0; i < 3; i++) { for (var j = 0; j < 3; j++) { if (j == 1) continue outer; n++; } } n + ',' + i"
+        ),
+        "3,3"
+    );
+    assert_eq!(
+        ok(
+            "var r = []; a: for (var i = 0; i < 3; i++) { b: for (var j = 0; j < 3; j++) { if (j == 1) continue a; if (i == 2) break a; r.push(i + '' + j); } } r.join()"
+        ),
+        "00,10"
+    );
+    assert_eq!(
+        ok(
+            "var s = 0, i = 0; w: while (i < 5) { i++; for (;;) { if (i % 2) continue w; s += i; break; } } s"
+        ),
+        "6"
+    );
+    assert_eq!(
+        ok(
+            "var n = 0; k: do { n++; for (var m of [1, 2]) { if (n < 3) continue k; } } while (n < 5); n"
+        ),
+        "5"
+    );
+    assert_eq!(ok("var n = 0; l: { n++; break l; n++; } n"), "1");
+    assert_eq!(
+        ok(
+            "var o = []; q: for (var k in {a: 1, b: 2, c: 3}) { for (;;) { if (k == 'b') continue q; o.push(k); break; } } o.join()"
+        ),
+        "a,c"
+    );
+}
+
+#[test]
+fn static_blocks_can_name_their_class() {
+    assert_eq!(
+        ok("class B { static #x = 1; static { B.y = B.#x + 1; } } B.y"),
+        "2"
+    );
+    assert_eq!(
+        ok(
+            "class C { static a = 1; static { var local = C.a + 1; C.b = local; } } C.b + ',' + typeof local"
+        ),
+        "2,undefined"
+    );
+}

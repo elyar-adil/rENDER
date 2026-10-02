@@ -143,7 +143,33 @@ impl JsRuntime {
             .set_property(array, "index".to_owned(), JsValue::Number(index_number));
         self.realm
             .set_property(array, "input".to_owned(), JsValue::String(text.to_owned()));
+        let groups = if found.names.is_empty() {
+            JsValue::Undefined
+        } else {
+            self.named_groups_object(&found, input)?
+        };
+        self.realm.set_property(array, "groups".to_owned(), groups);
         Ok(Some(JsValue::Object(array)))
+    }
+
+    /// The `groups` object of a match: a prototype-less object mapping each
+    /// group name to its capture, or `undefined` for a group that did not
+    /// participate (ECMA-262 §22.2.7.2 `RegExpBuiltinExec`).
+    pub(in crate::runtime) fn named_groups_object(
+        &mut self,
+        found: &crate::regex::MatchRanges,
+        input: &[char],
+    ) -> Result<JsValue, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let groups = self.realm.create_object(None);
+        for (name, index) in found.names.iter() {
+            let value = match found.groups.get(index - 1) {
+                Some(Some((start, end))) => JsValue::String(input[*start..*end].iter().collect()),
+                _ => JsValue::Undefined,
+            };
+            self.realm.set_property(groups, name.clone(), value);
+        }
+        Ok(JsValue::Object(groups))
     }
 
     pub(in crate::runtime) fn regexp_exec(

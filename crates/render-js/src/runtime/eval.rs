@@ -857,13 +857,14 @@ impl JsRuntime {
             Statement::While {
                 condition, body, ..
             } => {
+                let own_labels = std::mem::take(&mut self.pending_loop_labels);
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
                     if !self.evaluate(dom, condition)?.is_truthy() {
                         break;
                     }
-                    match self.evaluate_statement(dom, body)? {
+                    match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
                         Completion::Continue(None) => {}
                         Completion::Break(None) => break,
@@ -878,10 +879,11 @@ impl JsRuntime {
             Statement::DoWhile {
                 condition, body, ..
             } => {
+                let own_labels = std::mem::take(&mut self.pending_loop_labels);
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
-                    match self.evaluate_statement(dom, body)? {
+                    match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
                         Completion::Continue(None) => {}
                         Completion::Break(None) => break,
@@ -931,14 +933,32 @@ impl JsRuntime {
             } => self.evaluate_for_in_expr_statement(dom, target, iterable, body),
             // Labels bind `break label` / `continue label` to this statement;
             // unlabeled control flow binds to the nearest enclosing loop.
-            Statement::Labeled { label, body, .. } => match self.evaluate_statement(dom, body)? {
-                Completion::Break(Some(target)) | Completion::Continue(Some(target))
-                    if *target == *label =>
-                {
-                    Ok(Completion::Normal(JsValue::Undefined))
+            Statement::Labeled { label, body, .. } => {
+                // A label in front of a loop (or of another label) belongs to
+                // that loop, which needs it to recognise `continue label`.
+                if matches!(
+                    body.as_ref(),
+                    Statement::While { .. }
+                        | Statement::DoWhile { .. }
+                        | Statement::For { .. }
+                        | Statement::ForIn { .. }
+                        | Statement::ForOf { .. }
+                        | Statement::ForInExpr { .. }
+                        | Statement::Labeled { .. }
+                ) {
+                    self.pending_loop_labels.push(label.clone());
+                } else {
+                    self.pending_loop_labels.clear();
                 }
-                other => Ok(other),
-            },
+                match self.evaluate_statement(dom, body)? {
+                    Completion::Break(Some(target)) | Completion::Continue(Some(target))
+                        if *target == *label =>
+                    {
+                        Ok(Completion::Normal(JsValue::Undefined))
+                    }
+                    other => Ok(other),
+                }
+            }
             Statement::Break(label) => Ok(Completion::Break(label.clone())),
             Statement::Continue(label) => Ok(Completion::Continue(label.clone())),
             Statement::Block(statements) => self.evaluate_scoped_statements(dom, statements),
@@ -993,17 +1013,43 @@ impl JsRuntime {
         update: Option<&Expr>,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
+        // `for (let …;;)` gives every iteration its own copy of the loop
+        // variables (ECMA-262 §14.7.4.4 CreatePerIterationEnvironment), which
+        // is what lets closures made in an iteration keep that iteration's value.
+        let per_iteration_bindings = matches!(
+            initializer,
+            Some(
+                Statement::Variable {
+                    kind: VariableKind::Let | VariableKind::Const,
+                    ..
+                } | Statement::VariableList {
+                    kind: VariableKind::Let | VariableKind::Const,
+                    ..
+                }
+            )
+        );
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             if let Some(initializer) = initializer {
-                if let Statement::Variable { kind, name, .. } = initializer {
-                    self.create_binding(
-                        name,
-                        *kind,
-                        *kind == VariableKind::Var,
-                        JsValue::Undefined,
-                    )?;
+                // Lexical loop variables live in the loop's own scope. `var`
+                // ones were hoisted to the function (or the global scope)
+                // before the statement ran, so there is nothing to create.
+                match initializer {
+                    Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
+                        self.create_binding(name, *kind, false, JsValue::Undefined)?;
+                    }
+                    Statement::VariableList {
+                        kind, declarations, ..
+                    } if *kind != VariableKind::Var => {
+                        for (target, _) in declarations {
+                            for name in target.names() {
+                                self.create_binding(&name, *kind, false, JsValue::Undefined)?;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 match self.evaluate_statement(dom, initializer)? {
                     Completion::Normal(_) => {}
@@ -1018,7 +1064,7 @@ impl JsRuntime {
                 {
                     break;
                 }
-                match self.evaluate_statement(dom, body)? {
+                match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                     Completion::Normal(next) => value = next,
                     Completion::Continue(None) => {}
                     Completion::Break(None) => break,
@@ -1026,6 +1072,14 @@ impl JsRuntime {
                     labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
                         return Ok(labeled);
                     }
+                }
+                if per_iteration_bindings && let Some(top) = self.environment.last() {
+                    let copy = EnvironmentRecord {
+                        bindings: top.borrow().bindings.clone(),
+                        ..EnvironmentRecord::default()
+                    };
+                    let last = self.environment.len() - 1;
+                    self.environment[last] = Rc::new(RefCell::new(copy));
                 }
                 if let Some(update) = update {
                     self.evaluate(dom, update)?;
@@ -1045,6 +1099,7 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
         let names = match iterable {
             JsValue::Object(object) => self
@@ -1082,7 +1137,7 @@ impl JsRuntime {
             if iteration_environment.is_some() {
                 self.environment.pop();
             }
-            match completion? {
+            match own_loop_completion(&own_labels, completion?) {
                 Completion::Normal(next) => value = next,
                 Completion::Continue(None) => {}
                 Completion::Break(None) => break,
@@ -1104,6 +1159,7 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
         let names = match iterable {
             JsValue::Object(object) => self
@@ -1117,7 +1173,7 @@ impl JsRuntime {
             self.consume_step()?;
             let reference = self.resolve_assignment_reference(dom, target)?;
             self.write_assignment_reference(dom, &reference, JsValue::String(property.clone()))?;
-            match self.evaluate_statement(dom, body)? {
+            match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                 Completion::Normal(next) => value = next,
                 Completion::Continue(None) => {}
                 Completion::Break(None) => break,
@@ -1138,6 +1194,7 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
         // Arrays and strings are walked directly. Any other iterable goes
         // through the iterator protocol one step at a time, so an infinite
@@ -1200,6 +1257,8 @@ impl JsRuntime {
             if iteration_environment.is_some() {
                 self.environment.pop();
             }
+            let completion =
+                completion.map(|completion| own_loop_completion(&own_labels, completion));
             match completion {
                 Err(error) => {
                     // The original error wins over anything `return()` throws.
@@ -5152,5 +5211,15 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
         | Statement::Continue(_)
         | Statement::Block(_)
         | Statement::Expression(_) => None,
+    }
+}
+
+/// A `break`/`continue` aimed at a label this loop carries is aimed at the loop
+/// itself, so it is read as the unlabeled form.
+fn own_loop_completion(labels: &[String], completion: Completion) -> Completion {
+    match completion {
+        Completion::Continue(Some(label)) if labels.contains(&label) => Completion::Continue(None),
+        Completion::Break(Some(label)) if labels.contains(&label) => Completion::Break(None),
+        other => other,
     }
 }

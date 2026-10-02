@@ -81,6 +81,8 @@ pub struct JsRuntime {
     modules: BTreeMap<String, module::ModuleRecord>,
     /// Whether the self-hosted built-ins in `prelude.js` have been installed.
     prelude_installed: bool,
+    /// Labels written directly in front of the loop about to run.
+    pending_loop_labels: Vec<String>,
     /// Generator and async activations, by id; `None` while one is running.
     coroutines: Vec<Option<coroutine_run::Coroutine>>,
     /// Compiled coroutine bodies, by function index.
@@ -193,6 +195,7 @@ impl JsRuntime {
             environment: Vec::new(),
             modules: BTreeMap::new(),
             prelude_installed: false,
+            pending_loop_labels: Vec::new(),
             coroutines: Vec::new(),
             coroutine_code: BTreeMap::new(),
             prelude_error: None,

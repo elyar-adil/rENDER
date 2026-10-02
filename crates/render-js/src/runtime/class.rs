@@ -361,7 +361,26 @@ impl JsRuntime {
             self.install_class_element(home, key, element.kind, method);
         }
 
-        // 7. Static fields and initialization blocks, in source order.
+        // 7. Initialize the inner class-name binding. Static fields and blocks run
+        // after this, so they can name the class they belong to.
+        if let Some(name) = name {
+            self.environment
+                .last()
+                .expect("class scope was pushed")
+                .borrow_mut()
+                .bindings
+                .insert(
+                    name.to_owned(),
+                    Binding {
+                        value: JsValue::Object(constructor),
+                        mutable: false,
+                        initialized: true,
+                        kind: VariableKind::Const,
+                    },
+                );
+        }
+
+        // 8. Static fields and initialization blocks, in source order.
         for (element, key) in elements.iter().zip(&resolved_keys) {
             if !element.is_static {
                 continue;
@@ -411,29 +430,14 @@ impl JsRuntime {
                 }
                 ClassElementKind::StaticBlock => {
                     self.with_this(JsValue::Object(constructor), |runtime| {
+                        // A static block is function-like: its own `let`/`const`
+                        // and `var` declarations are local to it.
+                        runtime.instantiate_statements(&element.body)?;
                         runtime.evaluate_statements(dom, &element.body)
                     })?;
                 }
                 _ => {}
             }
-        }
-
-        // 8. Initialize the inner class-name binding.
-        if let Some(name) = name {
-            self.environment
-                .last()
-                .expect("class scope was pushed")
-                .borrow_mut()
-                .bindings
-                .insert(
-                    name.to_owned(),
-                    Binding {
-                        value: JsValue::Object(constructor),
-                        mutable: false,
-                        initialized: true,
-                        kind: VariableKind::Const,
-                    },
-                );
         }
 
         Ok(JsValue::Object(constructor))
