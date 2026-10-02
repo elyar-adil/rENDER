@@ -21,6 +21,8 @@ use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
 use crate::runtime::types::ElementRect;
+use crate::value::DomNodeKind;
+use crate::value::HTML_ELEMENT_INTERFACES;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_css::selector::MatchContext;
@@ -44,7 +46,7 @@ impl JsRuntime {
                 self.require_document(receiver)?;
                 let id = required_argument(arguments, 0, "getElementById")?.to_js_string();
                 match self.find_element_by_id(dom, &id)? {
-                    Some(node) => self.wrap_node(node),
+                    Some(node) => self.wrap_node(dom, node),
                     None => Ok(JsValue::Null),
                 }
             }
@@ -56,7 +58,7 @@ impl JsRuntime {
                     .into_iter()
                     .next()
                 {
-                    Some(node) => self.wrap_node(node),
+                    Some(node) => self.wrap_node(dom, node),
                     None => Ok(JsValue::Null),
                 }
             }
@@ -66,7 +68,7 @@ impl JsRuntime {
                 let selectors = self.parse_selectors(&selector, "querySelectorAll")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
-                    .map(|node| self.wrap_node(node))
+                    .map(|node| self.wrap_node(dom, node))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
             }
@@ -78,7 +80,7 @@ impl JsRuntime {
                 let selectors = self.parse_selectors(&tag, "getElementsByTagName")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
-                    .map(|node| self.wrap_node(node))
+                    .map(|node| self.wrap_node(dom, node))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
             }
@@ -99,7 +101,7 @@ impl JsRuntime {
                 let selectors = self.parse_selectors(&selector, "getElementsByClassName")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
-                    .map(|node| self.wrap_node(node))
+                    .map(|node| self.wrap_node(dom, node))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
             }
@@ -112,18 +114,18 @@ impl JsRuntime {
                 self.require_document(receiver)?;
                 let data = required_argument(arguments, 0, "createTextNode")?.to_js_string();
                 let node = dom.create_text(data);
-                self.wrap_node(node)
+                self.wrap_node(dom, node)
             }
             NativeFunction::CreateComment => {
                 self.require_document(receiver)?;
                 let data = required_argument(arguments, 0, "createComment")?.to_js_string();
                 let node = dom.create_comment(data);
-                self.wrap_node(node)
+                self.wrap_node(dom, node)
             }
             NativeFunction::CreateDocumentFragment => {
                 self.require_document(receiver)?;
                 let node = dom.create_document_fragment();
-                self.wrap_node(node)
+                self.wrap_node(dom, node)
             }
             NativeFunction::CreateEvent => {
                 self.require_document(receiver)?;
@@ -185,7 +187,9 @@ impl JsRuntime {
                 self.ensure_heap_capacity(1)?;
                 self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
                 let node = dom.create_element(name);
-                Ok(JsValue::Object(self.realm.node_wrapper(node)))
+                Ok(JsValue::Object(
+                    self.realm.node_wrapper(node, dom_interface_name(dom, node)),
+                ))
             }
             NativeFunction::GetAttribute => {
                 let node = self.require_node(receiver)?;
@@ -209,13 +213,13 @@ impl JsRuntime {
                 let parent = self.require_node(receiver)?;
                 let child = self.value_as_node(required_argument(arguments, 0, "appendChild")?)?;
                 dom.append_child(parent, child)?;
-                self.wrap_node(child)
+                self.wrap_node(dom, child)
             }
             NativeFunction::RemoveChild => {
                 let parent = self.require_node(receiver)?;
                 let child = self.value_as_node(required_argument(arguments, 0, "removeChild")?)?;
                 dom.remove_child(parent, child)?;
-                self.wrap_node(child)
+                self.wrap_node(dom, child)
             }
             NativeFunction::InsertBefore => {
                 let parent = self.require_node(receiver)?;
@@ -225,7 +229,7 @@ impl JsRuntime {
                     Some(value) => Some(self.value_as_node(value)?),
                 };
                 dom.insert_before(parent, child, reference)?;
-                self.wrap_node(child)
+                self.wrap_node(dom, child)
             }
             NativeFunction::RemoveNode => {
                 let node = self.require_node(receiver)?;
@@ -503,7 +507,7 @@ impl JsRuntime {
                 dom.set_attribute(image, name, number.to_string())?;
             }
         }
-        self.wrap_node(image)
+        self.wrap_node(dom, image)
     }
 
     pub(in crate::runtime) fn element_rect_value(&mut self, node: NodeId) -> JsValue {
@@ -624,7 +628,7 @@ impl JsRuntime {
         deep: bool,
     ) -> Result<JsValue, JsError> {
         let copy = self.clone_node_recursive(dom, node, deep)?;
-        self.wrap_node(copy)
+        self.wrap_node(dom, copy)
     }
 
     pub(in crate::runtime) fn clone_node_recursive(
@@ -1142,8 +1146,62 @@ impl JsRuntime {
         self.require_node(*object)
     }
 
-    pub(in crate::runtime) fn wrap_node(&mut self, node: NodeId) -> Result<JsValue, JsError> {
+    /// `new Text(data)`, `new Comment(data)`, `new DocumentFragment()`.
+    pub(in crate::runtime) fn construct_dom_node(
+        &mut self,
+        dom: &mut Dom,
+        kind: DomNodeKind,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
+            return Err(JsError::resource("DOM node creation limit exceeded"));
+        }
+        self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
+        let data = arguments
+            .first()
+            .filter(|value| !matches!(value, JsValue::Undefined))
+            .map(JsValue::to_js_string)
+            .unwrap_or_default();
+        let node = match kind {
+            DomNodeKind::Text => dom.create_text(data),
+            DomNodeKind::Comment => dom.create_comment(data),
+            DomNodeKind::Fragment => dom.create_document_fragment(),
+        };
+        self.wrap_node(dom, node)
+    }
+
+    pub(in crate::runtime) fn wrap_node(
+        &mut self,
+        dom: &Dom,
+        node: NodeId,
+    ) -> Result<JsValue, JsError> {
+        if matches!(
+            dom.node(node).map(render_dom::Node::kind),
+            Some(NodeKind::Document)
+        ) {
+            return Ok(JsValue::Object(self.realm.document_object()));
+        }
         self.ensure_heap_capacity(1)?;
-        Ok(JsValue::Object(self.realm.node_wrapper(node)))
+        let interface = dom_interface_name(dom, node);
+        Ok(JsValue::Object(self.realm.node_wrapper(node, interface)))
+    }
+}
+
+/// The DOM interface a node's wrapper should inherit from.
+pub(in crate::runtime) fn dom_interface_name(dom: &Dom, node: NodeId) -> &'static str {
+    match dom.node(node).map(render_dom::Node::kind) {
+        Some(NodeKind::Element(element)) => match element.namespace {
+            render_dom::Namespace::Html => HTML_ELEMENT_INTERFACES
+                .iter()
+                .find(|(_, tags)| tags.contains(&element.local_name.as_str()))
+                .map_or("HTMLElement", |(interface, _)| interface),
+            render_dom::Namespace::Svg if element.local_name == "svg" => "SVGSVGElement",
+            render_dom::Namespace::Svg => "SVGElement",
+            _ => "Element",
+        },
+        Some(NodeKind::Text(_)) => "Text",
+        Some(NodeKind::Comment(_)) => "Comment",
+        Some(NodeKind::DocumentFragment) => "DocumentFragment",
+        _ => "Node",
     }
 }

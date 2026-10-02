@@ -26,6 +26,7 @@ use crate::parser::BindingPattern;
 use crate::parser::BindingTarget;
 use crate::parser::CatchClause;
 use crate::parser::Expr;
+use crate::parser::FunctionKind;
 use crate::parser::ObjectAccessorKind;
 use crate::parser::ObjectProperty;
 use crate::parser::PARAMETER_DEFAULT_MARKER;
@@ -52,12 +53,13 @@ use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_int32;
 use crate::runtime::convert::to_number;
 use crate::runtime::convert::unsigned_shift_right;
+use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::Binding;
 use crate::runtime::types::CallFrame;
 use crate::runtime::types::ClassFrame;
-use crate::runtime::types::ClassFunction;
 use crate::runtime::types::Environment;
 use crate::runtime::types::EnvironmentRecord;
+use crate::runtime::types::FunctionFlags;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::NavigationRequest;
 use crate::runtime::types::UserFunction;
@@ -436,10 +438,11 @@ impl JsRuntime {
                     name,
                     parameters,
                     body,
+                    kind,
                     ..
                 } => {
                     var_names.insert(name.clone());
-                    functions.push((name, parameters, body));
+                    functions.push((name, parameters, body, *kind));
                 }
                 Statement::Class { name, .. } => {
                     if lexical_declarations
@@ -471,8 +474,8 @@ impl JsRuntime {
         for name in var_names {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
-        for (name, parameters, body) in functions {
-            let value = self.create_function(Some(name), parameters, body)?;
+        for (name, parameters, body, kind) in functions {
+            let value = self.create_function(Some(name), parameters, body, kind)?;
             self.initialize_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -518,6 +521,7 @@ impl JsRuntime {
                     name,
                     parameters,
                     body,
+                    kind,
                     ..
                 } => {
                     if declarations
@@ -529,7 +533,7 @@ impl JsRuntime {
                             0,
                         ));
                     }
-                    functions.push((name, parameters, body));
+                    functions.push((name, parameters, body, *kind));
                 }
                 Statement::Class { name, .. }
                     if declarations
@@ -547,8 +551,8 @@ impl JsRuntime {
         for (name, kind) in declarations {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
-        for (name, parameters, body) in functions {
-            let value = self.create_function(Some(name), parameters, body)?;
+        for (name, parameters, body, kind) in functions {
+            let value = self.create_function(Some(name), parameters, body, kind)?;
             self.initialize_binding(name, value, VariableKind::Const)?;
         }
         Ok(())
@@ -558,14 +562,16 @@ impl JsRuntime {
         &mut self,
         parameters: &[String],
         body: &[Statement],
+        kind: FunctionKind,
     ) -> Result<JsValue, JsError> {
-        self.create_function(None, parameters, body)
+        self.create_function(None, parameters, body, kind)
     }
 
     pub(super) fn create_arrow_function(
         &mut self,
         parameters: &[String],
         body: &[Statement],
+        is_async: bool,
     ) -> Result<JsValue, JsError> {
         // Arrows inherit `super` and `this` lexically from the function they
         // execute inside, so they carry that class's metadata and bind no
@@ -574,7 +580,17 @@ impl JsRuntime {
             .class_frames
             .last()
             .and_then(|frame| frame.function.clone());
-        self.create_function_meta(None, parameters, body, true, false, class)
+        self.create_function_meta(
+            None,
+            parameters,
+            body,
+            FunctionFlags {
+                arrow: true,
+                strict: false,
+                class,
+                kind: FunctionKind::new(is_async, false),
+            },
+        )
     }
 
     pub(super) fn create_function(
@@ -582,8 +598,19 @@ impl JsRuntime {
         name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
+        kind: FunctionKind,
     ) -> Result<JsValue, JsError> {
-        self.create_function_meta(name, parameters, body, false, false, None)
+        self.create_function_meta(
+            name,
+            parameters,
+            body,
+            FunctionFlags {
+                arrow: false,
+                strict: false,
+                class: None,
+                kind,
+            },
+        )
     }
 
     pub(super) fn create_function_meta(
@@ -591,10 +618,14 @@ impl JsRuntime {
         name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
-        arrow: bool,
-        strict: bool,
-        class: Option<Rc<ClassFunction>>,
+        flags: FunctionFlags,
     ) -> Result<JsValue, JsError> {
+        let FunctionFlags {
+            arrow,
+            strict,
+            class,
+            kind,
+        } = flags;
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
         let (body, defaults) = Self::extract_parameter_defaults(body);
@@ -612,6 +643,7 @@ impl JsRuntime {
             strict,
             class,
             rest,
+            kind,
         });
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
@@ -825,13 +857,14 @@ impl JsRuntime {
             Statement::While {
                 condition, body, ..
             } => {
+                let own_labels = std::mem::take(&mut self.pending_loop_labels);
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
                     if !self.evaluate(dom, condition)?.is_truthy() {
                         break;
                     }
-                    match self.evaluate_statement(dom, body)? {
+                    match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
                         Completion::Continue(None) => {}
                         Completion::Break(None) => break,
@@ -846,10 +879,11 @@ impl JsRuntime {
             Statement::DoWhile {
                 condition, body, ..
             } => {
+                let own_labels = std::mem::take(&mut self.pending_loop_labels);
                 let mut value = JsValue::Undefined;
                 loop {
                     self.consume_step()?;
-                    match self.evaluate_statement(dom, body)? {
+                    match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
                         Completion::Continue(None) => {}
                         Completion::Break(None) => break,
@@ -899,14 +933,32 @@ impl JsRuntime {
             } => self.evaluate_for_in_expr_statement(dom, target, iterable, body),
             // Labels bind `break label` / `continue label` to this statement;
             // unlabeled control flow binds to the nearest enclosing loop.
-            Statement::Labeled { label, body, .. } => match self.evaluate_statement(dom, body)? {
-                Completion::Break(Some(target)) | Completion::Continue(Some(target))
-                    if *target == *label =>
-                {
-                    Ok(Completion::Normal(JsValue::Undefined))
+            Statement::Labeled { label, body, .. } => {
+                // A label in front of a loop (or of another label) belongs to
+                // that loop, which needs it to recognise `continue label`.
+                if matches!(
+                    body.as_ref(),
+                    Statement::While { .. }
+                        | Statement::DoWhile { .. }
+                        | Statement::For { .. }
+                        | Statement::ForIn { .. }
+                        | Statement::ForOf { .. }
+                        | Statement::ForInExpr { .. }
+                        | Statement::Labeled { .. }
+                ) {
+                    self.pending_loop_labels.push(label.clone());
+                } else {
+                    self.pending_loop_labels.clear();
                 }
-                other => Ok(other),
-            },
+                match self.evaluate_statement(dom, body)? {
+                    Completion::Break(Some(target)) | Completion::Continue(Some(target))
+                        if *target == *label =>
+                    {
+                        Ok(Completion::Normal(JsValue::Undefined))
+                    }
+                    other => Ok(other),
+                }
+            }
             Statement::Break(label) => Ok(Completion::Break(label.clone())),
             Statement::Continue(label) => Ok(Completion::Continue(label.clone())),
             Statement::Block(statements) => self.evaluate_scoped_statements(dom, statements),
@@ -961,17 +1013,43 @@ impl JsRuntime {
         update: Option<&Expr>,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
+        // `for (let …;;)` gives every iteration its own copy of the loop
+        // variables (ECMA-262 §14.7.4.4 CreatePerIterationEnvironment), which
+        // is what lets closures made in an iteration keep that iteration's value.
+        let per_iteration_bindings = matches!(
+            initializer,
+            Some(
+                Statement::Variable {
+                    kind: VariableKind::Let | VariableKind::Const,
+                    ..
+                } | Statement::VariableList {
+                    kind: VariableKind::Let | VariableKind::Const,
+                    ..
+                }
+            )
+        );
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             if let Some(initializer) = initializer {
-                if let Statement::Variable { kind, name, .. } = initializer {
-                    self.create_binding(
-                        name,
-                        *kind,
-                        *kind == VariableKind::Var,
-                        JsValue::Undefined,
-                    )?;
+                // Lexical loop variables live in the loop's own scope. `var`
+                // ones were hoisted to the function (or the global scope)
+                // before the statement ran, so there is nothing to create.
+                match initializer {
+                    Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
+                        self.create_binding(name, *kind, false, JsValue::Undefined)?;
+                    }
+                    Statement::VariableList {
+                        kind, declarations, ..
+                    } if *kind != VariableKind::Var => {
+                        for (target, _) in declarations {
+                            for name in target.names() {
+                                self.create_binding(&name, *kind, false, JsValue::Undefined)?;
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 match self.evaluate_statement(dom, initializer)? {
                     Completion::Normal(_) => {}
@@ -986,7 +1064,7 @@ impl JsRuntime {
                 {
                     break;
                 }
-                match self.evaluate_statement(dom, body)? {
+                match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                     Completion::Normal(next) => value = next,
                     Completion::Continue(None) => {}
                     Completion::Break(None) => break,
@@ -994,6 +1072,14 @@ impl JsRuntime {
                     labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
                         return Ok(labeled);
                     }
+                }
+                if per_iteration_bindings && let Some(top) = self.environment.last() {
+                    let copy = EnvironmentRecord {
+                        bindings: top.borrow().bindings.clone(),
+                        ..EnvironmentRecord::default()
+                    };
+                    let last = self.environment.len() - 1;
+                    self.environment[last] = Rc::new(RefCell::new(copy));
                 }
                 if let Some(update) = update {
                     self.evaluate(dom, update)?;
@@ -1013,6 +1099,7 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
         let names = match iterable {
             JsValue::Object(object) => self
@@ -1050,7 +1137,7 @@ impl JsRuntime {
             if iteration_environment.is_some() {
                 self.environment.pop();
             }
-            match completion? {
+            match own_loop_completion(&own_labels, completion?) {
                 Completion::Normal(next) => value = next,
                 Completion::Continue(None) => {}
                 Completion::Break(None) => break,
@@ -1072,6 +1159,7 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
         let names = match iterable {
             JsValue::Object(object) => self
@@ -1085,7 +1173,7 @@ impl JsRuntime {
             self.consume_step()?;
             let reference = self.resolve_assignment_reference(dom, target)?;
             self.write_assignment_reference(dom, &reference, JsValue::String(property.clone()))?;
-            match self.evaluate_statement(dom, body)? {
+            match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                 Completion::Normal(next) => value = next,
                 Completion::Continue(None) => {}
                 Completion::Break(None) => break,
@@ -1106,14 +1194,44 @@ impl JsRuntime {
         iterable: &Expr,
         body: &Statement,
     ) -> Result<Completion, JsError> {
+        let own_labels = std::mem::take(&mut self.pending_loop_labels);
         let iterable = self.evaluate(dom, iterable)?;
-        let values = self.iterate_values(dom, &iterable)?;
+        // Arrays and strings are walked directly. Any other iterable goes
+        // through the iterator protocol one step at a time, so an infinite
+        // generator works and leaving the loop early closes the iterator
+        // (ECMA-262 §7.4.12 `IteratorClose`).
+        let mut eager = None;
+        let mut lazy = None;
+        match &iterable {
+            JsValue::Object(object)
+                if !matches!(self.realm.host(*object), Some(ObjectHost::Array)) =>
+            {
+                match self.get_iterator(dom, &iterable)? {
+                    Some(pair) => lazy = Some(pair),
+                    None => eager = Some(self.iterate_values(dom, &iterable)?.into_iter()),
+                }
+            }
+            _ => eager = Some(self.iterate_values(dom, &iterable)?.into_iter()),
+        }
         if kind == VariableKind::Var {
             self.create_binding(name, kind, true, JsValue::Undefined)?;
         }
         let mut value = JsValue::Undefined;
-        for item in values {
+        loop {
             self.consume_step()?;
+            let item = if let Some(items) = eager.as_mut() {
+                match items.next() {
+                    Some(item) => item,
+                    None => break,
+                }
+            } else if let Some((iterator, next)) = lazy {
+                match self.iterator_next(dom, iterator, next)? {
+                    Some(item) => item,
+                    None => break,
+                }
+            } else {
+                break;
+            };
             let iteration_environment = if kind == VariableKind::Var {
                 None
             } else {
@@ -1130,20 +1248,35 @@ impl JsRuntime {
                 self.environment.push(Rc::clone(&environment));
                 Some(environment)
             };
-            if kind == VariableKind::Var {
-                self.assign_binding(name, item)?;
-            }
-            let completion = self.evaluate_statement(dom, body);
+            let completion = if kind == VariableKind::Var {
+                self.assign_binding(name, item)
+                    .and_then(|()| self.evaluate_statement(dom, body))
+            } else {
+                self.evaluate_statement(dom, body)
+            };
             if iteration_environment.is_some() {
                 self.environment.pop();
             }
-            match completion? {
-                Completion::Normal(next) => value = next,
-                Completion::Continue(None) => {}
-                Completion::Break(None) => break,
-                returned @ Completion::Return(_) => return Ok(returned),
-                labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                    return Ok(labeled);
+            let completion =
+                completion.map(|completion| own_loop_completion(&own_labels, completion));
+            match completion {
+                Err(error) => {
+                    // The original error wins over anything `return()` throws.
+                    if let Some((iterator, _)) = lazy {
+                        let _ = self.close_iterator_object(dom, iterator);
+                    }
+                    return Err(error);
+                }
+                Ok(Completion::Normal(next)) => value = next,
+                Ok(Completion::Continue(None)) => {}
+                Ok(abrupt) => {
+                    if let Some((iterator, _)) = lazy {
+                        self.close_iterator_object(dom, iterator)?;
+                    }
+                    match abrupt {
+                        Completion::Break(None) => break,
+                        other => return Ok(other),
+                    }
                 }
             }
         }
@@ -1165,19 +1298,7 @@ impl JsRuntime {
             // Native engine errors materialize as standard Error instances so
             // `instanceof TypeError` and `error.stack` behave like a real
             // engine inside catch blocks.
-            let value = if let Some(value) = error.thrown_value().cloned() {
-                value
-            } else {
-                let message = error.message().to_owned();
-                let kind = match error.kind() {
-                    JsErrorKind::Syntax => ErrorKind::SyntaxError,
-                    JsErrorKind::Reference => ErrorKind::ReferenceError,
-                    JsErrorKind::Type => ErrorKind::TypeError,
-                    JsErrorKind::ResourceLimit => ErrorKind::RangeError,
-                    JsErrorKind::Dom | JsErrorKind::Throw => ErrorKind::Error,
-                };
-                self.construct_standard_error(kind, &message)?
-            };
+            let value = self.error_to_thrown_value(error)?;
             let catch_environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
             catch_environment.borrow_mut().bindings.insert(
                 catch.parameter.clone(),
@@ -1201,6 +1322,30 @@ impl JsRuntime {
             }
         }
         result
+    }
+
+    /// The JavaScript value a `catch` clause (or a rejected promise) sees for
+    /// `error`: the thrown value itself, or a standard error instance.
+    pub(super) fn error_to_thrown_value(&mut self, error: &JsError) -> Result<JsValue, JsError> {
+        if let Some(value) = error.thrown_value().cloned() {
+            return Ok(value);
+        }
+        let kind = match error.kind() {
+            JsErrorKind::Syntax => ErrorKind::SyntaxError,
+            JsErrorKind::Reference => ErrorKind::ReferenceError,
+            JsErrorKind::Type => ErrorKind::TypeError,
+            JsErrorKind::ResourceLimit => ErrorKind::RangeError,
+            JsErrorKind::Dom | JsErrorKind::Throw => ErrorKind::Error,
+        };
+        self.construct_standard_error(kind, error.message())
+    }
+
+    /// A promise already rejected with `error`.
+    pub(super) fn rejected_promise_for(&mut self, error: &JsError) -> Result<JsValue, JsError> {
+        let reason = self.error_to_thrown_value(error)?;
+        let (promise, result) = self.create_promise()?;
+        self.reject_promise(promise, &reason);
+        Ok(result)
     }
 
     pub(super) fn evaluate_scoped_statements(
@@ -1257,11 +1402,15 @@ impl JsRuntime {
                 name,
                 parameters,
                 body,
+                kind,
                 ..
-            } => self.evaluate_function_expression(name.as_deref(), parameters, body),
+            } => self.evaluate_function_expression(name.as_deref(), parameters, body, *kind),
             Expr::Arrow {
-                parameters, body, ..
-            } => self.create_arrow_function(parameters, body),
+                parameters,
+                body,
+                is_async,
+                ..
+            } => self.create_arrow_function(parameters, body, *is_async),
             Expr::Class {
                 name,
                 super_class,
@@ -1297,6 +1446,17 @@ impl JsRuntime {
                         "super constructor returned a non-object",
                     ));
                 };
+                // A built-in parent builds its instance from its own prototype;
+                // `super()` must re-parent it onto `new.target.prototype`, or a
+                // subclass of `Error`, `Map`, `Array`, `Event`… would not be an
+                // instance of itself (ECMA-262 `OrdinaryCreateFromConstructor`).
+                if let Some(JsValue::Object(new_target)) = self.new_target_stack.last().cloned()
+                    && let Some(JsValue::Object(prototype)) =
+                        self.realm.get_property(new_target, "prototype")
+                    && self.realm.get_prototype(instance) != Some(prototype)
+                {
+                    self.realm.set_prototype(instance, Some(prototype));
+                }
                 self.initialize_this(JsValue::Object(instance));
                 self.run_instance_fields(dom, &class, instance)?;
                 Ok(JsValue::Object(instance))
@@ -1317,6 +1477,25 @@ impl JsRuntime {
             Expr::Object(properties) => self.evaluate_object_literal(dom, properties),
             Expr::Array(elements) => self.evaluate_array_literal(dom, elements),
             Expr::Spread(expression) => self.evaluate(dom, expression),
+            // Outside a coroutine (a module's top level, which is not yet run
+            // as one) suspension is unavailable, so the operand is evaluated
+            // and its value stands in for the awaited or yielded result.
+            Expr::Await(operand) => self.evaluate(dom, operand),
+            Expr::Yield { argument, .. } => match argument {
+                Some(argument) => self.evaluate(dom, argument),
+                None => Ok(JsValue::Undefined),
+            },
+            Expr::OptionalChain(inner) => match self.evaluate(dom, inner) {
+                Err(error) if error.is_optional_short_circuit() => Ok(JsValue::Undefined),
+                other => other,
+            },
+            Expr::OptionalGuard(inner) => {
+                let value = self.evaluate(dom, inner)?;
+                if matches!(value, JsValue::Null | JsValue::Undefined) {
+                    return Err(JsError::optional_short_circuit());
+                }
+                Ok(value)
+            }
             Expr::Unary {
                 operator: UnaryOp::Delete,
                 operand,
@@ -2326,6 +2505,14 @@ impl JsRuntime {
             _ => String::new(),
         };
         let (callee_value, receiver) = match callee {
+            // `f?.()` / `o.m?.()`: resolve the inner callee with its receiver;
+            // a callee that is nullish ends the whole chain.
+            Expr::OptionalGuard(inner) => {
+                return match self.resolve_call_target(dom, inner)? {
+                    Some(target) => Ok(Some(target)),
+                    None => Err(JsError::optional_short_circuit()),
+                };
+            }
             Expr::SuperMember { property, .. } => {
                 let value = self.read_super_property(dom, property)?;
                 let receiver = self.current_this()?;
@@ -2426,15 +2613,16 @@ impl JsRuntime {
         name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
+        kind: FunctionKind,
     ) -> Result<JsValue, JsError> {
         let Some(name) = name else {
-            return self.create_user_function(parameters, body);
+            return self.create_user_function(parameters, body, kind);
         };
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
-            let value = self.create_function(Some(name), parameters, body)?;
+            let value = self.create_function(Some(name), parameters, body, kind)?;
             self.initialize_binding(name, value.clone(), VariableKind::Const)?;
             Ok(value)
         })();
@@ -3212,9 +3400,43 @@ impl JsRuntime {
                         _ => "head",
                     };
                     return match self.find_element_by_tag(dom, document, tag)? {
-                        Some(node) => self.wrap_node(node),
+                        Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
                     };
+                }
+                "parentNode" | "parentElement" | "nextSibling" | "previousSibling"
+                | "ownerDocument" => return Ok(JsValue::Null),
+                "firstChild" | "lastChild" => {
+                    let child = dom.children(document).and_then(|children| {
+                        if property == "firstChild" {
+                            children.first()
+                        } else {
+                            children.last()
+                        }
+                        .copied()
+                    });
+                    return match child {
+                        Some(child) => self.wrap_node(dom, child),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "childNodes" | "children" => {
+                    let elements_only = property == "children";
+                    let values = dom
+                        .children(document)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .filter(|child| {
+                            !elements_only
+                                || matches!(
+                                    dom.node(*child).map(render_dom::Node::kind),
+                                    Some(NodeKind::Element(_))
+                                )
+                        })
+                        .map(|child| self.wrap_node(dom, child))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
                 "readyState" => return Ok(JsValue::String("complete".to_owned())),
                 "cookie" => {
@@ -3226,7 +3448,7 @@ impl JsRuntime {
                 }
                 "activeElement" => {
                     return match self.find_element_by_tag(dom, document, "body")? {
-                        Some(node) => self.wrap_node(node),
+                        Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3296,7 +3518,7 @@ impl JsRuntime {
                             )
                     });
                     return match parent {
-                        Some(parent) => self.wrap_node(parent),
+                        Some(parent) => self.wrap_node(dom, parent),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3314,7 +3536,7 @@ impl JsRuntime {
                         _ => dom.previous_sibling(node),
                     };
                     return match related {
-                        Some(related) => self.wrap_node(related),
+                        Some(related) => self.wrap_node(dom, related),
                         None => Ok(JsValue::Null),
                     };
                 }
@@ -3333,7 +3555,7 @@ impl JsRuntime {
                                     Some(NodeKind::Element(_))
                                 )
                         })
-                        .map(|child| self.wrap_node(child))
+                        .map(|child| self.wrap_node(dom, child))
                         .collect::<Result<Vec<_>, _>>()?;
                     return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
@@ -4170,6 +4392,9 @@ impl JsRuntime {
                 Ok(value)
             }
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
+            Some(ObjectHost::DomNodeConstructor(kind)) => {
+                self.construct_dom_node(dom, kind, arguments)
+            }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             Some(ObjectHost::VideoConstructor) => self.video_constructor(constructor, arguments),
@@ -4403,6 +4628,9 @@ impl JsRuntime {
                 Err(JsError::type_error("Event constructor requires 'new'"))
             }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
+            Some(ObjectHost::DomNodeConstructor(_)) => Err(JsError::type_error(
+                "Failed to construct a DOM node: please use the 'new' operator",
+            )),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             // Legacy web compatibility: `Video()` without `new` constructs,
             // exactly like `Image()`.
@@ -4556,6 +4784,19 @@ impl JsRuntime {
             }
             Some(ObjectHost::ArrowFunction(index)) => {
                 self.call_user(dom, index, arguments, receiver, false)
+            }
+            Some(ObjectHost::AsyncResume {
+                coroutine,
+                rejected,
+            }) => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                let resume = if rejected {
+                    Resume::Throw(value)
+                } else {
+                    Resume::Next(value)
+                };
+                self.async_continue(dom, coroutine, resume);
+                Ok(JsValue::Undefined)
             }
             Some(ObjectHost::PromiseSettler { promise, fulfilled }) => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
@@ -4727,10 +4968,21 @@ impl JsRuntime {
             _ => label,
         };
         self.call_stack.push(CallFrame { name: label });
-        let result = self
+        let prepared = self
             .bind_parameters(dom, &function, arguments, &call_environment)
-            .and_then(|()| self.instantiate_statements(&function.body))
-            .and_then(|()| self.evaluate_statements(dom, &function.body));
+            .and_then(|()| self.instantiate_statements(&function.body));
+        let result = match prepared {
+            Ok(()) if function.kind.is_coroutine() => self
+                .start_coroutine(dom, index, &function, &call_environment)
+                .map(Completion::Return),
+            Ok(()) => self.evaluate_statements(dom, &function.body),
+            // An async function reports a failing parameter list through its
+            // promise rather than by throwing (ECMA-262 §10.2.1.1).
+            Err(error) if function.kind == FunctionKind::Async => {
+                self.rejected_promise_for(&error).map(Completion::Return)
+            }
+            Err(error) => Err(error),
+        };
         self.call_stack.pop();
         self.class_frames.pop();
         // A constructor's `[[Construct]]` result is its final `this`
@@ -4865,43 +5117,7 @@ impl JsRuntime {
         realm: &Realm,
     ) -> Result<ObjectId, JsError> {
         let object = Self::require_object(value)?;
-        if matches!(
-            realm.host(object),
-            Some(
-                ObjectHost::NativeFunction(_)
-                    | ObjectHost::BoundFunction { .. }
-                    | ObjectHost::BoundCallable { .. }
-                    | ObjectHost::UserFunction(_)
-                    | ObjectHost::ArrowFunction(_)
-                    | ObjectHost::FunctionConstructor
-                    | ObjectHost::StringConstructor
-                    | ObjectHost::NumberConstructor
-                    | ObjectHost::BooleanConstructor
-                    | ObjectHost::DateConstructor
-                    | ObjectHost::SymbolConstructor
-                    | ObjectHost::ArrayConstructor
-                    | ObjectHost::RegExpConstructor
-                    | ObjectHost::EventConstructor
-                    | ObjectHost::DomConstructor
-                    | ObjectHost::ImageConstructor
-                    | ObjectHost::VideoConstructor
-                    | ObjectHost::ObjectConstructor
-                    | ObjectHost::PromiseConstructor
-                    | ObjectHost::MutationObserverConstructor
-                    | ObjectHost::UrlConstructor
-                    | ObjectHost::UrlSearchParamsConstructor
-                    | ObjectHost::XmlHttpRequestConstructor
-                    | ObjectHost::AbortControllerConstructor
-                    | ObjectHost::FormDataConstructor
-                    | ObjectHost::ResponseConstructor
-                    | ObjectHost::BlobConstructor
-                    | ObjectHost::ProxyConstructor
-                    | ObjectHost::IntersectionObserverConstructor
-                    | ObjectHost::CollectionConstructor(_)
-                    | ObjectHost::TypedArrayConstructor(_)
-                    | ObjectHost::ErrorConstructor(_)
-            )
-        ) {
+        if Self::is_callable_object(object, realm) {
             Ok(object)
         } else {
             Err(JsError::type_error(format!(
@@ -5013,6 +5229,10 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         | Expr::Object(_)
         | Expr::Array(_)
         | Expr::Spread(_)
+        | Expr::OptionalChain(_)
+        | Expr::OptionalGuard(_)
+        | Expr::Await(_)
+        | Expr::Yield { .. }
         | Expr::NewTarget
         | Expr::Sequence(_) => None,
     }
@@ -5042,5 +5262,15 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
         | Statement::Continue(_)
         | Statement::Block(_)
         | Statement::Expression(_) => None,
+    }
+}
+
+/// A `break`/`continue` aimed at a label this loop carries is aimed at the loop
+/// itself, so it is read as the unlabeled form.
+fn own_loop_completion(labels: &[String], completion: Completion) -> Completion {
+    match completion {
+        Completion::Continue(Some(label)) if labels.contains(&label) => Completion::Continue(None),
+        Completion::Break(Some(label)) if labels.contains(&label) => Completion::Break(None),
+        other => other,
     }
 }

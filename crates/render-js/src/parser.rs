@@ -22,6 +22,40 @@ pub(super) enum VariableKind {
     Var,
 }
 
+/// What a function call does with its body (ECMA-262 §15.2-§15.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(super) enum FunctionKind {
+    #[default]
+    Normal,
+    Async,
+    Generator,
+    AsyncGenerator,
+}
+
+impl FunctionKind {
+    pub(super) const fn new(is_async: bool, is_generator: bool) -> Self {
+        match (is_async, is_generator) {
+            (false, false) => Self::Normal,
+            (true, false) => Self::Async,
+            (false, true) => Self::Generator,
+            (true, true) => Self::AsyncGenerator,
+        }
+    }
+
+    pub(super) const fn is_async(self) -> bool {
+        matches!(self, Self::Async | Self::AsyncGenerator)
+    }
+
+    pub(super) const fn is_generator(self) -> bool {
+        matches!(self, Self::Generator | Self::AsyncGenerator)
+    }
+
+    /// Whether calling the function runs its body as a coroutine.
+    pub(super) const fn is_coroutine(self) -> bool {
+        !matches!(self, Self::Normal)
+    }
+}
+
 /// Marker prefix flagging a parameter that carried a default initializer.
 /// Neither marker character can appear in a lexer-produced identifier, so the
 /// prefixed names stay unambiguous; [`super::runtime::eval`] strips them when
@@ -223,6 +257,7 @@ pub(super) enum Statement {
         parameters: Vec<String>,
         body: Vec<Statement>,
         offset: usize,
+        kind: FunctionKind,
     },
     /// `class Name extends Base { ... }`, a lexical binding like `let`.
     Class {
@@ -324,12 +359,22 @@ pub(super) enum Expr {
         parameters: Vec<String>,
         body: Vec<Statement>,
         offset: usize,
+        kind: FunctionKind,
     },
     Arrow {
         parameters: Vec<String>,
         body: Vec<Statement>,
         offset: usize,
+        is_async: bool,
     },
+    /// `yield`, `yield value`, `yield* iterable`.
+    Yield {
+        argument: Option<Box<Self>>,
+        delegate: bool,
+        offset: usize,
+    },
+    /// `await operand`.
+    Await(Box<Self>),
     /// `class [Name] [extends Base] { ... }` as an expression.
     Class {
         name: Option<String>,
@@ -443,6 +488,13 @@ pub(super) enum Expr {
         offset: usize,
     },
     Sequence(Vec<Self>),
+    /// The extent of an optional chain (`a?.b.c(d)`): a nullish base reached
+    /// at an [`Self::OptionalGuard`] inside ends the whole chain with
+    /// `undefined`.
+    OptionalChain(Box<Self>),
+    /// The `?.` itself: evaluates its operand and short-circuits the
+    /// enclosing [`Self::OptionalChain`] when the value is `null`/`undefined`.
+    OptionalGuard(Box<Self>),
 }
 
 pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
@@ -457,6 +509,8 @@ pub(super) fn parse_module(
 ) -> Result<(Vec<Statement>, ModuleInfo), JsError> {
     let mut parser = Parser::new(tokens, limits);
     parser.module = Some(ModuleInfo::default());
+    // Top-level `await` is part of the module grammar (ECMA-262 §16.2).
+    parser.in_async = true;
     let statements = parser.statement_list(false)?;
     let info = parser.module.take().unwrap_or_default();
     Ok((statements, info))
@@ -562,6 +616,8 @@ impl Parser {
             class_depth: 0,
             no_in: false,
             module: None,
+            in_async: false,
+            in_generator: false,
         }
     }
 }
@@ -582,6 +638,11 @@ struct Parser {
     no_in: bool,
     /// Present while parsing a module; collects its import/export tables.
     module: Option<ModuleInfo>,
+    /// Whether the function being parsed is async (`await` is an operator) or
+    /// a generator (`yield` is an operator). Outside both, they are ordinary
+    /// identifiers.
+    in_async: bool,
+    in_generator: bool,
 }
 
 impl Parser {
@@ -628,11 +689,8 @@ impl Parser {
             return Ok(Statement::Block(statements));
         }
         if self.take(&TokenKind::Function) {
-            // Treat async/generator declarations as ordinary functions. The
-            // runtime does not suspend generator frames, but accepting their
-            // syntax lets feature-detection and polyfill code load normally.
-            let _ = self.take(&TokenKind::Star);
-            return self.function_declaration();
+            let is_generator = self.take(&TokenKind::Star);
+            return self.function_declaration(FunctionKind::new(false, is_generator));
         }
         // Module declarations are intentionally lowered into the shared page
         // realm. Static imports/exports are dependency metadata for the
@@ -673,8 +731,8 @@ impl Parser {
         ) {
             self.advance();
             self.advance();
-            let _ = self.take(&TokenKind::Star);
-            return self.function_declaration();
+            let is_generator = self.take(&TokenKind::Star);
+            return self.function_declaration(FunctionKind::new(true, is_generator));
         }
         if self.take(&TokenKind::If) {
             return self.if_statement();
@@ -1238,16 +1296,17 @@ impl Parser {
         declarations.push((BindingTarget::Pattern(pattern), Some(initializer)));
     }
 
-    fn function_declaration(&mut self) -> Result<Statement, JsError> {
+    fn function_declaration(&mut self, kind: FunctionKind) -> Result<Statement, JsError> {
         let TokenKind::Identifier(name) = self.advance().kind else {
             return Err(self.error("expected a function name"));
         };
-        let (parameters, body) = self.function_tail()?;
+        let (parameters, body) = self.function_tail(kind)?;
         Ok(Statement::Function {
             offset: self.previous_offset(),
             name,
             parameters,
             body,
+            kind,
         })
     }
 
@@ -1585,6 +1644,7 @@ impl Parser {
 
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
         let checkpoint = self.cursor;
+        let mut is_async_arrow = false;
         // Async arrows have the same callable shape in this synchronous
         // runtime; consume the marker while retaining their parameter/body.
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
@@ -1594,6 +1654,7 @@ impl Parser {
             )
         {
             self.advance();
+            is_async_arrow = true;
         }
         let mut patterns = Vec::new();
         let mut defaults: Vec<Statement> = Vec::new();
@@ -1662,7 +1723,11 @@ impl Parser {
             return Ok(None);
         };
 
-        let mut body = if self.take(&TokenKind::LeftBrace) {
+        // An arrow function has no `yield`, and its `await` is its own: it is
+        // an operator only in an async arrow.
+        let previous_async = std::mem::replace(&mut self.in_async, is_async_arrow);
+        let previous_generator = std::mem::replace(&mut self.in_generator, false);
+        let body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
             self.function_depth = self.function_depth.saturating_add(1);
@@ -1670,15 +1735,20 @@ impl Parser {
             let body = self.statement_list(true);
             self.function_depth = previous_function_depth;
             self.loop_depth = previous_loop_depth;
-            let body = body?;
-            self.require(
-                &TokenKind::RightBrace,
-                "expected '}' after arrow function body",
-            )?;
-            body
+            body.and_then(|body| {
+                self.require(
+                    &TokenKind::RightBrace,
+                    "expected '}' after arrow function body",
+                )?;
+                Ok(body)
+            })
         } else {
-            vec![Statement::Return(Some(self.assignment()?))]
+            self.assignment()
+                .map(|value| vec![Statement::Return(Some(value))])
         };
+        self.in_async = previous_async;
+        self.in_generator = previous_generator;
+        let mut body = body?;
         if !defaults.is_empty() {
             defaults.extend(body);
             body = defaults;
@@ -1701,6 +1771,7 @@ impl Parser {
             offset: self.previous_offset(),
             parameters,
             body,
+            is_async: is_async_arrow,
         }))
     }
 
@@ -1914,21 +1985,21 @@ impl Parser {
                 offset,
             });
         }
-        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await") {
-            // Promise suspension is outside the synchronous interpreter, but
-            // await has unary expression precedence. Parsing it here avoids
-            // mistaking nested `await (...)` expressions for calls to a
-            // missing global named await.
+        if self.in_async
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await")
+        {
+            // `await` has unary-expression precedence (ECMA-262 §15.8).
             self.advance();
-            return self.unary();
+            return Ok(Expr::Await(Box::new(self.unary()?)));
         }
-        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield") {
-            // Generator suspension is also outside the synchronous
-            // interpreter, but modern bundles wrap `yield` in helper-driven
-            // generator bodies that must still parse. The operand (a full
-            // AssignmentExpression per ECMA-262) keeps its side effects; a
-            // bare `yield` followed by a terminator stays an expression.
+        if self.in_generator
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield")
+        {
+            // The operand of `yield` is a full AssignmentExpression; a bare
+            // `yield` followed by a terminator has no operand.
+            let offset = self.current().offset;
             self.advance();
+            let delegate = !self.current().after_newline && self.take(&TokenKind::Star);
             let terminated = self.current().after_newline
                 || matches!(
                     self.current().kind,
@@ -1942,11 +2013,16 @@ impl Parser {
                         | TokenKind::Dot
                         | TokenKind::Eof
                 );
-            return if terminated {
-                Ok(Expr::Literal(JsValue::Undefined))
+            let argument = if terminated && !delegate {
+                None
             } else {
-                self.assignment()
+                Some(Box::new(self.assignment()?))
             };
+            return Ok(Expr::Yield {
+                argument,
+                delegate,
+                offset,
+            });
         }
         let update_operator = if self.take(&TokenKind::PlusPlus) {
             Some(BinaryOp::Add)
@@ -2068,8 +2144,48 @@ impl Parser {
     }
 
     fn postfix_tail(&mut self, mut expression: Expr) -> Result<Expr, JsError> {
+        let mut optional = false;
         loop {
-            if self.take(&TokenKind::Dot) {
+            if self.take(&TokenKind::QuestionDot) {
+                optional = true;
+                expression = Expr::OptionalGuard(Box::new(expression));
+                if self.take(&TokenKind::LeftParen) {
+                    let arguments = self.arguments_after_left_paren()?;
+                    expression = Expr::Call {
+                        offset: self.previous_offset(),
+                        callee: Box::new(expression),
+                        arguments,
+                    };
+                } else if self.take(&TokenKind::LeftBracket) {
+                    let property = self.assignment()?;
+                    self.require(
+                        &TokenKind::RightBracket,
+                        "expected ']' after computed property",
+                    )?;
+                    expression = Expr::ComputedMember {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        property: Box::new(property),
+                    };
+                } else if let TokenKind::PrivateName(name) = self.current().kind.clone() {
+                    if self.class_depth == 0 {
+                        return Err(self.error("private names are only allowed in class bodies"));
+                    }
+                    self.advance();
+                    expression = Expr::PrivateMember {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        name,
+                    };
+                } else {
+                    let property = self.property_name()?;
+                    expression = Expr::Member {
+                        offset: self.previous_offset(),
+                        object: Box::new(expression),
+                        property,
+                    };
+                }
+            } else if self.take(&TokenKind::Dot) {
                 if let TokenKind::PrivateName(name) = self.current().kind.clone() {
                     if self.class_depth == 0 {
                         return Err(self.error("private names are only allowed in class bodies"));
@@ -2107,6 +2223,9 @@ impl Parser {
                     arguments,
                 };
             } else if matches!(self.current().kind, TokenKind::Template(_)) {
+                if optional {
+                    return Err(self.error("tagged templates are not allowed in an optional chain"));
+                }
                 // ECMA-262 13.3.11 `TaggedTemplate`: the tag is handed a
                 // template object and the substitution values, not the
                 // concatenated string an untagged template literal produces.
@@ -2118,6 +2237,9 @@ impl Parser {
             } else {
                 break;
             }
+        }
+        if optional {
+            expression = Expr::OptionalChain(Box::new(expression));
         }
         Ok(expression)
     }
@@ -2146,8 +2268,7 @@ impl Parser {
         match token.kind {
             TokenKind::Identifier(name) if name == "async" && self.at(&TokenKind::Function) => {
                 self.advance();
-                let _ = self.take(&TokenKind::Star);
-                self.function_expression()
+                self.function_expression(true)
             }
             TokenKind::Identifier(name) if name == "class" => {
                 // An anonymous class may be followed by `extends`; only a
@@ -2200,10 +2321,7 @@ impl Parser {
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
             TokenKind::Null => Ok(Expr::Literal(JsValue::Null)),
             TokenKind::Undefined => Ok(Expr::Literal(JsValue::Undefined)),
-            TokenKind::Function => {
-                let _ = self.take(&TokenKind::Star);
-                self.function_expression()
-            }
+            TokenKind::Function => self.function_expression(false),
             TokenKind::LeftBrace => self.object_literal(),
             TokenKind::LeftBracket => self.array_literal(),
             TokenKind::LeftParen => {
@@ -2344,7 +2462,8 @@ impl Parser {
         let is_generator = self.take(&TokenKind::Star);
         let key = self.class_element_key()?;
         if self.at(&TokenKind::LeftParen) {
-            let (parameters, body) = self.function_tail()?;
+            let (parameters, body) =
+                self.function_tail(FunctionKind::new(is_async, is_generator))?;
             let kind = if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
                 kind
             } else if !is_static
@@ -2476,6 +2595,13 @@ impl Parser {
         let limits = RuntimeLimits::default();
         let tokens = tokenize(source, &limits)?;
         let mut parser = Parser::new(tokens, &limits);
+        // The substitution is part of the enclosing function, class and module,
+        // so it sees the same `await`/`yield`, private names and `import.meta`.
+        parser.in_async = self.in_async;
+        parser.in_generator = self.in_generator;
+        parser.class_depth = self.class_depth;
+        parser.function_depth = self.function_depth;
+        parser.module = self.module.as_ref().map(|_| ModuleInfo::default());
         let expression = parser.expression()?;
         if !parser.at(&TokenKind::Eof) {
             return Err(JsError::syntax(
@@ -2486,7 +2612,9 @@ impl Parser {
         Ok(expression)
     }
 
-    fn function_expression(&mut self) -> Result<Expr, JsError> {
+    fn function_expression(&mut self, is_async: bool) -> Result<Expr, JsError> {
+        let is_generator = self.take(&TokenKind::Star);
+        let kind = FunctionKind::new(is_async, is_generator);
         let name = if let TokenKind::Identifier(name) = &self.current().kind {
             let name = name.clone();
             self.advance();
@@ -2494,22 +2622,36 @@ impl Parser {
         } else {
             None
         };
-        let (parameters, body) = self.function_tail()?;
+        let (parameters, body) = self.function_tail(kind)?;
         Ok(Expr::Function {
             offset: self.previous_offset(),
             name,
             parameters,
             body,
+            kind,
         })
     }
 
-    fn function_tail(&mut self) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    fn function_tail(
+        &mut self,
+        kind: FunctionKind,
+    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+        let previous_async = std::mem::replace(&mut self.in_async, kind.is_async());
+        let previous_generator = std::mem::replace(&mut self.in_generator, kind.is_generator());
+        let result = self.function_tail_inner();
+        self.in_async = previous_async;
+        self.in_generator = previous_generator;
+        result
+    }
+
+    fn function_tail_inner(&mut self) -> Result<(Vec<String>, Vec<Statement>), JsError> {
         self.require(
             &TokenKind::LeftParen,
             "expected '(' before function parameters",
         )?;
         let mut parameters = Vec::new();
         let mut defaults: Vec<Statement> = Vec::new();
+        let mut patterns = Vec::new();
         let mut bound = BTreeSet::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
@@ -2523,17 +2665,15 @@ impl Parser {
                     parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                     break;
                 }
-                // Destructuring parameters are accepted and lowered to their
-                // bound names. The compact runtime does not yet materialize
-                // a separate pattern environment, but retaining the names
-                // keeps modern framework bundles parseable and callable.
+                // A destructuring parameter binds an anonymous argument slot;
+                // the pattern itself is lowered to a `var` declaration at the
+                // top of the body, exactly as arrow functions do.
                 let mut bound_names = Vec::new();
                 if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
                     let pattern = self.binding_pattern()?;
-                    collect_binding_names(&pattern, &mut bound_names);
-                    if bound_names.is_empty() {
-                        bound_names.push(format!("__arg{}", parameters.len()));
-                    }
+                    let temporary = format!("\0param_{}", parameters.len());
+                    patterns.push((temporary.clone(), pattern));
+                    bound_names.push(temporary);
                 } else {
                     // `undefined` is an ordinary identifier in parameter position.
                     let parameter = match self.advance().kind {
@@ -2585,6 +2725,20 @@ impl Parser {
             defaults.extend(body);
             body = defaults;
         }
+        if !patterns.is_empty() {
+            let mut declarations = Vec::new();
+            for (temporary, pattern) in patterns {
+                Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
+            }
+            body.insert(
+                0,
+                Statement::VariableList {
+                    offset: self.previous_offset(),
+                    kind: VariableKind::Var,
+                    declarations,
+                },
+            );
+        }
         Ok((parameters, body))
     }
 
@@ -2608,26 +2762,54 @@ impl Parser {
                     }
                     continue;
                 }
-                if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
-                    && matches!(
-                        self.tokens.get(self.cursor + 2).map(|token| &token.kind),
-                        Some(TokenKind::LeftParen)
-                    )
-                {
+                // Method modifiers: `async`, `*`, or `async *`. `async` is only
+                // a modifier when something that can start a property name
+                // follows; `{ async }`, `{ async: 1 }` and `{ async() {} }`
+                // keep it as the name.
+                let async_is_modifier = matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+                    && !self.tokens.get(self.cursor + 1).is_none_or(|next| {
+                        next.after_newline
+                            || matches!(
+                                next.kind,
+                                TokenKind::LeftParen
+                                    | TokenKind::Colon
+                                    | TokenKind::Comma
+                                    | TokenKind::RightBrace
+                                    | TokenKind::Equal
+                            )
+                    });
+                let mut modifier_async = false;
+                if async_is_modifier {
                     self.advance();
-                    let key = self.property_name()?;
-                    let (parameters, body) = self.function_tail()?;
+                    modifier_async = true;
+                }
+                let modifier_generator = self.take(&TokenKind::Star);
+                if modifier_async || modifier_generator {
+                    let kind = FunctionKind::new(modifier_async, modifier_generator);
+                    let (key, name) = if self.take(&TokenKind::LeftBracket) {
+                        let key = self.assignment()?;
+                        self.require(
+                            &TokenKind::RightBracket,
+                            "expected ']' after computed property name",
+                        )?;
+                        (PropertyKey::Computed(key), None)
+                    } else {
+                        let key = self.property_name()?;
+                        (PropertyKey::Static(key.clone()), Some(key))
+                    };
+                    let (parameters, body) = self.function_tail(kind)?;
                     properties.push(ObjectProperty {
-                        key: PropertyKey::Static(key.clone()),
+                        key,
                         value: Expr::Function {
                             offset: self.previous_offset(),
-                            name: Some(key),
+                            name,
                             parameters,
                             body,
+                            kind,
                         },
                         accessor: None,
                         shorthand: false,
-                        method: false,
+                        method: true,
                     });
                     if !self.take(&TokenKind::Comma) {
                         break;
@@ -2644,12 +2826,13 @@ impl Parser {
                         "expected ']' after computed property name",
                     )?;
                     let value = if self.at(&TokenKind::LeftParen) {
-                        let (parameters, body) = self.function_tail()?;
+                        let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
                         Expr::Function {
                             offset: self.previous_offset(),
                             name: None,
                             parameters,
                             body,
+                            kind: FunctionKind::Normal,
                         }
                     } else {
                         self.require(
@@ -2692,7 +2875,7 @@ impl Parser {
                 if let Some(accessor_kind) = accessor_kind {
                     self.advance();
                     let key = self.property_name()?;
-                    let (parameters, body) = self.function_tail()?;
+                    let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
                     properties.push(ObjectProperty {
                         key: PropertyKey::Static(key.clone()),
                         value: Expr::Function {
@@ -2700,6 +2883,7 @@ impl Parser {
                             name: Some(key),
                             parameters,
                             body,
+                            kind: FunctionKind::Normal,
                         },
                         accessor: Some(accessor_kind),
                         shorthand: false,
@@ -2717,13 +2901,14 @@ impl Parser {
                 let (value, shorthand, method) = if self.take(&TokenKind::Colon) {
                     (self.assignment()?, false, false)
                 } else if self.at(&TokenKind::LeftParen) {
-                    let (parameters, body) = self.function_tail()?;
+                    let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
                     (
                         Expr::Function {
                             offset: self.previous_offset(),
                             name: Some(key.clone()),
                             parameters,
                             body,
+                            kind: FunctionKind::Normal,
                         },
                         false,
                         true,
@@ -3120,7 +3305,13 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(&property.value)
         }),
         Expr::Array(elements) => elements.iter().try_for_each(validate_strict_expression),
-        Expr::Spread(expression) => validate_strict_expression(expression),
+        Expr::Spread(expression)
+        | Expr::OptionalChain(expression)
+        | Expr::OptionalGuard(expression)
+        | Expr::Await(expression) => validate_strict_expression(expression),
+        Expr::Yield { argument, .. } => argument
+            .as_deref()
+            .map_or(Ok(()), validate_strict_expression),
 
         Expr::Unary {
             operator: UnaryOp::Delete,
@@ -3533,7 +3724,17 @@ fn validate_reserved_expression(
                 validate_reserved_expression(element, context)?;
             }
         }
-        Expr::Spread(inner) => validate_reserved_expression(inner, context)?,
+        Expr::Spread(inner)
+        | Expr::OptionalChain(inner)
+        | Expr::OptionalGuard(inner)
+        | Expr::Await(inner) => {
+            validate_reserved_expression(inner, context)?;
+        }
+        Expr::Yield { argument, .. } => {
+            if let Some(argument) = argument {
+                validate_reserved_expression(argument, context)?;
+            }
+        }
         Expr::Unary { operand, .. } => validate_reserved_expression(operand, context)?,
         Expr::Binary { left, right, .. } => {
             validate_reserved_expression(left, context)?;

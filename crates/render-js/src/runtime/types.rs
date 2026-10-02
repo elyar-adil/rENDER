@@ -16,6 +16,7 @@
 use crate::JsValue;
 use crate::ObjectId;
 use crate::parser::Expr;
+use crate::parser::FunctionKind;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::builtins::promise::PromiseState;
@@ -69,6 +70,38 @@ pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;
 /// when script logs past it so a chatty page cannot exhaust memory.
 pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
 
+/// One registration made with `addEventListener` (DOM Standard §2.7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Listener {
+    /// A function, or an object whose `handleEvent` method is called.
+    pub(super) callback: ObjectId,
+    pub(super) capture: bool,
+    pub(super) once: bool,
+    pub(super) passive: bool,
+}
+
+/// Dispatch state that belongs to an `Event` while it is being dispatched
+/// (DOM Standard §2.2 "stop propagation flag" and friends).
+#[derive(Clone, Debug, Default)]
+pub(super) struct EventFlags {
+    pub(super) stop_propagation: bool,
+    pub(super) stop_immediate: bool,
+    /// Set while a passive listener runs, where `preventDefault` is ignored.
+    pub(super) in_passive_listener: bool,
+    /// What `composedPath()` returns: the objects the event travels through.
+    pub(super) path: Vec<ObjectId>,
+}
+
+/// How a user function is created, beyond its name, parameters and body.
+pub(super) struct FunctionFlags {
+    /// Arrow functions bind no `this` of their own.
+    pub(super) arrow: bool,
+    /// Class code runs in strict mode.
+    pub(super) strict: bool,
+    pub(super) class: Option<Rc<ClassFunction>>,
+    pub(super) kind: FunctionKind,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
@@ -91,6 +124,8 @@ pub(super) struct UserFunction {
     pub(super) class: Option<Rc<ClassFunction>>,
     /// The final parameter collects the remaining arguments into an array.
     pub(super) rest: bool,
+    /// Whether calling the function starts a generator or an async activation.
+    pub(super) kind: FunctionKind,
 }
 
 /// One class body's private-name registry, chained to the lexically
@@ -147,6 +182,7 @@ pub(super) struct ClassFieldDefinition {
 #[derive(Clone, Debug)]
 pub(super) enum ClassFieldKey {
     Named(String),
+    Symbol(crate::JsSymbol),
     Private(u64),
 }
 

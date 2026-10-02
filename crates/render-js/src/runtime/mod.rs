@@ -44,11 +44,23 @@ use url::Url;
 mod builtins;
 mod class;
 mod convert;
+mod coroutine;
+mod coroutine_run;
+#[cfg(test)]
+mod coroutine_tests;
+#[cfg(test)]
+mod dom_tests;
 mod eval;
+#[cfg(test)]
+mod event_tests;
 mod gc;
+#[cfg(test)]
+mod language_tests;
 mod module;
 #[cfg(test)]
 mod module_tests;
+#[cfg(test)]
+mod prelude_tests;
 mod types;
 
 #[cfg(test)]
@@ -71,6 +83,16 @@ pub struct JsRuntime {
     environment: Vec<Environment>,
     /// Declared modules by key (the module's absolute URL).
     modules: BTreeMap<String, module::ModuleRecord>,
+    /// Whether the self-hosted built-ins in `prelude.js` have been installed.
+    prelude_installed: bool,
+    /// Labels written directly in front of the loop about to run.
+    pending_loop_labels: Vec<String>,
+    /// Generator and async activations, by id; `None` while one is running.
+    coroutines: Vec<Option<coroutine_run::Coroutine>>,
+    /// Compiled coroutine bodies, by function index.
+    coroutine_code: BTreeMap<usize, std::rc::Rc<coroutine::CoroutineCode>>,
+    /// The error the prelude failed with, if it did; a test pins this to `None`.
+    prelude_error: Option<JsError>,
     functions: Vec<UserFunction>,
     /// Class context of each active user-function call, for `super`,
     /// `new.target`, and field initialization.
@@ -81,7 +103,9 @@ pub struct JsRuntime {
     next_private_id: u64,
     promises: Vec<PromiseRecord>,
     pending_microtasks: Vec<JsMicrotask>,
-    event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<ObjectId>>>,
+    event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<types::Listener>>>,
+    /// Per-event dispatch state, present only while the event is dispatched.
+    event_flags: BTreeMap<ObjectId, types::EventFlags>,
     event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
     global_bindings: BTreeMap<String, GlobalBinding>,
     timers: BTreeMap<u64, TimerEntry>,
@@ -100,7 +124,7 @@ pub struct JsRuntime {
     next_fetch_id: u64,
     regexes: Vec<RegexRecord>,
     console_messages: Vec<ConsoleMessage>,
-    window_event_handlers: BTreeMap<String, Vec<ObjectId>>,
+    window_event_handlers: BTreeMap<String, Vec<types::Listener>>,
     next_symbol_id: u64,
     /// `Symbol.for` registry: registry key -> symbol id.
     global_symbol_registry: BTreeMap<String, u64>,
@@ -135,6 +159,9 @@ impl From<DomError> for JsError {
         Self::new(JsErrorKind::Dom, error.to_string(), None)
     }
 }
+
+/// The self-hosted standard library; see `JsRuntime::ensure_prelude`.
+const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
 
 impl JsRuntime {
     #[must_use]
@@ -176,6 +203,11 @@ impl JsRuntime {
             dom_nodes_created: 0,
             environment: Vec::new(),
             modules: BTreeMap::new(),
+            prelude_installed: false,
+            pending_loop_labels: Vec::new(),
+            coroutines: Vec::new(),
+            coroutine_code: BTreeMap::new(),
+            prelude_error: None,
             functions: Vec::new(),
             class_frames: Vec::new(),
             new_target_stack: Vec::new(),
@@ -183,6 +215,7 @@ impl JsRuntime {
             promises: Vec::new(),
             pending_microtasks: Vec::new(),
             event_listeners: BTreeMap::new(),
+            event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
             global_bindings: BTreeMap::new(),
             timers: BTreeMap::new(),
@@ -491,33 +524,7 @@ impl JsRuntime {
         cancelable: bool,
         extra_properties: &[(&str, JsValue)],
     ) -> Result<bool, JsError> {
-        let prototype = self
-            .realm
-            .global("Event")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            })
-            .and_then(|constructor| {
-                self.realm
-                    .get_property(constructor, "prototype")
-                    .and_then(|value| match value {
-                        JsValue::Object(object) => Some(object),
-                        _ => None,
-                    })
-            });
-        self.ensure_heap_capacity(1)?;
-        let event = self.realm.create_object(prototype);
-        for (name, value) in [
-            ("type", JsValue::String(event_type.to_owned())),
-            ("bubbles", JsValue::Boolean(bubbles)),
-            ("cancelable", JsValue::Boolean(cancelable)),
-            ("defaultPrevented", JsValue::Boolean(false)),
-            ("target", JsValue::Null),
-            ("currentTarget", JsValue::Null),
-        ] {
-            self.realm.set_property(event, name.to_owned(), value);
-        }
+        let event = self.create_event_object(event_type, bubbles, cancelable, false, true)?;
         for (name, value) in extra_properties {
             self.realm
                 .set_property(event, (*name).to_owned(), value.clone());
@@ -693,6 +700,7 @@ impl JsRuntime {
     /// Returns a typed syntax/runtime/DOM/resource-limit error. Unsupported
     /// syntax is never silently ignored.
     pub fn execute(&mut self, dom: &mut Dom, source: &str) -> Result<ScriptOutcome, JsError> {
+        self.ensure_prelude(dom);
         self.source_line_starts = build_line_starts(source);
         let script = match super::CompiledScript::compile(source, &self.limits) {
             Ok(script) => script,
@@ -703,6 +711,56 @@ impl JsRuntime {
             }
         };
         self.execute_compiled(dom, &script)
+    }
+
+    /// Install the built-ins that are written in JavaScript (`prelude.js`).
+    ///
+    /// Engines commonly self-host the parts of the standard library that are
+    /// simplest to state in the language itself; doing the same here keeps the
+    /// Rust surface small. It runs once, lazily, before the first script, with
+    /// its own execution budget, and never reports to `window.onerror`.
+    pub(super) fn ensure_prelude(&mut self, dom: &mut Dom) {
+        if self.prelude_installed {
+            return;
+        }
+        self.prelude_installed = true;
+        thread_local! {
+            // Parsing the prelude is most of its cost, and a thread's runtimes
+            // can all run the same tree.
+            static COMPILED: std::cell::RefCell<Option<std::rc::Rc<super::CompiledScript>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let compiled = COMPILED.with(|cell| {
+            if let Some(script) = cell.borrow().as_ref() {
+                return Ok(script.clone());
+            }
+            let script = std::rc::Rc::new(super::CompiledScript::compile(
+                PRELUDE_SOURCE,
+                &self.limits,
+            )?);
+            *cell.borrow_mut() = Some(script.clone());
+            Ok(script)
+        });
+        let outcome = compiled.and_then(|script| {
+            self.source_line_starts = build_line_starts(PRELUDE_SOURCE);
+            self.steps_remaining = self.limits.max_execution_steps;
+            self.calls_active = 0;
+            self.environment.clear();
+            let from_revision = dom.revision();
+            self.run_compiled_script(dom, &script.statements, from_revision)
+        });
+        if let Err(error) = outcome {
+            if std::env::var_os("RENDER_JS_TRACE").is_some() {
+                eprintln!("[render-js prelude failed: {error}]");
+            }
+            self.prelude_error = Some(error);
+        }
+    }
+
+    /// The error the self-hosted prelude failed with, if any.
+    #[must_use]
+    pub fn prelude_error(&self) -> Option<&JsError> {
+        self.prelude_error.as_ref()
     }
 
     /// Resolve an error's byte offset into a line/column pair using the
@@ -729,6 +787,7 @@ impl JsRuntime {
         dom: &mut Dom,
         script: &super::CompiledScript,
     ) -> Result<ScriptOutcome, JsError> {
+        self.ensure_prelude(dom);
         self.source_line_starts = build_line_starts(script.source());
         let from_revision = dom.revision();
         // Nothing from the previous script can still be held by an interpreter

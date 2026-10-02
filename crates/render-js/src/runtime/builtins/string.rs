@@ -431,10 +431,35 @@ pub(in crate::runtime) fn expand_replacement(
                 index += 2;
             }
             digit @ '1'..='9' => {
-                let group = digit as usize - '1' as usize;
+                // `$nn` names group `nn` when the pattern has that many groups;
+                // otherwise it is `$n` followed by a literal digit.
+                let mut group = digit as usize - '1' as usize;
                 index += 2;
+                if let Some(second) = characters.get(index).and_then(|c| c.to_digit(10)) {
+                    let two_digit = (group + 1) * 10 + second as usize;
+                    if (1..=found.groups.len()).contains(&two_digit) {
+                        group = two_digit - 1;
+                        index += 1;
+                    }
+                }
                 if let Some(Some((start, end))) = found.groups.get(group) {
                     output.extend(&input[*start..*end]);
+                }
+            }
+            '<' if !found.names.is_empty() => {
+                if let Some(close) = characters[index + 2..].iter().position(|c| *c == '>') {
+                    let name: String = characters[index + 2..index + 2 + close].iter().collect();
+                    if let Some((_, group)) =
+                        found.names.iter().find(|(candidate, _)| *candidate == name)
+                        && let Some(Some((start, end))) = found.groups.get(group - 1)
+                    {
+                        output.extend(&input[*start..*end]);
+                    }
+                    index += close + 3;
+                } else {
+                    output.push('$');
+                    output.push('<');
+                    index += 2;
                 }
             }
             other => {
@@ -517,10 +542,36 @@ pub(in crate::runtime) fn expand_units_replacement(
                 index += 2;
             }
             digit if (u16::from(b'1')..=u16::from(b'9')).contains(&digit) => {
-                let group = usize::from(digit - u16::from(b'1'));
+                let mut group = usize::from(digit - u16::from(b'1'));
                 index += 2;
+                if let Some(second) = units
+                    .get(index)
+                    .filter(|unit| (u16::from(b'0')..=u16::from(b'9')).contains(unit))
+                {
+                    let two_digit = (group + 1) * 10 + usize::from(second - u16::from(b'0'));
+                    if (1..=found.groups.len()).contains(&two_digit) {
+                        group = two_digit - 1;
+                        index += 1;
+                    }
+                }
                 if let Some(Some((start, end))) = found.groups.get(group) {
                     output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                }
+            }
+            unit if unit == u16::from(b'<') && !found.names.is_empty() => {
+                let rest = &units[index + 2..];
+                if let Some(close) = rest.iter().position(|unit| *unit == u16::from(b'>')) {
+                    let name = utf16::string_from_utf16(&rest[..close]);
+                    if let Some((_, group)) =
+                        found.names.iter().find(|(candidate, _)| *candidate == name)
+                        && let Some(Some((start, end))) = found.groups.get(group - 1)
+                    {
+                        output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                    }
+                    index += close + 3;
+                } else {
+                    output.push_str("$<");
+                    index += 2;
                 }
             }
             other => {
@@ -1051,6 +1102,7 @@ impl JsRuntime {
                 start: cursor,
                 end: cursor + pattern.len(),
                 groups: Vec::new(),
+                names: std::sync::Arc::from(Vec::new()),
             };
             let matched = !pattern.is_empty() && units[cursor..].starts_with(pattern.as_slice());
             if matched {
@@ -1311,6 +1363,10 @@ impl JsRuntime {
                     let position = utf16::utf16_offset_of_char(&text, found.start) as f64;
                     call_arguments.push(JsValue::Number(position));
                     call_arguments.push(JsValue::String(text.clone()));
+                    if !found.names.is_empty() {
+                        let groups = self.named_groups_object(&found, &characters)?;
+                        call_arguments.push(groups);
+                    }
                     let produced = self.call(dom, *callable, &call_arguments)?;
                     utf16::utf16_units(&produced.to_js_string())
                 }

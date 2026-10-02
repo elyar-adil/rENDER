@@ -473,10 +473,8 @@ mod tests {
     /// only reads `name` sees nothing - and `e instanceof DOMException` changed
     /// from false to true, which is why the caller that reads *that* now works.
     ///
-    /// The four APIs asserted here are the ones that take a selector. The parse
-    /// is one shared step for all of them, so the exception is the same one, and
-    /// a fifth selector-taking API that this engine does not implement would be
-    /// reported by the `typeof` assertion below rather than by silently passing.
+    /// The five APIs asserted here are the ones that take a selector. The parse
+    /// is one shared step for all of them, so the exception is the same one.
     #[test]
     fn a_bad_selector_throws_a_dom_exception_named_syntax_error() {
         assert_eq!(
@@ -485,19 +483,10 @@ mod tests {
                 [thrown(function () { return document.querySelector('::'); }),
                  thrown(function () { return document.querySelectorAll('a b c d e ! !'); }),
                  thrown(function () { return document.body.matches('&&'); }),
-                 thrown(function () { return document.getElementsByClassName('a!'); })].join(',')
+                 thrown(function () { return document.getElementsByClassName('a!'); }),
+                 thrown(function () { return document.body.closest('&&'); })].join(',')
             "),
-            "SyntaxError,SyntaxError,SyntaxError,SyntaxError"
-        );
-        // `closest` is a fifth selector-taking API and this engine does not have
-        // it, so the four above are the complete set of *implemented* ones. The
-        // assertion is here rather than in a comment because a comment is what
-        // the previous round's arity table was.
-        assert_eq!(
-            run("typeof document.body.closest"),
-            "undefined",
-            "if `closest` is implemented it must be listed above as a fifth \
-             API that throws the same SyntaxError DOMException"
+            "SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError"
         );
         // The `SyntaxError` DOMException is not JavaScript's `SyntaxError`
         // (WebIDL §2.8.1: "this name is used to report parsing errors in web

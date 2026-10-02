@@ -32,9 +32,9 @@ pub(super) fn gc_trace_enabled() -> bool {
 }
 
 pub(super) fn listener_values(
-    entry: &BTreeMap<String, Vec<ObjectId>>,
+    entry: &BTreeMap<String, Vec<super::types::Listener>>,
 ) -> impl Iterator<Item = &ObjectId> {
-    entry.values().flatten()
+    entry.values().flatten().map(|listener| &listener.callback)
 }
 
 pub(super) fn mark_value(
@@ -161,6 +161,8 @@ pub(super) fn mark_host(
         | ObjectHost::DataSet(_)
         | ObjectHost::CssStyleDeclaration(_)
         | ObjectHost::NativeFunction(_)
+        | ObjectHost::Generator(_)
+        | ObjectHost::AsyncResume { .. }
         | ObjectHost::PromiseConstructor
         | ObjectHost::ObjectConstructor
         | ObjectHost::FunctionConstructor
@@ -180,6 +182,7 @@ pub(super) fn mark_host(
         | ObjectHost::RegExpConstructor
         | ObjectHost::EventConstructor
         | ObjectHost::DomConstructor
+        | ObjectHost::DomNodeConstructor(_)
         | ObjectHost::ImageConstructor
         | ObjectHost::IntersectionObserverConstructor
         | ObjectHost::MutationObserverConstructor
@@ -363,7 +366,12 @@ impl JsRuntime {
                 *handler,
             );
         }
-        for handler in self.window_event_handlers.values().flatten() {
+        for handler in self
+            .window_event_handlers
+            .values()
+            .flatten()
+            .map(|listener| &listener.callback)
+        {
             mark_object(
                 self,
                 &mut marked,
@@ -472,6 +480,20 @@ impl JsRuntime {
                 &mut marked_environments,
                 &record.environment,
             );
+        }
+        // A suspended generator or async function is kept alive by its saved
+        // scope chain, which also holds the hidden bindings that stand in for
+        // its registers. (A running one is covered by `self.environment`.)
+        for coroutine in self.coroutines.iter().flatten() {
+            for environment in &coroutine.environment {
+                mark_environment(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    environment,
+                );
+            }
         }
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.

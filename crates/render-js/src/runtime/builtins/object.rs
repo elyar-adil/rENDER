@@ -677,7 +677,8 @@ impl JsRuntime {
         let callable_slot =
             |field: Option<JsValue>, name: &str| -> Result<Option<ObjectId>, JsError> {
                 match field {
-                    None => Ok(None),
+                    // `{ set: undefined }` is an accessor with no setter (§6.2.6.5).
+                    None | Some(JsValue::Undefined) => Ok(None),
                     Some(JsValue::Object(function))
                         if JsRuntime::is_callable_object(function, &self.realm) =>
                     {

@@ -24,11 +24,13 @@ use render_dom::Dom;
 
 use crate::JsError;
 use crate::JsErrorKind;
+use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::parser::ClassElement;
 use crate::parser::ClassElementKind;
 use crate::parser::Expr;
+use crate::parser::FunctionKind;
 use crate::parser::PARAMETER_REST_MARKER;
 use crate::parser::PropertyKey;
 use crate::parser::Statement;
@@ -40,6 +42,7 @@ use crate::runtime::types::ClassFieldKey;
 use crate::runtime::types::ClassFrame;
 use crate::runtime::types::ClassFunction;
 use crate::runtime::types::EnvironmentRecord;
+use crate::runtime::types::FunctionFlags;
 use crate::runtime::types::PrivateScope;
 use crate::value::ObjectHost;
 use crate::value::PropertyDescriptor;
@@ -206,9 +209,10 @@ impl JsRuntime {
         for element in elements {
             let key = match &element.key {
                 PropertyKey::Static(key) => ResolvedKey::Named(key.clone()),
-                PropertyKey::Computed(expression) => {
-                    ResolvedKey::Named(self.evaluate(dom, expression)?.to_js_string())
-                }
+                PropertyKey::Computed(expression) => match self.evaluate(dom, expression)? {
+                    JsValue::Symbol(symbol) => ResolvedKey::Symbol(symbol),
+                    other => ResolvedKey::Named(other.to_js_string()),
+                },
                 PropertyKey::Private(private) => ResolvedKey::Private(
                     *private_names
                         .names
@@ -249,6 +253,7 @@ impl JsRuntime {
             .map(|(element, key)| ClassFieldDefinition {
                 key: match key {
                     ResolvedKey::Named(key) => ClassFieldKey::Named(key.clone()),
+                    ResolvedKey::Symbol(symbol) => ClassFieldKey::Symbol(symbol.clone()),
                     ResolvedKey::Private(id, _) => ClassFieldKey::Private(*id),
                 },
                 initializer: element.initializer.clone(),
@@ -268,9 +273,12 @@ impl JsRuntime {
             Some(constructor_name),
             &parameters,
             &body,
-            false,
-            true,
-            Some(class_metadata),
+            FunctionFlags {
+                arrow: false,
+                strict: true,
+                class: Some(class_metadata),
+                kind: FunctionKind::Normal,
+            },
         )?;
         let JsValue::Object(constructor) = constructor else {
             return Err(JsError::type_error("class constructor allocation failed"));
@@ -330,15 +338,22 @@ impl JsRuntime {
             });
             let method_name = match key {
                 ResolvedKey::Named(key) => key.clone(),
+                // §15.4.4: a method named by a symbol is called `[description]`.
+                ResolvedKey::Symbol(symbol) => symbol
+                    .description()
+                    .map_or_else(String::new, |description| format!("[{description}]")),
                 ResolvedKey::Private(_, private) => format!("#{private}"),
             };
             let method = self.create_function_meta(
                 Some(&method_name),
                 &element.parameters,
                 &element.body,
-                false,
-                true,
-                Some(metadata),
+                FunctionFlags {
+                    arrow: false,
+                    strict: true,
+                    class: Some(metadata),
+                    kind: FunctionKind::new(element.is_async, element.is_generator),
+                },
             )?;
             let JsValue::Object(method) = method else {
                 continue;
@@ -346,7 +361,26 @@ impl JsRuntime {
             self.install_class_element(home, key, element.kind, method);
         }
 
-        // 7. Static fields and initialization blocks, in source order.
+        // 7. Initialize the inner class-name binding. Static fields and blocks run
+        // after this, so they can name the class they belong to.
+        if let Some(name) = name {
+            self.environment
+                .last()
+                .expect("class scope was pushed")
+                .borrow_mut()
+                .bindings
+                .insert(
+                    name.to_owned(),
+                    Binding {
+                        value: JsValue::Object(constructor),
+                        mutable: false,
+                        initialized: true,
+                        kind: VariableKind::Const,
+                    },
+                );
+        }
+
+        // 8. Static fields and initialization blocks, in source order.
         for (element, key) in elements.iter().zip(&resolved_keys) {
             if !element.is_static {
                 continue;
@@ -375,6 +409,20 @@ impl JsRuntime {
                                 },
                             );
                         }
+                        ResolvedKey::Symbol(symbol) => {
+                            self.realm.define_symbol_property(
+                                constructor,
+                                symbol,
+                                PropertyDescriptor {
+                                    getter: None,
+                                    setter: None,
+                                    value,
+                                    writable: true,
+                                    enumerable: true,
+                                    configurable: true,
+                                },
+                            );
+                        }
                         ResolvedKey::Private(id, _) => {
                             self.realm.set_private_field(constructor, *id, value);
                         }
@@ -382,29 +430,14 @@ impl JsRuntime {
                 }
                 ClassElementKind::StaticBlock => {
                     self.with_this(JsValue::Object(constructor), |runtime| {
+                        // A static block is function-like: its own `let`/`const`
+                        // and `var` declarations are local to it.
+                        runtime.instantiate_statements(&element.body)?;
                         runtime.evaluate_statements(dom, &element.body)
                     })?;
                 }
                 _ => {}
             }
-        }
-
-        // 8. Initialize the inner class-name binding.
-        if let Some(name) = name {
-            self.environment
-                .last()
-                .expect("class scope was pushed")
-                .borrow_mut()
-                .bindings
-                .insert(
-                    name.to_owned(),
-                    Binding {
-                        value: JsValue::Object(constructor),
-                        mutable: false,
-                        initialized: true,
-                        kind: VariableKind::Const,
-                    },
-                );
         }
 
         Ok(JsValue::Object(constructor))
@@ -454,6 +487,7 @@ impl JsRuntime {
         if getter.is_some() || setter.is_some() {
             let existing = match key {
                 ResolvedKey::Named(key) => self.realm.own_property(target, key),
+                ResolvedKey::Symbol(symbol) => self.realm.own_symbol_property(target, symbol),
                 ResolvedKey::Private(id, _) => self.realm.own_private_method(target, *id),
             };
             let descriptor = PropertyDescriptor {
@@ -467,6 +501,10 @@ impl JsRuntime {
             match key {
                 ResolvedKey::Named(key) => {
                     self.realm.define_property(target, key.clone(), descriptor);
+                }
+                ResolvedKey::Symbol(symbol) => {
+                    self.realm
+                        .define_symbol_property(target, symbol, descriptor);
                 }
                 ResolvedKey::Private(id, _) => {
                     self.realm.define_private_method(target, *id, descriptor);
@@ -485,6 +523,10 @@ impl JsRuntime {
         match key {
             ResolvedKey::Named(key) => {
                 self.realm.define_property(target, key.clone(), descriptor);
+            }
+            ResolvedKey::Symbol(symbol) => {
+                self.realm
+                    .define_symbol_property(target, symbol, descriptor);
             }
             ResolvedKey::Private(id, _) => {
                 self.realm.define_private_method(target, *id, descriptor);
@@ -522,6 +564,20 @@ impl JsRuntime {
                         runtime.realm.define_property(
                             instance,
                             name.clone(),
+                            PropertyDescriptor {
+                                getter: None,
+                                setter: None,
+                                value,
+                                writable: true,
+                                enumerable: true,
+                                configurable: true,
+                            },
+                        );
+                    }
+                    ClassFieldKey::Symbol(symbol) => {
+                        runtime.realm.define_symbol_property(
+                            instance,
+                            symbol,
                             PropertyDescriptor {
                                 getter: None,
                                 setter: None,
@@ -721,6 +777,7 @@ impl JsRuntime {
 /// A class element key resolved once at class-definition time.
 enum ResolvedKey {
     Named(String),
+    Symbol(JsSymbol),
     Private(u64, String),
 }
 
@@ -728,6 +785,7 @@ impl std::fmt::Debug for ResolvedKey {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Named(name) => write!(formatter, "{name}"),
+            Self::Symbol(symbol) => write!(formatter, "{symbol:?}"),
             Self::Private(_, name) => write!(formatter, "#{name}"),
         }
     }

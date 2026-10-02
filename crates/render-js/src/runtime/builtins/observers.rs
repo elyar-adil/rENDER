@@ -45,7 +45,7 @@ impl JsRuntime {
             NativeFunction::IntersectionTakeRecords => self.intersection_take_records(receiver),
             NativeFunction::MutationObserve => self.mutation_observe(receiver, arguments),
             NativeFunction::MutationDisconnect => self.mutation_disconnect(receiver),
-            NativeFunction::MutationTakeRecords => self.mutation_take_records(receiver),
+            NativeFunction::MutationTakeRecords => self.mutation_take_records(dom, receiver),
             NativeFunction::WindowMatchMedia => self.window_match_media(arguments),
             NativeFunction::MediaQueryListMediaGetter => {
                 self.media_query_list_attribute(receiver, false)
@@ -280,6 +280,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn mutation_take_records(
         &mut self,
+        dom: &Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let Some(ObjectHost::MutationObserver { queued, .. }) = self.realm.host_mut(receiver)
@@ -291,7 +292,7 @@ impl JsRuntime {
         let drained = std::mem::take(queued);
         let values = drained
             .iter()
-            .map(|record| self.mutation_record_value(record))
+            .map(|record| self.mutation_record_value(dom, record))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(JsValue::Object(self.create_array_from_values(&values)?))
     }
@@ -373,7 +374,7 @@ impl JsRuntime {
         }
         let records = drained
             .iter()
-            .map(|record| self.mutation_record_value(record))
+            .map(|record| self.mutation_record_value(dom, record))
             .collect::<Result<Vec<_>, _>>()?;
         let records = self.create_array_from_values(&records)?;
         self.call_with_this(
@@ -386,6 +387,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn mutation_record_value(
         &mut self,
+        dom: &Dom,
         record: &render_dom::MutationRecord,
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
@@ -419,7 +421,7 @@ impl JsRuntime {
             "type".to_owned(),
             JsValue::String(type_name.to_owned()),
         );
-        let wrapper = self.wrap_node(target)?;
+        let wrapper = self.wrap_node(dom, target)?;
         self.realm
             .set_property(object, "target".to_owned(), wrapper);
         self.realm.set_property(
@@ -430,7 +432,7 @@ impl JsRuntime {
         for (name, nodes) in [("addedNodes", added), ("removedNodes", removed)] {
             let values = nodes
                 .iter()
-                .map(|node| self.wrap_node(*node))
+                .map(|node| self.wrap_node(dom, *node))
                 .collect::<Result<Vec<_>, _>>()?;
             let list = self.create_array_from_values(&values)?;
             self.realm
@@ -496,7 +498,7 @@ impl JsRuntime {
             if dom.node(target).is_none() {
                 continue;
             }
-            entries.push(self.intersection_entry(target)?);
+            entries.push(self.intersection_entry(dom, target)?);
         }
         if entries.is_empty() {
             return Ok(JsValue::Undefined);
@@ -791,6 +793,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn intersection_entry(
         &mut self,
+        dom: &Dom,
         target: NodeId,
     ) -> Result<JsValue, JsError> {
         let document_rect = self
@@ -850,7 +853,7 @@ impl JsRuntime {
         let bounding = self.rect_value(viewport_rect);
         let intersection_rect = self.rect_value(intersection);
         let root = self.rect_value(root_bounds);
-        let target = self.wrap_node(target)?;
+        let target = self.wrap_node(dom, target)?;
         for (name, value) in [
             ("time", JsValue::Number(Self::monotonic_now_ms())),
             ("target", target),

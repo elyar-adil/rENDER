@@ -118,13 +118,13 @@ impl JsRuntime {
         if matches!(iterable, JsValue::Null | JsValue::Undefined) {
             return Ok(JsValue::Object(collection));
         }
-        let iterable = Self::require_object(iterable)?;
-        if !matches!(self.realm.host(iterable), Some(ObjectHost::Array)) {
-            return Err(JsError::type_error(
-                "collection constructor currently requires an Array iterable",
-            ));
+        if !matches!(iterable, JsValue::Object(_) | JsValue::String(_)) {
+            return Err(JsError::type_error(format!(
+                "{} is not iterable",
+                iterable.to_js_string()
+            )));
         }
-        for item in self.array_elements_for(iterable)? {
+        for item in self.iterate_values(dom, iterable)? {
             if kind.is_map() {
                 let pair = Self::require_object(&item)?;
                 let key = self.get_member(dom, pair, "0")?;
