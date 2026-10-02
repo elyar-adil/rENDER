@@ -20,6 +20,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::to_number;
+use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::ConsoleLevel;
 use crate::runtime::types::ConsoleMessage;
 use crate::runtime::types::JsMicrotask;
@@ -611,6 +612,21 @@ impl JsRuntime {
             | NativeFunction::ArrayEntries => {
                 self.dispatch_array_native(dom, function, receiver, arguments)
             }
+            NativeFunction::GeneratorNext => self.generator_resume(
+                dom,
+                receiver,
+                Resume::Next(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::GeneratorReturn => self.generator_resume(
+                dom,
+                receiver,
+                Resume::Return(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::GeneratorThrow => self.generator_resume(
+                dom,
+                receiver,
+                Resume::Throw(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
             NativeFunction::IteratorConstructor
             | NativeFunction::IteratorFrom
             | NativeFunction::IteratorPrototypeIterator

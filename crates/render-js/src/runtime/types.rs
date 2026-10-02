@@ -16,6 +16,7 @@
 use crate::JsValue;
 use crate::ObjectId;
 use crate::parser::Expr;
+use crate::parser::FunctionKind;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::builtins::promise::PromiseState;
@@ -69,6 +70,16 @@ pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;
 /// when script logs past it so a chatty page cannot exhaust memory.
 pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
 
+/// How a user function is created, beyond its name, parameters and body.
+pub(super) struct FunctionFlags {
+    /// Arrow functions bind no `this` of their own.
+    pub(super) arrow: bool,
+    /// Class code runs in strict mode.
+    pub(super) strict: bool,
+    pub(super) class: Option<Rc<ClassFunction>>,
+    pub(super) kind: FunctionKind,
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
@@ -91,6 +102,8 @@ pub(super) struct UserFunction {
     pub(super) class: Option<Rc<ClassFunction>>,
     /// The final parameter collects the remaining arguments into an array.
     pub(super) rest: bool,
+    /// Whether calling the function starts a generator or an async activation.
+    pub(super) kind: FunctionKind,
 }
 
 /// One class body's private-name registry, chained to the lexically
@@ -147,6 +160,7 @@ pub(super) struct ClassFieldDefinition {
 #[derive(Clone, Debug)]
 pub(super) enum ClassFieldKey {
     Named(String),
+    Symbol(crate::JsSymbol),
     Private(u64),
 }
 

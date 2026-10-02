@@ -161,6 +161,8 @@ pub(super) fn mark_host(
         | ObjectHost::DataSet(_)
         | ObjectHost::CssStyleDeclaration(_)
         | ObjectHost::NativeFunction(_)
+        | ObjectHost::Generator(_)
+        | ObjectHost::AsyncResume { .. }
         | ObjectHost::PromiseConstructor
         | ObjectHost::ObjectConstructor
         | ObjectHost::FunctionConstructor
@@ -472,6 +474,20 @@ impl JsRuntime {
                 &mut marked_environments,
                 &record.environment,
             );
+        }
+        // A suspended generator or async function is kept alive by its saved
+        // scope chain, which also holds the hidden bindings that stand in for
+        // its registers. (A running one is covered by `self.environment`.)
+        for coroutine in self.coroutines.iter().flatten() {
+            for environment in &coroutine.environment {
+                mark_environment(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    environment,
+                );
+            }
         }
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.

@@ -44,6 +44,10 @@ use url::Url;
 mod builtins;
 mod class;
 mod convert;
+mod coroutine;
+mod coroutine_run;
+#[cfg(test)]
+mod coroutine_tests;
 mod eval;
 mod gc;
 #[cfg(test)]
@@ -77,6 +81,10 @@ pub struct JsRuntime {
     modules: BTreeMap<String, module::ModuleRecord>,
     /// Whether the self-hosted built-ins in `prelude.js` have been installed.
     prelude_installed: bool,
+    /// Generator and async activations, by id; `None` while one is running.
+    coroutines: Vec<Option<coroutine_run::Coroutine>>,
+    /// Compiled coroutine bodies, by function index.
+    coroutine_code: BTreeMap<usize, std::rc::Rc<coroutine::CoroutineCode>>,
     /// The error the prelude failed with, if it did; a test pins this to `None`.
     prelude_error: Option<JsError>,
     functions: Vec<UserFunction>,
@@ -185,6 +193,8 @@ impl JsRuntime {
             environment: Vec::new(),
             modules: BTreeMap::new(),
             prelude_installed: false,
+            coroutines: Vec::new(),
+            coroutine_code: BTreeMap::new(),
             prelude_error: None,
             functions: Vec::new(),
             class_frames: Vec::new(),

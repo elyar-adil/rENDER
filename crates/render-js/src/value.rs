@@ -695,6 +695,9 @@ pub(crate) enum NativeFunction {
     IteratorConstructor,
     IteratorFrom,
     IteratorPrototypeIterator,
+    GeneratorNext,
+    GeneratorReturn,
+    GeneratorThrow,
     IteratorHelperNext,
     IteratorHelperReturn,
     IteratorMap,
@@ -1200,6 +1203,14 @@ pub(crate) enum ObjectHost {
         promise: usize,
         fulfilled: bool,
     },
+    /// A generator object; the index names its coroutine.
+    Generator(usize),
+    /// The callback an `await` registers on a promise to continue its
+    /// coroutine with the settled value (or reason, when `rejected`).
+    AsyncResume {
+        coroutine: usize,
+        rejected: bool,
+    },
     CollectionConstructor(CollectionKind),
     Collection {
         kind: CollectionKind,
@@ -1373,6 +1384,7 @@ impl ObjectHost {
                 | Self::TextEncoderConstructor
                 | Self::TextDecoderConstructor
                 | Self::PromiseSettler { .. }
+                | Self::AsyncResume { .. }
         )
     }
 }
@@ -1601,6 +1613,8 @@ pub struct Realm {
     element_prototype: ObjectId,
     /// `%IteratorPrototype%` carrying the iterator-helper methods.
     iterator_prototype: ObjectId,
+    /// `%GeneratorPrototype%`: `next`, `return` and `throw` of every generator.
+    generator_prototype: ObjectId,
     /// `%Storage.prototype%` shared by `localStorage` and `sessionStorage`.
     storage_prototype: ObjectId,
     /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
@@ -1764,6 +1778,8 @@ impl Realm {
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         let (iterator_prototype, iterator_helper_prototype) =
             Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
+        let generator_prototype =
+            Self::install_generator(&mut objects, function_prototype, iterator_prototype);
         let storage_prototype =
             Self::install_storage(&mut objects, global, object_prototype, function_prototype);
         for name in ["localStorage", "sessionStorage"] {
@@ -1904,6 +1920,7 @@ impl Realm {
                     | ObjectHost::BoundFunction { .. }
                     | ObjectHost::BoundCallable { .. }
                     | ObjectHost::PromiseSettler { .. }
+                    | ObjectHost::AsyncResume { .. }
             ) && object.prototype.is_none()
             {
                 object.prototype = Some(function_prototype);
@@ -2340,6 +2357,7 @@ impl Realm {
                     | ObjectHost::MutationObserverConstructor
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
+                    | ObjectHost::AsyncResume { .. }
                     | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
                     _ if index != object_prototype.0 => Some(object_prototype),
                     _ => None,
@@ -2363,6 +2381,7 @@ impl Realm {
             promise_prototype,
             element_prototype,
             iterator_prototype,
+            generator_prototype,
             iterator_helper_prototype,
             storage_prototype,
             media_query_list_prototype,
@@ -2964,6 +2983,52 @@ impl Realm {
             ],
             "DataView",
         );
+    }
+
+    /// `%GeneratorPrototype%` (ECMA-262 §27.5.1): inherits the iterator
+    /// helpers and `[Symbol.iterator]` from `%IteratorPrototype%`.
+    fn install_generator(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        iterator_prototype: ObjectId,
+    ) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(iterator_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("next", NativeFunction::GeneratorNext),
+            ("return", NativeFunction::GeneratorReturn),
+            ("throw", NativeFunction::GeneratorThrow),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String("Generator".to_owned()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        prototype
     }
 
     /// Installs the `console` object with the standard logging methods.
@@ -6022,6 +6087,7 @@ impl Realm {
         // The iterator prototypes are only reachable through helper objects,
         // which may all be garbage at collection time; keep them rooted.
         roots.push(self.iterator_prototype);
+        roots.push(self.generator_prototype);
         roots.push(self.iterator_helper_prototype);
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
@@ -6696,6 +6762,26 @@ impl Realm {
         self.allocate(JsObject {
             prototype: Some(self.promise_prototype),
             host: ObjectHost::Promise(promise),
+            ..JsObject::default()
+        })
+    }
+
+    /// A new generator object whose behaviour lives in coroutine `coroutine`.
+    pub(crate) fn generator_object(&mut self, coroutine: usize) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.generator_prototype),
+            host: ObjectHost::Generator(coroutine),
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn async_resume(&mut self, coroutine: usize, rejected: bool) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::AsyncResume {
+                coroutine,
+                rejected,
+            },
             ..JsObject::default()
         })
     }
