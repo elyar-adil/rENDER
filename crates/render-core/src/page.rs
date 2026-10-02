@@ -26,6 +26,7 @@ use crate::js::{
     PendingFetch, RuntimeLimits, ScriptOutcome, TimerRequest,
 };
 use crate::layout::{FragmentKind, SimpleTextMeasurer};
+use crate::module_graph::{ModuleEntry, ModuleGraph, module_key};
 use crate::paint::{DisplayListDiff, NoGlyphMasks, ReferenceTextShaper};
 use crate::script::{
     ClassicScript, ScriptDiagnostic, ScriptDiscoveryLimits, ScriptScheduling, ScriptSource,
@@ -65,6 +66,8 @@ pub struct PageOptions {
 pub enum PageTask {
     Script(String),
     CompiledScript(CompiledScript),
+    /// Declare and evaluate a module and the modules it imports.
+    Module(ModuleEntry),
     JsMicrotask(JsMicrotask),
     /// Fire one registered script timer (timeout, interval, or animation
     /// frame callback). Ids are the runtime's timer identities.
@@ -193,6 +196,13 @@ pub enum DocumentScriptQueueError {
         source_order: usize,
         error: PageQueueError,
     },
+    /// A module script that cannot be linked without the browser resource
+    /// loader, or that does not compile.
+    Module {
+        owner: crate::dom::NodeId,
+        source_order: usize,
+        message: String,
+    },
 }
 
 impl fmt::Display for DocumentScriptQueueError {
@@ -210,6 +220,7 @@ impl fmt::Display for DocumentScriptQueueError {
                 "external script {resolved_url} requires the browser resource loader"
             ),
             Self::Queue { error, .. } => error.fmt(formatter),
+            Self::Module { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -218,7 +229,9 @@ impl Error for DocumentScriptQueueError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Queue { error, .. } => Some(error),
-            Self::StaleDiscovery { .. } | Self::ExternalScriptPending { .. } => None,
+            Self::StaleDiscovery { .. }
+            | Self::ExternalScriptPending { .. }
+            | Self::Module { .. } => None,
         }
     }
 }
@@ -237,6 +250,9 @@ pub struct PreparedPageScript {
     pub source_order: usize,
     pub scheduling: ScriptScheduling,
     pub compiled: CompiledScript,
+    /// Set for `type="module"` scripts: the linked graph to evaluate instead
+    /// of running `compiled` as a classic script.
+    pub module: Option<ModuleEntry>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,7 +743,13 @@ impl Page {
             .chain(asynchronous)
             .chain(deferred)
         {
-            match self.queue_compiled_script(script.compiled) {
+            let queued_task = match script.module {
+                Some(entry) => {
+                    self.queue_task(TaskSource::DomManipulation, PageTask::Module(entry))
+                }
+                None => self.queue_compiled_script(script.compiled),
+            };
+            match queued_task {
                 Ok(id) => queued.push(id),
                 Err(error) => errors.push(DocumentScriptQueueError::Queue {
                     owner: script.owner,
@@ -813,7 +835,7 @@ impl Page {
             .chain(asynchronous)
             .chain(deferred)
         {
-            queue_discovered_inline_script(self, script, &mut queued, &mut errors);
+            queue_discovered_inline_script(self, script, base_url, &mut queued, &mut errors);
         }
         DocumentScriptQueue {
             revision: discovery.revision,
@@ -1460,20 +1482,66 @@ impl Page {
 fn queue_discovered_inline_script(
     page: &mut Page,
     script: ClassicScript,
+    base_url: &Url,
     queued: &mut Vec<TaskId>,
     errors: &mut Vec<DocumentScriptQueueError>,
 ) {
     let ScriptSource::Inline { source } = script.source else {
         unreachable!("external scripts are rejected before queuing begins");
     };
-    match page.queue_script(source) {
+    let result = if script.module {
+        queue_inline_module(page, &source, base_url, script.source_order)
+    } else {
+        page.queue_script(source)
+            .map_err(|error| DocumentScriptQueueError::Queue {
+                owner: script.owner,
+                source_order: script.source_order,
+                error,
+            })
+    };
+    match result {
         Ok(id) => queued.push(id),
-        Err(error) => errors.push(DocumentScriptQueueError::Queue {
-            owner: script.owner,
-            source_order: script.source_order,
-            error,
+        Err(error) => errors.push(match error {
+            DocumentScriptQueueError::Module { message, .. } => DocumentScriptQueueError::Module {
+                owner: script.owner,
+                source_order: script.source_order,
+                message,
+            },
+            other => other,
         }),
     }
+}
+
+/// Queue an inline module that imports nothing. A module with imports needs
+/// the browser resource loader to build its graph.
+fn queue_inline_module(
+    page: &mut Page,
+    source: &str,
+    base_url: &Url,
+    source_order: usize,
+) -> Result<TaskId, DocumentScriptQueueError> {
+    let module_error = |message: String| DocumentScriptQueueError::Module {
+        owner: page.document.dom().document(),
+        source_order,
+        message,
+    };
+    let compiled = CompiledScript::compile_module(source, &RuntimeLimits::default())
+        .map_err(|error| module_error(format!("module script failed to compile: {error}")))?;
+    let mut graph = ModuleGraph::new();
+    let key = format!("{}#inline-module-{source_order}", module_key(base_url));
+    graph.add(&key, base_url.clone(), compiled);
+    if let Some(pending) = graph.take_pending().first() {
+        return Err(module_error(format!(
+            "module script imports {pending}, which requires the browser resource loader"
+        )));
+    }
+    let entry = graph.entry(&key).expect("module was just added");
+    page.queue_task(TaskSource::DomManipulation, PageTask::Module(entry))
+        .map_err(|error| DocumentScriptQueueError::Queue {
+            owner: page.document.dom().document(),
+            source_order,
+            error,
+        })
 }
 
 fn timer_delay_duration(delay_ms: f64) -> Duration {
@@ -1489,6 +1557,14 @@ fn execute_task(
     match task {
         PageTask::Script(source) => runtime.execute(dom, &source),
         PageTask::CompiledScript(script) => runtime.execute_compiled(dom, &script),
+        PageTask::Module(entry) => {
+            for unit in &entry.units {
+                if !runtime.has_module(&unit.key) {
+                    runtime.declare_module(&unit.key, &unit.compiled, unit.resolutions.clone())?;
+                }
+            }
+            runtime.evaluate_module(dom, &entry.key)
+        }
         PageTask::JsMicrotask(microtask) => {
             let from_revision = dom.revision();
             runtime
@@ -1719,6 +1795,102 @@ mod tests {
     }
 
     #[test]
+    fn inline_module_scripts_keep_their_declarations_and_scope() {
+        let mut page = Page::new(
+            "<!doctype html><p id=message>before</p>\
+             <script type=module>\
+               export const label = 'mod'; export function twice(n) { return n * 2; }\
+               const hidden = twice(21);\
+               document.getElementById('message').setAttribute('data-out', label + hidden + typeof globalThis.hidden);\
+             </script>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/page").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+        assert!(queue.errors.is_empty(), "{:?}", queue.errors);
+        let turn = page
+            .run_one_turn_reference()
+            .expect("turn renders")
+            .expect("module task is queued");
+        assert!(
+            turn.executions[0].result.is_ok(),
+            "{:?}",
+            turn.executions[0].result
+        );
+        let message = element_with_id(page.document().dom(), "message");
+        assert_eq!(
+            page.document().dom().attribute(message, "data-out"),
+            Ok(Some("mod42undefined"))
+        );
+    }
+
+    #[test]
+    fn inline_module_with_imports_is_reported_not_run_half_linked() {
+        let mut page = Page::new(
+            "<!doctype html><script type=module>import { a } from './a.js'; var ran = 1;</script>",
+        );
+        let queue = page.queue_document_scripts(
+            &Url::parse("https://example.test/page").expect("base URL"),
+            ScriptDiscoveryLimits::default(),
+        );
+        assert!(queue.queued.is_empty());
+        assert!(matches!(
+            queue.errors.as_slice(),
+            [DocumentScriptQueueError::Module { message, .. }] if message.contains("a.js")
+        ));
+    }
+
+    #[test]
+    fn prepared_module_graph_links_across_modules_in_the_page_realm() {
+        let mut page = Page::new("<!doctype html><p id=message>before</p>");
+        let revision = page.document().dom().revision();
+        let owner = element_with_id(page.document().dom(), "message");
+        let limits = RuntimeLimits::default();
+        let base = Url::parse("https://example.test/index.html").expect("base");
+        let mut graph = crate::module_graph::ModuleGraph::new();
+        let entry_source = "import { greet } from './lib.js'; \
+             document.getElementById('message').setAttribute('data-out', greet('page'));";
+        let entry =
+            crate::js::CompiledScript::compile_module(entry_source, &limits).expect("entry");
+        graph.add("entry", base, entry.clone());
+        let pending = graph.take_pending();
+        graph.complete(
+            &pending[0],
+            Ok((
+                pending[0].clone(),
+                "export const greet = (who) => 'hello ' + who;".to_owned(),
+            )),
+            &limits,
+        );
+        assert!(graph.take_pending().is_empty());
+        let queue = page.queue_prepared_scripts(
+            revision,
+            vec![PreparedPageScript {
+                owner,
+                source_order: 0,
+                scheduling: ScriptScheduling::Defer,
+                compiled: entry,
+                module: graph.entry("entry"),
+            }],
+        );
+        assert!(queue.errors.is_empty());
+        let turn = page
+            .run_one_turn_reference()
+            .expect("turn renders")
+            .expect("module task");
+        assert!(
+            turn.executions[0].result.is_ok(),
+            "{:?}",
+            turn.executions[0].result
+        );
+        assert_eq!(
+            page.document().dom().attribute(owner, "data-out"),
+            Ok(Some("hello page"))
+        );
+    }
+
+    #[test]
     fn compiled_script_task_executes_without_reparsing_in_the_page_realm() {
         let mut page = Page::new("<!doctype html><p id=message>before</p>");
         let script = crate::js::CompiledScript::compile(
@@ -1760,30 +1932,35 @@ mod tests {
                     source_order: 3,
                     scheduling: ScriptScheduling::Defer,
                     compiled: compile("order += 'D3';"),
+                    module: None,
                 },
                 PreparedPageScript {
                     owner,
                     source_order: 0,
                     scheduling: ScriptScheduling::ParserBlocking,
                     compiled: compile("var order = 'P0';"),
+                    module: None,
                 },
                 PreparedPageScript {
                     owner,
                     source_order: 4,
                     scheduling: ScriptScheduling::Async,
                     compiled: compile("order += 'A4';"),
+                    module: None,
                 },
                 PreparedPageScript {
                     owner,
                     source_order: 1,
                     scheduling: ScriptScheduling::Defer,
                     compiled: compile("order += 'D1';"),
+                    module: None,
                 },
                 PreparedPageScript {
                     owner,
                     source_order: 2,
                     scheduling: ScriptScheduling::Async,
                     compiled: compile("order += 'A2';"),
+                    module: None,
                 },
             ],
         );
@@ -1826,6 +2003,7 @@ mod tests {
                 source_order: 0,
                 scheduling: ScriptScheduling::ParserBlocking,
                 compiled: script,
+                module: None,
             }],
         );
 

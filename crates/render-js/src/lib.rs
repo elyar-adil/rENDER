@@ -6,6 +6,7 @@
 //! its [`render_dom::MutationBatch`] without reparsing HTML.
 
 mod lexer;
+mod module;
 mod parser;
 mod regex;
 mod runtime;
@@ -213,6 +214,8 @@ pub struct CompiledScript {
     /// byte offsets into line/column positions.
     source: String,
     statements: Vec<Statement>,
+    /// Import/export tables; `Some` only for scripts compiled as modules.
+    module: Option<module::ModuleInfo>,
 }
 
 impl CompiledScript {
@@ -228,7 +231,38 @@ impl CompiledScript {
         Ok(Self {
             source: source.to_owned(),
             statements,
+            module: None,
         })
+    }
+
+    /// Tokenize and parse a module (ECMA-262 §16.2). Imports and exports are
+    /// recorded as tables; the rest of the body is ordinary statements.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed syntax or resource-limit error.
+    pub fn compile_module(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
+        let tokens = lexer::tokenize(source, limits)?;
+        let (statements, module) = parser::parse_module(tokens, limits)?;
+        Ok(Self {
+            source: source.to_owned(),
+            statements,
+            module: Some(module),
+        })
+    }
+
+    /// Module specifiers this module imports or re-exports from, in source
+    /// order. Empty for classic scripts.
+    #[must_use]
+    pub fn module_requests(&self) -> &[String] {
+        self.module
+            .as_ref()
+            .map_or(&[], |module| module.requests.as_slice())
+    }
+
+    #[must_use]
+    pub fn is_module(&self) -> bool {
+        self.module.is_some()
     }
 
     #[must_use]

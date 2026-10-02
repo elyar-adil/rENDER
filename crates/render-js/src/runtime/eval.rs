@@ -2250,12 +2250,10 @@ impl JsRuntime {
     /// Whether `name` resolves in any scope, the global bindings, or the
     /// global object itself.
     pub(super) fn binding_exists(&self, name: &str) -> bool {
-        if self
-            .environment
-            .iter()
-            .rev()
-            .any(|scope| scope.borrow().bindings.contains_key(name))
-        {
+        if self.environment.iter().rev().any(|scope| {
+            let scope = scope.borrow();
+            scope.bindings.contains_key(name) || scope.imports.contains_key(name)
+        }) {
             return true;
         }
         self.global_bindings.contains_key(name) || self.realm.global(name).is_some()
@@ -3059,6 +3057,10 @@ impl JsRuntime {
                 }
                 return Ok(binding.value.clone());
             }
+            let import = scope.borrow().imports.get(name).cloned();
+            if let Some(import) = import {
+                return self.read_import(&import);
+            }
         }
         if let Some(binding) = self.global_bindings.get(name)
             && !binding.initialized
@@ -3095,6 +3097,11 @@ impl JsRuntime {
                 }
                 binding.value = value;
                 return Ok(());
+            }
+            if scope.imports.contains_key(name) {
+                return Err(JsError::type_error(format!(
+                    "assignment to constant binding {name:?}"
+                )));
             }
         }
         if let Some(binding) = self.global_bindings.get(name) {

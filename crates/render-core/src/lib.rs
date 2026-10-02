@@ -25,6 +25,7 @@ pub mod js {
 }
 pub use render_layout as layout;
 pub mod media;
+pub mod module_graph;
 pub mod navigation;
 pub mod page;
 pub mod paint;

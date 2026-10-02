@@ -30,6 +30,7 @@ use crate::page_source::home_source;
 use crate::page_source::settings_source;
 use crate::page_source::source_from_local_file;
 use crate::page_source::source_from_network_response;
+use crate::page_state::ModulePhase;
 use crate::page_state::PageState;
 use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
@@ -79,6 +80,8 @@ use render_browser::navigation::NavigationIntent;
 use render_browser::navigation::NavigationTarget;
 use render_browser::navigation::intent_from_address;
 use render_browser::resources::StylesheetFetchPlan;
+use render_browser::scripts::ScriptBatchPreparation;
+use render_browser::scripts::ScriptFetchPlan;
 use render_browser::scripts::plan_unstarted_classic_scripts;
 use render_browser::scripts::prepare_script_batch;
 use render_browser::settings::CacheClearUiState;
@@ -1410,6 +1413,36 @@ impl BrowserApp {
         self.start_classic_scripts(id);
     }
 
+    /// Put a script batch in flight. `module_preparation` is set when the
+    /// requests are module dependencies of an already-prepared batch.
+    fn submit_script_batch(
+        &mut self,
+        id: TabId,
+        plan: ScriptFetchPlan,
+        requests: Vec<FetchRequest>,
+        module_preparation: Option<ScriptBatchPreparation>,
+    ) {
+        let module_requests = module_preparation.as_ref().map(|_| requests.clone());
+        let handle = self.submit_cached_batch(requests);
+        let Some(page) = self.pages.get_mut(&id) else {
+            handle.cancel();
+            return;
+        };
+        page.pending_scripts = Some(PendingScripts {
+            plan,
+            handle,
+            since: Instant::now(),
+            stall_reported: false,
+            module_phase: module_preparation
+                .zip(module_requests)
+                .map(|(preparation, requests)| ModulePhase {
+                    preparation,
+                    requests,
+                }),
+        });
+        self.tabs.set_loading(id, true);
+    }
+
     pub(super) fn start_classic_scripts(&mut self, id: TabId) {
         let mut rerender = false;
         let mut loading_complete = false;
@@ -1466,12 +1499,20 @@ impl BrowserApp {
                 break;
             }
             if plan.resources.is_empty() {
-                let preparation = prepare_script_batch(
+                let mut preparation = prepare_script_batch(
                     page.page.document(),
                     &plan,
                     Vec::new(),
                     &RuntimeLimits::default(),
                 );
+                let module_requests = page.module_round_requests(&mut preparation);
+                if !module_requests.is_empty() {
+                    // An inline module with imports: fetch its dependency
+                    // graph before anything in the batch runs.
+                    pending_request = Some((plan, module_requests, Some(preparation)));
+                    break;
+                }
+                preparation.finish_modules();
                 report_script_diagnostics(&preparation.diagnostics);
                 if page.styles_resolved {
                     rerender |= page.execute_script_batch(preparation);
@@ -1485,24 +1526,13 @@ impl BrowserApp {
                     .into_iter()
                     .map(|request| page.cookies.decorate_request(request))
                     .collect::<Vec<_>>();
-                pending_request = Some((plan, requests));
+                pending_request = Some((plan, requests, None));
                 break;
             }
         }
 
-        if let Some((plan, requests)) = pending_request {
-            let handle = self.submit_cached_batch(requests);
-            let Some(page) = self.pages.get_mut(&id) else {
-                handle.cancel();
-                return;
-            };
-            page.pending_scripts = Some(PendingScripts {
-                plan,
-                handle,
-                since: Instant::now(),
-                stall_reported: false,
-            });
-            self.tabs.set_loading(id, true);
+        if let Some((plan, requests, module_preparation)) = pending_request {
+            self.submit_script_batch(id, plan, requests, module_preparation);
         }
 
         self.sync_page_title(id);
@@ -1801,6 +1831,7 @@ impl BrowserApp {
     }
 
     pub(super) fn finish_classic_scripts(&mut self, id: TabId, results: Vec<FetchResult>) {
+        let mut next_module_round = None;
         let rerender = {
             let Some(page) = self.pages.get_mut(&id) else {
                 return;
@@ -1813,22 +1844,39 @@ impl BrowserApp {
                     eprintln!("browser cookie rejected: {}", issue.message);
                 }
             }
-            let preparation = prepare_script_batch(
-                page.page.document(),
-                &pending.plan,
-                results,
-                &RuntimeLimits::default(),
-            );
-            report_script_diagnostics(&preparation.diagnostics);
-            if page.styles_resolved {
-                page.execute_script_batch(preparation)
+            let limits = RuntimeLimits::default();
+            let mut preparation = match pending.module_phase {
+                Some(phase) => {
+                    let mut preparation = phase.preparation;
+                    preparation.absorb_module_results(&phase.requests, results, &limits);
+                    preparation
+                }
+                None => prepare_script_batch(page.page.document(), &pending.plan, results, &limits),
+            };
+            // Module dependencies are discovered one round at a time: each
+            // arriving module can name more. The batch runs when none remain.
+            let module_requests = page.module_round_requests(&mut preparation);
+            if module_requests.is_empty() {
+                preparation.finish_modules();
+                report_script_diagnostics(&preparation.diagnostics);
+                if page.styles_resolved {
+                    page.execute_script_batch(preparation)
+                } else {
+                    // The bodies arrived before the stylesheets did; hold the
+                    // batch until the stylesheets resolve.
+                    page.held_scripts = Some(preparation);
+                    false
+                }
             } else {
-                // The bodies arrived before the stylesheets did; hold the
-                // batch until the stylesheets resolve.
-                page.held_scripts = Some(preparation);
+                next_module_round = Some((pending.plan, preparation, module_requests));
                 false
             }
         };
+
+        if let Some((plan, preparation, requests)) = next_module_round {
+            self.submit_script_batch(id, plan, requests, Some(preparation));
+            return;
+        }
 
         self.sync_page_title(id);
         if rerender {
