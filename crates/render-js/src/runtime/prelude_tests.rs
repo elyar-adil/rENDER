@@ -260,3 +260,29 @@ fn custom_element_reflecting_property_writes_react() {
         "id:null:z,class:null:c"
     );
 }
+
+#[test]
+fn abort_signal_interface_and_factories() {
+    assert_eq!(
+        ok(
+            "var c = new AbortController(); [c.signal instanceof AbortSignal, c.signal instanceof EventTarget, typeof AbortSignal.abort, c.signal.aborted].join()"
+        ),
+        "true,true,function,false"
+    );
+    assert_eq!(
+        ok(
+            "var s = AbortSignal.abort('why'); var r; try { s.throwIfAborted() } catch (e) { r = e } [s.aborted, s.reason, r].join()"
+        ),
+        "true,why,why"
+    );
+    assert_eq!(
+        ok(
+            "var a = new AbortController(); var s = AbortSignal.any([a.signal]); var hit = 0; s.addEventListener('abort', function () { hit++ }); a.abort('x'); [s.aborted, s.reason, hit].join()"
+        ),
+        "true,x,1"
+    );
+    assert_eq!(
+        ok("try { new AbortSignal() } catch (e) { e.name }"),
+        "TypeError"
+    );
+}

@@ -234,11 +234,16 @@ impl JsRuntime {
         self.ensure_heap_capacity(2)?;
         let controller = self.realm.create_object(Some(prototype));
         let signal = self.realm.create_ordinary_object();
-        // An `AbortSignal` is an `EventTarget`; the prelude supplies its methods.
-        if let Some(JsValue::Object(target)) = self.realm.global("EventTarget")
-            && let Some(JsValue::Object(prototype)) = self.realm.get_property(target, "prototype")
-        {
-            self.realm.set_prototype(signal, Some(prototype));
+        // An `AbortSignal` is an `EventTarget`; the prelude supplies the
+        // `AbortSignal` interface, and `EventTarget` stands in until it has run.
+        for interface in ["AbortSignal", "EventTarget"] {
+            if let Some(JsValue::Object(target)) = self.realm.global(interface)
+                && let Some(JsValue::Object(prototype)) =
+                    self.realm.get_property(target, "prototype")
+            {
+                self.realm.set_prototype(signal, Some(prototype));
+                break;
+            }
         }
         *self
             .realm

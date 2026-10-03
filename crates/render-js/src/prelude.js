@@ -1038,6 +1038,56 @@
     define(global, 'BroadcastChannel', BroadcastChannelImpl);
   }
 
+  // ------------------------------------------------------------- AbortSignal
+  // DOM Standard §3.2. Signals are made by `AbortController`; this supplies the
+  // interface object, `throwIfAborted`, and the `abort`/`timeout`/`any` factories.
+  if (typeof AbortSignal === 'undefined' && typeof AbortController === 'function') {
+    var AbortSignalImpl = function AbortSignal() {
+      throw new TypeError('Illegal constructor');
+    };
+    AbortSignalImpl.prototype = Object.create(EventTarget.prototype);
+    defineProperty(AbortSignalImpl.prototype, 'constructor', {
+      value: AbortSignalImpl, writable: true, configurable: true, enumerable: false
+    });
+    defineProperty(AbortSignalImpl.prototype, Symbol.toStringTag, {
+      value: 'AbortSignal', configurable: true
+    });
+    define(AbortSignalImpl.prototype, 'throwIfAborted', function throwIfAborted() {
+      if (this.aborted) throw this.reason;
+    });
+    define(AbortSignalImpl, 'abort', function abort(reason) {
+      var controller = new AbortController();
+      controller.abort(reason);
+      return controller.signal;
+    });
+    define(AbortSignalImpl, 'timeout', function timeout(milliseconds) {
+      var controller = new AbortController();
+      setTimeout(function () {
+        controller.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+      }, Number(milliseconds));
+      return controller.signal;
+    });
+    define(AbortSignalImpl, 'any', function any(signals) {
+      var controller = new AbortController();
+      var list = Array.from(signals);
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].aborted) {
+          controller.abort(list[i].reason);
+          return controller.signal;
+        }
+      }
+      list.forEach(function (signal) {
+        signal.addEventListener('abort', function () { controller.abort(signal.reason); }, { once: true });
+      });
+      return controller.signal;
+    });
+    defineProperty(global, 'AbortSignal', {
+      value: AbortSignalImpl, writable: true, configurable: true, enumerable: false
+    });
+    // Signals made before this point (none: the prelude runs first) and after
+    // it share the interface prototype.
+  }
+
   // ---------------------------------------------------------- custom elements
   // HTML Standard §4.13. The registry, `define`/`get`/`getName`/`whenDefined`/
   // `upgrade`, the `HTMLElement` constructor for autonomous elements, and the

@@ -1405,7 +1405,7 @@ Absent:
 | `FormData` | Every HTML form submission path and every `fetch`/`XHR` call that sends a body. |
 | `TextEncoder`, `TextDecoder` | Used pervasively by bundled base64/utf8 helpers. |
 | `structuredClone` | Used by current framework state handling. |
-| `AbortController`, `AbortSignal` | Used by essentially every `fetch` wrapper. |
+| ~~`AbortController`, `AbortSignal`~~ **now implemented** | `AbortSignal` interface object with `abort`/`timeout`/`any`/`throwIfAborted` is in `crates/render-js/src/prelude.js`. |
 | `ResizeObserver` | Component frameworks gate layout on it. |
 | `attachShadow`, `ShadowRoot` (and `customElements` for customized built-ins) | Shadow DOM; `docs/generic-browser-todo.md` Priority 3. Autonomous `customElements` now exist (`crates/render-js/src/prelude.js`, reactions hooked from `set_member` in `runtime/eval.rs`); `attributeChangedCallback` does not fire for `classList`/`style`/`dataset`/`Attr.value` writes. |
 | `DataView` | Absent even though the whole `TypedArray` family is implemented in `runtime/builtins/typed_array.rs`. A small inconsistency in an otherwise complete area. |
