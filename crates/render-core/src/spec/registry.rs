@@ -157,8 +157,12 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         status: SupportStatus::Partial,
         notes: "Tree construction, traversal, attribute and character-data mutation, \
                 live NodeList/HTMLCollection-style views and a mutation history are \
-                implemented. `customElements`, shadow trees and `attachShadow` are \
-                absent, so there is no shadow DOM.",
+                implemented. `customElements` is implemented for autonomous elements \
+                (define/get/getName/whenDefined/upgrade, upgrade on define and on \
+                insertion, connected/disconnected/attributeChanged callbacks for \
+                the attribute and subtree APIs); customized built-ins, \
+                `classList`/`style`/`dataset` attribute reactions, shadow trees \
+                and `attachShadow` are absent, so there is no shadow DOM.",
         dependencies: &[],
         tests: DOM_TESTS,
     },

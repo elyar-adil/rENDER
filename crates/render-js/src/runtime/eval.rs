@@ -77,6 +77,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+/// The prelude global the evaluator calls around native node property writes.
+const CUSTOM_ELEMENT_REACTION: &str = "__customElementReaction";
+
 /// Coercion hint passed to `ToPrimitive` (`Symbol.toPrimitive` receives the
 /// name, `OrdinaryToPrimitive` uses the method order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1440,7 +1443,13 @@ impl JsRuntime {
                 for argument in arguments {
                     self.evaluate_argument(dom, argument, &mut values)?;
                 }
-                let instance = self.construct(dom, super_constructor, &values)?;
+                // The parent runs with the derived class's `new.target`
+                // (ECMA-262 §13.3.7.1), so a plain-function or class parent
+                // can tell which constructor the instance is for.
+                self.super_call_pending = true;
+                let instance = self.construct(dom, super_constructor, &values);
+                self.super_call_pending = false;
+                let instance = instance?;
                 let JsValue::Object(instance) = instance else {
                     return Err(JsError::type_error(
                         "super constructor returned a non-object",
@@ -3930,11 +3939,38 @@ impl JsRuntime {
         self.get_value(dom, object, property)
     }
 
+    /// Writes the engine performs natively on a node (`innerHTML`, `id`,
+    /// `className`, ...) are where custom element reactions have to be
+    /// observed. The prelude installs [`CUSTOM_ELEMENT_REACTION`] with the
+    /// first `customElements.define`, so a page without one pays one lookup.
+    pub(super) fn set_member(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        property: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let reacts = matches!(self.realm.host(object), Some(ObjectHost::Node(_)))
+            && (matches!(property, "innerHTML" | "outerHTML" | "textContent")
+                || node_attribute_property(property).is_some());
+        let hook = match self.realm.global(CUSTOM_ELEMENT_REACTION) {
+            Some(JsValue::Object(hook)) if reacts => hook,
+            _ => return self.set_member_native(dom, object, property, value),
+        };
+        let property_name = JsValue::String(property.to_owned());
+        let after = self.call(dom, hook, &[JsValue::Object(object), property_name])?;
+        self.set_member_native(dom, object, property, value)?;
+        if let JsValue::Object(after) = after {
+            self.call(dom, after, &[])?;
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "host-object write paths each need their own arm"
     )]
-    pub(super) fn set_member(
+    fn set_member_native(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
@@ -4298,6 +4334,17 @@ impl JsRuntime {
         Ok(JsValue::Object(object))
     }
 
+    /// The `new.target` a constructor runs with: itself, except when it is the
+    /// parent of a `super()` call, where it inherits the derived class's.
+    fn dispatch_new_target(&mut self, constructor: ObjectId) -> JsValue {
+        if std::mem::take(&mut self.super_call_pending)
+            && let Some(top) = self.new_target_stack.last().cloned()
+        {
+            return top;
+        }
+        JsValue::Object(constructor)
+    }
+
     pub(super) fn construct_dispatch(
         &mut self,
         dom: &mut Dom,
@@ -4470,7 +4517,8 @@ impl JsRuntime {
                         Err(JsError::type_error("class method is not a constructor"))
                     }
                     Some(class) => {
-                        self.new_target_stack.push(JsValue::Object(constructor));
+                        let new_target = self.dispatch_new_target(constructor);
+                        self.new_target_stack.push(new_target);
                         let result = if class.derived {
                             // A derived constructor receives `this` from its
                             // `super()` call; call_user returns the final
@@ -4509,7 +4557,8 @@ impl JsRuntime {
                         self.ensure_heap_capacity(1)?;
                         let prototype = instance_prototype(self);
                         let instance = self.realm.create_object(prototype);
-                        self.new_target_stack.push(JsValue::Object(constructor));
+                        let new_target = self.dispatch_new_target(constructor);
+                        self.new_target_stack.push(new_target);
                         let result =
                             self.call_user(dom, index, arguments, JsValue::Object(instance), true);
                         self.new_target_stack.pop();

@@ -1038,6 +1038,417 @@
     define(global, 'BroadcastChannel', BroadcastChannelImpl);
   }
 
+  // ---------------------------------------------------------- custom elements
+  // HTML Standard §4.13. The registry, `define`/`get`/`getName`/`whenDefined`/
+  // `upgrade`, the `HTMLElement` constructor for autonomous elements, and the
+  // `connectedCallback`, `disconnectedCallback` and `attributeChangedCallback`
+  // reactions (no `adoptedCallback`: there is one document) for the attribute APIs that go
+  // through `setAttribute`, `removeAttribute`, `toggleAttribute` and the reflecting
+  // properties (`id`, `className`, ...). Changes made through `classList`,
+  // `style`, `dataset` or `Attr.value` do not reach a callback.
+  //
+  // The mutation hooks are installed on the first `define`, so a page that
+  // never registers an element pays nothing for any of this.
+  if (typeof customElements === 'undefined') {
+    (function () {
+      var NativeHTMLElement = global.HTMLElement;
+      var setPrototypeOf = Object.setPrototypeOf;
+      var definitions = {};
+      var byConstructor = new Map();
+      var waiters = {};
+      var states = new WeakMap();
+      var upgrading = null;
+      var hooked = false;
+      var reserved = ['annotation-xml', 'color-profile', 'font-face', 'font-face-src',
+        'font-face-uri', 'font-face-format', 'font-face-name', 'missing-glyph'];
+      var namePattern = /^[a-z][-._0-9a-z·À-￿]*-[-._0-9a-z·À-￿]*$/;
+
+      function report(error) {
+        if (typeof global.reportError === 'function') global.reportError(error);
+      }
+      function isCustomName(name) {
+        return namePattern.test(name) && reserved.indexOf(name) === -1;
+      }
+      defineGetter(elementPrototype, 'localName', function () {
+        return String(this.tagName).toLowerCase();
+      });
+      function localNameOf(element) {
+        return String(element.tagName).toLowerCase();
+      }
+      function isHtml(element) {
+        return typeof global.SVGElement !== 'function' || !(element instanceof global.SVGElement);
+      }
+
+      function HTMLElementConstructor() {
+        var target = new.target;
+        var definition;
+        if (upgrading !== null) {
+          definition = upgrading.definition;
+        } else if (target !== undefined && target !== HTMLElementConstructor) {
+          definition = byConstructor.get(target);
+        }
+        if (!definition) throw new TypeError('Illegal constructor');
+        var element;
+        if (upgrading !== null) {
+          element = upgrading.element;
+          upgrading = null;
+        } else {
+          element = createRaw(definition.name);
+          states.set(element, 'custom');
+        }
+        setPrototypeOf(element, target.prototype);
+        return element;
+      }
+      defineProperty(HTMLElementConstructor, 'name', { value: 'HTMLElement', configurable: true });
+      HTMLElementConstructor.prototype = NativeHTMLElement.prototype;
+      defineProperty(NativeHTMLElement.prototype, 'constructor', {
+        value: HTMLElementConstructor, writable: true, configurable: true, enumerable: false
+      });
+      setPrototypeOf(HTMLElementConstructor, Object.getPrototypeOf(NativeHTMLElement));
+      defineProperty(global, 'HTMLElement', {
+        value: HTMLElementConstructor, writable: true, configurable: true, enumerable: false
+      });
+
+      var nativeCreateElement = document.createElement;
+      function createRaw(name) {
+        return nativeCreateElement.call(document, name);
+      }
+
+      function callback(element, name, args) {
+        var definition = definitions[localNameOf(element)];
+        if (!definition || states.get(element) !== 'custom') return;
+        var fn = definition.callbacks[name];
+        if (typeof fn !== 'function') return;
+        try {
+          fn.apply(element, args);
+        } catch (error) {
+          report(error);
+        }
+      }
+
+      function upgrade(element) {
+        if (states.has(element) || !isHtml(element)) return;
+        var definition = definitions[localNameOf(element)];
+        if (!definition) return;
+        var attributes = [];
+        for (var i = 0; i < element.attributes.length; i++) {
+          attributes.push(element.attributes[i]);
+        }
+        upgrading = { element: element, definition: definition };
+        var result;
+        try {
+          result = new definition.constructor();
+          if (result !== element) throw new TypeError('The custom element constructor did not produce the element being upgraded');
+        } catch (error) {
+          states.set(element, 'failed');
+          report(error);
+          return;
+        } finally {
+          upgrading = null;
+        }
+        states.set(element, 'custom');
+        for (var j = 0; j < attributes.length; j++) {
+          if (definition.observed.indexOf(attributes[j].name) !== -1) {
+            callback(element, 'attributeChangedCallback', [attributes[j].name, null, attributes[j].value, null]);
+          }
+        }
+        if (element.isConnected) callback(element, 'connectedCallback', []);
+      }
+
+      // Inclusive descendants that are elements, in tree order, without
+      // recursion so a deep tree cannot exhaust the stack.
+      function elementsOf(root) {
+        var list = [];
+        if (root.nodeType !== 1) return list;
+        var node = root;
+        while (node) {
+          if (node.nodeType === 1) list.push(node);
+          if (node.firstChild && node.nodeType === 1) {
+            node = node.firstChild;
+          } else {
+            while (node && node !== root && !node.nextSibling) node = node.parentNode;
+            if (!node || node === root) break;
+            node = node.nextSibling;
+          }
+        }
+        return list;
+      }
+      function customElementsOf(root) {
+        return elementsOf(root).filter(function (element) {
+          return states.get(element) === 'custom';
+        });
+      }
+      function connect(root) {
+        var elements = elementsOf(root);
+        for (var i = 0; i < elements.length; i++) {
+          var element = elements[i];
+          if (!element.isConnected) continue;
+          if (states.get(element) === 'custom') callback(element, 'connectedCallback', []);
+          else upgrade(element);
+        }
+      }
+      function disconnect(list) {
+        for (var i = 0; i < list.length; i++) {
+          if (!list[i].isConnected) callback(list[i], 'disconnectedCallback', []);
+        }
+      }
+      function connectedCustom(root) {
+        return root.isConnected ? customElementsOf(root) : [];
+      }
+      function newlyConnected(root, known) {
+        var elements = elementsOf(root);
+        for (var i = 0; i < elements.length; i++) {
+          var element = elements[i];
+          if (known.indexOf(element) !== -1 || !element.isConnected) continue;
+          if (states.get(element) === 'custom') callback(element, 'connectedCallback', []);
+          else upgrade(element);
+        }
+      }
+
+      function ownerOf(name) {
+        var proto = elementPrototype;
+        while (proto && !Object.prototype.hasOwnProperty.call(proto, name)) proto = Object.getPrototypeOf(proto);
+        return proto;
+      }
+      // Some element methods are not prototype properties: the engine resolves
+      // them on the node itself. A property defined on the prototype is found
+      // first, so wrapping the function value read off a real element is enough.
+      function patchMethod(name, make) {
+        var owner = ownerOf(name);
+        var original = owner ? owner[name] : document.documentElement[name];
+        if (typeof original !== 'function') return;
+        defineProperty(owner || elementPrototype, name, {
+          value: make(original), writable: true, configurable: true, enumerable: false
+        });
+      }
+
+      function install() {
+        if (hooked) return;
+        hooked = true;
+        // Insertion: the moved nodes are the roots whose subtrees connect.
+        ['appendChild', 'insertBefore'].forEach(function (name) {
+          patchMethod(name, function (original) {
+            return function (node) {
+              var moved = node && node.nodeType === 11 ? slice.call(node.childNodes) : [node];
+              var leaving = node && node.nodeType !== 11 ? connectedCustom(node) : [];
+              var result = original.apply(this, arguments);
+              disconnect(leaving);
+              for (var i = 0; i < moved.length; i++) {
+                if (moved[i] && moved[i].isConnected) connect(moved[i]);
+              }
+              return result;
+            };
+          });
+        });
+        patchMethod('replaceChild', function (original) {
+          return function (node, old) {
+            var moved = node && node.nodeType === 11 ? slice.call(node.childNodes) : [node];
+            var leaving = connectedCustom(old).concat(node && node.nodeType !== 11 ? connectedCustom(node) : []);
+            var result = original.apply(this, arguments);
+            disconnect(leaving);
+            for (var i = 0; i < moved.length; i++) {
+              if (moved[i] && moved[i].isConnected) connect(moved[i]);
+            }
+            return result;
+          };
+        });
+        patchMethod('removeChild', function (original) {
+          return function (child) {
+            var leaving = child ? connectedCustom(child) : [];
+            var result = original.apply(this, arguments);
+            disconnect(leaving);
+            return result;
+          };
+        });
+        patchMethod('remove', function (original) {
+          return function () {
+            var leaving = connectedCustom(this);
+            var result = original.apply(this, arguments);
+            disconnect(leaving);
+            return result;
+          };
+        });
+        // Operations that replace a subtree wholesale are reconciled by
+        // comparing the connected custom elements of the container before and
+        // after, so every path through them reacts the same way.
+        function reconcile(name, scope) {
+          patchMethod(name, function (original) {
+            return function () {
+              var root = scope(this);
+              var before = connectedCustom(root);
+              var result = original.apply(this, arguments);
+              disconnect(before);
+              newlyConnected(root, before);
+              return result;
+            };
+          });
+        }
+        function self(element) { return element; }
+        function parentOrSelf(element) { return element.parentNode || element; }
+        reconcile('replaceChildren', self);
+        reconcile('insertAdjacentHTML', parentOrSelf);
+        reconcile('insertAdjacentElement', parentOrSelf);
+        // Attributes.
+        function observed(element, name) {
+          var definition = definitions[localNameOf(element)];
+          return states.get(element) === 'custom' && definition && definition.observed.indexOf(name) !== -1;
+        }
+        patchMethod('setAttribute', function (original) {
+          return function (name, value) {
+            name = String(name);
+            if (this.hasAttribute && /[A-Z]/.test(name) && isHtml(this)) name = name.toLowerCase();
+            var watch = observed(this, name);
+            var old = watch ? this.getAttribute(name) : null;
+            var result = original.apply(this, arguments);
+            if (watch) callback(this, 'attributeChangedCallback', [name, old, this.getAttribute(name), null]);
+            return result;
+          };
+        });
+        patchMethod('removeAttribute', function (original) {
+          return function (name) {
+            name = String(name).toLowerCase();
+            var watch = observed(this, name);
+            var old = watch ? this.getAttribute(name) : null;
+            var result = original.apply(this, arguments);
+            if (watch && old !== null) callback(this, 'attributeChangedCallback', [name, old, null, null]);
+            return result;
+          };
+        });
+        patchMethod('toggleAttribute', function (original) {
+          return function (name) {
+            name = String(name).toLowerCase();
+            var watch = observed(this, name);
+            var old = watch ? this.getAttribute(name) : null;
+            var result = original.apply(this, arguments);
+            var now = watch ? this.getAttribute(name) : null;
+            if (watch && old !== now) callback(this, 'attributeChangedCallback', [name, old, now, null]);
+            return result;
+          };
+        });
+        // Property writes the engine performs natively (`innerHTML`, `id`,
+        // `className`, ...) call this before they run; the function it returns
+        // is called after. See `set_member` in the evaluator.
+        var propertyAttribute = { className: 'class', tabIndex: 'tabindex', readOnly: 'readonly', srcSet: 'srcset' };
+        defineProperty(global, '__customElementReaction', {
+          value: function (node, property) {
+            if (property === 'innerHTML' || property === 'textContent' || property === 'outerHTML') {
+              var root = property === 'outerHTML' ? (node.parentNode || node) : node;
+              var before = connectedCustom(root);
+              return function () {
+                disconnect(before);
+                newlyConnected(root, before);
+              };
+            }
+            var name = propertyAttribute[property] || property;
+            if (!observed(node, name)) return undefined;
+            var old = node.getAttribute(name);
+            return function () {
+              var now = node.getAttribute(name);
+              if (old !== now) callback(node, 'attributeChangedCallback', [name, old, now, null]);
+            };
+          },
+          writable: true, configurable: true, enumerable: false
+        });
+        patchMethod('cloneNode', function (original) {
+          return function () {
+            var copy = original.apply(this, arguments);
+            elementsOf(copy).forEach(upgrade);
+            return copy;
+          };
+        });
+        defineProperty(documentPrototype, 'createElement', {
+          value: function createElement(name) {
+            var element = nativeCreateElement.apply(this, arguments);
+            if (typeof name === 'string' && isHtml(element)) upgrade(element);
+            return element;
+          },
+          writable: true, configurable: true, enumerable: false
+        });
+      }
+
+      function CustomElementRegistryImpl() {
+        throw new TypeError('Illegal constructor');
+      }
+      CustomElementRegistryImpl.prototype.define = function define(name, constructor, options) {
+        name = String(name);
+        if (typeof constructor !== 'function' || !constructor.prototype) {
+          throw new TypeError("Failed to execute 'define' on 'CustomElementRegistry': parameter 2 is not of type 'Function'.");
+        }
+        if (!isCustomName(name)) {
+          throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': \"" + name + '" is not a valid custom element name', 'SyntaxError');
+        }
+        if (Object.prototype.hasOwnProperty.call(definitions, name)) {
+          throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': the name \"" + name + '" has already been used with this registry', 'NotSupportedError');
+        }
+        if (byConstructor.has(constructor)) {
+          throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': this constructor has already been used with this registry", 'NotSupportedError');
+        }
+        if (options && options.extends !== undefined) {
+          throw new DOMException("Failed to execute 'define' on 'CustomElementRegistry': customized built-in elements are not supported", 'NotSupportedError');
+        }
+        var prototype = constructor.prototype;
+        var callbacks = {};
+        ['connectedCallback', 'disconnectedCallback', 'attributeChangedCallback'].forEach(function (key) {
+          var value = prototype[key];
+          if (value !== undefined && typeof value !== 'function') {
+            throw new TypeError("The '" + key + "' property of the custom element prototype is not a function");
+          }
+          callbacks[key] = value;
+        });
+        var observed = [];
+        if (callbacks.attributeChangedCallback) {
+          var list = constructor.observedAttributes;
+          if (list !== undefined) {
+            for (var item of list) observed.push(String(item));
+          }
+        }
+        var definition = { name: name, constructor: constructor, callbacks: callbacks, observed: observed };
+        definitions[name] = definition;
+        byConstructor.set(constructor, definition);
+        install();
+        elementsOf(document.documentElement || document.createElement('div')).forEach(function (element) {
+          if (localNameOf(element) === name) upgrade(element);
+        });
+        var waiting = waiters[name];
+        if (waiting) {
+          delete waiters[name];
+          waiting.forEach(function (resolve) { resolve(constructor); });
+        }
+      };
+      CustomElementRegistryImpl.prototype.get = function get(name) {
+        var definition = definitions[String(name)];
+        return definition ? definition.constructor : undefined;
+      };
+      CustomElementRegistryImpl.prototype.getName = function getName(constructor) {
+        var definition = byConstructor.get(constructor);
+        return definition ? definition.name : null;
+      };
+      CustomElementRegistryImpl.prototype.whenDefined = function whenDefined(name) {
+        name = String(name);
+        if (!isCustomName(name)) {
+          return Promise.reject(new DOMException("Failed to execute 'whenDefined' on 'CustomElementRegistry': \"" + name + '" is not a valid custom element name', 'SyntaxError'));
+        }
+        if (Object.prototype.hasOwnProperty.call(definitions, name)) return Promise.resolve(definitions[name].constructor);
+        return new Promise(function (resolve) {
+          (waiters[name] = waiters[name] || []).push(resolve);
+        });
+      };
+      CustomElementRegistryImpl.prototype.upgrade = function upgradeRoot(root) {
+        elementsOf(root).forEach(upgrade);
+      };
+      defineProperty(CustomElementRegistryImpl.prototype, Symbol.toStringTag, {
+        value: 'CustomElementRegistry', configurable: true
+      });
+      var registry = Object.create(CustomElementRegistryImpl.prototype);
+      defineProperty(global, 'CustomElementRegistry', {
+        value: CustomElementRegistryImpl, writable: true, configurable: true, enumerable: false
+      });
+      defineProperty(global, 'customElements', {
+        value: registry, writable: true, configurable: true, enumerable: true
+      });
+    })();
+  }
+
   // --------------------------------------------------------------- selection
   // There is no way to select text, so the selection is always empty.
   if (typeof getSelection === 'undefined') {
