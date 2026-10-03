@@ -420,6 +420,9 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => ",".to_owned(),
             Some(value) => value.to_js_string(),
         };
+        if self.arrays_joining.contains(&receiver) {
+            return Ok(JsValue::String(String::new()));
+        }
         let length = self.array_like_len(dom, receiver)?;
         // The joined string is at least `length - 1` characters long; a
         // hostile length must yield a catchable error, not an unbounded
@@ -427,21 +430,36 @@ impl JsRuntime {
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(self.range_error("Invalid string length"));
         }
+        self.arrays_joining.push(receiver);
+        let output = self.join_indexed(dom, receiver, length, &separator);
+        self.arrays_joining.pop();
+        Ok(JsValue::String(output?))
+    }
+
+    fn join_indexed(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        length: f64,
+        separator: &str,
+    ) -> Result<String, JsError> {
         let mut output = String::new();
         let mut index = 0.0;
         while index < length {
             if index > 0.0 {
-                output.push_str(&separator);
+                output.push_str(separator);
             }
             if self.has_indexed(receiver, index) {
                 match self.indexed_value(dom, receiver, index)? {
                     JsValue::Undefined | JsValue::Null => {}
-                    value => output.push_str(&value.to_js_string()),
+                    // ToString, not the primitive shortcut: a nested array or
+                    // any object element runs its own `toString`.
+                    value => output.push_str(&self.to_string_value(dom, &value)?),
                 }
             }
             index += 1.0;
         }
-        Ok(JsValue::String(output))
+        Ok(output)
     }
 
     /// Read all indexed elements (holes become `undefined`). String wrappers
@@ -1394,17 +1412,15 @@ mod tests {
 
     /// `flat`'s `depth` argument is the part an engine that only answers `flat()`
     /// gets wrong, and it is wrong silently: the result is still an array. The
-    /// `.length` assertions are the load-bearing ones, because `join` renders an
-    /// unflattened inner array as `[object Object]` whether it is one level or
-    /// three.
+    /// `.length` assertions are the load-bearing ones, because `join` flattens
+    /// nested arrays however deep they are.
     #[test]
     fn flat_honours_its_depth_argument() {
-        // Three levels: one level removed leaves `[1, 2, [3]]`, and the join
-        // renders the survivor as `[object Object]`, so the depth is visible
-        // without measuring a length.
+        // Three levels: one level removed leaves `[1, 2, [3]]`, which
+        // `JSON.stringify` shows with its surviving inner array.
         assert_eq!(run("[1,[2,[3]]].flat().length"), "3");
         assert_eq!(run("[1,[2,[3]]].flat(1).length"), "3");
-        assert_eq!(run("[1,[2,[3]]].flat(1).join(',')"), "1,2,[object Object]");
+        assert_eq!(run("JSON.stringify([1,[2,[3]]].flat(1))"), "[1,2,[3]]");
         assert_eq!(run("[1,[2,[3]]].flat(2).join(',')"), "1,2,3");
         // Four levels, one step at a time: the depth is the number of levels
         // removed, and each level is observable.

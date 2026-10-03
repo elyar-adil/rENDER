@@ -101,6 +101,8 @@ pub struct JsRuntime {
     new_target_stack: Vec<JsValue>,
     /// Set across the `construct` of a `super()` call; see `dispatch_new_target`.
     super_call_pending: bool,
+    /// Arrays being stringified right now, so a cycle ends instead of recursing.
+    arrays_joining: Vec<ObjectId>,
     /// Counter allocating class-unique private-name ids.
     next_private_id: u64,
     promises: Vec<PromiseRecord>,
@@ -214,6 +216,7 @@ impl JsRuntime {
             class_frames: Vec::new(),
             new_target_stack: Vec::new(),
             super_call_pending: false,
+            arrays_joining: Vec::new(),
             next_private_id: 1,
             promises: Vec::new(),
             pending_microtasks: Vec::new(),

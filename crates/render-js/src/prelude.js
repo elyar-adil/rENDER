@@ -1038,6 +1038,171 @@
     define(global, 'BroadcastChannel', BroadcastChannelImpl);
   }
 
+  // ------------------------------------------------------- Headers, Request
+  // Fetch Standard §5.2 and §5.3. `Headers` and `Request` are written here;
+  // `fetch` is wrapped so it accepts both, and hands the native transfer a
+  // plain URL, method, header record, body and signal.
+  if (typeof Headers === 'undefined') {
+    var tokenPattern = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+    var headerName = function (name, method) {
+      name = String(name);
+      if (!tokenPattern.test(name)) {
+        throw new TypeError("Failed to execute '" + method + "' on 'Headers': Invalid name");
+      }
+      return name.toLowerCase();
+    };
+    var headerValue = function (value) {
+      return String(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, '');
+    };
+    var HeadersImpl = function Headers(init) {
+      if (!(this instanceof HeadersImpl)) throw new TypeError("Failed to construct 'Headers': Please use the 'new' operator");
+      defineProperty(this, '__list', { value: {}, enumerable: false });
+      if (init === undefined || init === null) return;
+      var self = this;
+      if (init instanceof HeadersImpl) {
+        init.forEach(function (value, name) { self.append(name, value); });
+      } else if (typeof init[Symbol.iterator] === 'function') {
+        for (var pair of init) {
+          var entry = Array.from(pair);
+          if (entry.length !== 2) throw new TypeError("Failed to construct 'Headers': Invalid value");
+          self.append(entry[0], entry[1]);
+        }
+      } else if (typeof init === 'object') {
+        Object.keys(init).forEach(function (name) { self.append(name, init[name]); });
+      } else {
+        throw new TypeError("Failed to construct 'Headers': The provided value is not of type 'HeadersInit'");
+      }
+    };
+    var headersPrototype = HeadersImpl.prototype;
+    define(headersPrototype, 'append', function append(name, value) {
+      name = headerName(name, 'append');
+      value = headerValue(value);
+      var list = this.__list;
+      list[name] = Object.prototype.hasOwnProperty.call(list, name) ? list[name] + ', ' + value : value;
+    });
+    define(headersPrototype, 'set', function set(name, value) {
+      this.__list[headerName(name, 'set')] = headerValue(value);
+    });
+    define(headersPrototype, 'get', function get(name) {
+      name = headerName(name, 'get');
+      return Object.prototype.hasOwnProperty.call(this.__list, name) ? this.__list[name] : null;
+    });
+    define(headersPrototype, 'has', function has(name) {
+      return Object.prototype.hasOwnProperty.call(this.__list, headerName(name, 'has'));
+    });
+    define(headersPrototype, 'delete', function (name) {
+      delete this.__list[headerName(name, 'delete')];
+    });
+    define(headersPrototype, 'forEach', function forEach(callback, thisArg) {
+      var list = this.__list;
+      Object.keys(list).sort().forEach(function (name) {
+        callback.call(thisArg, list[name], name, this);
+      }, this);
+    });
+    define(headersPrototype, 'entries', function entries() {
+      var list = this.__list;
+      return Object.keys(list).sort().map(function (name) { return [name, list[name]]; })[Symbol.iterator]();
+    });
+    define(headersPrototype, 'keys', function keys() {
+      return Object.keys(this.__list).sort()[Symbol.iterator]();
+    });
+    define(headersPrototype, 'values', function values() {
+      var list = this.__list;
+      return Object.keys(list).sort().map(function (name) { return list[name]; })[Symbol.iterator]();
+    });
+    defineProperty(headersPrototype, Symbol.iterator, {
+      value: headersPrototype.entries, writable: true, configurable: true, enumerable: false
+    });
+    defineProperty(headersPrototype, Symbol.toStringTag, { value: 'Headers', configurable: true });
+    defineProperty(global, 'Headers', {
+      value: HeadersImpl, writable: true, configurable: true, enumerable: false
+    });
+
+    var RequestImpl = function Request(input, init) {
+      if (!(this instanceof RequestImpl)) throw new TypeError("Failed to construct 'Request': Please use the 'new' operator");
+      init = init || {};
+      var source = input instanceof RequestImpl ? input : null;
+      var url = source ? source.url : String(input);
+      // The transfer resolves a relative URL against the document itself, so a
+      // base the page cannot name (an `about:blank` document) leaves it as is.
+      try {
+        url = new URL(url, document.baseURI || location.href).href;
+      } catch (error) {
+        if (/^[a-z][a-z0-9+.-]*:/i.test(url)) {
+          throw new TypeError("Failed to construct 'Request': Failed to parse URL from " + url);
+        }
+      }
+      var method = init.method !== undefined ? String(init.method) : source ? source.method : 'GET';
+      var upper = method.toUpperCase();
+      if (['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'].indexOf(upper) !== -1) method = upper;
+      if (!tokenPattern.test(method) || ['CONNECT', 'TRACE', 'TRACK'].indexOf(upper) !== -1) {
+        throw new TypeError("Failed to construct 'Request': '" + method + "' is not a valid HTTP method.");
+      }
+      var body = init.body !== undefined ? init.body : source ? source.__body : null;
+      if (body !== null && body !== undefined && (method === 'GET' || method === 'HEAD')) {
+        throw new TypeError("Failed to construct 'Request': Request with GET/HEAD method cannot have body.");
+      }
+      var hidden = {
+        url: url,
+        method: method,
+        headers: new HeadersImpl(init.headers !== undefined ? init.headers : source ? source.headers : undefined),
+        signal: init.signal !== undefined ? init.signal : source ? source.signal : new AbortController().signal,
+        credentials: init.credentials || (source && source.credentials) || 'same-origin',
+        mode: init.mode || (source && source.mode) || 'cors',
+        cache: init.cache || (source && source.cache) || 'default',
+        redirect: init.redirect || (source && source.redirect) || 'follow',
+        referrer: init.referrer !== undefined ? init.referrer : 'about:client',
+        __body: body === undefined ? null : body,
+        bodyUsed: false
+      };
+      Object.keys(hidden).forEach(function (key) {
+        defineProperty(this, key, { value: hidden[key], writable: key === 'bodyUsed', enumerable: key.indexOf('__') !== 0, configurable: true });
+      }, this);
+    };
+    var requestPrototype = RequestImpl.prototype;
+    define(requestPrototype, 'clone', function clone() {
+      if (this.bodyUsed) throw new TypeError("Failed to execute 'clone' on 'Request': Request body is already used");
+      return new RequestImpl(this);
+    });
+    function consumeBody(request, convert) {
+      if (request.bodyUsed) return Promise.reject(new TypeError('Body is unusable: Body has already been read'));
+      request.bodyUsed = true;
+      var body = request.__body;
+      return Promise.resolve(convert(body === null ? '' : typeof body === 'string' ? body : String(body)));
+    }
+    define(requestPrototype, 'text', function text() { return consumeBody(this, function (v) { return v; }); });
+    define(requestPrototype, 'json', function json() { return consumeBody(this, JSON.parse); });
+    defineProperty(requestPrototype, Symbol.toStringTag, { value: 'Request', configurable: true });
+    defineProperty(global, 'Request', {
+      value: RequestImpl, writable: true, configurable: true, enumerable: false
+    });
+
+    var nativeFetch = global.fetch;
+    if (typeof nativeFetch === 'function') {
+      defineProperty(global, 'fetch', {
+        value: function fetch(input, init) {
+          var request = input instanceof RequestImpl ? input : null;
+          var options = {};
+          if (request) {
+            options.method = request.method;
+            options.headers = request.headers;
+            if (request.__body !== null) options.body = request.__body;
+            options.signal = request.signal;
+          }
+          if (init) Object.keys(init).forEach(function (key) { options[key] = init[key]; });
+          var headers = options.headers;
+          if (headers !== undefined && headers !== null && (headers instanceof HeadersImpl || typeof headers[Symbol.iterator] === 'function')) {
+            var record = {};
+            new HeadersImpl(headers).forEach(function (value, name) { record[name] = value; });
+            options.headers = record;
+          }
+          return nativeFetch.call(this, request ? request.url : input, options);
+        },
+        writable: true, configurable: true, enumerable: false
+      });
+    }
+  }
+
   // ------------------------------------------------------------- AbortSignal
   // DOM Standard §3.2. Signals are made by `AbortController`; this supplies the
   // interface object, `throwIfAborted`, and the `abort`/`timeout`/`any` factories.

@@ -2350,6 +2350,17 @@ impl JsRuntime {
         Ok(primitive.to_js_string())
     }
 
+    fn join_array_elements(&mut self, dom: &mut Dom, array: ObjectId) -> Result<String, JsError> {
+        let mut parts = Vec::new();
+        for value in self.array_elements_for(array)? {
+            parts.push(match value {
+                JsValue::Null | JsValue::Undefined => String::new(),
+                value => self.to_string_value(dom, &value)?,
+            });
+        }
+        Ok(parts.join(","))
+    }
+
     fn to_primitive_with_hint(
         &mut self,
         dom: &mut Dom,
@@ -2367,16 +2378,16 @@ impl JsRuntime {
             Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
             Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
             Some(ObjectHost::Array) => {
-                let text = self
-                    .array_elements_for(object)?
-                    .iter()
-                    .map(|value| match value {
-                        JsValue::Null | JsValue::Undefined => String::new(),
-                        value => value.to_js_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                return Ok(JsValue::String(text));
+                // An array already being joined further up the stack is a
+                // cycle and contributes nothing (ECMA-262 leaves this to the
+                // host; every engine returns the empty string).
+                if self.arrays_joining.contains(&object) {
+                    return Ok(JsValue::String(String::new()));
+                }
+                self.arrays_joining.push(object);
+                let text = self.join_array_elements(dom, object);
+                self.arrays_joining.pop();
+                return Ok(JsValue::String(text?));
             }
             _ => {}
         }

@@ -286,3 +286,53 @@ fn abort_signal_interface_and_factories() {
         "TypeError"
     );
 }
+
+#[test]
+fn headers_behave_like_the_fetch_standard() {
+    assert_eq!(
+        ok(
+            "var h = new Headers({'Content-Type': 'a'}); h.append('x-k', '1'); h.append('X-K', ' 2 '); [h.get('content-type'), h.get('x-k'), h.has('nope'), h.get('nope'), Array.from(h).join('|')].join()"
+        ),
+        "a,1, 2,false,,content-type,a|x-k,1, 2"
+    );
+    assert_eq!(
+        ok(
+            "var h = new Headers([['b', '1'], ['a', '2']]); h.delete('b'); h.set('c', 'x'); Array.from(h.keys()).join() + Array.from(new Headers(h).values()).join()"
+        ),
+        "a,c2,x"
+    );
+    assert_eq!(
+        ok("try { new Headers({'bad name': 'x'}) } catch (e) { e.name }"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn request_carries_method_headers_and_body() {
+    assert_eq!(
+        ok(
+            "var r = new Request('/p', { method: 'post', headers: { A: 'b' }, body: 'hi' }); [r.method, r.headers.get('a'), r.url.indexOf('/p') >= 0, r.clone().method].join()"
+        ),
+        "POST,b,true,POST"
+    );
+    assert_eq!(
+        ok("try { new Request('/p', { body: 'x' }) } catch (e) { e.name }"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var out; new Request('/p', { method: 'POST', body: '{\"a\":1}' }).json().then(function (v) { out = v.a }); out"
+        ),
+        "undefined"
+    );
+}
+
+#[test]
+fn array_join_stringifies_object_elements() {
+    assert_eq!(ok("String([['a', 1], [2, [3]]])"), "a,1,2,3");
+    assert_eq!(
+        ok("[{ toString: function () { return 'o'; } }, null, 1].join('-')"),
+        "o--1"
+    );
+    assert_eq!(ok("var a = [1]; a.push(a); a.join()"), "1,");
+}
