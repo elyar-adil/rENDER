@@ -2022,7 +2022,7 @@ fn paint_glyph(
             };
             let Some((target_x, target_y)) = u32::try_from(target_x)
                 .ok()
-                .and_then(|target_x| u32::try_from(target_y).ok().map(|y| (target_x, y)))
+                .zip(u32::try_from(target_y).ok())
             else {
                 continue;
             };
