@@ -13,6 +13,7 @@ name = "render_js"
 render-dom = { path = "../render-dom" }
 render-css = { path = "../render-css" }
 render-html = { path = "../render-html" }
+getrandom = "0.4"
 mp4parse = "0.17.0"
 unicode-ident = "1.0.24"
 url = "2.5.4"

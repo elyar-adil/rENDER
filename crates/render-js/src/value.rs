@@ -479,6 +479,7 @@ pub(crate) enum NativeFunction {
     GlobalUnescape,
     GlobalAtob,
     GlobalBtoa,
+    GlobalRandomBytes,
     GlobalEvalStub,
     GlobalImport,
     GlobalNoop,
@@ -1903,6 +1904,7 @@ impl Realm {
             ("unescape", NativeFunction::GlobalUnescape),
             ("atob", NativeFunction::GlobalAtob),
             ("btoa", NativeFunction::GlobalBtoa),
+            ("__render_random_bytes", NativeFunction::GlobalRandomBytes),
             ("eval", NativeFunction::GlobalEvalStub),
             ("__render_noop", NativeFunction::GlobalNoop),
         ] {

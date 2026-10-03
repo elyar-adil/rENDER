@@ -1038,6 +1038,224 @@
     define(global, 'BroadcastChannel', BroadcastChannelImpl);
   }
 
+  // ------------------------------------------------------------ typed arrays
+  // ECMA-262 §23.2.3: the %TypedArray%.prototype methods the native arrays do
+  // not carry, written against indexing and `length` only. Every method defined
+  // here is a no-op where the engine already provides it.
+  (function () {
+    var names = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+      'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array'];
+    function callable(fn, method) {
+      if (typeof fn !== 'function') throw new TypeError(String(fn) + ' is not a function');
+      return fn;
+    }
+    function sameType(array, length) {
+      return new array.constructor(length);
+    }
+    function compareNumbers(a, b) {
+      if (a !== a) return b !== b ? 0 : 1;
+      if (b !== b) return -1;
+      if (a < b) return -1;
+      if (a > b) return 1;
+      if (a === 0 && b === 0) return 1 / a < 1 / b ? -1 : 1 / a > 1 / b ? 1 : 0;
+      return 0;
+    }
+    var methods = {
+      at: function at(index) {
+        var relative = toIntegerOrInfinity(index);
+        var k = relative >= 0 ? relative : this.length + relative;
+        return k < 0 || k >= this.length ? undefined : this[k];
+      },
+      every: function every(callback, thisArg) {
+        callable(callback);
+        for (var i = 0; i < this.length; i++) if (!callback.call(thisArg, this[i], i, this)) return false;
+        return true;
+      },
+      some: function some(callback, thisArg) {
+        callable(callback);
+        for (var i = 0; i < this.length; i++) if (callback.call(thisArg, this[i], i, this)) return true;
+        return false;
+      },
+      find: function find(callback, thisArg) {
+        callable(callback);
+        for (var i = 0; i < this.length; i++) if (callback.call(thisArg, this[i], i, this)) return this[i];
+        return undefined;
+      },
+      findIndex: function findIndex(callback, thisArg) {
+        callable(callback);
+        for (var i = 0; i < this.length; i++) if (callback.call(thisArg, this[i], i, this)) return i;
+        return -1;
+      },
+      findLast: function findLast(callback, thisArg) {
+        callable(callback);
+        for (var i = this.length - 1; i >= 0; i--) if (callback.call(thisArg, this[i], i, this)) return this[i];
+        return undefined;
+      },
+      findLastIndex: function findLastIndex(callback, thisArg) {
+        callable(callback);
+        for (var i = this.length - 1; i >= 0; i--) if (callback.call(thisArg, this[i], i, this)) return i;
+        return -1;
+      },
+      lastIndexOf: function lastIndexOf(search, from) {
+        var length = this.length;
+        var k = arguments.length > 1 ? toIntegerOrInfinity(from) : length - 1;
+        k = k >= 0 ? Math.min(k, length - 1) : length + k;
+        for (; k >= 0; k--) if (this[k] === search) return k;
+        return -1;
+      },
+      reduce: function reduce(callback, initial) {
+        callable(callback);
+        var i = 0;
+        var accumulator;
+        if (arguments.length > 1) {
+          accumulator = initial;
+        } else {
+          if (this.length === 0) throw new TypeError('Reduce of empty array with no initial value');
+          accumulator = this[i++];
+        }
+        for (; i < this.length; i++) accumulator = callback(accumulator, this[i], i, this);
+        return accumulator;
+      },
+      reduceRight: function reduceRight(callback, initial) {
+        callable(callback);
+        var i = this.length - 1;
+        var accumulator;
+        if (arguments.length > 1) {
+          accumulator = initial;
+        } else {
+          if (this.length === 0) throw new TypeError('Reduce of empty array with no initial value');
+          accumulator = this[i--];
+        }
+        for (; i >= 0; i--) accumulator = callback(accumulator, this[i], i, this);
+        return accumulator;
+      },
+      reverse: function reverse() {
+        for (var low = 0, high = this.length - 1; low < high; low++, high--) {
+          var swap = this[low];
+          this[low] = this[high];
+          this[high] = swap;
+        }
+        return this;
+      },
+      sort: function sort(compare) {
+        if (compare !== undefined) callable(compare);
+        var sorted = slice.call(this).sort(compare === undefined ? compareNumbers : compare);
+        for (var i = 0; i < sorted.length; i++) this[i] = sorted[i];
+        return this;
+      },
+      copyWithin: function copyWithin(target, start, end) {
+        var length = this.length;
+        var to = relativeIndex(target, length, 0);
+        var from = relativeIndex(start, length, 0);
+        var final = relativeIndex(end, length, length);
+        var count = Math.min(final - from, length - to);
+        var copy = slice.call(this, from, from + Math.max(count, 0));
+        for (var i = 0; i < copy.length; i++) this[to + i] = copy[i];
+        return this;
+      },
+      entries: function entries() {
+        var self = this;
+        var index = 0;
+        var iterator = {
+          next: function () {
+            return index < self.length ? { value: [index, self[index++]], done: false } : { value: undefined, done: true };
+          }
+        };
+        iterator[Symbol.iterator] = function () { return this; };
+        return iterator;
+      },
+      keys: function keys() {
+        var self = this;
+        var index = 0;
+        var iterator = {
+          next: function () {
+            return index < self.length ? { value: index++, done: false } : { value: undefined, done: true };
+          }
+        };
+        iterator[Symbol.iterator] = function () { return this; };
+        return iterator;
+      },
+      toReversed: function toReversed() {
+        var copy = sameType(this, this.length);
+        for (var i = 0; i < this.length; i++) copy[i] = this[this.length - 1 - i];
+        return copy;
+      },
+      toSorted: function toSorted(compare) {
+        if (compare !== undefined) callable(compare);
+        var copy = sameType(this, this.length);
+        for (var i = 0; i < this.length; i++) copy[i] = this[i];
+        return copy.sort(compare);
+      },
+      with: function (index, value) {
+        var relative = toIntegerOrInfinity(index);
+        var k = relative >= 0 ? relative : this.length + relative;
+        if (k < 0 || k >= this.length) throw new RangeError('Invalid typed array index');
+        var copy = sameType(this, this.length);
+        for (var i = 0; i < this.length; i++) copy[i] = this[i];
+        copy[k] = value;
+        return copy;
+      },
+      toLocaleString: function toLocaleString() {
+        return slice.call(this).map(function (v) { return v.toLocaleString(); }).join(',');
+      }
+    };
+    names.forEach(function (name) {
+      var ctor = global[name];
+      if (typeof ctor !== 'function') return;
+      Object.keys(methods).forEach(function (method) {
+        define(ctor.prototype, method, methods[method]);
+      });
+    });
+  })();
+
+  // ------------------------------------------------------------------ crypto
+  // Web Crypto §10 `getRandomValues` and `randomUUID`, drawn from the operating
+  // system's generator. `crypto.subtle` is absent: there is no digest, key or
+  // cipher implementation behind it, and a stub that answers would be wrong.
+  if (typeof crypto === 'undefined' && typeof global.__render_random_bytes === 'function') {
+    var randomBytes = global.__render_random_bytes;
+    delete global.__render_random_bytes;
+    var integerViews = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array',
+      'Int32Array', 'Uint32Array'];
+    var CryptoImpl = function Crypto() {
+      throw new TypeError('Illegal constructor');
+    };
+    define(CryptoImpl.prototype, 'getRandomValues', function getRandomValues(array) {
+      var integer = integerViews.some(function (name) {
+        return typeof global[name] === 'function' && array instanceof global[name];
+      });
+      if (!integer) {
+        throw new DOMException("Failed to execute 'getRandomValues' on 'Crypto': The provided value is not an integer-typed array", 'TypeMismatchError');
+      }
+      if (array.byteLength > 65536) {
+        throw new DOMException("Failed to execute 'getRandomValues' on 'Crypto': The ArrayBufferView's byte length (" + array.byteLength + ') exceeds the number of bytes of entropy available via this API (65536)', 'QuotaExceededError');
+      }
+      // Written element by element: a typed array does not expose its buffer
+      // here. A 32-bit lane is built unsigned, and the element type's own
+      // conversion wraps it into range.
+      var size = array.byteLength / array.length;
+      var bytes = randomBytes(array.byteLength);
+      for (var i = 0; i < array.length; i++) {
+        var value = 0;
+        for (var j = size - 1; j >= 0; j--) value = value * 256 + bytes[i * size + j];
+        array[i] = value;
+      }
+      return array;
+    });
+    define(CryptoImpl.prototype, 'randomUUID', function randomUUID() {
+      var b = randomBytes(16);
+      b[6] = (b[6] & 0x0f) | 0x40;
+      b[8] = (b[8] & 0x3f) | 0x80;
+      var hex = b.map(function (v) { return (v + 256).toString(16).slice(1); }).join('');
+      return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+    });
+    defineProperty(CryptoImpl.prototype, Symbol.toStringTag, { value: 'Crypto', configurable: true });
+    defineProperty(global, 'Crypto', { value: CryptoImpl, writable: true, configurable: true, enumerable: false });
+    defineProperty(global, 'crypto', {
+      value: Object.create(CryptoImpl.prototype), writable: true, configurable: true, enumerable: true
+    });
+  }
+
   // ------------------------------------------------------- Headers, Request
   // Fetch Standard §5.2 and §5.3. `Headers` and `Request` are written here;
   // `fetch` is wrapped so it accepts both, and hands the native transfer a

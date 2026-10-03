@@ -336,3 +336,51 @@ fn array_join_stringifies_object_elements() {
     );
     assert_eq!(ok("var a = [1]; a.push(a); a.join()"), "1,");
 }
+
+#[test]
+fn crypto_random_values_and_uuid() {
+    assert_eq!(
+        ok(
+            "var a = new Uint32Array(8); var r = crypto.getRandomValues(a); var b = crypto.getRandomValues(new Int16Array(16)); var c = crypto.getRandomValues(new Uint8Array(32)); [r === a, Array.from(a).some(function (v) { return v > 65535 }), Array.from(b).some(function (v) { return v < 0 }), Array.from(c).some(function (v) { return v > 0 })].join()"
+        ),
+        "true,true,true,true"
+    );
+    assert_eq!(
+        ok(
+            "/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(crypto.randomUUID()) && crypto.randomUUID() !== crypto.randomUUID()"
+        ),
+        "true"
+    );
+    assert_eq!(
+        ok("try { crypto.getRandomValues(new Float32Array(1)) } catch (e) { e.name }"),
+        "TypeMismatchError"
+    );
+    assert_eq!(
+        ok("try { crypto.getRandomValues(new Uint8Array(65537)) } catch (e) { e.name }"),
+        "QuotaExceededError"
+    );
+    assert_eq!(
+        ok("typeof __render_random_bytes + typeof crypto.subtle"),
+        "undefinedundefined"
+    );
+}
+
+#[test]
+fn typed_array_prototype_methods() {
+    assert_eq!(
+        ok(
+            "var t = new Uint8Array([3, 1, 2]); [t.some(function (v) { return v > 2 }), t.every(function (v) { return v > 0 }), t.find(function (v) { return v < 3 }), t.findIndex(function (v) { return v === 2 }), t.findLast(function (v) { return v < 3 }), t.at(-1), t.reduce(function (a, v) { return a + v }), t.reduceRight(function (a, v) { return a + '' + v }), t.lastIndexOf(1)].join()"
+        ),
+        "true,true,1,2,2,2,6,213,1"
+    );
+    assert_eq!(
+        ok(
+            "var t = new Int16Array([10, 9, 1, -5]); var s = t.toSorted(); [t.join(), s.join(), s instanceof Int16Array, t.toReversed().join(), t.with(0, 7).join(), Array.from(t.keys()).join(), String(Array.from(t.entries())[1])].join('|')"
+        ),
+        "10,9,1,-5|-5,1,9,10|true|-5,1,9,10|7,9,1,-5|0,1,2,3|1,9"
+    );
+    assert_eq!(
+        ok("var t = new Uint8Array([1, 2, 3, 4, 5]); t.copyWithin(0, 3); t.reverse(); t.join()"),
+        "5,4,3,5,4"
+    );
+}

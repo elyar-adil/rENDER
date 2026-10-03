@@ -490,6 +490,26 @@ impl JsRuntime {
                 let text = required_argument(arguments, 0, "atob")?.to_js_string();
                 self.base64_decode(&text).map(JsValue::String)
             }
+            NativeFunction::GlobalRandomBytes => {
+                // The prelude's `crypto.getRandomValues` and `randomUUID` draw
+                // from the operating system's generator through this, and
+                // take it off the global object before any page script runs.
+                let count = required_argument(arguments, 0, "random bytes")?.to_js_string();
+                let count = count.parse::<usize>().ok().filter(|count| *count <= 65_536);
+                let Some(count) = count else {
+                    return Err(self.range_error(
+                        "byte length exceeds the 65536 bytes of entropy available per call",
+                    ));
+                };
+                let mut bytes = vec![0_u8; count];
+                getrandom::fill(&mut bytes)
+                    .map_err(|error| JsError::dom(format!("no entropy source: {error}")))?;
+                let values: Vec<JsValue> = bytes
+                    .into_iter()
+                    .map(|byte| JsValue::Number(f64::from(byte)))
+                    .collect();
+                Ok(JsValue::Object(self.create_array_from_values(&values)?))
+            }
             NativeFunction::GlobalBtoa => {
                 let text = required_argument(arguments, 0, "btoa")?.to_js_string();
                 // Infra §"base64 encode": "If the code point value of any
