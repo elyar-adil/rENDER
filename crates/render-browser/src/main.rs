@@ -4,6 +4,7 @@ mod app;
 #[cfg(test)]
 mod app_tests;
 mod content_interaction;
+mod cors;
 mod diagnostics;
 mod fetch_handles;
 mod frame;

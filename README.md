@@ -23,7 +23,7 @@ capabilities that are parsed but never consumed, or computed and then dropped.
 | Layout | 48% | Block/inline, floats, positioned boxes, flex, grid, table, overflow, and common sizing work; intrinsic and multi-axis edge cases remain. |
 | Painting and images | 42% | CPU display lists, backgrounds, borders, clipping, opacity, transforms, and common raster images work; stacking, replaced-element, and SVG coverage remain. |
 | JavaScript runtime | 15% | Common script execution, DOM mutation, promises, timers, and events work; the latest full test262 run passed 30,808/98,096 variants (31.4%), recorded 2026-09-20. |
-| Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active, while Fetch/CORS and service workers remain. |
+| Network and resources | 50% | TLS HTTP(S), redirects, cookies, gzip/Brotli, CSS, scripts, images, and common lazy-image sources work; bounded workers and a conservative private HTTP cache are active; CORS covers simple and preflighted requests without credentials, while credentialed CORS and service workers remain. |
 | Browser shell and interaction | 55% | Native window, tabs, address editing, history, scrolling, links, forms, and DPI-aware painting work; accessibility and broader input remain. |
 | **Overall minimum usable browser** | **42%** | Enough infrastructure exists for iterative real-site compatibility work; this is not a claim of general web compatibility. |
 
@@ -162,7 +162,9 @@ is a defect to rewrite, not to remove. See the "Priority -1" section of
 ## Security Model
 
 - TLS certificate errors are fatal and are never retried with verification disabled.
-- JavaScript `fetch` and XHR are same-origin only until CORS response handling is implemented.
+- Cross-origin `fetch` and XHR follow CORS for simple and preflighted requests. They never carry cookies, because the engine has no credentials mode yet. A page reads a cross-origin response only where `Access-Control-Allow-Origin` admits its origin, and sees only the CORS-safelisted and exposed headers. A redirect that crosses origins is judged at its final response, not at each hop.
+- Pages cannot set the request headers the Fetch standard forbids, such as `Cookie`, `Origin` and `Host`.
+- Persistent cookies and `localStorage` are stored in the profile directory (`RENDER_PROFILE_DIR`, or the platform data directory); the cookie file is readable only by its owner on Unix. `SameSite` is parsed and stored but not enforced yet.
 - Remote pages cannot read `file:` URLs; local file access is enabled only for local documents and their resources.
 - Network responses and data URIs have in-memory size limits.
 

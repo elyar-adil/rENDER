@@ -166,6 +166,10 @@ pub enum HttpMethod {
     Delete,
     /// `HEAD`, a `GET` without a response body.
     Head,
+    /// `OPTIONS`, the CORS preflight method. Pages can also send it.
+    Options,
+    /// `PATCH`, which the Fetch standard allows pages to use.
+    Patch,
 }
 
 impl HttpMethod {
@@ -178,6 +182,8 @@ impl HttpMethod {
             "PUT" => Some(Self::Put),
             "DELETE" => Some(Self::Delete),
             "HEAD" => Some(Self::Head),
+            "OPTIONS" => Some(Self::Options),
+            "PATCH" => Some(Self::Patch),
             _ => None,
         }
     }
@@ -191,6 +197,8 @@ impl HttpMethod {
             Self::Put => "PUT",
             Self::Delete => "DELETE",
             Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Patch => "PATCH",
         }
     }
 
@@ -1169,6 +1177,16 @@ impl HttpTransport {
                 decorate(self.agent.put(uri), headers, proxy).send(bytes)
             }
             (HttpMethod::Put, None) => decorate(self.agent.put(uri), headers, proxy).send_empty(),
+            (HttpMethod::Patch, Some(bytes)) => {
+                decorate(self.agent.patch(uri), headers, proxy).send(bytes)
+            }
+            (HttpMethod::Patch, None) => {
+                decorate(self.agent.patch(uri), headers, proxy).send_empty()
+            }
+            (HttpMethod::Options, None) => decorate(self.agent.options(uri), headers, proxy).call(),
+            (HttpMethod::Options, Some(bytes)) => {
+                decorate(self.agent.options(uri).force_send_body(), headers, proxy).send(bytes)
+            }
         }
     }
 
@@ -1902,6 +1920,11 @@ mod tests {
         assert!(HttpMethod::Post.allows_body());
         assert!(HttpMethod::Put.allows_body());
         assert!(HttpMethod::Delete.allows_body());
+        assert_eq!(HttpMethod::Options.as_str(), "OPTIONS");
+        assert_eq!(HttpMethod::Patch.as_str(), "PATCH");
+        assert_eq!(HttpMethod::from_wire("OPTIONS"), Some(HttpMethod::Options));
+        assert_eq!(HttpMethod::from_wire("PATCH"), Some(HttpMethod::Patch));
+        assert_eq!(HttpMethod::from_wire("TRACE"), None);
     }
 
     #[test]

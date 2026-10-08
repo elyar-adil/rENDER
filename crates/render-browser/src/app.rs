@@ -11,6 +11,7 @@ use crate::content_interaction;
 use crate::content_interaction::ContentNavigation;
 use crate::content_interaction::content_text_input_value;
 use crate::content_interaction::content_wrapper_control;
+use crate::cors;
 use crate::diagnostics::dump_debug_frame;
 use crate::diagnostics::log_completed_frame_debug;
 use crate::diagnostics::report_image_diagnostics;
@@ -109,6 +110,7 @@ use render_core::script::ScriptDiscoveryLimits;
 use render_net::CancelToken;
 use render_net::FetchError;
 use render_net::FetchRequest;
+use render_net::FetchResponse;
 use render_net::FetchResult;
 use render_net::HttpMethod;
 use render_net::NetworkWorker;
@@ -153,6 +155,29 @@ pub(super) enum HistoryMode {
 /// command queue is full. The two crates share the wording by contract.
 const NETWORK_QUEUE_FULL_MESSAGE: &str = "network worker queue is full";
 
+/// A `fetch()` or XHR transfer the shell carries out for a page.
+pub(super) struct PendingPageFetch {
+    tab: TabId,
+    id: u64,
+    handle: CachedRequestHandle,
+    stage: PageFetchStage,
+}
+
+/// What a page transfer does when the request it is waiting on completes.
+pub(super) enum PageFetchStage {
+    /// The response answers the page. For a cross-origin request, `origin` is
+    /// the page's origin, and the response is read only if CORS allows it.
+    Response { origin: Option<String> },
+    /// A preflight for a cross-origin request that is not simple. The actual
+    /// request is sent only if the preflight allows it.
+    Preflight {
+        origin: String,
+        method: HttpMethod,
+        headers: Vec<(String, String)>,
+        actual: Box<FetchRequest>,
+    },
+}
+
 #[allow(
     clippy::struct_excessive_bools,
     reason = "each flag tracks an independent input-pipeline stage: pointer, selection, focus"
@@ -170,7 +195,7 @@ pub(super) struct BrowserApp {
     pub(super) storage: ProfileStorage,
     /// In-flight `fetch()`/XHR transfers awaiting completion, keyed by tab
     /// and the runtime's correlation id.
-    pub(super) pending_fetches: Vec<(TabId, u64, CachedRequestHandle)>,
+    pub(super) pending_fetches: Vec<PendingPageFetch>,
     pub(super) disk_cache: Option<DiskCacheWorker>,
     pub(super) pending_disk_clear: Option<DiskCacheOperationId>,
     pub(super) cache_clear_state: CacheClearUiState,
@@ -1239,26 +1264,66 @@ impl BrowserApp {
             );
             return;
         };
+        let Some(page_url) = self
+            .pages
+            .get(&tab)
+            .map(|page| page.navigation.committed().target.history_url())
+        else {
+            return;
+        };
+        let headers = cors::author_headers(&request.headers);
         let mut fetch_request = FetchRequest::new(method, url.clone());
-        for (name, value) in &request.headers {
-            match name.to_ascii_lowercase().as_str() {
-                "accept" => {
-                    fetch_request = fetch_request.with_accept(value.clone());
-                }
-                "cookie" => {
-                    fetch_request = fetch_request.with_cookie(value.clone());
-                }
-                _ => {
-                    fetch_request = fetch_request.with_header(name.clone(), value.clone());
-                }
-            }
+        for (name, value) in &headers {
+            fetch_request = if name.eq_ignore_ascii_case("accept") {
+                fetch_request.with_accept(value.clone())
+            } else {
+                fetch_request.with_header(name.clone(), value.clone())
+            };
         }
         if let Some(body) = &request.body {
             fetch_request = fetch_request.with_body(body.clone().into_bytes());
         }
-        let fetch_request = self.cookies.decorate_request(fetch_request);
-        let handle = self.submit_cached_fetch(fetch_request);
-        self.pending_fetches.push((tab, request.id, handle));
+        if !cors::is_cross_origin(&page_url, &url) {
+            let fetch_request = self.cookies.decorate_request(fetch_request);
+            let handle = self.submit_cached_fetch(fetch_request);
+            self.pending_fetches.push(PendingPageFetch {
+                tab,
+                id: request.id,
+                handle,
+                stage: PageFetchStage::Response { origin: None },
+            });
+            return;
+        }
+        // A cross-origin request carries no cookies: the page has no
+        // credentials mode yet, so every such request is "omit". Its response
+        // is read only if CORS allows it.
+        let origin = cors::page_origin(&page_url);
+        let fetch_request = fetch_request.with_header("Origin", origin.clone());
+        if cors::is_simple(method, &headers) {
+            let handle = self.submit_cached_fetch(fetch_request);
+            self.pending_fetches.push(PendingPageFetch {
+                tab,
+                id: request.id,
+                handle,
+                stage: PageFetchStage::Response {
+                    origin: Some(origin),
+                },
+            });
+        } else {
+            let preflight = cors::preflight_request(&url, &origin, method, &headers);
+            let handle = self.submit_cached_fetch(preflight);
+            self.pending_fetches.push(PendingPageFetch {
+                tab,
+                id: request.id,
+                handle,
+                stage: PageFetchStage::Preflight {
+                    origin,
+                    method,
+                    headers,
+                    actual: Box::new(fetch_request),
+                },
+            });
+        }
     }
 
     pub(super) fn submit_cached_fetch(&mut self, request: FetchRequest) -> CachedRequestHandle {
@@ -1774,8 +1839,8 @@ impl BrowserApp {
         for (tab, request) in new_fetches {
             self.submit_page_fetch(tab, &request);
         }
-        for (_tab, _id, handle) in &mut self.pending_fetches {
-            handle.retry_deferred(resubmit);
+        for pending in &mut self.pending_fetches {
+            pending.handle.retry_deferred(resubmit);
         }
         let settlement_errors = self.poll_pending_fetch_settlements();
         for error in settlement_errors {
@@ -1998,49 +2063,106 @@ impl BrowserApp {
         }
     }
 
-    /// Polls in-flight `fetch()`/XHR transfers and settles their runtimes.
-    /// Returns per-transfer settlement callback errors for the caller to log
-    /// (a throwing callback must not abort the polling loop).
+    /// Polls in-flight `fetch()`/XHR transfers. A transfer either moves on to
+    /// the next stage or settles its runtime. Returns per-transfer settlement
+    /// callback errors for the caller to log (a throwing callback must not abort
+    /// the polling loop).
     fn poll_pending_fetch_settlements(&mut self) -> Vec<String> {
-        let mut errors = Vec::new();
-        let mut finished = Vec::new();
-        for (tab, id, handle) in &mut self.pending_fetches {
-            let outcome = match handle.try_recv() {
-                Ok(result) => match result.result {
-                    Ok(response) => {
-                        let headers = response
-                            .headers
-                            .iter()
-                            .map(|header| {
-                                (
-                                    header.name.clone(),
-                                    String::from_utf8_lossy(&header.value).into_owned(),
-                                )
-                            })
-                            .collect();
-                        Ok(FetchOutcome {
-                            status: response.status.as_u16(),
-                            status_text: String::new(),
-                            headers,
-                            body: response.body.clone(),
-                        })
-                    }
-                    Err(error) => Err(error.to_string()),
-                },
-                Err(TryRecvError::Empty) => continue,
+        let mut waiting = Vec::new();
+        let mut settled: Vec<(TabId, u64, Result<FetchOutcome, String>)> = Vec::new();
+        for mut pending in std::mem::take(&mut self.pending_fetches) {
+            let completion = match pending.handle.try_recv() {
+                Ok(result) => result.result.map_err(|error| error.to_string()),
+                Err(TryRecvError::Empty) => {
+                    waiting.push(pending);
+                    continue;
+                }
                 Err(TryRecvError::Disconnected) => Err("network worker stopped".to_owned()),
             };
-            let Some(page) = self.pages.get_mut(tab) else {
+            match (pending.stage, completion) {
+                (
+                    PageFetchStage::Preflight {
+                        origin,
+                        method,
+                        headers,
+                        actual,
+                    },
+                    Ok(response),
+                ) => {
+                    if cors::preflight_allows(
+                        response.status.as_u16(),
+                        &response.headers,
+                        &origin,
+                        method,
+                        &headers,
+                    ) {
+                        let handle = self.submit_cached_fetch(*actual);
+                        waiting.push(PendingPageFetch {
+                            tab: pending.tab,
+                            id: pending.id,
+                            handle,
+                            stage: PageFetchStage::Response {
+                                origin: Some(origin),
+                            },
+                        });
+                    } else {
+                        settled.push((
+                            pending.tab,
+                            pending.id,
+                            Err(cors::BLOCKED_MESSAGE.to_owned()),
+                        ));
+                    }
+                }
+                (PageFetchStage::Response { origin }, Ok(response)) => {
+                    let outcome = self.page_fetch_outcome(origin.as_deref(), response);
+                    settled.push((pending.tab, pending.id, outcome));
+                }
+                (
+                    PageFetchStage::Preflight { .. } | PageFetchStage::Response { .. },
+                    Err(error),
+                ) => {
+                    settled.push((pending.tab, pending.id, Err(error)));
+                }
+            }
+        }
+        self.pending_fetches = waiting;
+
+        let mut errors = Vec::new();
+        for (tab, id, outcome) in settled {
+            let Some(page) = self.pages.get_mut(&tab) else {
                 continue;
             };
-            if let Err(error) = page.page.settle_fetch(*id, outcome) {
+            if let Err(error) = page.page.settle_fetch(id, outcome) {
                 errors.push(error.to_string());
             }
-            finished.push((*tab, *id));
         }
-        self.pending_fetches
-            .retain(|(tab, id, _)| !finished.contains(&(*tab, *id)));
         errors
+    }
+
+    /// What a page transfer settles with. A same-origin response updates the
+    /// cookie jar, as a navigation's does. A cross-origin response is refused
+    /// unless CORS allows the page to read it, and then exposes only the headers
+    /// CORS allows.
+    fn page_fetch_outcome(
+        &mut self,
+        origin: Option<&str>,
+        response: FetchResponse,
+    ) -> Result<FetchOutcome, String> {
+        if let Some(origin) = origin {
+            if !cors::response_allows(&response.headers, origin) {
+                return Err(cors::BLOCKED_MESSAGE.to_owned());
+            }
+        } else {
+            for issue in self.cookies.absorb_response(&response) {
+                eprintln!("browser cookie rejected: {}", issue.message);
+            }
+        }
+        Ok(FetchOutcome {
+            status: response.status.as_u16(),
+            status_text: String::new(),
+            headers: cors::exposed_headers(&response.headers, origin.is_some()),
+            body: response.body,
+        })
     }
 
     pub(super) fn has_pending_network(&self) -> bool {

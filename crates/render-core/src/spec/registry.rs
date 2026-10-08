@@ -721,8 +721,11 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 that reuses connections, sets `.encoding` rather than relying on the \
                 brotli reader draining the length-delimited body, and reports a \
                 terminal outcome naming its phase and elapsed time for every request. \
-                Not implemented: CORS and preflight, `no-cors` semantics, streaming \
-                request and response bodies, and the cache. HTTP/2 is rejected rather \
+                CORS covers simple and preflighted requests with no credentials, \
+                checked on the final response of a redirect chain rather than at each \
+                hop. Not implemented: credentialed requests, `no-cors` semantics, \
+                preflight caching, streaming request and response bodies. HTTP/2 is \
+                rejected rather \
                 than absent: a pooled connection is removed from the pool while in use \
                 and `run` holds it for the whole request, so one connection carries one \
                 in-flight request, which is the exact inverse of multiplexing.",

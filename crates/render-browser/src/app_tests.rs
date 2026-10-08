@@ -2213,9 +2213,25 @@ fn formless_fallback_resolves_form_syncs_value_and_routes_the_button() {
     );
 }
 
-/// Reads one HTTP/1.1 request from `stream`: its request line and headers, and
-/// the body of its `Content-Length`.
-fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {
+/// One HTTP/1.1 request as a test origin received it.
+struct ReceivedRequest {
+    request_line: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+impl ReceivedRequest {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// Reads one HTTP/1.1 request from `stream`: its request line, every header,
+/// and the body of its `Content-Length`.
+fn read_http_request(stream: &mut std::net::TcpStream) -> ReceivedRequest {
     use std::io::Read;
 
     let mut buffer = Vec::new();
@@ -2229,14 +2245,20 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u
         }
     };
     let head = String::from_utf8(buffer[..header_end].to_vec()).expect("ASCII headers");
-    let length = head
-        .lines()
-        .find_map(|line| {
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_owned();
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().expect("numeric length"))
+            Some((name.trim().to_owned(), value.trim().to_owned()))
         })
-        .unwrap_or(0);
+        .collect();
+    let length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map_or(0, |(_, value)| {
+            value.parse::<usize>().expect("numeric length")
+        });
     let mut body = buffer[header_end..].to_vec();
     while body.len() < length {
         let mut chunk = [0_u8; 1024];
@@ -2244,16 +2266,244 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u
         assert!(read > 0, "the client closed before sending its body");
         body.extend_from_slice(&chunk[..read]);
     }
-    let request_line = head.lines().next().unwrap_or_default().to_owned();
-    let content_type = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-type")
-                .then(|| value.trim().to_owned())
+    ReceivedRequest {
+        request_line,
+        headers,
+        body,
+    }
+}
+
+impl ReceivedRequest {
+    fn method(&self) -> &str {
+        self.request_line.split(' ').next().unwrap_or_default()
+    }
+}
+
+/// Serves connections until the requests stop: once one has arrived, the server
+/// returns after `idle` with none. Before the first arrival it waits for up to
+/// ten seconds, so the test may build its shell after starting the server. It
+/// answers each request with `respond` and returns the requests in arrival order.
+fn serve_until_idle(
+    listener: &std::net::TcpListener,
+    idle: std::time::Duration,
+    respond: impl Fn(&ReceivedRequest) -> String,
+) -> Vec<ReceivedRequest> {
+    use std::io::Write;
+
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let started = Instant::now();
+    let mut served = Vec::new();
+    let mut last_arrival: Option<Instant> = None;
+    loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).expect("blocking stream");
+                let received = read_http_request(&mut stream);
+                stream
+                    .write_all(respond(&received).as_bytes())
+                    .expect("send response");
+                served.push(received);
+                last_arrival = Some(Instant::now());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let finished = match last_arrival {
+                    Some(arrival) => arrival.elapsed() > idle,
+                    None => started.elapsed() > Duration::from_secs(10),
+                };
+                if finished {
+                    return served;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return served,
+        }
+    }
+}
+
+/// Runs the shell until no page transfer is in flight, or fails at the deadline.
+fn drain_page_fetches(app: &mut BrowserApp) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !app.pending_fetches.is_empty() {
+        app.poll_network();
+        assert!(Instant::now() < deadline, "a page transfer never finished");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn a_same_origin_fetch_stores_the_cookies_its_response_sets() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind page origin");
+    let port = listener.local_addr().expect("local address").port();
+    let page_origin = std::thread::spawn(move || {
+        serve_until_idle(&listener, Duration::from_millis(800), |_| {
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Set-Cookie: session=xyz; Path=/; Max-Age=600\r\n\
+             Content-Length: 2\r\nConnection: close\r\n\r\n{}"
+                .to_owned()
         })
-        .unwrap_or_default();
-    (request_line, content_type, body)
+    });
+
+    // The page itself is served from the same origin as the request it makes.
+    let (mut app, tab) = headless_app_with("<!doctype html><p>page</p>");
+    app.pages.insert(
+        tab,
+        PageState::new(PageSource {
+            html: "<!doctype html><p>page</p>".into(),
+            title: "page".into(),
+            target: NavigationTarget::Url(
+                Url::parse(&format!("http://127.0.0.1:{port}/")).expect("page URL"),
+            ),
+        }),
+    );
+    app.submit_page_fetch(
+        tab,
+        &render_core::js::PendingFetch {
+            id: 4,
+            url: format!("http://127.0.0.1:{port}/api/login"),
+            method: "GET".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    );
+    drain_page_fetches(&mut app);
+    let _ = page_origin.join().expect("page origin thread");
+
+    let later =
+        FetchRequest::get(Url::parse(&format!("http://127.0.0.1:{port}/account")).expect("URL"));
+    assert_eq!(
+        app.cookies.decorate_request(later).cookie.as_deref(),
+        Some("session=xyz"),
+        "the cookie a same-origin fetch response sets is kept for later requests"
+    );
+}
+
+#[test]
+fn a_cross_origin_put_is_sent_only_after_its_preflight_allows_it() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind other origin");
+    let port = listener.local_addr().expect("local address").port();
+    let other_origin = std::thread::spawn(move || {
+        serve_until_idle(&listener, Duration::from_millis(800), |request| {
+            if request.method() == "OPTIONS" {
+                "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: null\r\n\
+                 Access-Control-Allow-Methods: PUT\r\nAccess-Control-Allow-Headers: x-token\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_owned()
+            } else {
+                "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: null\r\n\
+                 Content-Length: 2\r\nConnection: close\r\n\r\nok"
+                    .to_owned()
+            }
+        })
+    });
+
+    let (mut app, tab) = headless_app_with("<!doctype html><p>page</p>");
+    app.submit_page_fetch(
+        tab,
+        &render_core::js::PendingFetch {
+            id: 2,
+            url: format!("http://127.0.0.1:{port}/items/1"),
+            method: "PUT".to_owned(),
+            headers: vec![("X-Token".to_owned(), "t".to_owned())],
+            body: Some("{}".to_owned()),
+        },
+    );
+    drain_page_fetches(&mut app);
+    let served = other_origin.join().expect("other origin thread");
+
+    let methods: Vec<&str> = served.iter().map(ReceivedRequest::method).collect();
+    assert_eq!(methods, ["OPTIONS", "PUT"], "the PUT follows its preflight");
+    assert_eq!(served[0].header("origin"), Some("null"));
+    assert_eq!(
+        served[0].header("access-control-request-method"),
+        Some("PUT")
+    );
+    assert_eq!(
+        served[0].header("access-control-request-headers"),
+        Some("x-token")
+    );
+    assert_eq!(served[1].header("origin"), Some("null"));
+    assert_eq!(served[1].header("x-token"), Some("t"));
+    assert_eq!(served[1].body, b"{}".to_vec());
+}
+
+#[test]
+fn a_refused_preflight_keeps_the_request_from_being_sent() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind other origin");
+    let port = listener.local_addr().expect("local address").port();
+    let other_origin = std::thread::spawn(move || {
+        serve_until_idle(&listener, Duration::from_millis(800), |_| {
+            // No Access-Control-Allow-Origin: the preflight is refused.
+            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
+        })
+    });
+
+    let (mut app, tab) = headless_app_with("<!doctype html><p>page</p>");
+    app.submit_page_fetch(
+        tab,
+        &render_core::js::PendingFetch {
+            id: 3,
+            url: format!("http://127.0.0.1:{port}/items/1"),
+            method: "DELETE".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    );
+    drain_page_fetches(&mut app);
+    let served = other_origin.join().expect("other origin thread");
+
+    let methods: Vec<&str> = served.iter().map(ReceivedRequest::method).collect();
+    assert_eq!(methods, ["OPTIONS"], "the DELETE is never sent");
+}
+
+#[test]
+fn a_cross_origin_page_fetch_carries_no_cookies() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind other origin");
+    let port = listener.local_addr().expect("local address").port();
+    let other_origin = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept the page's fetch");
+        let received = read_http_request(&mut stream);
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 6\r\n\
+                        Connection: close\r\n\r\nsecret";
+        stream
+            .write_all(response.as_bytes())
+            .expect("send response");
+        received
+    });
+
+    // A cookie the browser already holds for that host, from the profile store.
+    let directory =
+        std::env::temp_dir().join(format!("render-cors-cookies-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).expect("scratch directory");
+    std::fs::write(
+        directory.join("cookies.txt"),
+        "# rENDER cookie store v1\nsession\tabc\t127.0.0.1\t/\t1\t0\t0\t-\t4102444800\n",
+    )
+    .expect("cookie store");
+    let (mut app, tab) = headless_app_with("<!doctype html><p>page</p>");
+    app.cookies = crate::profile::ProfileCookies::open(Some(directory.clone()));
+
+    app.submit_page_fetch(
+        tab,
+        &render_core::js::PendingFetch {
+            id: 1,
+            url: format!("http://127.0.0.1:{port}/data"),
+            method: "GET".to_owned(),
+            headers: Vec::new(),
+            body: None,
+        },
+    );
+    let received = other_origin.join().expect("other origin thread");
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert_eq!(
+        received.header("cookie"),
+        None,
+        "a cross-origin fetch must not send the browser's cookies"
+    );
 }
 
 #[test]
@@ -2264,8 +2514,8 @@ fn a_post_form_sends_its_urlencoded_body_and_commits_the_response() {
     let port = listener.local_addr().expect("local address").port();
     let origin = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept the form submission");
-        let (request_line, content_type, body) = read_http_request(&mut stream);
-        let echoed = String::from_utf8_lossy(&body).into_owned();
+        let received = read_http_request(&mut stream);
+        let echoed = String::from_utf8_lossy(&received.body).into_owned();
         let page = format!("<!doctype html><title>signed in</title><p id=echo>{echoed}</p>");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -2275,7 +2525,7 @@ fn a_post_form_sends_its_urlencoded_body_and_commits_the_response() {
         stream
             .write_all(response.as_bytes())
             .expect("send response");
-        (request_line, content_type, body)
+        received
     });
 
     let action = format!("http://127.0.0.1:{port}/login?next=/home");
@@ -2330,10 +2580,13 @@ fn a_post_form_sends_its_urlencoded_body_and_commits_the_response() {
         std::thread::sleep(Duration::from_millis(5));
     }
 
-    let (request_line, content_type, body) = origin.join().expect("origin thread");
-    assert_eq!(request_line, "POST /login?next=/home HTTP/1.1");
-    assert_eq!(content_type, "application/x-www-form-urlencoded");
-    assert_eq!(body, b"user=a+b%26c".to_vec());
+    let received = origin.join().expect("origin thread");
+    assert_eq!(received.request_line, "POST /login?next=/home HTTP/1.1");
+    assert_eq!(
+        received.header("content-type"),
+        Some("application/x-www-form-urlencoded")
+    );
+    assert_eq!(received.body, b"user=a+b%26c".to_vec());
     let committed = app
         .pages
         .get(&tab)

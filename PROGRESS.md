@@ -94,6 +94,12 @@ against an older report.
 - **`document.cookie` is implemented** - the `document.cookie` accessor and setter in
   `crates/render-js/src/runtime/eval.rs` (cite the symbol, not a line number: that file
   is under active edit and the line numbers move every session).
+- **Page `fetch()` and XHR were same-origin only.** They were not: the shell attached the
+  browser's cookies to cross-origin page requests and handed their bodies to the page. CORS
+  now applies (`crates/render-browser/src/cors.rs`), and cross-origin requests carry no cookies.
+- **`localStorage` is not persisted, so a reload starts empty.** The old `storage.rs` comment
+  said so, but WHATWG HTML 11.2 requires origin persistence. The host now seeds and records
+  each origin's area (`crates/render-browser/src/profile.rs`).
 - **`render-dom` is namespace-ready** (`Namespace`, `ElementData.namespace`,
   `create_element_ns`, and HTML-only lowercasing at `render-dom/src/lib.rs:192,209,502,726`).
 
