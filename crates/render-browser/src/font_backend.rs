@@ -1118,6 +1118,13 @@ impl SystemFontBackend {
     /// face while the next character is being resolved. The `Arc` also means a
     /// font document face resolved through a `local()` name and the same font as an
     /// installed face are one allocation.
+    /// The face a character no installed face covers is drawn from: the first
+    /// loaded face, whose `.notdef` glyph is the box every font carries for a
+    /// missing character.
+    fn missing_glyph_face(&self) -> Option<Arc<Font>> {
+        self.with_state(|state| state.loaded.iter().flatten().next().map(Arc::clone))
+    }
+
     fn face_for(
         &self,
         instance: &ResolvedInstance,
@@ -1179,6 +1186,17 @@ fn advance_of(font: &Font, character: char, font_size: f32) -> f32 {
     font.metrics(character, font_size).advance_width
 }
 
+/// The glyph id that stands for a character no installed face covers. It is
+/// glyph 0 in every font: the `.notdef` box, which is what a browser draws for a
+/// missing character. Real glyph ids here are codepoints, and U+0000 is never
+/// shaped as text (the HTML parser replaces it), so the id is unambiguous.
+const MISSING_GLYPH: u32 = 0;
+
+/// The advance of the `.notdef` box of `font`, used for a missing character.
+fn missing_advance(font: &Font, font_size: f32) -> f32 {
+    font.metrics_indexed(0, font_size).advance_width
+}
+
 /// The ascent and descent of a face, falling back to the reference path's
 /// nominal values for a font with no line metrics.
 fn line_metrics(font: &Font, font_size: f32) -> (f32, f32) {
@@ -1208,14 +1226,21 @@ impl TextMeasurer for SystemFontBackend {
             text.chars().collect()
         };
         for character in characters {
-            // A character no face has keeps its zero advance. §5 says to
-            // indicate that it is not displayed, and an empty gap does that
-            // without putting a letterform from the wrong script in its place.
-            let Some((font, _, _)) = self.face_for(&instance, character) else {
-                continue;
-            };
+            // A character no face has is drawn as the missing-glyph box, with the
+            // advance of that box, which is what shaping uses too.
+            let (font, character_advance) =
+                if let Some((font, _, _)) = self.face_for(&instance, character) {
+                    let character_advance = advance_of(&font, character, style.font_size);
+                    (font, character_advance)
+                } else {
+                    let Some(missing) = self.missing_glyph_face() else {
+                        continue;
+                    };
+                    let character_advance = missing_advance(&missing, style.font_size);
+                    (missing, character_advance)
+                };
             if !text.is_empty() {
-                advance += advance_of(&font, character, style.font_size);
+                advance += character_advance;
             }
             let (face_ascent, face_descent) = line_metrics(&font, style.font_size);
             ascent = ascent.max(face_ascent);
@@ -1250,15 +1275,24 @@ impl TextShaper for SystemFontBackend {
         let mut x = origin.x;
         let mut glyphs = Vec::new();
         for character in text.chars() {
-            let Some((loaded, _, _)) = self.face_for(&instance, character) else {
-                continue;
+            let (glyph, advance) = if let Some((loaded, _, _)) = self.face_for(&instance, character)
+            {
+                (
+                    GlyphId(character as u32),
+                    advance_of(&loaded, character, font_size),
+                )
+            } else {
+                let Some(missing) = self.missing_glyph_face() else {
+                    continue;
+                };
+                (GlyphId(MISSING_GLYPH), missing_advance(&missing, font_size))
             };
             glyphs.push(GlyphInstance {
-                glyph: GlyphId(character as u32),
+                glyph,
                 position: PhysicalPoint { x, y: origin.y },
-                advance: advance_of(&loaded, character, font_size),
+                advance,
             });
-            x += advance_of(&loaded, character, font_size);
+            x += advance;
         }
         GlyphRun {
             // The run's id is minted from the table it was shaped against, so a
@@ -1299,9 +1333,16 @@ impl GlyphMaskProvider for SystemFontBackend {
         // [`is_private_use`] for why the per-site table that used to be here is
         // gone - so §5.4's Private Use Area rule governs the character the author
         // actually wrote.
-        let character = char::from_u32(glyph.0)?;
-        let (loaded, embolden, shear_degrees) = self.face_for(&instance, character)?;
-        let (metrics, coverage) = loaded.rasterize(character, font_size);
+        let (embolden, shear_degrees, metrics, coverage) = if glyph.0 == MISSING_GLYPH {
+            let face = self.missing_glyph_face()?;
+            let (metrics, coverage) = face.rasterize_indexed(0, font_size);
+            (false, 0.0, metrics, coverage)
+        } else {
+            let character = char::from_u32(glyph.0)?;
+            let (loaded, embolden, shear_degrees) = self.face_for(&instance, character)?;
+            let (metrics, coverage) = loaded.rasterize(character, font_size);
+            (embolden, shear_degrees, metrics, coverage)
+        };
         let width = u32::try_from(metrics.width).ok()?;
         let height = u32::try_from(metrics.height).ok()?;
         let coverage = if embolden {
@@ -1955,18 +1996,71 @@ mod tests {
                  {} but shaped it at {drawn}",
                 measured.advance
             );
-            // A character no installed face covers is left out of the run on both
-            // the measure and the draw side, so the glyphs are the text's characters
-            // in order rather than one per character.
-            let mut characters = text.chars();
-            for glyph in &glyphs {
+            // One glyph per character. A character no installed face covers is the
+            // missing-glyph box, so every glyph is its own character or that box.
+            assert_eq!(
+                glyphs.len(),
+                text.chars().count(),
+                "{family}: a run keeps one glyph per character"
+            );
+            for (character, glyph) in text.chars().zip(&glyphs) {
                 assert!(
-                    characters.any(|character| character as u32 == glyph.glyph.0),
-                    "glyph {} is not the next character of the run",
+                    glyph.glyph.0 == character as u32 || glyph.glyph.0 == super::MISSING_GLYPH,
+                    "character {character:?} is painted as glyph {}",
                     glyph.glyph.0
                 );
             }
         }
+    }
+
+    /// A character no installed face covers is drawn as the missing-glyph box:
+    /// it keeps its place in the run, takes the box's advance, and paints ink.
+    #[test]
+    fn a_character_no_face_covers_is_drawn_as_the_missing_glyph_box() {
+        use render_core::layout::{FontRequest, TextMeasurer, TextStyle};
+        use render_core::paint::{Color, GlyphMaskProvider, TextShaper};
+
+        let backend = super::SystemFontBackend::load().expect("the platform table loads");
+        // A noncharacter that no font maps.
+        let text = "A\u{10FFFF}B";
+        let request = FontRequest::initial();
+        let run = backend.shape_font(
+            text,
+            &request,
+            24.0,
+            render_core::layout::PhysicalPoint { x: 0.0, y: 0.0 },
+            Color::BLACK,
+        );
+        assert_eq!(run.glyphs.len(), 3, "the missing character keeps its place");
+        assert_eq!(run.glyphs[1].glyph.0, super::MISSING_GLYPH);
+        assert!(run.glyphs[1].advance > 0.0, "the box has an advance");
+
+        let measured = backend.measure(
+            text,
+            TextStyle {
+                font_size: 24.0,
+                line_height: 28.8,
+                font: request,
+            },
+        );
+        let drawn: f32 = run.glyphs.iter().map(|glyph| glyph.advance).sum();
+        assert!(
+            (measured.advance - drawn).abs() < 1e-3,
+            "measured {} but drew {drawn}",
+            measured.advance
+        );
+
+        let mask = backend
+            .mask(
+                run.font,
+                render_core::paint::GlyphId(super::MISSING_GLYPH),
+                24.0,
+            )
+            .expect("the missing glyph has a mask");
+        assert!(
+            mask.coverage.iter().any(|coverage| *coverage > 0),
+            "the missing-glyph box paints ink"
+        );
     }
 
     // ---- the webfont path, end to end ---------------------------------------
