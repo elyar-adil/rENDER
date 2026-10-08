@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 
 use render_browser::chrome::Point;
 use render_core::interaction::{
-    ButtonBehavior, DefaultActionKind, FormMethod, activation_plan, plan_form_submission,
+    ButtonBehavior, DefaultActionKind, FormEnctype, FormMethod, FormSubmissionPlan,
+    activation_plan, plan_form_submission,
 };
 use render_core::js::ElementRect;
 use render_core::layout::{PhysicalPoint, PhysicalRect};
@@ -72,23 +73,33 @@ pub(crate) fn is_content_hit_command(command: &DisplayCommand) -> bool {
     )
 }
 
-pub(crate) fn get_content_navigation_target(
+/// Where activating a navigable control leads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ContentNavigation {
+    /// A link, or a GET form, as the URL to load.
+    Get(Url),
+    /// A POST form: its action URL and `application/x-www-form-urlencoded` body.
+    Post { url: Url, body: String },
+}
+
+/// The navigation a link or submit control under `hit_node` performs, if any.
+pub(crate) fn content_navigation(
     dom: &render_core::dom::Dom,
     hit_node: render_core::dom::NodeId,
     document_url: &Url,
     rendered: &dyn Fn(render_core::dom::NodeId) -> bool,
-) -> Option<Url> {
+) -> Option<ContentNavigation> {
     let mut candidate = Some(hit_node);
     while let Some(node) = candidate {
         match activation_plan(dom, node).map(|plan| plan.default_action) {
             Some(DefaultActionKind::FollowHyperlink { href }) => {
-                return document_url.join(&href).ok();
+                return document_url.join(&href).ok().map(ContentNavigation::Get);
             }
             Some(DefaultActionKind::InvokeButton(ButtonBehavior::Submit))
                 if dom.attribute(node, "disabled").ok().flatten().is_none() =>
             {
                 if let Ok(submission) = plan_form_submission(dom, node, document_url) {
-                    return (submission.method == FormMethod::Get).then_some(submission.target);
+                    return navigation_from_plan(submission);
                 }
                 // The submitter has no associated form. Pages whose visible
                 // search box is script-driven still ship one classic (usually
@@ -96,13 +107,48 @@ pub(crate) fn get_content_navigation_target(
                 // fall back to it when it is unambiguous.
                 let form = fallback_submit_form(dom, node, rendered)?;
                 let submission = plan_form_submission(dom, form, document_url).ok()?;
-                return (submission.method == FormMethod::Get).then_some(submission.target);
+                return navigation_from_plan(submission);
             }
             _ => {}
         }
         candidate = dom.parent(node);
     }
     None
+}
+
+/// The navigation a form submission performs. GET puts the fields in the URL.
+/// POST carries them in the body, which is built only for the urlencoded
+/// encoding. Multipart and text/plain bodies are not implemented, so such a
+/// submission is refused rather than sent with a body the server would misread.
+pub(crate) fn navigation_from_plan(plan: FormSubmissionPlan) -> Option<ContentNavigation> {
+    match (plan.method, plan.enctype) {
+        (FormMethod::Get, _) => Some(ContentNavigation::Get(plan.target)),
+        (FormMethod::Post, FormEnctype::UrlEncoded) => Some(ContentNavigation::Post {
+            body: plan.urlencoded_body(),
+            url: plan.target,
+        }),
+        (FormMethod::Post, enctype) => {
+            eprintln!(
+                "render-browser form submission not sent: enctype {enctype:?} is not supported"
+            );
+            None
+        }
+    }
+}
+
+/// The URL a link or GET submission under `hit_node` loads. A POST submission
+/// has no URL alone, so it yields `None` here; use [`content_navigation`].
+#[cfg(test)]
+pub(crate) fn get_content_navigation_target(
+    dom: &render_core::dom::Dom,
+    hit_node: render_core::dom::NodeId,
+    document_url: &Url,
+    rendered: &dyn Fn(render_core::dom::NodeId) -> bool,
+) -> Option<Url> {
+    match content_navigation(dom, hit_node, document_url, rendered)? {
+        ContentNavigation::Get(url) => Some(url),
+        ContentNavigation::Post { .. } => None,
+    }
 }
 
 /// Resolves the form a submit intent applies to, falling back to the

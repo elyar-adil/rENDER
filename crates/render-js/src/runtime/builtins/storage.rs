@@ -1,9 +1,12 @@
 //! Web Storage: the `Storage` interface behind `localStorage` and
 //! `sessionStorage` (WHATWG HTML §11.2).
 //!
-//! Both areas are per-realm, in-memory maps; nothing is persisted, so a
-//! document reload starts empty exactly as a fresh browsing session would.
-//! Entries live in the storage object's own property table, which is what
+//! Both areas are per-realm maps. The engine does not write them to disk: the
+//! host owns an origin's `localStorage` between documents, seeds it with
+//! [`JsRuntime::seed_local_storage`] before the document runs, and reads changes
+//! back with [`JsRuntime::local_storage_entries`]. `sessionStorage` has no host
+//! store yet, so it starts empty in each document. Entries live in the storage
+//! object's own property table, which is what
 //! makes `Object.keys(localStorage)` and `for…in` report the stored keys in
 //! insertion order without a second bookkeeping structure. `length` and the
 //! indexed slots are answered by the host arms in `eval.rs` because they must
@@ -18,6 +21,46 @@ use crate::value::NativeFunction;
 use render_dom::Dom;
 
 impl JsRuntime {
+    /// The entries of `localStorage` in the order the document stored them, for
+    /// a host that keeps each origin's storage area between documents.
+    #[must_use]
+    pub fn local_storage_entries(&self) -> Vec<(String, String)> {
+        let Some(storage) = self.local_storage_object() else {
+            return Vec::new();
+        };
+        self.realm
+            .own_property_names(storage)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|key| match self.realm.own_property(storage, &key)?.value {
+                JsValue::String(value) => Some((key, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replace the contents of `localStorage` before the document runs, so the
+    /// host can restore an origin's entries from an earlier session.
+    pub fn seed_local_storage(&mut self, entries: &[(String, String)]) {
+        let Some(storage) = self.local_storage_object() else {
+            return;
+        };
+        for key in self.realm.own_property_names(storage).unwrap_or_default() {
+            self.realm.delete_property(storage, &key);
+        }
+        for (key, value) in entries {
+            self.realm
+                .set_property(storage, key.clone(), JsValue::String(value.clone()));
+        }
+    }
+
+    fn local_storage_object(&self) -> Option<ObjectId> {
+        match self.realm.global("localStorage")? {
+            JsValue::Object(storage) => Some(storage),
+            _ => None,
+        }
+    }
+
     pub(in crate::runtime) fn dispatch_storage_native(
         &mut self,
         _dom: &mut Dom,

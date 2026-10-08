@@ -4,6 +4,8 @@ use crate::ACTIVE_PAGE_TURN_BUDGET;
 use crate::fetch_handles::CachedBatchHandle;
 use crate::fetch_handles::CachedRequestHandle;
 use crate::page_source::PageSource;
+use crate::profile::ProfileCookies;
+use crate::profile::ProfileStorage;
 use render_browser::images::ImageFetchPlan;
 use render_browser::model::PageScrollState;
 use render_browser::resources::StylesheetFetchPlan;
@@ -27,7 +29,6 @@ use render_core::paint::Color;
 use render_core::paint::DisplayList;
 use render_core::paint::PaintScene;
 use render_core::script::ScriptScheduling;
-use render_net::CookieJar;
 use render_net::FetchResult;
 use render_net::Url;
 use std::collections::BTreeMap;
@@ -56,7 +57,10 @@ const SCRIPT_BATCH_TURN_BUDGET: usize = 1_024;
 pub(super) struct PageState {
     pub(super) navigation: PageNavigation<CachedRequestHandle>,
     pub(super) page: Page,
-    pub(super) cookies: CookieJar,
+    /// This document's `localStorage` as of the last sync with the profile.
+    /// Changes are reported as a difference from it, so other documents of the
+    /// same origin are not overwritten by a stale copy.
+    pub(super) storage_baseline: Vec<(String, String)>,
     pub(super) style_sheets: ExternalStyleSheets,
     /// Keys already submitted for this document. A failed stylesheet is not
     /// resubmitted on every paint; changing its URL creates a new key.
@@ -198,7 +202,7 @@ impl PageState {
         Self {
             navigation: PageNavigation::new(source),
             page,
-            cookies: CookieJar::default(),
+            storage_baseline: Vec::new(),
             style_sheets: ExternalStyleSheets::default(),
             started_style_sheets: HashSet::new(),
             style_batch: None,
@@ -229,6 +233,39 @@ impl PageState {
             expected_render: None,
             created_at: Instant::now(),
         }
+    }
+
+    /// The origin whose `localStorage` this document shares with the profile.
+    /// Only tuple origins (`http` and `https`) persist. Opaque origins such as
+    /// `file:` and `about:` documents keep their storage for the document only.
+    pub(super) fn local_storage_origin(&self) -> Option<String> {
+        let origin = self.navigation.committed().target.history_url().origin();
+        origin.is_tuple().then(|| origin.ascii_serialization())
+    }
+
+    /// Seed this document's `localStorage` from the profile. Call it after the
+    /// document is created and before it runs any script.
+    pub(super) fn restore_local_storage(&mut self, storage: &ProfileStorage) {
+        let Some(origin) = self.local_storage_origin() else {
+            return;
+        };
+        let entries = storage.area(&origin);
+        self.page.runtime_mut().seed_local_storage(&entries);
+        self.storage_baseline = entries;
+    }
+
+    /// Write this document's `localStorage` changes to the profile, relative to
+    /// the copy it started from.
+    pub(super) fn sync_local_storage(&mut self, storage: &mut ProfileStorage) {
+        let Some(origin) = self.local_storage_origin() else {
+            return;
+        };
+        let current = self.page.runtime().local_storage_entries();
+        if current == self.storage_baseline {
+            return;
+        }
+        storage.apply_changes(&origin, &self.storage_baseline, &current);
+        self.storage_baseline = current;
     }
 
     pub(super) fn set_source(&mut self, source: PageSource) {
@@ -289,15 +326,15 @@ impl PageState {
     }
 
     /// The next round of module-dependency requests for a prepared batch,
-    /// carrying this page's cookies. Empty once the module graph is closed.
+    /// carrying the browser's cookies. Empty once the module graph is closed.
     pub(super) fn module_round_requests(
-        &self,
         preparation: &mut ScriptBatchPreparation,
+        cookies: &ProfileCookies,
     ) -> Vec<render_net::FetchRequest> {
         preparation
             .pending_module_requests()
             .into_iter()
-            .map(|request| self.cookies.decorate_request(request))
+            .map(|request| cookies.decorate_request(request))
             .collect()
     }
 

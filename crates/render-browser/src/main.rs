@@ -9,6 +9,7 @@ mod fetch_handles;
 mod frame;
 mod page_source;
 mod page_state;
+mod profile;
 mod render_worker;
 
 use crate::app::BrowserApp;

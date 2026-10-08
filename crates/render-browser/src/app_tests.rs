@@ -647,6 +647,59 @@ fn network_commit_takes_the_title_from_the_parsed_head_title() {
 }
 
 #[test]
+fn a_document_restores_its_origins_local_storage_and_reports_changes_back() {
+    use crate::profile::ProfileStorage;
+
+    let origin = "https://storage.example.test";
+    let mut store = ProfileStorage::open(None);
+    store.apply_changes(origin, &[], &[("theme".to_owned(), "dark".to_owned())]);
+
+    let mut page = PageState::new(PageSource {
+        html: "<!doctype html><p>stored</p>".into(),
+        title: "stored".into(),
+        target: NavigationTarget::Url(Url::parse(&format!("{origin}/")).expect("page URL")),
+    });
+    page.restore_local_storage(&store);
+    assert_eq!(
+        page.page.runtime().local_storage_entries(),
+        vec![("theme".to_owned(), "dark".to_owned())]
+    );
+
+    // The document changes its own copy, then the browser syncs it. Only the
+    // keys that differ from the restored copy reach the store.
+    page.page.runtime_mut().seed_local_storage(&[
+        ("theme".to_owned(), "light".to_owned()),
+        ("lang".to_owned(), "zh".to_owned()),
+    ]);
+    page.sync_local_storage(&mut store);
+    assert_eq!(
+        store.area(origin),
+        vec![
+            ("lang".to_owned(), "zh".to_owned()),
+            ("theme".to_owned(), "light".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_document_without_a_persistent_origin_keeps_its_storage_to_itself() {
+    use crate::profile::ProfileStorage;
+
+    let mut store = ProfileStorage::open(None);
+    let mut page = PageState::new(PageSource {
+        html: "<!doctype html><p>local file</p>".into(),
+        title: "local".into(),
+        target: NavigationTarget::Url(Url::parse("file:///tmp/page.html").expect("page URL")),
+    });
+    assert_eq!(page.local_storage_origin(), None);
+    page.page
+        .runtime_mut()
+        .seed_local_storage(&[("k".to_owned(), "v".to_owned())]);
+    page.sync_local_storage(&mut store);
+    assert!(store.area("file://").is_empty());
+}
+
+#[test]
 fn title_less_page_keeps_the_url_fallback_title() {
     let mut page = PageState::new(PageSource {
         html: "<!doctype html><html><body><p>plain</p></body></html>".into(),
@@ -1633,6 +1686,8 @@ fn headless_app_with_render_worker(
         render_worker,
         network,
         http_cache: render_browser::cache::HttpCache::default(),
+        cookies: crate::profile::ProfileCookies::open(None),
+        storage: crate::profile::ProfileStorage::open(None),
         pending_fetches: Vec::new(),
         disk_cache: None,
         pending_disk_clear: None,
@@ -2155,5 +2210,140 @@ fn formless_fallback_resolves_form_syncs_value_and_routes_the_button() {
         ancestor_wrapper_control(dom, &geometry, button),
         Some(textarea),
         "the button's nearest wrapper routes to the dominant text control"
+    );
+}
+
+/// Reads one HTTP/1.1 request from `stream`: its request line and headers, and
+/// the body of its `Content-Length`.
+fn read_http_request(stream: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {
+    use std::io::Read;
+
+    let mut buffer = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).expect("read request");
+        assert!(read > 0, "the client closed before sending its headers");
+        buffer.extend_from_slice(&chunk[..read]);
+        if let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8(buffer[..header_end].to_vec()).expect("ASCII headers");
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().expect("numeric length"))
+        })
+        .unwrap_or(0);
+    let mut body = buffer[header_end..].to_vec();
+    while body.len() < length {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).expect("read body");
+        assert!(read > 0, "the client closed before sending its body");
+        body.extend_from_slice(&chunk[..read]);
+    }
+    let request_line = head.lines().next().unwrap_or_default().to_owned();
+    let content_type = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-type")
+                .then(|| value.trim().to_owned())
+        })
+        .unwrap_or_default();
+    (request_line, content_type, body)
+}
+
+#[test]
+fn a_post_form_sends_its_urlencoded_body_and_commits_the_response() {
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind local origin");
+    let port = listener.local_addr().expect("local address").port();
+    let origin = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept the form submission");
+        let (request_line, content_type, body) = read_http_request(&mut stream);
+        let echoed = String::from_utf8_lossy(&body).into_owned();
+        let page = format!("<!doctype html><title>signed in</title><p id=echo>{echoed}</p>");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{page}",
+            page.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("send response");
+        (request_line, content_type, body)
+    });
+
+    let action = format!("http://127.0.0.1:{port}/login?next=/home");
+    let (mut app, tab) = headless_app_with(&format!(
+        "<!doctype html><form action='{action}' method=post>\
+         <input name=user value='a b&c'><button id=submit>Sign in</button></form>"
+    ));
+    let submit = {
+        let dom = app.pages.get(&tab).expect("page").page.document().dom();
+        find_id(dom, "submit")
+    };
+    let document_url = app
+        .pages
+        .get(&tab)
+        .expect("page")
+        .navigation
+        .committed()
+        .target
+        .history_url();
+    let navigation = {
+        let page = app.pages.get(&tab).expect("page");
+        crate::content_interaction::content_navigation(
+            page.page.document().dom(),
+            submit,
+            &document_url,
+            &|_| true,
+        )
+    };
+    let Some(crate::content_interaction::ContentNavigation::Post { url, body }) = navigation else {
+        panic!("a POST form must yield a POST navigation");
+    };
+    app.submit_form_navigation(tab, url, body);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        app.poll_network();
+        let committed = app
+            .pages
+            .get(&tab)
+            .expect("page")
+            .navigation
+            .committed()
+            .html
+            .clone();
+        if committed.contains("id=echo") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the POST response never committed"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let (request_line, content_type, body) = origin.join().expect("origin thread");
+    assert_eq!(request_line, "POST /login?next=/home HTTP/1.1");
+    assert_eq!(content_type, "application/x-www-form-urlencoded");
+    assert_eq!(body, b"user=a+b%26c".to_vec());
+    let committed = app
+        .pages
+        .get(&tab)
+        .expect("page")
+        .navigation
+        .committed()
+        .html
+        .clone();
+    assert!(
+        committed.contains("user=a+b%26c"),
+        "the committed document is the server's response to the POST"
     );
 }

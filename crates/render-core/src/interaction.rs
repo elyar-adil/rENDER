@@ -736,6 +736,15 @@ pub enum FormMethod {
     Post,
 }
 
+/// The `enctype` of a form, which decides how a POST body is encoded (HTML
+/// §4.10.21.8). An absent or unrecognized value is `application/x-www-form-urlencoded`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FormEnctype {
+    UrlEncoded,
+    MultipartFormData,
+    TextPlain,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormField {
     pub name: String,
@@ -747,8 +756,24 @@ pub struct FormSubmissionPlan {
     pub form: NodeId,
     pub submitter: NodeId,
     pub method: FormMethod,
+    pub enctype: FormEnctype,
     pub target: Url,
     pub fields: Vec<FormField>,
+}
+
+impl FormSubmissionPlan {
+    /// The fields encoded as `application/x-www-form-urlencoded`, the body of a
+    /// POST whose `enctype` is [`FormEnctype::UrlEncoded`].
+    #[must_use]
+    pub fn urlencoded_body(&self) -> String {
+        let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+        serializer.extend_pairs(
+            self.fields
+                .iter()
+                .map(|field| (field.name.as_str(), field.value.as_str())),
+        );
+        serializer.finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -809,6 +834,13 @@ pub fn plan_form_submission(
         .flatten()
         .filter(|value| value.eq_ignore_ascii_case("post"))
         .map_or(FormMethod::Get, |_| FormMethod::Post);
+    let enctype = match dom.attribute(form, "enctype").ok().flatten() {
+        Some(value) if value.eq_ignore_ascii_case("multipart/form-data") => {
+            FormEnctype::MultipartFormData
+        }
+        Some(value) if value.eq_ignore_ascii_case("text/plain") => FormEnctype::TextPlain,
+        _ => FormEnctype::UrlEncoded,
+    };
     let fields = collect_successful_controls(dom, form, submitter);
     if method == FormMethod::Get {
         target.set_query(None);
@@ -820,6 +852,7 @@ pub fn plan_form_submission(
         form,
         submitter,
         method,
+        enctype,
         target,
         fields,
     })
@@ -1082,8 +1115,8 @@ fn button_behavior(dom: &Dom, node: NodeId) -> ButtonBehavior {
 mod tests {
     use super::{
         BoundaryPoint, DefaultActionKind, DefaultActionStatus, DomRange, FocusManager,
-        FocusNavigationDirection, FormMethod, InteractionErrorKind, InteractiveKind, Selection,
-        SelectionDirection, SelectionRepair, activation_plan, plan_form_submission,
+        FocusNavigationDirection, FormEnctype, FormMethod, InteractionErrorKind, InteractiveKind,
+        Selection, SelectionDirection, SelectionRepair, activation_plan, plan_form_submission,
         sequential_focus_order,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
@@ -1302,6 +1335,48 @@ mod tests {
                 .kind,
             InteractiveKind::Textarea
         );
+    }
+
+    #[test]
+    fn post_form_submission_encodes_its_fields_as_urlencoded_and_keeps_the_enctype() {
+        let parsed = parse_document(
+            "<!doctype html><form id=login action='/session?next=/home' method=POST>\
+             <input name=user value='a b&c'>\
+             <input type=password name=pass value='p+w/x=y'>\
+             <button id=submit>Sign in</button></form>\
+             <form id=upload action='/u' method=post enctype='multipart/form-data'>\
+             <button id=send>Send</button></form>\
+             <form id=plain action='/p' method=post enctype='text/plain'>\
+             <button id=text>Send</button></form>\
+             <form id=odd action='/o' method=post enctype='application/xml'>\
+             <button id=odd-button>Send</button></form>",
+        );
+        let document_url =
+            url::Url::parse("https://login.example.test/page").expect("document URL");
+        let login = plan_form_submission(&parsed.dom, by_id(&parsed.dom, "submit"), &document_url)
+            .expect("login form should submit");
+
+        assert_eq!(login.method, FormMethod::Post);
+        assert_eq!(login.enctype, FormEnctype::UrlEncoded);
+        assert_eq!(
+            login.target.as_str(),
+            "https://login.example.test/session?next=/home",
+            "a POST keeps the action's query and adds no fields to the URL"
+        );
+        assert_eq!(login.urlencoded_body(), "user=a+b%26c&pass=p%2Bw%2Fx%3Dy");
+
+        let multipart =
+            plan_form_submission(&parsed.dom, by_id(&parsed.dom, "send"), &document_url)
+                .expect("multipart form should plan");
+        assert_eq!(multipart.enctype, FormEnctype::MultipartFormData);
+        let text = plan_form_submission(&parsed.dom, by_id(&parsed.dom, "text"), &document_url)
+            .expect("text/plain form should plan");
+        assert_eq!(text.enctype, FormEnctype::TextPlain);
+        // An unrecognized enctype falls back to the urlencoded default.
+        let odd =
+            plan_form_submission(&parsed.dom, by_id(&parsed.dom, "odd-button"), &document_url)
+                .expect("unrecognized enctype should plan");
+        assert_eq!(odd.enctype, FormEnctype::UrlEncoded);
     }
 
     #[test]

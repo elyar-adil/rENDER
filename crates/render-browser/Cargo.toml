@@ -16,5 +16,13 @@ render-net = { path = "../render-net" }
 softbuffer = { version = "0.4.8", default-features = false }
 winit = { version = "0.30.12", default-features = false, features = ["rwh_06"] }
 
+# winit and softbuffer have no window-system backend on Linux unless one is
+# selected, and the build fails with `compile_error!` without it. X11 and
+# Wayland are loaded at run time (`*-dlopen`), so building needs no system
+# development packages and the binary still runs on either session type.
+[target.'cfg(target_os = "linux")'.dependencies]
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11", "x11-dlopen", "wayland", "wayland-dlopen"] }
+winit = { version = "0.30.12", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+
 [lints]
 workspace = true

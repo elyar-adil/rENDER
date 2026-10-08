@@ -8,6 +8,7 @@ use crate::NativeSurface;
 use crate::SCROLL_LINE_PIXELS;
 use crate::UserEvent;
 use crate::content_interaction;
+use crate::content_interaction::ContentNavigation;
 use crate::content_interaction::content_text_input_value;
 use crate::content_interaction::content_wrapper_control;
 use crate::diagnostics::dump_debug_frame;
@@ -35,6 +36,9 @@ use crate::page_state::PageState;
 use crate::page_state::PendingImages;
 use crate::page_state::PendingScripts;
 use crate::page_state::PendingStyleSheets;
+use crate::profile::ProfileCookies;
+use crate::profile::ProfileStorage;
+use crate::profile::profile_directory;
 use crate::render_worker::FullPageRenderPayload;
 use crate::render_worker::PageRenderFrame;
 use crate::render_worker::PageRenderPayload;
@@ -94,7 +98,7 @@ use render_browser::worker::RenderViewport;
 use render_core::image::ImageLimits;
 use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
-use render_core::interaction::FormMethod;
+
 use render_core::js::RuntimeLimits;
 use render_core::js::{FetchOutcome, PendingFetch};
 use render_core::layout::PhysicalPoint;
@@ -160,6 +164,10 @@ pub(super) struct BrowserApp {
     pub(super) render_worker: PageRenderWorker,
     pub(super) network: NetworkWorker,
     pub(super) http_cache: HttpCache,
+    /// One cookie jar for every tab, persisted to the profile directory.
+    pub(super) cookies: ProfileCookies,
+    /// Origin-keyed `localStorage` persisted under the profile directory.
+    pub(super) storage: ProfileStorage,
     /// In-flight `fetch()`/XHR transfers awaiting completion, keyed by tab
     /// and the runtime's correlation id.
     pub(super) pending_fetches: Vec<(TabId, u64, CachedRequestHandle)>,
@@ -224,13 +232,15 @@ impl BrowserApp {
                 None
             }
         };
-        Self {
+        let mut app = Self {
             tabs,
             pages: HashMap::from([(active, PageState::new(initial))]),
             fonts,
             render_worker,
             network,
             http_cache: HttpCache::default(),
+            cookies: ProfileCookies::open(profile_directory()),
+            storage: ProfileStorage::open(profile_directory()),
             pending_fetches: Vec::new(),
             disk_cache,
             pending_disk_clear: None,
@@ -264,7 +274,11 @@ impl BrowserApp {
             address_clicks: AddressClickTracker::default(),
             left_pointer_down: false,
             started_at: Instant::now(),
+        };
+        if let Some(page) = app.pages.get_mut(&active) {
+            page.restore_local_storage(&app.storage);
         }
+        app
     }
 
     pub(super) fn initialize(
@@ -972,6 +986,7 @@ impl BrowserApp {
             TabIntent::Close(id) => {
                 self.render_worker.cancel_tab(id.as_u64());
                 if let Some(mut page) = self.pages.remove(&id) {
+                    page.sync_local_storage(&mut self.storage);
                     page.cancel_pending();
                 }
                 if let Some(created) = self.tabs.apply(intent) {
@@ -1143,10 +1158,43 @@ impl BrowserApp {
     pub(super) fn start_network_navigation(&mut self, id: TabId, url: Url) {
         let request =
             FetchRequest::get(url.clone()).with_accept("text/html,text/plain;q=0.8,*/*;q=0.1");
-        let request = self.pages.get(&id).map_or(request.clone(), |page| {
-            page.cookies.decorate_request(request)
-        });
+        let request = self.cookies.decorate_request(request);
         let handle = self.submit_cached_fetch(request);
+        self.begin_network_navigation(id, url, handle);
+    }
+
+    /// Starts a form submission as a navigation that adds a history entry for
+    /// its target URL, the way a link does. The body is sent with the POST.
+    pub(super) fn submit_form_navigation(&mut self, id: TabId, url: Url, body: String) {
+        if self
+            .content_editor
+            .as_ref()
+            .is_some_and(|editor| editor.tab == id)
+        {
+            self.close_content_editor();
+        }
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        page.cancel_pending();
+        if let Err(error) = page.history.push(HistoryEntry::new(url.clone())) {
+            self.install_source(
+                id,
+                error_source(NavigationTarget::from_url(url), &error.to_string()),
+                false,
+            );
+            return;
+        }
+        let request = FetchRequest::new(HttpMethod::Post, url.clone())
+            .with_header("Content-Type", "application/x-www-form-urlencoded")
+            .with_body(body)
+            .with_accept("text/html,text/plain;q=0.8,*/*;q=0.1");
+        let request = self.cookies.decorate_request(request);
+        let handle = self.submit_cached_fetch(request);
+        self.begin_network_navigation(id, url, handle);
+    }
+
+    fn begin_network_navigation(&mut self, id: TabId, url: Url, handle: CachedRequestHandle) {
         let Some(page) = self.pages.get_mut(&id) else {
             handle.cancel();
             return;
@@ -1208,10 +1256,7 @@ impl BrowserApp {
         if let Some(body) = &request.body {
             fetch_request = fetch_request.with_body(body.clone().into_bytes());
         }
-        let fetch_request = match self.pages.get(&tab) {
-            Some(page) => page.cookies.decorate_request(fetch_request),
-            None => fetch_request,
-        };
+        let fetch_request = self.cookies.decorate_request(fetch_request);
         let handle = self.submit_cached_fetch(fetch_request);
         self.pending_fetches.push((tab, request.id, handle));
     }
@@ -1316,7 +1361,9 @@ impl BrowserApp {
         let mut title = fallback_title;
         let mut address = source.target.display_address();
         if let Some(page) = self.pages.get_mut(&id) {
+            page.sync_local_storage(&mut self.storage);
             page.set_source(source);
+            page.restore_local_storage(&self.storage);
             page.sync_committed_title();
             title.clone_from(&page.navigation.committed().title);
             address = page.navigation.committed().target.display_address();
@@ -1391,7 +1438,7 @@ impl BrowserApp {
                 .extend(plan.resources.iter().map(|resource| resource.key.clone()));
             plan.requests()
                 .into_iter()
-                .map(|request| page.cookies.decorate_request(request))
+                .map(|request| self.cookies.decorate_request(request))
                 .collect::<Vec<_>>()
         };
         let handle = self.submit_cached_batch(requests);
@@ -1505,7 +1552,8 @@ impl BrowserApp {
                     Vec::new(),
                     &RuntimeLimits::default(),
                 );
-                let module_requests = page.module_round_requests(&mut preparation);
+                let module_requests =
+                    PageState::module_round_requests(&mut preparation, &self.cookies);
                 if !module_requests.is_empty() {
                     // An inline module with imports: fetch its dependency
                     // graph before anything in the batch runs.
@@ -1524,7 +1572,7 @@ impl BrowserApp {
                 let requests = plan
                     .requests()
                     .into_iter()
-                    .map(|request| page.cookies.decorate_request(request))
+                    .map(|request| self.cookies.decorate_request(request))
                     .collect::<Vec<_>>();
                 pending_request = Some((plan, requests, None));
                 break;
@@ -1575,7 +1623,7 @@ impl BrowserApp {
             let requests = plan
                 .requests()
                 .into_iter()
-                .map(|request| page.cookies.decorate_request(request))
+                .map(|request| self.cookies.decorate_request(request))
                 .collect::<Vec<_>>();
             (plan, requests)
         };
@@ -1780,7 +1828,7 @@ impl BrowserApp {
         };
         let final_url = response.final_url.clone();
         if let Some(page) = self.pages.get_mut(&id) {
-            for issue in page.cookies.absorb_response(&response) {
+            for issue in self.cookies.absorb_response(&response) {
                 eprintln!("browser cookie rejected: {}", issue.message);
             }
             let _history_result = page.history.replace(HistoryEntry::new(final_url.clone()));
@@ -1805,7 +1853,7 @@ impl BrowserApp {
             return;
         };
         for response in results.iter().flatten() {
-            for issue in page.cookies.absorb_response(response) {
+            for issue in self.cookies.absorb_response(response) {
                 eprintln!("browser cookie rejected: {}", issue.message);
             }
         }
@@ -1840,7 +1888,7 @@ impl BrowserApp {
                 return;
             };
             for response in results.iter().flatten() {
-                for issue in page.cookies.absorb_response(response) {
+                for issue in self.cookies.absorb_response(response) {
                     eprintln!("browser cookie rejected: {}", issue.message);
                 }
             }
@@ -1855,7 +1903,7 @@ impl BrowserApp {
             };
             // Module dependencies are discovered one round at a time: each
             // arriving module can name more. The batch runs when none remain.
-            let module_requests = page.module_round_requests(&mut preparation);
+            let module_requests = PageState::module_round_requests(&mut preparation, &self.cookies);
             if module_requests.is_empty() {
                 preparation.finish_modules();
                 report_script_diagnostics(&preparation.diagnostics);
@@ -2120,6 +2168,19 @@ impl BrowserApp {
         }
     }
 
+    /// Performs the navigation a clicked link or submit control leads to.
+    fn perform_content_navigation(&mut self, id: TabId, navigation: Option<ContentNavigation>) {
+        match navigation {
+            Some(ContentNavigation::Get(url)) => {
+                self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Push);
+            }
+            Some(ContentNavigation::Post { url, body }) => {
+                self.submit_form_navigation(id, url, body);
+            }
+            None => {}
+        }
+    }
+
     pub(super) fn handle_content_press(&mut self) {
         self.content_selecting = false;
         self.editor.set_focused(false);
@@ -2217,16 +2278,14 @@ impl BrowserApp {
             .flatten()
             .and_then(|hit_node| {
                 let page = self.pages.get(&id)?;
-                content_interaction::get_content_navigation_target(
+                content_interaction::content_navigation(
                     page.page.document().dom(),
                     hit_node,
                     &page.navigation.committed().target.history_url(),
                     &rendered,
                 )
             });
-        if let Some(url) = navigation {
-            self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Push);
-        }
+        self.perform_content_navigation(id, navigation);
         self.repaint_chrome();
     }
 
@@ -2696,7 +2755,7 @@ impl BrowserApp {
                 .content_node_at_cursor()
                 .and_then(|node| {
                     let page = self.pages.get(&self.tabs.active_id())?;
-                    content_interaction::get_content_navigation_target(
+                    content_interaction::content_navigation(
                         page.page.document().dom(),
                         node,
                         &page.navigation.committed().target.history_url(),
@@ -3133,14 +3192,19 @@ impl BrowserApp {
                             })
                         })
                         .flatten()
-                        .filter(|submission| submission.method == FormMethod::Get)
-                        .map(|submission| submission.target);
-                    if let Some(url) = target {
-                        self.navigate_target(
-                            tab,
-                            NavigationTarget::from_url(url),
-                            HistoryMode::Push,
-                        );
+                        .and_then(content_interaction::navigation_from_plan);
+                    match target {
+                        Some(ContentNavigation::Get(url)) => {
+                            self.navigate_target(
+                                tab,
+                                NavigationTarget::from_url(url),
+                                HistoryMode::Push,
+                            );
+                        }
+                        Some(ContentNavigation::Post { url, body }) => {
+                            self.submit_form_navigation(tab, url, body);
+                        }
+                        None => {}
                     }
                 }
                 true
@@ -3332,7 +3396,12 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             return;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                for page in self.pages.values_mut() {
+                    page.sync_local_storage(&mut self.storage);
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.address_menu = None;
                 self.address_selecting = false;
@@ -3410,6 +3479,8 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
         self.poll_network();
         self.recover_unresolved_render_requests();
         self.poll_disk_cache();
+        self.cookies.flush_if_dirty();
+        self.storage.flush_if_dirty();
         let active = self.tabs.active_id();
         let mut rendered_active = false;
         let mut navigation_candidates = Vec::new();
@@ -3439,6 +3510,7 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 Err(error) => eprintln!("render-browser page pump failed: {error}"),
             }
             page.drain_console();
+            page.sync_local_storage(&mut self.storage);
             if !page
                 .page
                 .runtime_mut()

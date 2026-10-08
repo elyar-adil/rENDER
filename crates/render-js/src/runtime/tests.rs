@@ -1980,6 +1980,45 @@ fn web_storage_areas_answer_the_storage_interface() {
 }
 
 #[test]
+fn local_storage_is_seeded_and_its_changes_are_reported_to_the_host() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime.seed_local_storage(&[
+        ("theme".to_owned(), "dark".to_owned()),
+        ("gone".to_owned(), "soon".to_owned()),
+    ]);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [localStorage.getItem('theme')];
+                localStorage.removeItem('gone');
+                localStorage.setItem('count', 7);
+                // Named property assignment is a storage write too.
+                localStorage.token = 'abc';
+                results.join(',');
+            ",
+        )
+        .expect("storage probe executes");
+    assert_eq!(outcome.value, JsValue::String("dark".to_owned()));
+    assert_eq!(
+        runtime.local_storage_entries(),
+        vec![
+            ("theme".to_owned(), "dark".to_owned()),
+            ("count".to_owned(), "7".to_owned()),
+            ("token".to_owned(), "abc".to_owned()),
+        ]
+    );
+
+    // Seeding replaces the area rather than merging into it.
+    runtime.seed_local_storage(&[("only".to_owned(), "this".to_owned())]);
+    assert_eq!(
+        runtime.local_storage_entries(),
+        vec![("only".to_owned(), "this".to_owned())]
+    );
+}
+
+#[test]
 fn own_string_keys_enumerate_in_insertion_order() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

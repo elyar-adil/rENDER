@@ -12,7 +12,9 @@ pub mod payload;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use render_net::{CacheValidators, FetchRequest, FetchResponse, Header, HttpStatus, Url};
+use render_net::{
+    CacheValidators, FetchRequest, FetchResponse, Header, HttpMethod, HttpStatus, Url,
+};
 
 /// Limits for the in-memory HTTP cache.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,6 +77,10 @@ pub enum CachePolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheSkipReason {
     UnsupportedScheme,
+    /// Only GET responses are cached. The cache key has no method, so a POST
+    /// would otherwise read a cached GET body and a POST body could be served
+    /// to a later GET.
+    NonGetMethod,
     RequestHasCookie,
     RequestHasByteRange,
     ResponseStatus(u16),
@@ -445,6 +451,9 @@ fn request_skip_reason(request: &FetchRequest) -> Option<CacheSkipReason> {
     if !matches!(request.url.scheme(), "http" | "https") {
         return Some(CacheSkipReason::UnsupportedScheme);
     }
+    if request.method != HttpMethod::Get {
+        return Some(CacheSkipReason::NonGetMethod);
+    }
     if request.cookie.is_some() {
         return Some(CacheSkipReason::RequestHasCookie);
     }
@@ -593,7 +602,7 @@ mod tests {
 
     use render_net::{
         ByteRange, CacheValidators, CancelToken, FetchConfig, FetchRequest, FetchResponse, Header,
-        HttpStatus, HttpTransport, Url,
+        HttpMethod, HttpStatus, HttpTransport, Url,
     };
 
     use super::{
@@ -628,6 +637,37 @@ mod tests {
 
     fn cacheable_response(url: &str, body: &[u8]) -> FetchResponse {
         response(url, vec![header("Cache-Control", "max-age=60")], body)
+    }
+
+    #[test]
+    fn a_post_neither_reads_nor_writes_the_cache() {
+        let url = "https://example.test/login";
+        let get = request(url);
+        let post = FetchRequest::new(HttpMethod::Post, Url::parse(url).expect("test URL"))
+            .with_body(b"user=a".to_vec());
+        let cacheable = cacheable_response(url, b"get body");
+        let now = Instant::now();
+        let mut cache = HttpCache::default();
+
+        // A GET response is cached, but a POST to the same URL must not read it.
+        let epoch = cache.epoch();
+        assert_eq!(
+            cache.store(&get, &cacheable, now, epoch),
+            CacheStoreOutcome::Stored
+        );
+        assert!(matches!(cache.lookup(&get, now), CacheLookup::Hit(_)));
+        assert_eq!(cache.lookup(&post, now), CacheLookup::Miss);
+
+        // A POST response is never stored, so a later GET cannot receive it.
+        let post_response = cacheable_response(url, b"post result");
+        assert_eq!(
+            cache.store(&post, &post_response, now, epoch),
+            CacheStoreOutcome::Skipped(CacheSkipReason::NonGetMethod)
+        );
+        assert_eq!(
+            cache_policy(&post, &post_response),
+            CachePolicy::Skip(CacheSkipReason::NonGetMethod)
+        );
     }
 
     #[test]
