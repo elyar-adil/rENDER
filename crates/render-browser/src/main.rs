@@ -75,6 +75,8 @@ fn main() {
 fn browser_main() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     use winit::platform::windows::EventLoopBuilderExtWindows as _;
+    #[cfg(target_os = "linux")]
+    use winit::platform::x11::EventLoopBuilderExtX11 as _;
     let Some(initial) = load_initial_page().map_err(|error| error.to_string())? else {
         return Ok(());
     };
@@ -82,8 +84,10 @@ fn browser_main() -> Result<(), String> {
     let event_loop = {
         let mut builder = EventLoop::<UserEvent>::with_user_event();
         // The event loop lives on our dedicated big-stack thread for the
-        // whole program lifetime; no other thread touches it.
-        #[cfg(target_os = "windows")]
+        // whole program lifetime; no other thread touches it. winit refuses to
+        // build an event loop off the main thread on Linux unless told
+        // otherwise, and the X11 and Wayland builders share that flag.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         builder.with_any_thread(true);
         builder.build().map_err(|error| error.to_string())?
     };
