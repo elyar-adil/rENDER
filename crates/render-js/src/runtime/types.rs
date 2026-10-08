@@ -256,6 +256,9 @@ pub struct TimerEntry {
     pub kind: TimerKind,
     pub callback: ObjectId,
     pub delay_ms: f64,
+    /// Extra arguments given to `setTimeout` or `setInterval` after the delay,
+    /// passed to the callback on every run.
+    pub arguments: Vec<JsValue>,
 }
 
 /// A scheduling request emitted while script executed. `Schedule` entries must

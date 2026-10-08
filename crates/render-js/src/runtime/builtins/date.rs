@@ -80,10 +80,10 @@ impl JsRuntime {
             }
             NativeFunction::DateToJSON => {
                 let primitive = self.date_to_primitive_number(dom, receiver)?;
-                if let JsValue::Number(number) = primitive {
-                    if !number.is_finite() {
-                        return Ok(JsValue::Null);
-                    }
+                if let JsValue::Number(number) = primitive
+                    && !number.is_finite()
+                {
+                    return Ok(JsValue::Null);
                 }
                 let method = self.get_member(dom, receiver, "toISOString")?;
                 let JsValue::Object(method) = method else {
@@ -752,10 +752,10 @@ fn is_weekday_token(token: &str) -> bool {
 /// because ECMA-262 leaves their exact grammar implementation-defined.
 fn parse_legacy_date(value: &str) -> Option<f64> {
     let mut text = value;
-    if let Some(open) = text.rfind('(') {
-        if text.ends_with(')') {
-            text = &text[..open];
-        }
+    if let Some(open) = text.rfind('(')
+        && text.ends_with(')')
+    {
+        text = &text[..open];
     }
     let normalized: String = text
         .chars()

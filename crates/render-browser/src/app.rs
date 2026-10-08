@@ -2597,6 +2597,46 @@ impl BrowserApp {
         None
     }
 
+    /// Whether the open content control is a textarea.
+    fn content_editor_is_multiline(&self) -> bool {
+        self.content_editor.as_ref().is_some_and(|content| {
+            self.pages.get(&content.tab).is_some_and(|page| {
+                content_interaction::is_multiline_text_control(
+                    page.page.document().dom(),
+                    content.node,
+                )
+            })
+        })
+    }
+
+    /// Enter in a textarea: the keydown still reaches the page, and a line break
+    /// is inserted unless the page cancelled the key. The editor stays open.
+    fn insert_content_line_break(&mut self) {
+        let Some((tab, node)) = self
+            .content_editor
+            .as_ref()
+            .map(|content| (content.tab, content.node))
+        else {
+            return;
+        };
+        let key_task = self
+            .pages
+            .get_mut(&tab)
+            .and_then(|page| page.page.queue_keydown_at(node, "Enter").ok());
+        let key_allowed = key_task.is_none_or(|task| {
+            self.pages.get_mut(&tab).is_some_and(|page| {
+                let (_, defaults) = page.run_page_turns();
+                defaults.get(&task).copied().unwrap_or(true)
+            })
+        });
+        self.drain_script_navigations(tab);
+        if key_allowed && let Some(content) = self.content_editor.as_mut() {
+            content.editor.insert_line_break();
+            self.sync_content_editor();
+        }
+        self.repaint_chrome();
+    }
+
     pub(super) fn sync_content_editor(&mut self) {
         let Some(content) = self.content_editor.as_ref() else {
             return;
@@ -2771,23 +2811,21 @@ impl BrowserApp {
                 }
             }
         }
-        if !has_glyph_run {
-            if let Some(style) = page.computed_styles.get(&node) {
-                let border = style
-                    .get("border-left-width")
-                    .and_then(|value| parse_css_pixels(value.css_text()))
-                    .unwrap_or(1.0);
-                let padding = style
-                    .get("padding-left")
-                    .and_then(|value| parse_css_pixels(value.css_text()))
-                    .unwrap_or(4.0);
-                base_x = rect.x + border.max(0.0) + padding.max(0.0);
-                font_size = style
-                    .get("font-size")
-                    .and_then(|value| parse_css_pixels(value.css_text()))
-                    .unwrap_or(font_size)
-                    .max(1.0);
-            }
+        if !has_glyph_run && let Some(style) = page.computed_styles.get(&node) {
+            let border = style
+                .get("border-left-width")
+                .and_then(|value| parse_css_pixels(value.css_text()))
+                .unwrap_or(1.0);
+            let padding = style
+                .get("padding-left")
+                .and_then(|value| parse_css_pixels(value.css_text()))
+                .unwrap_or(4.0);
+            base_x = rect.x + border.max(0.0) + padding.max(0.0);
+            font_size = style
+                .get("font-size")
+                .and_then(|value| parse_css_pixels(value.css_text()))
+                .unwrap_or(font_size)
+                .max(1.0);
         }
         let target = (x - base_x).max(0.0);
         let mut previous = 0.0;
@@ -3218,6 +3256,9 @@ impl BrowserApp {
             self.repaint_chrome();
             return true;
         }
+        // Read before the editor borrow below: a textarea takes Enter as a
+        // line break, and only the other controls submit on it.
+        let multiline = self.content_editor_is_multiline();
         let Some(content) = self.content_editor.as_mut() else {
             return false;
         };
@@ -3229,6 +3270,10 @@ impl BrowserApp {
             Key::Named(NamedKey::Enter) if composing || ime_enter_pending => {
                 // Enter belongs to the IME here: it either confirms the live
                 // composition or just confirmed one, so it must not submit.
+                true
+            }
+            Key::Named(NamedKey::Enter) if multiline => {
+                self.insert_content_line_break();
                 true
             }
             Key::Named(NamedKey::Enter) => {
@@ -3622,7 +3667,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 Ok(_) => {
                     let revision_after = page.page.document().dom().revision().as_u64();
                     page.dom_revision = revision_after;
-                    if revision_after != revision_before {
+                    // A change made by an input handler was already counted by its
+                    // turn, so the revision comparison alone would miss it.
+                    let changed_in_turn = std::mem::take(&mut page.dom_changed_in_turn);
+                    if revision_after != revision_before || changed_in_turn {
                         rendered_active |= *id == active;
                         title_candidates.push(*id);
                         page.scripts_resolved = false;

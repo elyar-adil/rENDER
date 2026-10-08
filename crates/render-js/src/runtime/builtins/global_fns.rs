@@ -255,6 +255,7 @@ impl JsRuntime {
                     callback,
                     0.0,
                     TimerKind::AnimationFrame,
+                    Vec::new(),
                 )))
             }
             NativeFunction::ClearTimeout | NativeFunction::ClearInterval => {

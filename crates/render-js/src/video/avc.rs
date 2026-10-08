@@ -395,7 +395,7 @@ impl<'a> BitReader<'a> {
     }
 
     fn read_u8(&mut self) -> Option<u8> {
-        if self.bit % 8 != 0 {
+        if !self.bit.is_multiple_of(8) {
             return None;
         }
         let byte = *self.bytes.get(self.bit / 8)?;
@@ -452,7 +452,7 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn push_bit(&mut self, bit: u32) {
-            if self.bit % 8 == 0 {
+            if self.bit.is_multiple_of(8) {
                 self.bytes.push(0);
             }
             if bit != 0 {
@@ -497,7 +497,7 @@ pub(crate) mod test_support {
         /// RBSP trailing bit: a one followed by alignment zeroes.
         pub(crate) fn push_trailing(&mut self) {
             self.push_bit(1);
-            while self.bit % 8 != 0 {
+            while !self.bit.is_multiple_of(8) {
                 self.push_bit(0);
             }
         }

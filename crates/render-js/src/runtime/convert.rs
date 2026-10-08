@@ -494,11 +494,11 @@ pub(crate) fn parse_int(text: &str, radix: Option<&JsValue>) -> Result<f64, JsEr
         return Ok(f64::NAN);
     }
     let mut body = digits_source;
-    if radix_value == 16 || radix_value == 0 {
-        if let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
-            body = rest;
-            radix_value = 16;
-        }
+    if (radix_value == 16 || radix_value == 0)
+        && let Some(rest) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X"))
+    {
+        body = rest;
+        radix_value = 16;
     }
     if radix_value == 0 {
         radix_value = 10;

@@ -298,18 +298,17 @@ impl JsRuntime {
         self.realm.configure_class_prototype(constructor, prototype);
         // The constructor's [[HomeObject]] is the class prototype, so field
         // initializers and constructor bodies resolve `super.x` there.
-        if let Some(ObjectHost::UserFunction(index)) = self.realm.host(constructor) {
-            if let Some(class) = self
+        if let Some(ObjectHost::UserFunction(index)) = self.realm.host(constructor)
+            && let Some(class) = self
                 .functions
                 .get_mut(index)
                 .and_then(|function| function.class.take())
-            {
-                let updated = Rc::new(ClassFunction {
-                    home_object: Some(prototype),
-                    ..(*class).clone()
-                });
-                self.functions[index].class = Some(updated);
-            }
+        {
+            let updated = Rc::new(ClassFunction {
+                home_object: Some(prototype),
+                ..(*class).clone()
+            });
+            self.functions[index].class = Some(updated);
         }
         if let Some(super_constructor) = super_constructor {
             self.realm

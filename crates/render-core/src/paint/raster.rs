@@ -297,10 +297,10 @@ impl CpuRasterizer {
             return Err(RasterCancelled);
         }
 
-        if let (Some(retained), Some(damage)) = (request.retained, request.damage) {
-            if Self::can_apply_damage(&request, retained, damage) {
-                return Self::rasterize_damage(&request, retained, damage, control);
-            }
+        if let (Some(retained), Some(damage)) = (request.retained, request.damage)
+            && Self::can_apply_damage(&request, retained, damage)
+        {
+            return Self::rasterize_damage(&request, retained, damage, control);
         }
 
         Self::rasterize_list_cancellable(
@@ -1609,10 +1609,10 @@ fn distance_to_rounded_rect(rect: PhysicalRect, radii: CornerRadii, point: Physi
     } else {
         None
     };
-    if let Some((center_x, center_y, radius)) = corner {
-        if radius > 0.0 {
-            return ((point.x - center_x).powi(2) + (point.y - center_y).powi(2)).sqrt() - radius;
-        }
+    if let Some((center_x, center_y, radius)) = corner
+        && radius > 0.0
+    {
+        return ((point.x - center_x).powi(2) + (point.y - center_y).powi(2)).sqrt() - radius;
     }
     distance_to_rect(rect, point)
 }
@@ -2164,10 +2164,10 @@ fn warp_surface(
             + inverse.scale_y * u32_to_f32(y)
             + inverse.translate_y;
         for x in left..right {
-            if let Some(color) = sample_bilinear(source, source_x, source_y) {
-                if let Some(index) = destination.index(x, y) {
-                    destination.pixels[index] = blend(destination.pixels[index], color, opacity);
-                }
+            if let Some(color) = sample_bilinear(source, source_x, source_y)
+                && let Some(index) = destination.index(x, y)
+            {
+                destination.pixels[index] = blend(destination.pixels[index], color, opacity);
             }
             source_x += inverse.scale_x;
             source_y += inverse.skew_y;

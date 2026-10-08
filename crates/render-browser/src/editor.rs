@@ -277,6 +277,18 @@ impl AddressEditor {
         self.record_edit(before);
     }
 
+    /// Inserts a line break at the cursor. Only a multi-line control calls this:
+    /// [`AddressEditor::insert`] drops control characters, so Enter in a single-line
+    /// field can never reach the value.
+    pub fn insert_line_break(&mut self) {
+        let before = self.snapshot();
+        self.delete_selection_raw();
+        self.text.insert(self.cursor, '\n');
+        self.cursor += 1;
+        self.preedit.clear();
+        self.record_edit(before);
+    }
+
     pub fn backspace(&mut self) {
         if self.selection().is_none() && self.cursor == 0 {
             return;

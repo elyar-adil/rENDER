@@ -44,12 +44,31 @@ pub(in crate::runtime) fn optional_timer_id(value: &JsValue) -> Option<u64> {
     }
 }
 
+/// The delay a timer function actually uses. The `timeout` argument is a `WebIDL`
+/// `long`: a non-finite number becomes 0, any other value wraps modulo 2^32 into
+/// the signed 32-bit range, and a negative result is 0 (HTML 8.6, timer
+/// initialization steps).
+#[must_use]
+pub(crate) fn timer_delay_ms(delay: f64) -> f64 {
+    if !delay.is_finite() {
+        return 0.0;
+    }
+    let wrapped = delay.trunc().rem_euclid(4_294_967_296.0);
+    let signed = if wrapped >= 2_147_483_648.0 {
+        wrapped - 4_294_967_296.0
+    } else {
+        wrapped
+    };
+    signed.max(0.0)
+}
+
 impl JsRuntime {
     pub(in crate::runtime) fn register_timer_entry(
         &mut self,
         callback: ObjectId,
         delay_ms: f64,
         kind: TimerKind,
+        arguments: Vec<JsValue>,
     ) -> f64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
@@ -59,6 +78,7 @@ impl JsRuntime {
                 kind,
                 callback,
                 delay_ms,
+                arguments,
             },
         );
         self.pending_timer_requests
@@ -92,10 +112,13 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => 0.0,
             Some(value) => to_number(value)?,
         };
-        let delay_ms = if delay.is_nan() { 0.0 } else { delay.max(0.0) };
-        Ok(JsValue::Number(
-            self.register_timer_entry(callback, delay_ms, kind),
-        ))
+        let extra = arguments.get(2..).unwrap_or_default().to_vec();
+        Ok(JsValue::Number(self.register_timer_entry(
+            callback,
+            timer_delay_ms(delay),
+            kind,
+            extra,
+        )))
     }
 
     pub(in crate::runtime) fn cancel_timer(&mut self, arguments: &[JsValue]) -> JsValue {

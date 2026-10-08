@@ -813,10 +813,10 @@ fn collect_test_paths(directory: &Path, paths: &mut Vec<String>) {
         let path = entry.path();
         if path.is_dir() {
             collect_test_paths(&path, paths);
-        } else if path.extension().is_some_and(|extension| extension == "js") {
-            if let Ok(relative) = path.strip_prefix(Path::new(TEST262_ROOT).join("test")) {
-                paths.push(relative.to_string_lossy().replace('\\', "/"));
-            }
+        } else if path.extension().is_some_and(|extension| extension == "js")
+            && let Ok(relative) = path.strip_prefix(Path::new(TEST262_ROOT).join("test"))
+        {
+            paths.push(relative.to_string_lossy().replace('\\', "/"));
         }
     }
 }

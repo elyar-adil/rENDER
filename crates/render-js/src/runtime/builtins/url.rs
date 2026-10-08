@@ -287,28 +287,25 @@ impl JsRuntime {
                     owner,
                 };
             }
-            if let Some(owner) = owner {
-                if let Some(ObjectHost::UrlInstance(mut url)) = self.realm.host(owner) {
-                    let query = pairs
-                        .iter()
-                        .map(|(name, value)| format!("{name}={value}"))
-                        .collect::<Vec<_>>()
-                        .join("&");
-                    url.set_query(Some(&query));
-                    if let Some(host) = self.realm.host_mut(owner) {
-                        *host = ObjectHost::UrlInstance(url.clone());
-                    }
-                    self.realm.set_property(
-                        owner,
-                        "href".to_owned(),
-                        JsValue::String(url.to_string()),
-                    );
-                    self.realm.set_property(
-                        owner,
-                        "search".to_owned(),
-                        JsValue::String(format!("?{query}")),
-                    );
+            if let Some(owner) = owner
+                && let Some(ObjectHost::UrlInstance(mut url)) = self.realm.host(owner)
+            {
+                let query = pairs
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
+                url.set_query(Some(&query));
+                if let Some(host) = self.realm.host_mut(owner) {
+                    *host = ObjectHost::UrlInstance(url.clone());
                 }
+                self.realm
+                    .set_property(owner, "href".to_owned(), JsValue::String(url.to_string()));
+                self.realm.set_property(
+                    owner,
+                    "search".to_owned(),
+                    JsValue::String(format!("?{query}")),
+                );
             }
         }
         result

@@ -732,6 +732,26 @@ fn script_assigned_document_title_propagates_to_the_committed_title() {
 }
 
 #[test]
+fn a_dom_change_in_a_turn_is_kept_for_the_event_loop_even_when_the_caller_ignores_it() {
+    let mut page = PageState::new(PageSource {
+        html: "<!doctype html><p id=message>before</p>".into(),
+        title: "page".into(),
+        target: NavigationTarget::Url(Url::parse("https://example.test/").expect("page URL")),
+    });
+    page.page
+        .queue_script("document.getElementById('message').textContent = 'after';")
+        .expect("script queues");
+
+    // A caller that discards the flag, as the click and Enter paths do.
+    let _ = page.run_page_turns();
+
+    assert!(
+        page.dom_changed_in_turn,
+        "the event loop must still see that the page changed"
+    );
+}
+
+#[test]
 fn timer_deferred_document_title_propagates_on_a_later_turn() {
     let mut page = PageState::new(PageSource {
         html: "<!doctype html><html><body></body></html>".into(),
@@ -2034,7 +2054,7 @@ fn raw_keystrokes_are_dropped_while_a_composition_is_live() {
 }
 
 #[test]
-fn enter_in_a_formless_control_submits_through_the_page_hidden_form() {
+fn enter_in_a_textarea_inserts_a_line_break_and_does_not_submit() {
     let (mut app, tab, textarea, _button) = headless_chat_app();
     click_content_at(&mut app, 100.0, 30.0);
     let content = app.content_editor.as_ref().expect("box gains focus");
@@ -2057,19 +2077,106 @@ fn enter_in_a_formless_control_submits_through_the_page_hidden_form() {
         history_before
     );
 
-    // A second Enter submits through the page's hidden form.
+    // In a textarea the default action of Enter is a line break (HTML 4.10.11),
+    // so the second Enter adds a newline and the form stays unsubmitted. Only a
+    // page script that cancels the keydown could change that.
     app.handle_keyboard(&pressed_named(NamedKey::Enter));
+    assert!(app.content_editor.is_some(), "the textarea stays open");
+    assert_eq!(committed_value(&app, tab, textarea), "a旅行\n");
     let page = app.pages.get(&tab).expect("page stays open");
-    assert!(
-        page.history.len() > history_before,
-        "Enter must submit through the page's hidden form"
+    assert_eq!(
+        page.history.len(),
+        history_before,
+        "Enter in a textarea must not submit the form"
+    );
+}
+
+#[test]
+fn password_and_email_fields_take_typed_text() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><form><input id=pw type=password name=pw value=''>\
+         <input id=mail type=email name=mail value=''></form>",
+    );
+    let (password, email) = {
+        let dom = app.pages.get(&tab).expect("page").page.document().dom();
+        (find_id(dom, "pw"), find_id(dom, "mail"))
+    };
+    for (node, top) in [(password, 150.0), (email, 200.0)] {
+        app.pages.get_mut(&tab).expect("page").geometry.insert(
+            node.as_u64(),
+            ElementRect {
+                x: 200.0,
+                y: top,
+                width: 400.0,
+                height: 34.0,
+            },
+        );
+    }
+
+    click_content_at(&mut app, 205.0, 167.0);
+    assert_eq!(
+        app.content_editor.as_ref().expect("password focus").node,
+        password
+    );
+    app.handle_keyboard(&pressed_character("s"));
+    app.handle_keyboard(&pressed_character("3"));
+    assert_eq!(committed_value(&app, tab, password), "s3");
+
+    click_content_at(&mut app, 205.0, 217.0);
+    assert_eq!(
+        app.content_editor.as_ref().expect("email focus").node,
+        email
+    );
+    app.handle_keyboard(&pressed_character("a"));
+    assert_eq!(committed_value(&app, tab, email), "a");
+}
+
+#[test]
+fn a_javascript_link_does_not_navigate_and_an_ordinary_link_does() {
+    let parsed = parse_document(
+        "<!doctype html><a id=script href='javascript:void(0)'>x</a>\
+         <a id=plain href='/next'>y</a>",
+    );
+    let base = Url::parse("https://example.test/index.html").expect("base URL");
+    let rendered = |_: NodeId| true;
+    assert_eq!(
+        crate::content_interaction::content_navigation(
+            &parsed.dom,
+            find_id(&parsed.dom, "script"),
+            &base,
+            &rendered,
+        ),
+        None
     );
     assert_eq!(
-        page.history.current().url.as_str(),
-        "file:///s?ie=utf-8&wd=a%E6%97%85%E8%A1%8C",
-        "the typed text must ride along as the hidden form's query field"
+        crate::content_interaction::content_navigation(
+            &parsed.dom,
+            find_id(&parsed.dom, "plain"),
+            &base,
+            &rendered,
+        ),
+        Some(crate::content_interaction::ContentNavigation::Get(
+            Url::parse("https://example.test/next").expect("target URL")
+        ))
     );
-    assert!(app.content_editor.is_none());
+}
+
+#[test]
+fn an_error_status_still_renders_the_html_the_server_sent() {
+    let url = Url::parse(
+        "data:text/html,%3Ctitle%3EMissing%3C%2Ftitle%3E%3Cp%3Eno%20such%20page%3C%2Fp%3E",
+    )
+    .expect("valid data URL");
+    let mut response = HttpTransport::new(FetchConfig::default())
+        .fetch(&FetchRequest::get(url), &render_net::CancelToken::default())
+        .expect("data response");
+    response.status = render_net::HttpStatus::from_u16(404);
+    let source = source_from_network_response(&response).expect("an HTML error page renders");
+    assert!(source.html.contains("no such page"));
+
+    response.body.clear();
+    let error = source_from_network_response(&response).expect_err("an empty error body");
+    assert!(error.contains("HTTP status 404"), "{error}");
 }
 
 #[test]

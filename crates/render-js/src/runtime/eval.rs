@@ -776,10 +776,10 @@ impl JsRuntime {
                                 )?;
                             }
                         }
-                    } else if *kind == VariableKind::Let {
-                        if let BindingTarget::Name(name) = target {
-                            self.initialize_binding(name, JsValue::Undefined, *kind)?;
-                        }
+                    } else if *kind == VariableKind::Let
+                        && let BindingTarget::Name(name) = target
+                    {
+                        self.initialize_binding(name, JsValue::Undefined, *kind)?;
                     }
                 }
                 Ok(Completion::Normal(value))

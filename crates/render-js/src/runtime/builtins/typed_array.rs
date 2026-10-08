@@ -180,7 +180,7 @@ impl JsRuntime {
             reason = "buffer lengths stay far below any precision boundary"
         )]
         let offset_value = offset as usize;
-        if offset_value % element_size != 0 {
+        if !offset_value.is_multiple_of(element_size) {
             return Err(self.range_error("byteOffset must be a multiple of the element size"));
         }
         if offset_value > total_bytes {

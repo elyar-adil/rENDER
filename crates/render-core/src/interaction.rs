@@ -1065,6 +1065,18 @@ pub fn activation_plan(dom: &Dom, node: NodeId) -> Option<ActivationPlan> {
     })
 }
 
+/// Whether typing edits an `input` of this type as text. These are the types
+/// whose value is a free string with no per-character filter: `text`,
+/// `search`, `email`, `password`, `tel` and `url`. `number` is excluded until
+/// its value sanitization (HTML 4.10.5.4) filters typed characters.
+#[must_use]
+pub fn is_text_entry_input_type(input_type: &str) -> bool {
+    matches!(
+        input_type.to_ascii_lowercase().as_str(),
+        "text" | "search" | "email" | "password" | "tel" | "url"
+    )
+}
+
 fn input_activation(dom: &Dom, node: NodeId) -> Option<(InteractiveKind, DefaultActionKind)> {
     let input_type = dom
         .attribute(node, "type")
@@ -1088,7 +1100,7 @@ fn input_activation(dom: &Dom, node: NodeId) -> Option<(InteractiveKind, Default
             InteractiveKind::Button,
             DefaultActionKind::InvokeButton(button_behavior(dom, node)),
         )),
-        "text" | "search" | "email" | "password" | "tel" | "url" | "number" => Some((
+        value if is_text_entry_input_type(value) => Some((
             InteractiveKind::TextInput,
             DefaultActionKind::BeginTextEditing,
         )),
@@ -1377,6 +1389,22 @@ mod tests {
             plan_form_submission(&parsed.dom, by_id(&parsed.dom, "odd-button"), &document_url)
                 .expect("unrecognized enctype should plan");
         assert_eq!(odd.enctype, FormEnctype::UrlEncoded);
+    }
+
+    #[test]
+    fn text_entry_input_types_are_the_free_string_types() {
+        for input_type in ["text", "search", "email", "password", "tel", "url", "TEXT"] {
+            assert!(
+                super::is_text_entry_input_type(input_type),
+                "{input_type} is typed into as text"
+            );
+        }
+        for input_type in ["number", "checkbox", "date", "color"] {
+            assert!(
+                !super::is_text_entry_input_type(input_type),
+                "{input_type} is not a free text field yet"
+            );
+        }
     }
 
     #[test]

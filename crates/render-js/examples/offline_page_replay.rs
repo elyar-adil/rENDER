@@ -258,49 +258,49 @@ fn collect_scripts(
     let Some(node_ref) = dom.node(node) else {
         return;
     };
-    if let NodeKind::Element(element) = node_ref.kind() {
-        if element.local_name == "script" {
-            let script_type = attribute(element, "type").unwrap_or_default();
-            let executable = script_type.is_empty()
-                || script_type.contains("javascript")
-                || script_type.contains("ecmascript")
-                || script_type == "module";
-            let is_module = script_type.eq_ignore_ascii_case("module");
-            if executable && !has_attribute(element, "nomodule") {
-                let scheduling = if is_module || has_attribute(element, "defer") {
-                    Scheduling::Deferred
-                } else {
-                    Scheduling::ParserBlocking
-                };
-                let list = match scheduling {
-                    Scheduling::ParserBlocking => &mut *blocking,
-                    Scheduling::Deferred => &mut *deferred,
-                };
-                if let Some(src) = attribute(element, "src") {
-                    let url = resolve(&src, base_url);
-                    match url.as_ref().and_then(|url| manifest.get(url.as_str())) {
-                        Some(file) => {
-                            let path = assets_dir.join(file);
-                            match fs::read_to_string(&path) {
-                                Ok(source) => {
-                                    let label = format!("{src} [{file}]");
-                                    list.push(PendingScript { label, source });
-                                }
-                                Err(error) => {
-                                    println!("cannot read asset {}: {error}", path.display());
-                                }
+    if let NodeKind::Element(element) = node_ref.kind()
+        && element.local_name == "script"
+    {
+        let script_type = attribute(element, "type").unwrap_or_default();
+        let executable = script_type.is_empty()
+            || script_type.contains("javascript")
+            || script_type.contains("ecmascript")
+            || script_type == "module";
+        let is_module = script_type.eq_ignore_ascii_case("module");
+        if executable && !has_attribute(element, "nomodule") {
+            let scheduling = if is_module || has_attribute(element, "defer") {
+                Scheduling::Deferred
+            } else {
+                Scheduling::ParserBlocking
+            };
+            let list = match scheduling {
+                Scheduling::ParserBlocking => &mut *blocking,
+                Scheduling::Deferred => &mut *deferred,
+            };
+            if let Some(src) = attribute(element, "src") {
+                let url = resolve(&src, base_url);
+                match url.as_ref().and_then(|url| manifest.get(url.as_str())) {
+                    Some(file) => {
+                        let path = assets_dir.join(file);
+                        match fs::read_to_string(&path) {
+                            Ok(source) => {
+                                let label = format!("{src} [{file}]");
+                                list.push(PendingScript { label, source });
+                            }
+                            Err(error) => {
+                                println!("cannot read asset {}: {error}", path.display());
                             }
                         }
-                        None => println!("no manifest entry for {src}"),
                     }
-                } else {
-                    let text = inline_text(dom, node);
-                    let label = format!("inline[{}…]", &text[..text.len().min(40)]);
-                    list.push(PendingScript {
-                        label,
-                        source: text,
-                    });
+                    None => println!("no manifest entry for {src}"),
                 }
+            } else {
+                let text = inline_text(dom, node);
+                let label = format!("inline[{}…]", &text[..text.len().min(40)]);
+                list.push(PendingScript {
+                    label,
+                    source: text,
+                });
             }
         }
     }

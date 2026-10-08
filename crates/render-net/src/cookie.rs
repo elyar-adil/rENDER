@@ -515,28 +515,28 @@ fn parse_cookie_date(value: &str) -> Option<i64> {
     // Each token fills the first field of the four that it matches and that is
     // still empty, in the order RFC 6265 §5.1.1 gives.
     for token in value.split(is_delimiter).filter(|token| !token.is_empty()) {
-        if time.is_none() {
-            if let Some(parsed) = parse_time_token(token) {
-                time = Some(parsed);
-                continue;
-            }
+        if time.is_none()
+            && let Some(parsed) = parse_time_token(token)
+        {
+            time = Some(parsed);
+            continue;
         }
-        if day.is_none() {
-            if let Some((number, _)) = leading_number(token, 1, 2) {
-                day = Some(number);
-                continue;
-            }
+        if day.is_none()
+            && let Some((number, _)) = leading_number(token, 1, 2)
+        {
+            day = Some(number);
+            continue;
         }
-        if month.is_none() {
-            if let Some(index) = parse_month_token(token, &MONTHS) {
-                month = Some(index);
-                continue;
-            }
+        if month.is_none()
+            && let Some(index) = parse_month_token(token, &MONTHS)
+        {
+            month = Some(index);
+            continue;
         }
-        if year.is_none() {
-            if let Some((number, _)) = leading_number(token, 2, 4) {
-                year = Some(number);
-            }
+        if year.is_none()
+            && let Some((number, _)) = leading_number(token, 2, 4)
+        {
+            year = Some(number);
         }
     }
     let (hour, minute, second) = time?;

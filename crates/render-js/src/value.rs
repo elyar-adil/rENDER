@@ -4718,20 +4718,20 @@ impl Realm {
         }
         // `Symbol.prototype.description` is a getter-only accessor (spec);
         // reuse the method object installed above as the getter.
-        if let Some(descriptor) = objects[prototype.0].properties.remove("[description]") {
-            if let JsValue::Object(getter) = descriptor.value {
-                objects[prototype.0].properties.insert(
-                    "description".to_owned(),
-                    PropertyDescriptor {
-                        value: JsValue::Undefined,
-                        writable: false,
-                        getter: Some(getter),
-                        setter: None,
-                        enumerable: false,
-                        configurable: true,
-                    },
-                );
-            }
+        if let Some(descriptor) = objects[prototype.0].properties.remove("[description]")
+            && let JsValue::Object(getter) = descriptor.value
+        {
+            objects[prototype.0].properties.insert(
+                "description".to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
         }
         // Well-known symbols are real symbol values at fixed ids so engine
         // internals can key on them without a registry lookup.

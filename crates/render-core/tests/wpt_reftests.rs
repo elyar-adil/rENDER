@@ -414,28 +414,27 @@ fn has_unsupported_markup(source: &str) -> bool {
 fn has_skip_flag(dom: &Dom) -> bool {
     let mut pending = vec![dom.document()];
     while let Some(node) = pending.pop() {
-        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind) {
-            if element.local_name == "meta"
-                && dom
-                    .attribute(node, "name")
-                    .ok()
-                    .flatten()
-                    .is_some_and(|name| name.eq_ignore_ascii_case("flags"))
-                && dom
-                    .attribute(node, "content")
-                    .ok()
-                    .flatten()
-                    .is_some_and(|content| {
-                        content.split_ascii_whitespace().any(|flag| {
-                            matches!(
-                                flag.to_ascii_lowercase().as_str(),
-                                "interact" | "manual" | "print" | "paged"
-                            )
-                        })
+        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind)
+            && element.local_name == "meta"
+            && dom
+                .attribute(node, "name")
+                .ok()
+                .flatten()
+                .is_some_and(|name| name.eq_ignore_ascii_case("flags"))
+            && dom
+                .attribute(node, "content")
+                .ok()
+                .flatten()
+                .is_some_and(|content| {
+                    content.split_ascii_whitespace().any(|flag| {
+                        matches!(
+                            flag.to_ascii_lowercase().as_str(),
+                            "interact" | "manual" | "print" | "paged"
+                        )
                     })
-            {
-                return true;
-            }
+                })
+        {
+            return true;
         }
         pending.extend(dom.children(node).unwrap_or_default().iter().copied());
     }
@@ -448,27 +447,26 @@ fn match_link_targets(dom: &Dom, test_path: &Path, reference_path: &Path) -> boo
     };
     let mut pending = vec![dom.document()];
     while let Some(node) = pending.pop() {
-        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind) {
-            if element.local_name == "link"
-                && dom
-                    .attribute(node, "rel")
-                    .ok()
-                    .flatten()
-                    .is_some_and(|rel| {
-                        rel.split_ascii_whitespace()
-                            .any(|token| token.eq_ignore_ascii_case("match"))
-                    })
-                && let Some(href) = dom.attribute(node, "href").ok().flatten()
-                && let Ok(base) = Url::from_file_path(test_path)
-                && let Ok(target) = base.join(href)
-                && target.scheme() == "file"
-                && target.query().is_none()
-                && target.fragment().is_none()
-                && let Ok(path) = target.to_file_path()
-                && path.canonicalize().ok().as_ref() == Some(&expected)
-            {
-                return true;
-            }
+        if let Some(NodeKind::Element(element)) = dom.node(node).map(Node::kind)
+            && element.local_name == "link"
+            && dom
+                .attribute(node, "rel")
+                .ok()
+                .flatten()
+                .is_some_and(|rel| {
+                    rel.split_ascii_whitespace()
+                        .any(|token| token.eq_ignore_ascii_case("match"))
+                })
+            && let Some(href) = dom.attribute(node, "href").ok().flatten()
+            && let Ok(base) = Url::from_file_path(test_path)
+            && let Ok(target) = base.join(href)
+            && target.scheme() == "file"
+            && target.query().is_none()
+            && target.fragment().is_none()
+            && let Ok(path) = target.to_file_path()
+            && path.canonicalize().ok().as_ref() == Some(&expected)
+        {
+            return true;
         }
         pending.extend(dom.children(node).unwrap_or_default().iter().copied());
     }

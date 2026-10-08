@@ -148,23 +148,26 @@ pub(super) fn error_source(target: NavigationTarget, message: &str) -> PageSourc
 
 pub(super) fn source_from_network_response(response: &FetchResponse) -> Result<PageSource, String> {
     let target = NavigationTarget::Url(response.final_url.clone());
-    if !response.status.is_success() {
-        return Err(format!(
-            "The server returned HTTP status {}.",
-            response.status.as_u16()
-        ));
-    }
-
+    let status = response.status.as_u16();
     let media_type = response
         .content_type
         .as_ref()
         .map(|content_type| content_type.media_type.as_str());
-    if let Some(media_type) = media_type
-        && !matches!(media_type, "text/html" | "text/plain")
-    {
-        return Err(format!(
-            "The response content type '{media_type}' is not renderable as a document yet."
-        ));
+    // The status code does not stop rendering: a 4xx or 5xx response with an
+    // HTML body is the page the server sent. Only a body the engine cannot
+    // render is replaced by a status message.
+    if !matches!(media_type, None | Some("text/html" | "text/plain")) {
+        return Err(if response.status.is_success() {
+            format!(
+                "The response content type '{}' is not renderable as a document yet.",
+                media_type.unwrap_or_default()
+            )
+        } else {
+            format!("The server returned HTTP status {status}.")
+        });
+    }
+    if !response.status.is_success() && response.body.is_empty() {
+        return Err(format!("The server returned HTTP status {status}."));
     }
 
     let decoded = decode_html_bytes(

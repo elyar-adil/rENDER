@@ -797,30 +797,28 @@ impl Solver<'_> {
             // scrollport stops its content counting towards an outer one.
             self.clipping_boxes.push((fragment, node.source));
         }
-        if out_of_flow {
-            if let Some(outer) = self.fragment_outer_rect(fragment) {
-                let target_x = left.map_or_else(
-                    || {
-                        right.map_or(outer.origin.x, |right| {
-                            containing.right() - right - outer.size.width
-                        })
-                    },
-                    |left| containing.origin.x + left,
-                );
-                let target_y = top.map_or_else(
-                    || {
-                        bottom.map_or(outer.origin.y, |bottom| {
-                            containing.bottom() - bottom - outer.size.height
-                        })
-                    },
-                    |top| containing.origin.y + top,
-                );
-                self.translate_fragment_subtree(
-                    fragment,
-                    target_x - outer.origin.x,
-                    target_y - outer.origin.y,
-                );
-            }
+        if out_of_flow && let Some(outer) = self.fragment_outer_rect(fragment) {
+            let target_x = left.map_or_else(
+                || {
+                    right.map_or(outer.origin.x, |right| {
+                        containing.right() - right - outer.size.width
+                    })
+                },
+                |left| containing.origin.x + left,
+            );
+            let target_y = top.map_or_else(
+                || {
+                    bottom.map_or(outer.origin.y, |bottom| {
+                        containing.bottom() - bottom - outer.size.height
+                    })
+                },
+                |top| containing.origin.y + top,
+            );
+            self.translate_fragment_subtree(
+                fragment,
+                target_x - outer.origin.x,
+                target_y - outer.origin.y,
+            );
         }
         Some(BlockResult {
             fragment,

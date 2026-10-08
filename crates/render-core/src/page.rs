@@ -1242,10 +1242,10 @@ impl Page {
                 let result = match task {
                     PageTask::Timer { id } => {
                         let from_revision = dom.revision();
-                        let fired = runtime.fire_timer(dom, id);
-                        if let Ok(Some(delay_ms)) = fired {
-                            // Intervals re-arm from their registration period;
-                            // the runtime keeps the entry registered.
+                        let (next_period, fired) = runtime.fire_timer_reporting(dom, id);
+                        if let Some(delay_ms) = next_period {
+                            // Intervals re-arm from their registration period, even
+                            // when this run's callback threw.
                             let delay = timer_delay_duration(delay_ms);
                             if let Ok(timer_id) =
                                 scheduler.set_timeout(delay, PageTask::Timer { id })
@@ -1253,7 +1253,7 @@ impl Page {
                                 js_timers.insert(id, timer_id);
                             }
                         }
-                        fired.map(|_| ScriptOutcome {
+                        fired.map(|()| ScriptOutcome {
                             value: JsValue::Undefined,
                             from_revision,
                             to_revision: dom.revision(),

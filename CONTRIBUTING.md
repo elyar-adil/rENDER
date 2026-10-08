@@ -2,7 +2,7 @@
 
 ## Setup
 
-Install a stable Rust toolchain (1.85 or newer), then build the workspace:
+Install a stable Rust toolchain (1.88 or newer; the code uses let-chains), then build the workspace:
 
 ```bash
 cargo build --workspace

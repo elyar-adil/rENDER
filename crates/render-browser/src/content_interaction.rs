@@ -73,6 +73,18 @@ pub(crate) fn is_content_hit_command(command: &DisplayCommand) -> bool {
     )
 }
 
+/// Whether `node` is a `textarea`, the one text control where Enter is a line
+/// break rather than a form submission.
+pub(crate) fn is_multiline_text_control(
+    dom: &render_core::dom::Dom,
+    node: render_core::dom::NodeId,
+) -> bool {
+    matches!(
+        dom.node(node).map(render_core::dom::Node::kind),
+        Some(render_core::dom::NodeKind::Element(element)) if element.local_name.as_str() == "textarea"
+    )
+}
+
 /// Where activating a navigable control leads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ContentNavigation {
@@ -93,7 +105,11 @@ pub(crate) fn content_navigation(
     while let Some(node) = candidate {
         match activation_plan(dom, node).map(|plan| plan.default_action) {
             Some(DefaultActionKind::FollowHyperlink { href }) => {
-                return document_url.join(&href).ok().map(ContentNavigation::Get);
+                let target = document_url.join(&href).ok()?;
+                // A `javascript:` link would run script in the page, which the
+                // shell cannot do yet. The click does nothing rather than
+                // replacing the page with an unsupported-scheme error.
+                return (target.scheme() != "javascript").then_some(ContentNavigation::Get(target));
             }
             Some(DefaultActionKind::InvokeButton(ButtonBehavior::Submit))
                 if dom.attribute(node, "disabled").ok().flatten().is_none() =>
@@ -225,7 +241,7 @@ fn is_query_control(dom: &render_core::dom::Dom, node: render_core::dom::NodeId)
                 .flatten()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("text");
-            matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search")
+            render_core::interaction::is_text_entry_input_type(input_type)
         }
         "textarea" => true,
         _ => false,
@@ -391,7 +407,7 @@ pub(crate) fn content_text_input_value(
                 .flatten()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("text");
-            matches!(input_type.to_ascii_lowercase().as_str(), "text" | "search").then(|| {
+            render_core::interaction::is_text_entry_input_type(input_type).then(|| {
                 dom.attribute(node, "value")
                     .ok()
                     .flatten()

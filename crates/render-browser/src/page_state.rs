@@ -83,6 +83,10 @@ pub(super) struct PageState {
     pub(super) held_scripts: Option<ScriptBatchPreparation>,
     pub(super) started_scripts: HashSet<render_core::dom::NodeId>,
     pub(super) initial_script_scan_completed: bool,
+    /// The DOM changed in a page turn run from an input handler. The caller may
+    /// ignore that turn's change flag, so the event loop takes this instead and
+    /// repaints and rescans scripts for the page.
+    pub(super) dom_changed_in_turn: bool,
     /// A DOM mutation (or style/image generation change) arrived while a
     /// render for this tab was already running. The running render stays
     /// committable, so instead of superseding it — which starves commits
@@ -217,6 +221,7 @@ impl PageState {
             held_scripts: None,
             started_scripts: HashSet::new(),
             initial_script_scan_completed: false,
+            dom_changed_in_turn: false,
             render_dirty: false,
             render_dirty_viewport: None,
             frame: Vec::new(),
@@ -504,6 +509,7 @@ impl PageState {
             // Timers, event handlers and fetch callbacks may append scripts
             // long after the initial document scan completed.
             self.scripts_resolved = false;
+            self.dom_changed_in_turn = true;
         }
         (changed, defaults)
     }

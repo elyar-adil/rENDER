@@ -499,8 +499,23 @@ impl JsRuntime {
     /// Propagates errors thrown inside the callback, except promise rejections
     /// which stay contained like in ordinary microtask execution.
     pub fn fire_timer(&mut self, dom: &mut Dom, id: u64) -> Result<Option<f64>, JsError> {
+        let (next_period, outcome) = self.fire_timer_reporting(dom, id);
+        outcome.map(|()| next_period)
+    }
+
+    /// Runs one timer callback. Returns the period of the next run, if the timer
+    /// repeats, together with the callback's outcome, and the two are
+    /// independent: an interval keeps repeating when its callback throws
+    /// (HTML 8.6), so the embedding must reschedule from the first value and
+    /// report the second. A callback that cancelled its own interval gets no
+    /// next run.
+    pub fn fire_timer_reporting(
+        &mut self,
+        dom: &mut Dom,
+        id: u64,
+    ) -> (Option<f64>, Result<(), JsError>) {
         let Some(entry) = self.timers.get(&id).cloned() else {
-            return Ok(None);
+            return (None, Ok(()));
         };
         if entry.kind != TimerKind::Interval {
             self.timers.remove(&id);
@@ -509,9 +524,10 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
-        self.call(dom, entry.callback, &[])?;
+        let outcome = self.call(dom, entry.callback, &entry.arguments).map(|_| ());
         self.queue_mutation_deliveries(dom);
-        Ok((entry.kind == TimerKind::Interval).then_some(entry.delay_ms))
+        let repeats = entry.kind == TimerKind::Interval && self.timers.contains_key(&id);
+        (repeats.then_some(entry.delay_ms), outcome)
     }
 
     /// Dispatch a trusted DOM event at `target` as if the user agent produced

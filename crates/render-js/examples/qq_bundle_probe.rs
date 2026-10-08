@@ -367,18 +367,18 @@ fn probe_main() -> ExitCode {
             eprintln!("host shim failed: {error}");
             return ExitCode::FAILURE;
         }
-        if std::env::var_os("RENDER_QQ_TRACE_PROTO").is_some() {
-            if let Err(error) = runtime.execute(dom, PROTO_TRACE_SHIM) {
-                eprintln!("proto trace shim failed: {error}");
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    if options.pre_reflect {
-        if let Err(error) = runtime.execute(dom, PRE_REFLECT_SHIM) {
-            eprintln!("pre-reflect shim failed: {error}");
+        if std::env::var_os("RENDER_QQ_TRACE_PROTO").is_some()
+            && let Err(error) = runtime.execute(dom, PROTO_TRACE_SHIM)
+        {
+            eprintln!("proto trace shim failed: {error}");
             return ExitCode::FAILURE;
         }
+    }
+    if options.pre_reflect
+        && let Err(error) = runtime.execute(dom, PRE_REFLECT_SHIM)
+    {
+        eprintln!("pre-reflect shim failed: {error}");
+        return ExitCode::FAILURE;
     }
 
     let started = Instant::now();

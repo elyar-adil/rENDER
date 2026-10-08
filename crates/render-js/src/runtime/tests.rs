@@ -652,6 +652,94 @@ fn set_timeout_registers_timer_and_requests_scheduling() {
 }
 
 #[test]
+fn an_interval_keeps_repeating_after_its_callback_throws() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var runs = 0;
+                setInterval(function () {
+                    runs += 1;
+                    if (runs === 1) { throw new Error('first run fails'); }
+                }, 7);
+            ",
+        )
+        .expect("interval registration should succeed");
+    let _ = runtime.take_pending_timer_requests();
+
+    let (next, first) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert!(first.is_err(), "the first run's error is reported");
+    assert_eq!(next, Some(7.0), "the interval is still rescheduled");
+
+    let (next, second) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert!(second.is_ok());
+    assert_eq!(next, Some(7.0));
+    runtime
+        .execute(&mut parsed.dom, "runs")
+        .map(|outcome| assert_eq!(outcome.value, JsValue::Number(2.0)))
+        .expect("reading runs");
+}
+
+#[test]
+fn an_interval_cancelled_by_its_own_callback_is_not_rescheduled() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var timer = setInterval(function () { clearInterval(timer); }, 5);
+            ",
+        )
+        .expect("interval registration should succeed");
+    let _ = runtime.take_pending_timer_requests();
+
+    let (next, outcome) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert!(outcome.is_ok());
+    assert_eq!(next, None, "clearInterval inside the callback stops it");
+}
+
+#[test]
+fn set_timeout_passes_its_extra_arguments_and_webidl_delays_are_finite() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var total = 0;
+                setTimeout(function (a, b) { total = a + b; }, 0, 2, 3);
+                setTimeout(function () {}, Infinity);
+                setTimeout(function () {}, -5);
+            ",
+        )
+        .expect("timer registration should succeed");
+    let requests = runtime.take_pending_timer_requests();
+    let delays: Vec<f64> = requests
+        .iter()
+        .filter_map(|request| match request {
+            crate::runtime::TimerRequest::Schedule { delay_ms, .. } => Some(*delay_ms),
+            crate::runtime::TimerRequest::Cancel { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        delays,
+        vec![0.0, 0.0, 0.0],
+        "Infinity and negative delays become 0, as WebIDL long conversion gives"
+    );
+
+    runtime
+        .fire_timer(&mut parsed.dom, 1)
+        .expect("the timeout fires");
+    runtime
+        .execute(&mut parsed.dom, "total")
+        .map(|outcome| assert_eq!(outcome.value, JsValue::Number(5.0)))
+        .expect("reading total");
+}
+
+#[test]
 fn fire_timer_invokes_callback_once_and_clear_removes_it() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

@@ -658,7 +658,7 @@ fn parse_points(raw: &str) -> Option<Vec<(f32, f32)>> {
         .filter(|part| !part.is_empty())
         .filter_map(parse_length)
         .collect();
-    if numbers.is_empty() || numbers.len() % 2 != 0 {
+    if numbers.is_empty() || !numbers.len().is_multiple_of(2) {
         return None;
     }
     Some(

@@ -956,15 +956,14 @@ impl SystemFontBackend {
         for source in &rule.sources {
             match source {
                 ResolvedSource::Local(name) => {
-                    if let Some((family, face)) = self.installed.local_face(name) {
-                        if let Some(font) = self
+                    if let Some((family, face)) = self.installed.local_face(name)
+                        && let Some(font) = self
                             .installed
                             .loaded
                             .get(family)
                             .and_then(|faces| faces.get(face))
-                        {
-                            return Some(Arc::clone(font));
-                        }
+                    {
+                        return Some(Arc::clone(font));
                     }
                 }
                 ResolvedSource::Url(url) => {
