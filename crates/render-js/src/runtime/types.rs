@@ -307,13 +307,14 @@ pub struct NavigationRequest {
 
 /// A session-history change a script requested through the `History` interface.
 /// The runtime records these and never applies them: the embedding updates its
-/// session history, and performs any traversal as a navigation.
+/// session history, and performs any traversal itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HistoryRequest {
-    /// `history.pushState`: add an entry for `url`. Nothing is loaded.
-    Push { url: String },
-    /// `history.replaceState`: replace the current entry's URL. Nothing is loaded.
-    Replace { url: String },
+    /// `history.pushState`: add an entry for `url` carrying `state`, the
+    /// JSON text of the state value (`None` when it is `undefined`).
+    Push { url: String, state: Option<String> },
+    /// `history.replaceState`: replace the current entry's URL and state.
+    Replace { url: String, state: Option<String> },
     /// `history.back()`, `history.forward()` and `history.go(delta)`.
     Go { delta: isize },
 }

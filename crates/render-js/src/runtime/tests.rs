@@ -4302,9 +4302,11 @@ fn push_and_replace_state_move_the_location_and_queue_history_requests() {
         vec![
             crate::HistoryRequest::Push {
                 url: "https://example.test/app/one?x=1".to_owned(),
+                state: Some(r#"{"page":1}"#.to_owned()),
             },
             crate::HistoryRequest::Replace {
                 url: "https://example.test/app/two".to_owned(),
+                state: Some(r#"{"page":2}"#.to_owned()),
             },
         ]
     );
@@ -4354,6 +4356,7 @@ fn history_refuses_another_origin_and_file_documents_may_move_between_files() {
         runtime.take_pending_history_requests(),
         vec![crate::HistoryRequest::Push {
             url: "file:///rENDER-test-fixtures/next.html".to_owned(),
+            state: Some("null".to_owned()),
         }]
     );
 }
@@ -4377,5 +4380,62 @@ fn history_traversal_queues_go_requests_with_their_delta() {
             crate::HistoryRequest::Go { delta: -2 },
             crate::HistoryRequest::Go { delta: 0 },
         ]
+    );
+}
+
+#[test]
+fn a_same_document_traversal_fires_popstate_with_the_state_and_keeps_the_script() {
+    let mut parsed = parse_document("<!doctype html><title>start</title><p></p>");
+    let url = Url::parse("https://example.test/app/two").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                window.kept = "yes";
+                window.addEventListener("popstate", function (event) {
+                    document.title = "pop:" + event.state.page + ":" + history.state.page + ":" + kept;
+                });
+            "#,
+        )
+        .expect("the listener installs");
+
+    let back = Url::parse("https://example.test/app/one").expect("test URL");
+    let not_canceled = runtime
+        .traverse_history(&mut parsed.dom, &back, Some(r#"{"page":1}"#))
+        .expect("the traversal fires popstate");
+    assert!(not_canceled);
+    runtime
+        .execute(&mut parsed.dom, "location.href + ' ' + document.title")
+        .map(|outcome| {
+            assert_eq!(
+                outcome.value,
+                JsValue::String("https://example.test/app/one pop:1:1:yes".to_owned())
+            );
+        })
+        .expect("the location and handler see the traversal");
+}
+
+#[test]
+fn history_length_is_the_embedding_count_and_state_round_trips_as_json() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app/").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime.set_history_length(3);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                history.pushState({ list: [1, "two"] }, "", "next");
+                if (history.length !== 3) { throw new Error("length " + history.length); }
+            "#,
+        )
+        .expect("the length the embedding reported is visible");
+    assert_eq!(
+        runtime.take_pending_history_requests(),
+        vec![crate::HistoryRequest::Push {
+            url: "https://example.test/app/next".to_owned(),
+            state: Some(r#"{"list":[1,"two"]}"#.to_owned()),
+        }]
     );
 }

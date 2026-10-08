@@ -359,6 +359,27 @@ impl JsRuntime {
         }
     }
 
+    /// `JSON.stringify` of one value as text, or `None` when it has no JSON
+    /// form (`undefined`, a symbol, or a function).
+    pub(in crate::runtime) fn json_text_of(
+        &mut self,
+        value: &JsValue,
+    ) -> Result<Option<String>, JsError> {
+        let mut stack = BTreeSet::new();
+        self.json_stringify_value(value, &mut stack, 0)
+    }
+
+    /// `JSON.parse` of text into a value.
+    pub(in crate::runtime) fn json_value_of_text(
+        &mut self,
+        text: &str,
+    ) -> Result<JsValue, JsError> {
+        let node = JsonParser::new(text)
+            .parse()
+            .map_err(|message| JsError::syntax(message, 0))?;
+        self.json_node_to_value(node)
+    }
+
     pub(in crate::runtime) fn json_stringify_value(
         &mut self,
         value: &JsValue,

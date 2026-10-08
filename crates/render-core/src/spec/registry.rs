@@ -706,11 +706,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         status: SupportStatus::Partial,
         notes: "Same-document and cross-document navigation and the session history \
                 are implemented. `history.pushState` and `replaceState` change the URL \
-                and `history.state` without a load; `back`, `forward` and `go` reload \
-                the entry reached. Not implemented: `popstate`, restoring `history.state` \
-                on traversal, `history.length` (fixed at 1) and `scrollRestoration`. \
-                Nested browsing contexts are not, so an `iframe` renders as nothing and \
-                `window.open` and `target=_blank` do nothing.",
+                and `history.state` without a load. `back`, `forward` and `go` reach an \
+                entry of the same document without a load and fire `popstate` with its \
+                state; an entry of another document is loaded. Not implemented: restoring \
+                `history.state` when a traversal loads a document, and `scrollRestoration`. \
+                `history.length` reflects the list as of each turn's start. Nested browsing \
+                contexts are not, so an `iframe` renders as nothing and `window.open` and \
+                `target=_blank` do nothing.",
         dependencies: &[URL_PARSER],
         tests: NAVIGATION_TESTS,
     },

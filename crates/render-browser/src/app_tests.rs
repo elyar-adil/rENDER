@@ -25,6 +25,7 @@ use winit::keyboard::Key;
 use winit::keyboard::NamedKey;
 
 use crate::app::BrowserApp;
+use crate::app::HistoryMode;
 use crate::app::HostPlatform;
 use crate::app::RawKeyInput;
 use crate::app::address_shortcut;
@@ -2848,4 +2849,91 @@ fn history_back_after_a_push_state_returns_to_the_entry_before_it() {
     );
     assert_eq!(page.history.current().url.as_str(), PAGE_URL);
     assert_eq!(tab_address(&app, tab), PAGE_URL);
+}
+
+#[test]
+fn a_back_after_push_state_stays_in_the_document_and_fires_popstate() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         window.kept = 'yes';\
+         window.addEventListener('popstate', function (event) {\
+           document.title = 'pop:' + (event.state && event.state.step) + ':' + kept;\
+         });\
+         history.pushState({ step: 1 }, '', '/app/one');\
+         history.pushState({ step: 2 }, '', '/app/two');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+    assert_eq!(tab_address(&app, tab), "file:///app/two");
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("history.back();")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    app.drain_history_requests(tab);
+
+    // The traversal stayed in the document: its script global survived and the
+    // popstate handler ran with the state of the entry reached.
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.sync_committed_title();
+    assert_eq!(page.navigation.committed().title, "pop:1:yes");
+    assert_eq!(page.history.current().url.as_str(), "file:///app/one");
+    assert_eq!(tab_address(&app, tab), "file:///app/one");
+}
+
+#[test]
+fn history_length_counts_the_session_entries_at_the_start_of_each_turn() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         history.pushState(null, '', '/app/one');\
+         history.pushState(null, '', '/app/two');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("document.title = 'len:' + history.length;")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    page.sync_committed_title();
+    assert_eq!(page.navigation.committed().title, "len:3");
+}
+
+#[test]
+fn a_back_out_of_a_replaced_document_loads_the_entry_it_reaches() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         window.addEventListener('popstate', function () { document.title = 'popped'; });\
+         history.pushState({ step: 1 }, '', '/app/one');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+
+    // A link to another document pushes an entry and replaces the document.
+    let other = Url::parse("file:///rENDER-test-fixtures/other.html").expect("test URL");
+    app.navigate_target(tab, NavigationTarget::Url(other), HistoryMode::Push);
+    assert_eq!(app.pages.get(&tab).expect("page").history.len(), 3);
+
+    // The entry made in the replaced document is loaded rather than given a
+    // popstate: that document is gone, so the new one must read the entry.
+    app.navigate_target(
+        tab,
+        NavigationTarget::Url(Url::parse(PAGE_URL).expect("test URL")),
+        HistoryMode::Current,
+    );
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("history.back();")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(page.history.current().url.as_str(), "file:///app/one");
+    assert_eq!(tab_address(&app, tab), "file:///app/one");
 }

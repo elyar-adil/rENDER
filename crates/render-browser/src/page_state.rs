@@ -108,6 +108,11 @@ pub(super) struct PageState {
     pub(super) raster_background: Color,
     pub(super) scroll: PageScrollState,
     pub(super) history: SessionHistory,
+    /// The number of the document on show. Each history entry records the
+    /// number of the document it was made in.
+    pub(super) document_serial: u64,
+    /// The highest document number handed out so far.
+    last_document_serial: u64,
     pub(super) dom_revision: u64,
     pub(super) external_styles_generation: u64,
     pub(super) render_generation: u64,
@@ -197,13 +202,15 @@ impl<H> PageNavigation<H> {
     }
 }
 
+/// The number of the first document a page shows.
+const FIRST_DOCUMENT_SERIAL: u64 = 1;
+
 impl PageState {
     pub(super) fn new(source: PageSource) -> Self {
-        let history = SessionHistory::new(
-            HistoryEntry::new(source.target.history_url()),
-            NavigationLimits::default(),
-        )
-        .expect("browser-created page URLs fit the session-history limits");
+        let mut first_entry = HistoryEntry::new(source.target.history_url());
+        first_entry.document = Some(FIRST_DOCUMENT_SERIAL);
+        let history = SessionHistory::new(first_entry, NavigationLimits::default())
+            .expect("browser-created page URLs fit the session-history limits");
         let page = Page::with_url_unrendered(&source.html, &source.target.history_url());
         Self {
             navigation: PageNavigation::new(source),
@@ -234,6 +241,8 @@ impl PageState {
             raster_background: DocumentRenderOptions::default().raster_background,
             scroll: PageScrollState::default(),
             history,
+            document_serial: FIRST_DOCUMENT_SERIAL,
+            last_document_serial: FIRST_DOCUMENT_SERIAL,
             dom_revision: 1,
             external_styles_generation: 0,
             render_generation: 0,
@@ -280,6 +289,12 @@ impl PageState {
         self.cancel_scripts();
         self.page = Page::with_url_unrendered(&source.html, &source.target.history_url());
         self.navigation.commit(source);
+        // The new document gets a number of its own, and the entry being shown
+        // now belongs to it. Entries made in the old document keep its number, so
+        // traversing to them loads rather than changing this document.
+        self.last_document_serial += 1;
+        self.document_serial = self.last_document_serial;
+        self.history.current_mut().document = Some(self.document_serial);
         self.style_sheets = ExternalStyleSheets::default();
         self.started_style_sheets.clear();
         self.style_batch = None;
@@ -526,10 +541,24 @@ impl PageState {
         self.run_page_turns_with_budget(ACTIVE_PAGE_TURN_BUDGET)
     }
 
+    /// Runs a same-document session-history traversal, then the turn its
+    /// `popstate` handlers start, so their timers and microtasks settle before
+    /// the caller repaints.
+    pub(super) fn traverse_document_history(&mut self, url: &Url, state: Option<&str>) {
+        if let Err(error) = self.page.traverse_same_document(url, state) {
+            eprintln!("render-browser popstate handler failed: {error}");
+        }
+        let _ = self.run_page_turns();
+    }
+
     pub(super) fn run_page_turns_with_budget(
         &mut self,
         turn_budget: usize,
     ) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {
+        // `history.length` reflects the session list as of the turn's start.
+        self.page
+            .runtime_mut()
+            .set_history_length(self.history.len());
         let now = self.created_at.elapsed();
         let revision_before = self.page.document().dom().revision().as_u64();
         let mut defaults = HashMap::new();

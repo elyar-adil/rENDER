@@ -111,9 +111,10 @@
 > **当前状态：部分达成。** `history.pushState`/`replaceState` 更新文档 URL 与
 > `history.state`（同源检查见 `crates/render-js/src/runtime/mod.rs`），壳侧把请求记入会话
 > 历史（`crates/render-browser/src/app.rs` 的 `drain_history_requests`），不触发加载；
-> `back`/`forward`/`go` 重新加载所到达的条目。仍缺：`popstate` 事件、遍历时恢复
-> `history.state`、`history.length` 恒为 1、`scrollRestoration`；`customElements` 不存在；
-> Shadow DOM 不存在。
+> `back`/`forward`/`go` 到达同一文档的条目时不加载，并在该文档内触发 `popstate`（带上条目的
+> state）；到达其它文档的条目则重新加载。仍缺：跨文档遍历时恢复 `history.state`、
+> `scrollRestoration`；`history.length` 按每轮脚本开始时的列表长度报告；`customElements`
+> 不存在；Shadow DOM 不存在。
 
 任何超出 M3 的能力（WebGL、Service Worker、IndexedDB、媒体解码等）属于本文档以外的
 "未来路线"。
@@ -572,8 +573,8 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | API | 状态 |
 |------|------|
 | `location.href / pathname / search / hash` | 🟡 `install_location` 在 `crates/render-js/src/value.rs:2654-2669`，`ObjectHost::Location`；`innerWidth`/`innerHeight` 读自 viewport（`runtime/eval.rs:2706-2707,2780-2781`）。hash 变更是否触发 `hashchange` ❓ 未核实 |
-| `history.back / forward / go / pushState / replaceState` | 🟡 pushState/replaceState 更新 URL 与 `history.state`，不加载；back/forward/go 重新加载所到达的条目。`length` 恒 1（壳侧未回写列表长度）；遍历不恢复 `state` |
-| `popstate` 事件 | 🔴 同文档遍历不触发（`pushState` 之后的 back 走重新加载） |
+| `history.back / forward / go / pushState / replaceState` | 🟡 pushState/replaceState 更新 URL 与 `history.state`，不加载；同文档条目的遍历不加载。`length` 按每轮开始时的列表长度报告；跨文档遍历不恢复 `state` |
+| `popstate` 事件 | 🟡 同文档遍历时在文档上触发，带上条目的 `state`；跨文档遍历不触发 |
 | `BroadcastChannel` | ⛔ |
 
 ### 7.6 Web Components

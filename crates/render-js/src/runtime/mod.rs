@@ -415,20 +415,63 @@ impl JsRuntime {
             ));
         }
         let state = arguments.first().cloned().unwrap_or(JsValue::Null);
+        let serialized = self.json_text_of(&state)?;
         if let Some(JsValue::Object(history)) = self.realm.global("history") {
             self.realm.set_property(history, "state".to_owned(), state);
         }
         self.realm.set_location_url(url.clone());
+        let url = url.to_string();
         self.pending_history_requests.push(if replace {
             HistoryRequest::Replace {
-                url: url.to_string(),
+                url,
+                state: serialized,
             }
         } else {
             HistoryRequest::Push {
-                url: url.to_string(),
+                url,
+                state: serialized,
             }
         });
         Ok(JsValue::Undefined)
+    }
+
+    /// Applies a same-document session-history traversal: the location becomes
+    /// `url`, `history.state` becomes the parsed `state`, and `popstate` fires at
+    /// the document. Nothing reloads, so script state survives. Returns whether
+    /// the event was not canceled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a handler that throws, or of a `state` text
+    /// that is not JSON.
+    pub fn traverse_history(
+        &mut self,
+        dom: &mut Dom,
+        url: &Url,
+        state: Option<&str>,
+    ) -> Result<bool, JsError> {
+        let state = match state {
+            Some(text) => self.json_value_of_text(text)?,
+            None => JsValue::Null,
+        };
+        if let Some(JsValue::Object(history)) = self.realm.global("history") {
+            self.realm
+                .set_property(history, "state".to_owned(), state.clone());
+        }
+        self.realm.set_location_url(url.clone());
+        let document = dom.document();
+        self.dispatch_dom_event(dom, document, "popstate", false, false, &[("state", state)])
+    }
+
+    /// Sets `history.length` to the embedding's session-history length. The
+    /// embedding calls it before each turn, so the value reflects the list as
+    /// of the turn's start.
+    pub fn set_history_length(&mut self, length: usize) {
+        let length = f64::from(u32::try_from(length).unwrap_or(u32::MAX));
+        if let Some(JsValue::Object(history)) = self.realm.global("history") {
+            self.realm
+                .set_property(history, "length".to_owned(), JsValue::Number(length));
+        }
     }
 
     /// The state `document.readyState` reports.

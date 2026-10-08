@@ -528,6 +528,27 @@ impl Page {
         &mut self.runtime
     }
 
+    /// Applies a session-history traversal between entries of this document:
+    /// the location moves, `history.state` is restored and `popstate` fires.
+    ///
+    /// # Errors
+    ///
+    /// Returns the typed error of a handler that throws, or of a state text
+    /// that is not JSON.
+    pub fn traverse_same_document(
+        &mut self,
+        url: &Url,
+        state: Option<&str>,
+    ) -> Result<bool, JsError> {
+        let result = self
+            .runtime
+            .traverse_history(self.document.dom_mut(), url, state);
+        // A handler's `document.title` assignment reaches the DOM at the end of
+        // a turn; this dispatch is not a turn, so it syncs the title itself.
+        self.sync_script_title();
+        result
+    }
+
     /// The document's title: the text content of its first HTML `title`
     /// element in tree order.
     ///

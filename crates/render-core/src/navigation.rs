@@ -467,12 +467,22 @@ impl HistoryIndex {
 pub struct HistoryEntry {
     pub url: Url,
     pub title: Option<String>,
+    /// The serialized `history.state` the entry carries, if a script set one.
+    pub state: Option<String>,
+    /// The document the entry belongs to, as the embedding numbers documents.
+    /// A traversal between entries of one document changes no document.
+    pub document: Option<u64>,
 }
 
 impl HistoryEntry {
     #[must_use]
     pub const fn new(url: Url) -> Self {
-        Self { url, title: None }
+        Self {
+            url,
+            title: None,
+            state: None,
+            document: None,
+        }
     }
 }
 
@@ -519,6 +529,10 @@ impl SessionHistory {
     #[must_use]
     pub fn current(&self) -> &HistoryEntry {
         &self.entries[self.current.0]
+    }
+
+    pub fn current_mut(&mut self) -> &mut HistoryEntry {
+        &mut self.entries[self.current.0]
     }
 
     #[must_use]

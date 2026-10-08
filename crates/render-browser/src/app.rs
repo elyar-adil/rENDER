@@ -1062,13 +1062,9 @@ impl BrowserApp {
         }
     }
 
-    /// Perform any navigations the page's script requested since the last
-    /// pump (`location.assign`/`replace`/`href`). Only the newest request is
-    /// honored; scripts that redirect repeatedly cannot loop the browser.
     /// Applies the session-history changes a page's script requested, in order.
     /// A push or replace records the entry and the URL the document reports; it
-    /// loads nothing. A traversal moves through the list and navigates to the
-    /// entry it reaches, which replaces the document, so the rest is dropped.
+    /// loads nothing. A traversal ends the batch: see `traverse_history_by`.
     pub(super) fn drain_history_requests(&mut self, id: TabId) {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
@@ -1076,29 +1072,24 @@ impl BrowserApp {
         let requests = page.page.runtime_mut().take_pending_history_requests();
         for request in requests {
             match request {
-                HistoryRequest::Push { url } => self.record_history_entry(id, &url, false),
-                HistoryRequest::Replace { url } => self.record_history_entry(id, &url, true),
+                HistoryRequest::Push { url, state } => {
+                    self.record_history_entry(id, &url, state, false);
+                }
+                HistoryRequest::Replace { url, state } => {
+                    self.record_history_entry(id, &url, state, true);
+                }
                 HistoryRequest::Go { delta } => {
-                    let Some(page) = self.pages.get_mut(&id) else {
-                        return;
-                    };
-                    let target = page.history.go(delta).map(|entry| entry.url.clone());
-                    if let Some(url) = target {
-                        self.navigate_target(
-                            id,
-                            NavigationTarget::from_url(url),
-                            HistoryMode::Current,
-                        );
-                    }
+                    self.traverse_history_by(id, delta);
                     return;
                 }
             }
         }
     }
 
-    /// Records a `pushState` or `replaceState` entry for `id`. The committed URL
-    /// moves with it, so relative links and the address bar follow the document.
-    fn record_history_entry(&mut self, id: TabId, url: &str, replace: bool) {
+    /// Records a `pushState` or `replaceState` entry for `id`. The entry belongs
+    /// to the document the page is showing, so traversal can return to it
+    /// without a load.
+    fn record_history_entry(&mut self, id: TabId, url: &str, state: Option<String>, replace: bool) {
         let Ok(url) = Url::parse(url) else {
             eprintln!("render-browser ignoring an invalid history URL");
             return;
@@ -1106,7 +1097,9 @@ impl BrowserApp {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
         };
-        let entry = HistoryEntry::new(url.clone());
+        let mut entry = HistoryEntry::new(url.clone());
+        entry.state = state;
+        entry.document = Some(page.document_serial);
         let recorded = if replace {
             page.history.replace(entry)
         } else {
@@ -1116,6 +1109,15 @@ impl BrowserApp {
             eprintln!("render-browser history entry refused: {error}");
             return;
         }
+        self.commit_history_url(id, url);
+    }
+
+    /// Moves the committed URL of `id` after a history change that loads
+    /// nothing, so the address bar and relative links follow the document.
+    fn commit_history_url(&mut self, id: TabId, url: Url) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
         page.navigation.committed.target = NavigationTarget::from_url(url);
         let title = page.navigation.committed().title.clone();
         let address = page.navigation.committed().target.display_address();
@@ -1126,6 +1128,50 @@ impl BrowserApp {
         self.repaint_chrome();
     }
 
+    /// Moves `id` through its session history by `delta` entries, as the
+    /// toolbar, `history.back()` and `history.go()` do. An entry of the document
+    /// on show changes without a load: its URL and state apply and `popstate`
+    /// fires. Any other entry is loaded, which replaces the document. A `delta`
+    /// of zero reloads, as `history.go()` does.
+    fn traverse_history_by(&mut self, id: TabId, delta: isize) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        page.cancel_pending();
+        let Some(entry) = page.history.go(delta).cloned() else {
+            self.repaint_chrome();
+            return;
+        };
+        if delta != 0 && entry.document == Some(page.document_serial) {
+            self.traverse_same_document(id, entry);
+        } else {
+            self.navigate_target(
+                id,
+                NavigationTarget::from_url(entry.url),
+                HistoryMode::Current,
+            );
+        }
+    }
+
+    /// Runs a traversal between entries of the document already shown. Nothing
+    /// reloads: the page sees the new URL and state through `popstate`.
+    fn traverse_same_document(&mut self, id: TabId, entry: HistoryEntry) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        page.traverse_document_history(&entry.url, entry.state.as_deref());
+        page.scripts_resolved = false;
+        self.commit_history_url(id, entry.url);
+        self.sync_page_title(id);
+        self.start_classic_scripts(id);
+        if id == self.tabs.active_id() {
+            self.schedule_page_render_for_tab(id);
+        }
+    }
+
+    /// Perform any navigations the page's script requested since the last
+    /// pump (`location.assign`/`replace`/`href`). Only the newest request is
+    /// honored; scripts that redirect repeatedly cannot loop the browser.
     pub(super) fn drain_script_navigations(&mut self, id: TabId) {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
@@ -1225,20 +1271,7 @@ impl BrowserApp {
 
     pub(super) fn traverse_active(&mut self, forward: bool) {
         let id = self.tabs.active_id();
-        let Some(page) = self.pages.get_mut(&id) else {
-            return;
-        };
-        page.cancel_pending();
-        let entry = if forward {
-            page.history.forward()
-        } else {
-            page.history.back()
-        };
-        let Some(url) = entry.map(|entry| entry.url.clone()) else {
-            self.repaint_chrome();
-            return;
-        };
-        self.navigate_target(id, NavigationTarget::from_url(url), HistoryMode::Current);
+        self.traverse_history_by(id, if forward { 1 } else { -1 });
     }
 
     pub(super) fn start_network_navigation(&mut self, id: TabId, url: Url) {
