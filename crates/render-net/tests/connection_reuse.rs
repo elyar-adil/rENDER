@@ -229,11 +229,14 @@ fn a_forty_asset_page_uses_one_connection_per_in_flight_slot() {
             b"body-for-this-request-only"
         );
     }
-    assert_eq!(
-        connections.load(Ordering::SeqCst),
-        per_origin,
-        "forty assets from one origin must cost one connection per in-flight slot, \
-         not a handshake per wave"
+    // A socket that finishes early can carry a later request, so the pool may
+    // open fewer than `per_origin` connections when the waves overlap unevenly.
+    // The property is the ceiling: a handshake per wave would open about forty.
+    let opened = connections.load(Ordering::SeqCst);
+    assert!(
+        (1..=per_origin).contains(&opened),
+        "forty assets from one origin must cost at most one connection per in-flight \
+         slot, not a handshake per wave; opened {opened}"
     );
 }
 

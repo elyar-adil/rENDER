@@ -1979,9 +1979,15 @@ fn dragging_in_a_page_input_creates_a_selection_that_replaces_on_type() {
     // held, then release; this follows the same path as native Winit events.
     click_content_at(&mut app, 205.0, 167.0);
     app.left_pointer_down = true;
+    // The end of "hello" depends on the face the text is measured with, so the
+    // drag target is the first pixel the input maps to the boundary after it.
+    let end_x = (205..=400)
+        .map(|x| x as f32)
+        .find(|&x| app.content_index_at_x(tab, kw, x) == "hello".len())
+        .expect("the input maps a pixel to the boundary after hello");
     let chrome_height = app.layout.as_ref().expect("chrome layout").chrome_height;
     app.handle_cursor_move(PhysicalPosition::new(
-        235.0,
+        f64::from(end_x),
         f64::from(chrome_height) + 167.0,
     ));
     app.handle_pointer_release();

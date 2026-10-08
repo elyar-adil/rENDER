@@ -2880,7 +2880,12 @@ impl BrowserApp {
     /// generated for an input is present in the display list with the same
     /// glyph origin and font size used by rasterization; empty/stale frames
     /// fall back to the control's computed border and padding.
-    fn content_index_at_x(&self, tab: TabId, node: render_core::dom::NodeId, x: f32) -> usize {
+    pub(super) fn content_index_at_x(
+        &self,
+        tab: TabId,
+        node: render_core::dom::NodeId,
+        x: f32,
+    ) -> usize {
         let Some(page) = self.pages.get(&tab) else {
             return 0;
         };

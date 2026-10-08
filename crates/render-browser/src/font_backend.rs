@@ -1955,10 +1955,15 @@ mod tests {
                  {} but shaped it at {drawn}",
                 measured.advance
             );
-            for (index, (character, glyph)) in text.chars().zip(&glyphs).enumerate() {
-                assert_eq!(
-                    glyph.glyph.0, character as u32,
-                    "character {index} of the run is not the character it measures"
+            // A character no installed face covers is left out of the run on both
+            // the measure and the draw side, so the glyphs are the text's characters
+            // in order rather than one per character.
+            let mut characters = text.chars();
+            for glyph in &glyphs {
+                assert!(
+                    characters.any(|character| character as u32 == glyph.glyph.0),
+                    "glyph {} is not the next character of the run",
+                    glyph.glyph.0
                 );
             }
         }
@@ -2588,21 +2593,32 @@ mod tests {
     /// own name rather than against a family.
     #[test]
     fn a_local_name_resolves_to_an_installed_face_and_issues_no_request() {
-        // The name is taken from the declared table rather than written here, so
-        // the assertion cannot be wrong about a specific font's name: it is about
-        // the mechanism, and it holds for whichever face the platform has.
-        let Some((family, face, name)) = PLATFORM_FACES
-            .iter()
-            .find(|source| !source.local_names.is_empty())
-            .map(|source| (source.family, source.weight, source.local_names[0]))
-        else {
-            panic!("the platform table declares a face with a local() name");
-        };
+        // The name comes from a face this platform actually has installed: the
+        // declared table also lists faces of other platforms, which are absent
+        // here. The assertion is about the mechanism, so it holds for whichever
+        // installed face declares a name.
         let backend = SystemFontBackend::load().expect("the platform table loads");
+        let installed_name = backend
+            .installed
+            .local_names
+            .iter()
+            .flatten()
+            .find_map(|candidates| candidates.first().copied());
+        let Some(name) = installed_name else {
+            // No installed face declares a local() name, so the lookup must miss.
+            assert!(
+                backend
+                    .installed
+                    .local_face("rENDER no such face")
+                    .is_none(),
+                "an unknown local() name resolves to no face"
+            );
+            return;
+        };
         assert!(
             backend.installed.local_face(name).is_some(),
             "§4.3.3.1 matches a local() name against the name table of an \
-             installed face, and {family} declares {name:?} for its {face} face"
+             installed face, and that face declares {name:?}"
         );
 
         // A `local()` that names a face this table does not carry is not found,
