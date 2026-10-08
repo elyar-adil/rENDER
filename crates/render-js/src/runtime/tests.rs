@@ -652,6 +652,26 @@ fn set_timeout_registers_timer_and_requests_scheduling() {
 }
 
 #[test]
+fn document_ready_state_follows_the_host_and_starts_loading() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, "document.readyState")
+        .map(|outcome| assert_eq!(outcome.value, JsValue::String("loading".to_owned())))
+        .expect("a new document is loading");
+
+    runtime.set_document_ready_state(crate::DocumentReadyState::Interactive);
+    runtime
+        .execute(&mut parsed.dom, "document.readyState")
+        .map(|outcome| assert_eq!(outcome.value, JsValue::String("interactive".to_owned())))
+        .expect("the host moves the document on");
+    assert_eq!(
+        runtime.document_ready_state(),
+        crate::DocumentReadyState::Interactive
+    );
+}
+
+#[test]
 fn an_interval_keeps_repeating_after_its_callback_throws() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

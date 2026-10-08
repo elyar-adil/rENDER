@@ -1650,6 +1650,9 @@ impl BrowserApp {
 
         self.sync_page_title(id);
         if loading_complete {
+            if let Some(page) = self.pages.get_mut(&id) {
+                rerender |= page.fire_dom_content_loaded().unwrap_or(false);
+            }
             self.tabs.set_loading(id, false);
         }
         if rerender {
@@ -3688,6 +3691,17 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 .is_empty()
             {
                 navigation_candidates.push(*id);
+            }
+        }
+        // `load` waits for everything a document loads, so it is checked after
+        // this pass has run the resource pipelines.
+        let ids: Vec<TabId> = self.pages.keys().copied().collect();
+        for id in ids {
+            let Some(page) = self.pages.get_mut(&id) else {
+                continue;
+            };
+            if let Some(changed) = page.fire_load_when_settled() {
+                rendered_active |= changed && id == active;
             }
         }
         if rendered_active {

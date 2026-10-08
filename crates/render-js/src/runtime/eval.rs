@@ -3458,7 +3458,9 @@ impl JsRuntime {
                         .collect::<Result<Vec<_>, _>>()?;
                     return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
-                "readyState" => return Ok(JsValue::String("complete".to_owned())),
+                "readyState" => {
+                    return Ok(JsValue::String(self.ready_state.as_str().to_owned()));
+                }
                 "cookie" => {
                     return Ok(JsValue::String(self.js_cookie_jar_serialize()));
                 }

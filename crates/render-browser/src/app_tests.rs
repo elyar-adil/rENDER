@@ -732,6 +732,46 @@ fn script_assigned_document_title_propagates_to_the_committed_title() {
 }
 
 #[test]
+fn dom_content_loaded_fires_once_on_an_interactive_document_and_load_follows_when_settled() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         document.addEventListener('DOMContentLoaded', function (event) {\
+           document.title = 'dcl:' + document.readyState + ':' + event.bubbles;\
+         });\
+         window.addEventListener('load', function () {\
+           document.title = document.title + ' load:' + document.readyState;\
+         });\
+         </script>",
+    );
+    // Inline scripts wait for the document's stylesheets, as in a browser; with
+    // none pending, they run at once.
+    app.pages.get_mut(&tab).expect("page").styles_resolved = true;
+    app.start_classic_scripts(tab);
+    let page = app.pages.get_mut(&tab).expect("page");
+    let _ = page.run_page_turns();
+    assert!(page.sync_committed_title());
+    assert_eq!(page.navigation.committed().title, "dcl:interactive:true");
+
+    // The event fires once: a second pass over the same document is a no-op.
+    assert_eq!(page.fire_dom_content_loaded(), None);
+
+    // The title change above marked the scripts for a rescan, which the shell
+    // runs on its next pass. `load` waits until that rescan has settled.
+    app.start_classic_scripts(tab);
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.styles_resolved = true;
+    page.pending_images = None;
+    assert!(page.fire_load_when_settled().is_some());
+    let _ = page.run_page_turns();
+    assert!(page.sync_committed_title());
+    assert_eq!(
+        page.navigation.committed().title,
+        "dcl:interactive:true load:complete"
+    );
+    assert_eq!(page.fire_load_when_settled(), None, "load fires once");
+}
+
+#[test]
 fn a_dom_change_in_a_turn_is_kept_for_the_event_loop_even_when_the_caller_ignores_it() {
     let mut page = PageState::new(PageSource {
         html: "<!doctype html><p id=message>before</p>".into(),

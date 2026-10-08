@@ -18,12 +18,14 @@ use render_core::document::ExternalStyleSheetKey;
 use render_core::document::ExternalStyleSheets;
 use render_core::image::ImageResourceKey;
 use render_core::image::ImageResources;
+use render_core::js::DocumentReadyState;
 use render_core::js::ElementRect;
 use render_core::js::JsValue;
 use render_core::navigation::HistoryEntry;
 use render_core::navigation::NavigationLimits;
 use render_core::navigation::SessionHistory;
 use render_core::page::Page;
+use render_core::page::PageDomEvent;
 use render_core::page::PageJob;
 use render_core::paint::Color;
 use render_core::paint::DisplayList;
@@ -475,6 +477,49 @@ impl PageState {
     ///
     /// Returns whether any turn mutated the DOM plus per-task default-action
     /// results (`true` when the task's event was not `preventDefault()`-ed).
+    /// Moves a loading document to `interactive` and dispatches
+    /// `DOMContentLoaded` at the document, which bubbles. The event fires once per
+    /// document, when its parser-blocking scripts have run. Returns whether the
+    /// document changed while the handlers ran, or `None` if it was not fired.
+    pub(super) fn fire_dom_content_loaded(&mut self) -> Option<bool> {
+        if self.page.runtime().document_ready_state() != DocumentReadyState::Loading {
+            return None;
+        }
+        self.page
+            .runtime_mut()
+            .set_document_ready_state(DocumentReadyState::Interactive);
+        let target = self.page.document().dom().document();
+        let _ = self
+            .page
+            .queue_dom_event(PageDomEvent::new(target, "DOMContentLoaded").bubbles(true));
+        Some(self.run_page_turns().0)
+    }
+
+    /// Moves an interactive document to `complete` and dispatches `load` once
+    /// nothing the document loaded is still in flight. The event targets the
+    /// document and does not bubble, but it still reaches the window, as it always
+    /// has here. Returns whether the document changed in the handlers, or `None`
+    /// if the document was not ready for `load`.
+    pub(super) fn fire_load_when_settled(&mut self) -> Option<bool> {
+        if self.page.runtime().document_ready_state() != DocumentReadyState::Interactive
+            || !self.styles_resolved
+            || !self.scripts_resolved
+            || self.held_scripts.is_some()
+            || self.pending_scripts.is_some()
+            || self.pending_style_sheets.is_some()
+            || self.pending_images.is_some()
+            || self.navigation.pending.is_some()
+        {
+            return None;
+        }
+        self.page
+            .runtime_mut()
+            .set_document_ready_state(DocumentReadyState::Complete);
+        let target = self.page.document().dom().document();
+        let _ = self.page.queue_dom_event(PageDomEvent::new(target, "load"));
+        Some(self.run_page_turns().0)
+    }
+
     pub(super) fn run_page_turns(
         &mut self,
     ) -> (bool, HashMap<render_core::event_loop::TaskId, bool>) {

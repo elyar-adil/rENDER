@@ -67,8 +67,8 @@ mod types;
 mod tests;
 
 pub use types::{
-    ConsoleLevel, ConsoleMessage, ElementRect, FetchOutcome, JsMicrotask, NavigationRequest,
-    PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, JsMicrotask,
+    NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
 };
 
 /// A realm-owning interpreter instance. DOM wrappers retain stable `NodeId`
@@ -115,6 +115,7 @@ pub struct JsRuntime {
     timers: BTreeMap<u64, TimerEntry>,
     next_timer_id: u64,
     pending_timer_requests: Vec<TimerRequest>,
+    ready_state: DocumentReadyState,
     pending_navigations: Vec<NavigationRequest>,
     /// Network transfers queued by `fetch()`/`XMLHttpRequest`, drained by the
     /// embedding through [`Self::take_pending_fetch_requests`].
@@ -227,6 +228,7 @@ impl JsRuntime {
             timers: BTreeMap::new(),
             next_timer_id: 1,
             pending_timer_requests: Vec::new(),
+            ready_state: DocumentReadyState::Loading,
             pending_navigations: Vec::new(),
             pending_fetch_requests: Vec::new(),
             pending_fetch_promises: BTreeMap::new(),
@@ -356,6 +358,19 @@ impl JsRuntime {
     }
 
     /// Drain timer scheduling requests emitted by script since the last call.
+    /// The state `document.readyState` reports.
+    #[must_use]
+    pub const fn document_ready_state(&self) -> DocumentReadyState {
+        self.ready_state
+    }
+
+    /// Set the state `document.readyState` reports. The embedding calls this
+    /// before it queues the matching lifecycle event, so a handler sees the
+    /// state the event announces.
+    pub fn set_document_ready_state(&mut self, state: DocumentReadyState) {
+        self.ready_state = state;
+    }
+
     pub fn take_pending_timer_requests(&mut self) -> Vec<TimerRequest> {
         std::mem::take(&mut self.pending_timer_requests)
     }

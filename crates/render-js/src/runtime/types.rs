@@ -248,6 +248,28 @@ pub enum TimerKind {
     AnimationFrame,
 }
 
+/// The `document.readyState` of the page that owns a runtime (HTML 3.1.3). A new
+/// document is `loading`; the embedding moves it to `interactive` when its
+/// parser-blocking scripts have run and to `complete` once its resources settle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentReadyState {
+    Loading,
+    Interactive,
+    Complete,
+}
+
+impl DocumentReadyState {
+    /// The value `document.readyState` reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Loading => "loading",
+            Self::Interactive => "interactive",
+            Self::Complete => "complete",
+        }
+    }
+}
+
 /// A callback registered through the global timer functions. The runtime
 /// retains only callable identities; actual scheduling belongs to the
 /// embedding page, which drains [`JsRuntime::take_pending_timer_requests`].
