@@ -4281,3 +4281,101 @@ fn document_create_comment_produces_a_comment_node() {
         JsValue::String("8:feature-detect".to_owned())
     );
 }
+
+#[test]
+fn push_and_replace_state_move_the_location_and_queue_history_requests() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app/index").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                history.pushState({ page: 1 }, "", "/app/one?x=1");
+                history.replaceState({ page: 2 }, "", "two");
+                if (history.state.page !== 2) { throw new Error("state not kept"); }
+            "#,
+        )
+        .expect("same-origin history changes should execute");
+    assert_eq!(
+        runtime.take_pending_history_requests(),
+        vec![
+            crate::HistoryRequest::Push {
+                url: "https://example.test/app/one?x=1".to_owned(),
+            },
+            crate::HistoryRequest::Replace {
+                url: "https://example.test/app/two".to_owned(),
+            },
+        ]
+    );
+    runtime
+        .execute(&mut parsed.dom, "location.href")
+        .map(|outcome| {
+            assert_eq!(
+                outcome.value,
+                JsValue::String("https://example.test/app/two".to_owned())
+            );
+        })
+        .expect("the location reports the replaced URL");
+}
+
+#[test]
+fn history_refuses_another_origin_and_file_documents_may_move_between_files() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app/").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var result = "allowed";
+                try { history.pushState(null, "", "https://other.test/"); }
+                catch (error) { result = String(error.message); }
+                result;
+            "#,
+        )
+        .expect("the refusal is a catchable exception");
+    let JsValue::String(message) = outcome.value else {
+        panic!("the script reports the refusal as a string");
+    };
+    assert!(message.contains("SecurityError"), "{message}");
+    assert!(runtime.take_pending_history_requests().is_empty());
+
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let file = Url::parse("file:///rENDER-test-fixtures/page.html").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &file);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"history.pushState(null, "", "next.html");"#,
+        )
+        .expect("a file document may move to another file");
+    assert_eq!(
+        runtime.take_pending_history_requests(),
+        vec![crate::HistoryRequest::Push {
+            url: "file:///rENDER-test-fixtures/next.html".to_owned(),
+        }]
+    );
+}
+
+#[test]
+fn history_traversal_queues_go_requests_with_their_delta() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/app/").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "history.back(); history.forward(); history.go(-2); history.go();",
+        )
+        .expect("traversal calls should execute");
+    assert_eq!(
+        runtime.take_pending_history_requests(),
+        vec![
+            crate::HistoryRequest::Go { delta: -1 },
+            crate::HistoryRequest::Go { delta: 1 },
+            crate::HistoryRequest::Go { delta: -2 },
+            crate::HistoryRequest::Go { delta: 0 },
+        ]
+    );
+}

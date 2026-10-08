@@ -704,10 +704,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         specification: "HTML Living Standard",
         section: "7.4 Navigation and 7.2.6 Session history traversal",
         status: SupportStatus::Partial,
-        notes: "Same-document and cross-document navigation, the session history and \
-                traversal including `history.length` and `scrollRestoration` are \
-                implemented. Nested browsing contexts are not, so an `iframe` renders \
-                as nothing and `window.open` and `target=_blank` do nothing.",
+        notes: "Same-document and cross-document navigation and the session history \
+                are implemented. `history.pushState` and `replaceState` change the URL \
+                and `history.state` without a load; `back`, `forward` and `go` reload \
+                the entry reached. Not implemented: `popstate`, restoring `history.state` \
+                on traversal, `history.length` (fixed at 1) and `scrollRestoration`. \
+                Nested browsing contexts are not, so an `iframe` renders as nothing and \
+                `window.open` and `target=_blank` do nothing.",
         dependencies: &[URL_PARSER],
         tests: NAVIGATION_TESTS,
     },

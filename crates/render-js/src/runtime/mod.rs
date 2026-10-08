@@ -67,9 +67,24 @@ mod types;
 mod tests;
 
 pub use types::{
-    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, JsMicrotask,
-    NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
+    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
 };
+
+/// Whether a history change may point `new` at the document URL `current`.
+///
+/// Tuple origins compare exactly. A `file:` document has an opaque origin in
+/// the URL model, yet browsers let its script move between files, so every
+/// `file:` URL shares one origin here. Other opaque origins match nothing.
+fn same_history_origin(new: &Url, current: &Url) -> bool {
+    if new.scheme() != current.scheme() {
+        return false;
+    }
+    match (new.origin(), current.origin()) {
+        (url::Origin::Tuple(..), url::Origin::Tuple(..)) => new.origin() == current.origin(),
+        _ => new.scheme() == "file",
+    }
+}
 
 /// A realm-owning interpreter instance. DOM wrappers retain stable `NodeId`
 /// identities, never Rust references, across calls to [`Self::execute`].
@@ -116,6 +131,7 @@ pub struct JsRuntime {
     next_timer_id: u64,
     pending_timer_requests: Vec<TimerRequest>,
     ready_state: DocumentReadyState,
+    pending_history_requests: Vec<HistoryRequest>,
     pending_navigations: Vec<NavigationRequest>,
     /// Network transfers queued by `fetch()`/`XMLHttpRequest`, drained by the
     /// embedding through [`Self::take_pending_fetch_requests`].
@@ -229,6 +245,7 @@ impl JsRuntime {
             next_timer_id: 1,
             pending_timer_requests: Vec::new(),
             ready_state: DocumentReadyState::Loading,
+            pending_history_requests: Vec::new(),
             pending_navigations: Vec::new(),
             pending_fetch_requests: Vec::new(),
             pending_fetch_promises: BTreeMap::new(),
@@ -358,6 +375,62 @@ impl JsRuntime {
     }
 
     /// Drain timer scheduling requests emitted by script since the last call.
+    /// Session-history changes script requested since the last call, in order.
+    pub fn take_pending_history_requests(&mut self) -> Vec<HistoryRequest> {
+        std::mem::take(&mut self.pending_history_requests)
+    }
+
+    /// The URL the document reports as its location, if the location host is
+    /// available.
+    fn document_location_url(&self) -> Option<Url> {
+        match self.realm.global("location") {
+            Some(JsValue::Object(object)) => match self.realm.host(object) {
+                Some(ObjectHost::Location(url)) => Some(url),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `history.pushState` and `history.replaceState`: same-origin only, as the
+    /// HTML standard requires (a different origin is a `SecurityError`). The
+    /// location and `history.state` change at once; the shell applies the entry.
+    pub(crate) fn history_state_change(
+        &mut self,
+        arguments: &[JsValue],
+        replace: bool,
+    ) -> Result<JsValue, JsError> {
+        let current = self
+            .document_location_url()
+            .ok_or_else(|| JsError::dom("the document has no location to change"))?;
+        let url = match arguments.get(2) {
+            None | Some(JsValue::Undefined) => current.clone(),
+            Some(value) => current
+                .join(&value.to_js_string())
+                .map_err(|error| JsError::dom(format!("invalid history URL: {error}")))?,
+        };
+        if !same_history_origin(&url, &current) {
+            return Err(JsError::dom(
+                "SecurityError: history cannot change the document to another origin",
+            ));
+        }
+        let state = arguments.first().cloned().unwrap_or(JsValue::Null);
+        if let Some(JsValue::Object(history)) = self.realm.global("history") {
+            self.realm.set_property(history, "state".to_owned(), state);
+        }
+        self.realm.set_location_url(url.clone());
+        self.pending_history_requests.push(if replace {
+            HistoryRequest::Replace {
+                url: url.to_string(),
+            }
+        } else {
+            HistoryRequest::Push {
+                url: url.to_string(),
+            }
+        });
+        Ok(JsValue::Undefined)
+    }
+
     /// The state `document.readyState` reports.
     #[must_use]
     pub const fn document_ready_state(&self) -> DocumentReadyState {

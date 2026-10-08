@@ -99,11 +99,11 @@ use render_browser::worker::RenderViewport;
 use render_core::image::ImageLimits;
 use render_core::image::ImageSelectionContext;
 use render_core::image::ImageSource;
+use render_core::navigation::HistoryEntry;
 
 use render_core::js::RuntimeLimits;
-use render_core::js::{FetchOutcome, PendingFetch};
+use render_core::js::{FetchOutcome, HistoryRequest, PendingFetch};
 use render_core::layout::PhysicalPoint;
-use render_core::navigation::HistoryEntry;
 use render_core::page::PageDomEvent;
 use render_core::paint::DisplayCommand;
 use render_core::script::ScriptDiscoveryLimits;
@@ -1065,6 +1065,67 @@ impl BrowserApp {
     /// Perform any navigations the page's script requested since the last
     /// pump (`location.assign`/`replace`/`href`). Only the newest request is
     /// honored; scripts that redirect repeatedly cannot loop the browser.
+    /// Applies the session-history changes a page's script requested, in order.
+    /// A push or replace records the entry and the URL the document reports; it
+    /// loads nothing. A traversal moves through the list and navigates to the
+    /// entry it reaches, which replaces the document, so the rest is dropped.
+    pub(super) fn drain_history_requests(&mut self, id: TabId) {
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        let requests = page.page.runtime_mut().take_pending_history_requests();
+        for request in requests {
+            match request {
+                HistoryRequest::Push { url } => self.record_history_entry(id, &url, false),
+                HistoryRequest::Replace { url } => self.record_history_entry(id, &url, true),
+                HistoryRequest::Go { delta } => {
+                    let Some(page) = self.pages.get_mut(&id) else {
+                        return;
+                    };
+                    let target = page.history.go(delta).map(|entry| entry.url.clone());
+                    if let Some(url) = target {
+                        self.navigate_target(
+                            id,
+                            NavigationTarget::from_url(url),
+                            HistoryMode::Current,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Records a `pushState` or `replaceState` entry for `id`. The committed URL
+    /// moves with it, so relative links and the address bar follow the document.
+    fn record_history_entry(&mut self, id: TabId, url: &str, replace: bool) {
+        let Ok(url) = Url::parse(url) else {
+            eprintln!("render-browser ignoring an invalid history URL");
+            return;
+        };
+        let Some(page) = self.pages.get_mut(&id) else {
+            return;
+        };
+        let entry = HistoryEntry::new(url.clone());
+        let recorded = if replace {
+            page.history.replace(entry)
+        } else {
+            page.history.push(entry)
+        };
+        if let Err(error) = recorded {
+            eprintln!("render-browser history entry refused: {error}");
+            return;
+        }
+        page.navigation.committed.target = NavigationTarget::from_url(url);
+        let title = page.navigation.committed().title.clone();
+        let address = page.navigation.committed().target.display_address();
+        self.tabs.update(id, title, address);
+        if id == self.tabs.active_id() {
+            self.sync_active_address();
+        }
+        self.repaint_chrome();
+    }
+
     pub(super) fn drain_script_navigations(&mut self, id: TabId) {
         let Some(page) = self.pages.get_mut(&id) else {
             return;
@@ -3703,6 +3764,10 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
             if let Some(changed) = page.fire_load_when_settled() {
                 rendered_active |= changed && id == active;
             }
+        }
+        let ids: Vec<TabId> = self.pages.keys().copied().collect();
+        for id in ids {
+            self.drain_history_requests(id);
         }
         if rendered_active {
             self.schedule_page_render_for_tab(active);

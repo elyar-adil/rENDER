@@ -305,6 +305,19 @@ pub struct NavigationRequest {
     pub replace: bool,
 }
 
+/// A session-history change a script requested through the `History` interface.
+/// The runtime records these and never applies them: the embedding updates its
+/// session history, and performs any traversal as a navigation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HistoryRequest {
+    /// `history.pushState`: add an entry for `url`. Nothing is loaded.
+    Push { url: String },
+    /// `history.replaceState`: replace the current entry's URL. Nothing is loaded.
+    Replace { url: String },
+    /// `history.back()`, `history.forward()` and `history.go(delta)`.
+    Go { delta: isize },
+}
+
 /// One network transfer (`fetch()` or `XMLHttpRequest`) that script queued.
 ///
 /// The runtime never performs I/O; the embedding drains these requests

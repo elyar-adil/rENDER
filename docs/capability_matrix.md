@@ -105,7 +105,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **`window.matchMedia`** | every responsive site that gates behaviour in script gets nothing |
 | **Form submission** | the owner relationship exists and is derived on read, but there is **no submit event path and no navigation**. A search box and a login do not submit - the single most-used interactive path on the web |
 | **Web Workers** | zero occurrences of `Worker` |
-| **History API** | no `pushState`/`replaceState`, so client-side routing has no state to change |
+| **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load; `back`/`forward`/`go` reload the entry reached. No `popstate`, `history.length` stays 1 |
 | **Iframes** | no second document, so any page embedding one loses that content entirely |
 | **Animations and transitions** | `@keyframes` is parsed, diagnosed and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
 | **Selection / Range** | no `getSelection`, `createRange`, or caret position APIs |

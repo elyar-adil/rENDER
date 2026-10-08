@@ -13,6 +13,7 @@
     clippy::wrong_self_convention
 )]
 
+use crate::HistoryRequest;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -458,6 +459,37 @@ impl JsRuntime {
                 Ok(result)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
+            NativeFunction::HistoryPushState => self.history_state_change(arguments, false),
+            NativeFunction::HistoryReplaceState => self.history_state_change(arguments, true),
+            NativeFunction::HistoryBack => {
+                self.pending_history_requests
+                    .push(HistoryRequest::Go { delta: -1 });
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::HistoryForward => {
+                self.pending_history_requests
+                    .push(HistoryRequest::Go { delta: 1 });
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::HistoryGo => {
+                let delta = match arguments.first() {
+                    None | Some(JsValue::Undefined) => 0.0,
+                    Some(value) => to_number(value)?,
+                };
+                let delta = if delta.is_finite() {
+                    delta.trunc()
+                } else {
+                    0.0
+                };
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "history deltas are small; the shell clamps them to the list"
+                )]
+                let delta = delta as isize;
+                self.pending_history_requests
+                    .push(HistoryRequest::Go { delta });
+                Ok(JsValue::Undefined)
+            }
             NativeFunction::CssSupports => css_supports(arguments),
             NativeFunction::GlobalEscape => {
                 let text = required_argument(arguments, 0, "escape")?.to_js_string();

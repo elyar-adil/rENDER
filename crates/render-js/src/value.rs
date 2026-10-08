@@ -483,6 +483,11 @@ pub(crate) enum NativeFunction {
     GlobalEvalStub,
     GlobalImport,
     GlobalNoop,
+    HistoryPushState,
+    HistoryReplaceState,
+    HistoryBack,
+    HistoryForward,
+    HistoryGo,
     CssSupports,
     UrlSearchParamsGet,
     UrlSearchParamsHas,
@@ -1948,19 +1953,26 @@ impl Realm {
             },
         );
 
-        // Session history is owned by the browser shell. Exposing the
-        // standard object and harmless methods lets application bootstrap
-        // register routes without aborting the document script turn.
+        // Session history is owned by the browser shell. These methods record
+        // a `HistoryRequest` the shell applies after the turn, and
+        // `pushState`/`replaceState` move the location at once, so routing code
+        // sees the new URL without a load.
         let history = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
-        for name in ["back", "forward", "go", "pushState", "replaceState"] {
+        for (name, function) in [
+            ("back", NativeFunction::HistoryBack),
+            ("forward", NativeFunction::HistoryForward),
+            ("go", NativeFunction::HistoryGo),
+            ("pushState", NativeFunction::HistoryPushState),
+            ("replaceState", NativeFunction::HistoryReplaceState),
+        ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
                 prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(NativeFunction::GlobalNoop),
+                host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
             objects[history.0].properties.insert(
@@ -6427,6 +6439,28 @@ impl Realm {
         let reclaimed = swept.saturating_sub(self.swept_objects);
         self.swept_objects = swept;
         reclaimed
+    }
+
+    /// Replace the URL the global `location` object reports. `pushState` and
+    /// `replaceState` use it, because the document URL changes without a load.
+    pub(crate) fn set_location_url(&mut self, url: Url) {
+        let Some(JsValue::Object(location)) = self.global("location") else {
+            return;
+        };
+        // The components (`href`, `pathname`, ...) are data properties filled
+        // in when the object is made, so they are rewritten along with the host.
+        let Some(object) = self.object_mut(location) else {
+            return;
+        };
+        for (name, value) in location_components(&url) {
+            object.properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::String(value)),
+            );
+        }
+        if let ObjectHost::Location(current) = &mut object.host {
+            *current = url;
+        }
     }
 
     pub(crate) fn host(&self, object: ObjectId) -> Option<ObjectHost> {

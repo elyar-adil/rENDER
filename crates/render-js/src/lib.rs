@@ -22,8 +22,8 @@ use std::error::Error;
 use std::fmt;
 
 pub use runtime::{
-    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, JsMicrotask,
-    JsRuntime, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
+    JsMicrotask, JsRuntime, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
 };
 pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm};
 

@@ -2747,3 +2747,105 @@ fn a_post_form_sends_its_urlencoded_body_and_commits_the_response() {
         "the committed document is the server's response to the POST"
     );
 }
+
+/// Runs a page's inline scripts the way the shell does on its first pass.
+fn run_page_scripts(app: &mut BrowserApp, tab: TabId) {
+    app.pages.get_mut(&tab).expect("page").styles_resolved = true;
+    app.start_classic_scripts(tab);
+    let page = app.pages.get_mut(&tab).expect("page");
+    let _ = page.run_page_turns();
+}
+
+fn tab_address(app: &BrowserApp, tab: TabId) -> String {
+    app.tabs
+        .tabs()
+        .iter()
+        .find(|candidate| candidate.id == tab)
+        .expect("tab exists")
+        .address
+        .clone()
+}
+
+const PAGE_URL: &str = "file:///rENDER-test-fixtures/page.html";
+
+#[test]
+fn a_push_state_moves_the_address_and_history_without_loading_anything() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         history.pushState({ step: 1 }, '', '/app/next?x=1');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(page.history.len(), 2);
+    assert_eq!(page.history.current().url.as_str(), "file:///app/next?x=1");
+    assert_eq!(
+        page.navigation.committed().target.display_address(),
+        "file:///app/next?x=1"
+    );
+    assert_eq!(tab_address(&app, tab), "file:///app/next?x=1");
+}
+
+#[test]
+fn a_replace_state_rewrites_the_current_entry_without_growing_history() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         history.replaceState(null, '', '/app/here');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get(&tab).expect("page");
+    assert_eq!(page.history.len(), 1);
+    assert_eq!(page.history.current().url.as_str(), "file:///app/here");
+    assert_eq!(tab_address(&app, tab), "file:///app/here");
+}
+
+#[test]
+fn a_cross_origin_push_state_is_refused_and_leaves_the_history_alone() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         try { history.pushState(null, '', 'https://other.test/'); document.title = 'pushed'; }\
+         catch (error) { document.title = 'refused'; }\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.sync_committed_title();
+    assert_eq!(page.navigation.committed().title, "refused");
+    assert_eq!(page.history.len(), 1);
+    assert_eq!(tab_address(&app, tab), PAGE_URL);
+}
+
+#[test]
+fn history_back_after_a_push_state_returns_to_the_entry_before_it() {
+    let (mut app, tab) = headless_app_with(
+        "<!doctype html><title>start</title><script>\
+         history.pushState(null, '', '/app/next');\
+         </script>",
+    );
+    run_page_scripts(&mut app, tab);
+    app.drain_history_requests(tab);
+    assert_eq!(tab_address(&app, tab), "file:///app/next");
+
+    let page = app.pages.get_mut(&tab).expect("page");
+    page.page
+        .queue_script("history.back();")
+        .expect("script should queue");
+    let _ = page.run_page_turns();
+    app.drain_history_requests(tab);
+
+    let page = app.pages.get(&tab).expect("page");
+    assert!(!page.history.can_go_back(), "the original entry is first");
+    assert!(
+        page.history.can_go_forward(),
+        "the pushed entry stays ahead"
+    );
+    assert_eq!(page.history.current().url.as_str(), PAGE_URL);
+    assert_eq!(tab_address(&app, tab), PAGE_URL);
+}

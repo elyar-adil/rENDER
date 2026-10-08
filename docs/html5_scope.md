@@ -108,10 +108,12 @@
 
 > 目标：单页应用类页面（中等复杂度）能加载、能路由、能与后端通信。
 > 验收：History API / fetch / 基础 Custom Elements 测试通过。
-> **当前状态：未达成。** `history.pushState`/`replaceState`/`back`/`forward`/`go`
-> 目前是**空实现**（`crates/render-js/src/value.rs:1464-1495`，五个方法全部装成
-> `NativeFunction::GlobalNoop`，源码注释自述"Session history is owned by the browser
-> shell"）；`customElements` 不存在；Shadow DOM 不存在。
+> **当前状态：部分达成。** `history.pushState`/`replaceState` 更新文档 URL 与
+> `history.state`（同源检查见 `crates/render-js/src/runtime/mod.rs`），壳侧把请求记入会话
+> 历史（`crates/render-browser/src/app.rs` 的 `drain_history_requests`），不触发加载；
+> `back`/`forward`/`go` 重新加载所到达的条目。仍缺：`popstate` 事件、遍历时恢复
+> `history.state`、`history.length` 恒为 1、`scrollRestoration`；`customElements` 不存在；
+> Shadow DOM 不存在。
 
 任何超出 M3 的能力（WebGL、Service Worker、IndexedDB、媒体解码等）属于本文档以外的
 "未来路线"。
@@ -570,8 +572,8 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | API | 状态 |
 |------|------|
 | `location.href / pathname / search / hash` | 🟡 `install_location` 在 `crates/render-js/src/value.rs:2654-2669`，`ObjectHost::Location`；`innerWidth`/`innerHeight` 读自 viewport（`runtime/eval.rs:2706-2707,2780-2781`）。hash 变更是否触发 `hashchange` ❓ 未核实 |
-| `history.back / forward / go / pushState / replaceState` | 🔴 **全部是 `NativeFunction::GlobalNoop` 空实现**（`crates/render-js/src/value.rs:1464-1495`），`length` 恒 1、`state` 恒 null。源码注释自述"Session history is owned by the browser shell"，但壳侧未接 |
-| `popstate` 事件 | 🔴 |
+| `history.back / forward / go / pushState / replaceState` | 🟡 pushState/replaceState 更新 URL 与 `history.state`，不加载；back/forward/go 重新加载所到达的条目。`length` 恒 1（壳侧未回写列表长度）；遍历不恢复 `state` |
+| `popstate` 事件 | 🔴 同文档遍历不触发（`pushState` 之后的 back 走重新加载） |
 | `BroadcastChannel` | ⛔ |
 
 ### 7.6 Web Components
