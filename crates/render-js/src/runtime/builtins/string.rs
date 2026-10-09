@@ -230,31 +230,39 @@ impl JsRuntime {
                     std::cmp::Ordering::Greater => 1.0,
                 }))
             }
-            // ECMA-262 22.1.3.19 `String.prototype.replaceAll`. The two entry
-            // points share `GetSubstitution`; the only difference is `global`.
-            // For a regular expression that is a *check* - a non-global `RegExp`
-            // is a `TypeError`, because silently treating it as `replace` would
-            // give a different answer than the same expression with `g` - and for
-            // a string pattern it is the search loop, which runs to the end of
-            // the input rather than stopping at the first hit.
+            // ECMA-262 22.1.3.20 `String.prototype.replaceAll`. A RegExp search
+            // value must carry `g` (a `TypeError` otherwise), and its `@@replace`
+            // method takes over; a string search value is replaced everywhere.
             NativeFunction::StrReplaceAll => {
-                let search = required_argument(arguments, 0, "replaceAll")?.clone();
+                let search = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 let replacement = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-                if matches!(search, JsValue::Object(_))
-                    && let (_, global) = self.coerce_pattern_argument(&search)?
-                    && !global
+                if let JsValue::Object(object) = search
+                    && self.is_regexp(dom, &search)?
                 {
-                    return Err(JsError::type_error(
-                        "String.prototype.replaceAll must be called with a global RegExp",
-                    ));
+                    let flags = self.get_member(dom, object, "flags")?;
+                    if matches!(flags, JsValue::Undefined | JsValue::Null) {
+                        return Err(JsError::type_error("RegExp flags are not coercible"));
+                    }
+                    let flags = self.to_string_value(dom, &flags)?;
+                    if !flags.contains('g') {
+                        return Err(JsError::type_error(
+                            "String.prototype.replaceAll must be called with a global RegExp",
+                        ));
+                    }
                 }
-                // `coerce_pattern_argument` turns a string search value into a
-                // non-global pattern, so the literal case is handled here rather
-                // than by delegating.
-                if matches!(search, JsValue::Object(_)) {
-                    return self.string_replace(dom, receiver, arguments);
+                if !matches!(search, JsValue::Undefined | JsValue::Null)
+                    && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
+                {
+                    let text = self.this_string(dom, receiver)?;
+                    return self.call_with_this(
+                        dom,
+                        replacer,
+                        &[JsValue::String(text), replacement],
+                        search,
+                    );
                 }
-                self.string_replace_all_literal(dom, receiver, &search.to_js_string(), &replacement)
+                let needle = self.to_string_argument(dom, &search)?;
+                self.string_replace_all_literal(dom, receiver, &needle, &replacement)
             }
             // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units.
             // `intStart` is `ToClampedIndex(start, size)` - a negative start
@@ -335,134 +343,7 @@ pub(in crate::runtime) fn char_at_value(units: &[u16], position: f64) -> JsValue
 
 /// Collect spans of every non-overlapping match honouring empty-match
 /// advancement; used by global matching.
-pub(in crate::runtime) fn collect_global_matches(
-    compiled: &crate::regex::Compiled,
-    input: &[u16],
-) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
-    let mut cursor = 0usize;
-    while cursor <= input.len() {
-        let Some(found) = compiled.find(input, cursor) else {
-            break;
-        };
-        spans.push((found.start, found.end));
-        cursor = if found.end == found.start {
-            crate::regex::advance_index(input, found.end, compiled.flags().unicode)
-        } else {
-            found.end
-        };
-    }
-    spans
-}
-
 /// Split `input` around each match of `compiled`, returning piece spans.
-pub(in crate::runtime) fn split_by_regex(
-    compiled: &crate::regex::Compiled,
-    input: &[u16],
-    limit: usize,
-) -> Vec<(usize, usize)> {
-    let mut pieces = Vec::new();
-    let mut cursor = 0usize;
-    while pieces.len() < limit && cursor <= input.len() {
-        match compiled.find(input, cursor) {
-            Some(found) => {
-                pieces.push((cursor, found.start));
-                cursor = if found.end == found.start {
-                    crate::regex::advance_index(input, found.end, compiled.flags().unicode)
-                } else {
-                    found.end
-                };
-                if pieces.len() >= limit {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-    if pieces.len() < limit {
-        pieces.push((cursor.min(input.len()), input.len()));
-    }
-    pieces
-}
-
-/// Expand `$&`, `` $` ``, `$'`, `$$`, and `$1`–`$9` in a replacement string.
-pub(in crate::runtime) fn expand_replacement(
-    replacement: &str,
-    input: &[u16],
-    found: &crate::regex::MatchRanges,
-) -> String {
-    let characters: Vec<char> = replacement.chars().collect();
-    let mut output = String::new();
-    let mut index = 0usize;
-    while index < characters.len() {
-        let character = characters[index];
-        if character != '$' || index + 1 >= characters.len() {
-            output.push(character);
-            index += 1;
-            continue;
-        }
-        let next = characters[index + 1];
-        match next {
-            '$' => {
-                output.push('$');
-                index += 2;
-            }
-            '&' => {
-                output.push_str(&utf16::string_from_utf16(&input[found.start..found.end]));
-                index += 2;
-            }
-            '`' => {
-                output.push_str(&utf16::string_from_utf16(&input[..found.start]));
-                index += 2;
-            }
-            '\'' => {
-                output.push_str(&utf16::string_from_utf16(
-                    &input[found.end.min(input.len())..],
-                ));
-                index += 2;
-            }
-            digit @ '1'..='9' => {
-                // `$nn` names group `nn` when the pattern has that many groups;
-                // otherwise it is `$n` followed by a literal digit.
-                let mut group = digit as usize - '1' as usize;
-                index += 2;
-                if let Some(second) = characters.get(index).and_then(|c| c.to_digit(10)) {
-                    let two_digit = (group + 1) * 10 + second as usize;
-                    if (1..=found.groups.len()).contains(&two_digit) {
-                        group = two_digit - 1;
-                        index += 1;
-                    }
-                }
-                if let Some(Some((start, end))) = found.groups.get(group) {
-                    output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
-                }
-            }
-            '<' if !found.names.is_empty() => {
-                if let Some(close) = characters[index + 2..].iter().position(|c| *c == '>') {
-                    let name: String = characters[index + 2..index + 2 + close].iter().collect();
-                    if let Some((_, group)) =
-                        found.names.iter().find(|(candidate, _)| *candidate == name)
-                        && let Some(Some((start, end))) = found.groups.get(group - 1)
-                    {
-                        output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
-                    }
-                    index += close + 3;
-                } else {
-                    output.push('$');
-                    output.push('<');
-                    index += 2;
-                }
-            }
-            other => {
-                output.push('$');
-                output.push(other);
-                index += 2;
-            }
-        }
-    }
-    output
-}
-
 /// `String.prototype.split` with a **non-empty** literal separator, over code
 /// units.
 ///
@@ -633,6 +514,7 @@ pub(in crate::runtime) fn string_method_native(name: &str) -> Option<NativeFunct
         "replace" => Some(NativeFunction::StrReplace),
         "replaceAll" => Some(NativeFunction::StrReplaceAll),
         "match" => Some(NativeFunction::StrMatch),
+        "matchAll" => Some(NativeFunction::StrMatchAll),
         "search" => Some(NativeFunction::StrSearch),
         "concat" => Some(NativeFunction::StrConcat),
         "toString" | "valueOf" => Some(NativeFunction::StrToString),
@@ -661,6 +543,7 @@ pub(in crate::runtime) fn is_string_native(function: NativeFunction) -> bool {
             | NativeFunction::StrSplit
             | NativeFunction::StrReplace
             | NativeFunction::StrMatch
+            | NativeFunction::StrMatchAll
             | NativeFunction::StrSearch
             | NativeFunction::StrConcat
             | NativeFunction::StrToString
@@ -881,9 +764,18 @@ impl JsRuntime {
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "the preceding range and integer checks guarantee a Unicode scalar input"
+                reason = "the preceding range and integer checks guarantee a code point input"
             )]
             let code = number as u32;
+            // A surrogate is a code point the specification accepts (§22.1.2.2
+            // only bounds the value to 0..=0x10FFFF), so it becomes the
+            // placeholder for one unpaired code unit rather than a range error.
+            if let Ok(unit) = u16::try_from(code)
+                && (0xD800..=0xDFFF).contains(&unit)
+            {
+                text.push_str(&utf16::string_from_unit(unit));
+                continue;
+            }
             let Some(character) = char::from_u32(code) else {
                 return Err(self.range_error("invalid code point"));
             };
@@ -1095,7 +987,7 @@ impl JsRuntime {
         needle: &str,
         replacement: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.this_string(dom, receiver)?;
         let units = utf16::utf16_units(&text);
         let pattern = utf16::utf16_units(needle);
         // The output is accumulated as code units rather than as text, because a
@@ -1191,121 +1083,123 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.this_string(dom, receiver)?;
+        let separator = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let limit = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        // ECMA-262 22.1.3.23 steps 3-4: a `@@split` method takes over.
+        if !matches!(separator, JsValue::Undefined | JsValue::Null)
+            && let Some(splitter) = self.symbol_method_of(dom, &separator, "@@split")?
+        {
+            return self.call_with_this(dom, splitter, &[JsValue::String(text), limit], separator);
+        }
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "split limits are clamped to the u32 range first"
         )]
-        let limit = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => usize::MAX,
-            Some(value) => {
+        let limit = match &limit {
+            JsValue::Undefined => u32::MAX as usize,
+            value => {
                 let number = self.to_number_value(dom, value)?;
                 uint32_of_number(number) as usize
             }
         };
-        let pieces = match arguments.first() {
-            None | Some(JsValue::Undefined) => vec![text],
-            Some(separator) => {
-                let characters = utf16::utf16_units(&text);
-                if let JsValue::Object(_) = separator {
-                    let (index, _) = self.coerce_pattern_argument(separator)?;
-                    split_by_regex(&self.regexes[index].compiled, &characters, limit)
-                        .into_iter()
-                        .map(|span| utf16::string_from_utf16(&characters[span.0..span.1]))
-                        .collect()
-                } else {
-                    let separator = separator.to_js_string();
-                    if separator.is_empty() {
-                        // §22.1.3.32: an empty separator "returns the List
-                        // containing the String values for each code unit", so
-                        // `'\u{1F600}'.split('')` has two elements. This is the
-                        // same code-unit notion `length` reports, and answering
-                        // with code points here would make `split('')`, `length`
-                        // and `charAt` disagree about the same string.
-                        utf16::utf16_units(&text)
-                            .iter()
-                            .take(limit)
-                            .map(|unit| utf16::string_from_unit(*unit))
-                            .collect()
-                    } else if limit == 0 {
-                        Vec::new()
-                    } else {
-                        // A non-empty literal separator is matched as a
-                        // substring, so it is found in the code-unit sequence
-                        // too: `'\u{1F600}a'.split('\uDE00')` splits inside the
-                        // pair, which a `&str` search could not do.
-                        split_by_units(&text, &separator, limit)
-                    }
-                }
+        if limit == 0 {
+            return Ok(JsValue::Object(self.create_array_from_values(&[])?));
+        }
+        let pieces = if matches!(separator, JsValue::Undefined) {
+            vec![text]
+        } else {
+            let separator = self.to_string_argument(dom, &separator)?;
+            if separator.is_empty() {
+                // §22.1.3.23: an empty separator "returns the List containing the
+                // String values for each code unit", so `'\u{1F600}'.split('')`
+                // has two elements. This is the same code-unit notion `length`
+                // reports, so `split('')`, `length` and `charAt` agree.
+                utf16::utf16_units(&text)
+                    .iter()
+                    .take(limit)
+                    .map(|unit| utf16::string_from_unit(*unit))
+                    .collect()
+            } else {
+                // A non-empty separator is matched as a substring of the
+                // code-unit sequence, so `'\u{1F600}a'.split('\uDE00')` splits
+                // inside the pair, which a `&str` search could not do.
+                split_by_units(&text, &separator, limit)
             }
         };
         let values = pieces.into_iter().map(JsValue::String).collect::<Vec<_>>();
         Ok(JsValue::Object(self.create_array_from_values(&values)?))
     }
 
-    /// `String.prototype.match`: one exec-style result unless the regex is
-    /// global, in which case every full match is collected.
+    /// ECMA-262 22.1.3.13 `String.prototype.match`: the `@@match` method of the
+    /// argument, or a `RegExp` created from it.
     pub(in crate::runtime) fn string_match(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        let characters = utf16::utf16_units(&text);
-        let Some(argument) = arguments.first() else {
-            let object = self.construct_regex("", "")?;
-            let Some(ObjectHost::RegExp(index)) = self.realm.host(object) else {
-                return Err(JsError::type_error("regexp construction failed"));
-            };
-            return match self.regex_exec_value(index, &characters, &text, 0)? {
-                Some(value) => Ok(value),
-                None => Ok(JsValue::Null),
-            };
-        };
-        let (index, global) = self.coerce_pattern_argument(argument)?;
-        if !global {
-            return match self.regex_exec_value(index, &characters, &text, 0)? {
-                Some(value) => Ok(value),
-                None => Ok(JsValue::Null),
-            };
+        let text = self.this_string(dom, receiver)?;
+        let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        if !matches!(regexp, JsValue::Undefined | JsValue::Null)
+            && let Some(matcher) = self.symbol_method_of(dom, &regexp, "@@match")?
+        {
+            return self.call_with_this(dom, matcher, &[JsValue::String(text)], regexp);
         }
-        let spans = collect_global_matches(&self.regexes[index].compiled, &characters);
-        let values = spans
-            .into_iter()
-            .map(|(start, end)| JsValue::String(utf16::string_from_utf16(&characters[start..end])))
-            .collect::<Vec<_>>();
-        if values.is_empty() {
-            return Ok(JsValue::Null);
-        }
-        Ok(JsValue::Object(self.create_array_from_values(&values)?))
+        let rx = self.regexp_create(dom, &regexp, "")?;
+        self.invoke_symbol(dom, rx, "@@match", &[JsValue::String(text)])
     }
 
-    /// ECMA-262 22.1.3.21 `String.prototype.search`.
-    ///
-    /// The matcher walks code points but the answer is a String index, so the
-    /// offset is converted: `'\u{1F600}b'.search(/b/)` is 2, the position a
-    /// caller would pass to `slice`.
-    pub(in crate::runtime) fn string_search(
+    /// ECMA-262 22.1.3.14 `String.prototype.matchAll`.
+    pub(in crate::runtime) fn string_match_all(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        let characters = utf16::utf16_units(&text);
-        let argument = required_argument(arguments, 0, "search")?;
-        let (index, _) = self.coerce_pattern_argument(argument)?;
-        Ok(match self.regexes[index].compiled.find(&characters, 0) {
-            Some(found) => {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "string lengths stay far below any precision boundary"
-                )]
-                let start = found.start as f64;
-                JsValue::Number(start)
+        let text = self.this_string(dom, receiver)?;
+        let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        if !matches!(regexp, JsValue::Undefined | JsValue::Null) {
+            if let JsValue::Object(object) = regexp
+                && self.is_regexp(dom, &regexp)?
+            {
+                let flags = self.get_member(dom, object, "flags")?;
+                if matches!(flags, JsValue::Undefined | JsValue::Null) {
+                    return Err(JsError::type_error("RegExp flags are not coercible"));
+                }
+                let flags = self.to_string_value(dom, &flags)?;
+                if !flags.contains('g') {
+                    return Err(JsError::type_error(
+                        "String.prototype.matchAll called with a non-global RegExp argument",
+                    ));
+                }
             }
-            None => JsValue::Number(-1.0),
-        })
+            if let Some(matcher) = self.symbol_method_of(dom, &regexp, "@@matchAll")? {
+                return self.call_with_this(dom, matcher, &[JsValue::String(text)], regexp);
+            }
+        }
+        let rx = self.regexp_create(dom, &regexp, "g")?;
+        self.invoke_symbol(dom, rx, "@@matchAll", &[JsValue::String(text)])
+    }
+
+    /// ECMA-262 22.1.3.21 `String.prototype.search`: the `@@search` method of the
+    /// argument, or a `RegExp` created from it. The answer is a code-unit index.
+    pub(in crate::runtime) fn string_search(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let text = self.this_string(dom, receiver)?;
+        let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        if !matches!(regexp, JsValue::Undefined | JsValue::Null)
+            && let Some(searcher) = self.symbol_method_of(dom, &regexp, "@@search")?
+        {
+            return self.call_with_this(dom, searcher, &[JsValue::String(text)], regexp);
+        }
+        let rx = self.regexp_create(dom, &regexp, "")?;
+        self.invoke_symbol(dom, rx, "@@search", &[JsValue::String(text)])
     }
 
     /// `String.prototype[Symbol.iterator]` (and its `values` alias): a String
@@ -1333,80 +1227,86 @@ impl JsRuntime {
 
     /// `String.prototype.replace` with `$&`, `$1`–`$9`, `` $` ``, `$'`, `$$`
     /// expansion or a replacement function.
+    /// ECMA-262 22.1.3.19 `String.prototype.replace`: the `@@replace` method of
+    /// the search value, or the first occurrence of the search string.
     pub(in crate::runtime) fn string_replace(
         &mut self,
         dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        let search = required_argument(arguments, 0, "replace")?;
-        let replacement = required_argument(arguments, 1, "replace")?.clone();
-        let characters = utf16::utf16_units(&text);
-        let (index, global) = self.coerce_pattern_argument(search)?;
-        let compiled = self.regexes[index].compiled.clone();
-
-        let mut cursor = 0usize;
-        let mut last_end = 0usize;
-        // Accumulated as code units and decoded once at the end, so a
-        // replacement that supplies one half of a pair next to a copy of the
-        // other half is re-joined. The pattern is matched over code points (a
-        // pattern is written in those terms) but the reported `position` and the
-        // assembled result are String values, so both are in code units.
-        let mut output: Vec<u16> = Vec::new();
-        while let Some(found) = compiled.find(&characters, cursor) {
-            let replaced: Vec<u16> = match &replacement {
-                JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
-                    let mut call_arguments = vec![JsValue::String(utf16::string_from_utf16(
-                        &characters[found.start..found.end],
-                    ))];
-                    for group in &found.groups {
-                        call_arguments.push(match group {
-                            Some((start, end)) => {
-                                JsValue::String(utf16::string_from_utf16(&characters[*start..*end]))
-                            }
-                            None => JsValue::Undefined,
-                        });
-                    }
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "string lengths stay far below any precision boundary"
-                    )]
-                    let position = found.start as f64;
-                    call_arguments.push(JsValue::Number(position));
-                    call_arguments.push(JsValue::String(text.clone()));
-                    if !found.names.is_empty() {
-                        let groups = self.named_groups_object(&found, &characters)?;
-                        call_arguments.push(groups);
-                    }
-                    let produced = self.call(dom, *callable, &call_arguments)?;
-                    utf16::utf16_units(&produced.to_js_string())
-                }
-                other => utf16::utf16_units(&expand_replacement(
-                    &other.to_js_string(),
-                    &characters,
-                    &found,
-                )),
-            };
-            output.extend_from_slice(&characters[last_end..found.start]);
-            output.extend(replaced);
-            last_end = found.end;
-            if found.end == found.start {
-                // Empty match: step past the position to guarantee progress.
-                if found.end >= characters.len() {
-                    break;
-                }
-                cursor =
-                    crate::regex::advance_index(&characters, found.end, compiled.flags().unicode);
-            } else {
-                cursor = found.end;
-            }
-            if !global {
-                break;
-            }
+        let search = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let replace_value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let text = self.this_string(dom, receiver)?;
+        if !matches!(search, JsValue::Undefined | JsValue::Null)
+            && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
+        {
+            return self.call_with_this(
+                dom,
+                replacer,
+                &[JsValue::String(text), replace_value],
+                search,
+            );
         }
-        output.extend_from_slice(&characters[last_end.min(characters.len())..]);
+        let needle = self.to_string_argument(dom, &search)?;
+        let replacer = match &replace_value {
+            JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
+                Some(*callable)
+            }
+            _ => None,
+        };
+        let template = if replacer.is_some() {
+            Vec::new()
+        } else {
+            let template = self.to_string_argument(dom, &replace_value)?;
+            utf16::utf16_units(&template)
+        };
+        let units = utf16::utf16_units(&text);
+        let pattern = utf16::utf16_units(&needle);
+        let Some(position) = Self::find_units(&units, &pattern, 0) else {
+            return Ok(JsValue::String(text));
+        };
+        let replacement = match replacer {
+            Some(callable) => {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "string positions stay far below any precision boundary"
+                )]
+                let arguments = [
+                    JsValue::String(needle.clone()),
+                    JsValue::Number(position as f64),
+                    JsValue::String(text.clone()),
+                ];
+                let produced = self.call(dom, callable, &arguments)?;
+                let produced = self.to_string_value(dom, &produced)?;
+                utf16::utf16_units(&produced)
+            }
+            None => self.get_substitution(
+                dom,
+                &pattern,
+                &units,
+                position,
+                &[],
+                &JsValue::Undefined,
+                &template,
+            )?,
+        };
+        let mut output = units[..position].to_vec();
+        output.extend(replacement);
+        output.extend_from_slice(&units[position + pattern.len()..]);
         Ok(JsValue::String(utf16::string_from_utf16(&output)))
+    }
+
+    /// The first index at or after `from` where `pattern` occurs in `units`.
+    fn find_units(units: &[u16], pattern: &[u16], from: usize) -> Option<usize> {
+        if pattern.is_empty() {
+            return (from <= units.len()).then_some(from);
+        }
+        units
+            .get(from..)?
+            .windows(pattern.len())
+            .position(|window| window == pattern)
+            .map(|offset| offset + from)
     }
 }
 

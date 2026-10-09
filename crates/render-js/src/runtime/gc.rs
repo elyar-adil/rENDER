@@ -299,6 +299,9 @@ pub(super) fn mark_host(
                 mark_value(runtime, marked, work, marked_environments, value);
             }
         }
+        ObjectHost::RegExpStringIterator { matcher, .. } => {
+            mark_object(runtime, marked, work, marked_environments, *matcher);
+        }
         ObjectHost::IteratorHelper {
             source,
             source_next,
