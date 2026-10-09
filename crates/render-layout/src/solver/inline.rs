@@ -469,7 +469,7 @@ impl<'a> Solver<'a> {
             .find(|atom| atom.forced_break || !atom.character.is_whitespace())
             .is_some_and(|atom| atom.forced_break);
 
-        let text = self.inline_text_context(source, containing.size.width);
+        let mut text = self.inline_text_context(source, containing.size.width);
         let default_style = InlineTextStyle {
             style: TextStyle {
                 font_size: self.options.root_font_size,
@@ -497,6 +497,15 @@ impl<'a> Solver<'a> {
             0.0,
             line_indent,
         );
+        // CSS Overflow 3 §3.1: an ellipsis marks overflow, so it is drawn only
+        // when the content does not fit the line box. Without this test every
+        // character is checked against the room reserved for the ellipsis, and
+        // text that fits exactly would be cut as if it overflowed.
+        if text.ellipsis
+            && self.inline_sequence_max_content_width(roots, depth) <= line_right - line_left
+        {
+            text.ellipsis = false;
+        }
         let mut line_x = line_left;
         let mut current_line_height = first_style.style.line_height;
         let mut pending_space: Option<InlineAtom> = None;

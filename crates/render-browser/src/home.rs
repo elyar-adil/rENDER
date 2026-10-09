@@ -18,13 +18,14 @@ pub const HOME_HTML: &str = r#"<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --page: #f3f5f8;
+      --page: #f4f6fa;
       --surface: #ffffff;
-      --surface-muted: #e8ecf2;
-      --text: #20242c;
-      --muted: #68707d;
-      --line: #dce1e8;
-      --focus: #2864dc;
+      --text: #1d2129;
+      --muted: #6b7280;
+      --line: #e3e8ef;
+      --focus: #2563eb;
+      --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 2px 6px rgba(16, 24, 40, 0.06);
+      --shadow-hover: 0 4px 12px rgba(16, 24, 40, 0.10), 0 10px 24px rgba(16, 24, 40, 0.08);
       font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
     }
 
@@ -46,88 +47,73 @@ pub const HOME_HTML: &str = r#"<!doctype html>
 
     .start-page {
       width: calc(100% - 48px);
-      max-width: 960px;
+      max-width: 880px;
       margin-left: auto;
       margin-right: auto;
-      padding-top: clamp(64px, 14vh, 132px);
-      padding-bottom: 72px;
+      padding-top: clamp(48px, 10vh, 96px);
+      padding-bottom: 64px;
     }
 
     .section-heading {
-      margin-top: 0;
-      margin-right: 0;
-      margin-bottom: 24px;
-      margin-left: 0;
-      font-size: 20px;
+      margin: 0 0 6px 0;
+      font-size: 22px;
       font-weight: 650;
-      line-height: 1.25;
+      line-height: 1.3;
       letter-spacing: -0.01em;
     }
 
+    .section-caption {
+      margin: 0 0 24px 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
     .favorite-list {
-      margin-top: 0;
-      margin-right: 0;
-      margin-bottom: 0;
-      margin-left: 0;
-      padding-top: 0;
-      padding-right: 0;
-      padding-bottom: 0;
-      padding-left: 0;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: flex-start;
-      align-items: flex-start;
-      column-gap: 20px;
-      row-gap: 24px;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
       list-style: none;
     }
 
     .favorite-item {
       display: block;
-      flex-grow: 1;
-      flex-shrink: 1;
-      flex-basis: 96px;
-      min-width: 76px;
-      max-width: 100px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
     }
 
     .favorite-link {
-      width: 100%;
+      height: 100%;
       display: flex;
       flex-direction: column;
       align-items: center;
-      row-gap: 10px;
+      row-gap: 12px;
+      padding: 20px 10px 16px 10px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background-color: var(--surface);
+      box-shadow: var(--shadow);
       color: var(--text);
       text-align: center;
       text-decoration: none;
+      transition: transform 140ms ease, box-shadow 140ms ease;
     }
 
     .favorite-icon {
-      width: 56px;
-      height: 56px;
+      width: 52px;
+      height: 52px;
       display: flex;
       align-items: center;
       justify-content: center;
-      border-top-width: 1px;
-      border-right-width: 1px;
-      border-bottom-width: 1px;
-      border-left-width: 1px;
-      border-top-style: solid;
-      border-right-style: solid;
-      border-bottom-style: solid;
-      border-left-style: solid;
-      border-top-color: var(--line);
-      border-right-color: var(--line);
-      border-bottom-color: var(--line);
-      border-left-color: var(--line);
-      border-radius: 18px;
-      background-color: var(--surface);
-      color: var(--icon-color, #394150);
-      box-shadow: 0 4px 14px rgba(22, 30, 45, 0.08);
-      font-size: 18px;
+      border-radius: 14px;
+      background-color: var(--brand, #4b5563);
+      color: #ffffff;
+      font-size: 22px;
       font-weight: 700;
       line-height: 1;
-      transition: transform 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
     }
 
     .favorite-name {
@@ -135,75 +121,57 @@ pub const HOME_HTML: &str = r#"<!doctype html>
       max-width: 100%;
       overflow: hidden;
       color: var(--text);
-      font-size: 13px;
+      font-size: 14px;
+      font-weight: 500;
       line-height: 1.35;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    .favorite-link:hover .favorite-icon {
-      background-color: #f9fafc;
-      box-shadow: 0 7px 20px rgba(22, 30, 45, 0.12);
+    .favorite-link:hover {
       transform: translateY(-2px);
+      box-shadow: var(--shadow-hover);
     }
 
     .favorite-link:focus-visible {
-      outline: 3px solid var(--focus);
-      outline-offset: 5px;
-      border-radius: 20px;
+      outline: 2px solid var(--focus);
+      outline-offset: 3px;
     }
 
-    .baidu { --icon-color: #315efb; background-color: #eef2ff; }
-    .hao123 { --icon-color: #16875b; background-color: #edf8f2; }
-    .bilibili { --icon-color: #e65d87; background-color: #fff0f5; }
-    .zhihu { --icon-color: #1769e0; background-color: #edf5ff; }
-    .weibo { --icon-color: #db4b36; background-color: #fff1ee; }
-    .taobao { --icon-color: #e85d1a; background-color: #fff2e9; }
-    .jd { --icon-color: #d9363e; background-color: #fff0f1; }
-    .netease { --icon-color: #c83e42; background-color: #fff1f1; }
+    .baidu { --brand: #2932e1; }
+    .hao123 { --brand: #0f9d58; }
+    .bilibili { --brand: #fb7299; }
+    .zhihu { --brand: #0084ff; }
+    .weibo { --brand: #e6162d; }
+    .taobao { --brand: #ff5000; }
+    .jd { --brand: #e1251b; }
+    .netease { --brand: #c20c0c; }
 
     .start-page-details {
-      margin-top: 52px;
+      margin-top: 40px;
       display: flex;
       flex-wrap: wrap;
       align-items: stretch;
-      column-gap: 16px;
-      row-gap: 16px;
+      column-gap: 14px;
+      row-gap: 14px;
     }
 
     .empty-section {
       min-width: 240px;
-      min-height: 104px;
       flex-grow: 1;
       flex-shrink: 1;
-      flex-basis: 360px;
-      padding-top: 18px;
-      padding-right: 20px;
-      padding-bottom: 18px;
-      padding-left: 20px;
-      border-top-width: 1px;
-      border-right-width: 1px;
-      border-bottom-width: 1px;
-      border-left-width: 1px;
-      border-top-style: solid;
-      border-right-style: solid;
-      border-bottom-style: solid;
-      border-left-style: solid;
-      border-top-color: var(--line);
-      border-right-color: var(--line);
-      border-bottom-color: var(--line);
-      border-left-color: var(--line);
+      flex-basis: 320px;
+      padding: 16px 18px;
+      border: 1px solid var(--line);
       border-radius: 14px;
       background-color: var(--surface);
     }
 
     .empty-section h2 {
-      margin-top: 0;
-      margin-right: 0;
-      margin-bottom: 8px;
-      margin-left: 0;
-      font-size: 15px;
-      font-weight: 650;
+      margin: 0 0 4px 0;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
       line-height: 1.3;
     }
 
@@ -217,27 +185,17 @@ pub const HOME_HTML: &str = r#"<!doctype html>
     @media (max-width: 680px) {
       .start-page {
         width: calc(100% - 32px);
-        padding-top: 48px;
+        padding-top: 40px;
         padding-bottom: 40px;
       }
 
       .favorite-list {
-        column-gap: 12px;
-      }
-
-      .favorite-item {
-        flex-basis: calc(25% - 12px);
-        min-width: 64px;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 12px;
       }
 
       .start-page-details {
-        margin-top: 40px;
-      }
-    }
-
-    @media (max-width: 400px) {
-      .favorite-item {
-        flex-basis: calc(33.333% - 12px);
+        margin-top: 32px;
       }
     }
 
@@ -250,26 +208,15 @@ pub const HOME_HTML: &str = r#"<!doctype html>
     @media (prefers-color-scheme: dark) {
       :root {
         color-scheme: dark;
-        --page: #17191d;
-        --surface: #24272d;
-        --surface-muted: #2d3138;
-        --text: #f1f3f6;
-        --muted: #a7aeb9;
-        --line: #393e47;
-        --focus: #83aaff;
+        --page: #121417;
+        --surface: #1c1f24;
+        --text: #eceff4;
+        --muted: #9aa3b2;
+        --line: #2c3139;
+        --focus: #7aa2ff;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.30);
+        --shadow-hover: 0 6px 16px rgba(0, 0, 0, 0.40);
       }
-
-      .favorite-link:hover .favorite-icon {
-        background-color: #2b2f36;
-        box-shadow: 0 7px 20px rgba(0, 0, 0, 0.28);
-      }
-
-      .baidu { background-color: #202c50; }
-      .hao123 { background-color: #1d352d; }
-      .bilibili { background-color: #432832; }
-      .zhihu { background-color: #202f45; }
-      .weibo, .taobao { background-color: #402a27; }
-      .jd, .netease { background-color: #3e282b; }
     }
   </style>
 </head>
@@ -277,6 +224,7 @@ pub const HOME_HTML: &str = r#"<!doctype html>
   <main class="start-page">
     <section id="favorites" class="favorites" aria-labelledby="favorites-title" data-start-page-primary="favorites">
       <h1 id="favorites-title" class="section-heading">常用网站</h1>
+      <p class="section-caption">点击网站名称或图标即可访问</p>
       <nav aria-label="常用网站">
         <ul class="favorite-list">
           <li class="favorite-item"><a class="favorite-link" href="https://www.baidu.com/"><span class="favorite-icon baidu" aria-hidden="true">百</span><span class="favorite-name">百度</span></a></li>
