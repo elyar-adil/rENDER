@@ -805,6 +805,16 @@ impl JsRuntime {
             }
             Statement::Throw(expression) => {
                 let value = self.evaluate(dom, expression)?;
+                // A thrown object with a string `message` (an Error subclass
+                // or a user exception) reports that message, not
+                // "[object Object]", as a browser's uncaught-error line does.
+                let object_message = match &value {
+                    JsValue::Object(object) => match self.realm.get_property(*object, "message") {
+                        Some(JsValue::String(message)) => Some(message),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 // Thrown Error instances surface as "Name: message" (what a
                 // real engine prints), not "[object Object]".
                 let mut error = match value {
@@ -827,7 +837,10 @@ impl JsRuntime {
                             self.error_to_string(dom, object).to_js_string(),
                         )
                     }
-                    value => JsError::thrown(value),
+                    value => match object_message {
+                        Some(message) => JsError::thrown_with_message(value, message),
+                        None => JsError::thrown(value),
+                    },
                 };
                 if let Some(offset) = expr_offset(expression) {
                     error = error.at_offset(offset);
@@ -2339,6 +2352,27 @@ impl JsRuntime {
             return to_number(&primitive);
         }
         to_number(value)
+    }
+
+    /// ECMA-262 `ToIntegerOrInfinity` for a value that may be an object, so a
+    /// built-in's index or count argument can carry a `valueOf`.
+    pub(super) fn to_integer_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<f64, JsError> {
+        let number = self.to_number_value(dom, value)?;
+        Ok(super::convert::integer_or_infinity(number))
+    }
+
+    /// ECMA-262 `ToLength` for a value that may be an object.
+    pub(super) fn to_length_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<f64, JsError> {
+        let integer = self.to_integer_value(dom, value)?;
+        Ok(integer.clamp(0.0, 9_007_199_254_740_991.0))
     }
 
     /// ECMA-262 `ToString` for values that may be objects: run `ToPrimitive`
@@ -4441,7 +4475,7 @@ impl JsRuntime {
             }
             Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
             Some(ObjectHost::DateConstructor) => {
-                let ms = Self::date_from_constructor_arguments(arguments)?;
+                let ms = self.date_from_constructor_arguments(dom, arguments)?;
                 self.ensure_heap_capacity(1)?;
                 Ok(JsValue::Object(self.realm.date_wrapper(ms)))
             }
@@ -4693,7 +4727,7 @@ impl JsRuntime {
             })),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
                 None | Some(JsValue::Undefined) => 0.0,
-                Some(value) => to_number(value)?,
+                Some(value) => self.to_number_value(dom, value)?,
             })),
             Some(ObjectHost::BooleanConstructor) => Ok(JsValue::Boolean(
                 arguments.first().is_none_or(JsValue::is_truthy),

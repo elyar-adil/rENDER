@@ -117,18 +117,29 @@ impl JsRuntime {
                 )),
             },
             NativeFunction::NumToFixed => {
+                // ECMA-262 21.1.3.3: the digits argument is converted first and
+                // must lie in 0..=100; a non-finite number or one of 1e21 or more
+                // prints as `ToString` does.
+                let digits =
+                    self.to_integer_value(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
+                if !(0.0..=100.0).contains(&digits) {
+                    return Err(
+                        self.range_error("toFixed() digits argument must be between 0 and 100")
+                    );
+                }
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
-                    reason = "toFixed digits are validated small integers"
+                    reason = "digits was just checked to lie in 0..=100"
                 )]
-                let digits = match arguments.first() {
-                    Some(JsValue::Number(n)) => *n as usize,
-                    _ => 0,
-                };
+                let digits = digits as usize;
                 match self.realm.host(receiver) {
                     Some(ObjectHost::NumberPrimitive(value)) => {
-                        Ok(JsValue::String(format!("{value:.digits$}")))
+                        if !value.is_finite() || value.abs() >= 1e21 {
+                            Ok(JsValue::String(crate::value::number_to_string(value)))
+                        } else {
+                            Ok(JsValue::String(format!("{value:.digits$}")))
+                        }
                     }
                     _ => Err(JsError::type_error("incompatible Number method receiver")),
                 }

@@ -20,7 +20,6 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::ConsoleLevel;
 use crate::runtime::types::ConsoleMessage;
@@ -474,7 +473,7 @@ impl JsRuntime {
             NativeFunction::HistoryGo => {
                 let delta = match arguments.first() {
                     None | Some(JsValue::Undefined) => 0.0,
-                    Some(value) => to_number(value)?,
+                    Some(value) => self.to_number_value(dom, value)?,
                 };
                 let delta = if delta.is_finite() {
                     delta.trunc()
@@ -561,14 +560,16 @@ impl JsRuntime {
             NativeFunction::GlobalParseInt => {
                 // ECMA-262 7.1.1.1. The radix argument used to be ignored, so
                 // every `parseInt(hex, 16)` in a bundle came back `NaN`.
-                let text = required_argument(arguments, 0, "parseInt")?.to_js_string();
+                let text =
+                    self.to_string_value(dom, required_argument(arguments, 0, "parseInt")?)?;
                 Ok(JsValue::Number(crate::runtime::convert::parse_int(
                     &text,
                     arguments.get(1),
                 )?))
             }
             NativeFunction::GlobalParseFloat => {
-                let text = required_argument(arguments, 0, "parseFloat")?.to_js_string();
+                let text =
+                    self.to_string_value(dom, required_argument(arguments, 0, "parseFloat")?)?;
                 let trimmed = text.trim_start();
                 let end = trimmed
                     .find(|c: char| {
@@ -581,10 +582,12 @@ impl JsRuntime {
                 )
             }
             NativeFunction::GlobalIsNaN => Ok(JsValue::Boolean(
-                to_number(required_argument(arguments, 0, "isNaN")?)?.is_nan(),
+                self.to_number_value(dom, required_argument(arguments, 0, "isNaN")?)?
+                    .is_nan(),
             )),
             NativeFunction::GlobalIsFinite => Ok(JsValue::Boolean(
-                to_number(required_argument(arguments, 0, "isFinite")?)?.is_finite(),
+                self.to_number_value(dom, required_argument(arguments, 0, "isFinite")?)?
+                    .is_finite(),
             )),
             NativeFunction::GlobalEncodeURI | NativeFunction::GlobalEncodeURIComponent => {
                 let text = required_argument(arguments, 0, "encodeURI")?.to_js_string();

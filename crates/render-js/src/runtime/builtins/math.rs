@@ -17,7 +17,6 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
-use crate::runtime::convert::to_number;
 use crate::value::{MathOp, NativeFunction, NumberOp};
 use render_dom::Dom;
 
@@ -43,15 +42,17 @@ impl JsRuntime {
                 let value = (state >> 11) as f64 / (1u64 << 53) as f64;
                 Ok(JsValue::Number(value))
             }
-            NativeFunction::MathAbs => Self::math_unary(arguments, f64::abs),
-            NativeFunction::MathCeil => Self::math_unary(arguments, f64::ceil),
-            NativeFunction::MathFloor => Self::math_unary(arguments, f64::floor),
-            NativeFunction::MathMax => Self::math_min_max(arguments, f64::NEG_INFINITY, f64::max),
-            NativeFunction::MathMin => Self::math_min_max(arguments, f64::INFINITY, f64::min),
-            NativeFunction::MathPow => Self::math_pow(arguments),
-            NativeFunction::MathRound => Self::math_unary(arguments, js_math_round),
-            NativeFunction::MathSqrt => Self::math_unary(arguments, f64::sqrt),
-            NativeFunction::MathOp(operation) => Self::math_operation(operation, arguments),
+            NativeFunction::MathAbs => self.math_unary(dom, arguments, f64::abs),
+            NativeFunction::MathCeil => self.math_unary(dom, arguments, f64::ceil),
+            NativeFunction::MathFloor => self.math_unary(dom, arguments, f64::floor),
+            NativeFunction::MathMax => {
+                self.math_min_max(dom, arguments, f64::NEG_INFINITY, f64::max)
+            }
+            NativeFunction::MathMin => self.math_min_max(dom, arguments, f64::INFINITY, f64::min),
+            NativeFunction::MathPow => self.math_pow(dom, arguments),
+            NativeFunction::MathRound => self.math_unary(dom, arguments, js_math_round),
+            NativeFunction::MathSqrt => self.math_unary(dom, arguments, f64::sqrt),
+            NativeFunction::MathOp(operation) => self.math_operation(dom, operation, arguments),
             NativeFunction::NumberOp(operation) => Ok(JsValue::Boolean(match operation {
                 // §21.1.2: these never coerce; a non-number is simply false.
                 _ if !matches!(arguments.first(), Some(JsValue::Number(_))) => false,
@@ -96,9 +97,15 @@ pub(in crate::runtime) fn js_math_round(value: f64) -> f64 {
 
 impl JsRuntime {
     /// The pure-`f64` `Math` functions (ECMA-262 §21.3.2).
-    fn math_operation(operation: MathOp, arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let argument = |index: usize| -> Result<f64, JsError> {
-            to_number(arguments.get(index).unwrap_or(&JsValue::Undefined))
+    fn math_operation(
+        &mut self,
+        dom: &mut Dom,
+        operation: MathOp,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let mut argument = |index: usize| -> Result<f64, JsError> {
+            let value = arguments.get(index).cloned().unwrap_or(JsValue::Undefined);
+            self.to_number_value(dom, &value)
         };
         let value = match operation {
             MathOp::Sin => argument(0)?.sin(),
@@ -158,22 +165,27 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn math_unary(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         operation: impl FnOnce(f64) -> f64,
     ) -> Result<JsValue, JsError> {
-        Ok(JsValue::Number(operation(to_number(
-            arguments.first().unwrap_or(&JsValue::Undefined),
-        )?)))
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        Ok(JsValue::Number(operation(
+            self.to_number_value(dom, &value)?,
+        )))
     }
 
     pub(in crate::runtime) fn math_min_max(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         identity: f64,
         operation: impl Fn(f64, f64) -> f64,
     ) -> Result<JsValue, JsError> {
         let mut result = identity;
         for argument in arguments {
-            let value = to_number(argument)?;
+            let value = self.to_number_value(dom, argument)?;
             if value.is_nan() {
                 return Ok(JsValue::Number(f64::NAN));
             }
@@ -182,10 +194,16 @@ impl JsRuntime {
         Ok(JsValue::Number(result))
     }
 
-    pub(in crate::runtime) fn math_pow(arguments: &[JsValue]) -> Result<JsValue, JsError> {
-        let base = arguments.first().unwrap_or(&JsValue::Undefined);
-        let exponent = arguments.get(1).unwrap_or(&JsValue::Undefined);
-        Ok(JsValue::Number(to_number(base)?.powf(to_number(exponent)?)))
+    pub(in crate::runtime) fn math_pow(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let base = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let exponent = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let base = self.to_number_value(dom, &base)?;
+        let exponent = self.to_number_value(dom, &exponent)?;
+        Ok(JsValue::Number(base.powf(exponent)))
     }
 }
 

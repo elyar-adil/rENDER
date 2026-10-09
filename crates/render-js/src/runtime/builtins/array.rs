@@ -20,7 +20,6 @@ use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
-use crate::runtime::convert::to_integer_or_infinity;
 use crate::runtime::convert::to_number;
 use crate::utf16;
 use crate::value::NativeFunction;
@@ -41,9 +40,9 @@ impl JsRuntime {
             NativeFunction::ArrayValues => self.array_view_iterator(receiver, ArrayView::Values),
             NativeFunction::ArrayKeys => self.array_view_iterator(receiver, ArrayView::Keys),
             NativeFunction::ArrayEntries => self.array_view_iterator(receiver, ArrayView::Entries),
-            NativeFunction::ArraySplice => self.array_splice(receiver, arguments),
+            NativeFunction::ArraySplice => self.array_splice(dom, receiver, arguments),
             NativeFunction::ArrayReverse => self.array_reverse(receiver),
-            NativeFunction::ArrayAt => self.array_at(receiver, arguments),
+            NativeFunction::ArrayAt => self.array_at(dom, receiver, arguments),
             NativeFunction::ArrayFlat => self.array_flat(dom, receiver, arguments),
             NativeFunction::ArrayReduceRight => self.array_reduce_right(dom, receiver, arguments),
             NativeFunction::ArrayFindLast => self.array_find_last(dom, receiver, arguments, false),
@@ -210,7 +209,7 @@ impl JsRuntime {
         object: ObjectId,
     ) -> Result<usize, JsError> {
         let length = self.get_member(dom, object, "length")?;
-        let length = to_number(&length)?;
+        let length = self.to_number_value(dom, &length)?;
         if !length.is_finite() || length < 0.0 {
             return Err(self.range_error("invalid typed array length"));
         }
@@ -242,12 +241,10 @@ impl JsRuntime {
                 .map(JsValue::Number)
                 .collect());
         }
-        let length = self
-            .realm
-            .get_property(object, "length")
-            .map(|value| to_length(&value))
-            .transpose()?
-            .unwrap_or(0.0);
+        let length = match self.realm.get_property(object, "length") {
+            Some(value) => to_length(&value)?,
+            None => 0.0,
+        };
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(JsError::resource(
                 "array-like length exceeds the materialization bound",
@@ -308,7 +305,7 @@ impl JsRuntime {
             return Ok(utf16::utf16_length(&text) as f64);
         }
         let length = self.get_value(dom, object, "length")?;
-        to_length(&length)
+        self.to_length_value(dom, &length)
     }
 
     /// `HasProperty` for an integral index (§7.3.11), including the virtual
@@ -358,11 +355,17 @@ impl JsRuntime {
 
     /// Resolve one `start`/`end` bound of `slice` (`ToIntegerOrInfinity` plus
     /// the relative-to-length adjustment from §23.1.3.25).
-    fn relative_bound(value: Option<&JsValue>, length: f64, default: f64) -> Result<f64, JsError> {
+    fn relative_bound(
+        &mut self,
+        dom: &mut Dom,
+        value: Option<&JsValue>,
+        length: f64,
+        default: f64,
+    ) -> Result<f64, JsError> {
         let Some(value) = value else {
             return Ok(default);
         };
-        let raw = to_integer_or_infinity(value)?;
+        let raw = self.to_integer_value(dom, value)?;
         if raw == f64::NEG_INFINITY {
             return Ok(0.0);
         }
@@ -583,7 +586,7 @@ impl JsRuntime {
         // an infinite positive start can never find anything.
         let raw = match arguments.get(1) {
             None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_integer_or_infinity(value)?,
+            Some(value) => self.to_integer_value(dom, value)?,
         };
         let mut index = if raw == f64::INFINITY {
             return Ok(JsValue::Number(-1.0));
@@ -611,8 +614,8 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let length = self.array_like_len(dom, receiver)?;
-        let start = Self::relative_bound(arguments.first(), length, 0.0)?;
-        let end = Self::relative_bound(arguments.get(1), length, length)?;
+        let start = self.relative_bound(dom, arguments.first(), length, 0.0)?;
+        let end = self.relative_bound(dom, arguments.get(1), length, length)?;
         let count = (end - start).max(0.0);
         let result = self.create_array_with_length(count)?;
         let mut index = start;
@@ -630,6 +633,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn array_splice(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -637,7 +641,7 @@ impl JsRuntime {
         let length = elements.len();
         let raw_start = match arguments.first() {
             None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
+            Some(value) => self.to_integer_value(dom, value)?,
         };
         let start = if raw_start < 0.0 {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
@@ -653,7 +657,7 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => length - start,
             Some(value) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let raw = to_number(value)?.max(0.0) as usize;
+                let raw = self.to_integer_value(dom, value)?.max(0.0) as usize;
                 raw.min(length - start)
             }
         };
@@ -684,13 +688,14 @@ impl JsRuntime {
     /// only reason to use `at` at all.
     pub(in crate::runtime) fn array_at(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let elements = self.array_elements(receiver)?;
         let length = elements.len();
         let relative = match arguments.first() {
-            Some(value) => to_number(value)?.trunc(),
+            Some(value) => self.to_integer_value(dom, value)?,
             None => 0.0,
         };
         #[allow(
@@ -942,7 +947,7 @@ impl JsRuntime {
     ) -> Result<i32, JsError> {
         if let Some(function) = comparator {
             let result = self.call(dom, function, &[left.clone(), right.clone()])?;
-            let number = to_number(&result)?;
+            let number = self.to_number_value(dom, &result)?;
             return Ok(if number < 0.0 {
                 -1
             } else {
@@ -1227,7 +1232,7 @@ impl JsRuntime {
         let length = self.array_like_len(dom, receiver)?;
         let raw = match arguments.get(1) {
             None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_integer_or_infinity(value)?,
+            Some(value) => self.to_integer_value(dom, value)?,
         };
         let mut index = if raw == f64::INFINITY {
             return Ok(JsValue::Boolean(false));

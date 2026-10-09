@@ -294,6 +294,8 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn date_from_constructor_arguments(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<f64, JsError> {
         match arguments {
@@ -301,19 +303,24 @@ impl JsRuntime {
             [value] => match value {
                 JsValue::String(text) => Ok(Self::parse_date_string(text).unwrap_or(f64::NAN)),
                 JsValue::Undefined => Ok(f64::NAN),
-                other => Ok(Self::time_clip(to_number(other)?)),
+                other => {
+                    let number = self.to_date_number(dom, other)?;
+                    Ok(Self::time_clip(number))
+                }
             },
-            _ => Self::date_from_utc_arguments(arguments),
+            _ => self.date_from_utc_arguments(dom, arguments),
         }
     }
 
     pub(in crate::runtime) fn date_from_utc_arguments(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<f64, JsError> {
         let mut values = [f64::NAN, f64::NAN, 1.0, 0.0, 0.0, 0.0, 0.0];
         for (index, slot) in values.iter_mut().enumerate() {
             if let Some(value) = arguments.get(index) {
-                *slot = to_number(value)?;
+                *slot = self.to_date_number(dom, value)?;
             }
         }
         Ok(Self::make_date_time(
