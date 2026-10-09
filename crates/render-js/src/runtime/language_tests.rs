@@ -1108,3 +1108,15 @@ fn with_is_a_reserved_word_and_its_body_is_a_statement() {
     }
     assert_eq!(ok("var o = {with: 1}; o.with"), "1");
 }
+
+#[test]
+fn a_block_comment_with_a_line_separator_allows_automatic_semicolon_insertion() {
+    assert_eq!(ok("var a = 1 /*\u{2028}*/ var b = 2; a + b"), "3");
+    assert_eq!(ok("var a = 1 /*\u{2029}*/ var b = 2; a + b"), "3");
+    assert_eq!(
+        eval("var a = 1 /* no break */ var b = 2;")
+            .unwrap_err()
+            .kind(),
+        JsErrorKind::Syntax
+    );
+}

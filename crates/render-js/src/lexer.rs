@@ -1241,7 +1241,8 @@ impl Lexer<'_> {
                 self.advance();
                 return Ok(());
             }
-            if matches!(character, '\n' | '\r') {
+            // A comment that contains a line terminator counts as one (ECMA-262 12.4).
+            if is_js_line_terminator(character) {
                 self.newline = true;
             }
             self.advance();

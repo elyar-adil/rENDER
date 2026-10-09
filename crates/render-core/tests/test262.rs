@@ -1183,11 +1183,20 @@ fn parse_metadata(source: &str) -> Result<Metadata, String> {
     let mut negative_phase = None;
     let mut negative_type = None;
     let mut in_negative = false;
+    // The list whose YAML block sequence (`key:` then `- item` lines) is open.
+    let mut block_list: Option<ListKey> = None;
     for line in body.lines() {
         let line = line.trim();
         if line.is_empty() || line == "---" {
             continue;
         }
+        if let Some(key) = block_list
+            && let Some(item) = line.strip_prefix('-')
+        {
+            list_for(&mut metadata, key).push(unquote(item.trim()));
+            continue;
+        }
+        block_list = None;
         if line == "negative:" {
             in_negative = true;
             continue;
@@ -1200,15 +1209,21 @@ fn parse_metadata(source: &str) -> Result<Metadata, String> {
             negative_type = Some(value_after_colon(line));
             continue;
         }
-        if !line.starts_with(' ') && !line.starts_with('-') {
-            in_negative = false;
-        }
-        if line.starts_with("flags:") {
-            metadata.flags = parse_list(&value_after_colon(line));
-        } else if line.starts_with("includes:") {
-            metadata.includes = parse_list(&value_after_colon(line));
-        } else if line.starts_with("features:") {
-            metadata.features = parse_list(&value_after_colon(line));
+        in_negative = false;
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let list = match key {
+            "flags" => ListKey::Flags,
+            "includes" => ListKey::Includes,
+            "features" => ListKey::Features,
+            _ => continue,
+        };
+        // An empty value opens a block sequence; otherwise the value is an inline list.
+        if value.trim().is_empty() {
+            block_list = Some(list);
+        } else {
+            *list_for(&mut metadata, list) = parse_list(value);
         }
     }
     if negative_phase.is_some() != negative_type.is_some() {
@@ -1218,6 +1233,25 @@ fn parse_metadata(source: &str) -> Result<Metadata, String> {
         metadata.negative = Some(NegativeExpectation { phase, error_type });
     }
     Ok(metadata)
+}
+
+#[derive(Clone, Copy)]
+enum ListKey {
+    Flags,
+    Includes,
+    Features,
+}
+
+fn list_for(metadata: &mut Metadata, key: ListKey) -> &mut Vec<String> {
+    match key {
+        ListKey::Flags => &mut metadata.flags,
+        ListKey::Includes => &mut metadata.includes,
+        ListKey::Features => &mut metadata.features,
+    }
+}
+
+fn unquote(item: &str) -> String {
+    item.trim_matches(['\'', '"']).to_owned()
 }
 
 fn value_after_colon(line: &str) -> String {
@@ -1308,6 +1342,23 @@ language	88	2	0	1	200
         let negative = metadata.negative.expect("negative metadata should exist");
         assert_eq!(negative.phase, "parse");
         assert_eq!(negative.error_type, "SyntaxError");
+    }
+
+    #[test]
+    fn parses_block_sequence_flags_includes_and_features() {
+        let metadata = parse_metadata(
+            "/*---\nflags:\n  - noStrict\n  - async\nincludes:\n  - 'propertyHelper.js'\n  - doneprintHandle.js\nfeatures:\n  - Promise\nnegative:\n  phase: runtime\n  type: TypeError\n---*/",
+        )
+        .expect("block sequences should parse");
+        assert_eq!(metadata.flags, ["noStrict", "async"]);
+        assert_eq!(
+            metadata.includes,
+            ["propertyHelper.js", "doneprintHandle.js"]
+        );
+        assert_eq!(metadata.features, ["Promise"]);
+        let negative = metadata.negative.expect("negative metadata should exist");
+        assert_eq!(negative.phase, "runtime");
+        assert_eq!(negative.error_type, "TypeError");
     }
 
     #[test]
