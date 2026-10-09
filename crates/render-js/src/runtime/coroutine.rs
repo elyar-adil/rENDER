@@ -19,8 +19,8 @@
 use crate::JsError;
 use crate::JsValue;
 use crate::parser::{
-    BinaryOp, BindingPattern, BindingTarget, ClassElement, Expr, ObjectProperty, PropertyKey,
-    Statement, VariableKind,
+    BinaryOp, BindingPattern, BindingTarget, CatchClause, ClassElement, Expr, ObjectProperty,
+    PropertyKey, Statement, VariableKind,
 };
 use std::rc::Rc;
 
@@ -28,7 +28,13 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SuspendKind {
     Yield,
+    /// `yield` in an async generator: the operand was already awaited, and a
+    /// `return` resumption awaits its value before unwinding (ECMA-262 27.6.3.8).
+    AsyncYield,
     YieldDelegate,
+    /// `yield*` in an async generator: the inner iterator is driven with the
+    /// async iterator protocol, awaiting each inner result (ECMA-262 15.5.5).
+    AsyncYieldDelegate,
     Await,
 }
 
@@ -42,8 +48,27 @@ pub(super) struct LoopInfo {
     /// Whether an unlabeled `break` stops here (loops and `switch`, not
     /// labeled blocks).
     pub(super) unlabeled_break: bool,
-    /// Hidden-binding slot holding the iterator a `for…of` must close.
-    pub(super) iterator_slot: Option<usize>,
+    /// The iterator a `for…of` must close when the loop is left abruptly.
+    pub(super) iterator: Option<IteratorClose>,
+}
+
+/// An iterator held in a hidden binding that a loop closes on abrupt exit.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IteratorClose {
+    /// Slot whose `%i…` binding holds the iterator.
+    pub(super) slot: usize,
+    /// `for await`: the `return` result is awaited (ECMA-262 7.4.13).
+    pub(super) is_async: bool,
+}
+
+/// Hidden binding that receives the pending `next()` result of a `for await`.
+pub(super) fn next_result_name(slot: usize) -> String {
+    format!("%f{slot}")
+}
+
+/// Hidden binding that receives the awaited `next()` result of a `for await`.
+pub(super) fn awaited_result_name(slot: usize) -> String {
+    format!("%g{slot}")
 }
 
 /// How a `for…in`/`for…of` head binds each value.
@@ -82,8 +107,23 @@ pub(super) enum Instr {
         iterable: Rc<Expr>,
         slot: usize,
         binding: Rc<LoopBinding>,
+        /// `for await`: iterate with `@@asyncIterator`, falling back to a sync
+        /// iterator wrapped by `CreateAsyncFromSyncIterator`.
+        is_await: bool,
     },
     ForOfNext {
+        slot: usize,
+        binding: Rc<LoopBinding>,
+        done_pc: usize,
+    },
+    /// Call `next()` for a `for await` step; the Await that follows takes the
+    /// result (in [`next_result_name`]).
+    ForAwaitCall {
+        slot: usize,
+    },
+    /// Read the awaited step result of a `for await`: leave the loop when it is
+    /// done, otherwise bind its value.
+    ForAwaitBind {
         slot: usize,
         binding: Rc<LoopBinding>,
         done_pc: usize,
@@ -161,7 +201,8 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
         Statement::Function { .. }
         | Statement::Break(_)
         | Statement::Continue(_)
-        | Statement::ParameterDefault { .. } => false,
+        | Statement::ParameterDefault { .. }
+        | Statement::ParameterPattern { .. } => false,
         Statement::Class {
             super_class,
             elements,
@@ -222,6 +263,7 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
                 || update.as_ref().is_some_and(expr_has_suspend)
                 || statement_has_suspend(body)
         }
+        Statement::ForOf { is_await: true, .. } => true,
         Statement::ForIn { iterable, body, .. } | Statement::ForOf { iterable, body, .. } => {
             expr_has_suspend(iterable) || statement_has_suspend(body)
         }
@@ -350,6 +392,144 @@ pub(super) struct Compiler {
     next_slot: usize,
     /// Labels waiting for the loop (or block) they were written in front of.
     pending_labels: Vec<Rc<str>>,
+    /// Whether the body belongs to an async generator (`yield` and `return`
+    /// await their operands).
+    async_generator: bool,
+}
+
+/// ECMA-262 14.10.1: in an async generator, `return e` awaits `e`. The operand
+/// is rewritten to `await e` so the ordinary suspension analysis sees it. Only
+/// statements that run in this body are rewritten; nested functions and classes
+/// are left alone.
+fn await_returns(statements: &[Statement]) -> Vec<Statement> {
+    statements.iter().map(await_return_statement).collect()
+}
+
+fn await_return_statement(statement: &Statement) -> Statement {
+    let boxed = |inner: &Statement| Box::new(await_return_statement(inner));
+    match statement {
+        Statement::Return(Some(value)) => {
+            Statement::Return(Some(Expr::Await(Box::new(value.clone()))))
+        }
+        Statement::Block(statements) => Statement::Block(await_returns(statements)),
+        Statement::If {
+            condition,
+            consequent,
+            alternate,
+            offset,
+        } => Statement::If {
+            condition: condition.clone(),
+            consequent: boxed(consequent),
+            alternate: alternate.as_deref().map(boxed),
+            offset: *offset,
+        },
+        Statement::While {
+            condition,
+            body,
+            offset,
+        } => Statement::While {
+            condition: condition.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::DoWhile {
+            condition,
+            body,
+            offset,
+        } => Statement::DoWhile {
+            condition: condition.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::For {
+            initializer,
+            condition,
+            update,
+            body,
+            offset,
+        } => Statement::For {
+            initializer: initializer.clone(),
+            condition: condition.clone(),
+            update: update.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::ForIn {
+            kind,
+            name,
+            iterable,
+            body,
+            offset,
+        } => Statement::ForIn {
+            kind: *kind,
+            name: name.clone(),
+            iterable: iterable.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::ForOf {
+            kind,
+            name,
+            iterable,
+            body,
+            offset,
+            is_await,
+        } => Statement::ForOf {
+            kind: *kind,
+            name: name.clone(),
+            iterable: iterable.clone(),
+            body: boxed(body),
+            offset: *offset,
+            is_await: *is_await,
+        },
+        Statement::ForInExpr {
+            target,
+            iterable,
+            body,
+            offset,
+        } => Statement::ForInExpr {
+            target: target.clone(),
+            iterable: iterable.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::Labeled {
+            label,
+            body,
+            offset,
+        } => Statement::Labeled {
+            label: label.clone(),
+            body: boxed(body),
+            offset: *offset,
+        },
+        Statement::Switch {
+            expression,
+            cases,
+            offset,
+        } => Statement::Switch {
+            expression: expression.clone(),
+            cases: cases
+                .iter()
+                .map(|(tests, body)| (tests.clone(), await_returns(body)))
+                .collect(),
+            offset: *offset,
+        },
+        Statement::Try {
+            body,
+            catch,
+            finally,
+            offset,
+        } => Statement::Try {
+            body: await_returns(body),
+            catch: catch.as_ref().map(|catch| CatchClause {
+                parameter: catch.parameter.clone(),
+                body: await_returns(&catch.body),
+            }),
+            finally: finally.as_deref().map(await_returns),
+            offset: *offset,
+        },
+        other => other.clone(),
+    }
 }
 
 fn unsupported(what: &str, offset: usize) -> JsError {
@@ -361,12 +541,23 @@ fn unsupported(what: &str, offset: usize) -> JsError {
 
 impl Compiler {
     /// Compile a function body into instructions.
-    pub(super) fn compile(body: &[Statement]) -> Result<CoroutineCode, JsError> {
+    pub(super) fn compile(
+        body: &[Statement],
+        async_generator: bool,
+    ) -> Result<CoroutineCode, JsError> {
         let mut compiler = Self {
             instrs: Vec::new(),
             next_temp: 0,
             next_slot: 0,
             pending_labels: Vec::new(),
+            async_generator,
+        };
+        let rewritten;
+        let body = if async_generator {
+            rewritten = await_returns(body);
+            rewritten.as_slice()
+        } else {
+            body
         };
         for statement in body {
             compiler.statement(statement)?;
@@ -538,7 +729,7 @@ impl Compiler {
                     break_pc: after,
                     continue_pc: Some(test),
                     unlabeled_break: true,
-                    iterator_slot: None,
+                    iterator: None,
                 }));
             }
             Statement::DoWhile {
@@ -558,7 +749,7 @@ impl Compiler {
                     break_pc: after,
                     continue_pc: Some(continue_pc),
                     unlabeled_break: true,
-                    iterator_slot: None,
+                    iterator: None,
                 }));
             }
             Statement::For {
@@ -620,7 +811,7 @@ impl Compiler {
                     break_pc: after,
                     continue_pc: Some(continue_pc),
                     unlabeled_break: true,
-                    iterator_slot: None,
+                    iterator: None,
                 }));
             }
             Statement::ForOf {
@@ -628,15 +819,16 @@ impl Compiler {
                 name,
                 iterable,
                 body,
+                is_await,
                 ..
-            } => self.for_each(true, *kind, name, iterable, body)?,
+            } => self.for_each(true, *kind, name, iterable, body, *is_await)?,
             Statement::ForIn {
                 kind,
                 name,
                 iterable,
                 body,
                 ..
-            } => self.for_each(false, *kind, name, iterable, body)?,
+            } => self.for_each(false, *kind, name, iterable, body, false)?,
             Statement::ForInExpr { offset, .. } => {
                 return Err(unsupported("a `for…in` with an assignment target", *offset));
             }
@@ -667,7 +859,7 @@ impl Compiler {
                     break_pc: after,
                     continue_pc: None,
                     unlabeled_break: false,
-                    iterator_slot: None,
+                    iterator: None,
                 }));
             }
             Statement::Switch {
@@ -688,7 +880,8 @@ impl Compiler {
             Statement::Function { .. }
             | Statement::Break(_)
             | Statement::Continue(_)
-            | Statement::ParameterDefault { .. } => {
+            | Statement::ParameterDefault { .. }
+            | Statement::ParameterPattern { .. } => {
                 unreachable!("these never contain a suspension point of this function")
             }
         }
@@ -702,6 +895,7 @@ impl Compiler {
         name: &str,
         iterable: &Expr,
         body: &Statement,
+        is_await: bool,
     ) -> Result<(), JsError> {
         let labels = std::mem::take(&mut self.pending_labels);
         let iterable = Rc::new(self.explode(iterable)?);
@@ -715,6 +909,7 @@ impl Compiler {
                 iterable,
                 slot,
                 binding: binding.clone(),
+                is_await,
             }
         } else {
             Instr::ForInInit {
@@ -725,31 +920,49 @@ impl Compiler {
         });
         let enter = self.emit(Instr::Jump(0));
         let next = self.here();
-        let step = self.emit(Instr::Jump(0));
+        let step = if is_await {
+            // Call next(), await the result, then bind or finish.
+            self.emit(Instr::ForAwaitCall { slot });
+            self.emit(Instr::Suspend {
+                kind: SuspendKind::Await,
+                argument: Some(Rc::new(Expr::Identifier(next_result_name(slot)))),
+                target: Rc::from(awaited_result_name(slot)),
+            });
+            self.emit(Instr::Jump(0))
+        } else {
+            self.emit(Instr::Jump(0))
+        };
         self.statement(body)?;
         self.emit(Instr::Jump(next));
         let done = self.here();
         self.emit(Instr::ExitLoop);
         let after = self.here();
-        self.instrs[step] = if of {
-            Instr::ForOfNext {
+        self.instrs[step] = match (of, is_await) {
+            (true, true) => Instr::ForAwaitBind {
                 slot,
                 binding,
                 done_pc: done,
-            }
-        } else {
-            Instr::ForInNext {
+            },
+            (true, false) => Instr::ForOfNext {
                 slot,
                 binding,
                 done_pc: done,
-            }
+            },
+            (false, _) => Instr::ForInNext {
+                slot,
+                binding,
+                done_pc: done,
+            },
         };
         self.instrs[enter] = Instr::EnterLoop(Rc::new(LoopInfo {
             labels,
             break_pc: after,
             continue_pc: Some(next),
             unlabeled_break: true,
-            iterator_slot: of.then_some(slot),
+            iterator: of.then_some(IteratorClose {
+                slot,
+                is_async: is_await,
+            }),
         }));
         Ok(())
     }
@@ -808,7 +1021,7 @@ impl Compiler {
             break_pc: after,
             continue_pc: None,
             unlabeled_break: true,
-            iterator_slot: None,
+            iterator: None,
         }));
         Ok(())
     }
@@ -886,6 +1099,17 @@ impl Compiler {
         Expr::Identifier(name.to_string())
     }
 
+    /// Suspend until `argument` settles; the residual is the awaited value.
+    fn await_expression(&mut self, argument: Expr) -> Expr {
+        let target = self.fresh_temp();
+        self.emit(Instr::Suspend {
+            kind: SuspendKind::Await,
+            argument: Some(Rc::new(argument)),
+            target: target.clone(),
+        });
+        Expr::Identifier(target.to_string())
+    }
+
     /// Rewrite `expression` into instructions plus a suspension-free residual
     /// expression, preserving left-to-right evaluation.
     fn explode(&mut self, expression: &Expr) -> Result<Expr, JsError> {
@@ -895,29 +1119,31 @@ impl Compiler {
         match expression {
             Expr::Await(operand) => {
                 let argument = self.explode(operand)?;
-                let target = self.fresh_temp();
-                self.emit(Instr::Suspend {
-                    kind: SuspendKind::Await,
-                    argument: Some(Rc::new(argument)),
-                    target: target.clone(),
-                });
-                Ok(Expr::Identifier(target.to_string()))
+                Ok(self.await_expression(argument))
             }
             Expr::Yield {
                 argument, delegate, ..
             } => {
                 let argument = match argument {
-                    Some(argument) => Some(Rc::new(self.explode(argument)?)),
-                    None => None,
+                    Some(argument) => self.explode(argument)?,
+                    None => Expr::Literal(JsValue::Undefined),
+                };
+                let (kind, argument) = if *delegate && self.async_generator {
+                    // `yield*` does not await its operand: the inner iterator's
+                    // results are awaited instead.
+                    (SuspendKind::AsyncYieldDelegate, argument)
+                } else if *delegate {
+                    (SuspendKind::YieldDelegate, argument)
+                } else if self.async_generator {
+                    // `yield v` in an async generator awaits `v` first.
+                    (SuspendKind::AsyncYield, self.await_expression(argument))
+                } else {
+                    (SuspendKind::Yield, argument)
                 };
                 let target = self.fresh_temp();
                 self.emit(Instr::Suspend {
-                    kind: if *delegate {
-                        SuspendKind::YieldDelegate
-                    } else {
-                        SuspendKind::Yield
-                    },
-                    argument,
+                    kind,
+                    argument: Some(Rc::new(argument)),
                     target: target.clone(),
                 });
                 Ok(Expr::Identifier(target.to_string()))

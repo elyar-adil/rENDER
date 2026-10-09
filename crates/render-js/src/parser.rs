@@ -334,6 +334,8 @@ pub(super) enum Statement {
         iterable: Expr,
         body: Box<Statement>,
         offset: usize,
+        /// `for await (… of …)`: iterate with the async iterator protocol.
+        is_await: bool,
     },
     ForInExpr {
         target: Expr,
@@ -357,6 +359,16 @@ pub(super) enum Statement {
     ParameterDefault {
         index: usize,
         value: Expr,
+        offset: usize,
+    },
+    /// Parser-internal marker holding the lowered declaration of a destructuring
+    /// parameter at position `index`. Like [`Statement::ParameterDefault`] it is
+    /// extracted while the function is created: a call binds it straight after
+    /// the argument for that position (ECMA-262 10.2.11 step 25), so a generator
+    /// or async body never sees it and an invalid pattern throws at the call.
+    ParameterPattern {
+        index: usize,
+        declarations: Vec<(BindingTarget, Option<Expr>)>,
         offset: usize,
     },
 }
@@ -864,7 +876,8 @@ fn push_statement_parts<'a>(
 ) {
     match statement {
         Statement::Variable { value, .. } => expressions.extend(value.as_ref()),
-        Statement::VariableList { declarations, .. } => {
+        Statement::VariableList { declarations, .. }
+        | Statement::ParameterPattern { declarations, .. } => {
             for (target, value) in declarations {
                 expressions.extend(value.as_ref());
                 if let BindingTarget::Pattern(pattern) = target {
@@ -2030,6 +2043,20 @@ impl Parser {
     }
 
     fn for_statement(&mut self) -> Result<Statement, JsError> {
+        // `for await` is only a loop head inside an async body (ECMA-262 §14.7.5).
+        let is_await = self.in_async
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await");
+        if is_await {
+            self.advance();
+        }
+        let statement = self.for_statement_head(is_await)?;
+        if is_await && !matches!(statement, Statement::ForOf { .. }) {
+            return Err(self.error("expected 'of' after for await"));
+        }
+        Ok(statement)
+    }
+
+    fn for_statement_head(&mut self, is_await: bool) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after for")?;
         self.no_in = true;
         let initializer = if self.take(&TokenKind::Semicolon) {
@@ -2063,7 +2090,8 @@ impl Parser {
                     body: Box::new(body?),
                 });
             }
-            if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "of") {
+            // An escaped `of` is not the contextual keyword (ECMA-262 12.7.2).
+            if self.at_contextual("of") && !self.current().escaped {
                 self.advance();
                 self.no_in = false;
                 let iterable = self.expression()?;
@@ -2103,6 +2131,7 @@ impl Parser {
                             name: temporary,
                             iterable,
                             body: Box::new(body),
+                            is_await,
                         });
                     }
                 };
@@ -2112,6 +2141,7 @@ impl Parser {
                     name,
                     iterable,
                     body: Box::new(body),
+                    is_await,
                 });
             }
             self.cursor = declaration_start;
@@ -2135,7 +2165,7 @@ impl Parser {
                     body: Box::new(body?),
                 });
             }
-            if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "of") {
+            if self.at_contextual("of") && !self.current().escaped {
                 // `for (LHS of iterable)` with an assignment target, which may be
                 // a destructuring pattern. The loop binds one temporary, and the
                 // body first assigns the pattern from it, so the target is
@@ -2162,6 +2192,7 @@ impl Parser {
                     name: temporary,
                     iterable,
                     body: Box::new(Statement::Block(vec![assign, body?])),
+                    is_await,
                 });
             }
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
@@ -2360,7 +2391,7 @@ impl Parser {
             is_async_arrow = true;
         }
         let mut patterns = Vec::new();
-        let mut defaults: Vec<Statement> = Vec::new();
+        let mut markers: Vec<Statement> = Vec::new();
         let parameters = if let TokenKind::Identifier(name) = &self.current().kind {
             let name = name.clone();
             self.advance();
@@ -2389,7 +2420,7 @@ impl Parser {
                                 return Ok(None);
                             };
                             let temporary = format!("\0arrow_param_{}", parameters.len());
-                            patterns.push((temporary.clone(), pattern));
+                            patterns.push((parameters.len(), temporary.clone(), pattern));
                             temporary
                         } else {
                             let TokenKind::Identifier(parameter) = self.advance().kind else {
@@ -2401,7 +2432,7 @@ impl Parser {
                     let has_default = self.take(&TokenKind::Equal);
                     if has_default {
                         let value = self.assignment()?;
-                        defaults.push(Statement::ParameterDefault {
+                        markers.push(Statement::ParameterDefault {
                             index: parameters.len(),
                             value,
                             offset: self.previous_offset(),
@@ -2473,7 +2504,7 @@ impl Parser {
             .iter()
             .map(|parameter| parameter_binding_name(parameter).to_owned())
             .collect();
-        for (_, pattern) in &patterns {
+        for (_, _, pattern) in &patterns {
             collect_binding_names(pattern, &mut names);
         }
         if names.iter().any(|name| !seen.insert(name.as_str())) {
@@ -2486,23 +2517,19 @@ impl Parser {
             validate_strict_parameters(&parameters)?;
             validate_strict_statements(&body)?;
         }
-        if !defaults.is_empty() {
-            defaults.extend(body);
-            body = defaults;
-        }
-        if !patterns.is_empty() {
+        let offset = self.previous_offset();
+        for (index, temporary, pattern) in patterns {
             let mut declarations = Vec::new();
-            for (temporary, pattern) in patterns {
-                Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
-            }
-            body.insert(
-                0,
-                Statement::VariableList {
-                    offset: self.previous_offset(),
-                    kind: VariableKind::Var,
-                    declarations,
-                },
-            );
+            Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
+            markers.push(Statement::ParameterPattern {
+                index,
+                declarations,
+                offset,
+            });
+        }
+        if !markers.is_empty() {
+            markers.extend(body);
+            body = markers;
         }
         validate_declaration_conflicts(&body, true)?;
         Ok(Some(Expr::Arrow {
@@ -2544,8 +2571,19 @@ impl Parser {
     fn validate_assignment_target(&self, target: &Expr) -> Result<(), JsError> {
         match target {
             Expr::Array(_) | Expr::Object(_) => self.validate_destructuring_target(target, false),
-            _ if is_simple_target(target) => Ok(()),
+            _ if is_simple_target(target) => self.validate_simple_target(target),
             _ => Err(self.error("invalid assignment target")),
+        }
+    }
+
+    /// In strict code `eval` and `arguments` are not assignment targets
+    /// (ECMA-262 13.15.1.1), whether assigned alone or inside a pattern.
+    fn validate_simple_target(&self, target: &Expr) -> Result<(), JsError> {
+        match target {
+            Expr::Identifier(name) if self.strict && (name == "eval" || name == "arguments") => {
+                Err(self.error("assignment to eval or arguments in strict code"))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -2563,7 +2601,7 @@ impl Parser {
             Expr::Assignment { target: inner, .. } if allow_default => {
                 self.validate_destructuring_target(inner, false)
             }
-            _ if is_simple_target(target) => Ok(()),
+            _ if is_simple_target(target) => self.validate_simple_target(target),
             _ => Err(self.error("invalid destructuring assignment target")),
         }
     }
@@ -3728,7 +3766,7 @@ impl Parser {
         )?;
         self.in_parameters = true;
         let mut parameters = Vec::new();
-        let mut defaults: Vec<Statement> = Vec::new();
+        let mut markers: Vec<Statement> = Vec::new();
         let mut patterns = Vec::new();
         let mut bound = BTreeSet::new();
         if !self.at(&TokenKind::RightParen) {
@@ -3744,13 +3782,13 @@ impl Parser {
                     break;
                 }
                 // A destructuring parameter binds an anonymous argument slot;
-                // the pattern itself is lowered to a `var` declaration at the
-                // top of the body, exactly as arrow functions do.
+                // the pattern is lowered to a `var` declaration that the call
+                // runs for that slot (see `Statement::ParameterPattern`).
                 let mut bound_names = Vec::new();
                 if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
                     let pattern = self.binding_pattern()?;
                     let temporary = format!("\0param_{}", parameters.len());
-                    patterns.push((temporary.clone(), pattern));
+                    patterns.push((parameters.len(), temporary.clone(), pattern));
                     bound_names.push(temporary);
                 } else {
                     // `undefined` is an ordinary identifier in parameter position.
@@ -3765,7 +3803,7 @@ impl Parser {
                 let has_default = self.take(&TokenKind::Equal);
                 if has_default {
                     let value = self.assignment()?;
-                    defaults.push(Statement::ParameterDefault {
+                    markers.push(Statement::ParameterDefault {
                         index: parameters.len(),
                         value,
                         offset: self.previous_offset(),
@@ -3810,23 +3848,19 @@ impl Parser {
         if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
             return Err(self.error("'use strict' is not allowed with non-simple parameters"));
         }
-        if !defaults.is_empty() {
-            defaults.extend(body);
-            body = defaults;
-        }
-        if !patterns.is_empty() {
+        let offset = self.previous_offset();
+        for (index, temporary, pattern) in patterns {
             let mut declarations = Vec::new();
-            for (temporary, pattern) in patterns {
-                Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
-            }
-            body.insert(
-                0,
-                Statement::VariableList {
-                    offset: self.previous_offset(),
-                    kind: VariableKind::Var,
-                    declarations,
-                },
-            );
+            Self::lower_declarator(pattern, Expr::Identifier(temporary), &mut declarations);
+            markers.push(Statement::ParameterPattern {
+                index,
+                declarations,
+                offset,
+            });
+        }
+        if !markers.is_empty() {
+            markers.extend(body);
+            body = markers;
         }
         Ok((parameters, body))
     }
@@ -4407,7 +4441,8 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         Statement::Variable { value, .. } => {
             value.as_ref().map_or(Ok(()), validate_strict_expression)
         }
-        Statement::VariableList { declarations, .. } => declarations
+        Statement::VariableList { declarations, .. }
+        | Statement::ParameterPattern { declarations, .. } => declarations
             .iter()
             .filter_map(|(_, value)| value.as_ref())
             .try_for_each(validate_strict_expression),
@@ -4713,7 +4748,8 @@ fn validate_reserved_statement(
                 validate_reserved_expression(value, context)?;
             }
         }
-        Statement::VariableList { declarations, .. } => {
+        Statement::VariableList { declarations, .. }
+        | Statement::ParameterPattern { declarations, .. } => {
             for (target, value) in declarations {
                 if let BindingTarget::Name(name) = target {
                     check_reserved_identifier(name, context)?;
@@ -5039,7 +5075,8 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
             kind: VariableKind::Var,
             declarations,
             ..
-        } => {
+        }
+        | Statement::ParameterPattern { declarations, .. } => {
             for (target, _) in declarations {
                 names.extend(target.names());
             }
@@ -5167,6 +5204,12 @@ fn validate_declaration_conflicts<'a>(
                             return Err(duplicate(&name));
                         }
                     }
+                }
+            }
+            // A destructuring parameter's names are `var` names of the body.
+            Statement::ParameterPattern { declarations, .. } => {
+                for (target, _) in declarations {
+                    var_names.extend(target.names());
                 }
             }
             Statement::Class { name, .. } => {

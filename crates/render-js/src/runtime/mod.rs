@@ -41,6 +41,7 @@ use render_dom::NodeId;
 use std::collections::BTreeMap;
 use url::Url;
 
+mod async_iteration;
 mod builtins;
 mod class;
 mod convert;
@@ -106,6 +107,8 @@ pub struct JsRuntime {
     coroutines: Vec<Option<coroutine_run::Coroutine>>,
     /// Compiled coroutine bodies, by function index.
     coroutine_code: BTreeMap<usize, std::rc::Rc<coroutine::CoroutineCode>>,
+    /// Request queues and states of the async generators, by coroutine index.
+    async_generators: async_iteration::AsyncGenerators,
     /// The error the prelude failed with, if it did; a test pins this to `None`.
     prelude_error: Option<JsError>,
     functions: Vec<UserFunction>,
@@ -228,6 +231,7 @@ impl JsRuntime {
             pending_loop_labels: Vec::new(),
             coroutines: Vec::new(),
             coroutine_code: BTreeMap::new(),
+            async_generators: BTreeMap::new(),
             prelude_error: None,
             functions: Vec::new(),
             class_frames: Vec::new(),
