@@ -3192,11 +3192,21 @@ impl Parser {
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
-            TokenKind::RegexLiteral { pattern, flags } => Ok(Expr::RegexLiteral {
-                offset: self.previous_offset(),
-                pattern,
-                flags,
-            }),
+            TokenKind::RegexLiteral { pattern, flags } => {
+                // ECMA-262 §22.2.1: a regular expression literal whose pattern or
+                // flags are early errors is a SyntaxError at parse time.
+                crate::regex::validate(&pattern, &flags).map_err(|error| {
+                    JsError::syntax(
+                        format!("invalid regular expression /{pattern}/{flags}: {error}"),
+                        token.offset,
+                    )
+                })?;
+                Ok(Expr::RegexLiteral {
+                    offset: self.previous_offset(),
+                    pattern,
+                    flags,
+                })
+            }
             TokenKind::Template(parts) => self.template_literal(parts, token.offset),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),

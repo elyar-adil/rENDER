@@ -24,11 +24,33 @@ use std::fmt;
 
 /// Why a pattern could not be compiled.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RegexSyntaxError(pub String);
+pub struct RegexSyntaxError {
+    message: String,
+    /// `true` for a construct that ECMAScript accepts but this engine does not
+    /// implement. Parse-time validation lets these through, so the failure is
+    /// reported when the literal is evaluated rather than rejecting the script.
+    unsupported: bool,
+}
+
+impl RegexSyntaxError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unsupported: false,
+        }
+    }
+
+    fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            unsupported: true,
+        }
+    }
+}
 
 impl fmt::Display for RegexSyntaxError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -53,7 +75,14 @@ impl Flags {
     /// Returns an error for any letter outside the supported set.
     pub fn parse(flags: &str) -> Result<Self, RegexSyntaxError> {
         let mut parsed = Self::default();
+        let mut seen = String::new();
         for character in flags.chars() {
+            if seen.contains(character) {
+                return Err(RegexSyntaxError::new(format!(
+                    "duplicate regex flag {character:?}"
+                )));
+            }
+            seen.push(character);
             match character {
                 'g' => parsed.global = true,
                 'i' => parsed.ignore_case = true,
@@ -62,11 +91,16 @@ impl Flags {
                 'y' => parsed.sticky = true,
                 'd' | 'u' | 'v' => {}
                 other => {
-                    return Err(RegexSyntaxError(format!(
+                    return Err(RegexSyntaxError::new(format!(
                         "unsupported regex flag {other:?}"
                     )));
                 }
             }
+        }
+        if seen.contains('u') && seen.contains('v') {
+            return Err(RegexSyntaxError::new(
+                "flags u and v are mutually exclusive",
+            ));
         }
         Ok(parsed)
     }
@@ -704,7 +738,9 @@ pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError>
     };
     let root = parser.alternative(true)?;
     if parser.cursor != characters.len() {
-        return Err(RegexSyntaxError("unexpected ')' in pattern".to_owned()));
+        return Err(RegexSyntaxError::new(
+            "unexpected ')' in pattern".to_owned(),
+        ));
     }
     Ok(Compiled {
         root,
@@ -713,6 +749,21 @@ pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError>
         flags: parsed_flags,
         source: pattern.to_owned(),
     })
+}
+
+/// Parse-time validation of a regular expression literal: the early errors of
+/// ECMA-262 §22.2.1 for the constructs this engine implements. A construct it
+/// does not implement is accepted here and fails when the literal is evaluated.
+///
+/// # Errors
+///
+/// Returns the syntax error for a pattern or flag list ECMAScript rejects.
+pub fn validate(pattern: &str, flags: &str) -> Result<(), RegexSyntaxError> {
+    match compile(pattern, flags) {
+        Ok(_) => Ok(()),
+        Err(error) if error.unsupported => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 impl PatternParser<'_> {
@@ -788,10 +839,10 @@ impl PatternParser<'_> {
         let greedy = !self.eat('?');
         if matches!(
             atom,
-            Node::AnchorStart | Node::AnchorEnd | Node::WordBoundary(_)
+            Node::AnchorStart | Node::AnchorEnd | Node::WordBoundary(_) | Node::Lookbehind { .. }
         ) {
-            return Err(RegexSyntaxError(
-                "quantifier applied to an anchor".to_owned(),
+            return Err(RegexSyntaxError::new(
+                "quantifier applied to an assertion".to_owned(),
             ));
         }
         Ok(Node::Quantifier {
@@ -823,7 +874,7 @@ impl PatternParser<'_> {
         if let Some(maximum) = max
             && maximum < min
         {
-            return Err(RegexSyntaxError(
+            return Err(RegexSyntaxError::new(
                 "quantifier upper bound below lower bound".to_owned(),
             ));
         }
@@ -843,8 +894,15 @@ impl PatternParser<'_> {
     }
 
     fn atom(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
+        // Annex B: a braced quantifier with nothing before it is an early error,
+        // while a `{` that cannot be a quantifier is an ordinary character.
+        if self.peek() == Some('{') && self.try_bounds()?.is_some() {
+            return Err(RegexSyntaxError::new("quantifier has nothing to repeat"));
+        }
         let Some(character) = self.bump() else {
-            return Err(RegexSyntaxError("unexpected end of pattern".to_owned()));
+            return Err(RegexSyntaxError::new(
+                "unexpected end of pattern".to_owned(),
+            ));
         };
         match character {
             '^' => Ok(Node::AnchorStart),
@@ -853,7 +911,7 @@ impl PatternParser<'_> {
             '[' => self.class(),
             '(' => self.group(top_level),
             '\\' => self.escape(),
-            '*' | '+' | '?' => Err(RegexSyntaxError(
+            '*' | '+' | '?' => Err(RegexSyntaxError::new(
                 "quantifier has nothing to repeat".to_owned(),
             )),
             other => Ok(Node::Literal(other)),
@@ -868,7 +926,7 @@ impl PatternParser<'_> {
                 Some('=') => {
                     let body = self.alternative(false)?;
                     if !self.eat(')') {
-                        return Err(RegexSyntaxError("unterminated lookahead".to_owned()));
+                        return Err(RegexSyntaxError::new("unterminated lookahead".to_owned()));
                     }
                     return Ok(Node::Lookahead {
                         negated: false,
@@ -878,7 +936,7 @@ impl PatternParser<'_> {
                 Some('!') => {
                     let body = self.alternative(false)?;
                     if !self.eat(')') {
-                        return Err(RegexSyntaxError("unterminated lookahead".to_owned()));
+                        return Err(RegexSyntaxError::new("unterminated lookahead".to_owned()));
                     }
                     return Ok(Node::Lookahead {
                         negated: true,
@@ -890,7 +948,9 @@ impl PatternParser<'_> {
                         let negated = self.bump() == Some('!');
                         let body = self.alternative(false)?;
                         if !self.eat(')') {
-                            return Err(RegexSyntaxError("unterminated lookbehind".to_owned()));
+                            return Err(RegexSyntaxError::new(
+                                "unterminated lookbehind".to_owned(),
+                            ));
                         }
                         return Ok(Node::Lookbehind {
                             negated,
@@ -910,24 +970,32 @@ impl PatternParser<'_> {
                                 name.push(character);
                             }
                             _ => {
-                                return Err(RegexSyntaxError(
+                                return Err(RegexSyntaxError::new(
                                     "invalid capture group name".to_owned(),
                                 ));
                             }
                         }
                     }
                     if name.is_empty() || name.starts_with(|first: char| first.is_ascii_digit()) {
-                        return Err(RegexSyntaxError("invalid capture group name".to_owned()));
+                        return Err(RegexSyntaxError::new(
+                            "invalid capture group name".to_owned(),
+                        ));
                     }
                     let duplicates = self.names.iter().filter(|(existing, _)| *existing == name);
                     if duplicates.count() > 1 {
-                        return Err(RegexSyntaxError("duplicate capture group name".to_owned()));
+                        return Err(RegexSyntaxError::new(
+                            "duplicate capture group name".to_owned(),
+                        ));
                     }
                     self.group_count += 1;
                     index = Some(self.group_count);
                 }
+                Some('i' | 'm' | 's' | '-') => {
+                    self.cursor -= 1;
+                    return self.modifier_group();
+                }
                 _ => {
-                    return Err(RegexSyntaxError("invalid group modifier".to_owned()));
+                    return Err(RegexSyntaxError::new("invalid group modifier".to_owned()));
                 }
             }
         } else {
@@ -936,12 +1004,51 @@ impl PatternParser<'_> {
         }
         let body = self.alternative(top_level)?;
         if !self.eat(')') {
-            return Err(RegexSyntaxError("unterminated group".to_owned()));
+            return Err(RegexSyntaxError::new("unterminated group".to_owned()));
         }
         Ok(Node::Group {
             index,
             body: Box::new(body),
         })
+    }
+
+    /// `(?ims-ims:…)`: the modifiers proposal's group. Malformed modifier syntax
+    /// (an unknown or repeated letter, a letter both added and removed, or an
+    /// empty `(?-:`) is an early error. Well-formed modifiers are valid
+    /// ECMAScript this engine does not implement, so they are deferred.
+    fn modifier_group(&mut self) -> Result<Node, RegexSyntaxError> {
+        let mut add = String::new();
+        while let Some(letter @ ('i' | 'm' | 's')) = self.peek() {
+            self.cursor += 1;
+            add.push(letter);
+        }
+        let mut remove = String::new();
+        let has_remove = self.eat('-');
+        if has_remove {
+            while let Some(letter @ ('i' | 'm' | 's')) = self.peek() {
+                self.cursor += 1;
+                remove.push(letter);
+            }
+        }
+        if !self.eat(':') {
+            return Err(RegexSyntaxError::new("invalid group modifier".to_owned()));
+        }
+        let unique = |text: &str| {
+            text.chars()
+                .enumerate()
+                .all(|(index, letter)| !text[..index].contains(letter))
+        };
+        let disjoint = add.chars().all(|letter| !remove.contains(letter));
+        if !unique(&add)
+            || !unique(&remove)
+            || !disjoint
+            || (has_remove && add.is_empty() && remove.is_empty())
+        {
+            return Err(RegexSyntaxError::new("invalid group modifier".to_owned()));
+        }
+        Err(RegexSyntaxError::unsupported(
+            "regular expression modifiers are not implemented".to_owned(),
+        ))
     }
 
     fn class(&mut self) -> Result<Node, RegexSyntaxError> {
@@ -976,7 +1083,7 @@ impl PatternParser<'_> {
                     match self.class_escape()? {
                         ClassEscape::Char(value) => value,
                         ClassEscape::Shorthand(_) => {
-                            return Err(RegexSyntaxError(
+                            return Err(RegexSyntaxError::new(
                                 "shorthand cannot bound a class range".to_owned(),
                             ));
                         }
@@ -985,7 +1092,7 @@ impl PatternParser<'_> {
                     high_character
                 };
                 if high < low {
-                    return Err(RegexSyntaxError("class range out of order".to_owned()));
+                    return Err(RegexSyntaxError::new("class range out of order".to_owned()));
                 }
                 items.push(ClassItem::Range(low, high));
             } else {
@@ -993,14 +1100,16 @@ impl PatternParser<'_> {
             }
         }
         if !closed {
-            return Err(RegexSyntaxError("unterminated character class".to_owned()));
+            return Err(RegexSyntaxError::new(
+                "unterminated character class".to_owned(),
+            ));
         }
         Ok(Node::Class { negated, items })
     }
 
     fn escape(&mut self) -> Result<Node, RegexSyntaxError> {
         let Some(character) = self.bump() else {
-            return Err(RegexSyntaxError(
+            return Err(RegexSyntaxError::new(
                 "pattern ends with a lone backslash".to_owned(),
             ));
         };
@@ -1026,7 +1135,7 @@ impl PatternParser<'_> {
             )),
             'k' if !self.names.is_empty() => {
                 if !self.eat('<') {
-                    return Err(RegexSyntaxError("invalid named reference".to_owned()));
+                    return Err(RegexSyntaxError::new("invalid named reference".to_owned()));
                 }
                 let mut name = String::new();
                 loop {
@@ -1034,7 +1143,9 @@ impl PatternParser<'_> {
                         Some('>') => break,
                         Some(character) => name.push(character),
                         None => {
-                            return Err(RegexSyntaxError("invalid named reference".to_owned()));
+                            return Err(RegexSyntaxError::new(
+                                "invalid named reference".to_owned(),
+                            ));
                         }
                     }
                 }
@@ -1043,7 +1154,7 @@ impl PatternParser<'_> {
                     .iter()
                     .find(|(candidate, _)| *candidate == name)
                     .map(|(_, index)| *index)
-                    .ok_or_else(|| RegexSyntaxError("undefined named reference".to_owned()))?;
+                    .ok_or_else(|| RegexSyntaxError::new("undefined named reference".to_owned()))?;
                 Ok(Node::Backreference(index))
             }
             other => Ok(Node::Literal(self.escape_char(other)?)),
@@ -1052,7 +1163,7 @@ impl PatternParser<'_> {
 
     fn class_escape(&mut self) -> Result<ClassEscape, RegexSyntaxError> {
         let Some(character) = self.bump() else {
-            return Err(RegexSyntaxError(
+            return Err(RegexSyntaxError::new(
                 "class ends with a lone backslash".to_owned(),
             ));
         };
@@ -1075,18 +1186,19 @@ impl PatternParser<'_> {
     /// The `{Name}` or `{Name=Value}` after `\p`/`\P`.
     fn property_escape(&mut self) -> Result<property::Property, RegexSyntaxError> {
         if !self.eat('{') {
-            return Err(RegexSyntaxError("invalid property escape".to_owned()));
+            return Err(RegexSyntaxError::new("invalid property escape".to_owned()));
         }
         let mut name = String::new();
         loop {
             match self.bump() {
                 Some('}') => break,
                 Some(character) => name.push(character),
-                None => return Err(RegexSyntaxError("invalid property escape".to_owned())),
+                None => return Err(RegexSyntaxError::new("invalid property escape".to_owned())),
             }
         }
-        property::Property::parse(&name)
-            .ok_or_else(|| RegexSyntaxError(format!("unsupported unicode property {name:?}")))
+        property::Property::parse(&name).ok_or_else(|| {
+            RegexSyntaxError::unsupported(format!("unsupported unicode property {name:?}"))
+        })
     }
 
     fn escape_char(&mut self, character: char) -> Result<char, RegexSyntaxError> {
@@ -1119,7 +1231,7 @@ impl PatternParser<'_> {
                     }
                     let digits: String = self.characters[start..self.cursor].iter().collect();
                     if !(1..=6).contains(&digits.len()) || !self.eat('}') {
-                        return Err(RegexSyntaxError(
+                        return Err(RegexSyntaxError::new(
                             "invalid \\u{...} escape in pattern".to_owned(),
                         ));
                     }
@@ -1127,7 +1239,7 @@ impl PatternParser<'_> {
                         .ok()
                         .and_then(char::from_u32)
                         .ok_or_else(|| {
-                            RegexSyntaxError("invalid code point in pattern escape".to_owned())
+                            RegexSyntaxError::new("invalid code point in pattern escape".to_owned())
                         })
                 } else {
                     self.hex_escape(4)
@@ -1141,7 +1253,7 @@ impl PatternParser<'_> {
         let start = self.cursor;
         for _ in 0..digits {
             if !self.peek().is_some_and(|value| value.is_ascii_hexdigit()) {
-                return Err(RegexSyntaxError(
+                return Err(RegexSyntaxError::new(
                     "invalid hexadecimal escape in pattern".to_owned(),
                 ));
             }
@@ -1149,13 +1261,14 @@ impl PatternParser<'_> {
         }
         let text: String = self.characters[start..self.cursor].iter().collect();
         let value = u32::from_str_radix(&text, 16)
-            .map_err(|_| RegexSyntaxError("invalid escape value in pattern".to_owned()))?;
+            .map_err(|_| RegexSyntaxError::new("invalid escape value in pattern".to_owned()))?;
         if (0xd800..=0xdfff).contains(&value) {
-            return char::from_u32(0xf_0000 + value - 0xd800)
-                .ok_or_else(|| RegexSyntaxError("invalid escape value in pattern".to_owned()));
+            return char::from_u32(0xf_0000 + value - 0xd800).ok_or_else(|| {
+                RegexSyntaxError::new("invalid escape value in pattern".to_owned())
+            });
         }
         char::from_u32(value)
-            .ok_or_else(|| RegexSyntaxError("invalid escape value in pattern".to_owned()))
+            .ok_or_else(|| RegexSyntaxError::new("invalid escape value in pattern".to_owned()))
     }
 }
 
@@ -1539,6 +1652,50 @@ mod tests {
             );
         }
         assert!(compile("a", "q").is_err(), "unknown flag must be rejected");
+    }
+
+    #[test]
+    fn parse_time_validation_rejects_early_errors_only() {
+        use super::validate;
+        for (pattern, flags) in [
+            ("a", "gg"),
+            ("a", "uv"),
+            ("a", "q"),
+            ("(?<=a)*", ""),
+            ("{1}", ""),
+            ("x|{2,3}", ""),
+            ("a**", ""),
+            ("[b-a]", ""),
+            ("(", ""),
+            ("(?<n>a)\\k<m>", ""),
+            ("(?i-i:a)", ""),
+            ("(?-:a)", ""),
+            ("(?ii:a)", ""),
+            ("(?\u{130}:a)", ""),
+        ] {
+            assert!(
+                validate(pattern, flags).is_err(),
+                "/{pattern}/{flags} is an early error"
+            );
+        }
+        // Valid Annex B syntax, and valid syntax this engine does not implement
+        // (deferred to evaluation), must not be rejected at parse time.
+        for (pattern, flags) in [
+            ("a{1}", ""),
+            ("x{,2}", ""),
+            ("(?=a)*", ""),
+            ("a{", ""),
+            ("\\k<m>", ""),
+            ("\\p{ASCII_Hex_Digit}", "u"),
+            ("(?i:a)", ""),
+            ("(?-m:a)", ""),
+            ("(?i-s:a)", ""),
+        ] {
+            assert!(
+                validate(pattern, flags).is_ok(),
+                "/{pattern}/{flags} must not be rejected at parse time"
+            );
+        }
     }
 
     #[test]
