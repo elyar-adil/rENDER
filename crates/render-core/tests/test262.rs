@@ -860,9 +860,6 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
     if metadata.flags.iter().any(|flag| flag == "module") {
         return unsupported(relative_path, "module evaluation is not implemented");
     }
-    if metadata.flags.iter().any(|flag| flag == "async") {
-        return unsupported(relative_path, "async print completion is not implemented");
-    }
 
     let variants = if metadata.flags.iter().any(|flag| flag == "raw") {
         vec![("raw", false)]
@@ -887,6 +884,9 @@ fn run_variant(
     variant: &str,
     strict: bool,
 ) -> ResultRecord {
+    if metadata.flags.iter().any(|flag| flag == "async") {
+        return run_async_variant(relative_path, source, metadata, variant, strict);
+    }
     let raw = metadata.flags.iter().any(|flag| flag == "raw");
     let program = if strict && !raw {
         format!("\"use strict\";\n{source}")
@@ -920,6 +920,114 @@ fn run_variant(
         metadata,
         result.map(|outcome| outcome.value),
     )
+}
+
+/// Captures what the harness prints. `$DONE` (from `doneprintHandle.js`)
+/// reports an async test's outcome through `print`.
+const PRINT_SHIM: &str = "var __test262_printed = []; function print(message) { __test262_printed.push(String(message)); }";
+const PRINTED_LOG: &str = "__test262_printed.join('\\n')";
+
+/// ECMA-262 `async` tests (INTERPRETING.md "Asynchronous Tests"): run the
+/// script, then every queued job, and only then read what `$DONE` printed. The
+/// test passes only when the log holds `Test262:AsyncTestComplete`.
+fn run_async_variant(
+    relative_path: &str,
+    source: &str,
+    metadata: &Metadata,
+    variant: &str,
+    strict: bool,
+) -> ResultRecord {
+    let fail = |detail: String| ResultRecord {
+        path: relative_path.to_owned(),
+        variant: variant.to_owned(),
+        status: Status::Fail,
+        detail,
+    };
+    let program = if strict {
+        format!("\"use strict\";\n{source}")
+    } else {
+        source.to_owned()
+    };
+    let script = match CompiledScript::compile(&program, &RuntimeLimits::default()) {
+        Ok(script) => script,
+        Err(error) => {
+            return classify_result(relative_path, variant, metadata, Err::<(), JsError>(error));
+        }
+    };
+
+    let mut document = parse_document("<!doctype html><p>test262</p>");
+    let mut runtime = JsRuntime::new(&document.dom);
+    let shim = CompiledScript::compile(PRINT_SHIM, &RuntimeLimits::default())
+        .expect("print shim compiles");
+    if let Err(error) = runtime.execute_compiled(&mut document.dom, &shim) {
+        return fail(format!("print shim failed: {}", error.message()));
+    }
+    // The host provides `$DONE` to every async test (INTERPRETING.md), so the
+    // handle is installed even when the metadata does not list it.
+    let mut includes = metadata.includes.clone();
+    if !includes
+        .iter()
+        .any(|include| include == "doneprintHandle.js")
+    {
+        includes.push("doneprintHandle.js".to_owned());
+    }
+    if let Err(detail) = install_harness(&mut runtime, &mut document.dom, &includes) {
+        return fail(detail);
+    }
+    if let Err(error) = runtime.execute_compiled(&mut document.dom, &script) {
+        return fail(format!(
+            "unexpected {:?}: {}",
+            error.kind(),
+            error.message()
+        ));
+    }
+    if let Err(error) = drain_microtasks(&mut runtime, &mut document.dom) {
+        return fail(format!(
+            "unexpected {:?} in a queued job: {}",
+            error.kind(),
+            error.message()
+        ));
+    }
+    let log = match CompiledScript::compile(PRINTED_LOG, &RuntimeLimits::default()) {
+        Ok(log) => log,
+        Err(error) => return fail(format!("print log expression: {}", error.message())),
+    };
+    let printed = match runtime.execute_compiled(&mut document.dom, &log) {
+        Ok(outcome) => outcome.value.to_js_string(),
+        Err(error) => return fail(format!("print log failed: {}", error.message())),
+    };
+    let lines: Vec<&str> = printed.lines().collect();
+    if lines.contains(&"Test262:AsyncTestComplete") {
+        return ResultRecord {
+            path: relative_path.to_owned(),
+            variant: variant.to_owned(),
+            status: Status::Pass,
+            detail: "async test reported completion".to_owned(),
+        };
+    }
+    match lines
+        .iter()
+        .find(|line| line.starts_with("Test262:AsyncTestFailure"))
+    {
+        Some(line) => fail((*line).to_owned()),
+        None => fail("async test never reported completion".to_owned()),
+    }
+}
+
+/// Runs queued jobs until none remain, as a host's microtask checkpoint does.
+fn drain_microtasks(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+) -> Result<(), JsError> {
+    loop {
+        let pending = runtime.take_pending_microtasks();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for microtask in pending {
+            runtime.invoke_microtask(dom, microtask)?;
+        }
+    }
 }
 
 fn default_harness_sources() -> io::Result<Vec<String>> {
