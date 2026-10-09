@@ -859,3 +859,13 @@ fn a_statement_ends_at_a_semicolon_a_brace_the_end_or_a_line_break() {
     assert_eq!(ok("var r = 0; do r++; while (r < 3) r"), "3");
     assert_eq!(ok("var t = 0; { t = 5 } t"), "5");
 }
+
+#[test]
+fn arrow_parameter_names_are_never_duplicated() {
+    assert_early_syntax_errors(&[
+        "var f = (a, a) => 1;",
+        "var f = ([a, a]) => 1;",
+        "var f = ({a}, a) => 1;",
+    ]);
+    assert_eq!(ok("var f = (a, b) => a + b; f(2, 3)"), "5");
+}

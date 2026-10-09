@@ -2355,6 +2355,19 @@ impl Parser {
         self.switch_depth = previous_switch_depth;
         self.static_block_await = previous_static_await;
         let mut body = body?;
+        // An arrow's parameter names are never duplicated, even in sloppy code
+        // (ECMA-262 15.3.1); destructured names count too.
+        let mut seen = BTreeSet::new();
+        let mut names: Vec<String> = parameters
+            .iter()
+            .map(|parameter| parameter_binding_name(parameter).to_owned())
+            .collect();
+        for (_, pattern) in &patterns {
+            collect_binding_names(pattern, &mut names);
+        }
+        if names.iter().any(|name| !seen.insert(name.as_str())) {
+            return Err(self.error("duplicate parameter name in an arrow function"));
+        }
         if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
             return Err(self.error("'use strict' is not allowed with non-simple parameters"));
         }
