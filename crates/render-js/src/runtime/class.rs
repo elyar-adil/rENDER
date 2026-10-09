@@ -83,7 +83,7 @@ impl JsRuntime {
         self.evaluate_class_with_function_name(dom, name, name, super_class, elements)
     }
 
-    /// An anonymous class that takes its name from NamedEvaluation. The
+    /// An anonymous class that takes its name from `NamedEvaluation`. The
     /// constructor carries `function_name`, but the class binds no name inside
     /// its own body, which is what a named class expression does.
     pub(super) fn evaluate_anonymous_class_named(
@@ -103,7 +103,7 @@ impl JsRuntime {
     }
 
     /// Evaluates a class with its inner binding (`name`) and its constructor's
-    /// `name` kept separate, since NamedEvaluation supplies only the latter.
+    /// `name` kept separate, since `NamedEvaluation` supplies only the latter.
     fn evaluate_class_with_function_name(
         &mut self,
         dom: &mut Dom,

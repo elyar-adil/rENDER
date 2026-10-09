@@ -3940,83 +3940,6 @@ fn is_strict_reserved_word(name: &str) -> bool {
     ) || name == "eval"
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Expr, Statement, parse};
-    use crate::RuntimeLimits;
-    use crate::lexer::tokenize;
-
-    #[test]
-    fn parses_function_control_flow_and_return() {
-        let tokens = tokenize(
-            "function classify(value) { if (value > 1) { return 'high'; } return 'low'; }",
-            &RuntimeLimits::default(),
-        )
-        .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
-        assert!(
-            matches!(statements.as_slice(), [Statement::Function { name, .. }] if name == "classify")
-        );
-    }
-
-    #[test]
-    fn parses_for_break_continue_and_new() {
-        let tokens = tokenize(
-            "for (let i = 0; i < 2; i = i + 1) { if (i === 1) continue; } new Factory(1);",
-            &RuntimeLimits::default(),
-        )
-        .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
-        assert!(matches!(statements.first(), Some(Statement::For { .. })));
-        assert!(matches!(
-            statements.get(1),
-            Some(Statement::Expression(Expr::New { .. }))
-        ));
-    }
-
-    #[test]
-    fn parses_for_in_declarations_and_delete() {
-        let tokens = tokenize(
-            "for (var key in object) { delete object[key]; } for (const name in object) {}",
-            &RuntimeLimits::default(),
-        )
-        .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
-        assert!(matches!(
-            statements.first(),
-            Some(Statement::ForIn {
-                kind: super::VariableKind::Var,
-                name,
-                ..
-            }) if name == "key"
-        ));
-        assert!(matches!(
-            statements.get(1),
-            Some(Statement::ForIn {
-                kind: super::VariableKind::Const,
-                name,
-                ..
-            }) if name == "name"
-        ));
-    }
-
-    #[test]
-    fn strict_reserved_word_is_an_early_error() {
-        let tokens = tokenize("\"use strict\"; var public = 1;", &RuntimeLimits::default())
-            .expect("source should tokenize");
-        let error = parse(tokens, &RuntimeLimits::default()).expect_err("strict error expected");
-        assert_eq!(error.kind(), super::JsErrorKind::Syntax);
-    }
-
-    #[test]
-    fn parses_unicode_escaped_variable_name() {
-        let tokens = tokenize(r"let \u0061 = 1;", &RuntimeLimits::default())
-            .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
-        assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
-    }
-}
-
 pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
     match statement {
         Statement::Variable {
@@ -4187,4 +4110,81 @@ fn validate_declaration_conflicts<'a>(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Expr, Statement, parse};
+    use crate::RuntimeLimits;
+    use crate::lexer::tokenize;
+
+    #[test]
+    fn parses_function_control_flow_and_return() {
+        let tokens = tokenize(
+            "function classify(value) { if (value > 1) { return 'high'; } return 'low'; }",
+            &RuntimeLimits::default(),
+        )
+        .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(
+            matches!(statements.as_slice(), [Statement::Function { name, .. }] if name == "classify")
+        );
+    }
+
+    #[test]
+    fn parses_for_break_continue_and_new() {
+        let tokens = tokenize(
+            "for (let i = 0; i < 2; i = i + 1) { if (i === 1) continue; } new Factory(1);",
+            &RuntimeLimits::default(),
+        )
+        .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(matches!(statements.first(), Some(Statement::For { .. })));
+        assert!(matches!(
+            statements.get(1),
+            Some(Statement::Expression(Expr::New { .. }))
+        ));
+    }
+
+    #[test]
+    fn parses_for_in_declarations_and_delete() {
+        let tokens = tokenize(
+            "for (var key in object) { delete object[key]; } for (const name in object) {}",
+            &RuntimeLimits::default(),
+        )
+        .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(matches!(
+            statements.first(),
+            Some(Statement::ForIn {
+                kind: super::VariableKind::Var,
+                name,
+                ..
+            }) if name == "key"
+        ));
+        assert!(matches!(
+            statements.get(1),
+            Some(Statement::ForIn {
+                kind: super::VariableKind::Const,
+                name,
+                ..
+            }) if name == "name"
+        ));
+    }
+
+    #[test]
+    fn strict_reserved_word_is_an_early_error() {
+        let tokens = tokenize("\"use strict\"; var public = 1;", &RuntimeLimits::default())
+            .expect("source should tokenize");
+        let error = parse(tokens, &RuntimeLimits::default()).expect_err("strict error expected");
+        assert_eq!(error.kind(), super::JsErrorKind::Syntax);
+    }
+
+    #[test]
+    fn parses_unicode_escaped_variable_name() {
+        let tokens = tokenize(r"let \u0061 = 1;", &RuntimeLimits::default())
+            .expect("source should tokenize");
+        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
+    }
 }

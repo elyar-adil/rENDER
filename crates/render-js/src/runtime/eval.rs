@@ -2572,7 +2572,7 @@ impl JsRuntime {
         Ok(template)
     }
 
-    /// ECMA-262 8.4.5 NamedEvaluation. An anonymous function, arrow or class
+    /// ECMA-262 8.4.5 `NamedEvaluation`. An anonymous function, arrow or class
     /// that is the whole value of a named binding, assignment or default takes
     /// that name. Any other expression is evaluated as usual.
     pub(super) fn evaluate_named(

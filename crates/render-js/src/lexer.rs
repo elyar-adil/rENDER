@@ -165,7 +165,7 @@ struct Lexer<'a> {
     newline: bool,
 }
 
-/// ECMA-262 12.2 WhiteSpace: tab, vertical tab, form feed, space, no-break
+/// ECMA-262 12.2 `WhiteSpace`: tab, vertical tab, form feed, space, no-break
 /// space, the byte-order mark, and the Unicode `Zs` (space separator) category.
 fn is_js_whitespace(character: char) -> bool {
     matches!(
@@ -175,7 +175,7 @@ fn is_js_whitespace(character: char) -> bool {
     )
 }
 
-/// ECMA-262 12.3 LineTerminator.
+/// ECMA-262 12.3 `LineTerminator`.
 fn is_js_line_terminator(character: char) -> bool {
     matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
 }
