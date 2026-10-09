@@ -4561,6 +4561,11 @@ impl JsRuntime {
                                 self.call_user(dom, index, arguments, JsValue::Undefined, true);
                             match result {
                                 Ok(JsValue::Object(instance)) => Ok(JsValue::Object(instance)),
+                                // ECMA-262 9.2.2 step 12: an undefined result returns
+                                // GetThisBinding(), which throws while `this` is unset.
+                                Ok(JsValue::Undefined) => Err(JsError::reference(
+                                    "Must call super constructor in derived class before accessing 'this' or returning from derived constructor",
+                                )),
                                 Ok(_) => Err(JsError::type_error(
                                     "derived constructor did not return an object",
                                 )),
@@ -5076,6 +5081,11 @@ impl JsRuntime {
             .bindings
             .get("this")
             .map(|binding| binding.value.clone());
+        let this_initialized = call_environment
+            .borrow()
+            .bindings
+            .get("this")
+            .is_some_and(|binding| binding.initialized);
         self.environment = previous_environment;
         match result? {
             Completion::Normal(_)
@@ -5087,6 +5097,18 @@ impl JsRuntime {
                 Ok(final_this.unwrap_or(JsValue::Undefined))
             }
             Completion::Normal(_) => Ok(JsValue::Undefined),
+            // `return;` (or `return undefined`) from a constructor yields its `this`
+            // once it is set. Before that, the undefined result lets the caller
+            // throw the derived constructor's ReferenceError.
+            Completion::Return(JsValue::Undefined)
+                if this_initialized
+                    && function
+                        .class
+                        .as_ref()
+                        .is_some_and(|class| class.constructor) =>
+            {
+                Ok(final_this.unwrap_or(JsValue::Undefined))
+            }
             Completion::Return(value) => Ok(value),
             Completion::Break(_) | Completion::Continue(_) => Err(JsError::new(
                 JsErrorKind::Syntax,
