@@ -398,3 +398,26 @@ fn array_from_rejects_null_and_undefined_and_a_non_callable_mapper() {
     );
     assert_eq!(ok("Array.from(new Set([1, 2])).join()"), "1,2");
 }
+
+#[test]
+fn source_phase_import_calls_parse_and_only_other_import_forms_are_rejected() {
+    assert_eq!(
+        ok("var f = () => import.defer('./x.js'); typeof f"),
+        "function"
+    );
+    assert_eq!(
+        ok("var f = () => import.source('./x.js'); typeof f"),
+        "function"
+    );
+    assert!(eval("import.defer('./x.js', 'extra')").is_err());
+    assert!(eval("import.defer").is_err());
+    assert!(eval("new import.defer('./x.js')").is_err());
+    assert!(eval("new import.source('./x.js').x").is_err());
+    assert!(eval("new import('./x.js')").is_err());
+    assert_eq!(
+        ok("var r; try { new (import('')); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert!(eval("import.foo").is_err());
+    assert!(eval("import.meta").is_err());
+}

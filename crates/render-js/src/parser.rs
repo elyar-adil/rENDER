@@ -525,6 +525,21 @@ pub(super) fn parse_module(
     Ok((statements, info))
 }
 
+/// True for `import(...)`, `import.defer(...)` and `import.source(...)`. These
+/// calls are not `MemberExpressions`, so `new` cannot apply to them.
+fn is_import_call(expression: &Expr) -> bool {
+    let Expr::Call { callee, .. } = expression else {
+        return false;
+    };
+    match callee.as_ref() {
+        Expr::Identifier(name) => name == "import",
+        Expr::Member { object, .. } => {
+            matches!(object.as_ref(), Expr::Identifier(name) if name == "import")
+        }
+        _ => false,
+    }
+}
+
 /// Whether the token after a class modifier keyword (`get`, `set`, `async`,
 /// `static`) lets it act as a modifier instead of an element name. A name
 /// followed by `(`/`=`/`;`/`}` (or nothing) is an ordinary element.
@@ -2155,7 +2170,14 @@ impl Parser {
             }
             // `new` binds to a whole member chain (`new A.B.C(...)`), so
             // consume dots/computed members BEFORE the argument list.
+            // A bare import call is not a MemberExpression, so `new` cannot apply
+            // to it. A parenthesized one is a PrimaryExpression and is allowed.
+            let starts_with_import =
+                matches!(&self.current().kind, TokenKind::Identifier(name) if name == "import");
             let mut target = self.primary()?;
+            if starts_with_import && is_import_call(&target) {
+                return Err(self.error("'new' cannot be applied to an import call"));
+            }
             loop {
                 if self.take(&TokenKind::Dot) {
                     let property = self.property_name()?;
@@ -2396,11 +2418,47 @@ impl Parser {
                     arguments,
                 })
             }
-            // `import.meta` is only defined in modules and any other `import.`
-            // form is a syntax error. A bare `import` is a reserved word.
-            TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::Dot) => Err(
-                JsError::syntax("import.meta is only valid in modules", token.offset),
-            ),
+            // `import.defer(specifier)` and `import.source(specifier)` (the
+            // source-phase import proposals). The host does not define them, so
+            // they read as properties of `import` and fail when called. Any
+            // other `import.` form is a syntax error, and `import.meta` is only
+            // valid in modules. A bare `import` is a reserved word.
+            TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::Dot) => {
+                self.advance();
+                let phase = match &self.advance().kind {
+                    TokenKind::Identifier(phase) => phase.clone(),
+                    _ => String::new(),
+                };
+                if phase == "meta" {
+                    return Err(JsError::syntax(
+                        "import.meta is only valid in modules",
+                        token.offset,
+                    ));
+                }
+                if !matches!(phase.as_str(), "defer" | "source") || !self.at(&TokenKind::LeftParen)
+                {
+                    return Err(JsError::syntax(
+                        "'import.' must be followed by 'meta', 'defer(' or 'source('",
+                        token.offset,
+                    ));
+                }
+                self.advance();
+                let specifier = self.assignment()?;
+                let _ = self.take(&TokenKind::Comma);
+                self.require(
+                    &TokenKind::RightParen,
+                    "expected ')' after import.defer() or import.source() argument",
+                )?;
+                Ok(Expr::Call {
+                    offset: self.previous_offset(),
+                    callee: Box::new(Expr::Member {
+                        object: Box::new(Expr::Identifier(name)),
+                        property: phase,
+                        offset: token.offset,
+                    }),
+                    arguments: vec![specifier],
+                })
+            }
             TokenKind::Identifier(name) if name == "import" => Err(JsError::syntax(
                 "'import' must be followed by '(' or '.'",
                 token.offset,
