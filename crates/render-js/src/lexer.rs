@@ -846,47 +846,65 @@ impl Lexer<'_> {
                 self.advance();
                 self.advance();
                 let digits_start = self.offset;
-                while self.peek().is_some_and(|value| value.is_digit(radix)) {
-                    self.advance();
-                }
-                if self.offset == digits_start || self.peek().is_some_and(is_identifier_continue) {
+                let digits = self.digit_run(|value| value.is_digit(radix));
+                if digits == 0 || self.peek().is_some_and(is_identifier_continue) {
                     return Err(JsError::syntax("invalid numeric literal", start));
                 }
-                return Ok(TokenKind::Number(radix_digits_to_number(
-                    &self.source[digits_start..self.offset],
-                    radix,
-                )));
+                let text: String = self.source[digits_start..self.offset]
+                    .chars()
+                    .filter(|value| *value != '_')
+                    .collect();
+                return Ok(TokenKind::Number(radix_digits_to_number(&text, radix)));
             }
         }
-        while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-            self.advance();
+        // A separator cannot follow a leading zero (`0_1` is not a literal).
+        if self.peek() == Some('0') && self.peek_second() == Some('_') {
+            return Err(JsError::syntax("invalid numeric literal", start));
         }
+        self.digit_run(|value| value.is_ascii_digit());
         if self.peek() == Some('.') {
             self.advance();
-            while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-                self.advance();
-            }
+            self.digit_run(|value| value.is_ascii_digit());
         }
         if self.peek().is_some_and(|value| matches!(value, 'e' | 'E')) {
             self.advance();
             if self.peek().is_some_and(|value| matches!(value, '+' | '-')) {
                 self.advance();
             }
-            let exponent_start = self.offset;
-            while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-                self.advance();
-            }
-            if self.offset == exponent_start {
+            if self.digit_run(|value| value.is_ascii_digit()) == 0 {
                 return Err(JsError::syntax("invalid numeric literal", start));
             }
         }
         if self.peek().is_some_and(is_identifier_start) {
             return Err(JsError::syntax("invalid numeric literal", start));
         }
-        self.source[start..self.offset]
-            .parse::<f64>()
+        // NumericLiteralSeparator (ECMA-262 12.8.6): the underscores are not part
+        // of the value.
+        let text: String = self.source[start..self.offset]
+            .chars()
+            .filter(|value| *value != '_')
+            .collect();
+        text.parse::<f64>()
             .map(TokenKind::Number)
             .map_err(|_| JsError::syntax("invalid numeric literal", start))
+    }
+
+    /// Consumes one run of digits, with `_` separators allowed only between two
+    /// digits (ECMA-262 12.8.6). Returns how many digits were consumed.
+    fn digit_run(&mut self, is_digit: impl Fn(char) -> bool) -> usize {
+        let mut count = 0;
+        loop {
+            match self.peek() {
+                Some(value) if is_digit(value) => {
+                    self.advance();
+                    count += 1;
+                }
+                Some('_') if count > 0 && self.peek_second().is_some_and(&is_digit) => {
+                    self.advance();
+                }
+                _ => return count,
+            }
+        }
     }
 
     fn string(&mut self, quote: char) -> Result<TokenKind, JsError> {
