@@ -2367,6 +2367,35 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Identifier(IMPORT_META_BINDING.to_owned()))
             }
+            // `import(specifier[, options][,])` (ECMA-262 13.3.10). It is a call
+            // of the host's `import`, with one or two arguments and no spread.
+            TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::LeftParen) => {
+                self.advance();
+                let specifier = self.assignment()?;
+                let mut arguments = vec![specifier];
+                if self.take(&TokenKind::Comma) && !self.at(&TokenKind::RightParen) {
+                    arguments.push(self.assignment()?);
+                    let _ = self.take(&TokenKind::Comma);
+                }
+                self.require(
+                    &TokenKind::RightParen,
+                    "expected ')' after import() arguments",
+                )?;
+                Ok(Expr::Call {
+                    offset: self.previous_offset(),
+                    callee: Box::new(Expr::Identifier(name)),
+                    arguments,
+                })
+            }
+            // `import.meta` is only defined in modules and any other `import.`
+            // form is a syntax error. A bare `import` is a reserved word.
+            TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::Dot) => Err(
+                JsError::syntax("import.meta is only valid in modules", token.offset),
+            ),
+            TokenKind::Identifier(name) if name == "import" => Err(JsError::syntax(
+                "'import' must be followed by '(' or '.'",
+                token.offset,
+            )),
             TokenKind::Identifier(name) if name == "super" => self.super_expression(token.offset),
             TokenKind::PrivateName(name) => Err(JsError::syntax(
                 format!("private name #{name} must be followed by 'in'"),
