@@ -286,7 +286,7 @@ impl JsRuntime {
                 // the search value.
                 let text = self.require_string_receiver(dom, receiver)?;
                 let needle = self.to_string_coerced(dom, &search)?;
-                self.string_replace_all_literal(dom, text, &needle, &replacement)
+                self.string_replace_all_literal(dom, &text, &needle, &replacement)
             }
             // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units.
             // `intStart` is `ToClampedIndex(start, size)` - a negative start
@@ -1008,11 +1008,11 @@ impl JsRuntime {
     pub(in crate::runtime) fn string_replace_all_literal(
         &mut self,
         dom: &mut Dom,
-        text: String,
+        text: &str,
         needle: &str,
         replacement: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let units = utf16::utf16_units(&text);
+        let units = utf16::utf16_units(text);
         let pattern = utf16::utf16_units(needle);
         // The output is accumulated as code units rather than as text, because a
         // substitution can put a lone surrogate next to one the copy left
@@ -1045,7 +1045,7 @@ impl JsRuntime {
                         &[
                             JsValue::String(matched_text),
                             JsValue::Number(cursor as f64),
-                            JsValue::String(text.clone()),
+                            JsValue::String(text.to_owned()),
                         ],
                     )?;
                     output.extend(utf16::utf16_units(&produced.to_js_string()));
