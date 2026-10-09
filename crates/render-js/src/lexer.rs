@@ -1,8 +1,54 @@
 use super::{JsError, JsErrorKind, RuntimeLimits};
 
+/// Reserved words in every context (ECMA-262 12.7.2, Table 37 minus the
+/// contextual and strict-only words). Spelled with an escape they are a
+/// syntax error wherever a name is needed, and fine as a property name.
+const ESCAPE_RESTRICTED_WORDS: &[&str] = &[
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "new",
+    "null",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+];
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum TokenKind {
     Identifier(String),
+    /// A reserved word spelled with a Unicode escape, such as `if`. It is
+    /// not a keyword and never an identifier (ECMA-262 12.7.2), so only a
+    /// property name may use it.
+    EscapedReserved(String),
     /// `#name`, the private-name form used by class fields and methods.
     PrivateName(String),
     String(String),
@@ -755,6 +801,15 @@ impl Lexer<'_> {
             }
             identifier.push(character);
         }
+        // An escaped spelling is never a keyword (ECMA-262 12.7.2). Restricted
+        // words stay visible to the parser, which refuses them as identifiers.
+        if self.escaped_name {
+            return Ok(if ESCAPE_RESTRICTED_WORDS.contains(&identifier.as_str()) {
+                TokenKind::EscapedReserved(identifier)
+            } else {
+                TokenKind::Identifier(identifier)
+            });
+        }
         Ok(match identifier.as_str() {
             "let" => TokenKind::Let,
             "const" => TokenKind::Const,
@@ -1376,7 +1431,13 @@ mod tests {
                 .iter()
                 .any(|token| token.kind == TokenKind::Identifier("a".to_owned()))
         );
-        assert!(tokens.iter().any(|token| token.kind == TokenKind::If));
+        // An escaped spelling of a keyword is not that keyword (ECMA-262 12.7.2).
+        assert!(
+            tokens
+                .iter()
+                .any(|token| token.kind == TokenKind::EscapedReserved("if".to_owned()))
+        );
+        assert!(!tokens.iter().any(|token| token.kind == TokenKind::If));
     }
 
     #[test]

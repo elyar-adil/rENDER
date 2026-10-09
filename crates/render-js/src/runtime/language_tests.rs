@@ -662,3 +662,57 @@ fn declarations_are_refused_where_only_a_statement_can_stand() {
     assert_eq!(ok("var r = 'ok'; if (false) function f() {} r"), "ok");
     assert_eq!(ok("var r = 'none'; if (false) let \n r = 1; r"), "1");
 }
+
+#[test]
+fn yield_is_an_operator_only_at_assignment_level_in_generators() {
+    assert_early_syntax_errors(&[
+        "function* g() { void yield; }",
+        "function* g() { 1 + yield; }",
+        "function* g() { ({ yield }); }",
+        "function* g(a = yield) {}",
+        "async function f(a = await 1) {}",
+    ]);
+    assert_eq!(
+        ok(
+            "function* g() { var x = yield 1; yield* [2]; return x; } var it = g(); it.next().value"
+        ),
+        "1"
+    );
+    assert_eq!(
+        ok(
+            "function* g() { return [yield, (yield 3)]; } var it = g(); it.next(); String(it.next(7).value)"
+        ),
+        "3"
+    );
+    // `yield +1` is a YieldExpression whose operand is the unary `+1`.
+    assert_eq!(ok("function* g() { yield +1; } g().next().value"), "1");
+    // Outside generators `yield` is an ordinary sloppy identifier.
+    assert_eq!(ok("var yield = 5; yield + 1"), "6");
+}
+
+#[test]
+fn escaped_reserved_words_are_never_identifiers_or_keywords() {
+    assert_early_syntax_errors(&[
+        "\\u0069f (true) {}",
+        "var \\u0069f = 1;",
+        "var x = { i\\u0066 } = { if: 42 };",
+        "var o = { \\u0074his }; ",
+        "var \\u0074his = 1;",
+    ]);
+    // Property names may spell a reserved word, escaped or not.
+    assert_eq!(ok("var o = { \\u0069f: 4 }; o.if + o.\\u0069f"), "8");
+    assert_eq!(ok("var l\\u0065t = 2; l\\u0065t"), "2");
+}
+
+#[test]
+fn shorthand_properties_must_name_an_identifier_reference() {
+    assert_early_syntax_errors(&[
+        "({ if })",
+        "({ this })",
+        "({ 'a' })",
+        "var { if } = {};",
+        "async function f() { ({ await }); }",
+    ]);
+    assert_eq!(ok("var u = 1; ({ u, undefined: 2 }).u"), "1");
+    assert_eq!(ok("var n = 3; var { n: m } = { n }; m"), "3");
+}

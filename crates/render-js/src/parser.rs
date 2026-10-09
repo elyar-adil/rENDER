@@ -987,10 +987,15 @@ impl Parser {
             module: None,
             in_async: false,
             in_generator: false,
+            in_parameters: false,
         }
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent grammar context (no_in, async, generator, parameters, ...)"
+)]
 struct Parser {
     previous_offset: usize,
     tokens: Vec<Token>,
@@ -1014,6 +1019,9 @@ struct Parser {
     /// identifiers.
     in_async: bool,
     in_generator: bool,
+    /// Set while the formal parameters of a function are parsed. A `YieldExpression`
+    /// or `AwaitExpression` there is an early error (ECMA-262 15.5.1, 15.8.1).
+    in_parameters: bool,
 }
 
 impl Parser {
@@ -1634,6 +1642,12 @@ impl Parser {
                 }
                 // `PropertyName : AssignmentElement`, so a computed key may
                 // carry an arbitrary expression evaluated in binding order.
+                // Only an identifier token may stand alone; a keyword or an
+                // escaped reserved word spelling the same name may not.
+                let shorthand_candidate = matches!(
+                    &self.current().kind,
+                    TokenKind::Identifier(_) | TokenKind::Undefined
+                );
                 let key = if self.take(&TokenKind::LeftBracket) {
                     let expression = self.assignment()?;
                     self.require(
@@ -1647,6 +1661,7 @@ impl Parser {
                 let mut pattern = if self.take(&TokenKind::Colon) {
                     self.binding_pattern()?
                 } else if let PropertyKey::Static(property) = &key
+                    && shorthand_candidate
                     && is_identifier_name(property)
                 {
                     BindingPattern::Identifier(property.clone())
@@ -2043,7 +2058,47 @@ impl Parser {
         Ok(statements)
     }
 
+    /// `yield`, `yield value`, `yield* iterable` (ECMA-262 15.5). A
+    /// `YieldExpression` is an `AssignmentExpression`, so it can never be the
+    /// operand of an operator: `void yield` is not a `YieldExpression`.
+    fn yield_expression(&mut self) -> Result<Expr, JsError> {
+        if self.in_parameters {
+            return Err(self.error("yield expression is not allowed in formal parameters"));
+        }
+        let offset = self.current().offset;
+        self.advance();
+        let delegate = !self.current().after_newline && self.take(&TokenKind::Star);
+        let terminated = self.current().after_newline
+            || matches!(
+                self.current().kind,
+                TokenKind::Semicolon
+                    | TokenKind::Comma
+                    | TokenKind::RightParen
+                    | TokenKind::RightBracket
+                    | TokenKind::RightBrace
+                    | TokenKind::Colon
+                    | TokenKind::Question
+                    | TokenKind::Dot
+                    | TokenKind::Eof
+            );
+        let argument = if terminated && !delegate {
+            None
+        } else {
+            Some(Box::new(self.assignment()?))
+        };
+        Ok(Expr::Yield {
+            argument,
+            delegate,
+            offset,
+        })
+    }
+
     fn assignment(&mut self) -> Result<Expr, JsError> {
+        if self.in_generator
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield")
+        {
+            return self.yield_expression();
+        }
         if let Some(arrow) = self.arrow_function()? {
             return Ok(arrow);
         }
@@ -2193,6 +2248,7 @@ impl Parser {
         // an operator only in an async arrow.
         let previous_async = std::mem::replace(&mut self.in_async, is_async_arrow);
         let previous_generator = std::mem::replace(&mut self.in_generator, false);
+        let previous_parameters = std::mem::replace(&mut self.in_parameters, false);
         let body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
@@ -2214,6 +2270,7 @@ impl Parser {
         };
         self.in_async = previous_async;
         self.in_generator = previous_generator;
+        self.in_parameters = previous_parameters;
         let mut body = body?;
         if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
             return Err(self.error("'use strict' is not allowed with non-simple parameters"));
@@ -2459,40 +2516,11 @@ impl Parser {
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await")
         {
             // `await` has unary-expression precedence (ECMA-262 §15.8).
+            if self.in_parameters {
+                return Err(self.error("await expression is not allowed in formal parameters"));
+            }
             self.advance();
             return Ok(Expr::Await(Box::new(self.unary()?)));
-        }
-        if self.in_generator
-            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield")
-        {
-            // The operand of `yield` is a full AssignmentExpression; a bare
-            // `yield` followed by a terminator has no operand.
-            let offset = self.current().offset;
-            self.advance();
-            let delegate = !self.current().after_newline && self.take(&TokenKind::Star);
-            let terminated = self.current().after_newline
-                || matches!(
-                    self.current().kind,
-                    TokenKind::Semicolon
-                        | TokenKind::Comma
-                        | TokenKind::RightParen
-                        | TokenKind::RightBracket
-                        | TokenKind::RightBrace
-                        | TokenKind::Colon
-                        | TokenKind::Question
-                        | TokenKind::Dot
-                        | TokenKind::Eof
-                );
-            let argument = if terminated && !delegate {
-                None
-            } else {
-                Some(Box::new(self.assignment()?))
-            };
-            return Ok(Expr::Yield {
-                argument,
-                delegate,
-                offset,
-            });
         }
         let update_operator = if self.take(&TokenKind::PlusPlus) {
             Some(BinaryOp::Add)
@@ -2880,6 +2908,14 @@ impl Parser {
             TokenKind::Identifier(name) if ALWAYS_RESERVED_NAMES.contains(&name.as_str()) => Err(
                 JsError::syntax(format!("{name} is a reserved word"), token.offset),
             ),
+            // `yield` in generator code is always the operator (handled by
+            // `assignment`), so reaching it here means it is not an operand.
+            TokenKind::Identifier(name) if self.in_generator && name == "yield" => {
+                Err(JsError::syntax(
+                    "yield is not a valid identifier reference in a generator",
+                    token.offset,
+                ))
+            }
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
@@ -3266,9 +3302,11 @@ impl Parser {
     ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
         let previous_async = std::mem::replace(&mut self.in_async, kind.is_async());
         let previous_generator = std::mem::replace(&mut self.in_generator, kind.is_generator());
+        let previous_parameters = std::mem::replace(&mut self.in_parameters, false);
         let result = self.function_tail_inner();
         self.in_async = previous_async;
         self.in_generator = previous_generator;
+        self.in_parameters = previous_parameters;
         let (parameters, body) = result?;
         validate_declaration_conflicts(&body, true)?;
         Ok((parameters, body))
@@ -3279,6 +3317,7 @@ impl Parser {
             &TokenKind::LeftParen,
             "expected '(' before function parameters",
         )?;
+        self.in_parameters = true;
         let mut parameters = Vec::new();
         let mut defaults: Vec<Statement> = Vec::new();
         let mut patterns = Vec::new();
@@ -3339,6 +3378,7 @@ impl Parser {
             }
         }
         self.require(&TokenKind::RightParen, "expected ')' after parameters")?;
+        self.in_parameters = false;
         self.require(&TokenKind::LeftBrace, "expected '{' before function body")?;
         let previous_function_depth = self.function_depth;
         let previous_loop_depth = self.loop_depth;
@@ -3533,6 +3573,10 @@ impl Parser {
                     }
                     continue;
                 }
+                let shorthand_candidate = matches!(
+                    &self.current().kind,
+                    TokenKind::Identifier(_) | TokenKind::Undefined | TokenKind::Let
+                );
                 let key = self.property_name()?;
                 let (value, shorthand, method) = if self.take(&TokenKind::Colon) {
                     (self.assignment()?, false, false)
@@ -3549,8 +3593,14 @@ impl Parser {
                         false,
                         true,
                     )
-                } else {
+                } else if shorthand_candidate {
+                    // The shorthand is an IdentifierReference (ECMA-262 13.2.5.1).
+                    if (self.in_generator && key == "yield") || (self.in_async && key == "await") {
+                        return Err(self.error("name is not a valid identifier reference here"));
+                    }
                     (Expr::Identifier(key.clone()), true, false)
+                } else {
+                    return Err(self.error("expected ':' after property name"));
                 };
                 properties.push(ObjectProperty {
                     key: PropertyKey::Static(key),
@@ -3597,7 +3647,9 @@ impl Parser {
     fn property_name(&mut self) -> Result<String, JsError> {
         let token = self.advance();
         match token.kind {
-            TokenKind::Identifier(name) | TokenKind::String(name) => Ok(name),
+            TokenKind::Identifier(name)
+            | TokenKind::EscapedReserved(name)
+            | TokenKind::String(name) => Ok(name),
             TokenKind::Number(value) => Ok(value.to_string()),
             // Keywords are valid property names after `.`.
             TokenKind::Let => Ok("let".to_owned()),
