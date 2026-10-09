@@ -247,6 +247,30 @@ impl ArrayDestructuring {
         }
     }
 
+    /// `IteratorClose` for a pattern that finished normally (ECMA-262 7.4.11
+    /// with a normal completion). Unlike `close`, a throwing `return` propagates,
+    /// and so does a result that is not an object.
+    fn close_normal(&mut self, runtime: &mut JsRuntime, dom: &mut Dom) -> Result<(), JsError> {
+        if self.done {
+            return Ok(());
+        }
+        self.done = true;
+        let (Some(iterator), Some(_)) = (self.iterator, self.next) else {
+            return Ok(());
+        };
+        let Some(return_method) = runtime.get_method(dom, iterator, "return")? else {
+            return Ok(());
+        };
+        let result = runtime.call_with_this(dom, return_method, &[], JsValue::Object(iterator))?;
+        if matches!(result, JsValue::Object(_)) {
+            Ok(())
+        } else {
+            Err(JsError::type_error(
+                "iterator return() must produce an object",
+            ))
+        }
+    }
+
     fn iterator_next_value(
         &mut self,
         runtime: &mut JsRuntime,
@@ -255,11 +279,44 @@ impl ArrayDestructuring {
         let (Some(iterator), Some(next)) = (self.iterator, self.next) else {
             return Ok(None);
         };
-        let result = runtime.iterator_next(dom, iterator, next)?;
+        // A step that throws leaves the iterator done, so the pattern's
+        // IteratorClose must not call `return` on it (ECMA-262 7.4.6 IteratorStep).
+        let result = match runtime.iterator_next(dom, iterator, next) {
+            Ok(result) => result,
+            Err(error) => {
+                self.done = true;
+                return Err(error);
+            }
+        };
         if result.is_none() {
             self.done = true;
         }
         Ok(result)
+    }
+}
+
+/// The plain function a chain of labels names, when a labelled function
+/// declaration (Annex B.3.2) is what the statement is. It is declared like an
+/// unlabelled function, so hoisting looks through the labels.
+fn labelled_function(statement: &Statement) -> Option<&Statement> {
+    let mut inner = statement;
+    let mut labelled = false;
+    while let Statement::Labeled { body, .. } = inner {
+        inner = body.as_ref();
+        labelled = true;
+    }
+    (labelled && matches!(inner, Statement::Function { .. })).then_some(inner)
+}
+
+/// The name `SetFunctionName` gives a function defined under a property key
+/// (ECMA-262 8.4.5): a symbol key contributes `[description]`, or the empty name
+/// when the symbol has no description.
+fn property_key_function_name(key: &JsValue) -> String {
+    match key {
+        JsValue::Symbol(symbol) => symbol
+            .description()
+            .map_or_else(String::new, |description| format!("[{description}]")),
+        other => other.to_js_string(),
     }
 }
 
@@ -322,6 +379,7 @@ impl JsRuntime {
         let mut var_names = BTreeSet::new();
         let mut functions = Vec::new();
         for statement in statements {
+            let statement = labelled_function(statement).unwrap_or(statement);
             match statement {
                 Statement::Variable {
                     kind: kind @ (VariableKind::Let | VariableKind::Const),
@@ -405,14 +463,15 @@ impl JsRuntime {
         Ok(())
     }
 
-    pub(super) fn instantiate_block_lexicals(
+    pub(super) fn instantiate_block_lexicals<'a>(
         &mut self,
-        statements: &[Statement],
+        statements: impl IntoIterator<Item = &'a Statement>,
     ) -> Result<(), JsError> {
         let mut declarations = BTreeMap::new();
         let mut function_names = BTreeSet::new();
         let mut functions = Vec::new();
         for statement in statements {
+            let statement = labelled_function(statement).unwrap_or(statement);
             match statement {
                 Statement::VariableList {
                     kind,
@@ -967,24 +1026,42 @@ impl JsRuntime {
         cases: &[(Vec<Expr>, Vec<Statement>)],
     ) -> Result<Completion, JsError> {
         let discriminant = self.evaluate(dom, expression)?;
-        let mut active = false;
-        let mut value = JsValue::Undefined;
-        for (tests, statements) in cases {
-            if !active {
-                if tests.is_empty() {
-                    active = true;
-                } else {
-                    for test in tests {
-                        if strict_equal(&discriminant, &self.evaluate(dom, test)?) {
-                            active = true;
-                            break;
-                        }
-                    }
+        // The case block is one lexical scope shared by every clause (ECMA-262
+        // 14.12.4): its declarations are instantiated before any clause runs.
+        self.environment
+            .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
+        let result = self
+            .instantiate_block_lexicals(cases.iter().flat_map(|(_, statements)| statements))
+            .and_then(|()| self.run_case_clauses(dom, &discriminant, cases));
+        self.environment.pop();
+        result
+    }
+
+    /// `CaseBlockEvaluation` (ECMA-262 14.12.4): the tests of the non-default
+    /// clauses run in source order, and the first match starts execution there.
+    /// With no match, execution starts at the default clause, if any, and falls
+    /// through to the clauses after it.
+    fn run_case_clauses(
+        &mut self,
+        dom: &mut Dom,
+        discriminant: &JsValue,
+        cases: &[(Vec<Expr>, Vec<Statement>)],
+    ) -> Result<Completion, JsError> {
+        let mut start = None;
+        'search: for (index, (tests, _)) in cases.iter().enumerate() {
+            for test in tests {
+                if strict_equal(discriminant, &self.evaluate(dom, test)?) {
+                    start = Some(index);
+                    break 'search;
                 }
             }
-            if !active {
-                continue;
-            }
+        }
+        let start = start.or_else(|| cases.iter().position(|(tests, _)| tests.is_empty()));
+        let Some(start) = start else {
+            return Ok(Completion::Normal(JsValue::Undefined));
+        };
+        let mut value = JsValue::Undefined;
+        for (_, statements) in &cases[start..] {
             match self.evaluate_statements(dom, statements)? {
                 Completion::Normal(next) => value = next,
                 Completion::Break(None) => break,
@@ -1892,7 +1969,7 @@ impl JsRuntime {
                         // A pattern that consumed fewer values than the source
                         // offers must close the iterator rather than drain it,
                         // or an endless generator would never terminate.
-                        None => iterator.close(self, dom),
+                        None => iterator.close_normal(self, dom)?,
                     }
                     Ok(())
                 })();
@@ -1931,24 +2008,38 @@ impl JsRuntime {
                 self.assign_destructuring_target(dom, target, value)
             }
             Expr::Array(targets) => {
-                let values = self.iterate_values(dom, &value)?;
-                for (index, target) in targets.iter().enumerate() {
-                    if matches!(target, Expr::Literal(JsValue::Undefined)) {
-                        continue;
+                // Like a binding pattern, an assignment pattern takes only the
+                // values its elements need, and closes the iterator if it stops
+                // before the source is done (ECMA-262 13.15.5.5).
+                let mut iterator = ArrayDestructuring::open(self, dom, &value)?;
+                let outcome = (|| -> Result<(), JsError> {
+                    for target in targets {
+                        match target {
+                            // An elision still consumes a value.
+                            Expr::Literal(JsValue::Undefined) => {
+                                iterator.next(self, dom)?;
+                            }
+                            // A rest target is the last element and takes what is left.
+                            Expr::Spread(target) => {
+                                let remaining = iterator.rest(self, dom)?;
+                                return self.assign_destructuring_target(
+                                    dom,
+                                    target,
+                                    JsValue::Object(remaining),
+                                );
+                            }
+                            target => {
+                                let element = iterator.next(self, dom)?;
+                                self.assign_destructuring_target(dom, target, element)?;
+                            }
+                        }
                     }
-                    if let Expr::Spread(target) = target {
-                        let rest =
-                            self.create_array_from_values(values.get(index..).unwrap_or_default())?;
-                        self.assign_destructuring_target(dom, target, JsValue::Object(rest))?;
-                        break;
-                    }
-                    self.assign_destructuring_target(
-                        dom,
-                        target,
-                        values.get(index).cloned().unwrap_or(JsValue::Undefined),
-                    )?;
+                    iterator.close_normal(self, dom)
+                })();
+                if outcome.is_err() {
+                    iterator.close(self, dom);
                 }
-                Ok(())
+                outcome
             }
             Expr::Object(properties) => {
                 // `DestructuringAssignmentEvaluation` for an object pattern
@@ -2878,7 +2969,18 @@ impl JsRuntime {
                 _ => None,
             };
             let key = key_value.to_js_string();
-            let value = self.evaluate(dom, &property.value)?;
+            // `PropertyName : AssignmentExpression` names an anonymous function,
+            // arrow or class after its key (ECMA-262 13.2.5.5 step 7). Methods and
+            // accessors arrive already named by the parser.
+            let value = if property.accessor.is_none() && !property.method && !property.shorthand {
+                let name = property_key_function_name(&key_value);
+                self.evaluate_named(dom, &property.value, &name)?
+            } else {
+                self.evaluate(dom, &property.value)?
+            };
+            if property.method || property.accessor.is_some() {
+                self.set_method_home_object(&value, object);
+            }
             if let Some(accessor) = property.accessor {
                 // `{get x(){}}` / `{set x(v){}}`, and their symbol-keyed forms
                 // `{get [s](){}}`, install accessor slots; a repeated member of

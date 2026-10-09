@@ -768,7 +768,7 @@ impl JsRuntime {
             Instr::PushScope(statements) => {
                 self.environment
                     .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
-                self.instantiate_block_lexicals(&statements)?;
+                self.instantiate_block_lexicals(statements.iter())?;
                 co.pc += 1;
                 Ok(Flow::Next)
             }
@@ -1008,7 +1008,7 @@ impl JsRuntime {
                     let thrown = co.hidden(&format!("%e{slot}"));
                     self.bind_catch_parameter(dom, Some(parameter), thrown)?;
                 }
-                self.instantiate_block_lexicals(&lexicals)?;
+                self.instantiate_block_lexicals(lexicals.iter())?;
                 co.pc += 1;
                 Ok(Flow::Next)
             }

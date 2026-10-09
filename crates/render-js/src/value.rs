@@ -7121,27 +7121,41 @@ impl Realm {
         false
     }
 
-    /// Find a private method/accessor for `id` along the prototype chain.
+    /// A private method or accessor of `object` for `id`. It is an own element
+    /// that the class installed on the instance (ECMA-262 7.3.32
+    /// `PrivateElementFind`), so a prototype never supplies it.
     #[must_use]
     pub(crate) fn find_private_method(
         &self,
         object: ObjectId,
         id: u64,
     ) -> Option<PropertyDescriptor> {
-        let mut candidate = Some(object);
-        let mut visited = 0usize;
-        while let Some(current) = candidate {
-            let target = self.objects.get(current.0)?;
-            if let Some(descriptor) = target.private_method(id) {
-                return Some(descriptor.clone());
-            }
-            candidate = target.prototype;
-            visited = visited.saturating_add(1);
-            if visited > self.objects.len() {
-                return None;
-            }
-        }
-        None
+        self.own_private_method(object, id)
+    }
+
+    /// Every private method and accessor installed as an own element of `object`.
+    #[must_use]
+    pub(crate) fn private_method_entries(
+        &self,
+        object: ObjectId,
+    ) -> Vec<(u64, PropertyDescriptor)> {
+        self.objects.get(object.0).map_or_else(Vec::new, |target| {
+            target
+                .private_methods
+                .iter()
+                .map(|(id, descriptor)| (*id, descriptor.clone()))
+                .collect()
+        })
+    }
+
+    /// Whether `object` already holds a private field or method for `id`, which
+    /// a second initialization of the same element must reject (ECMA-262
+    /// 7.3.29 `PrivateFieldAdd`, 7.3.31 `PrivateMethodOrAccessorAdd`).
+    #[must_use]
+    pub(crate) fn has_own_private_element(&self, object: ObjectId, id: u64) -> bool {
+        self.objects.get(object.0).is_some_and(|target| {
+            target.has_private_field(id) || target.private_method(id).is_some()
+        })
     }
 
     /// `Object.preventExtensions`: new own properties are rejected.

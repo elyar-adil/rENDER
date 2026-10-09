@@ -551,7 +551,7 @@ pub(super) fn parse_module(
     // Module code is always strict (ECMA-262 11.2.2).
     parser.strict = true;
     let statements = parser.statement_list(false)?;
-    validate_declaration_conflicts(&statements, true)?;
+    validate_declaration_conflicts(&statements, true, true)?;
     let info = parser.module.take().unwrap_or_default();
     Ok((statements, info))
 }
@@ -1035,6 +1035,8 @@ impl Parser {
             static_block: false,
             static_block_await: false,
             strict: false,
+            pattern_candidate: false,
+            pending_covers: 0,
         }
     }
 }
@@ -1090,13 +1092,22 @@ struct Parser {
     /// early error there (ECMA-262 14.11.1), and it must be known while the
     /// body is parsed because the directive comes before the `with`.
     strict: bool,
+    /// Set by an array element, a spread, an object property value or a
+    /// for-head left side just before it calls `assignment`: the expression may
+    /// still become an assignment pattern, so a `{ name = value }` inside it is
+    /// not yet an error. `assignment` consumes the flag on entry.
+    pattern_candidate: bool,
+    /// Count of `{ name = value }` (`CoverInitializedName`) members parsed and not
+    /// yet resolved by an `=` that makes them a pattern. An expression's own
+    /// unresolved members are the difference of this count across its parse.
+    pending_covers: usize,
 }
 
 impl Parser {
     fn program(mut self) -> Result<Vec<Statement>, JsError> {
         self.strict = self.prologue_is_strict(self.cursor);
         let statements = self.statement_list(false)?;
-        validate_declaration_conflicts(&statements, true)?;
+        validate_declaration_conflicts(&statements, true, self.strict)?;
         if has_use_strict_directive(&statements) {
             validate_strict_statements(&statements)?;
         }
@@ -1156,6 +1167,13 @@ impl Parser {
         if is_refused_body(&statement, position) {
             return Err(self.error("declaration is not allowed in statement position"));
         }
+        // Annex B.3.2 allows a labelled plain function in sloppy code only (ECMA-262 14.13.1).
+        if self.strict
+            && position == BodyPosition::LabelBody
+            && matches!(statement, Statement::Function { .. })
+        {
+            return Err(self.error("labelled function declaration is not allowed in strict code"));
+        }
         Ok(statement)
     }
 
@@ -1166,7 +1184,7 @@ impl Parser {
         if self.take(&TokenKind::LeftBrace) {
             let statements = self.statement_list(true)?;
             self.require(&TokenKind::RightBrace, "expected '}' after block")?;
-            validate_declaration_conflicts(&statements, false)?;
+            validate_declaration_conflicts(&statements, false, self.strict)?;
             return Ok(Statement::Block(statements));
         }
         if self.take(&TokenKind::Function) {
@@ -1204,13 +1222,16 @@ impl Parser {
                 elements,
             });
         }
+        // An escaped `async` is an identifier, never the modifier (ECMA-262 12.7.2).
         if matches!(
             &self.current().kind,
             TokenKind::Identifier(name) if name == "async"
-        ) && matches!(
-            self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-            Some(TokenKind::Function)
-        ) {
+        ) && !self.current().escaped
+            && matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Function)
+            )
+        {
             self.advance();
             self.advance();
             let is_generator = self.take(&TokenKind::Star);
@@ -1251,6 +1272,10 @@ impl Parser {
                 unreachable!("checked above");
             };
             self.check_contextual_binding(&label)?;
+            // A label is a LabelIdentifier, so the strict reserved words are refused in strict code (ECMA-262 13.1.1).
+            if self.strict && is_strict_reserved_word(&label) {
+                return Err(self.error("reserved word cannot be a label in strict code"));
+            }
             if self.labels.iter().any(|(active, _)| *active == label) {
                 return Err(self.error("duplicate label in the label set"));
             }
@@ -1581,7 +1606,7 @@ impl Parser {
                 self.tokens.get(self.cursor + 1).map(|token| &token.kind),
                 Some(TokenKind::Identifier(name)) if name != "extends"
             ),
-            TokenKind::Identifier(word) if word == "async" => matches!(
+            TokenKind::Identifier(word) if word == "async" && !self.current().escaped => matches!(
                 (
                     self.tokens.get(self.cursor + 1).map(|token| &token.kind),
                     self.tokens.get(self.cursor + 2).map(|token| &token.kind),
@@ -2007,7 +2032,11 @@ impl Parser {
         }
         self.switch_depth = self.switch_depth.saturating_sub(1);
         self.require(&TokenKind::RightBrace, "expected '}' after switch")?;
-        validate_declaration_conflicts(cases.iter().flat_map(|(_, body)| body), false)?;
+        validate_declaration_conflicts(
+            cases.iter().flat_map(|(_, body)| body),
+            false,
+            self.strict,
+        )?;
         Ok(Statement::Switch {
             offset: self.previous_offset(),
             expression,
@@ -2083,15 +2112,47 @@ impl Parser {
                 self.loop_depth = self.loop_depth.saturating_add(1);
                 let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
-                return Ok(Statement::ForIn {
-                    offset: self.previous_offset(),
-                    kind,
-                    name: match pattern.expect("pattern parsed") {
-                        BindingPattern::Identifier(name) => name,
-                        _ => return Err(self.error("for-in destructuring is not supported")),
+                let offset = self.previous_offset();
+                let body = body?;
+                return Ok(match pattern.expect("pattern parsed") {
+                    BindingPattern::Identifier(name) => Statement::ForIn {
+                        offset,
+                        kind,
+                        name,
+                        iterable,
+                        body: Box::new(body),
                     },
-                    iterable,
-                    body: Box::new(body?),
+                    pattern => {
+                        // A destructuring declaration binds its names from one
+                        // temporary at the top of each iteration, as the for-of
+                        // form does, so the names get the declared kind per iteration.
+                        let temporary = format!("\0for_in_{}", declaration_start);
+                        let mut declarations = Vec::new();
+                        Self::lower_declarator(
+                            pattern,
+                            Expr::Identifier(temporary.clone()),
+                            &mut declarations,
+                        );
+                        let declared = Statement::VariableList {
+                            offset,
+                            kind,
+                            declarations,
+                        };
+                        // The head's BoundNames must not repeat a lexical name (ECMA-262 14.7.5.1).
+                        validate_declaration_conflicts(
+                            std::slice::from_ref(&declared),
+                            false,
+                            self.strict,
+                        )?;
+                        let body = Statement::Block(vec![declared, body]);
+                        Statement::ForIn {
+                            offset,
+                            kind: VariableKind::Var,
+                            name: temporary,
+                            iterable,
+                            body: Box::new(body),
+                        }
+                    }
                 });
             }
             // An escaped `of` is not the contextual keyword (ECMA-262 12.7.2).
@@ -2121,14 +2182,18 @@ impl Parser {
                             Expr::Identifier(temporary.clone()),
                             &mut declarations,
                         );
-                        let body = Statement::Block(vec![
-                            Statement::VariableList {
-                                offset: self.previous_offset(),
-                                kind,
-                                declarations,
-                            },
-                            body,
-                        ]);
+                        let declared = Statement::VariableList {
+                            offset: self.previous_offset(),
+                            kind,
+                            declarations,
+                        };
+                        // The head's BoundNames must not repeat a lexical name (ECMA-262 14.7.5.1).
+                        validate_declaration_conflicts(
+                            std::slice::from_ref(&declared),
+                            false,
+                            self.strict,
+                        )?;
+                        let body = Statement::Block(vec![declared, body]);
                         return Ok(Statement::ForOf {
                             offset: self.previous_offset(),
                             kind: VariableKind::Var,
@@ -2153,20 +2218,49 @@ impl Parser {
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(statement))
         } else {
+            let covers_before = self.pending_covers;
+            // The left side may be a destructuring pattern (`for ({ a = 1 } of xs)`),
+            // which is known only once `in` or `of` follows.
+            self.pattern_candidate = true;
             let expression = self.expression()?;
+            let covers = self.pending_covers.saturating_sub(covers_before);
             if self.take(&TokenKind::In) {
                 self.no_in = false;
                 let iterable = self.expression()?;
                 self.validate_assignment_target(&expression)?;
+                if covers != pattern_cover_count(&expression) {
+                    return Err(self.error("invalid shorthand property initializer"));
+                }
+                self.pending_covers = self.pending_covers.saturating_sub(covers);
                 self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
                 let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
-                return Ok(Statement::ForInExpr {
-                    offset: self.previous_offset(),
-                    target: expression,
+                let offset = self.previous_offset();
+                let body = body?;
+                if !matches!(expression, Expr::Object(_) | Expr::Array(_)) {
+                    return Ok(Statement::ForInExpr {
+                        offset,
+                        target: expression,
+                        iterable,
+                        body: Box::new(body),
+                    });
+                }
+                // A pattern target is assigned from one temporary at the top of
+                // each iteration, as the for-of form below does.
+                let temporary = format!("\0for_in_expr_{}", self.cursor);
+                let assign = Statement::Expression(Expr::Assignment {
+                    target: Box::new(expression),
+                    value: Box::new(Expr::Identifier(temporary.clone())),
+                    offset,
+                    parenthesized_target: false,
+                });
+                return Ok(Statement::ForIn {
+                    offset,
+                    kind: VariableKind::Var,
+                    name: temporary,
                     iterable,
-                    body: Box::new(body?),
+                    body: Box::new(Statement::Block(vec![assign, body])),
                 });
             }
             if self.at_contextual("of") && !self.current().escaped {
@@ -2177,6 +2271,10 @@ impl Parser {
                 self.advance();
                 self.no_in = false;
                 self.validate_assignment_target(&expression)?;
+                if covers != pattern_cover_count(&expression) {
+                    return Err(self.error("invalid shorthand property initializer"));
+                }
+                self.pending_covers = self.pending_covers.saturating_sub(covers);
                 let iterable = self.assignment()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
@@ -2198,6 +2296,9 @@ impl Parser {
                     body: Box::new(Statement::Block(vec![assign, body?])),
                     is_await,
                 });
+            }
+            if covers > 0 {
+                return Err(self.error("invalid shorthand property initializer"));
             }
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(Statement::Expression(expression)))
@@ -2311,6 +2412,7 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, JsError> {
+        let pattern_candidate = std::mem::take(&mut self.pattern_candidate);
         if self.in_generator
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "yield")
         {
@@ -2320,10 +2422,24 @@ impl Parser {
             return Ok(arrow);
         }
         let parenthesized_target = self.at(&TokenKind::LeftParen);
+        let covers_before = self.pending_covers;
         let target = self.conditional()?;
+        let covers = self.pending_covers.saturating_sub(covers_before);
         if self.take(&TokenKind::Equal) {
-            self.assignment_value(target, None, parenthesized_target)
-        } else if self.take(&TokenKind::PlusEqual) {
+            // Only a plain `=` makes its left side a pattern, and each cover
+            // member must sit in a pattern position of that left side.
+            if covers != pattern_cover_count(&target) {
+                return Err(self.error("invalid shorthand property initializer"));
+            }
+            self.pending_covers = self.pending_covers.saturating_sub(covers);
+            return self.assignment_value(target, None, parenthesized_target);
+        }
+        // Any other operator, or a plain expression that no enclosing literal
+        // turns into a pattern, leaves a cover member as an early error.
+        if covers > 0 && (!pattern_candidate || self.at_compound_assignment()) {
+            return Err(self.error("invalid shorthand property initializer"));
+        }
+        if self.take(&TokenKind::PlusEqual) {
             self.assignment_value(target, Some(BinaryOp::Add), parenthesized_target)
         } else if self.take(&TokenKind::MinusEqual) {
             self.assignment_value(target, Some(BinaryOp::Subtract), parenthesized_target)
@@ -2380,12 +2496,35 @@ impl Parser {
         })
     }
 
+    /// Whether the current token is an assignment operator other than `=`.
+    fn at_compound_assignment(&self) -> bool {
+        matches!(
+            self.current().kind,
+            TokenKind::PlusEqual
+                | TokenKind::MinusEqual
+                | TokenKind::StarStarEqual
+                | TokenKind::StarEqual
+                | TokenKind::SlashEqual
+                | TokenKind::PercentEqual
+                | TokenKind::AmpersandEqual
+                | TokenKind::CaretEqual
+                | TokenKind::PipeEqual
+                | TokenKind::LeftShiftEqual
+                | TokenKind::RightShiftEqual
+                | TokenKind::UnsignedRightShiftEqual
+                | TokenKind::AndAndEqual
+                | TokenKind::OrOrEqual
+                | TokenKind::QuestionQuestionEqual
+        )
+    }
+
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
         let checkpoint = self.cursor;
         let mut is_async_arrow = false;
         // Async arrows have the same callable shape in this synchronous
         // runtime; consume the marker while retaining their parameter/body.
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && !self.current().escaped
             && matches!(
                 self.tokens.get(self.cursor + 1).map(|token| &token.kind),
                 Some(TokenKind::LeftParen | TokenKind::Identifier(_))
@@ -2535,7 +2674,7 @@ impl Parser {
             markers.extend(body);
             body = markers;
         }
-        validate_declaration_conflicts(&body, true)?;
+        validate_declaration_conflicts(&body, true, self.strict)?;
         Ok(Some(Expr::Arrow {
             offset: self.previous_offset(),
             parameters,
@@ -2876,8 +3015,10 @@ impl Parser {
         }
         if self.take(&TokenKind::New) {
             if self.take(&TokenKind::Dot) {
+                // An escaped `target` spells the name but is not the keyword (ECMA-262 12.7.2).
+                let escaped = self.current().escaped;
                 let property = self.property_name()?;
-                if property != "target" {
+                if property != "target" || escaped {
                     return Err(self.error("expected 'new.target'"));
                 }
                 // `new.target` is only valid in function code, eval code
@@ -3096,8 +3237,11 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr, JsError> {
         let token = self.advance();
+        let escaped = token.escaped;
         match token.kind {
-            TokenKind::Identifier(name) if name == "async" && self.at(&TokenKind::Function) => {
+            TokenKind::Identifier(name)
+                if name == "async" && !escaped && self.at(&TokenKind::Function) =>
+            {
                 self.advance();
                 self.function_expression(true)
             }
@@ -3425,6 +3569,7 @@ impl Parser {
         let static_start = self.current().offset;
         let mut is_static = false;
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "static")
+            && !self.current().escaped
             && class_modifier_follows(self.tokens.get(self.cursor + 1))
         {
             self.advance();
@@ -3451,6 +3596,7 @@ impl Parser {
         let mut kind = ClassElementKind::Method;
         let next = self.tokens.get(self.cursor + 1);
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "get" || name == "set")
+            && !self.current().escaped
             && class_modifier_follows(next)
             && !matches!(next, Some(token) if token.kind == TokenKind::Star)
         {
@@ -3469,6 +3615,7 @@ impl Parser {
         let next = self.tokens.get(self.cursor + 1);
         if matches!(kind, ClassElementKind::Method)
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && !self.current().escaped
             && class_modifier_follows(next)
             && next.is_some_and(|token| !token.after_newline)
         {
@@ -3696,7 +3843,7 @@ impl Parser {
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         let body = result?;
-        validate_declaration_conflicts(&body, true)?;
+        validate_declaration_conflicts(&body, true, self.strict)?;
         Ok(body)
     }
 
@@ -3760,7 +3907,7 @@ impl Parser {
         self.static_block = previous_static_block;
         self.static_block_await = previous_static_await;
         let (parameters, body) = result?;
-        validate_declaration_conflicts(&body, true)?;
+        validate_declaration_conflicts(&body, true, self.strict)?;
         // A function whose own body is strict is checked as strict code here,
         // whatever the enclosing script is (ECMA-262 11.2.2).
         if has_use_strict_directive(&body) {
@@ -3900,6 +4047,7 @@ impl Parser {
     /// `IdentifierReference`.
     fn object_member(&mut self) -> Result<ObjectProperty, JsError> {
         if self.take(&TokenKind::Ellipsis) {
+            self.pattern_candidate = true;
             return Ok(ObjectProperty {
                 key: PropertyKey::Spread,
                 value: self.assignment()?,
@@ -3912,6 +4060,7 @@ impl Parser {
         // the same line (`async [no LineTerminator here] *`). `{ async }`,
         // `{ async: 1 }` and `{ async() {} }` keep it as the name.
         let is_async = matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && !self.current().escaped
             && self.tokens.get(self.cursor + 1).is_some_and(|next| {
                 !next.after_newline
                     && !matches!(
@@ -3938,6 +4087,7 @@ impl Parser {
         let accessor = match &self.current().kind {
             TokenKind::Identifier(name)
                 if (name == "get" || name == "set")
+                    && !self.current().escaped
                     && !matches!(
                         next_kind,
                         Some(
@@ -3989,6 +4139,7 @@ impl Parser {
             return self.object_method(key, FunctionKind::Normal);
         }
         if self.take(&TokenKind::Colon) {
+            self.pattern_candidate = true;
             return Ok(ObjectProperty {
                 key,
                 value: self.assignment()?,
@@ -4006,6 +4157,25 @@ impl Parser {
                     || (self.static_block && name == "arguments");
                 if restricted {
                     return Err(self.error("name is not a valid identifier reference here"));
+                }
+                if self.take(&TokenKind::Equal) {
+                    // `{ name = value }` is a CoverInitializedName: it is an
+                    // AssignmentPattern only if the literal becomes a pattern
+                    // (ECMA-262 13.2.5.1). `assignment` rejects it otherwise.
+                    let default = self.assignment()?;
+                    self.pending_covers = self.pending_covers.saturating_add(1);
+                    return Ok(ObjectProperty {
+                        key: PropertyKey::Static(name.clone()),
+                        value: Expr::Assignment {
+                            offset: self.previous_offset(),
+                            target: Box::new(Expr::Identifier(name)),
+                            value: Box::new(default),
+                            parenthesized_target: false,
+                        },
+                        accessor: None,
+                        shorthand: true,
+                        method: false,
+                    });
                 }
                 Ok(ObjectProperty {
                     key: PropertyKey::Static(name.clone()),
@@ -4056,7 +4226,11 @@ impl Parser {
                 elements.push(Expr::Literal(JsValue::Undefined));
                 continue;
             }
-            let element = if self.take(&TokenKind::Ellipsis) {
+            // An element may be a rest target or an element of an assignment
+            // pattern, so a cover-initialized name inside it is not an error yet.
+            let spread = self.take(&TokenKind::Ellipsis);
+            self.pattern_candidate = true;
+            let element = if spread {
                 Expr::Spread(Box::new(self.assignment()?))
             } else {
                 self.assignment()?
@@ -4330,6 +4504,9 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             format!("{name} is reserved in strict mode"),
             0,
         )),
+        Statement::Variable { name, .. } if is_strict_restricted_binding(name) => {
+            validate_strict_binding_names([name.clone()])
+        }
         // Reached only from strict code, so the body is strict whatever its own
         // directive says.
         Statement::Function {
@@ -4338,7 +4515,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             body,
             ..
         } => {
-            if is_strict_reserved_word(name) || name == "arguments" {
+            if is_strict_restricted_binding(name) {
                 return Err(JsError::syntax(
                     format!("{name} is reserved in strict mode"),
                     0,
@@ -4379,7 +4556,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             body,
             ..
         } => {
-            if is_strict_reserved_word(name) {
+            if is_strict_restricted_binding(name) {
                 return Err(JsError::syntax(
                     format!("{name} is reserved in strict mode"),
                     0,
@@ -4394,7 +4571,7 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             body,
             ..
         } => {
-            if is_strict_reserved_word(name) {
+            if is_strict_restricted_binding(name) {
                 return Err(JsError::syntax(
                     format!("{name} is reserved in strict mode"),
                     0,
@@ -4433,6 +4610,9 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
         } => {
             validate_strict_statements(body)?;
             if let Some(catch) = catch {
+                if let Some(parameter) = &catch.parameter {
+                    validate_strict_binding_names(parameter.names())?;
+                }
                 validate_strict_statements(&catch.body)?;
             }
             if let Some(finally) = finally {
@@ -4459,10 +4639,15 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             value.as_ref().map_or(Ok(()), validate_strict_expression)
         }
         Statement::VariableList { declarations, .. }
-        | Statement::ParameterPattern { declarations, .. } => declarations
-            .iter()
-            .filter_map(|(_, value)| value.as_ref())
-            .try_for_each(validate_strict_expression),
+        | Statement::ParameterPattern { declarations, .. } => {
+            validate_strict_binding_names(
+                declarations.iter().flat_map(|(target, _)| target.names()),
+            )?;
+            declarations
+                .iter()
+                .filter_map(|(_, value)| value.as_ref())
+                .try_for_each(validate_strict_expression)
+        }
         Statement::Return(value) => value.as_ref().map_or(Ok(()), validate_strict_expression),
         Statement::Throw(value) => validate_strict_expression(value),
         Statement::ParameterDefault { value, .. } => validate_strict_expression(value),
@@ -4645,6 +4830,32 @@ struct ReservedContext {
     generator_context: bool,
 }
 
+/// `{ name = value }` (`CoverInitializedName`, ECMA-262 13.2.5.1): a shorthand
+/// member whose value is the assignment `name = value`. Only a pattern may
+/// hold one, so it is an error anywhere an expression is meant.
+fn is_cover_initialized(property: &ObjectProperty) -> bool {
+    property.shorthand && matches!(property.value, Expr::Assignment { .. })
+}
+
+/// The number of still-unresolved cover-initialized members that `expression`
+/// holds in pattern positions, reached through array elements, spreads and
+/// object values. An assignment is opaque: its own `=` already resolved the
+/// members in its target. A member anywhere else (a call argument, a member
+/// object) is not counted, so the caller reports it.
+fn pattern_cover_count(expression: &Expr) -> usize {
+    match expression {
+        Expr::Array(elements) => elements.iter().map(pattern_cover_count).sum(),
+        Expr::Spread(rest) => pattern_cover_count(rest),
+        Expr::Object(properties) => properties
+            .iter()
+            .map(|property| {
+                usize::from(is_cover_initialized(property)) + pattern_cover_count(&property.value)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// A simple assignment target: a name or a property reference (ECMA-262 13.15.1).
 fn is_simple_target(expression: &Expr) -> bool {
     matches!(
@@ -4669,12 +4880,31 @@ fn is_simple_parameter_list(parameters: &[String]) -> bool {
     })
 }
 
+/// Whether strict code refuses `name` as a binding: a strict reserved word, or
+/// `eval` or `arguments` (ECMA-262 13.1.1, 15.2.1).
+fn is_strict_restricted_binding(name: &str) -> bool {
+    is_strict_reserved_word(name) || name == "eval" || name == "arguments"
+}
+
+/// Refuse each strictly restricted name among the bindings of a declaration.
+fn validate_strict_binding_names(names: impl IntoIterator<Item = String>) -> Result<(), JsError> {
+    for name in names {
+        if is_strict_restricted_binding(&name) {
+            return Err(JsError::syntax(
+                format!("{name} cannot be a binding name in strict code"),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parameter names in strict code may be neither `eval`, `arguments`, nor a
 /// strict reserved word (ECMA-262 15.2.1).
 fn validate_strict_parameters(parameters: &[String]) -> Result<(), JsError> {
     for parameter in parameters {
         let name = parameter_binding_name(parameter);
-        if is_strict_reserved_word(name) || name == "arguments" {
+        if is_strict_restricted_binding(name) {
             return Err(JsError::syntax(
                 "strict mode parameter uses a reserved word",
                 0,
@@ -5193,6 +5423,7 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
 fn validate_declaration_conflicts<'a>(
     statements: impl IntoIterator<Item = &'a Statement>,
     top_level: bool,
+    strict: bool,
 ) -> Result<(), JsError> {
     let mut lexical = BTreeSet::new();
     let mut block_functions = BTreeSet::new();
@@ -5237,8 +5468,10 @@ fn validate_declaration_conflicts<'a>(
             Statement::Function { name, .. } => {
                 if top_level {
                     var_names.insert(name.clone());
-                } else {
-                    block_functions.insert(name.clone());
+                } else if !block_functions.insert(name.clone()) && strict {
+                    // Annex B.3.3 lets sloppy code repeat a block-level function;
+                    // strict code makes each one lexical (ECMA-262 14.2.1).
+                    return Err(duplicate(name));
                 }
             }
             other => collect_var_names(other, &mut var_names),
