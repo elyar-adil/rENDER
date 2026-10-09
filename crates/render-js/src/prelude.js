@@ -149,28 +149,6 @@
   });
 
   // ---------------------------------------------------------------- String
-  define(String.prototype, 'matchAll', function matchAll(pattern) {
-    var text = String(this);
-    var expression;
-    if (pattern instanceof RegExp) {
-      if (pattern.flags.indexOf('g') === -1) {
-        throw new TypeError('String.prototype.matchAll called with a non-global RegExp argument');
-      }
-      expression = new RegExp(pattern.source, pattern.flags);
-      expression.lastIndex = pattern.lastIndex;
-    } else {
-      expression = new RegExp(pattern, 'g');
-    }
-    // Eager rather than lazy: the matches are computed up front and then
-    // iterated. Observable only through `lastIndex` side effects mid-iteration.
-    var matches = [];
-    var match;
-    while ((match = expression.exec(text)) !== null) {
-      matches.push(match);
-      if (match[0] === '') expression.lastIndex++;
-    }
-    return matches[Symbol.iterator]();
-  });
   define(String.prototype, 'trimLeft', String.prototype.trimStart);
   define(String.prototype, 'trimRight', String.prototype.trimEnd);
   define(String.prototype, 'toLocaleLowerCase', function toLocaleLowerCase() {

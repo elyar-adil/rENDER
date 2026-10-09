@@ -4034,10 +4034,9 @@ impl JsRuntime {
                     return match attributes.get(index) {
                         Some(attribute) => {
                             self.ensure_heap_capacity(1)?;
-                            Ok(JsValue::Object(self.realm.attr_wrapper(
-                                node,
-                                attribute.local_name.clone(),
-                            )))
+                            Ok(JsValue::Object(
+                                self.realm.attr_wrapper(node, attribute.local_name.clone()),
+                            ))
                         }
                         None => Ok(JsValue::Undefined),
                     };
@@ -4087,7 +4086,8 @@ impl JsRuntime {
                 // DOMStringMap named-property visibility: only members whose
                 // mapped `data-*` attribute exists shadow the ordinary
                 // prototype-chain lookup; everything else falls through.
-                if let Some(value) = JsRuntime::dataset_member_attribute_value(dom, node, property)? {
+                if let Some(value) = JsRuntime::dataset_member_attribute_value(dom, node, property)?
+                {
                     return Ok(JsValue::String(value));
                 }
             }
@@ -4138,17 +4138,6 @@ impl JsRuntime {
                     }
                 }
             }
-            Some(ObjectHost::RegExp(index))
-                // `lastIndex` lives in the record so exec/test updates stay
-                // visible even when the cached property lags behind.
-                if property == "lastIndex" => {
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "string lengths stay far below any precision boundary"
-                    )]
-                    let last_index = self.regexes[index].last_index as f64;
-                    return Ok(JsValue::Number(last_index));
-                }
             Some(ObjectHost::Collection { kind, entries })
                 if property == "size" && !kind.is_weak() =>
             {
@@ -4230,7 +4219,10 @@ impl JsRuntime {
                         clippy::cast_precision_loss,
                         reason = "entry counts stay far below any precision boundary"
                     )]
-                    let length = self.realm.own_property_names(object).map_or(0, |keys| keys.len());
+                    let length = self
+                        .realm
+                        .own_property_names(object)
+                        .map_or(0, |keys| keys.len());
                     return Ok(JsValue::Number(length as f64));
                 }
                 if property.parse::<usize>().is_ok() {
@@ -4611,24 +4603,6 @@ impl JsRuntime {
                         Err(JsError::type_error("could not store the value"))
                     };
                 }
-            }
-            Some(ObjectHost::RegExp(index)) if property == "lastIndex" => {
-                let number = to_number(&value)?;
-                #[allow(
-                    clippy::cast_sign_loss,
-                    clippy::cast_possible_truncation,
-                    reason = "negative and fractional indices floor toward zero"
-                )]
-                let last_index = number.floor().max(0.0) as usize;
-                self.regexes[index].last_index = last_index;
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "string lengths stay far below any precision boundary"
-                )]
-                let stored = last_index as f64;
-                self.realm
-                    .set_property(object, "lastIndex".to_owned(), JsValue::Number(stored));
-                return Ok(());
             }
             _ => {}
         }
@@ -5276,6 +5250,42 @@ impl JsRuntime {
                 | NativeFunction::UrlSearchParamsToString
                 | NativeFunction::UrlSearchParamsForEach),
             )) => Ok(self.url_search_params_method(&receiver, function, arguments, dom)),
+            // ECMA-262 22.1.3.x step 1: `RequireObjectCoercible(this value)`. A
+            // native receives `null` and `undefined` as the global object, so the
+            // check is made here, before that substitution.
+            Some(ObjectHost::NativeFunction(
+                NativeFunction::StrReplace
+                | NativeFunction::StrReplaceAll
+                | NativeFunction::StrMatch
+                | NativeFunction::StrMatchAll
+                | NativeFunction::StrSearch
+                | NativeFunction::StrSplit,
+            )) if matches!(receiver, JsValue::Null | JsValue::Undefined) => Err(
+                JsError::type_error("String.prototype method called on null or undefined"),
+            ),
+            Some(ObjectHost::NativeFunction(
+                function @ (NativeFunction::RegExpSymbolMatch
+                | NativeFunction::RegExpSymbolMatchAll
+                | NativeFunction::RegExpSymbolReplace
+                | NativeFunction::RegExpSymbolSearch
+                | NativeFunction::RegExpSymbolSplit),
+            )) => {
+                // ECMA-262 22.2.6.8 step 2: `this` must be an Object, so the
+                // receiver is passed unboxed. Pins follow `call_native`.
+                let pinned = self.transient_roots.len();
+                self.transient_roots.extend(
+                    arguments
+                        .iter()
+                        .chain(std::iter::once(&receiver))
+                        .filter_map(|value| match value {
+                            JsValue::Object(object) => Some(*object),
+                            _ => None,
+                        }),
+                );
+                let result = self.regexp_symbol_method(dom, function, &receiver, arguments);
+                self.transient_roots.truncate(pinned);
+                result
+            }
             Some(ObjectHost::NativeFunction(function)) => {
                 let receiver = match &receiver {
                     JsValue::Object(object) => *object,

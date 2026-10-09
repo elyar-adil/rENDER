@@ -149,6 +149,9 @@ pub struct JsRuntime {
     pending_fetch_targets: BTreeMap<u64, ObjectId>,
     next_fetch_id: u64,
     regexes: Vec<RegexRecord>,
+    /// Compiled patterns by `(source, flags)`, so a regex literal evaluated
+    /// again (in a loop, or a function called repeatedly) is not compiled again.
+    regex_cache: std::collections::HashMap<(String, String), std::rc::Rc<crate::regex::Compiled>>,
     console_messages: Vec<ConsoleMessage>,
     window_event_handlers: BTreeMap<String, Vec<types::Listener>>,
     next_symbol_id: u64,
@@ -258,6 +261,7 @@ impl JsRuntime {
             pending_fetch_targets: BTreeMap::new(),
             next_fetch_id: 1,
             regexes: Vec::new(),
+            regex_cache: std::collections::HashMap::new(),
             console_messages: Vec::new(),
             window_event_handlers: BTreeMap::new(),
             next_symbol_id: crate::value::FIRST_DYNAMIC_SYMBOL_ID,

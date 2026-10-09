@@ -816,13 +816,7 @@ fn item_matches(item: &ClassItem, value: u32, flags: Flags) -> bool {
         }
         ClassItem::Word(positive) => is_word(value, flags) == *positive,
         ClassItem::Space(positive) => is_space(value) == *positive,
-        ClassItem::Property(property, positive) => {
-            let contained = match char::from_u32(value) {
-                Some(character) => property.contains(character),
-                None => *property == property::Property::Any,
-            };
-            contained == *positive
-        }
+        ClassItem::Property(property, positive) => property.contains(value) == *positive,
     }
 }
 
@@ -1656,9 +1650,10 @@ impl PatternParser<'_> {
                 None => return Err(RegexSyntaxError::new("invalid property escape".to_owned())),
             }
         }
-        property::Property::parse(&name).ok_or_else(|| {
-            RegexSyntaxError::unsupported(format!("unsupported unicode property {name:?}"))
-        })
+        // The table is the specification's complete list, so a name it does not
+        // have is an early error rather than something to defer.
+        property::Property::parse(&name)
+            .ok_or_else(|| RegexSyntaxError::new(format!("invalid unicode property {name:?}")))
     }
 
     /// The character that an escape other than the class, decimal and `\k`
@@ -1730,239 +1725,158 @@ impl PatternParser<'_> {
     }
 }
 
-/// Unicode property escapes (`\p{…}`).
-///
-/// The standard library exposes only a few of the properties the specification
-/// names, and this crate carries no Unicode database, so this is a deliberate
-/// subset: the general categories and binary properties `std` can answer
-/// exactly, a few that are answered by code-point ranges (documented below),
-/// and the scripts that matter for the pages this engine is used on. A name
-/// outside the table is a syntax error, not a silent non-match.
 mod property {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Property {
-        Any,
-        Ascii,
-        Letter,
-        UppercaseLetter,
-        LowercaseLetter,
-        Number,
-        Punctuation,
-        Symbol,
-        Separator,
-        Alphabetic,
-        Uppercase,
-        Lowercase,
-        WhiteSpace,
-        Emoji,
-        Script(Script),
-    }
+    //! The `\p{…}` / `\P{…}` property table (ECMA-262 22.2.2.9 and Table 67 to
+    //! Table 69). Every name the specification lists is answered by the Unicode
+    //! data in `icu_properties`; every other name is a syntax error, because
+    //! the table is complete rather than a subset of it.
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(super) enum Script {
-        Latin,
-        Greek,
-        Cyrillic,
-        Han,
-        Hiragana,
-        Katakana,
-        Hangul,
-        Arabic,
-        Hebrew,
-        Thai,
-        Devanagari,
+    use icu_properties::props::{GeneralCategory, GeneralCategoryGroup, Script};
+    use icu_properties::script::ScriptWithExtensions;
+    use icu_properties::{
+        CodePointMapData, CodePointSetData, CodePointSetDataBorrowed, PropertyParser,
+    };
+
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum Property {
+        /// `Any`: every code point.
+        Any,
+        /// `ASCII`: U+0000 to U+007F.
+        Ascii,
+        /// `Assigned`: every code point whose `General_Category` is not `Cn`.
+        Assigned,
+        /// `General_Category` values, including the grouped ones (`L`, `Letter`).
+        Category(GeneralCategoryGroup),
+        /// `Script=`, and the Script property a value of `Script_Extensions=`
+        /// names by its primary script.
+        Script(Script),
+        /// `Script_Extensions=`: every code point that has the script among its
+        /// extensions.
+        ScriptExtensions(Script),
+        /// A binary property from the specification's table of binary properties.
+        Binary(CodePointSetDataBorrowed<'static>),
     }
 
     impl Property {
+        /// The property `text` names, as the body of `\p{text}`. `None` for a
+        /// name the specification does not define.
         pub(super) fn parse(text: &str) -> Option<Self> {
-            let (name, value) = match text.split_once('=') {
-                Some((name, value)) => (name, Some(value)),
-                None => (text, None),
-            };
-            match (name, value) {
-                ("General_Category" | "gc", Some(value)) => Self::parse_category(value),
-                ("Script" | "sc" | "Script_Extensions" | "scx", Some(value)) => {
-                    Self::parse_script(value).map(Self::Script)
-                }
-                (name, None) => Self::parse_category(name).or(match name {
+            match text.split_once('=') {
+                Some((name, value)) => match name {
+                    "General_Category" | "gc" => parse_category(value).map(Self::Category),
+                    "Script" | "sc" => PropertyParser::<Script>::new()
+                        .get_strict(value)
+                        .map(Self::Script),
+                    "Script_Extensions" | "scx" => PropertyParser::<Script>::new()
+                        .get_strict(value)
+                        .map(Self::ScriptExtensions),
+                    _ => None,
+                },
+                None => match text {
                     "Any" => Some(Self::Any),
                     "ASCII" => Some(Self::Ascii),
-                    "Alphabetic" | "Alpha" => Some(Self::Alphabetic),
-                    "Uppercase" | "Upper" => Some(Self::Uppercase),
-                    "Lowercase" | "Lower" => Some(Self::Lowercase),
-                    "White_Space" | "space" => Some(Self::WhiteSpace),
-                    "Emoji" | "Emoji_Presentation" | "Extended_Pictographic" => Some(Self::Emoji),
-                    _ => None,
-                }),
-                _ => None,
+                    "Assigned" => Some(Self::Assigned),
+                    _ => CodePointSetData::new_for_ecma262(text.as_bytes())
+                        .map(Self::Binary)
+                        .or_else(|| parse_category(text).map(Self::Category)),
+                },
             }
         }
 
-        fn parse_category(name: &str) -> Option<Self> {
-            Some(match name {
-                "L" | "Letter" => Self::Letter,
-                "Lu" | "Uppercase_Letter" => Self::UppercaseLetter,
-                "Ll" | "Lowercase_Letter" => Self::LowercaseLetter,
-                "N" | "Number" => Self::Number,
-                "P" | "Punctuation" | "punct" => Self::Punctuation,
-                "S" | "Symbol" => Self::Symbol,
-                "Z" | "Separator" | "Zs" | "Space_Separator" => Self::Separator,
-                _ => return None,
-            })
-        }
-
-        fn parse_script(name: &str) -> Option<Script> {
-            Some(match name {
-                "Latin" | "Latn" => Script::Latin,
-                "Greek" | "Grek" => Script::Greek,
-                "Cyrillic" | "Cyrl" => Script::Cyrillic,
-                "Han" | "Hani" => Script::Han,
-                "Hiragana" | "Hira" => Script::Hiragana,
-                "Katakana" | "Kana" => Script::Katakana,
-                "Hangul" | "Hang" => Script::Hangul,
-                "Arabic" | "Arab" => Script::Arabic,
-                "Hebrew" | "Hebr" => Script::Hebrew,
-                "Thai" => Script::Thai,
-                "Devanagari" | "Deva" => Script::Devanagari,
-                _ => return None,
-            })
-        }
-
-        pub(super) fn contains(self, character: char) -> bool {
-            let code = u32::from(character);
+        /// Whether the code point `value` (a code unit when the pattern is read
+        /// without `u`, and a code point otherwise) has the property.
+        pub(super) fn contains(self, value: u32) -> bool {
             match self {
                 Self::Any => true,
-                Self::Ascii => character.is_ascii(),
-                // `Letter` is Alphabetic without the number letters and the
-                // combining marks `std`'s Alphabetic also admits.
-                Self::Letter => {
-                    character.is_alphabetic()
-                        && !is_mark(code)
-                        && !matches!(code, 0x2160..=0x2188 | 0x3007 | 0x3021..=0x3029)
+                Self::Ascii => value < 0x80,
+                Self::Assigned => {
+                    CodePointMapData::<GeneralCategory>::new().get32(value)
+                        != GeneralCategory::Unassigned
                 }
-                Self::Alphabetic => character.is_alphabetic(),
-                Self::UppercaseLetter | Self::Uppercase => character.is_uppercase(),
-                Self::LowercaseLetter | Self::Lowercase => character.is_lowercase(),
-                Self::Number => character.is_numeric(),
-                Self::WhiteSpace => character.is_whitespace(),
-                Self::Separator => {
-                    character.is_whitespace() && !character.is_control() || code == 0x3000
+                Self::Category(group) => {
+                    group.contains(CodePointMapData::<GeneralCategory>::new().get32(value))
                 }
-                Self::Punctuation => is_punctuation(character, code),
-                Self::Symbol => is_symbol(character, code),
-                Self::Emoji => is_emoji(code),
-                Self::Script(script) => script.contains(code),
+                Self::Script(script) => CodePointMapData::<Script>::new().get32(value) == script,
+                Self::ScriptExtensions(script) => {
+                    ScriptWithExtensions::new().has_script32(value, script)
+                }
+                Self::Binary(set) => set.contains32(value),
             }
         }
     }
 
-    impl Script {
-        fn contains(self, code: u32) -> bool {
-            match self {
-                Self::Latin => matches!(
-                    code,
-                    0x41..=0x5a | 0x61..=0x7a | 0xaa | 0xba | 0xc0..=0xd6 | 0xd8..=0xf6
-                        | 0xf8..=0x2b8 | 0x1e00..=0x1eff | 0x2c60..=0x2c7f | 0xa720..=0xa7ff
-                        | 0xff21..=0xff3a | 0xff41..=0xff5a
-                ),
-                Self::Greek => matches!(code, 0x370..=0x3ff | 0x1f00..=0x1fff),
-                Self::Cyrillic => {
-                    matches!(code, 0x400..=0x52f | 0x1c80..=0x1c8f | 0x2de0..=0x2dff | 0xa640..=0xa69f)
-                }
-                Self::Han => matches!(
-                    code,
-                    0x2e80..=0x2fdf | 0x3005 | 0x3007 | 0x3021..=0x3029 | 0x3038..=0x303b
-                        | 0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff
-                        | 0x20000..=0x2fa1f | 0x30000..=0x3134f
-                ),
-                Self::Hiragana => {
-                    matches!(code, 0x3041..=0x3096 | 0x309d..=0x309f | 0x1b001..=0x1b11f)
-                }
-                Self::Katakana => matches!(
-                    code,
-                    0x30a1..=0x30fa | 0x30fd..=0x30ff | 0x31f0..=0x31ff | 0x32d0..=0x32fe
-                        | 0x3300..=0x3357 | 0xff66..=0xff6f | 0xff71..=0xff9d
-                ),
-                Self::Hangul => matches!(
-                    code,
-                    0x1100..=0x11ff | 0x3131..=0x318e | 0xa960..=0xa97c | 0xac00..=0xd7a3 | 0xd7b0..=0xd7fb
-                ),
-                Self::Arabic => {
-                    matches!(code, 0x600..=0x6ff | 0x750..=0x77f | 0x8a0..=0x8ff | 0xfb50..=0xfdff | 0xfe70..=0xfeff)
-                }
-                Self::Hebrew => matches!(code, 0x591..=0x5f4 | 0xfb1d..=0xfb4f),
-                Self::Thai => matches!(code, 0xe01..=0xe3a | 0xe40..=0xe5b),
-                Self::Devanagari => matches!(code, 0x900..=0x97f | 0xa8e0..=0xa8ff),
-            }
-        }
+    /// The `General_Category` value or group a name or `name=value` pair names.
+    fn parse_category(name: &str) -> Option<GeneralCategoryGroup> {
+        let value = name
+            .strip_prefix("General_Category=")
+            .or_else(|| name.strip_prefix("gc="))
+            .unwrap_or(name);
+        PropertyParser::<GeneralCategory>::new()
+            .get_strict(value)
+            .map(GeneralCategoryGroup::from)
+            .or_else(|| grouped_category(value))
     }
 
-    fn is_mark(code: u32) -> bool {
-        matches!(
-            code,
-            0x300..=0x36f | 0x483..=0x489 | 0x591..=0x5bd | 0x610..=0x61a | 0x64b..=0x65f
-                | 0x900..=0x903 | 0x93a..=0x94f | 0xe31 | 0xe34..=0xe3a | 0xe47..=0xe4e
-                | 0x1ab0..=0x1aff | 0x1dc0..=0x1dff | 0x20d0..=0x20ff | 0x3099..=0x309a
-                | 0xfe00..=0xfe0f | 0xfe20..=0xfe2f
-        )
-    }
-
-    /// ASCII punctuation (not the ASCII symbols) plus the Latin-1, General
-    /// Punctuation, CJK and fullwidth ranges that are punctuation.
-    fn is_punctuation(character: char, code: u32) -> bool {
-        if character.is_ascii() {
-            return character.is_ascii_punctuation()
-                && !matches!(
-                    character,
-                    '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~'
-                );
-        }
-        matches!(
-            code,
-            0xa1 | 0xa7 | 0xab | 0xb6 | 0xb7 | 0xbb | 0xbf | 0x37e | 0x387 | 0x55a..=0x55f
-                | 0x589..=0x58a | 0x5be | 0x5c0 | 0x5c3 | 0x5c6 | 0x5f3..=0x5f4
-                | 0x60c..=0x60d | 0x61b | 0x61e..=0x61f | 0x66a..=0x66d | 0x6d4
-                | 0x2010..=0x2027 | 0x2030..=0x2043 | 0x2045..=0x2051 | 0x2053..=0x205e
-                | 0x207d..=0x207e | 0x208d..=0x208e | 0x2308..=0x230b | 0x2329..=0x232a
-                | 0x2768..=0x2775 | 0x27e6..=0x27ef | 0x2983..=0x2998 | 0x29d8..=0x29db
-                | 0x29fc..=0x29fd | 0x2e00..=0x2e2e | 0x2e30..=0x2e4f
-                | 0x3001..=0x3003 | 0x3008..=0x3011 | 0x3014..=0x301f | 0x3030 | 0x303d
-                | 0x30a0 | 0x30fb | 0xfe10..=0xfe19 | 0xfe30..=0xfe52 | 0xfe54..=0xfe61
-                | 0xfe63 | 0xfe68 | 0xfe6a..=0xfe6b | 0xff01..=0xff03 | 0xff05..=0xff0a
-                | 0xff0c..=0xff0f | 0xff1a..=0xff1b | 0xff1f..=0xff20 | 0xff3b..=0xff3d
-                | 0xff3f | 0xff5b | 0xff5d | 0xff5f..=0xff65
-        )
-    }
-
-    fn is_symbol(character: char, code: u32) -> bool {
-        if character.is_ascii() {
-            return matches!(
-                character,
-                '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~'
-            );
-        }
-        matches!(
-            code,
-            0xa2..=0xa6 | 0xa8..=0xa9 | 0xac | 0xae..=0xb1 | 0xb4 | 0xb8 | 0xd7 | 0xf7
-                | 0x2044 | 0x2052 | 0x207a..=0x207c | 0x208a..=0x208c | 0x20a0..=0x20c0
-                | 0x2100..=0x214f | 0x2190..=0x2307 | 0x230c..=0x2328 | 0x232b..=0x2426
-                | 0x2440..=0x244a | 0x249c..=0x24e9 | 0x2500..=0x2767 | 0x2794..=0x27c4
-                | 0x27c7..=0x27e5 | 0x27f0..=0x2982 | 0x2999..=0x29d7 | 0x29dc..=0x29fb
-                | 0x29fe..=0x2b73 | 0x2b76..=0x2bff | 0x3004 | 0x3012..=0x3013 | 0x3020
-                | 0x3036..=0x3037 | 0x303e..=0x303f | 0xff04 | 0xff0b | 0xff1c..=0xff1e
-                | 0xff3e | 0xff40 | 0xff5c | 0xff5e | 0xffe0..=0xffe6 | 0xffe8..=0xffee
-                | 0x1f000..=0x1faff
-        )
-    }
-
-    fn is_emoji(code: u32) -> bool {
-        matches!(
-            code,
-            0x23 | 0x2a | 0x30..=0x39 | 0xa9 | 0xae | 0x203c | 0x2049 | 0x2122 | 0x2139
-                | 0x2194..=0x21aa | 0x231a..=0x23ff | 0x24c2 | 0x25aa..=0x25fe
-                | 0x2600..=0x27bf | 0x2934..=0x2935 | 0x2b05..=0x2b55 | 0x3030 | 0x303d
-                | 0x3297 | 0x3299 | 0x1f000..=0x1faff
-        )
+    /// The grouped `General_Category` names (`L`, `Letter`, `LC`, `Cased_Letter`,
+    /// and so on), which name a set of values rather than one.
+    fn grouped_category(name: &str) -> Option<GeneralCategoryGroup> {
+        let members: &[GeneralCategory] = match name {
+            "L" | "Letter" => &[
+                GeneralCategory::UppercaseLetter,
+                GeneralCategory::LowercaseLetter,
+                GeneralCategory::TitlecaseLetter,
+                GeneralCategory::ModifierLetter,
+                GeneralCategory::OtherLetter,
+            ],
+            "LC" | "Cased_Letter" => &[
+                GeneralCategory::UppercaseLetter,
+                GeneralCategory::LowercaseLetter,
+                GeneralCategory::TitlecaseLetter,
+            ],
+            "M" | "Mark" | "Combining_Mark" => &[
+                GeneralCategory::NonspacingMark,
+                GeneralCategory::SpacingMark,
+                GeneralCategory::EnclosingMark,
+            ],
+            "N" | "Number" => &[
+                GeneralCategory::DecimalNumber,
+                GeneralCategory::LetterNumber,
+                GeneralCategory::OtherNumber,
+            ],
+            "P" | "Punctuation" | "punct" => &[
+                GeneralCategory::ConnectorPunctuation,
+                GeneralCategory::DashPunctuation,
+                GeneralCategory::OpenPunctuation,
+                GeneralCategory::ClosePunctuation,
+                GeneralCategory::InitialPunctuation,
+                GeneralCategory::FinalPunctuation,
+                GeneralCategory::OtherPunctuation,
+            ],
+            "S" | "Symbol" => &[
+                GeneralCategory::MathSymbol,
+                GeneralCategory::CurrencySymbol,
+                GeneralCategory::ModifierSymbol,
+                GeneralCategory::OtherSymbol,
+            ],
+            "Z" | "Separator" => &[
+                GeneralCategory::SpaceSeparator,
+                GeneralCategory::LineSeparator,
+                GeneralCategory::ParagraphSeparator,
+            ],
+            "C" | "Other" => &[
+                GeneralCategory::Control,
+                GeneralCategory::Format,
+                GeneralCategory::Surrogate,
+                GeneralCategory::PrivateUse,
+                GeneralCategory::Unassigned,
+            ],
+            _ => return None,
+        };
+        // One bit per value, the layout `GeneralCategoryGroup` itself uses.
+        let mask = members
+            .iter()
+            .fold(0_u32, |mask, category| mask | (1 << (*category as u32)));
+        Some(GeneralCategoryGroup::from(mask))
     }
 }
 
@@ -1996,6 +1910,30 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn property_escapes_use_the_specification_table_exactly() {
+        // Names the table lists match, including the aliases and the grouped
+        // General_Category values.
+        assert!(matches("\\p{Lu}", "u", "A").is_some());
+        assert!(matches("\\p{Letter}", "u", "a").is_some());
+        assert!(matches("\\p{scx=Thai}", "u", "\u{0e01}").is_some());
+        assert!(matches("\\p{Script=Tolong_Siki}", "u", "\u{11db0}").is_some());
+        assert!(matches("\\P{Lu}", "u", "a").is_some());
+        // Names outside the table are early errors, not deferred ones: loose
+        // matching, a removed binary property, and a property that is not one
+        // of the specification's.
+        for pattern in [
+            "\\p{ascii}",
+            "\\p{Hyphen}",
+            "\\p{Line_Break}",
+            "\\p{Script=Foo}",
+            "\\p{IsScript=Adlam}",
+        ] {
+            let error = validate(pattern, "u").expect_err(pattern);
+            assert!(!error.unsupported, "{pattern} must be a syntax error");
+        }
     }
 
     #[test]

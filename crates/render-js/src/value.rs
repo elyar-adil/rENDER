@@ -583,6 +583,19 @@ pub(crate) enum NativeFunction {
     RegExpTest,
     RegExpToString,
     RegExpAccessor(RegExpAccessor),
+    /// `RegExp.prototype[@@match]`, `[@@matchAll]`, `[@@replace]`, `[@@search]`
+    /// and `[@@split]` (ECMA-262 22.2.6.8-12).
+    RegExpSymbolMatch,
+    RegExpSymbolMatchAll,
+    RegExpSymbolReplace,
+    RegExpSymbolSearch,
+    RegExpSymbolSplit,
+    /// `%RegExpStringIteratorPrototype%.next` (ECMA-262 22.2.9.2.1).
+    RegExpStringIteratorNext,
+    /// `RegExp.escape` (the RegExp.escape proposal).
+    RegExpEscape,
+    /// The `get [Symbol.species]` getter on the `RegExp` constructor.
+    RegExpSpecies,
     StrCharAt,
     StrCharCodeAt,
     /// ECMA-262 22.1.3.12. The sibling of `charCodeAt` that answers the scalar
@@ -614,6 +627,7 @@ pub(crate) enum NativeFunction {
     StrSplit,
     StrReplace,
     StrMatch,
+    StrMatchAll,
     StrSearch,
     StrConcat,
     StrToString,
@@ -1424,6 +1438,15 @@ pub(crate) enum ObjectHost {
         values: Vec<JsValue>,
         index: usize,
     },
+    /// A `%RegExpStringIterator%` (ECMA-262 22.2.9): `matcher` is the `RegExp`
+    /// that `matchAll` cloned, stepped by `next()` over `input`.
+    RegExpStringIterator {
+        matcher: ObjectId,
+        input: String,
+        global: bool,
+        unicode: bool,
+        done: bool,
+    },
     /// A lazy iterator helper (`%IteratorPrototype%.map/take/chunks/...`).
     /// The state machine is stepped one `next()` call at a time by
     /// [`crate::runtime::builtins::iterator`].
@@ -1828,6 +1851,8 @@ pub struct Realm {
     dom_prototypes: BTreeMap<&'static str, ObjectId>,
     /// `%IteratorPrototype%` carrying the iterator-helper methods.
     iterator_prototype: ObjectId,
+    /// `%RegExpStringIteratorPrototype%`: the `next` of `matchAll`'s iterator.
+    regexp_string_iterator_prototype: ObjectId,
     /// `%GeneratorPrototype%`: `next`, `return` and `throw` of every generator.
     generator_prototype: ObjectId,
     /// `%AsyncGeneratorPrototype%` (ECMA-262 27.6.1).
@@ -2002,6 +2027,11 @@ impl Realm {
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
         let (iterator_prototype, iterator_helper_prototype) =
             Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
+        let regexp_string_iterator_prototype = Self::install_regexp_string_iterator(
+            &mut objects,
+            iterator_prototype,
+            function_prototype,
+        );
         let generator_prototype =
             Self::install_generator(&mut objects, function_prototype, iterator_prototype);
         let (
@@ -2643,6 +2673,7 @@ impl Realm {
             element_prototype,
             dom_prototypes,
             iterator_prototype,
+            regexp_string_iterator_prototype,
             generator_prototype,
             async_generator_prototype,
             async_generator_function_prototype,
@@ -4140,6 +4171,7 @@ impl Realm {
             | "toFixed"
             | "toPrecision"
             | "match"
+            | "matchAll"
             | "search"
             | "localeCompare"
             | "startsWith"
@@ -4839,6 +4871,7 @@ impl Realm {
             ("replace", NativeFunction::StrReplace),
             ("replaceAll", NativeFunction::StrReplaceAll),
             ("match", NativeFunction::StrMatch),
+            ("matchAll", NativeFunction::StrMatchAll),
             ("search", NativeFunction::StrSearch),
             ("concat", NativeFunction::StrConcat),
             ("toString", NativeFunction::StrToString),
@@ -4894,6 +4927,71 @@ impl Realm {
         );
     }
 
+    /// The `name` and `length` own properties of a built-in function whose
+    /// arity the name table cannot give (a symbol-keyed or a species method).
+    fn function_metadata(name: &str, length: f64) -> BTreeMap<String, PropertyDescriptor> {
+        let read_only = |value: JsValue| PropertyDescriptor {
+            getter: None,
+            setter: None,
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        };
+        BTreeMap::from([
+            ("length".to_owned(), read_only(JsValue::Number(length))),
+            (
+                "name".to_owned(),
+                read_only(JsValue::String(name.to_owned())),
+            ),
+        ])
+    }
+
+    /// `%RegExpStringIteratorPrototype%` (ECMA-262 22.2.9): its `next`, and the
+    /// `RegExp String Iterator` tag, over `%IteratorPrototype%`.
+    fn install_regexp_string_iterator(
+        objects: &mut Vec<JsObject>,
+        iterator_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(iterator_prototype),
+            ..JsObject::default()
+        });
+        let next = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::RegExpStringIteratorNext),
+            properties: Self::function_metadata("next", 0.0),
+            ..JsObject::default()
+        });
+        objects[prototype.0].properties.insert(
+            "next".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(next)),
+        );
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String("RegExp String Iterator".to_owned()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        prototype
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the RegExp intrinsics are installed together, in one place"
+    )]
     fn install_regexp(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -4945,6 +5043,7 @@ impl Realm {
             objects.push(JsObject {
                 prototype: Some(function_prototype),
                 host: ObjectHost::NativeFunction(NativeFunction::RegExpAccessor(accessor)),
+                properties: Self::function_metadata(&format!("get {name}"), 0.0),
                 ..JsObject::default()
             });
             objects[prototype.0].properties.insert(
@@ -4959,6 +5058,63 @@ impl Realm {
                 },
             );
         }
+        // ECMA-262 22.2.6.8-12: the Symbol protocol methods are keyed by the
+        // well-known symbols, and carry their `[Symbol.x]` names and arities.
+        for (symbol, function, arity) in [
+            ("@@match", NativeFunction::RegExpSymbolMatch, 1.0),
+            ("@@matchAll", NativeFunction::RegExpSymbolMatchAll, 1.0),
+            ("@@replace", NativeFunction::RegExpSymbolReplace, 2.0),
+            ("@@search", NativeFunction::RegExpSymbolSearch, 1.0),
+            ("@@split", NativeFunction::RegExpSymbolSplit, 2.0),
+        ] {
+            let method = ObjectId(objects.len());
+            let key = JsSymbol::well_known(symbol);
+            let display = format!("[Symbol.{}]", &symbol[2..]);
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                properties: Self::function_metadata(&display, arity),
+                ..JsObject::default()
+            });
+            objects[prototype.0].symbols.insert(
+                key.id(),
+                (key, PropertyDescriptor::builtin(JsValue::Object(method))),
+            );
+        }
+        let escape = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::RegExpEscape),
+            properties: Self::function_metadata("escape", 1.0),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "escape".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(escape)),
+        );
+        // ECMA-262 22.2.5.2: `get RegExp[@@species]` returns `this`.
+        let species_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::RegExpSpecies),
+            properties: Self::function_metadata("get [Symbol.species]", 0.0),
+            ..JsObject::default()
+        });
+        let species = JsSymbol::well_known("@@species");
+        objects[constructor.0].symbols.insert(
+            species.id(),
+            (
+                species,
+                PropertyDescriptor {
+                    getter: Some(species_getter),
+                    setter: None,
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
         objects[prototype.0].properties.insert(
             "lastIndex".to_owned(),
             PropertyDescriptor {
@@ -7087,6 +7243,7 @@ impl Realm {
         roots.push(self.async_generator_function_prototype);
         roots.push(self.async_from_sync_iterator_prototype);
         roots.push(self.iterator_helper_prototype);
+        roots.push(self.regexp_string_iterator_prototype);
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
         roots.push(self.storage_prototype);
@@ -7959,6 +8116,28 @@ impl Realm {
                 buffer,
                 start,
                 length,
+            },
+            ..JsObject::default()
+        })
+    }
+
+    /// A `%RegExpStringIterator%` over `input`, stepping `matcher` (ECMA-262
+    /// 22.2.9.1 `CreateRegExpStringIterator`).
+    pub(crate) fn regexp_string_iterator(
+        &mut self,
+        matcher: ObjectId,
+        input: String,
+        global: bool,
+        unicode: bool,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.regexp_string_iterator_prototype),
+            host: ObjectHost::RegExpStringIterator {
+                matcher,
+                input,
+                global,
+                unicode,
+                done: false,
             },
             ..JsObject::default()
         })

@@ -365,11 +365,11 @@ pub struct FetchOutcome {
     pub body: Vec<u8>,
 }
 
-/// A compiled regular expression plus its mutable `lastIndex` state.
+/// A compiled regular expression. `lastIndex` is an ordinary own property of
+/// the `RegExp` object, not state kept here.
 #[derive(Debug)]
 pub(super) struct RegexRecord {
-    pub(super) compiled: crate::regex::Compiled,
-    pub(super) last_index: usize,
+    pub(super) compiled: std::rc::Rc<crate::regex::Compiled>,
 }
 
 /// Severity of a buffered `console.*` message.

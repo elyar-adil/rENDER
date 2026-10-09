@@ -401,8 +401,9 @@ impl JsRuntime {
             }
             NativeFunction::StrSplit => self.string_split(dom, receiver, arguments),
             NativeFunction::StrReplace => self.string_replace(dom, receiver, arguments),
-            NativeFunction::StrMatch => self.string_match(receiver, arguments),
-            NativeFunction::StrSearch => self.string_search(receiver, arguments),
+            NativeFunction::StrMatch => self.string_match(dom, receiver, arguments),
+            NativeFunction::StrMatchAll => self.string_match_all(dom, receiver, arguments),
+            NativeFunction::StrSearch => self.string_search(dom, receiver, arguments),
             NativeFunction::StrConcat => self.string_concat(receiver, arguments),
             NativeFunction::StrToString => {
                 Ok(JsValue::String(self.require_string_object(receiver)?))
@@ -1281,7 +1282,15 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
-            NativeFunction::RegExpAccessor(_) => {
+            NativeFunction::RegExpAccessor(_)
+            | NativeFunction::RegExpSymbolMatch
+            | NativeFunction::RegExpSymbolMatchAll
+            | NativeFunction::RegExpSymbolReplace
+            | NativeFunction::RegExpSymbolSearch
+            | NativeFunction::RegExpSymbolSplit
+            | NativeFunction::RegExpStringIteratorNext
+            | NativeFunction::RegExpEscape
+            | NativeFunction::RegExpSpecies => {
                 self.dispatch_regexp_native(dom, function, receiver, arguments)
             }
             NativeFunction::RemoveAttribute => {

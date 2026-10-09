@@ -636,7 +636,9 @@ impl Lexer<'_> {
             let Some(character) = self.peek() else {
                 return Err(JsError::syntax("unterminated regex literal", start));
             };
-            if matches!(character, '\n' | '\r') {
+            // ECMA-262 12.9.5: a RegularExpressionChar is any SourceCharacter but
+            // a LineTerminator, and so is the character after a backslash.
+            if is_js_line_terminator(character) {
                 return Err(JsError::syntax("newline in regex literal", self.offset));
             }
             self.advance();
@@ -645,7 +647,7 @@ impl Lexer<'_> {
                     let Some(escaped) = self.peek() else {
                         return Err(JsError::syntax("unterminated regex escape", self.offset));
                     };
-                    if matches!(escaped, '\n' | '\r') {
+                    if is_js_line_terminator(escaped) {
                         return Err(JsError::syntax("newline in regex literal", self.offset));
                     }
                     self.advance();
@@ -1509,6 +1511,29 @@ mod tests {
         ] {
             assert!(tokens.iter().any(|token| token.kind == expected));
         }
+    }
+
+    #[test]
+    fn a_regex_literal_body_excludes_every_line_terminator() {
+        // ECMA-262 12.9.5: a RegularExpressionChar is a SourceCharacter but not a
+        // LineTerminator, and so is the character after a backslash. U+2028 and
+        // U+2029 are line terminators too, not only LF and CR.
+        for source in [
+            "/a\u{2028}b/",
+            "/a\u{2029}b/",
+            "/a\\\u{2028}b/",
+            "/a\\\u{2029}b/",
+            "/a\nb/",
+            "/a\\\rb/",
+        ] {
+            assert!(
+                tokenize(source, &RuntimeLimits::default()).is_err(),
+                "{source:?} must not tokenize as a regex literal"
+            );
+        }
+        // U+180E is not white space since Unicode 6.3, so it is a legal body
+        // character.
+        assert!(tokenize("/\u{180e}/", &RuntimeLimits::default()).is_ok());
     }
 
     #[test]
