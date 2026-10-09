@@ -171,3 +171,6 @@ $RECYCLE.BIN/
 # Regenerable measurement output from tools/css_corpus.rs over the gitignored .diag/ corpus.
 crates/render-css/examples/*_BEFORE.txt
 crates/render-css/examples/*_AFTER.txt
+
+# Local agent worktrees (per-session checkouts, not project files)
+.claude/worktrees/
