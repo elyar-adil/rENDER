@@ -1099,7 +1099,7 @@ impl Parser {
                 }
                 if next.after_newline && matches!(next.kind, TokenKind::Identifier(_)) {
                     self.advance();
-                    self.end_statement();
+                    self.end_statement()?;
                     return Ok(Statement::Expression(Expr::Identifier("let".to_owned())));
                 }
             }
@@ -1221,7 +1221,7 @@ impl Parser {
                 }
                 _ => {}
             }
-            self.end_statement();
+            self.end_statement()?;
             return Ok(Statement::Break(label));
         }
         if self.take(&TokenKind::Continue) {
@@ -1240,7 +1240,7 @@ impl Parser {
                 }
                 _ => {}
             }
-            self.end_statement();
+            self.end_statement()?;
             return Ok(Statement::Continue(label));
         }
         if self.take(&TokenKind::Try) {
@@ -1251,7 +1251,7 @@ impl Parser {
                 return Err(self.error("throw requires an expression"));
             }
             let value = self.expression()?;
-            self.end_statement();
+            self.end_statement()?;
             return Ok(Statement::Throw(value));
         }
         if self.take(&TokenKind::Return) {
@@ -1266,14 +1266,14 @@ impl Parser {
             } else {
                 Some(self.expression()?)
             };
-            self.end_statement();
+            self.end_statement()?;
             return Ok(Statement::Return(value));
         }
         if let Some(kind) = self.take_variable_kind() {
             return self.variable_declaration(kind, true);
         }
         let expression = self.expression()?;
-        self.end_statement();
+        self.end_statement()?;
         Ok(Statement::Expression(expression))
     }
 
@@ -1370,7 +1370,7 @@ impl Parser {
     fn import_declaration(&mut self) -> Result<(), JsError> {
         if matches!(self.current().kind, TokenKind::String(_)) {
             self.module_specifier()?;
-            self.end_statement();
+            self.end_statement()?;
             return Ok(());
         }
         // (imported, local) pairs, resolved against the specifier afterwards.
@@ -1380,7 +1380,7 @@ impl Parser {
             entries.push((ImportName::Named("default".to_owned()), local));
             if !self.take(&TokenKind::Comma) {
                 let request = self.expect_from()?;
-                self.finish_import(&request, entries);
+                self.finish_import(&request, entries)?;
                 return Ok(());
             }
         }
@@ -1410,12 +1410,16 @@ impl Parser {
             return Err(self.error("malformed import declaration"));
         }
         let request = self.expect_from()?;
-        self.finish_import(&request, entries);
+        self.finish_import(&request, entries)?;
         Ok(())
     }
 
-    fn finish_import(&mut self, request: &str, entries: Vec<(ImportName, String)>) {
-        self.end_statement();
+    fn finish_import(
+        &mut self,
+        request: &str,
+        entries: Vec<(ImportName, String)>,
+    ) -> Result<(), JsError> {
+        self.end_statement()?;
         for (imported, local) in entries {
             self.module_info().imports.push(ImportEntry {
                 request: request.to_owned(),
@@ -1423,6 +1427,7 @@ impl Parser {
                 local,
             });
         }
+        Ok(())
     }
 
     fn export_declaration(&mut self) -> Result<Statement, JsError> {
@@ -1434,7 +1439,7 @@ impl Parser {
                 None
             };
             let request = self.expect_from()?;
-            self.end_statement();
+            self.end_statement()?;
             match exported {
                 Some(exported) => self.module_info().indirect_exports.push(IndirectExport {
                     exported,
@@ -1476,7 +1481,7 @@ impl Parser {
                     self.module_info().local_exports.push((exported, local));
                 }
             }
-            self.end_statement();
+            self.end_statement()?;
             return Ok(Statement::Block(Vec::new()));
         }
         if self.take(&TokenKind::Default) {
@@ -1545,7 +1550,7 @@ impl Parser {
         // Anonymous function/class declarations and every other expression
         // are evaluated in place and bound to the hidden default binding.
         let value = self.assignment()?;
-        self.end_statement();
+        self.end_statement()?;
         self.module_info()
             .local_exports
             .push(("default".to_owned(), DEFAULT_BINDING.to_owned()));
@@ -1677,7 +1682,7 @@ impl Parser {
             }
         }
         if end_statement {
-            self.end_statement();
+            self.end_statement()?;
         }
         // A single plain name keeps the compact `Statement::Variable` shape,
         // which the for-loop head and several early-error checks match on.
@@ -3965,8 +3970,18 @@ impl Parser {
     /// Automatic semicolon insertion: accept the statement as terminated
     /// when no explicit separator is present. The recursive-descent
     /// structure ensures each statement consumes exactly its own tokens.
-    fn end_statement(&mut self) {
-        let _ = self.take(&TokenKind::Semicolon);
+    /// The end of a simple statement. A `;` ends it, and so does a position where
+    /// automatic semicolon insertion applies: before `}`, at the end of input, or
+    /// after a line break (ECMA-262 12.9.1).
+    fn end_statement(&mut self) -> Result<(), JsError> {
+        if self.take(&TokenKind::Semicolon)
+            || self.at(&TokenKind::RightBrace)
+            || self.at(&TokenKind::Eof)
+            || self.current().after_newline
+        {
+            return Ok(());
+        }
+        Err(self.error("expected ';' after statement"))
     }
 
     fn require(&mut self, expected: &TokenKind, message: &str) -> Result<(), JsError> {

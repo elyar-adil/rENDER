@@ -844,3 +844,18 @@ fn strict_class_code_refuses_reserved_identifier_references() {
         "ok"
     );
 }
+
+#[test]
+fn a_statement_ends_at_a_semicolon_a_brace_the_end_or_a_line_break() {
+    assert_early_syntax_errors(&[
+        "var x = 1 y;",
+        "var x = 1 var y = 2;",
+        "x = 1 y = 2",
+        "{ 1 2 }",
+        "throw 1 2;",
+    ]);
+    assert_eq!(ok("var x = 1\nvar y = 2; x + y"), "3");
+    assert_eq!(ok("var a = 1; var b = a\n++a; b"), "1");
+    assert_eq!(ok("var r = 0; do r++; while (r < 3) r"), "3");
+    assert_eq!(ok("var t = 0; { t = 5 } t"), "5");
+}
