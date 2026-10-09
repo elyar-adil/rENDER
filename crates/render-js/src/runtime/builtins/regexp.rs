@@ -159,18 +159,44 @@ impl JsRuntime {
             ("unicodeSets", 'v', RegExpAccessor::UnicodeSets),
             ("sticky", 'y', RegExpAccessor::Sticky),
         ] {
-            // The built-in getter answers exactly what `Get` would, so it is
-            // read directly; a patched or inherited getter is called.
-            let set = if self.is_intrinsic_regexp_getter(receiver, name, accessor) {
-                self.regexp_accessor(dom, receiver, accessor)?.is_truthy()
-            } else {
-                self.get_member(dom, receiver, name)?.is_truthy()
+            // The built-in getter answers exactly what `Get` would, so the flag
+            // is read from the record; a patched or inherited getter is called.
+            let set = match self.intrinsic_flag(receiver, name, accessor) {
+                Some(value) => value,
+                None => self.get_member(dom, receiver, name)?.is_truthy(),
             };
             if set {
                 text.push(letter);
             }
         }
         Ok(JsValue::String(text))
+    }
+
+    /// The flag `accessor` reads from `receiver`'s record, when `Get(receiver,
+    /// name)` would run the built-in getter (see [`Self::is_intrinsic_regexp_getter`]);
+    /// `None` when the getter may be patched and must be called.
+    fn intrinsic_flag(
+        &self,
+        receiver: ObjectId,
+        name: &str,
+        accessor: RegExpAccessor,
+    ) -> Option<bool> {
+        if !self.is_intrinsic_regexp_getter(receiver, name, accessor) {
+            return None;
+        }
+        let index = self.realm.regexp_index_of(receiver)?;
+        let flags = self.regexes[index].compiled.flags();
+        Some(match accessor {
+            RegExpAccessor::HasIndices => flags.has_indices,
+            RegExpAccessor::Global => flags.global,
+            RegExpAccessor::IgnoreCase => flags.ignore_case,
+            RegExpAccessor::Multiline => flags.multiline,
+            RegExpAccessor::DotAll => flags.dot_all,
+            RegExpAccessor::Unicode => flags.unicode && !flags.unicode_sets,
+            RegExpAccessor::UnicodeSets => flags.unicode_sets,
+            RegExpAccessor::Sticky => flags.sticky,
+            RegExpAccessor::Source | RegExpAccessor::Flags => return None,
+        })
     }
 
     /// Whether `Get(receiver, name)` would run the built-in `accessor` getter:
@@ -182,8 +208,8 @@ impl JsRuntime {
         name: &str,
         accessor: RegExpAccessor,
     ) -> bool {
-        if !matches!(self.realm.host(receiver), Some(ObjectHost::RegExp(_)))
-            || self.realm.own_property(receiver, name).is_some()
+        if self.realm.regexp_index_of(receiver).is_none()
+            || self.realm.has_own_string_key(receiver, name)
         {
             return false;
         }
@@ -191,16 +217,15 @@ impl JsRuntime {
         if self.realm.get_prototype(receiver) != Some(prototype) {
             return false;
         }
-        match self.realm.own_property(prototype, name) {
-            Some(descriptor) => descriptor.getter.is_some_and(|getter| {
+        self.realm
+            .own_getter(prototype, name)
+            .is_some_and(|getter| {
                 matches!(
                     self.realm.host(getter),
                     Some(ObjectHost::NativeFunction(NativeFunction::RegExpAccessor(found)))
                         if found == accessor
                 )
-            }),
-            None => false,
-        }
+            })
     }
 
     pub(in crate::runtime) fn regex_index(&self, object: ObjectId) -> Result<usize, JsError> {

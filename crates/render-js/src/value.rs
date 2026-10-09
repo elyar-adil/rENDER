@@ -7374,6 +7374,42 @@ impl Realm {
         None
     }
 
+    /// Whether `object` is a `RegExp`, and if so its record index. Reads the host
+    /// in place, without cloning it.
+    pub(crate) fn regexp_index_of(&self, object: ObjectId) -> Option<usize> {
+        match self.objects.get(object.0)?.host {
+            ObjectHost::RegExp(index) => Some(index),
+            _ => None,
+        }
+    }
+
+    /// The own property `key` of `object` when it is a data property: whether it
+    /// is writable. `None` for an accessor or an absent property. No descriptor
+    /// is cloned.
+    pub(crate) fn own_writable_data(&self, object: ObjectId, key: &str) -> Option<bool> {
+        let property = self.objects.get(object.0)?.properties.get(key)?;
+        (!property.is_accessor()).then_some(property.writable)
+    }
+
+    /// The getter of the own accessor `key` of `object`, or `None` when the
+    /// property is a data property, has no getter, or is absent. No descriptor
+    /// is cloned.
+    pub(crate) fn own_getter(&self, object: ObjectId, key: &str) -> Option<ObjectId> {
+        let property = self.objects.get(object.0)?.properties.get(key)?;
+        if property.is_accessor() {
+            property.getter
+        } else {
+            None
+        }
+    }
+
+    /// Whether `object` has an own property named `key`, without cloning it.
+    pub(crate) fn has_own_string_key(&self, object: ObjectId, key: &str) -> bool {
+        self.objects
+            .get(object.0)
+            .is_some_and(|target| target.properties.contains_key(key))
+    }
+
     pub(crate) fn own_property(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
         let target = self.objects.get(object.0)?;
         if let Some(descriptor) = target.properties.get(key) {

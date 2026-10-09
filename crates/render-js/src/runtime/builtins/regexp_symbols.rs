@@ -254,20 +254,18 @@ impl JsRuntime {
         key: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
-        if let Some(own) = self.realm.own_property(object, key)
-            && !own.is_accessor()
-        {
-            if !own.writable {
-                return Err(JsError::type_error(format!(
-                    "Cannot assign to read only property '{key}'"
-                )));
+        match self.realm.own_writable_data(object, key) {
+            Some(false) => Err(JsError::type_error(format!(
+                "Cannot assign to read only property '{key}'"
+            ))),
+            Some(true) => {
+                // An own writable data property of a RegExp is written in place:
+                // the host-specific `[[Set]]` arms do not apply to it.
+                self.realm.set_property(object, key.to_owned(), value);
+                Ok(())
             }
-            // An own writable data property of a RegExp is written in place:
-            // the host-specific `[[Set]]` arms do not apply to it.
-            self.realm.set_property(object, key.to_owned(), value);
-            return Ok(());
+            None => self.set_member(dom, object, key, value),
         }
-        self.set_member(dom, object, key, value)
     }
 
     /// `RegExpBuiltinExec`'s matching half (§22.2.7.2 steps 4-14): reads and

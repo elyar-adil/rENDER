@@ -2445,8 +2445,10 @@ impl JsRuntime {
         value: &JsValue,
     ) -> Result<String, JsError> {
         let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?;
-        if std::env::var_os("RENDER_TRACE_STRING").is_some()
-            && let JsValue::Object(object) = value
+        // The trace is for objects only, so a primitive does not pay for an
+        // environment lookup on every conversion.
+        if let JsValue::Object(object) = value
+            && std::env::var_os("RENDER_TRACE_STRING").is_some()
         {
             let tag = self
                 .realm

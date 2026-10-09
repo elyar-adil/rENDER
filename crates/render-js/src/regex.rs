@@ -200,6 +200,15 @@ enum Node {
     AnchorStart,
     AnchorEnd,
     WordBoundary(bool),
+    /// `(?ims-ims:…)`: the body matches with each named modifier set or cleared
+    /// (`Some`), and leaves the flags in effect around the group alone (`None`).
+    /// The continuation after the group runs under the flags around it again.
+    Modifiers {
+        ignore_case: Option<bool>,
+        multiline: Option<bool>,
+        dot_all: Option<bool>,
+        body: Box<Node>,
+    },
 }
 
 /// A compiled pattern ready to be matched against inputs.
@@ -411,6 +420,33 @@ impl Matcher<'_> {
                     }
                 }
                 None
+            }
+            Node::Modifiers {
+                ignore_case,
+                multiline,
+                dot_all,
+                body,
+            } => {
+                let outer = self.flags;
+                let mut inner = outer;
+                if let Some(value) = ignore_case {
+                    inner.ignore_case = *value;
+                }
+                if let Some(value) = multiline {
+                    inner.multiline = *value;
+                }
+                if let Some(value) = dot_all {
+                    inner.dot_all = *value;
+                }
+                self.flags = inner;
+                let matched = self.node(body, position, &mut |matcher, end_position| {
+                    matcher.flags = outer;
+                    let result = next(matcher, end_position);
+                    matcher.flags = inner;
+                    result
+                });
+                self.flags = outer;
+                matched
             }
             Node::Group { index, body } => match index {
                 None => self.node(body, position, next),
@@ -1371,7 +1407,7 @@ impl PatternParser<'_> {
                 }
                 Some('i' | 'm' | 's' | '-') => {
                     self.cursor -= 1;
-                    return self.modifier_group();
+                    return self.modifier_group(top_level);
                 }
                 _ => {
                     return Err(RegexSyntaxError::new("invalid group modifier".to_owned()));
@@ -1391,11 +1427,11 @@ impl PatternParser<'_> {
         })
     }
 
-    /// `(?ims-ims:…)`: the modifiers proposal's group. Malformed modifier syntax
-    /// (an unknown or repeated letter, a letter both added and removed, or an
-    /// empty `(?-:`) is an early error. Well-formed modifiers are valid
-    /// ECMAScript this engine does not implement, so they are deferred.
-    fn modifier_group(&mut self) -> Result<Node, RegexSyntaxError> {
+    /// `(?ims-ims:…)`: the modifiers group of ECMA-262 22.2.2.1 (the `RegExp`
+    /// modifiers proposal). Malformed modifier syntax (an unknown or repeated
+    /// letter, a letter both added and removed, or an empty `(?-:`) is an early
+    /// error.
+    fn modifier_group(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
         let mut add = String::new();
         while let Some(letter @ ('i' | 'm' | 's')) = self.peek() {
             self.cursor += 1;
@@ -1425,9 +1461,26 @@ impl PatternParser<'_> {
         {
             return Err(RegexSyntaxError::new("invalid group modifier".to_owned()));
         }
-        Err(RegexSyntaxError::unsupported(
-            "regular expression modifiers are not implemented".to_owned(),
-        ))
+        let setting = |letter: char| {
+            if add.contains(letter) {
+                Some(true)
+            } else if remove.contains(letter) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        let (ignore_case, multiline, dot_all) = (setting('i'), setting('m'), setting('s'));
+        let body = self.alternative(top_level)?;
+        if !self.eat(')') {
+            return Err(RegexSyntaxError::new("unterminated group".to_owned()));
+        }
+        Ok(Node::Modifiers {
+            ignore_case,
+            multiline,
+            dot_all,
+            body: Box::new(body),
+        })
     }
 
     fn class(&mut self) -> Result<Node, RegexSyntaxError> {
@@ -1910,6 +1963,27 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn modifier_groups_change_flags_for_their_body_only() {
+        // `(?i:…)` makes case folding local to the group, and the continuation
+        // after the group reads the flags around it again.
+        assert!(matches("(?i:a)b", "", "Ab").is_some());
+        assert!(matches("(?i:a)b", "", "AB").is_none());
+        // A removal inside an `i` pattern is local too.
+        assert!(matches("a(?-i:b)", "i", "Ab").is_some());
+        assert!(matches("a(?-i:b)", "i", "AB").is_none());
+        // `s` and `m` change `.` and the anchors for their body alone.
+        assert!(matches("(?s:.)", "", "\n").is_some());
+        assert!(matches(".", "", "\n").is_none());
+        assert!(matches("(?m:^b)", "", "a\nb").is_some());
+        assert!(matches("^b", "", "a\nb").is_none());
+        // Malformed modifiers are early errors.
+        for pattern in ["(?ii:a)", "(?-:a)", "(?i-i:a)", "(?x:a)"] {
+            let error = compile(pattern, "").expect_err(pattern);
+            assert!(!error.unsupported, "{pattern} must be a syntax error");
+        }
     }
 
     #[test]
