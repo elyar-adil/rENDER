@@ -1600,8 +1600,8 @@ fn object_statics_and_reflect_share_one_to_object() {
                 results.push(Object.getOwnPropertySymbols(Symbol('a')).length === 0);
                 var frozen = Object.freeze(1);
                 results.push(frozen instanceof Number && Object.isFrozen(frozen));
-                results.push(typeof Object.defineProperty(1, 'x', { value: 1 }));
-                results.push(Object.getOwnPropertyNames(Object.defineProperty(1, 'x', { value: 1 })).join(','));
+                // §20.1.2.4 step 1: a primitive target is a TypeError, not a ToObject.
+                results.push(thrown(function () { Object.defineProperty(1, 'x', { value: 1 }); }));
                 var target = Object.assign(1, { a: 2 });
                 results.push([target instanceof Number, target.a, Object.keys(target).join(',')].join('/'));
                 // Integrity queries on a nullish target.
@@ -1624,7 +1624,7 @@ fn object_statics_and_reflect_share_one_to_object() {
     assert_eq!(
         outcome.value,
         JsValue::String(
-            "true,true,true,true,true,0,1,length,true,true,true,true,true,true,true,true,true,true,object,x,true/2/a,true,true,true,true,true,true,true,true"
+            "true,true,true,true,true,0,1,length,true,true,true,true,true,true,true,true,true,true,true,true/2/a,true,true,true,true,true,true,true,true"
                 .to_owned()
         )
     );

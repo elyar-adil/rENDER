@@ -266,19 +266,39 @@ fn same_value(left: &JsValue, right: &JsValue) -> bool {
     }
 }
 
-/// Whether a redefinition request is a no-op against the current descriptor,
-/// which makes it legal even for a non-configurable property.
-fn descriptors_are_identical(current: &PropertyDescriptor, next: &PropertyDescriptor) -> bool {
-    if current.writable != next.writable
-        || current.enumerable != next.enumerable
-        || current.configurable != next.configurable
-        || current.getter != next.getter
-        || current.setter != next.setter
-        || current.is_accessor() != next.is_accessor()
+/// ECMA-262 `CanonicalNumericIndexString` (§7.1.21): `-0`, and any string that
+/// `ToString` of its own `ToNumber` reproduces exactly (so `"1.5"` qualifies and
+/// `"1.50"` does not). Returns the number the key names.
+pub(crate) fn canonical_numeric_key(key: &str) -> Option<f64> {
+    if key == "-0" {
+        return Some(-0.0);
+    }
+    let number: f64 = key.parse().ok()?;
+    (JsValue::Number(number).to_js_string() == key).then_some(number)
+}
+
+/// ECMA-262 `ValidateAndApplyPropertyDescriptor` (§10.1.6.3) for a property
+/// that is not configurable. The redefinition must stay non-configurable and
+/// keep enumerability and kind. An accessor keeps its functions. A data
+/// property that is not writable keeps its value and stays non-writable, and a
+/// writable one may take a new value or lose writability.
+fn non_configurable_redefinition_allowed(
+    current: &PropertyDescriptor,
+    next: &PropertyDescriptor,
+) -> bool {
+    if next.configurable
+        || next.enumerable != current.enumerable
+        || next.is_accessor() != current.is_accessor()
     {
         return false;
     }
-    current.is_accessor() || same_value(&current.value, &next.value)
+    if current.is_accessor() {
+        return next.getter == current.getter && next.setter == current.setter;
+    }
+    if current.writable {
+        return true;
+    }
+    !next.writable && same_value(&current.value, &next.value)
 }
 
 /// ECMA-262 §6.1.7 `CanonicalNumericIndexString`: a property key is a
@@ -772,6 +792,34 @@ pub(crate) enum NativeFunction {
     /// `%TypedArray%.prototype.values`, which the specification also installs
     /// as `%TypedArray%.prototype[@@iterator]`.
     TypedArrayValues,
+    /// `%TypedArray%` itself, the abstract constructor that throws when it is
+    /// called or constructed.
+    TypedArrayIntrinsic,
+    TypedArrayOf,
+    TypedArrayKeys,
+    TypedArrayEntries,
+    TypedArrayAt,
+    TypedArrayCopyWithin,
+    TypedArrayEvery,
+    TypedArraySome,
+    TypedArrayFind,
+    TypedArrayFindIndex,
+    TypedArrayFindLast,
+    TypedArrayFindLastIndex,
+    TypedArrayLastIndexOf,
+    TypedArrayReduce,
+    TypedArrayReduceRight,
+    TypedArrayReverse,
+    TypedArraySort,
+    TypedArrayToReversed,
+    TypedArrayToSorted,
+    TypedArrayWith,
+    /// The `length`, `byteLength`, `byteOffset` and `@@toStringTag` accessors of
+    /// `%TypedArray%.prototype`.
+    TypedArrayLengthGetter,
+    TypedArrayByteLengthGetter,
+    TypedArrayByteOffsetGetter,
+    TypedArrayToStringTagGetter,
     PromiseAll,
     PromiseAllSettled,
     PromiseAny,
@@ -862,7 +910,16 @@ pub(crate) enum NativeFunction {
     DataViewSetUint32,
     DataViewSetFloat32,
     DataViewSetFloat64,
+    DataViewGetFloat16,
+    DataViewSetFloat16,
+    /// `DataView.prototype.buffer`, `byteLength` and `byteOffset`: accessors on
+    /// the prototype, not own data properties of each view.
+    DataViewBufferGetter,
+    DataViewByteLengthGetter,
+    DataViewByteOffsetGetter,
     ArrayBufferSlice,
+    /// `ArrayBuffer.prototype.byteLength`, an accessor on the prototype.
+    ArrayBufferByteLengthGetter,
     GlobalStructuredClone,
     VideoPlay,
     VideoPause,
@@ -1351,6 +1408,9 @@ pub(crate) enum ObjectHost {
     /// big-endian.
     DataView {
         buffer: TypedBuffer,
+        /// The `ArrayBuffer` object the view was built on, which the `buffer`
+        /// getter returns by identity.
+        buffer_object: ObjectId,
         /// Byte offset of the view within the shared buffer.
         byte_offset: usize,
         /// Byte length of the view.
@@ -2954,9 +3014,10 @@ impl Realm {
         }
     }
 
-    /// Install the typed-array family (`Int8Array` through `Float64Array`)
-    /// with constructor forms, prototype methods, and `BYTES_PER_ELEMENT`
-    /// constants.
+    /// Install the typed-array family (ECMA-262 23.2): `%TypedArray%`, the
+    /// abstract constructor whose prototype holds the methods and accessors every
+    /// concrete typed array shares, and the concrete constructors (`Int8Array`
+    /// through `Float64Array`), which inherit from it.
     #[allow(
         clippy::too_many_lines,
         reason = "bootstrap tables read best as a single listing"
@@ -2967,48 +3028,153 @@ impl Realm {
         object_prototype: ObjectId,
         function_prototype: ObjectId,
     ) {
+        // §23.2.3: `%TypedArray%.prototype`, which the concrete prototypes inherit.
+        let intrinsic_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        // §23.2.1: `%TypedArray%`, which is not directly constructable.
+        let intrinsic = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::TypedArrayIntrinsic),
+            ..JsObject::default()
+        });
+        objects[intrinsic.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(intrinsic_prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[intrinsic.0].properties.insert(
+            "name".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::String("TypedArray".to_owned()),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        Self::install_length(objects, intrinsic, 0.0);
+        objects[intrinsic_prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(intrinsic)),
+        );
+        // §23.2.2.1 and §23.2.2.2: `%TypedArray%.from` and `%TypedArray%.of`.
+        for (name, function, arity) in [
+            ("from", NativeFunction::TypedArrayFrom, 1.0),
+            ("of", NativeFunction::TypedArrayOf, 0.0),
+        ] {
+            let method = Self::install_native_method(objects, function_prototype, function, arity);
+            objects[intrinsic.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        // §23.2.3: the prototype methods, with their `length`s.
+        let methods: &[(&str, NativeFunction, f64)] = &[
+            ("at", NativeFunction::TypedArrayAt, 1.0),
+            ("copyWithin", NativeFunction::TypedArrayCopyWithin, 2.0),
+            ("entries", NativeFunction::TypedArrayEntries, 0.0),
+            ("every", NativeFunction::TypedArrayEvery, 1.0),
+            ("fill", NativeFunction::TypedArrayFill, 1.0),
+            ("filter", NativeFunction::TypedArrayFilter, 1.0),
+            ("find", NativeFunction::TypedArrayFind, 1.0),
+            ("findIndex", NativeFunction::TypedArrayFindIndex, 1.0),
+            ("findLast", NativeFunction::TypedArrayFindLast, 1.0),
+            (
+                "findLastIndex",
+                NativeFunction::TypedArrayFindLastIndex,
+                1.0,
+            ),
+            ("forEach", NativeFunction::TypedArrayForEach, 1.0),
+            ("includes", NativeFunction::TypedArrayIncludes, 1.0),
+            ("indexOf", NativeFunction::TypedArrayIndexOf, 1.0),
+            ("join", NativeFunction::TypedArrayJoin, 1.0),
+            ("keys", NativeFunction::TypedArrayKeys, 0.0),
+            ("lastIndexOf", NativeFunction::TypedArrayLastIndexOf, 1.0),
+            ("map", NativeFunction::TypedArrayMap, 1.0),
+            ("reduce", NativeFunction::TypedArrayReduce, 1.0),
+            ("reduceRight", NativeFunction::TypedArrayReduceRight, 1.0),
+            ("reverse", NativeFunction::TypedArrayReverse, 0.0),
+            ("set", NativeFunction::TypedArraySet, 1.0),
+            ("slice", NativeFunction::TypedArraySlice, 2.0),
+            ("some", NativeFunction::TypedArraySome, 1.0),
+            ("sort", NativeFunction::TypedArraySort, 1.0),
+            ("subarray", NativeFunction::TypedArraySubarray, 2.0),
+            ("toReversed", NativeFunction::TypedArrayToReversed, 0.0),
+            ("toSorted", NativeFunction::TypedArrayToSorted, 1.0),
+            ("toString", NativeFunction::TypedArrayJoin, 0.0),
+            ("values", NativeFunction::TypedArrayValues, 0.0),
+            ("with", NativeFunction::TypedArrayWith, 2.0),
+        ];
+        let mut values_method = None;
+        for &(name, function, arity) in methods {
+            let method = Self::install_native_method(objects, function_prototype, function, arity);
+            objects[intrinsic_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+            if name == "values" {
+                values_method = Some(method);
+            }
+        }
+        // §23.2.3.33: `%TypedArray%.prototype[@@iterator]` is the `values` function.
+        if let Some(values) = values_method {
+            let symbol = JsSymbol::well_known("@@iterator");
+            objects[intrinsic_prototype.0].symbols.insert(
+                symbol.id(),
+                (symbol, PropertyDescriptor::builtin(JsValue::Object(values))),
+            );
+        }
+        // §23.2.3.3, §23.2.3.19 and §23.2.3.23: the `length`, `byteLength` and
+        // `byteOffset` accessors.
+        Self::install_getters(
+            objects,
+            function_prototype,
+            intrinsic_prototype,
+            &[
+                ("length", NativeFunction::TypedArrayLengthGetter),
+                ("byteLength", NativeFunction::TypedArrayByteLengthGetter),
+                ("byteOffset", NativeFunction::TypedArrayByteOffsetGetter),
+            ],
+        );
+        // §23.2.3.32: `@@toStringTag` is an accessor that names the element kind.
+        let tag_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::TypedArrayToStringTagGetter),
+            ..JsObject::default()
+        });
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[intrinsic_prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(tag_getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
         for kind in TypedArrayKind::ALL {
             let prototype = ObjectId(objects.len());
             objects.push(JsObject {
-                prototype: Some(object_prototype),
+                prototype: Some(intrinsic_prototype),
                 ..JsObject::default()
             });
-            let methods: &[(&str, NativeFunction)] = &[
-                ("set", NativeFunction::TypedArraySet),
-                ("subarray", NativeFunction::TypedArraySubarray),
-                ("slice", NativeFunction::TypedArraySlice),
-                ("fill", NativeFunction::TypedArrayFill),
-                ("indexOf", NativeFunction::TypedArrayIndexOf),
-                ("includes", NativeFunction::TypedArrayIncludes),
-                ("join", NativeFunction::TypedArrayJoin),
-                ("toString", NativeFunction::TypedArrayJoin),
-                ("forEach", NativeFunction::TypedArrayForEach),
-                ("map", NativeFunction::TypedArrayMap),
-                ("filter", NativeFunction::TypedArrayFilter),
-                ("values", NativeFunction::TypedArrayValues),
-            ];
-            for &(method_name, function) in methods {
-                let method = ObjectId(objects.len());
-                objects.push(JsObject {
-                    prototype: Some(function_prototype),
-                    host: ObjectHost::NativeFunction(function),
-                    ..JsObject::default()
-                });
-                objects[prototype.0].properties.insert(
-                    method_name.to_owned(),
-                    PropertyDescriptor::builtin(JsValue::Object(method)),
-                );
-                // `%TypedArray%.prototype[@@iterator]` is the same function
-                // object as `values`, so spread, `for...of` and array
-                // destructuring all walk a typed array through one iterator.
-                if method_name == "values" {
-                    let symbol = JsSymbol::well_known("@@iterator");
-                    objects[prototype.0].symbols.insert(
-                        symbol.id(),
-                        (symbol, PropertyDescriptor::builtin(JsValue::Object(method))),
-                    );
-                }
-            }
             #[allow(
                 clippy::cast_precision_loss,
                 reason = "element sizes are tiny integers"
@@ -3027,7 +3193,7 @@ impl Realm {
             );
             let constructor = ObjectId(objects.len());
             objects.push(JsObject {
-                prototype: Some(function_prototype),
+                prototype: Some(intrinsic),
                 host: ObjectHost::TypedArrayConstructor(kind),
                 ..JsObject::default()
             });
@@ -3053,16 +3219,8 @@ impl Realm {
                     configurable: false,
                 },
             );
-            let from = ObjectId(objects.len());
-            objects.push(JsObject {
-                prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(NativeFunction::TypedArrayFrom),
-                ..JsObject::default()
-            });
-            objects[constructor.0].properties.insert(
-                "from".to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(from)),
-            );
+            // §23.2.5.1: every concrete constructor declares three parameters.
+            Self::install_length(objects, constructor, 3.0);
             objects[prototype.0].properties.insert(
                 "constructor".to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(constructor)),
@@ -3081,6 +3239,23 @@ impl Realm {
         }
     }
 
+    /// A built-in method object with an explicit `length`.
+    fn install_native_method(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        function: NativeFunction,
+        arity: f64,
+    ) -> ObjectId {
+        let method = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(function),
+            ..JsObject::default()
+        });
+        Self::install_length(objects, method, arity);
+        method
+    }
+
     /// Install an interface whose instances carry an `ObjectHost` state, with
     /// the given prototype methods and a `Symbol.toStringTag` naming the host.
     /// Shared by `DataView` and `TextDecoder`.
@@ -3094,7 +3269,7 @@ impl Realm {
         constructor_host: ObjectHost,
         methods: &[(&str, NativeFunction)],
         tag: &str,
-    ) {
+    ) -> (ObjectId, ObjectId) {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -3147,6 +3322,35 @@ impl Realm {
                 configurable: true,
             },
         );
+        (prototype, constructor)
+    }
+
+    /// Install accessor properties with getter-only functions on `target`.
+    fn install_getters(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        target: ObjectId,
+        getters: &[(&str, NativeFunction)],
+    ) {
+        for &(name, getter) in getters {
+            let accessor = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(getter),
+                ..JsObject::default()
+            });
+            objects[target.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(accessor),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
     }
 
     /// `TextEncoder`, `TextDecoder` (Encoding Standard) and `DataView`
@@ -3167,7 +3371,7 @@ impl Realm {
         // `ArrayBuffer` comes first because it is the buffer every binary
         // format constructs a `DataView` over, and a `DataView` a script cannot
         // build is a global that exists and cannot be used.
-        Self::install_host_interface(
+        let (array_buffer_prototype, array_buffer_constructor) = Self::install_host_interface(
             objects,
             global,
             object_prototype,
@@ -3177,6 +3381,16 @@ impl Realm {
             &[("slice", NativeFunction::ArrayBufferSlice)],
             "ArrayBuffer",
         );
+        Self::install_getters(
+            objects,
+            function_prototype,
+            array_buffer_prototype,
+            &[("byteLength", NativeFunction::ArrayBufferByteLengthGetter)],
+        );
+        // §25.1.4.1 and §25.2.2.1: `ArrayBuffer(length)` and
+        // `DataView(buffer [, byteOffset [, byteLength]])` both have a `length`
+        // of 1.
+        Self::install_length(objects, array_buffer_constructor, 1.0);
 
         let encoder_prototype = ObjectId(objects.len());
         objects.push(JsObject {
@@ -3283,7 +3497,7 @@ impl Realm {
             },
         );
 
-        Self::install_host_interface(
+        let (data_view_prototype, data_view_constructor) = Self::install_host_interface(
             objects,
             global,
             object_prototype,
@@ -3298,6 +3512,7 @@ impl Realm {
                 ("getInt32", NativeFunction::DataViewGetInt32),
                 ("getUint32", NativeFunction::DataViewGetUint32),
                 ("getFloat32", NativeFunction::DataViewGetFloat32),
+                ("getFloat16", NativeFunction::DataViewGetFloat16),
                 ("getFloat64", NativeFunction::DataViewGetFloat64),
                 ("setInt8", NativeFunction::DataViewSetInt8),
                 ("setUint8", NativeFunction::DataViewSetUint8),
@@ -3305,10 +3520,38 @@ impl Realm {
                 ("setUint16", NativeFunction::DataViewSetUint16),
                 ("setInt32", NativeFunction::DataViewSetInt32),
                 ("setUint32", NativeFunction::DataViewSetUint32),
+                ("setFloat16", NativeFunction::DataViewSetFloat16),
                 ("setFloat32", NativeFunction::DataViewSetFloat32),
                 ("setFloat64", NativeFunction::DataViewSetFloat64),
             ],
             "DataView",
+        );
+        Self::install_getters(
+            objects,
+            function_prototype,
+            data_view_prototype,
+            &[
+                ("buffer", NativeFunction::DataViewBufferGetter),
+                ("byteLength", NativeFunction::DataViewByteLengthGetter),
+                ("byteOffset", NativeFunction::DataViewByteOffsetGetter),
+            ],
+        );
+        Self::install_length(objects, data_view_constructor, 1.0);
+    }
+
+    /// Give a built-in constructor or function its `length` own property
+    /// (non-writable, non-enumerable, configurable).
+    fn install_length(objects: &mut [JsObject], function: ObjectId, length: f64) {
+        objects[function.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Number(length),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
         );
     }
 
@@ -3676,7 +3919,6 @@ impl Realm {
             | "isSealed"
             | "isExtensible"
             | "getOwnPropertyNames"
-            | "setPrototypeOf"
             | "trim"
             | "trimStart"
             | "trimEnd"
@@ -3685,6 +3927,16 @@ impl Realm {
             | "ceil" | "clz32" | "cos" | "cosh" | "exp" | "expm1" | "floor" | "fround"
             | "log" | "log1p" | "log10" | "log2" | "round" | "sign" | "sin" | "sinh"
             | "sqrt" | "tan" | "tanh" | "trunc" => 1,
+            // DataView accessors (ECMA-262 25.2.4): a getter takes the request
+            // index, and a setter takes the index and the value.
+            "getInt8" | "getUint8" | "getInt16" | "getUint16" | "getInt32" | "getUint32"
+            | "getFloat16" | "getFloat32" | "getFloat64" => 1,
+            "setInt8" | "setUint8" | "setInt16" | "setUint16" | "setInt32" | "setUint32"
+            | "setFloat16" | "setFloat32" | "setFloat64" => 2,
+            // Array, String and Object members whose `length` is one (ECMA-262
+            // 23.1.3.1, 22.1.3.1, 20.1.2.x and B.2.2.x).
+            "concat" | "unshift" | "join" | "fromEntries" | "__lookupGetter__"
+            | "__lookupSetter__" => 1,
             // Math (ECMA-262 21.3.2): two arguments.
             "atan2" | "hypot" | "imul" | "max" | "min" | "pow" => 2,
             "then"
@@ -3702,7 +3954,14 @@ impl Realm {
             | "padEnd"
             | "parseInt"
             | "assign"
-            | "getOwnPropertyDescriptor" => 2,
+            | "getOwnPropertyDescriptor"
+            | "setPrototypeOf"
+            | "copyWithin"
+            | "hasOwn"
+            | "__defineGetter__"
+            | "__defineSetter__"
+            | "groupBy"
+            | "is" => 2,
             "defineProperty" => 3,
             "construct" => 2,
             "toString" | "valueOf" | "toISOString" | "toJSON" | "toUTCString" | "toDateString"
@@ -6203,11 +6462,9 @@ impl Realm {
             return false;
         }
         if let Some(current) = target.properties.get(&key) {
-            if !current.configurable {
-                // ECMA-262 `ValidateAndApplyPropertyDescriptor`: redefining a
-                // non-configurable property is allowed when every field
-                // already matches (the write is a no-op).
-                return descriptors_are_identical(current, &descriptor);
+            if !current.configurable && !non_configurable_redefinition_allowed(current, &descriptor)
+            {
+                return false;
             }
         } else if !target.extensible {
             return false;
@@ -6644,8 +6901,9 @@ impl Realm {
 
     /// Create or overwrite an own symbol-keyed property, honouring
     /// non-configurable descriptors and object extensibility. A
-    /// non-configurable property accepts only a no-op redefinition, exactly
-    /// like the string-keyed `define_property`.
+    /// non-configurable property accepts only the redefinitions that
+    /// `ValidateAndApplyPropertyDescriptor` allows, exactly like the
+    /// string-keyed `define_property`.
     pub(crate) fn define_symbol_property(
         &mut self,
         object: ObjectId,
@@ -6656,8 +6914,9 @@ impl Realm {
             return false;
         };
         if let Some((_, current)) = target.symbols.get(&symbol.id()) {
-            if !current.configurable {
-                return descriptors_are_identical(current, &descriptor);
+            if !current.configurable && !non_configurable_redefinition_allowed(current, &descriptor)
+            {
+                return false;
             }
         } else if !target.extensible {
             return false;
@@ -7216,9 +7475,10 @@ impl Realm {
         })
     }
 
-    /// Create one typed-array view object. `length` is an own, non-writable,
-    /// non-enumerable property per the integer-indexed exotic object contract;
-    /// indexed elements are synthesized from the shared buffer on read.
+    /// Create one typed-array view object. Its `length`, `byteLength` and
+    /// `byteOffset` are accessors on `%TypedArray%.prototype` that read the host
+    /// state, so the instance carries no own properties for them; indexed
+    /// elements are synthesized from the shared buffer on read.
     pub(crate) fn typed_array(
         &mut self,
         kind: TypedArrayKind,
@@ -7227,7 +7487,7 @@ impl Realm {
         length: usize,
         prototype: Option<ObjectId>,
     ) -> ObjectId {
-        let object = self.allocate(JsObject {
+        self.allocate(JsObject {
             prototype,
             host: ObjectHost::TypedArray {
                 kind,
@@ -7236,42 +7496,7 @@ impl Realm {
                 length,
             },
             ..JsObject::default()
-        });
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "typed-array lengths stay far below any precision boundary"
-        )]
-        let length_value = length as f64;
-        self.objects[object.0].properties.insert(
-            "length".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Number(length_value),
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-        // `byteLength` is `length * BYTES_PER_ELEMENT`, which is what binary
-        // format code reads before sizing a `DataView`.
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "byte counts stay far below any precision boundary"
-        )]
-        let byte_length = (length * kind.element_size()) as f64;
-        self.objects[object.0].properties.insert(
-            "byteLength".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Number(byte_length),
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-        object
+        })
     }
 
     pub(crate) fn collection_iterator(&mut self, values: Vec<JsValue>) -> ObjectId {

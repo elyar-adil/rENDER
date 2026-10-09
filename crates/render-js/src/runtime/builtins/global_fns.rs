@@ -214,7 +214,13 @@ impl JsRuntime {
             | NativeFunction::DataViewSetUint32
             | NativeFunction::DataViewSetFloat32
             | NativeFunction::DataViewSetFloat64
-            | NativeFunction::ArrayBufferSlice => {
+            | NativeFunction::DataViewGetFloat16
+            | NativeFunction::DataViewSetFloat16
+            | NativeFunction::DataViewBufferGetter
+            | NativeFunction::DataViewByteLengthGetter
+            | NativeFunction::DataViewByteOffsetGetter
+            | NativeFunction::ArrayBufferSlice
+            | NativeFunction::ArrayBufferByteLengthGetter => {
                 self.dispatch_encoding_native(dom, function, receiver, arguments)
             }
             NativeFunction::GlobalStructuredClone => {
@@ -1405,6 +1411,32 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::TypedArrayIntrinsic
+            | NativeFunction::TypedArrayOf
+            | NativeFunction::TypedArrayKeys
+            | NativeFunction::TypedArrayEntries
+            | NativeFunction::TypedArrayAt
+            | NativeFunction::TypedArrayCopyWithin
+            | NativeFunction::TypedArrayEvery
+            | NativeFunction::TypedArraySome
+            | NativeFunction::TypedArrayFind
+            | NativeFunction::TypedArrayFindIndex
+            | NativeFunction::TypedArrayFindLast
+            | NativeFunction::TypedArrayFindLastIndex
+            | NativeFunction::TypedArrayLastIndexOf
+            | NativeFunction::TypedArrayReduce
+            | NativeFunction::TypedArrayReduceRight
+            | NativeFunction::TypedArrayReverse
+            | NativeFunction::TypedArraySort
+            | NativeFunction::TypedArrayToReversed
+            | NativeFunction::TypedArrayToSorted
+            | NativeFunction::TypedArrayWith
+            | NativeFunction::TypedArrayLengthGetter
+            | NativeFunction::TypedArrayByteLengthGetter
+            | NativeFunction::TypedArrayByteOffsetGetter
+            | NativeFunction::TypedArrayToStringTagGetter => {
+                self.dispatch_typed_array_native(dom, function, receiver, arguments)
+            }
             NativeFunction::UrlSearchParamsAppend => self.dispatch_url_native(
                 dom,
                 NativeFunction::UrlSearchParamsAppend,

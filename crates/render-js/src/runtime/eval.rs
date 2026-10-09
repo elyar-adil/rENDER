@@ -4037,14 +4037,31 @@ impl JsRuntime {
                     )]
                     return Ok(JsValue::Number(kind.element_size() as f64));
                 }
-                if let Ok(index) = property.parse::<usize>() {
-                    if index >= length {
-                        return Ok(JsValue::Undefined);
-                    }
-                    let element = buffer.0.borrow().get(start + index).copied();
+                // §10.4.5.4 [[Get]]: a canonical numeric key is an element read,
+                // and one that is not a valid integer index reads as undefined
+                // without consulting the prototype chain. Any other key is a
+                // method or property access.
+                if let Some(number) = crate::value::canonical_numeric_key(property) {
+                    #[allow(
+                        clippy::cast_precision_loss,
+                        reason = "typed-array lengths stay far below any precision boundary"
+                    )]
+                    let in_range = number.is_sign_positive()
+                        && number.fract() == 0.0
+                        && number < length as f64;
+                    let element = if in_range {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "the index is a non-negative integer below the length"
+                        )]
+                        let index = number as usize;
+                        buffer.0.borrow().get(start + index).copied()
+                    } else {
+                        None
+                    };
                     return Ok(element.map_or(JsValue::Undefined, JsValue::Number));
                 }
-                // Method access falls through to the inherited-prototype path.
             }
             Some(ObjectHost::StringPrimitive(text)) => {
                 let characters: Vec<char> = text.chars().collect();
@@ -4751,10 +4768,10 @@ impl JsRuntime {
                 self.text_decoder_constructor(constructor, arguments)
             }
             Some(ObjectHost::DataViewConstructor) => {
-                self.data_view_constructor(constructor, arguments)
+                self.data_view_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::ArrayBufferConstructor) => {
-                self.array_buffer_constructor(constructor, arguments)
+                self.array_buffer_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::ResponseConstructor) => {
                 self.response_constructor(constructor, arguments)
