@@ -240,11 +240,12 @@ impl JsRuntime {
         {
             return Ok(buffer.0.borrow()[start..start + length].to_vec());
         }
-        let length = self.array_like_length(dom, *source)?;
-        let mut values = Vec::new();
-        for index in 0..length {
-            let element = self.get_member(dom, *source, &index.to_string())?;
-            values.push(to_number(&element)?);
+        // ECMA-262 23.2.5.1 step 6: an object with `@@iterator` supplies its
+        // values through the iterator; anything else is an array-like.
+        let elements = self.iterate_values(dom, &JsValue::Object(*source))?;
+        let mut values = Vec::with_capacity(elements.len());
+        for element in &elements {
+            values.push(self.to_number_value(dom, element)?);
         }
         Ok(values)
     }
