@@ -390,7 +390,7 @@ impl Solver<'_> {
             } else {
                 margin_right.value
             };
-        } else if specified_width.is_none() {
+        } else if specified_width.is_none() && out_of_flow {
             margin_left.value = 0.0;
             margin_right.value = 0.0;
         } else if out_of_flow {

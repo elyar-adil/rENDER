@@ -201,8 +201,13 @@ caption { text-align: center; }
    document face, and `font-size` is the half of that this engine renders. */
 button, input, select, textarea { font-size: 13.3333px; }
 button, input, select, textarea { display: inline-block; }
+/* A single-line input and a button centre their text vertically in the box
+   (HTML §15.5). The value is the input's only child, so a centred flex box
+   places it without changing any other content. */
+input:not([type="hidden" i]) { display: inline-flex; align-items: center; }
 button, input:is([type="reset" i], [type="button" i], [type="submit" i]) {
   text-align: center;
+  justify-content: center;
 }
 button, input, select, textarea { box-sizing: border-box; }
 textarea { white-space: pre-wrap; }
@@ -2057,9 +2062,10 @@ mod tests {
             typed_css(&document, &render, "#column", "display"),
             "table-column"
         );
+        // A text input centres its value in an inline flex box (HTML §15.5).
         assert_eq!(
             typed_css(&document, &render, "#control", "display"),
-            "inline-block"
+            "inline flex"
         );
         assert_eq!(
             typed_css(&document, &render, "#hidden-control", "display"),

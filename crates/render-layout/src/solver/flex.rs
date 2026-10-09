@@ -439,6 +439,11 @@ impl Solver<'_> {
                     FlexDirection::Column => ("margin-top", "margin-bottom"),
                     FlexDirection::ColumnReverse => ("margin-bottom", "margin-top"),
                 };
+                let (cross_before_property, cross_after_property) = if horizontal {
+                    ("margin-top", "margin-bottom")
+                } else {
+                    ("margin-left", "margin-right")
+                };
                 Some(FlexItem {
                     node: *node,
                     source,
@@ -452,6 +457,8 @@ impl Solver<'_> {
                     natural_outer_cross: 0.0,
                     auto_main_before: Self::margin_is_auto(style, before_property),
                     auto_main_after: Self::margin_is_auto(style, after_property),
+                    auto_cross_before: Self::margin_is_auto(style, cross_before_property),
+                    auto_cross_after: Self::margin_is_auto(style, cross_after_property),
                 })
             })
             .collect::<Vec<_>>();
@@ -659,7 +666,13 @@ impl Solver<'_> {
                         item.target_outer,
                         item.natural_outer_cross,
                     ));
-                let cross_offset = align_offset(item_align, line_cross, outer.size.height);
+                let cross_offset = aligned_cross_offset(
+                    item_align,
+                    line_cross,
+                    outer.size.height,
+                    item.auto_cross_before,
+                    item.auto_cross_after,
+                );
                 let target_x = if reverse {
                     containing.origin.x + available_main - cursor - item.target_outer
                 } else {
@@ -680,7 +693,13 @@ impl Solver<'_> {
                         item.natural_outer_cross,
                         item.target_outer,
                     ));
-                let cross_offset = align_offset(item_align, line_cross, outer.size.width);
+                let cross_offset = aligned_cross_offset(
+                    item_align,
+                    line_cross,
+                    outer.size.width,
+                    item.auto_cross_before,
+                    item.auto_cross_after,
+                );
                 let target_y = if reverse {
                     containing.origin.y + available_main - cursor - item.target_outer
                 } else {
@@ -1067,5 +1086,25 @@ impl Solver<'_> {
             style.and_then(|style| style.typed(property)),
             Some(TypedPropertyValue::Size(Size::Auto)) | None
         )
+    }
+}
+
+/// CSS Flexbox §8.1: auto margins on the cross axis absorb the free space
+/// before `align-self` is applied, so they override the alignment.
+fn aligned_cross_offset(
+    align: AlignItems,
+    line_cross: f32,
+    item_cross: f32,
+    auto_before: bool,
+    auto_after: bool,
+) -> f32 {
+    if !auto_before && !auto_after {
+        return align_offset(align, line_cross, item_cross);
+    }
+    let free = (line_cross - item_cross).max(0.0);
+    match (auto_before, auto_after) {
+        (true, true) => free / 2.0,
+        (true, false) => free,
+        _ => 0.0,
     }
 }

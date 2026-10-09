@@ -453,6 +453,10 @@ struct BlockResult {
     flow_height: f32,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent margin edge of the item"
+)]
 struct FlexItem {
     node: FormattingNodeId,
     source: Option<NodeId>,
@@ -466,6 +470,10 @@ struct FlexItem {
     natural_outer_cross: f32,
     auto_main_before: bool,
     auto_main_after: bool,
+    /// Auto margins on the cross axis. They absorb the free cross space before
+    /// `align-self` applies (CSS Flexbox §8.1), so they win over the alignment.
+    auto_cross_before: bool,
+    auto_cross_after: bool,
 }
 
 struct GridItem {

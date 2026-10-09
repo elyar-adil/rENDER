@@ -1241,6 +1241,38 @@ fn flex_main_axis_auto_margins_absorb_positive_free_space() {
 }
 
 #[test]
+fn flex_cross_axis_auto_margins_centre_a_column_item() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='column'><div id='a'></div></div></body>",
+        "html, body, #a { display:block; margin:0 } #column { display:flex; flex-direction:column; width:400px; height:100px } #a { width:200px; height:30px; margin-left:auto; margin-right:auto }",
+        400.0,
+    );
+    let a = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(find(&output.dom, "#a")))
+        .unwrap();
+    assert_eq!(a.rect.origin.x, 100.0);
+}
+
+#[test]
+fn max_width_clamp_centres_a_block_with_auto_margins() {
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='box'></div></body>",
+        "html, body { display:block; margin:0 } #box { display:block; max-width:200px; margin-left:auto; margin-right:auto; height:30px }",
+        420.0,
+    );
+    let box_node = find(&output.dom, "#box");
+    let fragment = layout
+        .fragments
+        .iter()
+        .find(|fragment| fragment.source == Some(box_node))
+        .unwrap();
+    assert_eq!(fragment.rect.size.width, 200.0);
+    assert_eq!(fragment.rect.origin.x, 110.0);
+}
+
+#[test]
 fn class_mutation_rebuilds_flex_geometry_for_the_new_dom_revision() {
     let mut output = parse_document(
         "<!doctype html><body><div id='flex' class='row'><div id='a'></div><div id='b'></div></div></body>",
