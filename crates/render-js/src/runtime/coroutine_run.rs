@@ -11,7 +11,10 @@
 //! keeps its values alive simply by keeping its scope chain alive.
 
 use super::JsRuntime;
-use super::coroutine::{CoroutineCode, Instr, LoopBinding, LoopInfo, SuspendKind};
+use super::coroutine::{
+    CoroutineCode, Instr, IteratorClose, LoopBinding, LoopInfo, SuspendKind, awaited_result_name,
+    next_result_name,
+};
 use super::eval::Completion;
 use super::types::{Binding, CallFrame, ClassFrame, Environment, EnvironmentRecord, UserFunction};
 use crate::parser::{FunctionKind, VariableKind};
@@ -43,6 +46,34 @@ enum Flow {
     Done(JsValue),
 }
 
+/// An abrupt completion travelling outwards from the current position.
+#[derive(Clone, Debug)]
+enum Abrupt {
+    /// `return value`: runs every enclosing `finally`.
+    Return(JsValue),
+    /// `break`/`continue` to the loop `label` names, or the innermost one.
+    Jump {
+        label: Option<Rc<str>>,
+        is_continue: bool,
+    },
+    /// A `break`/`continue` whose loop has been left: resume at `pc`.
+    Goto(usize),
+    /// A throw: runs `catch` and `finally` handlers and closes loops.
+    Throw(JsError),
+}
+
+/// What a coroutine does when the `await` it is suspended on settles.
+#[derive(Clone, Debug)]
+enum AfterAwait {
+    /// A `for await` loop closing its iterator. The awaited `return()` result
+    /// must be an object unless the completion being carried is a throw, and
+    /// the completion then continues outwards.
+    CloseIterator(Abrupt),
+    /// An async generator resumed at `yield` with `return v`: the awaited value
+    /// becomes the return value (ECMA-262 27.6.3.8, AsyncGeneratorUnwrapYieldResumption).
+    YieldReturn,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CoState {
     /// Created, body not started.
@@ -66,6 +97,16 @@ struct LoopEntry {
     info: Rc<LoopInfo>,
     scope_depth: usize,
     handler_depth: usize,
+    /// Cleared while the loop fetches its next value: an error there does not
+    /// close the iterator (ECMA-262 14.7.5.7 ForIn/OfBodyEvaluation).
+    closable: bool,
+}
+
+/// Set whether the innermost loop closes its iterator if left abruptly.
+fn set_loop_closable(co: &mut Coroutine, closable: bool) {
+    if let Some(entry) = co.loops.last_mut() {
+        entry.closable = closable;
+    }
 }
 
 /// A generator or async function activation.
@@ -84,6 +125,9 @@ pub(super) struct Coroutine {
     /// The promise an async function resolves with its result.
     promise: Option<usize>,
     label: String,
+    /// Set while suspended on an `await` whose settlement needs more than
+    /// resuming the body (see [`AfterAwait`]).
+    after_await: Option<AfterAwait>,
 }
 
 /// What a `finally` block must do when it ends.
@@ -186,15 +230,14 @@ impl JsRuntime {
         function: &UserFunction,
         call_environment: &Environment,
     ) -> Result<JsValue, JsError> {
-        if function.kind == FunctionKind::AsyncGenerator {
-            return Err(JsError::type_error(
-                "async generators are not supported yet",
-            ));
-        }
+        let is_async_generator = function.kind == FunctionKind::AsyncGenerator;
         let code = if let Some(code) = self.coroutine_code.get(&function_index) {
             code.clone()
         } else {
-            let code = Rc::new(super::coroutine::Compiler::compile(&function.body)?);
+            let code = Rc::new(super::coroutine::Compiler::compile(
+                &function.body,
+                is_async_generator,
+            )?);
             self.coroutine_code.insert(function_index, code.clone());
             code
         };
@@ -214,10 +257,16 @@ impl JsRuntime {
             loops: Vec::new(),
             promise: None,
             label,
+            after_await: None,
         }));
         if function.kind == FunctionKind::Generator {
             self.ensure_heap_capacity(1)?;
             return Ok(JsValue::Object(self.realm.generator_object(id)));
+        }
+        if is_async_generator {
+            self.ensure_heap_capacity(1)?;
+            self.start_async_generator(id);
+            return Ok(JsValue::Object(self.realm.async_generator_object(id)));
         }
         let (promise, result) = self.create_promise()?;
         if let Some(Some(coroutine)) = self.coroutines.get_mut(id) {
@@ -264,7 +313,7 @@ impl JsRuntime {
         }
     }
 
-    fn finish_coroutine(&mut self, id: usize) {
+    pub(super) fn finish_coroutine(&mut self, id: usize) {
         if let Some(Some(coroutine)) = self.coroutines.get_mut(id) {
             coroutine.state = CoState::Done;
             coroutine.environment.clear();
@@ -291,6 +340,10 @@ impl JsRuntime {
     /// Run an async function until its next `await` (or its end) and arrange
     /// for the awaited promise to continue it.
     pub(super) fn async_continue(&mut self, dom: &mut Dom, id: usize, resume: Resume) {
+        if self.async_generator_state(id).is_some() {
+            self.async_generator_continue(dom, id, resume);
+            return;
+        }
         let promise = self
             .coroutines
             .get(id)
@@ -316,15 +369,24 @@ impl JsRuntime {
         }
     }
 
+    /// The value a script sees for `error`: the thrown value, or an Error object.
+    pub(super) fn error_value(&mut self, error: &JsError) -> JsValue {
+        self.error_to_thrown_value(error)
+            .unwrap_or_else(|_| JsValue::String(error.message().to_owned()))
+    }
+
     fn reject_with_error(&mut self, promise: usize, error: &JsError) {
-        let reason = self
-            .error_to_thrown_value(error)
-            .unwrap_or_else(|_| JsValue::String(error.message().to_owned()));
+        let reason = self.error_value(error);
         self.reject_promise(promise, &reason);
     }
 
     /// `await value`: subscribe the coroutine to `PromiseResolve(value)`.
-    fn await_value(&mut self, dom: &mut Dom, id: usize, value: &JsValue) -> Result<(), JsError> {
+    pub(super) fn await_value(
+        &mut self,
+        dom: &mut Dom,
+        id: usize,
+        value: &JsValue,
+    ) -> Result<(), JsError> {
         let promise = self.promise_resolve(dom, value)?;
         self.ensure_heap_capacity(2)?;
         let on_fulfilled = self.realm.async_resume(id, false);
@@ -337,7 +399,11 @@ impl JsRuntime {
     }
 
     /// ECMA-262 `PromiseResolve(%Promise%, value)`, including thenable adoption.
-    fn promise_resolve(&mut self, dom: &mut Dom, value: &JsValue) -> Result<ObjectId, JsError> {
+    pub(super) fn promise_resolve(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<ObjectId, JsError> {
         if let JsValue::Object(object) = value
             && matches!(self.realm.host(*object), Some(ObjectHost::Promise(_)))
         {
@@ -425,7 +491,12 @@ impl JsRuntime {
                 Ok(Flow::Next) => {}
                 Ok(Flow::Suspend(step)) => return Ok(step),
                 Ok(Flow::Done(value)) => return Ok(CoStep::Complete(value)),
-                Err(error) => self.handle_throw(dom, co, error)?,
+                Err(error) => {
+                    // The error goes to the innermost handler; with none left
+                    // it leaves the coroutine.
+                    action = Ok(self.unwind(dom, co, Abrupt::Throw(error))?);
+                    continue;
+                }
             }
             self.consume_step()?;
             action = self.step(dom, co);
@@ -439,6 +510,9 @@ impl JsRuntime {
         co: &mut Coroutine,
         resume: Resume,
     ) -> Result<Flow, JsError> {
+        if let Some(after) = co.after_await.take() {
+            return self.resume_after_await(dom, co, after, resume);
+        }
         let Instr::Suspend { kind, target, .. } = co.code.instrs[co.pc].clone() else {
             return Err(JsError::type_error(
                 "coroutine resumed away from a suspension",
@@ -454,7 +528,49 @@ impl JsRuntime {
                 Ok(Flow::Next)
             }
             Resume::Throw(value) => Err(JsError::thrown(value)),
+            // ECMA-262 27.6.3.8: an async generator awaits a `return` value
+            // before the return takes effect.
+            Resume::Return(value) if kind == SuspendKind::AsyncYield => {
+                co.after_await = Some(AfterAwait::YieldReturn);
+                Ok(Flow::Suspend(CoStep::Await(value)))
+            }
             Resume::Return(value) => self.do_return(dom, co, value),
+        }
+    }
+
+    /// Continue after an `await` that [`AfterAwait`] said needs more than the
+    /// body resuming with the settled value.
+    fn resume_after_await(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        after: AfterAwait,
+        resume: Resume,
+    ) -> Result<Flow, JsError> {
+        match (after, resume) {
+            (AfterAwait::YieldReturn, Resume::Next(value)) => {
+                self.unwind(dom, co, Abrupt::Return(value))
+            }
+            (AfterAwait::YieldReturn, Resume::Throw(value)) => {
+                self.unwind(dom, co, Abrupt::Throw(JsError::thrown(value)))
+            }
+            (AfterAwait::YieldReturn, Resume::Return(_)) => {
+                Err(JsError::type_error("coroutine resumed with an unexpected return"))
+            }
+            (AfterAwait::CloseIterator(abrupt), resume) => {
+                // AsyncIteratorClose: a throw completion already in flight wins
+                // over whatever closing produced; otherwise the awaited
+                // `return()` result must be an object.
+                let abrupt = match (abrupt, resume) {
+                    (throw @ Abrupt::Throw(_), _) => throw,
+                    (other, Resume::Next(JsValue::Object(_)) | Resume::Return(_)) => other,
+                    (_, Resume::Next(_)) => Abrupt::Throw(JsError::type_error(
+                        "iterator result is not an object",
+                    )),
+                    (_, Resume::Throw(reason)) => Abrupt::Throw(JsError::thrown(reason)),
+                };
+                self.unwind(dom, co, abrupt)
+            }
         }
     }
 
@@ -501,7 +617,9 @@ impl JsRuntime {
                     None => JsValue::Undefined,
                 };
                 match kind {
-                    SuspendKind::Yield => Ok(Flow::Suspend(CoStep::Yield(value))),
+                    SuspendKind::Yield | SuspendKind::AsyncYield => {
+                        Ok(Flow::Suspend(CoStep::Yield(value)))
+                    }
                     SuspendKind::Await => Ok(Flow::Suspend(CoStep::Await(value))),
                     SuspendKind::YieldDelegate => {
                         let (iterator, next) = self.delegate_iterator(dom, &value)?;
@@ -548,6 +666,7 @@ impl JsRuntime {
                     info,
                     scope_depth: self.environment.len(),
                     handler_depth: co.handlers.len(),
+                    closable: true,
                 });
                 co.pc += 1;
                 Ok(Flow::Next)
@@ -570,9 +689,14 @@ impl JsRuntime {
                 iterable,
                 slot,
                 binding,
+                is_await,
             } => {
                 let value = self.evaluate(dom, &iterable)?;
-                let (iterator, next) = self.delegate_iterator(dom, &value)?;
+                let (iterator, next) = if is_await {
+                    self.async_delegate_iterator(dom, &value)?
+                } else {
+                    self.delegate_iterator(dom, &value)?
+                };
                 if binding.kind == VariableKind::Var {
                     self.create_binding(
                         &binding.name,
@@ -592,6 +716,7 @@ impl JsRuntime {
                 done_pc,
             } => {
                 self.truncate_to_loop(co);
+                set_loop_closable(co, false);
                 let (JsValue::Object(iterator), JsValue::Object(next)) = (
                     co.hidden(&format!("%i{slot}")),
                     co.hidden(&format!("%n{slot}")),
@@ -608,6 +733,40 @@ impl JsRuntime {
                     return Ok(Flow::Next);
                 }
                 let value = self.get_member(dom, result, "value")?;
+                set_loop_closable(co, true);
+                self.bind_loop_value(dom, &binding, value)?;
+                co.pc += 1;
+                Ok(Flow::Next)
+            }
+            Instr::ForAwaitCall { slot } => {
+                self.truncate_to_loop(co);
+                set_loop_closable(co, false);
+                let (JsValue::Object(iterator), JsValue::Object(next)) = (
+                    co.hidden(&format!("%i{slot}")),
+                    co.hidden(&format!("%n{slot}")),
+                ) else {
+                    return Err(JsError::type_error("for await lost its iterator"));
+                };
+                let result = self.call_with_this(dom, next, &[], JsValue::Object(iterator))?;
+                co.set_hidden(&next_result_name(slot), result);
+                co.pc += 1;
+                Ok(Flow::Next)
+            }
+            Instr::ForAwaitBind {
+                slot,
+                binding,
+                done_pc,
+            } => {
+                let JsValue::Object(result) = co.hidden(&awaited_result_name(slot)) else {
+                    return Err(JsError::type_error("iterator result is not an object"));
+                };
+                let done = self.get_member(dom, result, "done")?.is_truthy();
+                if done {
+                    co.pc = done_pc;
+                    return Ok(Flow::Next);
+                }
+                let value = self.get_member(dom, result, "value")?;
+                set_loop_closable(co, true);
                 self.bind_loop_value(dom, &binding, value)?;
                 co.pc += 1;
                 Ok(Flow::Next)
@@ -799,42 +958,252 @@ impl JsRuntime {
 
     // -------------------------------------------------- abrupt control transfer
 
-    /// Close the loops above `loop_depth` (calling `return` on `for…of`
-    /// iterators) and drop scopes above `scope_depth`.
-    fn unwind_to(
+    /// Carry an abrupt completion outwards from the current position. Handlers
+    /// and loops are left innermost first: a `finally` the completion reaches
+    /// runs and the completion resumes at its end, and a loop being left
+    /// closes its iterator. Closing a `for await` loop suspends until the
+    /// `return()` result settles, so the rest of the walk resumes later through
+    /// [`AfterAwait::CloseIterator`] instead of recursing.
+    fn unwind(
         &mut self,
         dom: &mut Dom,
         co: &mut Coroutine,
-        scope_depth: usize,
-        loop_depth: usize,
-        suppress_errors: bool,
-    ) -> Result<(), JsError> {
-        let mut first_error = None;
-        while co.loops.len() > loop_depth {
-            let Some(entry) = co.loops.pop() else {
-                break;
-            };
-            if let Some(slot) = entry.info.iterator_slot
-                && let Err(error) = self.close_iterator(dom, co, slot)
-                && first_error.is_none()
+        mut abrupt: Abrupt,
+    ) -> Result<Flow, JsError> {
+        loop {
+            if let Abrupt::Throw(error) = &abrupt
+                && error.kind() == JsErrorKind::ResourceLimit
             {
-                first_error = Some(error);
+                return Err(error.clone());
             }
-        }
-        self.environment.truncate(scope_depth);
-        match first_error {
-            Some(error) if !suppress_errors => Err(error),
-            _ => Ok(()),
+            if let Abrupt::Goto(pc) = abrupt {
+                co.pc = pc;
+                return Ok(Flow::Next);
+            }
+            // A `break`/`continue` stays inside its target loop: loops above the
+            // target are left, and so are handlers entered inside the target.
+            let jump = match &abrupt {
+                Abrupt::Jump { label, is_continue } => {
+                    match Self::jump_target(co, label.as_deref(), *is_continue) {
+                        Ok(index) => Some((index, *is_continue)),
+                        Err(error) => {
+                            abrupt = Abrupt::Throw(error);
+                            continue;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let (loop_floor, handler_floor) = match jump {
+                Some((index, _)) => (index + 1, co.loops[index].handler_depth),
+                None => (0, 0),
+            };
+            // A handler entered after the innermost loop is the next thing out.
+            if co.handlers.len() > handler_floor
+                && co
+                    .handlers
+                    .last()
+                    .is_some_and(|handler| handler.loop_depth >= co.loops.len())
+                && let Some(handler) = co.handlers.pop()
+            {
+                match &abrupt {
+                    Abrupt::Throw(error) => {
+                        let value = self.error_to_thrown_value(error)?;
+                        self.environment.truncate(handler.scope_depth);
+                        if let Some(catch_pc) = handler.catch_pc {
+                            co.set_hidden(&format!("%e{}", handler.slot), value);
+                            if handler.finally_pc.is_some() {
+                                co.handlers.push(Handler {
+                                    catch_pc: None,
+                                    ..handler.clone()
+                                });
+                            }
+                            co.pc = catch_pc;
+                            return Ok(Flow::Next);
+                        }
+                        if let Some(finally_pc) = handler.finally_pc {
+                            co.set_pending(handler.slot, Pending::Throw(value));
+                            co.pc = finally_pc;
+                            return Ok(Flow::Next);
+                        }
+                    }
+                    Abrupt::Return(value) => {
+                        if let Some(finally_pc) = handler.finally_pc {
+                            self.environment.truncate(handler.scope_depth);
+                            co.set_pending(handler.slot, Pending::Return(value.clone()));
+                            co.pc = finally_pc;
+                            return Ok(Flow::Next);
+                        }
+                    }
+                    Abrupt::Jump { label, is_continue } => {
+                        if let Some(finally_pc) = handler.finally_pc {
+                            self.environment.truncate(handler.scope_depth);
+                            co.set_pending(
+                                handler.slot,
+                                Pending::Jump {
+                                    is_continue: *is_continue,
+                                    label: label.clone(),
+                                },
+                            );
+                            co.pc = finally_pc;
+                            return Ok(Flow::Next);
+                        }
+                    }
+                    // A resolved jump has no handlers above its loop left.
+                    Abrupt::Goto(_) => {}
+                }
+                continue;
+            }
+            if co.loops.len() > loop_floor {
+                let Some(entry) = co.loops.pop() else {
+                    continue;
+                };
+                self.environment.truncate(entry.scope_depth);
+                if entry.closable
+                    && let Some(close) = entry.info.iterator
+                    && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)?
+                {
+                    return Ok(flow);
+                }
+                continue;
+            }
+            // Nothing is left above the floor.
+            match (abrupt, jump) {
+                (Abrupt::Return(value), _) => return Ok(Flow::Done(value)),
+                (Abrupt::Throw(error), _) => return Err(error),
+                (Abrupt::Goto(pc), _) => {
+                    co.pc = pc;
+                    return Ok(Flow::Next);
+                }
+                (Abrupt::Jump { .. }, Some((index, true))) => {
+                    // `continue`: the target loop stays entered.
+                    let entry = &co.loops[index];
+                    self.environment.truncate(entry.scope_depth);
+                    let continue_pc = entry.info.continue_pc.unwrap_or(co.pc + 1);
+                    abrupt = Abrupt::Goto(continue_pc);
+                }
+                (Abrupt::Jump { .. }, Some((_, false))) => {
+                    // `break`: the target loop is left too, and closes as well.
+                    let Some(entry) = co.loops.pop() else {
+                        return Err(JsError::syntax("no enclosing loop for break", 0));
+                    };
+                    self.environment.truncate(entry.scope_depth);
+                    abrupt = Abrupt::Goto(entry.info.break_pc);
+                    if entry.closable
+                        && let Some(close) = entry.info.iterator
+                        && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)?
+                    {
+                        return Ok(flow);
+                    }
+                }
+                (Abrupt::Jump { .. }, None) => {
+                    return Err(JsError::syntax("no enclosing target for break/continue", 0));
+                }
+            }
         }
     }
 
-    /// `IteratorClose`: call the iterator's `return`, if it has one.
-    fn close_iterator(
+    /// `return value` from inside the body, running enclosing `finally` blocks.
+    fn do_return(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        value: JsValue,
+    ) -> Result<Flow, JsError> {
+        self.unwind(dom, co, Abrupt::Return(value))
+    }
+
+    /// `break` / `continue`, optionally to a label, running enclosing `finally`
+    /// blocks on the way out.
+    fn do_jump(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        label: Option<&str>,
+        is_continue: bool,
+    ) -> Result<Flow, JsError> {
+        self.unwind(
+            dom,
+            co,
+            Abrupt::Jump {
+                label: label.map(Rc::from),
+                is_continue,
+            },
+        )
+    }
+
+    /// The index of the loop a `break`/`continue` targets: the innermost one the
+    /// label names, or the innermost one that accepts the statement.
+    fn jump_target(co: &Coroutine, label: Option<&str>, is_continue: bool) -> Result<usize, JsError> {
+        co.loops
+            .iter()
+            .rposition(|entry| match label {
+                Some(label) => entry
+                    .info
+                    .labels
+                    .iter()
+                    .any(|candidate| &**candidate == label),
+                None if is_continue => entry.info.continue_pc.is_some(),
+                None => entry.info.unlabeled_break,
+            })
+            .ok_or_else(|| JsError::syntax("no enclosing target for break/continue", 0))
+    }
+
+    /// Close the iterator of a loop that `abrupt` is leaving. An error from
+    /// closing replaces a non-throw completion; a throw in flight keeps its own
+    /// error (ECMA-262 7.4.11 IteratorClose). For `for await`, the `return()`
+    /// result is awaited, so `Some(flow)` suspends the coroutine with `abrupt`
+    /// parked in [`AfterAwait::CloseIterator`].
+    fn close_left_iterator(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        close: IteratorClose,
+        abrupt: &mut Abrupt,
+    ) -> Result<Option<Flow>, JsError> {
+        let outcome = if close.is_async {
+            match self.start_async_close(dom, co, close.slot) {
+                Ok(Some(result)) => {
+                    co.after_await = Some(AfterAwait::CloseIterator(abrupt.clone()));
+                    return Ok(Some(Flow::Suspend(CoStep::Await(result))));
+                }
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
+            }
+        } else {
+            self.close_iterator(dom, co, close.slot)
+        };
+        if let Err(error) = outcome
+            && !matches!(abrupt, Abrupt::Throw(_))
+        {
+            *abrupt = Abrupt::Throw(error);
+        }
+        Ok(None)
+    }
+
+    /// The call half of `AsyncIteratorClose`: call the iterator's `return` and
+    /// hand back its result for the caller to await. `None` when there is none.
+    fn start_async_close(
         &mut self,
         dom: &mut Dom,
         co: &Coroutine,
         slot: usize,
-    ) -> Result<(), JsError> {
+    ) -> Result<Option<JsValue>, JsError> {
+        let JsValue::Object(iterator) = co.hidden(&format!("%i{slot}")) else {
+            return Ok(None);
+        };
+        match self.get_member(dom, iterator, "return")? {
+            JsValue::Undefined | JsValue::Null => Ok(None),
+            JsValue::Object(method) if Self::is_callable_object(method, &self.realm) => {
+                let result = self.call_with_this(dom, method, &[], JsValue::Object(iterator))?;
+                Ok(Some(result))
+            }
+            _ => Err(JsError::type_error("iterator return is not callable")),
+        }
+    }
+
+    /// `IteratorClose` for a `for…of` loop being left abruptly.
+    fn close_iterator(&mut self, dom: &mut Dom, co: &Coroutine, slot: usize) -> Result<(), JsError> {
         let JsValue::Object(iterator) = co.hidden(&format!("%i{slot}")) else {
             return Ok(());
         };
@@ -855,128 +1224,11 @@ impl JsRuntime {
         Ok(())
     }
 
-    /// An error was thrown at the current instruction: find the nearest
-    /// `catch` or `finally`, or give up.
-    fn handle_throw(
-        &mut self,
-        dom: &mut Dom,
-        co: &mut Coroutine,
-        error: JsError,
-    ) -> Result<(), JsError> {
-        if error.kind() == JsErrorKind::ResourceLimit {
-            return Err(error);
-        }
-        let mut error = error;
-        loop {
-            let Some(handler) = co.handlers.pop() else {
-                return Err(error);
-            };
-            // Errors from closing iterators while unwinding a throw are
-            // dropped; the original error wins.
-            self.unwind_to(dom, co, handler.scope_depth, handler.loop_depth, true)?;
-            if let Some(catch_pc) = handler.catch_pc {
-                let value = self.error_to_thrown_value(&error)?;
-                co.set_hidden(&format!("%e{}", handler.slot), value);
-                if handler.finally_pc.is_some() {
-                    co.handlers.push(Handler {
-                        catch_pc: None,
-                        ..handler
-                    });
-                }
-                co.pc = catch_pc;
-                return Ok(());
-            }
-            if let Some(finally_pc) = handler.finally_pc {
-                let value = self.error_to_thrown_value(&error)?;
-                co.set_pending(handler.slot, Pending::Throw(value));
-                co.pc = finally_pc;
-                return Ok(());
-            }
-            error = error.clone();
-        }
-    }
-
-    /// `return value` from inside the body, running enclosing `finally` blocks.
-    fn do_return(
-        &mut self,
-        dom: &mut Dom,
-        co: &mut Coroutine,
-        value: JsValue,
-    ) -> Result<Flow, JsError> {
-        while let Some(handler) = co.handlers.pop() {
-            if let Some(finally_pc) = handler.finally_pc {
-                self.unwind_to(dom, co, handler.scope_depth, handler.loop_depth, false)?;
-                co.set_pending(handler.slot, Pending::Return(value));
-                co.pc = finally_pc;
-                return Ok(Flow::Next);
-            }
-        }
-        self.unwind_to(dom, co, 0, 0, false)?;
-        Ok(Flow::Done(value))
-    }
-
-    /// `break` / `continue`, optionally to a label, running enclosing
-    /// `finally` blocks on the way out.
-    fn do_jump(
-        &mut self,
-        dom: &mut Dom,
-        co: &mut Coroutine,
-        label: Option<&str>,
-        is_continue: bool,
-    ) -> Result<Flow, JsError> {
-        let Some(index) = co.loops.iter().rposition(|entry| match label {
-            Some(label) => entry
-                .info
-                .labels
-                .iter()
-                .any(|candidate| &**candidate == label),
-            None if is_continue => entry.info.continue_pc.is_some(),
-            None => entry.info.unlabeled_break,
-        }) else {
-            return Err(JsError::syntax("no enclosing target for break/continue", 0));
-        };
-        let (scope_depth, handler_depth) = {
-            let entry = &co.loops[index];
-            (entry.scope_depth, entry.handler_depth)
-        };
-        let finally = co.handlers[handler_depth..]
-            .iter()
-            .rposition(|handler| handler.finally_pc.is_some());
-        if let Some(offset) = finally {
-            let position = handler_depth + offset;
-            let handler = co.handlers[position].clone();
-            co.handlers.truncate(position);
-            self.unwind_to(dom, co, handler.scope_depth, handler.loop_depth, false)?;
-            co.set_pending(
-                handler.slot,
-                Pending::Jump {
-                    is_continue,
-                    label: label.map(Rc::from),
-                },
-            );
-            co.pc = handler.finally_pc.unwrap_or(co.pc);
-            return Ok(Flow::Next);
-        }
-        co.handlers.truncate(handler_depth);
-        let (continue_pc, break_pc) = {
-            let entry = &co.loops[index];
-            (entry.info.continue_pc, entry.info.break_pc)
-        };
-        if is_continue {
-            self.unwind_to(dom, co, scope_depth, index + 1, false)?;
-            co.pc = continue_pc.unwrap_or(co.pc + 1);
-        } else {
-            self.unwind_to(dom, co, scope_depth, index, false)?;
-            co.pc = break_pc;
-        }
-        Ok(Flow::Next)
-    }
-
     // ------------------------------------------------------------------ yield*
 
     /// The iterator `yield*`/`for…of` steps through. Strings are iterated as
     /// code points by materialising them first.
-    fn delegate_iterator(
+    pub(super) fn delegate_iterator(
         &mut self,
         dom: &mut Dom,
         value: &JsValue,

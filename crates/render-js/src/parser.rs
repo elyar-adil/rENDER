@@ -334,6 +334,8 @@ pub(super) enum Statement {
         iterable: Expr,
         body: Box<Statement>,
         offset: usize,
+        /// `for await (… of …)`: iterate with the async iterator protocol.
+        is_await: bool,
     },
     ForInExpr {
         target: Expr,
@@ -2030,6 +2032,20 @@ impl Parser {
     }
 
     fn for_statement(&mut self) -> Result<Statement, JsError> {
+        // `for await` is only a loop head inside an async body (ECMA-262 §14.7.5).
+        let is_await = self.in_async
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await");
+        if is_await {
+            self.advance();
+        }
+        let statement = self.for_statement_head(is_await)?;
+        if is_await && !matches!(statement, Statement::ForOf { .. }) {
+            return Err(self.error("expected 'of' after for await"));
+        }
+        Ok(statement)
+    }
+
+    fn for_statement_head(&mut self, is_await: bool) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after for")?;
         self.no_in = true;
         let initializer = if self.take(&TokenKind::Semicolon) {
@@ -2103,6 +2119,7 @@ impl Parser {
                             name: temporary,
                             iterable,
                             body: Box::new(body),
+                            is_await,
                         });
                     }
                 };
@@ -2112,6 +2129,7 @@ impl Parser {
                     name,
                     iterable,
                     body: Box::new(body),
+                    is_await,
                 });
             }
             self.cursor = declaration_start;
@@ -2162,6 +2180,7 @@ impl Parser {
                     name: temporary,
                     iterable,
                     body: Box::new(Statement::Block(vec![assign, body?])),
+                    is_await,
                 });
             }
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
