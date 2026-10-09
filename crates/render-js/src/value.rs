@@ -3662,7 +3662,14 @@ impl Realm {
             | "setPrototypeOf"
             | "trim"
             | "trimStart"
-            | "trimEnd" => 1,
+            | "trimEnd"
+            // Math (ECMA-262 21.3.2): one argument.
+            | "abs" | "acos" | "acosh" | "asin" | "asinh" | "atan" | "atanh" | "cbrt"
+            | "ceil" | "clz32" | "cos" | "cosh" | "exp" | "expm1" | "floor" | "fround"
+            | "log" | "log1p" | "log10" | "log2" | "round" | "sign" | "sin" | "sinh"
+            | "sqrt" | "tan" | "tanh" | "trunc" => 1,
+            // Math (ECMA-262 21.3.2): two arguments.
+            "atan2" | "hypot" | "imul" | "max" | "min" | "pow" => 2,
             "then"
             | "set"
             | "apply"
