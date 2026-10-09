@@ -2963,7 +2963,7 @@ impl JsRuntime {
     /// The value of `left op right` once both operands are evaluated. Binary
     /// expressions and compound assignment both come here, so `x op= y` and
     /// `x = x op y` cannot disagree. `+` converts with the default hint, as
-    /// ECMA-262 13.15.3 requires, and the other operators with ToNumeric.
+    /// ECMA-262 13.15.3 requires, and the other operators with `ToNumeric`.
     pub(super) fn binary_operation(
         &mut self,
         dom: &mut Dom,
@@ -3041,8 +3041,8 @@ impl JsRuntime {
         }
     }
 
-    /// ECMA-262 7.2.14 IsLooselyEqual. An object compared with a string, number,
-    /// boolean, bigint or symbol is converted with ToPrimitive (default hint), so
+    /// ECMA-262 7.2.14 `IsLooselyEqual`. An object compared with a string, number,
+    /// boolean, bigint or symbol is converted with `ToPrimitive` (default hint), so
     /// `valueOf` and `toString` take part. An object is never loosely equal to
     /// `null` or `undefined`.
     pub(super) fn loose_equal(

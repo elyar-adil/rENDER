@@ -1,6 +1,6 @@
 //! The ES2025 Set methods (ECMA-262 24.2.4): `union`, `intersection`,
 //! `difference`, `symmetricDifference`, `isSubsetOf`, `isSupersetOf` and
-//! `isDisjointFrom`. Each takes a set-like `other`, which GetSetRecord reads
+//! `isDisjointFrom`. Each takes a set-like `other`, which `GetSetRecord` reads
 //! once: its `size`, `has` and `keys`, in that order.
 //!
 //! The receiver's entries are walked by position. A callback that deletes an
@@ -26,7 +26,7 @@ use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
 
-/// A set-like argument, read once (ECMA-262 24.2.1.2 GetSetRecord).
+/// A set-like argument, read once (ECMA-262 24.2.1.2 `GetSetRecord`).
 struct SetRecord {
     object: ObjectId,
     size: f64,
@@ -36,10 +36,12 @@ struct SetRecord {
 
 /// `-0` is stored as `+0`, as a Set's value is normalized (ECMA-262 24.2.4.1).
 fn normalize_zero(value: JsValue) -> JsValue {
-    match value {
-        JsValue::Number(number) if number == 0.0 => JsValue::Number(0.0),
-        other => other,
+    if let JsValue::Number(number) = value
+        && number == 0.0
+    {
+        return JsValue::Number(0.0);
     }
+    value
 }
 
 fn contains(values: &[JsValue], value: &JsValue) -> bool {
@@ -50,7 +52,7 @@ fn contains(values: &[JsValue], value: &JsValue) -> bool {
 
 impl JsRuntime {
     /// The Set the method was called on. Any other receiver, including a Map,
-    /// is a TypeError.
+    /// is a `TypeError`.
     fn set_receiver(&self, receiver: ObjectId) -> Result<ObjectId, JsError> {
         let target = self.collection_target(receiver);
         match self.realm.host(target) {
@@ -98,7 +100,7 @@ impl JsRuntime {
         }
     }
 
-    /// GetSetRecord: the `size`, `has` and `keys` of a set-like, each checked as
+    /// `GetSetRecord`: the `size`, `has` and `keys` of a set-like, each checked as
     /// the spec requires before the next is read.
     fn get_set_record(&mut self, dom: &mut Dom, other: &JsValue) -> Result<SetRecord, JsError> {
         let JsValue::Object(object) = other else {
@@ -140,7 +142,7 @@ impl JsRuntime {
         }
     }
 
-    /// GetKeysIterator: call `other.keys()` and read the iterator's `next`.
+    /// `GetKeysIterator`: call `other.keys()` and read the iterator's `next`.
     fn set_keys_iterator(
         &mut self,
         dom: &mut Dom,
@@ -351,7 +353,7 @@ impl JsRuntime {
     }
 
     /// ECMA-262 24.2.4.10 `Set.prototype.isSupersetOf`. Leaving early closes the
-    /// keys iterator, as the spec's IteratorClose does.
+    /// keys iterator, as the spec's `IteratorClose` does.
     fn set_is_superset_of(
         &mut self,
         dom: &mut Dom,

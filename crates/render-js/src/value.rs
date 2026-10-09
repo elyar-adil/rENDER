@@ -2805,6 +2805,10 @@ impl Realm {
         constructor
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table row per collection builtin, kept together for review"
+    )]
     fn install_collections(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
