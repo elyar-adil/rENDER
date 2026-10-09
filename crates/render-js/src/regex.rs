@@ -1017,15 +1017,22 @@ type NamedGroup = (String, usize, Vec<(usize, usize)>);
 /// engine deliberately does not support.
 pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
     let parsed_flags = Flags::parse(flags)?;
-    compile_flags(pattern, parsed_flags).map_err(|error| {
-        // Set notation under `v` is not implemented, so a pattern that fails the
-        // `u` grammar may still be valid `v` syntax: defer it, do not reject it.
-        if parsed_flags.unicode_sets {
-            RegexSyntaxError::unsupported(error.message)
-        } else {
-            error
-        }
-    })
+    match compile_flags(pattern, parsed_flags) {
+        Ok(compiled) => Ok(compiled),
+        // Set notation under `v` is not implemented. A pattern that is not valid
+        // `u` syntax may still be valid `v` syntax, so it keeps the reading it
+        // had before `v` took `u` semantics; a pattern invalid under both is
+        // deferred to evaluation, not rejected at parse time.
+        Err(_) if parsed_flags.unicode_sets => compile_flags(
+            pattern,
+            Flags {
+                unicode: false,
+                ..parsed_flags
+            },
+        )
+        .map_err(|error| RegexSyntaxError::unsupported(error.message)),
+        Err(error) => Err(error),
+    }
 }
 
 fn compile_flags(pattern: &str, parsed_flags: Flags) -> Result<Compiled, RegexSyntaxError> {
