@@ -1378,3 +1378,43 @@ fn regexp_indices_surrogates_and_flag_strings_at_the_script_level() {
     assert_eq!(ok("/\\udf06/u.test('\\ud834\\udf06')"), "false");
     assert_eq!(ok("/\\udf06/.test('\\ud834\\udf06')"), "true");
 }
+
+#[test]
+fn regexp_flags_and_source_are_prototype_accessors_not_own_properties() {
+    assert_eq!(
+        ok("var r = /a/gi; [r.global, r.ignoreCase, r.multiline].join()"),
+        "true,true,false"
+    );
+    assert_eq!(ok("/a/gimsuy.flags"), "gimsuy");
+    assert_eq!(ok("/x\\/y/.source"), "x\\/y");
+    assert_eq!(ok("Object.keys(/a/g).length"), "0");
+    assert_eq!(ok("Object.getOwnPropertyNames(/a/).join()"), "lastIndex");
+    assert_eq!(ok("'global' in /a/ ? 'yes' : 'no'"), "yes");
+    assert_eq!(ok("String(RegExp.prototype.source)"), "(?:)");
+    assert_eq!(ok("String(RegExp.prototype.global)"), "undefined");
+    assert_eq!(ok("RegExp.prototype.flags === ''"), "true");
+}
+
+#[test]
+fn regexp_flags_getter_reads_each_flag_through_get() {
+    assert_eq!(
+        ok("var r = /a/; Object.defineProperty(r, 'global', { get() { return true; } }); r.flags"),
+        "g"
+    );
+}
+
+#[test]
+fn a_unicode_back_reference_matches_whole_code_points() {
+    assert_eq!(
+        ok(r#"String(/foo(.+)bar\1/u.exec("foo\uD834bar\uD834\uDC00"))"#),
+        "null"
+    );
+    assert_eq!(
+        ok(r#"String(/foo(.+)bar\1/u.exec("foo\uD834bar\uD834"))"#),
+        "foo\u{f0034}bar\u{f0034},\u{f0034}"
+    );
+    assert_eq!(
+        ok(r#"String(/^(.+)\1$/u.exec("\uDC00foobar\uD834\uDC00foobar\uD834"))"#),
+        "null"
+    );
+}

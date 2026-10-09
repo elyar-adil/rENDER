@@ -1281,6 +1281,9 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::RegExpAccessor(_) => {
+                self.dispatch_regexp_native(dom, function, receiver, arguments)
+            }
             NativeFunction::RemoveAttribute => {
                 self.dispatch_dom_native(dom, NativeFunction::RemoveAttribute, receiver, arguments)
             }

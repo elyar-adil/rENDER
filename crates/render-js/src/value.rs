@@ -473,6 +473,21 @@ pub(crate) enum NumberOp {
     IsSafeInteger,
 }
 
+/// The accessors ECMA-262 22.2.6 defines on %RegExp.prototype%.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RegExpAccessor {
+    Source,
+    Flags,
+    Global,
+    IgnoreCase,
+    Multiline,
+    DotAll,
+    Sticky,
+    Unicode,
+    UnicodeSets,
+    HasIndices,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     MathOp(MathOp),
@@ -567,6 +582,7 @@ pub(crate) enum NativeFunction {
     RegExpExec,
     RegExpTest,
     RegExpToString,
+    RegExpAccessor(RegExpAccessor),
     StrCharAt,
     StrCharCodeAt,
     /// ECMA-262 22.1.3.12. The sibling of `charCodeAt` that answers the scalar
@@ -4911,33 +4927,49 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
-        // The prototype carries fallback values so `RegExp.prototype.source`
-        // reads stay defined even though real instances override them.
-        for (name, descriptor) in [
-            (
-                "source",
-                PropertyDescriptor::builtin(JsValue::String("(?:)".to_owned())),
-            ),
-            (
-                "flags",
-                PropertyDescriptor::builtin(JsValue::String(String::new())),
-            ),
-            (
-                "lastIndex",
-                PropertyDescriptor {
-                    getter: None,
-                    setter: None,
-                    value: JsValue::Number(0.0),
-                    writable: true,
-                    enumerable: false,
-                    configurable: false,
-                },
-            ),
+        // ECMA-262 22.2.6: the source and flag properties are accessors on the
+        // prototype, computed from each instance's compiled record.
+        for (name, accessor) in [
+            ("source", RegExpAccessor::Source),
+            ("flags", RegExpAccessor::Flags),
+            ("global", RegExpAccessor::Global),
+            ("ignoreCase", RegExpAccessor::IgnoreCase),
+            ("multiline", RegExpAccessor::Multiline),
+            ("dotAll", RegExpAccessor::DotAll),
+            ("sticky", RegExpAccessor::Sticky),
+            ("unicode", RegExpAccessor::Unicode),
+            ("unicodeSets", RegExpAccessor::UnicodeSets),
+            ("hasIndices", RegExpAccessor::HasIndices),
         ] {
-            objects[prototype.0]
-                .properties
-                .insert(name.to_owned(), descriptor);
+            let getter = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::RegExpAccessor(accessor)),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter: Some(getter),
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
         }
+        objects[prototype.0].properties.insert(
+            "lastIndex".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Number(0.0),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {
@@ -7455,6 +7487,29 @@ impl Realm {
         } else {
             None
         }
+    }
+
+    /// Define an own writable data property that is neither enumerable nor
+    /// configurable, as a `RegExp` instance's `lastIndex` is (ECMA-262 22.2.7.1).
+    pub(crate) fn define_hidden_data(&mut self, object: ObjectId, key: &str, value: JsValue) {
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.properties.insert(
+                key.to_owned(),
+                PropertyDescriptor {
+                    value,
+                    writable: true,
+                    getter: None,
+                    setter: None,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
+    /// The intrinsic %RegExp.prototype%.
+    pub(crate) fn regexp_prototype(&self) -> ObjectId {
+        self.regexp_prototype
     }
 
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {

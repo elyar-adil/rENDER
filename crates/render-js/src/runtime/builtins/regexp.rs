@@ -21,8 +21,8 @@ use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::RegexRecord;
 use crate::utf16;
-use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::{NativeFunction, RegExpAccessor};
 use render_dom::Dom;
 
 impl JsRuntime {
@@ -37,6 +37,9 @@ impl JsRuntime {
             NativeFunction::RegExpExec => self.regexp_exec(receiver, arguments),
             NativeFunction::RegExpTest => self.regexp_test(receiver, arguments),
             NativeFunction::RegExpToString => self.regexp_to_string(receiver),
+            NativeFunction::RegExpAccessor(accessor) => {
+                self.regexp_accessor(dom, receiver, accessor)
+            }
             other => self.dispatch_object_native(dom, other, receiver, arguments),
         }
     }
@@ -55,33 +58,89 @@ impl JsRuntime {
                 0,
             )
         })?;
-        let flags_text = compiled.flags().describe();
-        let global = compiled.flags().global;
-        let ignore_case = compiled.flags().ignore_case;
-        let multiline = compiled.flags().multiline;
-        let dot_all = compiled.flags().dot_all;
-        let sticky = compiled.flags().sticky;
-        let has_indices = compiled.flags().has_indices;
         let index = self.regexes.len();
         self.regexes.push(RegexRecord {
             compiled,
             last_index: 0,
         });
         let object = self.realm.regexp_wrapper(index);
-        for (name, value) in [
-            ("source", JsValue::String(pattern.to_owned())),
-            ("flags", JsValue::String(flags_text)),
-            ("global", JsValue::Boolean(global)),
-            ("ignoreCase", JsValue::Boolean(ignore_case)),
-            ("multiline", JsValue::Boolean(multiline)),
-            ("dotAll", JsValue::Boolean(dot_all)),
-            ("sticky", JsValue::Boolean(sticky)),
-            ("hasIndices", JsValue::Boolean(has_indices)),
-            ("lastIndex", JsValue::Number(0.0)),
-        ] {
-            self.realm.set_property(object, name.to_owned(), value);
-        }
+        // The flags and source are prototype accessors, not own properties; only
+        // `lastIndex` is an own property of an instance.
+        self.realm
+            .define_hidden_data(object, "lastIndex", JsValue::Number(0.0));
         Ok(object)
+    }
+
+    /// The accessors ECMA-262 22.2.6 defines on %RegExp.prototype%. An instance
+    /// reads its record. The prototype itself answers the source as `(?:)` and
+    /// every flag as undefined, and `flags` reads each flag through `Get`.
+    pub(in crate::runtime) fn regexp_accessor(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        accessor: RegExpAccessor,
+    ) -> Result<JsValue, JsError> {
+        // `flags` is generic (ECMA-262 22.2.6.4), so it reads every flag through
+        // `Get` even for a real RegExp, and a patched flag getter shows in it.
+        if accessor == RegExpAccessor::Flags {
+            return self.regexp_flags_from_getters(dom, receiver);
+        }
+        if let Some(ObjectHost::RegExp(index)) = self.realm.host(receiver) {
+            let flags = self.regexes[index].compiled.flags();
+            let value = match accessor {
+                RegExpAccessor::Source => {
+                    return Ok(JsValue::String(
+                        self.regexes[index].compiled.source().to_owned(),
+                    ));
+                }
+                RegExpAccessor::Flags => unreachable!("handled above"),
+                RegExpAccessor::Global => flags.global,
+                RegExpAccessor::IgnoreCase => flags.ignore_case,
+                RegExpAccessor::Multiline => flags.multiline,
+                RegExpAccessor::DotAll => flags.dot_all,
+                RegExpAccessor::Sticky => flags.sticky,
+                // `v` reads the pattern with `u` semantics internally, but the
+                // `unicode` getter reports only an explicit `u` (ECMA-262 22.2.6).
+                RegExpAccessor::Unicode => flags.unicode && !flags.unicode_sets,
+                RegExpAccessor::UnicodeSets => flags.unicode_sets,
+                RegExpAccessor::HasIndices => flags.has_indices,
+            };
+            return Ok(JsValue::Boolean(value));
+        }
+        if receiver != self.realm.regexp_prototype() {
+            return Err(JsError::type_error(
+                "RegExp accessor called on an incompatible receiver",
+            ));
+        }
+        Ok(match accessor {
+            RegExpAccessor::Source => JsValue::String("(?:)".to_owned()),
+            _ => JsValue::Undefined,
+        })
+    }
+
+    /// ECMA-262 22.2.6.4 `RegExp.prototype.flags`: each flag's getter is read
+    /// with `Get`, in the spec's order, so a subclass or a patched getter shows.
+    fn regexp_flags_from_getters(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let mut text = String::new();
+        for (name, letter) in [
+            ("hasIndices", 'd'),
+            ("global", 'g'),
+            ("ignoreCase", 'i'),
+            ("multiline", 'm'),
+            ("dotAll", 's'),
+            ("unicode", 'u'),
+            ("unicodeSets", 'v'),
+            ("sticky", 'y'),
+        ] {
+            if self.get_member(dom, receiver, name)?.is_truthy() {
+                text.push(letter);
+            }
+        }
+        Ok(JsValue::String(text))
     }
 
     pub(in crate::runtime) fn regex_index(&self, object: ObjectId) -> Result<usize, JsError> {

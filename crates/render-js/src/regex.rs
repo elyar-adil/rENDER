@@ -501,6 +501,14 @@ impl Matcher<'_> {
                 if position + length > self.input.len() {
                     return None;
                 }
+                // Under `u` a back-reference matches whole code points, so it can
+                // neither start nor end inside a surrogate pair of the input.
+                if self.flags.unicode
+                    && (is_trail_inside_pair(self.input, position)
+                        || is_trail_inside_pair(self.input, position + length))
+                {
+                    return None;
+                }
                 for offset in 0..length {
                     let expected = u32::from(self.input[start + offset]);
                     let actual = u32::from(self.input[position + offset]);
