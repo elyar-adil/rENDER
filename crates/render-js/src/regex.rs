@@ -161,12 +161,17 @@ enum Node {
         negated: bool,
         body: Box<Node>,
     },
-    Backreference(usize),
+    /// A reference to one or more groups. Duplicate names share one reference,
+    /// and the group that took part in the match is the one referred to.
+    Backreference(Vec<usize>),
     Quantifier {
         min: u32,
         max: Option<u32>,
         greedy: bool,
         body: Box<Node>,
+        /// 1-based capture indices inside `body`, cleared at the start of every
+        /// iteration (ECMA-262 `RepeatMatcher` step 4).
+        reset: Option<(usize, usize)>,
     },
     AnchorStart,
     AnchorEnd,
@@ -477,8 +482,11 @@ impl Matcher<'_> {
                     next(self, position)
                 }
             }
-            Node::Backreference(index) => {
-                let Some(Some((start, end))) = self.captures.get(*index).copied() else {
+            Node::Backreference(indices) => {
+                let captured = indices
+                    .iter()
+                    .find_map(|index| self.captures.get(*index).copied().flatten());
+                let Some((start, end)) = captured else {
                     return next(self, position);
                 };
                 let length = end - start;
@@ -499,6 +507,7 @@ impl Matcher<'_> {
                 max,
                 greedy,
                 body,
+                reset,
             } => {
                 if matches!(
                     body.as_ref(),
@@ -506,7 +515,7 @@ impl Matcher<'_> {
                 ) {
                     return self.simple_repeat(*min, *max, *greedy, body, position, next);
                 }
-                self.quantifier(*min, *max, *greedy, body, position, 0, next)
+                self.quantifier(*min, *max, *greedy, body, *reset, position, 0, next)
             }
         }
     }
@@ -592,6 +601,7 @@ impl Matcher<'_> {
         max: Option<u32>,
         greedy: bool,
         body: &Node,
+        reset: Option<(usize, usize)>,
         position: usize,
         count: u32,
         next: &mut Continuation<'_>,
@@ -602,13 +612,26 @@ impl Matcher<'_> {
             if !can_continue {
                 return None;
             }
-            matcher.node(body, position, &mut |inner, advanced| {
+            // Each iteration starts with the groups inside the body unset; they
+            // are put back if the iteration fails, so backtracking sees them.
+            let saved = reset.map(|(first, last)| {
+                let saved = matcher.captures[first..=last].to_vec();
+                matcher.captures[first..=last].fill(None);
+                saved
+            });
+            let result = matcher.node(body, position, &mut |inner, advanced| {
                 if advanced == position && min <= count + 1 {
                     // An empty-body repetition would loop forever.
                     return next(inner, advanced);
                 }
-                inner.quantifier(min, max, greedy, body, advanced, count + 1, next)
-            })
+                inner.quantifier(min, max, greedy, body, reset, advanced, count + 1, next)
+            });
+            if result.is_none()
+                && let (Some((first, last)), Some(saved)) = (reset, saved)
+            {
+                matcher.captures[first..=last].copy_from_slice(&saved);
+            }
+            result
         };
         if count < min {
             return attempt_more(self, next);
@@ -675,18 +698,31 @@ fn is_word_character(character: char) -> bool {
     character.is_ascii_alphanumeric() || character == '_'
 }
 
+/// A named group as parsed: its name, its capture index and the enclosing
+/// `(disjunction, branch)` path.
+type NamedGroup = (String, usize, Vec<(usize, usize)>);
+
 struct PatternParser<'a> {
     characters: &'a [char],
     cursor: usize,
     group_count: usize,
+    /// Capturing groups in the whole pattern, found before parsing so a decimal
+    /// escape can be told apart from a legacy octal escape.
+    total_groups: usize,
     /// Names found by [`scan_group_names`], so `\k<name>` can refer forward.
     names: Vec<(String, usize)>,
+    /// Each named group as parsed, with the `(disjunction, branch)` path that
+    /// encloses it. A name may repeat only in different branches.
+    named_groups: Vec<NamedGroup>,
+    /// The `(disjunction, branch)` pairs enclosing the position being parsed.
+    path: Vec<(usize, usize)>,
+    disjunctions: usize,
 }
 
 /// Find the named capture groups of `characters` and number them the way the
 /// parser will, without building anything. Escapes and character classes are
 /// skipped so a `(` inside them is not mistaken for a group.
-fn scan_group_names(characters: &[char]) -> Vec<(String, usize)> {
+fn scan_group_names(characters: &[char]) -> (Vec<(String, usize)>, usize) {
     let mut names = Vec::new();
     let mut count = 0usize;
     let mut cursor = 0usize;
@@ -703,13 +739,8 @@ fn scan_group_names(characters: &[char]) -> Vec<(String, usize)> {
                     && !matches!(characters.get(cursor + 3), Some('=' | '!'))
                 {
                     count += 1;
-                    let start = cursor + 3;
-                    let end = characters[start..]
-                        .iter()
-                        .position(|character| *character == '>')
-                        .map(|offset| start + offset);
-                    if let Some(end) = end {
-                        names.push((characters[start..end].iter().collect(), count));
+                    if let Some((name, _)) = read_group_name(characters, cursor + 3) {
+                        names.push((name, count));
                     }
                 }
             }
@@ -717,7 +748,99 @@ fn scan_group_names(characters: &[char]) -> Vec<(String, usize)> {
         }
         cursor += 1;
     }
-    names
+    (names, count)
+}
+
+/// Read a `GroupName` whose `<` is already consumed, from `cursor` through its
+/// closing `>`. Returns the decoded name and the cursor after the `>`. A `\u`
+/// escape is decoded, and each character must be an identifier start (first)
+/// or identifier part (later).
+fn read_group_name(characters: &[char], mut cursor: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    loop {
+        let character = *characters.get(cursor)?;
+        if character == '>' {
+            break;
+        }
+        let (value, next) = if character == '\\' {
+            if characters.get(cursor + 1) != Some(&'u') {
+                return None;
+            }
+            unicode_escape_value(characters, cursor + 2)?
+        } else {
+            (u32::from(character), cursor + 1)
+        };
+        let decoded = char::from_u32(value)?;
+        let valid = if name.is_empty() {
+            is_identifier_start(decoded)
+        } else {
+            is_identifier_part(decoded)
+        };
+        if !valid {
+            return None;
+        }
+        name.push(decoded);
+        cursor = next;
+    }
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, cursor + 1))
+}
+
+/// The code point of a `\u` escape whose `u` is already consumed: `{X…}`, or
+/// four hex digits joined with a following `\uXXXX` trail surrogate. Returns the
+/// code point and the cursor after the escape.
+fn unicode_escape_value(characters: &[char], cursor: usize) -> Option<(u32, usize)> {
+    if characters.get(cursor) == Some(&'{') {
+        let close = cursor + 1 + characters[cursor + 1..].iter().position(|c| *c == '}')?;
+        let digits: String = characters[cursor + 1..close].iter().collect();
+        if digits.is_empty() || !digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u32::from_str_radix(&digits, 16).ok()?;
+        return (value <= 0x10_ffff).then_some((value, close + 1));
+    }
+    let lead = hex_value(characters, cursor, 4)?;
+    if (0xd800..=0xdbff).contains(&lead)
+        && characters.get(cursor + 4) == Some(&'\\')
+        && characters.get(cursor + 5) == Some(&'u')
+        && let Some(trail) = hex_value(characters, cursor + 6, 4)
+        && (0xdc00..=0xdfff).contains(&trail)
+    {
+        let value = 0x1_0000 + ((lead - 0xd800) << 10) + (trail - 0xdc00);
+        return Some((value, cursor + 10));
+    }
+    Some((lead, cursor + 4))
+}
+
+/// `digits` hexadecimal digits starting at `cursor`, if all of them are present.
+fn hex_value(characters: &[char], cursor: usize, digits: usize) -> Option<u32> {
+    let text: String = characters.get(cursor..cursor + digits)?.iter().collect();
+    if !text.chars().all(|digit| digit.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(&text, 16).ok()
+}
+
+fn is_identifier_start(character: char) -> bool {
+    character == '$' || character == '_' || unicode_ident::is_xid_start(character)
+}
+
+fn is_identifier_part(character: char) -> bool {
+    is_identifier_start(character)
+        || character == '\u{200c}'
+        || character == '\u{200d}'
+        || unicode_ident::is_xid_continue(character)
+}
+
+/// Whether two groups share a disjunction and sit in different branches of it.
+fn in_different_branches(left: &[(usize, usize)], right: &[(usize, usize)]) -> bool {
+    left.iter().any(|(disjunction, branch)| {
+        right
+            .iter()
+            .any(|(other, other_branch)| disjunction == other && branch != other_branch)
+    })
 }
 
 /// Compile a pattern with the given flags.
@@ -729,18 +852,33 @@ fn scan_group_names(characters: &[char]) -> Vec<(String, usize)> {
 pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
     let parsed_flags = Flags::parse(flags)?;
     let characters: Vec<char> = pattern.chars().collect();
-    let names = scan_group_names(&characters);
+    let (names, total_groups) = scan_group_names(&characters);
     let mut parser = PatternParser {
         characters: &characters,
         cursor: 0,
         group_count: 0,
+        total_groups,
         names: names.clone(),
+        named_groups: Vec::new(),
+        path: Vec::new(),
+        disjunctions: 0,
     };
     let root = parser.alternative(true)?;
     if parser.cursor != characters.len() {
         return Err(RegexSyntaxError::new(
             "unexpected ')' in pattern".to_owned(),
         ));
+    }
+    let groups = &parser.named_groups;
+    for (position, (name, _, path)) in groups.iter().enumerate() {
+        let repeats = groups[position + 1..].iter().any(|(other, _, other_path)| {
+            other == name && !in_different_branches(path, other_path)
+        });
+        if repeats {
+            return Err(RegexSyntaxError::new(
+                "duplicate capture group name".to_owned(),
+            ));
+        }
     }
     Ok(Compiled {
         root,
@@ -787,10 +925,18 @@ impl PatternParser<'_> {
     }
 
     fn alternative(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
-        let mut branches = vec![self.sequence(top_level)?];
-        while self.peek() == Some('|') {
+        let disjunction = self.disjunctions;
+        self.disjunctions += 1;
+        let mut branches = Vec::new();
+        loop {
+            self.path.push((disjunction, branches.len()));
+            let branch = self.sequence(top_level)?;
+            self.path.pop();
+            branches.push(branch);
+            if self.peek() != Some('|') {
+                break;
+            }
             self.cursor += 1;
-            branches.push(self.sequence(top_level)?);
         }
         Ok(if branches.len() == 1 {
             branches.pop().unwrap_or(Node::Empty)
@@ -805,8 +951,11 @@ impl PatternParser<'_> {
             if character == '|' || character == ')' {
                 break;
             }
+            let groups_before = self.group_count;
             let atom = self.atom(top_level)?;
-            let atom = self.maybe_quantifier(atom)?;
+            let reset =
+                (self.group_count > groups_before).then_some((groups_before + 1, self.group_count));
+            let atom = self.maybe_quantifier(atom, reset)?;
             items.push(atom);
         }
         Ok(match items.len() {
@@ -816,7 +965,11 @@ impl PatternParser<'_> {
         })
     }
 
-    fn maybe_quantifier(&mut self, atom: Node) -> Result<Node, RegexSyntaxError> {
+    fn maybe_quantifier(
+        &mut self,
+        atom: Node,
+        reset: Option<(usize, usize)>,
+    ) -> Result<Node, RegexSyntaxError> {
         let (min, max) = match self.peek() {
             Some('*') => {
                 self.cursor += 1;
@@ -850,6 +1003,7 @@ impl PatternParser<'_> {
             max,
             greedy,
             body: Box::new(atom),
+            reset,
         })
     }
 
@@ -958,37 +1112,16 @@ impl PatternParser<'_> {
                         });
                     }
                     // `(?<name>…)`: a capture group that also has a name.
-                    let mut name = String::new();
-                    loop {
-                        match self.bump() {
-                            Some('>') => break,
-                            Some(character)
-                                if character.is_alphanumeric()
-                                    || character == '_'
-                                    || character == '$' =>
-                            {
-                                name.push(character);
-                            }
-                            _ => {
-                                return Err(RegexSyntaxError::new(
-                                    "invalid capture group name".to_owned(),
-                                ));
-                            }
-                        }
-                    }
-                    if name.is_empty() || name.starts_with(|first: char| first.is_ascii_digit()) {
+                    let Some((name, next)) = read_group_name(self.characters, self.cursor) else {
                         return Err(RegexSyntaxError::new(
                             "invalid capture group name".to_owned(),
                         ));
-                    }
-                    let duplicates = self.names.iter().filter(|(existing, _)| *existing == name);
-                    if duplicates.count() > 1 {
-                        return Err(RegexSyntaxError::new(
-                            "duplicate capture group name".to_owned(),
-                        ));
-                    }
+                    };
+                    self.cursor = next;
                     self.group_count += 1;
                     index = Some(self.group_count);
+                    self.named_groups
+                        .push((name, self.group_count, self.path.clone()));
                 }
                 Some('i' | 'm' | 's' | '-') => {
                     self.cursor -= 1;
@@ -1130,35 +1263,69 @@ impl PatternParser<'_> {
                     items: vec![ClassItem::Property(property, character == 'p')],
                 })
             }
-            '1'..='9' => Ok(Node::Backreference(
-                character.to_digit(10).unwrap_or_default() as usize,
-            )),
+            '1'..='9' => {
+                // A decimal escape is a backreference only when it names a group
+                // of the pattern; otherwise Annex B reads it as an octal escape
+                // (or, for 8 and 9, as the digit itself).
+                let first = character.to_digit(10).unwrap_or_default();
+                let after_first = self.cursor;
+                let mut number = first as usize;
+                while let Some(digit) = self.peek().and_then(|value| value.to_digit(10)) {
+                    number = number.saturating_mul(10).saturating_add(digit as usize);
+                    self.cursor += 1;
+                }
+                if number <= self.total_groups {
+                    return Ok(Node::Backreference(vec![number]));
+                }
+                self.cursor = after_first;
+                if first >= 8 {
+                    return Ok(Node::Literal(character));
+                }
+                Ok(Node::Literal(self.octal_escape(first)))
+            }
+            '0' => Ok(Node::Literal(self.octal_escape(0))),
             'k' if !self.names.is_empty() => {
                 if !self.eat('<') {
                     return Err(RegexSyntaxError::new("invalid named reference".to_owned()));
                 }
-                let mut name = String::new();
-                loop {
-                    match self.bump() {
-                        Some('>') => break,
-                        Some(character) => name.push(character),
-                        None => {
-                            return Err(RegexSyntaxError::new(
-                                "invalid named reference".to_owned(),
-                            ));
-                        }
-                    }
-                }
-                let index = self
+                let Some((name, next)) = read_group_name(self.characters, self.cursor) else {
+                    return Err(RegexSyntaxError::new("invalid named reference".to_owned()));
+                };
+                self.cursor = next;
+                let indices: Vec<usize> = self
                     .names
                     .iter()
-                    .find(|(candidate, _)| *candidate == name)
+                    .filter(|(candidate, _)| *candidate == name)
                     .map(|(_, index)| *index)
-                    .ok_or_else(|| RegexSyntaxError::new("undefined named reference".to_owned()))?;
-                Ok(Node::Backreference(index))
+                    .collect();
+                if indices.is_empty() {
+                    return Err(RegexSyntaxError::new(
+                        "undefined named reference".to_owned(),
+                    ));
+                }
+                Ok(Node::Backreference(indices))
             }
             other => Ok(Node::Literal(self.escape_char(other)?)),
         }
+    }
+
+    /// Annex B `LegacyOctalEscapeSequence` whose first digit `first` (0 to 7) is
+    /// already consumed. `\0` not followed by an octal digit is NUL.
+    fn octal_escape(&mut self, first: u32) -> char {
+        if first == 0 && !self.peek().is_some_and(|value| value.is_digit(8)) {
+            return '\0';
+        }
+        // Up to two more digits after 0 to 3, and one more after 4 to 7.
+        let extra = if first <= 3 { 2 } else { 1 };
+        let mut value = first;
+        for _ in 0..extra {
+            let Some(digit) = self.peek().and_then(|character| character.to_digit(8)) else {
+                break;
+            };
+            value = value * 8 + digit;
+            self.cursor += 1;
+        }
+        char::from_u32(value).unwrap_or('\0')
     }
 
     fn class_escape(&mut self) -> Result<ClassEscape, RegexSyntaxError> {
@@ -1172,6 +1339,9 @@ impl PatternParser<'_> {
                 Ok(ClassEscape::Shorthand(shorthand_item(character)))
             }
             'b' => Ok(ClassEscape::Char('\u{0008}')),
+            '0'..='7' => Ok(ClassEscape::Char(
+                self.octal_escape(character.to_digit(8).unwrap_or_default()),
+            )),
             'p' | 'P' => {
                 let property = self.property_escape()?;
                 Ok(ClassEscape::Shorthand(ClassItem::Property(
@@ -1208,12 +1378,6 @@ impl PatternParser<'_> {
             'r' => Ok('\r'),
             't' => Ok('\t'),
             'v' => Ok('\u{000b}'),
-            '0' if !self
-                .peek()
-                .is_some_and(|value: char| value.is_ascii_digit()) =>
-            {
-                Ok('\0')
-            }
             // §22.2.1 ControlEscape: `\cA` is U+0001 … `\cZ` is U+001A.
             'c' => match self.peek() {
                 Some(letter) if letter.is_ascii_alphabetic() => {
@@ -1696,6 +1860,43 @@ mod tests {
                 "/{pattern}/{flags} must not be rejected at parse time"
             );
         }
+    }
+
+    #[test]
+    fn named_groups_share_names_across_branches_and_decode_escapes() {
+        use super::validate;
+        // A name may repeat only in different branches of one disjunction.
+        assert!(validate("(?<x>a)|(?<x>b)", "").is_ok());
+        assert!(validate("(?<x>a)(?<x>b)", "").is_err());
+        // The duplicate that took part is the one a backreference refers to.
+        assert_eq!(matches(r"(?:(?<x>a)|(?<x>b))\k<x>", "", "bb"), Some((0, 2)));
+        assert_eq!(matches(r"(?:(?<x>a)|(?<x>b))\k<x>", "", "aa"), Some((0, 2)));
+        assert_eq!(matches(r"(?:(?<x>a)|(?<x>b))\k<x>", "", "ab"), None);
+        // Each iteration of a quantifier starts its groups unset.
+        assert_eq!(
+            matches(r"(?:(?:(?<x>a)|(?<x>b))\k<x>){2}", "", "aabb"),
+            Some((0, 4))
+        );
+        assert_eq!(
+            matches(r"(?:(?:(?<x>a)|(?<x>b))\k<x>){2}", "", "abab"),
+            None
+        );
+        assert_eq!(groups(r"(?:(a)|b)+", "", "ab"), vec![None]);
+        // Group names decode identifier escapes, including surrogate pairs.
+        let spelled = compile(r"(?<ab>x)\k<\u{61}b>", "").expect("compiles");
+        assert_eq!(spelled.group_names[0].0, "ab");
+        assert_eq!(matches(r"(?<ab>x)\k<\u{61}b>", "", "xx"), Some((0, 2)));
+        let astral = compile(r"(?<𝒜>a)", "").expect("compiles");
+        assert_eq!(astral.group_names[0].0, "\u{1d49c}");
+        assert!(validate(r"(?<\uD835>a)", "").is_err());
+        assert!(validate(r"(?<1a>a)", "").is_err());
+        // Annex B: a decimal escape is a backreference only to an existing group.
+        assert_eq!(matches(r"\1", "", "\u{1}"), Some((0, 1)));
+        assert_eq!(matches(r"(a)\2", "", "a\u{2}"), Some((0, 2)));
+        assert_eq!(matches(r"\8", "", "8"), Some((0, 1)));
+        assert_eq!(matches(r"\012", "", "\n"), Some((0, 1)));
+        assert_eq!(matches(r"[\1]", "", "\u{1}"), Some((0, 1)));
+        assert_eq!(matches(r"\0", "", "\u{0}"), Some((0, 1)));
     }
 
     #[test]

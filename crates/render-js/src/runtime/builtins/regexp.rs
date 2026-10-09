@@ -162,11 +162,24 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let groups = self.realm.create_object(None);
+        // Keys follow source order, and a name shared by several groups takes
+        // the value of the one that participated (at most one can).
+        let mut entries: Vec<(&String, JsValue)> = Vec::new();
         for (name, index) in found.names.iter() {
             let value = match found.groups.get(index - 1) {
                 Some(Some((start, end))) => JsValue::String(input[*start..*end].iter().collect()),
                 _ => JsValue::Undefined,
             };
+            match entries.iter_mut().find(|(existing, _)| *existing == name) {
+                Some((_, current)) => {
+                    if matches!(current, JsValue::Undefined) {
+                        *current = value;
+                    }
+                }
+                None => entries.push((name, value)),
+            }
+        }
+        for (name, value) in entries {
             self.realm.set_property(groups, name.clone(), value);
         }
         Ok(JsValue::Object(groups))
