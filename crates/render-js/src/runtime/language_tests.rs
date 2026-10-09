@@ -1120,3 +1120,78 @@ fn a_block_comment_with_a_line_separator_allows_automatic_semicolon_insertion() 
         JsErrorKind::Syntax
     );
 }
+
+#[test]
+fn an_escaped_of_is_not_the_for_of_keyword() {
+    let error = eval("var x; for (x o\\u0066 []) ;").expect_err("escaped of");
+    assert_eq!(error.kind(), JsErrorKind::Syntax);
+    let error = eval("async function* f() { for await (var x o\\u0066 []) ; }")
+        .expect_err("escaped of in for await");
+    assert_eq!(error.kind(), JsErrorKind::Syntax);
+}
+
+#[test]
+fn strict_code_refuses_eval_and_arguments_as_assignment_targets() {
+    let error = eval("'use strict'; for ([arguments] of [[]]) ;").expect_err("strict target");
+    assert_eq!(error.kind(), JsErrorKind::Syntax);
+    let error = eval("'use strict'; arguments = 1;").expect_err("strict simple target");
+    assert_eq!(error.kind(), JsErrorKind::Syntax);
+    assert_eq!(ok("var arguments = 1; arguments = 2; arguments"), "2");
+}
+
+#[test]
+fn generators_and_async_functions_are_not_constructors() {
+    assert_eq!(
+        eval("function* g() {} new g();").unwrap_err().kind(),
+        JsErrorKind::Type
+    );
+    assert_eq!(
+        eval("new (async function () {})();").unwrap_err().kind(),
+        JsErrorKind::Type
+    );
+    assert_eq!(ok("function f() {} String(new f() instanceof f)"), "true");
+}
+
+#[test]
+fn non_writable_symbol_keyed_properties_ignore_writes() {
+    assert_eq!(
+        ok(
+            "var o = Object.defineProperty({}, Symbol.toStringTag, { value: 'x', writable: false }); o[Symbol.toStringTag] = 'y'; o[Symbol.toStringTag]"
+        ),
+        "x"
+    );
+    assert_eq!(
+        ok(
+            "var p = Object.defineProperty({}, Symbol.toStringTag, { value: 'x', writable: false }); var o = Object.create(p); o[Symbol.toStringTag] = 'z'; Object.prototype.hasOwnProperty.call(o, Symbol.toStringTag) ? 'own' : o[Symbol.toStringTag]"
+        ),
+        "x"
+    );
+}
+
+#[test]
+fn iterator_steps_read_done_and_value_through_getters() {
+    assert_eq!(
+        ok(
+            "var iter = {}; iter[Symbol.iterator] = function () { return { next() { \
+            return Object.defineProperty({}, 'value', { get() { throw new Error('v'); } }); } }; }; \
+            var r; try { var [...x] = iter; r = 'no'; } catch (e) { r = e.message; } r"
+        ),
+        "v"
+    );
+}
+
+#[test]
+fn array_patterns_use_the_array_iterator_protocol() {
+    assert_eq!(
+        ok(
+            "delete Array.prototype[Symbol.iterator]; var r; try { var [x] = [1]; r = 'no'; } catch (e) { r = e.constructor.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var saved = Array.prototype[Symbol.iterator]; Array.prototype[Symbol.iterator] = function () { return { next() { return { done: true }; } }; }; var [a] = [1]; Array.prototype[Symbol.iterator] = saved; String(a)"
+        ),
+        "undefined"
+    );
+}

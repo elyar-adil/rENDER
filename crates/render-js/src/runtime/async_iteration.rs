@@ -59,7 +59,7 @@ pub(super) type AsyncGenerators = BTreeMap<usize, AsyncGenerator>;
 
 impl JsRuntime {
     /// A new async generator starts suspended before its body (ECMA-262
-    /// 27.6.3.2 AsyncGeneratorStart).
+    /// 27.6.3.2 `AsyncGeneratorStart`).
     pub(super) fn start_async_generator(&mut self, id: usize) {
         self.async_generators.insert(
             id,
@@ -71,7 +71,9 @@ impl JsRuntime {
     }
 
     pub(super) fn async_generator_state(&self, id: usize) -> Option<AsyncGeneratorState> {
-        self.async_generators.get(&id).map(|generator| generator.state)
+        self.async_generators
+            .get(&id)
+            .map(|generator| generator.state)
     }
 
     fn set_async_generator_state(&mut self, id: usize, state: AsyncGeneratorState) {
@@ -169,7 +171,7 @@ impl JsRuntime {
         Ok(result)
     }
 
-    /// AsyncGeneratorResume: run the body for `completion`.
+    /// `AsyncGeneratorResume`: run the body for `completion`.
     fn async_generator_resume(&mut self, dom: &mut Dom, id: usize, completion: Resume) {
         self.set_async_generator_state(id, AsyncGeneratorState::Executing);
         self.async_generator_drive(dom, id, completion);
@@ -188,15 +190,11 @@ impl JsRuntime {
                 Ok(CoStep::Yield(value)) => {
                     // AsyncGeneratorYield: settle the request that asked for it.
                     self.async_generator_complete_step(id, Ok(value), false);
-                    match self.front_completion(id) {
-                        Some(next) => resume = next,
-                        None => {
-                            self.set_async_generator_state(
-                                id,
-                                AsyncGeneratorState::SuspendedYield,
-                            );
-                            return;
-                        }
+                    if let Some(next) = self.front_completion(id) {
+                        resume = next;
+                    } else {
+                        self.set_async_generator_state(id, AsyncGeneratorState::SuspendedYield);
+                        return;
                     }
                 }
                 Ok(CoStep::Complete(value)) => {
@@ -230,7 +228,7 @@ impl JsRuntime {
         self.async_generator_drive(dom, id, resume);
     }
 
-    /// AsyncGeneratorCompleteStep: settle the request at the head of the queue.
+    /// `AsyncGeneratorCompleteStep`: settle the request at the head of the queue.
     fn async_generator_complete_step(
         &mut self,
         id: usize,
@@ -250,7 +248,7 @@ impl JsRuntime {
         }
     }
 
-    /// AsyncGeneratorStart's ending: the body is done, so it completes its
+    /// `AsyncGeneratorStart`'s ending: the body is done, so it completes its
     /// request and answers the rest of the queue (ECMA-262 27.6.3.2 steps 7-11).
     fn async_generator_finish(
         &mut self,
@@ -263,7 +261,7 @@ impl JsRuntime {
         self.async_generator_drain(dom, id);
     }
 
-    /// AsyncGeneratorDrainQueue: a completed generator answers its queued
+    /// `AsyncGeneratorDrainQueue`: a completed generator answers its queued
     /// requests in order; a queued `return` starts awaiting its operand.
     fn async_generator_drain(&mut self, dom: &mut Dom, id: usize) {
         loop {
@@ -284,7 +282,7 @@ impl JsRuntime {
         }
     }
 
-    /// AsyncGeneratorAwaitReturn: await the operand of the `return` request at
+    /// `AsyncGeneratorAwaitReturn`: await the operand of the `return` request at
     /// the head of the queue. Its settlement comes back through
     /// [`Self::async_generator_continue`].
     fn async_generator_await_return(&mut self, dom: &mut Dom, id: usize) {
@@ -314,7 +312,7 @@ impl JsRuntime {
 
     /// GetIterator(value, async) (ECMA-262 7.4.3): `@@asyncIterator` when the
     /// value has one, otherwise the sync iterator wrapped by
-    /// CreateAsyncFromSyncIterator (27.1.4.1).
+    /// `CreateAsyncFromSyncIterator` (27.1.4.1).
     pub(super) fn async_delegate_iterator(
         &mut self,
         dom: &mut Dom,
@@ -379,8 +377,7 @@ impl JsRuntime {
         method: AsyncFromSyncMethod,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let Some(ObjectHost::AsyncFromSyncIterator { iterator, next }) =
-            self.realm.host(receiver)
+        let Some(ObjectHost::AsyncFromSyncIterator { iterator, next }) = self.realm.host(receiver)
         else {
             return Err(JsError::type_error(
                 "incompatible AsyncFromSyncIterator receiver",
@@ -433,7 +430,7 @@ impl JsRuntime {
         }
     }
 
-    /// AsyncFromSyncIteratorContinuation (ECMA-262 27.1.6.4): await the sync
+    /// `AsyncFromSyncIteratorContinuation` (ECMA-262 27.1.6.4): await the sync
     /// result's value and unwrap it into an iterator result.
     fn async_from_sync_continuation(
         &mut self,
@@ -461,14 +458,11 @@ impl JsRuntime {
         } else {
             JsValue::Object(self.realm.async_from_sync_close(iterator))
         };
-        self.perform_promise_then(
-            wrapper,
-            &[JsValue::Object(on_fulfilled), on_rejected],
-        )
+        self.perform_promise_then(wrapper, &[JsValue::Object(on_fulfilled), on_rejected])
     }
 
-    /// The `[[Get]]` of an optional method (ECMA-262 7.3.11 GetMethod).
-    fn get_method(
+    /// The `[[Get]]` of an optional method (ECMA-262 7.3.11 `GetMethod`).
+    pub(super) fn get_method(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,

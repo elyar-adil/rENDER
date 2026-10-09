@@ -115,6 +115,10 @@ pub(super) struct UserFunction {
     /// its argument is `undefined` or absent, in the call environment built
     /// so far, so later defaults see earlier bindings.
     pub(super) defaults: Vec<Option<Expr>>,
+    /// The `var` declaration that binds a destructuring parameter, parallel to
+    /// `parameters`; `None` for a plain parameter. [`JsRuntime::bind_parameters`]
+    /// runs it during the call, before any body statement.
+    pub(super) patterns: Vec<Option<Statement>>,
     pub(super) body: Vec<Statement>,
     pub(super) captured_environment: Vec<Environment>,
     /// Arrow functions do not bind their own `this`; they resolve the

@@ -419,14 +419,12 @@ fn suspended_coroutines_survive_garbage_collection() {
 #[test]
 fn async_generator_yields_values_and_then_completes() {
     assert_eq!(
-        ok(
-            "async function* g() { yield 1; yield 2; return 3; } \
+        ok("async function* g() { yield 1; yield 2; return 3; } \
             var it = g(); \
             it.next().then(function (r) { log.push(r.value, r.done); }); \
             it.next().then(function (r) { log.push(r.value, r.done); }); \
             it.next().then(function (r) { log.push(r.value, r.done); }); \
-            it.next().then(function (r) { log.push(r.value, r.done); });"
-        ),
+            it.next().then(function (r) { log.push(r.value, r.done); });"),
         "1,false,2,false,3,true,,true"
     );
 }
@@ -434,7 +432,9 @@ fn async_generator_yields_values_and_then_completes() {
 #[test]
 fn async_generator_body_starts_on_the_first_next() {
     assert_eq!(
-        ok("async function* g() { log.push('started'); } var it = g(); log.push('created'); it.next();"),
+        ok(
+            "async function* g() { log.push('started'); } var it = g(); log.push('created'); it.next();"
+        ),
         "created,started"
     );
 }
@@ -453,7 +453,9 @@ fn async_generator_queues_requests_in_order() {
 #[test]
 fn async_generator_yield_awaits_its_operand() {
     assert_eq!(
-        ok("async function* g() { yield Promise.resolve(7); } g().next().then(function (r) { log.push(r.value, r.done); });"),
+        ok(
+            "async function* g() { yield Promise.resolve(7); } g().next().then(function (r) { log.push(r.value, r.done); });"
+        ),
         "7,false"
     );
 }
@@ -461,7 +463,9 @@ fn async_generator_yield_awaits_its_operand() {
 #[test]
 fn async_generator_return_awaits_its_operand() {
     assert_eq!(
-        ok("async function* g() { return Promise.resolve(9); } g().next().then(function (r) { log.push(r.value, r.done); });"),
+        ok(
+            "async function* g() { return Promise.resolve(9); } g().next().then(function (r) { log.push(r.value, r.done); });"
+        ),
         "9,true"
     );
 }
@@ -493,10 +497,8 @@ fn async_generator_throw_is_delivered_into_the_body_at_yield() {
 #[test]
 fn async_generator_return_before_start_completes_without_running_the_body() {
     assert_eq!(
-        ok(
-            "async function* g() { log.push('never'); } var it = g(); \
-            it.return(4).then(function (r) { log.push(r.value, r.done); });"
-        ),
+        ok("async function* g() { log.push('never'); } var it = g(); \
+            it.return(4).then(function (r) { log.push(r.value, r.done); });"),
         "4,true"
     );
 }
@@ -504,10 +506,8 @@ fn async_generator_return_before_start_completes_without_running_the_body() {
 #[test]
 fn async_generator_throw_before_start_rejects() {
     assert_eq!(
-        ok(
-            "async function* g() { log.push('never'); } var it = g(); \
-            it.throw('x').catch(function (e) { log.push('rejected' + e); });"
-        ),
+        ok("async function* g() { log.push('never'); } var it = g(); \
+            it.throw('x').catch(function (e) { log.push('rejected' + e); });"),
         "rejectedx"
     );
 }
@@ -515,10 +515,8 @@ fn async_generator_throw_before_start_rejects() {
 #[test]
 fn async_generator_after_completion_answers_done() {
     assert_eq!(
-        ok(
-            "async function* g() {} var it = g(); \
-            it.next().then(function () { return it.next(); }).then(function (r) { log.push(r.value, r.done); });"
-        ),
+        ok("async function* g() {} var it = g(); \
+            it.next().then(function () { return it.next(); }).then(function (r) { log.push(r.value, r.done); });"),
         ",true"
     );
 }
@@ -526,10 +524,8 @@ fn async_generator_after_completion_answers_done() {
 #[test]
 fn for_await_reads_an_async_generator() {
     assert_eq!(
-        ok(
-            "async function* g() { yield 1; yield 2; } \
-            (async function () { for await (var x of g()) { log.push(x); } })();"
-        ),
+        ok("async function* g() { yield 1; yield 2; } \
+            (async function () { for await (var x of g()) { log.push(x); } })();"),
         "1,2"
     );
 }
@@ -554,5 +550,128 @@ fn breaking_out_of_for_await_awaits_return() {
             (async function () { for await (var x of iterable) { log.push(x); if (x === 1) { break; } } log.push('after'); })();"
         ),
         "0,1,return,after"
+    );
+}
+
+#[test]
+fn generator_parameter_patterns_bind_at_the_call() {
+    // A later default initializer runs during the call, so it sees the
+    // pattern's binding before the generator body (which has not run) does.
+    assert_eq!(
+        ok(
+            "var captured = 'unbound'; function* g([a], b = (captured = a)) { yield; } g([9]); log.push(String(captured));"
+        ),
+        "9"
+    );
+    assert_eq!(
+        ok(
+            "var ran = 0; function* g({}) { ran++; } try { g(null); } catch (e) { log.push(e.constructor.name); } log.push(ran);"
+        ),
+        "TypeError,0"
+    );
+}
+
+#[test]
+fn async_generator_parameter_patterns_throw_at_the_call() {
+    assert_eq!(
+        ok(
+            "async function* g({}) { log.push('body'); } try { g(null); } catch (e) { log.push('sync ' + e.constructor.name); }"
+        ),
+        "sync TypeError"
+    );
+}
+
+#[test]
+fn async_generator_yield_star_drives_an_async_iterator() {
+    assert_eq!(
+        ok(
+            "var inner = { [Symbol.asyncIterator]() { var i = 0; return { \
+                next(v) { log.push('n' + v); i++; return Promise.resolve({ value: i * 10, done: i > 2 }); } }; } }; \
+            async function* g() { var r = yield* inner; return 'end' + r; } \
+            var it = g(); var out = []; \
+            it.next('a').then(function (x) { out.push(x.value, x.done); return it.next('b'); }) \
+              .then(function (x) { out.push(x.value, x.done); return it.next('c'); }) \
+              .then(function (x) { out.push(x.value, x.done); log.push(out.join('|')); });"
+        ),
+        "nundefined,nb,nc,10|false|20|false|end30|true"
+    );
+}
+
+#[test]
+fn async_generator_yield_star_return_is_awaited_and_delegated() {
+    assert_eq!(
+        ok("var inner = { [Symbol.asyncIterator]() { return { \
+                next() { return Promise.resolve({ value: 'x', done: false }); }, \
+                return(v) { log.push('ret' + v); return Promise.resolve({ value: 'R' + v, done: true }); } }; } }; \
+            async function* g() { try { yield* inner; } finally { log.push('fin'); } } \
+            var it = g(); \
+            it.next().then(function () { return it.return('z'); }) \
+              .then(function (r) { log.push(r.value + '|' + r.done); });"),
+        "retz,fin,Rz|true"
+    );
+}
+
+#[test]
+fn async_generator_yield_star_throw_reaches_the_inner_throw() {
+    assert_eq!(
+        ok("var inner = { [Symbol.asyncIterator]() { return { \
+                next() { return Promise.resolve({ value: 1, done: false }); }, \
+                throw(e) { log.push('thr' + e); return Promise.resolve({ value: 'caught', done: true }); } }; } }; \
+            async function* g() { var r = yield* inner; log.push('after' + r); } \
+            var it = g(); \
+            it.next().then(function () { return it.throw('boom'); }) \
+              .then(function (r) { log.push(r.value + '|' + r.done); });"),
+        "thrboom,aftercaught,undefined|true"
+    );
+}
+
+#[test]
+fn async_generator_yield_star_without_throw_closes_and_throws_a_type_error() {
+    assert_eq!(
+        ok("var inner = { [Symbol.asyncIterator]() { return { \
+                next() { return Promise.resolve({ value: 1, done: false }); }, \
+                return() { log.push('closed'); return Promise.resolve({ done: true }); } }; } }; \
+            async function* g() { yield* inner; } \
+            var it = g(); \
+            it.next().then(function () { return it.throw(new Error('x')); }) \
+              .then(null, function (e) { log.push(e.constructor.name); });"),
+        "closed,TypeError"
+    );
+}
+
+#[test]
+fn async_generator_yield_star_over_a_sync_iterable_awaits_its_values() {
+    assert_eq!(
+        ok("async function* g() { yield* [Promise.resolve(1), 2]; } \
+            var it = g(); \
+            it.next().then(function (r) { log.push(r.value); return it.next(); }) \
+              .then(function (r) { log.push(r.value, r.done); });"),
+        "1,2,false"
+    );
+}
+
+#[test]
+fn generator_objects_inherit_from_their_function_prototype() {
+    assert_eq!(
+        ok(
+            "function* g() {} log.push(Object.getPrototypeOf(g()) === g.prototype, g.prototype.hasOwnProperty('constructor'));"
+        ),
+        "true,false"
+    );
+    assert_eq!(
+        ok(
+            "async function* g() {} var P = Object.getPrototypeOf(Object.getPrototypeOf(g())); log.push(P.hasOwnProperty(Symbol.toStringTag), P.next.length, P.return.length, P.throw.length);"
+        ),
+        "true,1,1,1"
+    );
+}
+
+#[test]
+fn promise_resolve_wraps_a_promise_whose_constructor_is_not_promise() {
+    assert_eq!(
+        ok("var p = Promise.resolve(1); \
+            Object.defineProperty(p, 'constructor', { get() { throw new Error('ctor'); } }); \
+            (async function () { try { await p; log.push('ok'); } catch (e) { log.push('caught ' + e.message); } })();"),
+        "caught ctor"
     );
 }

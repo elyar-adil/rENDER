@@ -70,8 +70,40 @@ enum AfterAwait {
     /// the completion then continues outwards.
     CloseIterator(Abrupt),
     /// An async generator resumed at `yield` with `return v`: the awaited value
-    /// becomes the return value (ECMA-262 27.6.3.8, AsyncGeneratorUnwrapYieldResumption).
+    /// becomes the return value (ECMA-262 27.6.3.8, `AsyncGeneratorUnwrapYieldResumption`).
     YieldReturn,
+    /// An async `yield*` awaiting the result of its inner `next`, `throw` or
+    /// `return` call (ECMA-262 15.5.5 step 8.a.ii). `is_return` marks a `return`
+    /// call, whose done result ends the body instead of the `yield*`.
+    DelegateResult { is_return: bool },
+    /// An async `yield*` resumed with `return v`: `v` is awaited first, and the
+    /// settled value is delegated as a return, or a rejection as a throw
+    /// (`AsyncGeneratorUnwrapYieldResumption`).
+    DelegateUnwrap,
+    /// An async `yield*` resumed with `return` on an iterator with no `return`
+    /// method: the awaited value is returned from the body (step 7.c.iii.2).
+    ReturnAwaited,
+    /// An async `yield*` resumed with `throw` on an iterator with no `throw`
+    /// method: the awaited `return()` result closes the iterator, and the
+    /// protocol violation is thrown (step 7.b.iii).
+    MissingThrow,
+}
+
+/// Suspend the coroutine until `result` settles, then handle it as an inner
+/// result of an async `yield*` ([`AfterAwait::DelegateResult`]).
+fn await_delegate_result(co: &mut Coroutine, result: JsValue, is_return: bool) -> Flow {
+    co.after_await = Some(AfterAwait::DelegateResult { is_return });
+    Flow::Suspend(CoStep::Await(result))
+}
+
+/// The hidden binding a suspended `yield*` delivers its final value to.
+fn delegate_target(co: &Coroutine) -> Result<Rc<str>, JsError> {
+    match co.code.instrs.get(co.pc) {
+        Some(Instr::Suspend { target, .. }) => Ok(target.clone()),
+        _ => Err(JsError::type_error(
+            "coroutine resumed away from a suspension",
+        )),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,10 +258,22 @@ impl JsRuntime {
     pub(super) fn start_coroutine(
         &mut self,
         dom: &mut Dom,
+        callee: ObjectId,
         function_index: usize,
         function: &UserFunction,
         call_environment: &Environment,
     ) -> Result<JsValue, JsError> {
+        // OrdinaryCreateFromConstructor: a generator object inherits from the
+        // callee's own `prototype` when that is an object (ECMA-262 27.3.3.1, 27.6.3.1).
+        let generator_prototype = match function.kind {
+            FunctionKind::Generator | FunctionKind::AsyncGenerator => {
+                match self.get_member(dom, callee, "prototype")? {
+                    JsValue::Object(prototype) => Some(prototype),
+                    _ => None,
+                }
+            }
+            FunctionKind::Normal | FunctionKind::Async => None,
+        };
         let is_async_generator = function.kind == FunctionKind::AsyncGenerator;
         let code = if let Some(code) = self.coroutine_code.get(&function_index) {
             code.clone()
@@ -261,12 +305,16 @@ impl JsRuntime {
         }));
         if function.kind == FunctionKind::Generator {
             self.ensure_heap_capacity(1)?;
-            return Ok(JsValue::Object(self.realm.generator_object(id)));
+            return Ok(JsValue::Object(
+                self.realm.generator_object(id, generator_prototype),
+            ));
         }
         if is_async_generator {
             self.ensure_heap_capacity(1)?;
             self.start_async_generator(id);
-            return Ok(JsValue::Object(self.realm.async_generator_object(id)));
+            return Ok(JsValue::Object(
+                self.realm.async_generator_object(id, generator_prototype),
+            ));
         }
         let (promise, result) = self.create_promise()?;
         if let Some(Some(coroutine)) = self.coroutines.get_mut(id) {
@@ -349,11 +397,21 @@ impl JsRuntime {
             .get(id)
             .and_then(Option::as_ref)
             .and_then(|coroutine| coroutine.promise);
-        let outcome = match self.drive(dom, id, resume) {
-            Ok(CoStep::Await(value)) => self.await_value(dom, id, &value).map(|()| None),
-            Ok(CoStep::Complete(value)) => Ok(Some(value)),
-            Ok(CoStep::Yield(_)) => Err(JsError::type_error("yield in an async function")),
-            Err(error) => Err(error),
+        let mut resume = resume;
+        let outcome = loop {
+            match self.drive(dom, id, resume) {
+                Ok(CoStep::Await(value)) => match self.await_value(dom, id, &value) {
+                    Ok(()) => break Ok(None),
+                    // A failing `PromiseResolve` throws at the `await`, where
+                    // the body's own `catch` can see it.
+                    Err(error) => resume = Resume::Throw(self.error_value(&error)),
+                },
+                Ok(CoStep::Complete(value)) => break Ok(Some(value)),
+                Ok(CoStep::Yield(_)) => {
+                    break Err(JsError::type_error("yield in an async function"));
+                }
+                Err(error) => break Err(error),
+            }
         };
         let Some(promise) = promise else {
             return;
@@ -407,7 +465,17 @@ impl JsRuntime {
         if let JsValue::Object(object) = value
             && matches!(self.realm.host(*object), Some(ObjectHost::Promise(_)))
         {
-            return Ok(*object);
+            // ECMA-262 27.2.4.7.1: a promise is returned as it is only when its
+            // `constructor` is %Promise%; a subclass instance is wrapped.
+            let constructor = self.get_member(dom, *object, "constructor")?;
+            if let JsValue::Object(constructor) = constructor
+                && matches!(
+                    self.realm.host(constructor),
+                    Some(ObjectHost::PromiseConstructor)
+                )
+            {
+                return Ok(*object);
+            }
         }
         let (index, wrapper) = self.create_promise()?;
         let JsValue::Object(wrapper) = wrapper else {
@@ -521,6 +589,17 @@ impl JsRuntime {
         if kind == SuspendKind::YieldDelegate {
             return self.delegate_step(dom, co, resume, &target);
         }
+        if kind == SuspendKind::AsyncYieldDelegate {
+            return match resume {
+                // AsyncGeneratorUnwrapYieldResumption: a `return` value is
+                // awaited before the inner iterator sees it.
+                Resume::Return(value) => {
+                    co.after_await = Some(AfterAwait::DelegateUnwrap);
+                    Ok(Flow::Suspend(CoStep::Await(value)))
+                }
+                resume => self.async_delegate_step(dom, co, resume),
+            };
+        }
         match resume {
             Resume::Next(value) => {
                 co.set_hidden(&target, value);
@@ -554,9 +633,40 @@ impl JsRuntime {
             (AfterAwait::YieldReturn, Resume::Throw(value)) => {
                 self.unwind(dom, co, Abrupt::Throw(JsError::thrown(value)))
             }
-            (AfterAwait::YieldReturn, Resume::Return(_)) => {
-                Err(JsError::type_error("coroutine resumed with an unexpected return"))
+            (AfterAwait::YieldReturn, Resume::Return(_)) => Err(JsError::type_error(
+                "coroutine resumed with an unexpected return",
+            )),
+            (AfterAwait::DelegateResult { is_return }, Resume::Next(result)) => {
+                self.delegate_result(dom, co, &result, is_return)
             }
+            (AfterAwait::DelegateUnwrap, Resume::Next(value)) => {
+                self.async_delegate_step(dom, co, Resume::Return(value))
+            }
+            (AfterAwait::DelegateUnwrap, Resume::Throw(reason)) => {
+                self.async_delegate_step(dom, co, Resume::Throw(reason))
+            }
+            (AfterAwait::ReturnAwaited, Resume::Next(value)) => self.do_return(dom, co, value),
+            (AfterAwait::MissingThrow, Resume::Next(JsValue::Object(_))) => Err(
+                JsError::type_error("the iterator does not provide a 'throw' method"),
+            ),
+            (AfterAwait::MissingThrow, Resume::Next(_)) => {
+                Err(JsError::type_error("iterator result is not an object"))
+            }
+            (
+                AfterAwait::DelegateResult { .. }
+                | AfterAwait::ReturnAwaited
+                | AfterAwait::MissingThrow,
+                Resume::Throw(reason),
+            ) => self.unwind(dom, co, Abrupt::Throw(JsError::thrown(reason))),
+            (
+                AfterAwait::DelegateResult { .. }
+                | AfterAwait::DelegateUnwrap
+                | AfterAwait::ReturnAwaited
+                | AfterAwait::MissingThrow,
+                Resume::Return(_),
+            ) => Err(JsError::type_error(
+                "coroutine resumed with an unexpected return",
+            )),
             (AfterAwait::CloseIterator(abrupt), resume) => {
                 // AsyncIteratorClose: a throw completion already in flight wins
                 // over whatever closing produced; otherwise the awaited
@@ -564,9 +674,9 @@ impl JsRuntime {
                 let abrupt = match (abrupt, resume) {
                     (throw @ Abrupt::Throw(_), _) => throw,
                     (other, Resume::Next(JsValue::Object(_)) | Resume::Return(_)) => other,
-                    (_, Resume::Next(_)) => Abrupt::Throw(JsError::type_error(
-                        "iterator result is not an object",
-                    )),
+                    (_, Resume::Next(_)) => {
+                        Abrupt::Throw(JsError::type_error("iterator result is not an object"))
+                    }
                     (_, Resume::Throw(reason)) => Abrupt::Throw(JsError::thrown(reason)),
                 };
                 self.unwind(dom, co, abrupt)
@@ -626,6 +736,12 @@ impl JsRuntime {
                         co.set_hidden("%di", JsValue::Object(iterator));
                         co.set_hidden("%dn", JsValue::Object(next));
                         self.delegate_step(dom, co, Resume::Next(JsValue::Undefined), &target)
+                    }
+                    SuspendKind::AsyncYieldDelegate => {
+                        let (iterator, next) = self.async_delegate_iterator(dom, &value)?;
+                        co.set_hidden("%di", JsValue::Object(iterator));
+                        co.set_hidden("%dn", JsValue::Object(next));
+                        self.async_delegate_step(dom, co, Resume::Next(JsValue::Undefined))
                     }
                 }
             }
@@ -1061,7 +1177,7 @@ impl JsRuntime {
                 self.environment.truncate(entry.scope_depth);
                 if entry.closable
                     && let Some(close) = entry.info.iterator
-                    && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)?
+                    && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)
                 {
                     return Ok(flow);
                 }
@@ -1091,7 +1207,7 @@ impl JsRuntime {
                     abrupt = Abrupt::Goto(entry.info.break_pc);
                     if entry.closable
                         && let Some(close) = entry.info.iterator
-                        && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)?
+                        && let Some(flow) = self.close_left_iterator(dom, co, close, &mut abrupt)
                     {
                         return Ok(flow);
                     }
@@ -1134,7 +1250,11 @@ impl JsRuntime {
 
     /// The index of the loop a `break`/`continue` targets: the innermost one the
     /// label names, or the innermost one that accepts the statement.
-    fn jump_target(co: &Coroutine, label: Option<&str>, is_continue: bool) -> Result<usize, JsError> {
+    fn jump_target(
+        co: &Coroutine,
+        label: Option<&str>,
+        is_continue: bool,
+    ) -> Result<usize, JsError> {
         co.loops
             .iter()
             .rposition(|entry| match label {
@@ -1151,7 +1271,7 @@ impl JsRuntime {
 
     /// Close the iterator of a loop that `abrupt` is leaving. An error from
     /// closing replaces a non-throw completion; a throw in flight keeps its own
-    /// error (ECMA-262 7.4.11 IteratorClose). For `for await`, the `return()`
+    /// error (ECMA-262 7.4.11 `IteratorClose`). For `for await`, the `return()`
     /// result is awaited, so `Some(flow)` suspends the coroutine with `abrupt`
     /// parked in [`AfterAwait::CloseIterator`].
     fn close_left_iterator(
@@ -1160,12 +1280,12 @@ impl JsRuntime {
         co: &mut Coroutine,
         close: IteratorClose,
         abrupt: &mut Abrupt,
-    ) -> Result<Option<Flow>, JsError> {
+    ) -> Option<Flow> {
         let outcome = if close.is_async {
             match self.start_async_close(dom, co, close.slot) {
                 Ok(Some(result)) => {
                     co.after_await = Some(AfterAwait::CloseIterator(abrupt.clone()));
-                    return Ok(Some(Flow::Suspend(CoStep::Await(result))));
+                    return Some(Flow::Suspend(CoStep::Await(result)));
                 }
                 Ok(None) => Ok(()),
                 Err(error) => Err(error),
@@ -1178,7 +1298,7 @@ impl JsRuntime {
         {
             *abrupt = Abrupt::Throw(error);
         }
-        Ok(None)
+        None
     }
 
     /// The call half of `AsyncIteratorClose`: call the iterator's `return` and
@@ -1203,7 +1323,12 @@ impl JsRuntime {
     }
 
     /// `IteratorClose` for a `for…of` loop being left abruptly.
-    fn close_iterator(&mut self, dom: &mut Dom, co: &Coroutine, slot: usize) -> Result<(), JsError> {
+    fn close_iterator(
+        &mut self,
+        dom: &mut Dom,
+        co: &Coroutine,
+        slot: usize,
+    ) -> Result<(), JsError> {
         let JsValue::Object(iterator) = co.hidden(&format!("%i{slot}")) else {
             return Ok(());
         };
@@ -1309,5 +1434,87 @@ impl JsRuntime {
         } else {
             Ok(Flow::Suspend(CoStep::Yield(value)))
         }
+    }
+
+    /// One step of an async `yield*` (ECMA-262 15.5.5 steps 7-8 in an async
+    /// generator): call the inner iterator for `resume`, then await what it
+    /// returns. The result is handled by [`Self::delegate_result`] once settled.
+    fn async_delegate_step(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        resume: Resume,
+    ) -> Result<Flow, JsError> {
+        let (JsValue::Object(iterator), JsValue::Object(next)) =
+            (co.hidden("%di"), co.hidden("%dn"))
+        else {
+            return Err(JsError::type_error("yield* lost its iterator"));
+        };
+        match resume {
+            Resume::Next(value) => {
+                let result = self.call_with_this(dom, next, &[value], JsValue::Object(iterator))?;
+                Ok(await_delegate_result(co, result, false))
+            }
+            Resume::Throw(value) => match self.get_method(dom, iterator, "throw")? {
+                Some(method) => {
+                    let result =
+                        self.call_with_this(dom, method, &[value], JsValue::Object(iterator))?;
+                    Ok(await_delegate_result(co, result, false))
+                }
+                // Without `throw`, AsyncIteratorClose awaits `return()` before
+                // the protocol violation is thrown (step 7.b.iii).
+                None => match self.get_method(dom, iterator, "return")? {
+                    Some(method) => {
+                        let result =
+                            self.call_with_this(dom, method, &[], JsValue::Object(iterator))?;
+                        co.after_await = Some(AfterAwait::MissingThrow);
+                        Ok(Flow::Suspend(CoStep::Await(result)))
+                    }
+                    None => Err(JsError::type_error(
+                        "the iterator does not provide a 'throw' method",
+                    )),
+                },
+            },
+            Resume::Return(value) => {
+                if let Some(method) = self.get_method(dom, iterator, "return")? {
+                    let result =
+                        self.call_with_this(dom, method, &[value], JsValue::Object(iterator))?;
+                    Ok(await_delegate_result(co, result, true))
+                } else {
+                    // Without `return`, the value is awaited and then returned
+                    // (step 7.c.iii).
+                    co.after_await = Some(AfterAwait::ReturnAwaited);
+                    Ok(Flow::Suspend(CoStep::Await(value)))
+                }
+            }
+        }
+    }
+
+    /// Handle the settled inner result of an async `yield*` (ECMA-262 15.5.5
+    /// steps 8.a.iii-x): a done result ends the `yield*` with its value (or
+    /// returns it from the body for `return`), and any other result is
+    /// yielded from the generator with the `yield*` still suspended on it.
+    fn delegate_result(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        result: &JsValue,
+        is_return: bool,
+    ) -> Result<Flow, JsError> {
+        let JsValue::Object(result) = *result else {
+            return Err(JsError::type_error("iterator result is not an object"));
+        };
+        let done = self.get_member(dom, result, "done")?.is_truthy();
+        let value = self.get_member(dom, result, "value")?;
+        if !done {
+            return Ok(Flow::Suspend(CoStep::Yield(value)));
+        }
+        if is_return {
+            return self.do_return(dom, co, value);
+        }
+        let target = delegate_target(co)?;
+        co.set_hidden(&target, value);
+        co.pc += 1;
+        Ok(Flow::Next)
     }
 }

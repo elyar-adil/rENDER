@@ -155,23 +155,15 @@ impl ArrayDestructuring {
     /// `GetIterator(value, sync)`. A source with no `@@iterator` is a
     /// `TypeError`, not an empty list.
     fn open(runtime: &mut JsRuntime, dom: &mut Dom, value: &JsValue) -> Result<Self, JsError> {
-        // Strings and arrays are the two shapes the engine iterates without a
-        // host `@@iterator` lookup, and a string must be walked by code point
-        // so an astral character binds as one element.
-        match value {
-            JsValue::String(text) => {
-                let values = text
-                    .chars()
-                    .map(|character| JsValue::String(character.to_string()))
-                    .collect();
-                return Ok(Self::over(values));
-            }
-            JsValue::Object(object)
-                if matches!(runtime.realm.host(*object), Some(ObjectHost::Array)) =>
-            {
-                return Ok(Self::over(runtime.array_elements_for(*object)?));
-            }
-            _ => {}
+        // A string is walked by code point so an astral character binds as one
+        // element. Arrays go through their `@@iterator` like any other source:
+        // replacing `Array.prototype[@@iterator]` is observable (ECMA-262 8.6.2).
+        if let JsValue::String(text) = value {
+            let values = text
+                .chars()
+                .map(|character| JsValue::String(character.to_string()))
+                .collect();
+            return Ok(Self::over(values));
         }
         match runtime.get_iterator(dom, value)? {
             Some((iterator, next)) => Ok(Self {
@@ -555,15 +547,19 @@ impl JsRuntime {
         } = flags;
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
-        let (body, defaults) = Self::extract_parameter_defaults(body);
+        let (body, defaults, patterns) = Self::extract_parameter_markers(body);
         let (parameters, length, rest) = Self::binding_parameters(parameters);
         let defaults = (0..parameters.len())
             .map(|index| defaults.get(&index).cloned())
+            .collect();
+        let patterns = (0..parameters.len())
+            .map(|index| patterns.get(&index).cloned())
             .collect();
         self.functions.push(UserFunction {
             name: name.map(str::to_owned),
             parameters,
             defaults,
+            patterns,
             body,
             captured_environment: self.environment.clone(),
             arrow,
@@ -579,12 +575,7 @@ impl JsRuntime {
         let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
-            self.realm.user_function(
-                function_index,
-                name,
-                length,
-                kind == FunctionKind::AsyncGenerator,
-            )
+            self.realm.user_function(function_index, name, length, kind)
         };
         Ok(JsValue::Object(function))
     }
@@ -616,22 +607,44 @@ impl JsRuntime {
         (names, length, rest)
     }
 
-    /// Remove the parser's [`Statement::ParameterDefault`] markers from a
-    /// function body and return them keyed by parameter position. The parser
-    /// prepends one marker per defaulted parameter, in parameter order; the
-    /// evaluator never sees them as ordinary statements.
-    fn extract_parameter_defaults(body: &[Statement]) -> (Vec<Statement>, BTreeMap<usize, Expr>) {
+    /// Remove the parser's [`Statement::ParameterDefault`] and
+    /// [`Statement::ParameterPattern`] markers from a function body and return
+    /// them keyed by parameter position. The parser prepends them ahead of the
+    /// body; the evaluator never sees them as ordinary statements. A pattern
+    /// comes back as the `var` declaration it lowers to.
+    fn extract_parameter_markers(
+        body: &[Statement],
+    ) -> (
+        Vec<Statement>,
+        BTreeMap<usize, Expr>,
+        BTreeMap<usize, Statement>,
+    ) {
         let mut defaults = BTreeMap::new();
+        let mut patterns = BTreeMap::new();
         let mut statements = Vec::with_capacity(body.len());
         for statement in body {
             match statement {
                 Statement::ParameterDefault { index, value, .. } => {
                     defaults.insert(*index, value.clone());
                 }
+                Statement::ParameterPattern {
+                    index,
+                    declarations,
+                    offset,
+                } => {
+                    patterns.insert(
+                        *index,
+                        Statement::VariableList {
+                            kind: VariableKind::Var,
+                            declarations: declarations.clone(),
+                            offset: *offset,
+                        },
+                    );
+                }
                 statement => statements.push(statement.clone()),
             }
         }
-        (statements, defaults)
+        (statements, defaults, patterns)
     }
 
     #[allow(
@@ -930,7 +943,9 @@ impl JsRuntime {
             }
             // Parameter defaults are consumed while binding a call's
             // parameters; reaching one here means it was not extracted.
-            Statement::ParameterDefault { .. } => Ok(Completion::Normal(JsValue::Undefined)),
+            Statement::ParameterDefault { .. } | Statement::ParameterPattern { .. } => {
+                Ok(Completion::Normal(JsValue::Undefined))
+            }
         }
     }
 
@@ -2164,19 +2179,12 @@ impl JsRuntime {
         let JsValue::Object(result) = result else {
             return Err(JsError::type_error("iterator result is not an object"));
         };
-        let done = self
-            .realm
-            .get_property(result, "done")
-            .map(|value| value.is_truthy())
-            .unwrap_or(false);
-        if done {
+        // IteratorStep reads `done` and `value` with [[Get]], so getters run
+        // and their errors propagate (ECMA-262 7.4.5-7.4.6).
+        if self.get_member(dom, result, "done")?.is_truthy() {
             return Ok(None);
         }
-        Ok(Some(
-            self.realm
-                .get_property(result, "value")
-                .unwrap_or(JsValue::Undefined),
-        ))
+        Ok(Some(self.get_member(dom, result, "value")?))
     }
 
     /// Drain any iterable into an eager value list. Arrays and strings use
@@ -2269,16 +2277,26 @@ impl JsRuntime {
                 }
                 return Ok(());
             }
+            // A non-writable data property ignores the write, as for string keys.
+            if !own.writable {
+                return Ok(());
+            }
             self.realm
                 .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
             return Ok(());
         }
-        let inherited = self.realm.get_symbol_descriptor(object, symbol);
-        if let Some(descriptor) = inherited.filter(crate::value::PropertyDescriptor::is_accessor) {
-            if let Some(setter) = descriptor.setter {
-                self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+        if let Some(descriptor) = self.realm.get_symbol_descriptor(object, symbol) {
+            if descriptor.is_accessor() {
+                if let Some(setter) = descriptor.setter {
+                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                }
+                return Ok(());
             }
-            return Ok(());
+            // An inherited non-writable data property blocks creating an own one
+            // (ECMA-262 10.1.9.2 OrdinarySetWithOwnDescriptor).
+            if !descriptor.writable {
+                return Ok(());
+            }
         }
         self.realm
             .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
@@ -4536,12 +4554,13 @@ impl JsRuntime {
             // Iterator is an abstract constructor: `new Iterator()` throws,
             // but a subclass's `super()` constructs through it.
             Some(ObjectHost::NativeFunction(NativeFunction::IteratorConstructor)) => true,
+            // Only ordinary functions and class constructors have [[Construct]];
+            // generators and async functions do not (ECMA-262 27.3.1, 27.7.1, 15.8.1).
             Some(ObjectHost::UserFunction(index)) => {
-                let class = self
-                    .functions
-                    .get(index)
-                    .and_then(|function| function.class.clone());
-                !matches!(&class, Some(class) if !class.constructor)
+                self.functions.get(index).is_none_or(|function| {
+                    function.kind == FunctionKind::Normal
+                        && !matches!(&function.class, Some(class) if !class.constructor)
+                })
             }
             // A bound function is constructable exactly when its target is:
             // `IsConstructor` looks through the [[BoundFunction]] wrapper.
@@ -4816,6 +4835,16 @@ impl JsRuntime {
                 let prototype = instance_prototype(self);
                 Ok(JsValue::Object(self.realm.create_object(prototype)))
             }
+            Some(ObjectHost::UserFunction(index))
+                if self
+                    .functions
+                    .get(index)
+                    .is_some_and(|function| function.kind != FunctionKind::Normal) =>
+            {
+                Err(JsError::type_error(
+                    "generator or async function is not a constructor",
+                ))
+            }
             Some(ObjectHost::UserFunction(index)) => {
                 let class = self
                     .functions
@@ -4832,8 +4861,14 @@ impl JsRuntime {
                             // A derived constructor receives `this` from its
                             // `super()` call; call_user returns the final
                             // `this` on normal completion.
-                            let result =
-                                self.call_user(dom, index, arguments, JsValue::Undefined, true);
+                            let result = self.call_user(
+                                dom,
+                                constructor,
+                                index,
+                                arguments,
+                                JsValue::Undefined,
+                                true,
+                            );
                             match result {
                                 Ok(JsValue::Object(instance)) => Ok(JsValue::Object(instance)),
                                 // ECMA-262 9.2.2 step 12: an undefined result returns
@@ -4853,6 +4888,7 @@ impl JsRuntime {
                             self.run_instance_fields(dom, &class, instance)?;
                             let result = self.call_user(
                                 dom,
+                                constructor,
                                 index,
                                 arguments,
                                 JsValue::Object(instance),
@@ -4873,8 +4909,14 @@ impl JsRuntime {
                         let instance = self.realm.create_object(prototype);
                         let new_target = self.dispatch_new_target(constructor);
                         self.new_target_stack.push(new_target);
-                        let result =
-                            self.call_user(dom, index, arguments, JsValue::Object(instance), true);
+                        let result = self.call_user(
+                            dom,
+                            constructor,
+                            index,
+                            arguments,
+                            JsValue::Object(instance),
+                            true,
+                        );
                         self.new_target_stack.pop();
                         let result = result?;
                         if matches!(result, JsValue::Object(_)) {
@@ -5143,10 +5185,10 @@ impl JsRuntime {
                         "class constructor cannot be invoked without 'new'",
                     ));
                 }
-                self.call_user(dom, index, arguments, receiver, true)
+                self.call_user(dom, callee, index, arguments, receiver, true)
             }
             Some(ObjectHost::ArrowFunction(index)) => {
-                self.call_user(dom, index, arguments, receiver, false)
+                self.call_user(dom, callee, index, arguments, receiver, false)
             }
             Some(ObjectHost::AsyncResume {
                 coroutine,
@@ -5235,9 +5277,13 @@ impl JsRuntime {
         Ok(JsValue::Object(bound))
     }
 
+    /// Call the user function object `callee`, whose code is `index`. The
+    /// callee is needed when the call starts a generator: its `prototype`
+    /// property becomes the generator object's prototype.
     pub(super) fn call_user(
         &mut self,
         dom: &mut Dom,
+        callee: ObjectId,
         index: usize,
         arguments: &[JsValue],
         receiver: JsValue,
@@ -5346,7 +5392,7 @@ impl JsRuntime {
             .and_then(|()| self.instantiate_statements(&function.body));
         let result = match prepared {
             Ok(()) if function.kind.is_coroutine() => self
-                .start_coroutine(dom, index, &function, &call_environment)
+                .start_coroutine(dom, callee, index, &function, &call_environment)
                 .map(Completion::Return),
             Ok(()) => self.evaluate_statements(dom, &function.body),
             // An async function reports a failing parameter list through its
@@ -5429,23 +5475,32 @@ impl JsRuntime {
                     },
                 }
             };
-            let mut environment = call_environment.borrow_mut();
-            match environment.bindings.get_mut(parameter) {
-                Some(binding) => {
-                    binding.value = value;
-                    binding.initialized = true;
+            {
+                let mut environment = call_environment.borrow_mut();
+                match environment.bindings.get_mut(parameter) {
+                    Some(binding) => {
+                        binding.value = value;
+                        binding.initialized = true;
+                    }
+                    None => {
+                        environment.bindings.insert(
+                            parameter.clone(),
+                            Binding {
+                                value,
+                                mutable: true,
+                                initialized: true,
+                                kind: VariableKind::Var,
+                            },
+                        );
+                    }
                 }
-                None => {
-                    environment.bindings.insert(
-                        parameter.clone(),
-                        Binding {
-                            value,
-                            mutable: true,
-                            initialized: true,
-                            kind: VariableKind::Var,
-                        },
-                    );
-                }
+            }
+            // A destructuring parameter binds right after its argument
+            // (ECMA-262 10.2.11 step 25), so an error in the pattern throws
+            // from the call itself, including for generators.
+            if let Some(Some(declaration)) = function.patterns.get(index) {
+                self.instantiate_statements(std::slice::from_ref(declaration))?;
+                self.evaluate_statements(dom, std::slice::from_ref(declaration))?;
             }
         }
         Ok(())
@@ -5646,7 +5701,8 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
         | Statement::ForInExpr { offset, .. }
         | Statement::Labeled { offset, .. }
         | Statement::Class { offset, .. }
-        | Statement::ParameterDefault { offset, .. } => Some(*offset),
+        | Statement::ParameterDefault { offset, .. }
+        | Statement::ParameterPattern { offset, .. } => Some(*offset),
         Statement::Return(_)
         | Statement::Throw(_)
         | Statement::Break(_)

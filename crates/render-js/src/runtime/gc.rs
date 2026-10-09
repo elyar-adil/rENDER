@@ -17,8 +17,8 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
-use crate::runtime::coroutine_run::Resume;
 use crate::runtime::builtins::promise::PromiseState;
+use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::JsMicrotask;
 use crate::value::ObjectHost;
@@ -516,7 +516,13 @@ impl JsRuntime {
             for request in &generator.queue {
                 let (Resume::Next(value) | Resume::Throw(value) | Resume::Return(value)) =
                     &request.completion;
-                mark_value(self, &mut marked, &mut work, &mut marked_environments, value);
+                mark_value(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    value,
+                );
                 mark_promise(
                     self,
                     &mut marked,

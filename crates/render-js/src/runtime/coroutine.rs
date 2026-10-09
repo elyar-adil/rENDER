@@ -32,6 +32,9 @@ pub(super) enum SuspendKind {
     /// `return` resumption awaits its value before unwinding (ECMA-262 27.6.3.8).
     AsyncYield,
     YieldDelegate,
+    /// `yield*` in an async generator: the inner iterator is driven with the
+    /// async iterator protocol, awaiting each inner result (ECMA-262 15.5.5).
+    AsyncYieldDelegate,
     Await,
 }
 
@@ -105,7 +108,7 @@ pub(super) enum Instr {
         slot: usize,
         binding: Rc<LoopBinding>,
         /// `for await`: iterate with `@@asyncIterator`, falling back to a sync
-        /// iterator wrapped by CreateAsyncFromSyncIterator.
+        /// iterator wrapped by `CreateAsyncFromSyncIterator`.
         is_await: bool,
     },
     ForOfNext {
@@ -198,7 +201,8 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
         Statement::Function { .. }
         | Statement::Break(_)
         | Statement::Continue(_)
-        | Statement::ParameterDefault { .. } => false,
+        | Statement::ParameterDefault { .. }
+        | Statement::ParameterPattern { .. } => false,
         Statement::Class {
             super_class,
             elements,
@@ -259,9 +263,7 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
                 || update.as_ref().is_some_and(expr_has_suspend)
                 || statement_has_suspend(body)
         }
-        Statement::ForOf {
-            is_await: true, ..
-        } => true,
+        Statement::ForOf { is_await: true, .. } => true,
         Statement::ForIn { iterable, body, .. } | Statement::ForOf { iterable, body, .. } => {
             expr_has_suspend(iterable) || statement_has_suspend(body)
         }
@@ -878,7 +880,8 @@ impl Compiler {
             Statement::Function { .. }
             | Statement::Break(_)
             | Statement::Continue(_)
-            | Statement::ParameterDefault { .. } => {
+            | Statement::ParameterDefault { .. }
+            | Statement::ParameterPattern { .. } => {
                 unreachable!("these never contain a suspension point of this function")
             }
         }
@@ -1119,21 +1122,17 @@ impl Compiler {
                 Ok(self.await_expression(argument))
             }
             Expr::Yield {
-                argument,
-                delegate,
-                offset,
+                argument, delegate, ..
             } => {
-                if *delegate && self.async_generator {
-                    return Err(JsError::syntax(
-                        "`yield*` in an async generator is not supported yet",
-                        *offset,
-                    ));
-                }
                 let argument = match argument {
                     Some(argument) => self.explode(argument)?,
                     None => Expr::Literal(JsValue::Undefined),
                 };
-                let (kind, argument) = if *delegate {
+                let (kind, argument) = if *delegate && self.async_generator {
+                    // `yield*` does not await its operand: the inner iterator's
+                    // results are awaited instead.
+                    (SuspendKind::AsyncYieldDelegate, argument)
+                } else if *delegate {
                     (SuspendKind::YieldDelegate, argument)
                 } else if self.async_generator {
                     // `yield v` in an async generator awaits `v` first.

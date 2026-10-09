@@ -7,6 +7,7 @@ use std::num::FpCategory;
 use render_dom::NodeId;
 use url::Url;
 
+use crate::parser::FunctionKind;
 use crate::utf16;
 
 /// Stable identity for an object allocated in a [`Realm`].
@@ -3400,6 +3401,7 @@ impl Realm {
                 ("throw", NativeFunction::AsyncGeneratorThrow),
             ],
         );
+        Self::set_one_parameter_lengths(objects, generator, &["next", "return", "throw"]);
         let tag = JsSymbol::well_known("@@toStringTag");
         objects[generator.0].symbols.insert(
             tag.id(),
@@ -3431,6 +3433,7 @@ impl Realm {
                 ("throw", NativeFunction::AsyncFromSyncThrow),
             ],
         );
+        Self::set_one_parameter_lengths(objects, from_sync, &["next", "return", "throw"]);
 
         // %AsyncGeneratorFunction.prototype% (ECMA-262 27.7.1) and its links.
         let generator_function = ObjectId(objects.len());
@@ -3463,6 +3466,32 @@ impl Realm {
             ),
         );
         (generator, from_sync, generator_function)
+    }
+
+    /// Give the methods of `target` named in `names` the spec `length` of one.
+    /// [`Self::builtin_arity`] goes by name alone, so it cannot tell a
+    /// generator's `next` (one parameter) from an iterator helper's (none).
+    fn set_one_parameter_lengths(objects: &mut [JsObject], target: ObjectId, names: &[&str]) {
+        for name in names {
+            let Some(JsValue::Object(method)) = objects[target.0]
+                .properties
+                .get(*name)
+                .map(|descriptor| descriptor.value.clone())
+            else {
+                continue;
+            };
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Number(1.0),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
     }
 
     /// Give `target` one builtin method object per `(name, function)` pair.
@@ -3514,6 +3543,7 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        Self::set_one_parameter_lengths(objects, prototype, &["next", "return", "throw"]);
         let tag = JsSymbol::well_known("@@toStringTag");
         objects[prototype.0].symbols.insert(
             tag.id(),
@@ -7251,26 +7281,32 @@ impl Realm {
         object
     }
 
-    /// A user function object. An async generator function inherits from
-    /// `%AsyncGeneratorFunction.prototype%` and its `prototype` object inherits
-    /// from `%AsyncGeneratorPrototype%`, with no `constructor` (ECMA-262 27.7.4 and
-    /// 27.6.1.1 / MakeConstructor is not applied to generators).
+    /// A user function object of the given kind. An async function has no
+    /// `prototype` property. A generator's `prototype` inherits from
+    /// `%GeneratorPrototype%` (or `%AsyncGeneratorPrototype%`) and has no
+    /// `constructor` (ECMA-262 27.3.4.2, 27.6.1.1, 27.7.4), while an ordinary
+    /// function's `prototype` has the `constructor` back-link. An async generator
+    /// function inherits from `%AsyncGeneratorFunction.prototype%`.
     pub(crate) fn user_function(
         &mut self,
         function: usize,
         name: &str,
         length: usize,
-        async_generator: bool,
+        kind: FunctionKind,
     ) -> ObjectId {
-        let prototype = if async_generator {
-            self.allocate(JsObject {
+        let prototype = match kind {
+            FunctionKind::Async => None,
+            FunctionKind::Normal => Some(self.create_ordinary_object()),
+            FunctionKind::Generator => Some(self.allocate(JsObject {
+                prototype: Some(self.generator_prototype),
+                ..JsObject::default()
+            })),
+            FunctionKind::AsyncGenerator => Some(self.allocate(JsObject {
                 prototype: Some(self.async_generator_prototype),
                 ..JsObject::default()
-            })
-        } else {
-            self.create_ordinary_object()
+            })),
         };
-        let function_prototype = if async_generator {
+        let function_prototype = if kind == FunctionKind::AsyncGenerator {
             self.async_generator_function_prototype
         } else {
             self.function_prototype
@@ -7280,29 +7316,31 @@ impl Realm {
             host: ObjectHost::UserFunction(function),
             ..JsObject::default()
         });
-        self.objects[callable.0].properties.insert(
-            "prototype".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Object(prototype),
-                writable: true,
-                enumerable: false,
-                configurable: false,
-            },
-        );
-        if !async_generator {
-            self.objects[prototype.0].properties.insert(
-                "constructor".to_owned(),
+        if let Some(prototype) = prototype {
+            self.objects[callable.0].properties.insert(
+                "prototype".to_owned(),
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::Object(callable),
+                    value: JsValue::Object(prototype),
                     writable: true,
                     enumerable: false,
-                    configurable: true,
+                    configurable: false,
                 },
             );
+            if kind == FunctionKind::Normal {
+                self.objects[prototype.0].properties.insert(
+                    "constructor".to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Object(callable),
+                        writable: true,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
         }
         self.install_function_metadata(callable, name, length);
         callable
@@ -7375,24 +7413,32 @@ impl Realm {
     }
 
     /// A new generator object whose behaviour lives in coroutine `coroutine`.
-    pub(crate) fn generator_object(&mut self, coroutine: usize) -> ObjectId {
+    pub(crate) fn generator_object(
+        &mut self,
+        coroutine: usize,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.generator_prototype),
+            prototype: Some(prototype.unwrap_or(self.generator_prototype)),
             host: ObjectHost::Generator(coroutine),
             ..JsObject::default()
         })
     }
 
     /// A new async generator object whose behaviour lives in coroutine `coroutine`.
-    pub(crate) fn async_generator_object(&mut self, coroutine: usize) -> ObjectId {
+    pub(crate) fn async_generator_object(
+        &mut self,
+        coroutine: usize,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.async_generator_prototype),
+            prototype: Some(prototype.unwrap_or(self.async_generator_prototype)),
             host: ObjectHost::AsyncGenerator(coroutine),
             ..JsObject::default()
         })
     }
 
-    /// CreateAsyncFromSyncIterator's wrapper object (ECMA-262 27.1.4.1).
+    /// `CreateAsyncFromSyncIterator`'s wrapper object (ECMA-262 27.1.4.1).
     pub(crate) fn async_from_sync_iterator(
         &mut self,
         iterator: ObjectId,
