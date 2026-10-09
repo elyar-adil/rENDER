@@ -35,6 +35,7 @@ use crate::parser::PropertyKey;
 use crate::parser::Statement;
 use crate::parser::UnaryOp;
 use crate::parser::VariableKind;
+use crate::parser::collect_var_names;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
 use crate::runtime::builtins::dom::css_prop_from_member;
@@ -266,107 +267,6 @@ fn describe_source(value: &JsValue) -> String {
     }
 }
 
-pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
-    match statement {
-        Statement::Variable {
-            kind: VariableKind::Var,
-            name,
-            ..
-        } => {
-            names.insert(name.clone());
-        }
-        Statement::VariableList {
-            kind: VariableKind::Var,
-            declarations,
-            ..
-        } => {
-            for (target, _) in declarations {
-                names.extend(target.names());
-            }
-        }
-        Statement::If {
-            consequent,
-            alternate,
-            ..
-        } => {
-            collect_var_names(consequent, names);
-            if let Some(alternate) = alternate {
-                collect_var_names(alternate, names);
-            }
-        }
-        Statement::Switch { cases, .. } => {
-            for (_, statements) in cases {
-                for statement in statements {
-                    collect_var_names(statement, names);
-                }
-            }
-        }
-        Statement::While { body, .. }
-        | Statement::Labeled { body, .. }
-        | Statement::ForInExpr { body, .. }
-        | Statement::DoWhile { body, .. } => collect_var_names(body, names),
-        Statement::For {
-            initializer, body, ..
-        } => {
-            if let Some(initializer) = initializer {
-                collect_var_names(initializer, names);
-            }
-            collect_var_names(body, names);
-        }
-        Statement::ForIn {
-            kind, name, body, ..
-        } => {
-            if *kind == VariableKind::Var {
-                names.insert(name.clone());
-            }
-            collect_var_names(body, names);
-        }
-        Statement::ForOf {
-            kind, name, body, ..
-        } => {
-            if *kind == VariableKind::Var {
-                names.insert(name.clone());
-            }
-            collect_var_names(body, names);
-        }
-        Statement::Block(statements) => {
-            for statement in statements {
-                collect_var_names(statement, names);
-            }
-        }
-        Statement::Try {
-            body,
-            catch,
-            finally,
-            ..
-        } => {
-            for statement in body {
-                collect_var_names(statement, names);
-            }
-            if let Some(catch) = catch {
-                for statement in &catch.body {
-                    collect_var_names(statement, names);
-                }
-            }
-            if let Some(finally) = finally {
-                for statement in finally {
-                    collect_var_names(statement, names);
-                }
-            }
-        }
-        Statement::Function { .. }
-        | Statement::Class { .. }
-        | Statement::Variable { .. }
-        | Statement::VariableList { .. }
-        | Statement::ParameterDefault { .. }
-        | Statement::Return(_)
-        | Statement::Throw(_)
-        | Statement::Break(_)
-        | Statement::Continue(_)
-        | Statement::Expression(_) => {}
-    }
-}
-
 impl JsRuntime {
     pub(super) fn evaluate_statements(
         &mut self,
@@ -489,6 +389,7 @@ impl JsRuntime {
         statements: &[Statement],
     ) -> Result<(), JsError> {
         let mut declarations = BTreeMap::new();
+        let mut function_names = BTreeSet::new();
         let mut functions = Vec::new();
         for statement in statements {
             match statement {
@@ -527,15 +428,19 @@ impl JsRuntime {
                     kind,
                     ..
                 } => {
-                    if declarations
-                        .insert(name.clone(), VariableKind::Const)
-                        .is_some()
+                    // Sloppy code may repeat a block-level function declaration
+                    // (Annex B.3.3.4); the last one wins, and the binding is shared.
+                    if !function_names.contains(name)
+                        && declarations
+                            .insert(name.clone(), VariableKind::Const)
+                            .is_some()
                     {
                         return Err(JsError::syntax(
                             format!("binding {name:?} is declared more than once"),
                             0,
                         ));
                     }
+                    function_names.insert(name.clone());
                     functions.push((name, parameters, body, *kind));
                 }
                 Statement::Class { name, .. }
@@ -556,7 +461,7 @@ impl JsRuntime {
         }
         for (name, parameters, body, kind) in functions {
             let value = self.create_function(Some(name), parameters, body, kind)?;
-            self.initialize_binding(name, value, VariableKind::Const)?;
+            self.initialize_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
     }

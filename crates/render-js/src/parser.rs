@@ -514,6 +514,7 @@ pub(super) fn parse_module(
     // Top-level `await` is part of the module grammar (ECMA-262 §16.2).
     parser.in_async = true;
     let statements = parser.statement_list(false)?;
+    validate_declaration_conflicts(&statements, true)?;
     let info = parser.module.take().unwrap_or_default();
     Ok((statements, info))
 }
@@ -650,6 +651,7 @@ struct Parser {
 impl Parser {
     fn program(mut self) -> Result<Vec<Statement>, JsError> {
         let statements = self.statement_list(false)?;
+        validate_declaration_conflicts(&statements, true)?;
         if has_use_strict_directive(&statements) {
             validate_strict_statements(&statements)?;
         }
@@ -688,6 +690,7 @@ impl Parser {
         if self.take(&TokenKind::LeftBrace) {
             let statements = self.statement_list(true)?;
             self.require(&TokenKind::RightBrace, "expected '}' after block")?;
+            validate_declaration_conflicts(&statements, false)?;
             return Ok(Statement::Block(statements));
         }
         if self.take(&TokenKind::Function) {
@@ -760,6 +763,7 @@ impl Parser {
             let TokenKind::Identifier(label) = self.advance().kind else {
                 unreachable!("checked above");
             };
+            self.check_contextual_binding(&label)?;
             self.advance();
             let body = self.statement()?;
             return Ok(Statement::Labeled {
@@ -879,6 +883,19 @@ impl Parser {
         }
         self.advance();
         self.module_specifier()
+    }
+
+    /// `await` cannot name a binding or label in async code and `yield` cannot
+    /// in generator code (ECMA-262 13.1.1, 14.1.1, 14.4.1). A module's top level
+    /// counts as async, so `await` is reserved there too.
+    fn check_contextual_binding(&self, name: &str) -> Result<(), JsError> {
+        if self.in_async && name == "await" {
+            return Err(self.error("await cannot be a binding name in async code"));
+        }
+        if self.in_generator && name == "yield" {
+            return Err(self.error("yield cannot be a binding name in generator code"));
+        }
+        Ok(())
     }
 
     fn local_identifier(&mut self) -> Result<String, JsError> {
@@ -1165,6 +1182,7 @@ impl Parser {
                 let TokenKind::Identifier(name) = self.advance().kind else {
                     return Err(self.error("expected a binding after declaration keyword"));
                 };
+                self.check_contextual_binding(&name)?;
                 let value = if self.take(&TokenKind::Equal) {
                     Some(self.assignment()?)
                 } else {
@@ -1284,6 +1302,7 @@ impl Parser {
         let TokenKind::Identifier(name) = self.advance().kind else {
             return Err(self.error("expected a binding identifier or pattern"));
         };
+        self.check_contextual_binding(&name)?;
         Ok(BindingPattern::Identifier(name))
     }
 
@@ -1372,6 +1391,7 @@ impl Parser {
         }
         self.switch_depth = self.switch_depth.saturating_sub(1);
         self.require(&TokenKind::RightBrace, "expected '}' after switch")?;
+        validate_declaration_conflicts(cases.iter().flat_map(|(_, body)| body), false)?;
         Ok(Statement::Switch {
             offset: self.previous_offset(),
             expression,
@@ -1423,6 +1443,7 @@ impl Parser {
                 let TokenKind::Identifier(name) = self.advance().kind else {
                     return Err(self.error("expected an identifier after declaration keyword"));
                 };
+                self.check_contextual_binding(&name)?;
                 Some(BindingPattern::Identifier(name))
             };
             if self.take(&TokenKind::In) {
@@ -1804,6 +1825,7 @@ impl Parser {
                 },
             );
         }
+        validate_declaration_conflicts(&body, true)?;
         Ok(Some(Expr::Arrow {
             offset: self.previous_offset(),
             parameters,
@@ -2096,10 +2118,16 @@ impl Parser {
             None
         };
         if let Some(operator) = operator {
+            let operand = self.unary()?;
+            // ECMA-262 13.5.1.1: a private reference cannot be deleted. Parentheses
+            // leave no node, so `delete (this.#x)` is caught here too.
+            if operator == UnaryOp::Delete && matches!(operand, Expr::PrivateMember { .. }) {
+                return Err(self.error("private fields cannot be deleted"));
+            }
             return Ok(Expr::Unary {
                 offset: self.previous_offset(),
                 operator,
-                operand: Box::new(self.unary()?),
+                operand: Box::new(operand),
             });
         }
         if self.take(&TokenKind::New) {
@@ -2678,7 +2706,9 @@ impl Parser {
         let result = self.function_tail_inner();
         self.in_async = previous_async;
         self.in_generator = previous_generator;
-        result
+        let (parameters, body) = result?;
+        validate_declaration_conflicts(&body, true)?;
+        Ok((parameters, body))
     }
 
     fn function_tail_inner(&mut self) -> Result<(Vec<String>, Vec<Statement>), JsError> {
@@ -3943,4 +3973,176 @@ mod tests {
         let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
         assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
     }
+}
+
+pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<String>) {
+    match statement {
+        Statement::Variable {
+            kind: VariableKind::Var,
+            name,
+            ..
+        } => {
+            names.insert(name.clone());
+        }
+        Statement::VariableList {
+            kind: VariableKind::Var,
+            declarations,
+            ..
+        } => {
+            for (target, _) in declarations {
+                names.extend(target.names());
+            }
+        }
+        Statement::If {
+            consequent,
+            alternate,
+            ..
+        } => {
+            collect_var_names(consequent, names);
+            if let Some(alternate) = alternate {
+                collect_var_names(alternate, names);
+            }
+        }
+        Statement::Switch { cases, .. } => {
+            for (_, statements) in cases {
+                for statement in statements {
+                    collect_var_names(statement, names);
+                }
+            }
+        }
+        Statement::While { body, .. }
+        | Statement::Labeled { body, .. }
+        | Statement::ForInExpr { body, .. }
+        | Statement::DoWhile { body, .. } => collect_var_names(body, names),
+        Statement::For {
+            initializer, body, ..
+        } => {
+            if let Some(initializer) = initializer {
+                collect_var_names(initializer, names);
+            }
+            collect_var_names(body, names);
+        }
+        Statement::ForIn {
+            kind, name, body, ..
+        } => {
+            if *kind == VariableKind::Var {
+                names.insert(name.clone());
+            }
+            collect_var_names(body, names);
+        }
+        Statement::ForOf {
+            kind, name, body, ..
+        } => {
+            if *kind == VariableKind::Var {
+                names.insert(name.clone());
+            }
+            collect_var_names(body, names);
+        }
+        Statement::Block(statements) => {
+            for statement in statements {
+                collect_var_names(statement, names);
+            }
+        }
+        Statement::Try {
+            body,
+            catch,
+            finally,
+            ..
+        } => {
+            for statement in body {
+                collect_var_names(statement, names);
+            }
+            if let Some(catch) = catch {
+                for statement in &catch.body {
+                    collect_var_names(statement, names);
+                }
+            }
+            if let Some(finally) = finally {
+                for statement in finally {
+                    collect_var_names(statement, names);
+                }
+            }
+        }
+        Statement::Function { .. }
+        | Statement::Class { .. }
+        | Statement::Variable { .. }
+        | Statement::VariableList { .. }
+        | Statement::ParameterDefault { .. }
+        | Statement::Return(_)
+        | Statement::Throw(_)
+        | Statement::Break(_)
+        | Statement::Continue(_)
+        | Statement::Expression(_) => {}
+    }
+}
+
+/// Early errors for declarations that clash within one statement list
+/// (ECMA-262 14.2.1 for blocks, 15.2.1 for function bodies, 16.1.1 for scripts).
+/// A lexical name (`let`, `const`, `class`, or a block-level function) may not
+/// be declared twice, nor be declared by a `var` in the list or in a block
+/// nested in it. In a function body or script (`top_level`), a function
+/// declaration is var-scoped rather than lexical. Duplicate block-level
+/// functions are accepted: sloppy code allows them (Annex B.3.3.4), and the
+/// parser does not yet know the code's strictness.
+fn validate_declaration_conflicts<'a>(
+    statements: impl IntoIterator<Item = &'a Statement>,
+    top_level: bool,
+) -> Result<(), JsError> {
+    let mut lexical = BTreeSet::new();
+    let mut block_functions = BTreeSet::new();
+    let mut var_names = BTreeSet::new();
+    let duplicate =
+        |name: &str| JsError::syntax(format!("binding {name:?} is declared more than once"), 0);
+    for statement in statements {
+        match statement {
+            Statement::Variable {
+                kind: VariableKind::Let | VariableKind::Const,
+                name,
+                ..
+            } => {
+                if !lexical.insert(name.clone()) {
+                    return Err(duplicate(name));
+                }
+            }
+            Statement::VariableList {
+                kind, declarations, ..
+            } => {
+                for (target, _) in declarations {
+                    for name in target.names() {
+                        if *kind == VariableKind::Var {
+                            var_names.insert(name);
+                        } else if !lexical.insert(name.clone()) {
+                            return Err(duplicate(&name));
+                        }
+                    }
+                }
+            }
+            Statement::Class { name, .. } => {
+                if !lexical.insert(name.clone()) {
+                    return Err(duplicate(name));
+                }
+            }
+            Statement::Function { name, .. } => {
+                if top_level {
+                    var_names.insert(name.clone());
+                } else {
+                    block_functions.insert(name.clone());
+                }
+            }
+            other => collect_var_names(other, &mut var_names),
+        }
+    }
+    for name in &block_functions {
+        if lexical.contains(name) {
+            return Err(duplicate(name));
+        }
+    }
+    lexical.extend(block_functions);
+    if let Some(name) = lexical.iter().find(|name| var_names.contains(*name)) {
+        return Err(JsError::syntax(
+            format!("binding {name:?} conflicts with a var declaration"),
+            0,
+        ));
+    }
+    Ok(())
 }
