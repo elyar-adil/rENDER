@@ -1356,3 +1356,25 @@ fn array_patterns_use_the_array_iterator_protocol() {
         "undefined"
     );
 }
+
+#[test]
+fn regexp_indices_surrogates_and_flag_strings_at_the_script_level() {
+    // The `d` flag adds `indices`: a [start, end] pair per group, and a
+    // `groups` object for named groups.
+    assert_eq!(ok("/(a)(?<n>b)?/d.exec('ab').indices[1].join()"), "0,1");
+    assert_eq!(
+        ok("String(/(a)(?<n>x)?/d.exec('a').indices[2])"),
+        "undefined"
+    );
+    assert_eq!(ok("/(?<n>b)/d.exec('ab').indices.groups.n.join()"), "1,2");
+    assert_eq!(ok("String(/a/.exec('a').indices)"), "undefined");
+    assert_eq!(ok("/a/d.hasIndices + '/' + /a/.hasIndices"), "true/false");
+    // The flags string lists d, g, i, m, s, u, v, y in that order.
+    assert_eq!(ok("/a/d.flags + '/' + /a/gimsuy.flags"), "d/gimsuy");
+    assert_eq!(ok("/a/v.flags"), "v");
+    // Under u a pair is one character; without it, one code unit.
+    assert_eq!(ok("'\\u{1F600}'.match(/./u)[0].length"), "2");
+    assert_eq!(ok("'\\u{1F600}'.match(/./)[0].length"), "1");
+    assert_eq!(ok("/\\udf06/u.test('\\ud834\\udf06')"), "false");
+    assert_eq!(ok("/\\udf06/.test('\\ud834\\udf06')"), "true");
+}

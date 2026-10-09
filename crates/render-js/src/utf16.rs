@@ -112,37 +112,6 @@ pub(crate) fn utf16_length(text: &str) -> usize {
     text.chars().map(character_code_units).sum()
 }
 
-/// The code-unit offset of `character_index` in `text`.
-///
-/// The regex engine matches over `Vec<char>` because a pattern is written in
-/// terms of code points, but the positions it reports to script are indices
-/// into a String value, so they are code-unit offsets. This converts between
-/// the two at the boundary.
-pub(crate) fn utf16_offset_of_char(text: &str, character_index: usize) -> usize {
-    text.chars()
-        .take(character_index)
-        .map(character_code_units)
-        .sum()
-}
-
-/// The character offset at or before `code_unit_offset` in `text`.
-///
-/// The inverse of [`utf16_offset_of_char`], for the `lastIndex` direction: a
-/// `lastIndex` read from script is a code-unit offset while the matcher walks
-/// characters, so an offset landing inside a surrogate pair rounds *down* to
-/// the character that contains it.
-pub(crate) fn char_offset_of_utf16(text: &str, code_unit_offset: usize) -> usize {
-    let mut consumed = 0usize;
-    for (index, character) in text.chars().enumerate() {
-        let width = character_code_units(character);
-        if consumed + width > code_unit_offset {
-            return index;
-        }
-        consumed += width;
-    }
-    text.chars().count()
-}
-
 /// How many UTF-16 code units one engine character occupies: a placeholder is
 /// one, because it stands for exactly one surrogate.
 fn character_code_units(character: char) -> usize {
@@ -183,7 +152,7 @@ pub(crate) fn code_point_at(units: &[u16], position: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_point_at, string_from_unit, utf16_length, utf16_offset_of_char, utf16_units};
+    use super::{code_point_at, string_from_unit, utf16_length, utf16_units};
     use crate::lexer::surrogate_placeholder;
 
     /// The code-unit view agrees with `str::encode_utf16` for any string with
@@ -254,14 +223,5 @@ mod tests {
         assert_eq!(string_from_unit(0x61), "a");
         assert_eq!(utf16_length(&string_from_unit(0xd83d)), 1);
         assert_eq!(utf16_length(&string_from_unit(0xde00)), 1);
-    }
-
-    #[test]
-    fn char_offsets_map_to_code_unit_offsets() {
-        let text = "a\u{1f600}b";
-        assert_eq!(utf16_offset_of_char(text, 0), 0);
-        assert_eq!(utf16_offset_of_char(text, 1), 1);
-        assert_eq!(utf16_offset_of_char(text, 2), 3);
-        assert_eq!(utf16_offset_of_char(text, 3), 4);
     }
 }
