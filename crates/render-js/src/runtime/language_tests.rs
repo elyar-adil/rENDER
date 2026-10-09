@@ -772,3 +772,22 @@ fn class_names_are_strict_code_even_in_sloppy_scripts() {
     ]);
     assert_eq!(ok("class C {} String(typeof C)"), "function");
 }
+
+#[test]
+fn destructuring_assignment_targets_follow_the_pattern_grammar() {
+    assert_early_syntax_errors(&[
+        "[...x, y] = [];",
+        "var x; [...x = 1] = [];",
+        "var x; [...[x], y] = [];",
+        "var x, y; ({...x, y} = {});",
+        "var x; ({...{x}} = {});",
+        "[1] = [];",
+        "var x; ({a: 1} = {});",
+        "var a; [a] += 1;",
+        "for ([...x, y] of []) {}",
+    ]);
+    assert_eq!(ok("var a, b; [a, ...b] = [1, 2, 3]; b.length"), "2");
+    assert_eq!(ok("var x; ({a: [x = 4] = []} = {}); x"), "4");
+    assert_eq!(ok("var b; [, [b] = [5]] = [0, undefined]; b"), "5");
+    assert_eq!(ok("var o = {}; [o.x, o['y']] = [1, 2]; o.x + o.y"), "3");
+}

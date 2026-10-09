@@ -2318,6 +2318,10 @@ impl Parser {
         operator: Option<BinaryOp>,
         parenthesized_target: bool,
     ) -> Result<Expr, JsError> {
+        // Only a plain `=` takes a destructuring pattern (ECMA-262 13.15).
+        if operator.is_some() && !is_simple_target(&target) {
+            return Err(self.error("invalid compound assignment target"));
+        }
         self.validate_assignment_target(&target)?;
         let value = self.assignment()?;
         Ok(match operator {
@@ -2337,21 +2341,69 @@ impl Parser {
     }
 
     fn validate_assignment_target(&self, target: &Expr) -> Result<(), JsError> {
-        if matches!(
-            target,
-            Expr::Identifier(_)
-                | Expr::Member { .. }
-                | Expr::ComputedMember { .. }
-                | Expr::Array(_)
-                | Expr::Object(_)
-                | Expr::PrivateMember { .. }
-                | Expr::SuperMember { .. }
-                | Expr::SuperComputedMember { .. }
-        ) {
-            Ok(())
-        } else {
-            Err(self.error("invalid assignment target"))
+        match target {
+            Expr::Array(_) | Expr::Object(_) => self.validate_destructuring_target(target, false),
+            _ if is_simple_target(target) => Ok(()),
+            _ => Err(self.error("invalid assignment target")),
         }
+    }
+
+    /// A target of a destructuring assignment pattern (ECMA-262 13.15.5). A
+    /// default (`target = value`) is allowed only where the grammar takes an
+    /// `AssignmentElement`, not in a rest element.
+    fn validate_destructuring_target(
+        &self,
+        target: &Expr,
+        allow_default: bool,
+    ) -> Result<(), JsError> {
+        match target {
+            Expr::Array(elements) => self.validate_array_pattern(elements),
+            Expr::Object(properties) => self.validate_object_pattern(properties),
+            Expr::Assignment { target: inner, .. } if allow_default => {
+                self.validate_destructuring_target(inner, false)
+            }
+            _ if is_simple_target(target) => Ok(()),
+            _ => Err(self.error("invalid destructuring assignment target")),
+        }
+    }
+
+    /// Array pattern elements: a rest element is the last one and has no
+    /// initializer. An elision is a hole, which the parser records as `undefined`.
+    fn validate_array_pattern(&self, elements: &[Expr]) -> Result<(), JsError> {
+        for (index, element) in elements.iter().enumerate() {
+            match element {
+                Expr::Spread(rest) => {
+                    if index + 1 != elements.len() {
+                        return Err(self.error("rest element must be last in a pattern"));
+                    }
+                    self.validate_destructuring_target(rest, false)?;
+                }
+                Expr::Literal(JsValue::Undefined) => {}
+                _ => self.validate_destructuring_target(element, true)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Object pattern properties: a rest property is the last one and takes a
+    /// simple target only.
+    fn validate_object_pattern(&self, properties: &[ObjectProperty]) -> Result<(), JsError> {
+        for (index, property) in properties.iter().enumerate() {
+            if property.method || property.accessor.is_some() {
+                return Err(self.error("a method cannot be an assignment target"));
+            }
+            if property.key == PropertyKey::Spread {
+                if index + 1 != properties.len() {
+                    return Err(self.error("rest property must be last in a pattern"));
+                }
+                if !is_simple_target(&property.value) {
+                    return Err(self.error("rest property target must be a simple target"));
+                }
+            } else {
+                self.validate_destructuring_target(&property.value, true)?;
+            }
+        }
+        Ok(())
     }
 
     fn conditional(&mut self) -> Result<Expr, JsError> {
@@ -4215,6 +4267,19 @@ fn validate_strict_class(
 struct ReservedContext {
     async_context: bool,
     generator_context: bool,
+}
+
+/// A simple assignment target: a name or a property reference (ECMA-262 13.15.1).
+fn is_simple_target(expression: &Expr) -> bool {
+    matches!(
+        expression,
+        Expr::Identifier(_)
+            | Expr::Member { .. }
+            | Expr::ComputedMember { .. }
+            | Expr::PrivateMember { .. }
+            | Expr::SuperMember { .. }
+            | Expr::SuperComputedMember { .. }
+    )
 }
 
 /// Whether a parameter list is a `SimpleParameterList` (ECMA-262 15.1.1): plain
