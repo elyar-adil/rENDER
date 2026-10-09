@@ -572,6 +572,7 @@ impl JsRuntime {
 
     pub(super) fn create_arrow_function(
         &mut self,
+        name: Option<&str>,
         parameters: &[String],
         body: &[Statement],
         is_async: bool,
@@ -584,7 +585,7 @@ impl JsRuntime {
             .last()
             .and_then(|frame| frame.function.clone());
         self.create_function_meta(
-            None,
+            name,
             parameters,
             body,
             FunctionFlags {
@@ -750,7 +751,7 @@ impl JsRuntime {
                     return Ok(Completion::Normal(JsValue::Undefined));
                 }
                 let value = match value {
-                    Some(expression) => self.evaluate(dom, expression)?,
+                    Some(expression) => self.evaluate_named(dom, expression, name)?,
                     None => JsValue::Undefined,
                 };
                 self.initialize_binding(name, value.clone(), *kind)?;
@@ -762,7 +763,12 @@ impl JsRuntime {
                 let mut value = JsValue::Undefined;
                 for (target, expression) in declarations {
                     if let Some(expression) = expression {
-                        value = self.evaluate(dom, expression)?;
+                        value = match target {
+                            BindingTarget::Name(name) => {
+                                self.evaluate_named(dom, expression, name)?
+                            }
+                            BindingTarget::Pattern(_) => self.evaluate(dom, expression)?,
+                        };
                         match target {
                             BindingTarget::Name(name) => {
                                 self.initialize_binding(name, value.clone(), *kind)?;
@@ -1455,7 +1461,7 @@ impl JsRuntime {
                 body,
                 is_async,
                 ..
-            } => self.create_arrow_function(parameters, body, *is_async),
+            } => self.create_arrow_function(None, parameters, body, *is_async),
             Expr::Class {
                 name,
                 super_class,
@@ -1700,7 +1706,10 @@ impl JsRuntime {
                     return Ok(value);
                 }
                 let reference = self.resolve_assignment_reference(dom, target)?;
-                let value = self.evaluate(dom, value)?;
+                let value = match target.as_ref() {
+                    Expr::Identifier(name) => self.evaluate_named(dom, value, name)?,
+                    _ => self.evaluate(dom, value)?,
+                };
                 self.write_assignment_reference(dom, &reference, value.clone())?;
                 Ok(value)
             }
@@ -1721,7 +1730,10 @@ impl JsRuntime {
                 if short_circuits {
                     return Ok(current);
                 }
-                let value = self.evaluate(dom, value)?;
+                let value = match target.as_ref() {
+                    Expr::Identifier(name) => self.evaluate_named(dom, value, name)?,
+                    _ => self.evaluate(dom, value)?,
+                };
                 self.write_assignment_reference(dom, &reference, value.clone())?;
                 Ok(value)
             }
@@ -1806,7 +1818,12 @@ impl JsRuntime {
                 value: fallback,
             } => {
                 let value = if matches!(value, JsValue::Undefined) {
-                    self.evaluate(dom, fallback)?
+                    match pattern.as_ref() {
+                        BindingPattern::Identifier(name) => {
+                            self.evaluate_named(dom, fallback, name)?
+                        }
+                        _ => self.evaluate(dom, fallback)?,
+                    }
                 } else {
                     value
                 };
@@ -1912,7 +1929,10 @@ impl JsRuntime {
                 ..
             } => {
                 let value = if matches!(value, JsValue::Undefined) {
-                    self.evaluate(dom, default)?
+                    match target.as_ref() {
+                        Expr::Identifier(name) => self.evaluate_named(dom, default, name)?,
+                        _ => self.evaluate(dom, default)?,
+                    }
                 } else {
                     value
                 };
@@ -2645,6 +2665,39 @@ impl JsRuntime {
             },
         );
         Ok(template)
+    }
+
+    /// ECMA-262 8.4.5 NamedEvaluation. An anonymous function, arrow or class
+    /// that is the whole value of a named binding, assignment or default takes
+    /// that name. Any other expression is evaluated as usual.
+    pub(super) fn evaluate_named(
+        &mut self,
+        dom: &mut Dom,
+        expression: &Expr,
+        name: &str,
+    ) -> Result<JsValue, JsError> {
+        match expression {
+            Expr::Function {
+                name: None,
+                parameters,
+                body,
+                kind,
+                ..
+            } => self.create_function(Some(name), parameters, body, *kind),
+            Expr::Arrow {
+                parameters,
+                body,
+                is_async,
+                ..
+            } => self.create_arrow_function(Some(name), parameters, body, *is_async),
+            Expr::Class {
+                name: None,
+                super_class,
+                elements,
+                ..
+            } => self.evaluate_anonymous_class_named(dom, name, super_class.as_deref(), elements),
+            _ => self.evaluate(dom, expression),
+        }
     }
 
     pub(super) fn evaluate_function_expression(
@@ -5159,7 +5212,7 @@ impl JsRuntime {
                 match arguments.get(index) {
                     Some(argument) if !matches!(argument, JsValue::Undefined) => argument.clone(),
                     _ => match function.defaults.get(index).and_then(Option::as_ref) {
-                        Some(default) => self.evaluate(dom, default)?,
+                        Some(default) => self.evaluate_named(dom, default, parameter)?,
                         None => JsValue::Undefined,
                     },
                 }

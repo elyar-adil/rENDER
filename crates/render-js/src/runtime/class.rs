@@ -80,6 +80,38 @@ impl JsRuntime {
         super_class: Option<&Expr>,
         elements: &[ClassElement],
     ) -> Result<JsValue, JsError> {
+        self.evaluate_class_with_function_name(dom, name, name, super_class, elements)
+    }
+
+    /// An anonymous class that takes its name from NamedEvaluation. The
+    /// constructor carries `function_name`, but the class binds no name inside
+    /// its own body, which is what a named class expression does.
+    pub(super) fn evaluate_anonymous_class_named(
+        &mut self,
+        dom: &mut Dom,
+        function_name: &str,
+        super_class: Option<&Expr>,
+        elements: &[ClassElement],
+    ) -> Result<JsValue, JsError> {
+        self.evaluate_class_with_function_name(
+            dom,
+            None,
+            Some(function_name),
+            super_class,
+            elements,
+        )
+    }
+
+    /// Evaluates a class with its inner binding (`name`) and its constructor's
+    /// `name` kept separate, since NamedEvaluation supplies only the latter.
+    fn evaluate_class_with_function_name(
+        &mut self,
+        dom: &mut Dom,
+        name: Option<&str>,
+        function_name: Option<&str>,
+        super_class: Option<&Expr>,
+        elements: &[ClassElement],
+    ) -> Result<JsValue, JsError> {
         // 1. Heritage: the parent constructor and the prototype of the new
         // class's prototype object.
         let (super_constructor, super_prototype) = match super_class {
@@ -150,7 +182,7 @@ impl JsRuntime {
 
         let result = self.evaluate_class_body(
             dom,
-            name,
+            function_name,
             super_constructor,
             super_prototype,
             derived,

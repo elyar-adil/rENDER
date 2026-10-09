@@ -2786,8 +2786,9 @@ fn user_functions_expose_name_and_length_own_properties() {
         outcome.value,
         JsValue::String(
             // `length` counts parameters before the first default and
-            // excludes the rest parameter; anonymous callables read "".
-            "declared|2||2||1|0|string|true|true|0|declared".to_owned()
+            // excludes the rest parameter. A function or arrow assigned to a
+            // variable takes that name (NamedEvaluation, ECMA-262 8.4.5).
+            "declared|2|anonymous|2|arrow|1|0|string|true|true|0|declared".to_owned()
         )
     );
 }
