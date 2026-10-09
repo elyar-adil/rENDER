@@ -2728,8 +2728,54 @@ impl JsRuntime {
                 JsValue::Symbol(symbol) => Some(symbol.clone()),
                 _ => None,
             };
+            let key = key_value.to_js_string();
+            let value = self.evaluate(dom, &property.value)?;
+            if let Some(accessor) = property.accessor {
+                // `{get x(){}}` / `{set x(v){}}`, and their symbol-keyed forms
+                // `{get [s](){}}`, install accessor slots; a repeated member of
+                // either kind extends the same descriptor.
+                let function = match value {
+                    JsValue::Object(function)
+                        if JsRuntime::is_callable_object(function, &self.realm) =>
+                    {
+                        function
+                    }
+                    _ => return Err(JsError::type_error("object accessor must be a function")),
+                };
+                let existing = match &symbol_key {
+                    Some(symbol) => self.realm.own_symbol_property(object, symbol),
+                    None => self.realm.own_property(object, &key),
+                };
+                let (getter, setter) = match (accessor, existing) {
+                    (ObjectAccessorKind::Getter, Some(existing)) => {
+                        (Some(function), existing.setter)
+                    }
+                    (ObjectAccessorKind::Setter, Some(existing)) => {
+                        (existing.getter, Some(function))
+                    }
+                    (ObjectAccessorKind::Getter, None) => (Some(function), None),
+                    (ObjectAccessorKind::Setter, None) => (None, Some(function)),
+                };
+                let descriptor = PropertyDescriptor {
+                    value: JsValue::Undefined,
+                    writable: false,
+                    getter,
+                    setter,
+                    enumerable: true,
+                    configurable: true,
+                };
+                let defined = match &symbol_key {
+                    Some(symbol) => self
+                        .realm
+                        .define_symbol_property(object, symbol, descriptor),
+                    None => self.realm.define_property(object, key, descriptor),
+                };
+                if !defined {
+                    return Err(JsError::type_error("could not define object accessor"));
+                }
+                continue;
+            }
             if let Some(symbol) = symbol_key {
-                let value = self.evaluate(dom, &property.value)?;
                 if !self.realm.define_symbol_property(
                     object,
                     &symbol,
@@ -2743,46 +2789,6 @@ impl JsRuntime {
                     },
                 ) {
                     return Err(JsError::type_error("could not define symbol property"));
-                }
-                continue;
-            }
-            let key = key_value.to_js_string();
-            let value = self.evaluate(dom, &property.value)?;
-            if let Some(accessor) = property.accessor {
-                // `{get x(){}}` / `{set x(v){}}` install accessor slots; a
-                // repeated member of either kind extends the same descriptor.
-                let function = match value {
-                    JsValue::Object(function)
-                        if JsRuntime::is_callable_object(function, &self.realm) =>
-                    {
-                        function
-                    }
-                    _ => return Err(JsError::type_error("object accessor must be a function")),
-                };
-                let existing = self.realm.own_property(object, &key);
-                let (getter, setter) = match (accessor, existing) {
-                    (ObjectAccessorKind::Getter, Some(existing)) => {
-                        (Some(function), existing.setter)
-                    }
-                    (ObjectAccessorKind::Setter, Some(existing)) => {
-                        (existing.getter, Some(function))
-                    }
-                    (ObjectAccessorKind::Getter, None) => (Some(function), None),
-                    (ObjectAccessorKind::Setter, None) => (None, Some(function)),
-                };
-                if !self.realm.define_property(
-                    object,
-                    key,
-                    PropertyDescriptor {
-                        value: JsValue::Undefined,
-                        writable: false,
-                        getter,
-                        setter,
-                        enumerable: true,
-                        configurable: true,
-                    },
-                ) {
-                    return Err(JsError::type_error("could not define object accessor"));
                 }
                 continue;
             }

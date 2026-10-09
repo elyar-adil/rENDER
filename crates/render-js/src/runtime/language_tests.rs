@@ -869,3 +869,97 @@ fn arrow_parameter_names_are_never_duplicated() {
     ]);
     assert_eq!(ok("var f = (a, b) => a + b; f(2, 3)"), "5");
 }
+#[test]
+fn object_accessors_take_computed_names_and_install_accessor_slots() {
+    assert_eq!(
+        ok("var s = Symbol('k'); var o = { get [s]() { return 1; } }; typeof o[s]"),
+        "number"
+    );
+    assert_eq!(
+        ok(
+            "var s = Symbol('k'); var o = { get [s]() { return 1; }, set [s](v) { this.hit = v; } }; o[s] = 5; String(o.hit)"
+        ),
+        "5"
+    );
+    assert_eq!(
+        ok(
+            "var o = { get ['a' + 'b']() { return 'ab'; }, set ['a' + 'b'](v) { this.v = v; } }; o.ab + (o.ab = 2)"
+        ),
+        "ab2"
+    );
+    assert_eq!(
+        ok("var o = { get [1E+9]() { return 'g'; } }; o['1000000000']"),
+        "g"
+    );
+}
+
+#[test]
+fn object_get_and_set_are_ordinary_names_before_a_separator() {
+    assert_eq!(
+        ok("var get = 1, set = 2; var o = { get, set }; o.get + o.set"),
+        "3"
+    );
+    assert_eq!(
+        ok("var o = { get() { return 4; }, set: 5 }; o.get() + o.set"),
+        "9"
+    );
+}
+
+#[test]
+fn numeric_property_names_are_their_to_string_value() {
+    assert_eq!(
+        ok(
+            "var o = { 1e21: 'a', 0.0000001: 'b', 0x10: 'c', .5: 'd' }; o['1e+21'] + o['1e-7'] + o['16'] + o['0.5']"
+        ),
+        "abcd"
+    );
+}
+
+#[test]
+fn class_modifiers_stop_at_a_line_break_where_the_grammar_requires_it() {
+    assert_eq!(
+        ok(
+            "var i = new (class { async\n m() { return 1; } })(); String('async' in i) + ':' + typeof i.m"
+        ),
+        "true:function"
+    );
+    assert_eq!(
+        ok("var C = class { get\n *g() { return 7; } }; new C().g().next().value"),
+        "7"
+    );
+    assert_eq!(
+        ok("var i = new (class { get\n x() { return 9; } })(); i.x"),
+        "9"
+    );
+}
+
+#[test]
+fn a_star_after_get_or_set_and_malformed_shorthand_members_are_syntax_errors() {
+    for source in [
+        "class C { get *x() {} }",
+        "class C { set *x(v) {} }",
+        "({ get *x() {} })",
+        "({ set *x(v) {} })",
+        "({ async\nfoo() {} })",
+        "({ null })",
+        "({ 'a' })",
+        "({ this })",
+        "({ 1 })",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn computed_object_accessor_keys_parse_inside_a_for_initializer() {
+    assert_eq!(
+        ok(
+            "var o, v; for (o = { get ['x' in {x: 1}]() { return 'hit'; } }; ; ) { v = o.true; break; } v"
+        ),
+        "hit"
+    );
+}

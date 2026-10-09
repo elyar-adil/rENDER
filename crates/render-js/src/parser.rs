@@ -12,6 +12,7 @@ use crate::JsValue;
 use crate::module::{
     DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, IndirectExport, ModuleInfo,
 };
+use crate::value::number_to_string;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
@@ -581,13 +582,22 @@ fn is_refused_body(statement: &Statement, position: BodyPosition) -> bool {
 /// Whether the token after a class modifier keyword (`get`, `set`, `async`,
 /// `static`) lets it act as a modifier instead of an element name. A name
 /// followed by `(`/`=`/`;`/`}` (or nothing) is an ordinary element.
-fn class_modifier_follows(next: Option<&TokenKind>) -> bool {
-    !matches!(
-        next,
-        None | Some(
+fn class_modifier_follows(next: Option<&Token>) -> bool {
+    next.is_some_and(|token| {
+        !matches!(
+            token.kind,
             TokenKind::LeftParen | TokenKind::Equal | TokenKind::Semicolon | TokenKind::RightBrace
         )
-    )
+    })
+}
+
+/// The name a function built from a property key carries. A computed key has
+/// no static name; the runtime names it from the evaluated key.
+fn static_key_name(key: &PropertyKey) -> Option<String> {
+    match key {
+        PropertyKey::Static(name) => Some(name.clone()),
+        _ => None,
+    }
 }
 
 /// Class-body early errors (ECMA-262 §15.7.1): at most one constructor, no
@@ -1722,16 +1732,7 @@ impl Parser {
                     &self.current().kind,
                     TokenKind::Identifier(_) | TokenKind::Undefined
                 );
-                let key = if self.take(&TokenKind::LeftBracket) {
-                    let expression = self.assignment()?;
-                    self.require(
-                        &TokenKind::RightBracket,
-                        "expected ']' after computed binding key",
-                    )?;
-                    PropertyKey::Computed(expression)
-                } else {
-                    PropertyKey::Static(self.property_name()?)
-                };
+                let key = self.property_key()?;
                 let mut pattern = if self.take(&TokenKind::Colon) {
                     self.binding_pattern()?
                 } else if let PropertyKey::Static(property) = &key
@@ -3253,7 +3254,7 @@ impl Parser {
         let static_start = self.current().offset;
         let mut is_static = false;
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "static")
-            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+            && class_modifier_follows(self.tokens.get(self.cursor + 1))
         {
             self.advance();
             is_static = true;
@@ -3273,9 +3274,14 @@ impl Parser {
                 });
             }
         }
+        // `get *x` is not an accessor: the `*` cannot follow the word `get`, so
+        // `get` is the element's name, and `get` then `*x` on the same line is a
+        // syntax error. On a new line the `*` starts a generator element.
         let mut kind = ClassElementKind::Method;
+        let next = self.tokens.get(self.cursor + 1);
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "get" || name == "set")
-            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+            && class_modifier_follows(next)
+            && !matches!(next, Some(token) if token.kind == TokenKind::Star)
         {
             let TokenKind::Identifier(name) = self.advance().kind else {
                 unreachable!("checked above");
@@ -3286,10 +3292,14 @@ impl Parser {
                 ClassElementKind::Set
             };
         }
+        // `async [no LineTerminator here] *name`: on a new line `async` is the
+        // element's own name, a field, and the next line starts a new element.
         let mut is_async = false;
+        let next = self.tokens.get(self.cursor + 1);
         if matches!(kind, ClassElementKind::Method)
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
-            && class_modifier_follows(self.tokens.get(self.cursor + 1).map(|token| &token.kind))
+            && class_modifier_follows(next)
+            && next.is_some_and(|token| !token.after_newline)
         {
             self.advance();
             is_async = true;
@@ -3368,15 +3378,7 @@ impl Parser {
             self.advance();
             return Ok(PropertyKey::Private(name));
         }
-        if self.take(&TokenKind::LeftBracket) {
-            let key = self.assignment()?;
-            self.require(
-                &TokenKind::RightBracket,
-                "expected ']' after computed class element name",
-            )?;
-            return Ok(PropertyKey::Computed(key));
-        }
-        Ok(PropertyKey::Static(self.property_name()?))
+        self.property_key()
     }
 
     /// An untagged template literal: the chunks and the substituted values are
@@ -3709,210 +3711,170 @@ impl Parser {
     }
 
     fn object_literal(&mut self) -> Result<Expr, JsError> {
-        let mut properties = Vec::new();
-        if !self.at(&TokenKind::RightBrace) {
-            loop {
-                if self.take(&TokenKind::Ellipsis) {
-                    properties.push(ObjectProperty {
-                        key: PropertyKey::Spread,
-                        value: self.assignment()?,
-                        accessor: None,
-                        shorthand: false,
-                        method: false,
-                    });
-                    if !self.take(&TokenKind::Comma) {
-                        break;
-                    }
-                    if self.at(&TokenKind::RightBrace) {
-                        break;
-                    }
-                    continue;
-                }
-                // Method modifiers: `async`, `*`, or `async *`. `async` is only
-                // a modifier when something that can start a property name
-                // follows; `{ async }`, `{ async: 1 }` and `{ async() {} }`
-                // keep it as the name.
-                let async_is_modifier = matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
-                    && !self.tokens.get(self.cursor + 1).is_none_or(|next| {
-                        next.after_newline
-                            || matches!(
-                                next.kind,
-                                TokenKind::LeftParen
-                                    | TokenKind::Colon
-                                    | TokenKind::Comma
-                                    | TokenKind::RightBrace
-                                    | TokenKind::Equal
-                            )
-                    });
-                let mut modifier_async = false;
-                if async_is_modifier {
-                    self.advance();
-                    modifier_async = true;
-                }
-                let modifier_generator = self.take(&TokenKind::Star);
-                if modifier_async || modifier_generator {
-                    let kind = FunctionKind::new(modifier_async, modifier_generator);
-                    let (key, name) = if self.take(&TokenKind::LeftBracket) {
-                        let key = self.assignment()?;
-                        self.require(
-                            &TokenKind::RightBracket,
-                            "expected ']' after computed property name",
-                        )?;
-                        (PropertyKey::Computed(key), None)
-                    } else {
-                        let key = self.property_name()?;
-                        (PropertyKey::Static(key.clone()), Some(key))
-                    };
-                    let (parameters, body) = self.method_tail(kind, false)?;
-                    properties.push(ObjectProperty {
-                        key,
-                        value: Expr::Function {
-                            offset: self.previous_offset(),
-                            name,
-                            parameters,
-                            body,
-                            kind,
-                        },
-                        accessor: None,
-                        shorthand: false,
-                        method: true,
-                    });
-                    if !self.take(&TokenKind::Comma) {
-                        break;
-                    }
-                    if self.at(&TokenKind::RightBrace) {
-                        break;
-                    }
-                    continue;
-                }
-                if self.take(&TokenKind::LeftBracket) {
-                    let key = self.assignment()?;
-                    self.require(
-                        &TokenKind::RightBracket,
-                        "expected ']' after computed property name",
-                    )?;
-                    let value = if self.at(&TokenKind::LeftParen) {
-                        let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
-                        Expr::Function {
-                            offset: self.previous_offset(),
-                            name: None,
-                            parameters,
-                            body,
-                            kind: FunctionKind::Normal,
-                        }
-                    } else {
-                        self.require(
-                            &TokenKind::Colon,
-                            "expected ':' after computed property name",
-                        )?;
-                        self.assignment()?
-                    };
-                    properties.push(ObjectProperty {
-                        key: PropertyKey::Computed(key),
-                        value,
-                        accessor: None,
-                        shorthand: false,
-                        method: false,
-                    });
-                    if !self.take(&TokenKind::Comma) {
-                        break;
-                    }
-                    if self.at(&TokenKind::RightBrace) {
-                        break;
-                    }
-                    continue;
-                }
-                let accessor_kind = match &self.current().kind {
-                    TokenKind::Identifier(name)
-                        if (name == "get" || name == "set")
-                            && !matches!(
-                                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-                                Some(TokenKind::LeftParen | TokenKind::Colon | TokenKind::Comma)
-                            ) =>
-                    {
-                        if name == "get" {
-                            Some(ObjectAccessorKind::Getter)
-                        } else {
-                            Some(ObjectAccessorKind::Setter)
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(accessor_kind) = accessor_kind {
-                    self.advance();
-                    let key = self.property_name()?;
-                    let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
-                    properties.push(ObjectProperty {
-                        key: PropertyKey::Static(key.clone()),
-                        value: Expr::Function {
-                            offset: self.previous_offset(),
-                            name: Some(key),
-                            parameters,
-                            body,
-                            kind: FunctionKind::Normal,
-                        },
-                        accessor: Some(accessor_kind),
-                        shorthand: false,
-                        method: false,
-                    });
-                    if !self.take(&TokenKind::Comma) {
-                        break;
-                    }
-                    if self.at(&TokenKind::RightBrace) {
-                        break;
-                    }
-                    continue;
-                }
-                let shorthand_candidate = matches!(
-                    &self.current().kind,
-                    TokenKind::Identifier(_) | TokenKind::Undefined | TokenKind::Let
-                );
-                let key = self.property_name()?;
-                let (value, shorthand, method) = if self.take(&TokenKind::Colon) {
-                    (self.assignment()?, false, false)
-                } else if self.at(&TokenKind::LeftParen) {
-                    let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
-                    (
-                        Expr::Function {
-                            offset: self.previous_offset(),
-                            name: Some(key.clone()),
-                            parameters,
-                            body,
-                            kind: FunctionKind::Normal,
-                        },
-                        false,
-                        true,
-                    )
-                } else if shorthand_candidate {
-                    // The shorthand is an IdentifierReference (ECMA-262 13.2.5.1).
-                    let restricted = (self.in_generator && key == "yield")
-                        || (self.in_async && key == "await")
-                        || (self.static_block_await && key == "await")
-                        || (self.static_block && key == "arguments");
-                    if restricted {
-                        return Err(self.error("name is not a valid identifier reference here"));
-                    }
-                    (Expr::Identifier(key.clone()), true, false)
-                } else {
-                    return Err(self.error("expected ':' after property name"));
-                };
-                properties.push(ObjectProperty {
-                    key: PropertyKey::Static(key),
-                    value,
-                    accessor: None,
-                    shorthand,
-                    method,
-                });
-                if !self.take(&TokenKind::Comma) {
-                    break;
-                }
-                if self.at(&TokenKind::RightBrace) {
+        // Member values are `[+In]` even inside a for-loop initializer.
+        self.in_allowed(|parser| {
+            let mut properties = Vec::new();
+            while !parser.at(&TokenKind::RightBrace) {
+                properties.push(parser.object_member()?);
+                if !parser.take(&TokenKind::Comma) {
                     break;
                 }
             }
+            parser.require(&TokenKind::RightBrace, "expected '}' after object literal")?;
+            Ok(Expr::Object(properties))
+        })
+    }
+
+    /// One member of an object literal (ECMA-262 13.2.5): a spread, a method,
+    /// an accessor, a `PropertyName : AssignmentExpression` pair, or a shorthand
+    /// `IdentifierReference`.
+    fn object_member(&mut self) -> Result<ObjectProperty, JsError> {
+        if self.take(&TokenKind::Ellipsis) {
+            return Ok(ObjectProperty {
+                key: PropertyKey::Spread,
+                value: self.assignment()?,
+                accessor: None,
+                shorthand: false,
+                method: false,
+            });
         }
-        self.require(&TokenKind::RightBrace, "expected '}' after object literal")?;
-        Ok(Expr::Object(properties))
+        // `async` is a method modifier only when a property name follows on
+        // the same line (`async [no LineTerminator here] *`). `{ async }`,
+        // `{ async: 1 }` and `{ async() {} }` keep it as the name.
+        let is_async = matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
+            && self.tokens.get(self.cursor + 1).is_some_and(|next| {
+                !next.after_newline
+                    && !matches!(
+                        next.kind,
+                        TokenKind::LeftParen
+                            | TokenKind::Colon
+                            | TokenKind::Comma
+                            | TokenKind::RightBrace
+                            | TokenKind::Equal
+                    )
+            });
+        if is_async {
+            self.advance();
+        }
+        let is_generator = self.take(&TokenKind::Star);
+        if is_async || is_generator {
+            let key = self.property_key()?;
+            return self.object_method(key, FunctionKind::new(is_async, is_generator));
+        }
+        // `get` and `set` are accessor keywords only when a property name
+        // follows; `{ get }`, `{ get: 1 }`, `{ get() {} }` and `{ get = 1 }`
+        // keep them as names.
+        let next_kind = self.tokens.get(self.cursor + 1).map(|token| &token.kind);
+        let accessor = match &self.current().kind {
+            TokenKind::Identifier(name)
+                if (name == "get" || name == "set")
+                    && !matches!(
+                        next_kind,
+                        Some(
+                            TokenKind::LeftParen
+                                | TokenKind::Colon
+                                | TokenKind::Comma
+                                | TokenKind::RightBrace
+                                | TokenKind::Equal
+                        )
+                    ) =>
+            {
+                if name == "get" {
+                    Some(ObjectAccessorKind::Getter)
+                } else {
+                    Some(ObjectAccessorKind::Setter)
+                }
+            }
+            _ => None,
+        };
+        if let Some(accessor) = accessor {
+            self.advance();
+            let key = self.property_key()?;
+            let name = static_key_name(&key);
+            let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
+            return Ok(ObjectProperty {
+                key,
+                value: Expr::Function {
+                    offset: self.previous_offset(),
+                    name,
+                    parameters,
+                    body,
+                    kind: FunctionKind::Normal,
+                },
+                accessor: Some(accessor),
+                shorthand: false,
+                method: false,
+            });
+        }
+        // A shorthand member names an IdentifierReference, so a reserved word,
+        // a literal or a string cannot stand alone.
+        // `let` and `undefined` are lexed as keywords but are ordinary names here.
+        let shorthand_allowed = match &self.current().kind {
+            TokenKind::Identifier(name) => !ALWAYS_RESERVED_NAMES.contains(&name.as_str()),
+            TokenKind::Let | TokenKind::Undefined => true,
+            _ => false,
+        };
+        let key = self.property_key()?;
+        if self.at(&TokenKind::LeftParen) {
+            return self.object_method(key, FunctionKind::Normal);
+        }
+        if self.take(&TokenKind::Colon) {
+            return Ok(ObjectProperty {
+                key,
+                value: self.assignment()?,
+                accessor: None,
+                shorthand: false,
+                method: false,
+            });
+        }
+        match key {
+            PropertyKey::Static(name) if shorthand_allowed => {
+                // The shorthand is an IdentifierReference (ECMA-262 13.2.5.1).
+                let restricted = (self.in_generator && name == "yield")
+                    || (self.in_async && name == "await")
+                    || (self.static_block_await && name == "await")
+                    || (self.static_block && name == "arguments");
+                if restricted {
+                    return Err(self.error("name is not a valid identifier reference here"));
+                }
+                Ok(ObjectProperty {
+                    key: PropertyKey::Static(name.clone()),
+                    value: Expr::Identifier(name),
+                    accessor: None,
+                    shorthand: true,
+                    method: false,
+                })
+            }
+            PropertyKey::Computed(_) => {
+                Err(self.error("expected ':' after computed property name"))
+            }
+            _ => Err(self.error("expected ':' after property name")),
+        }
+    }
+
+    /// The parameters and body of an object-literal method whose key has been
+    /// read. Only a literal key names the function; a computed key is named at
+    /// run time.
+    fn object_method(
+        &mut self,
+        key: PropertyKey,
+        kind: FunctionKind,
+    ) -> Result<ObjectProperty, JsError> {
+        let name = static_key_name(&key);
+        let (parameters, body) = self.function_tail(kind)?;
+        Ok(ObjectProperty {
+            key,
+            value: Expr::Function {
+                offset: self.previous_offset(),
+                name,
+                parameters,
+                body,
+                kind,
+            },
+            accessor: None,
+            shorthand: false,
+            method: true,
+        })
     }
 
     fn array_literal(&mut self) -> Result<Expr, JsError> {
@@ -3938,13 +3900,29 @@ impl Parser {
         Ok(Expr::Array(elements))
     }
 
+    /// ECMA-262 13.2.5 `PropertyName`: a literal name, or `[ AssignmentExpression ]`
+    /// whose value is converted to a key at run time.
+    fn property_key(&mut self) -> Result<PropertyKey, JsError> {
+        if self.take(&TokenKind::LeftBracket) {
+            // The bracketed name is `[+In]` even inside a for-loop initializer.
+            let key = self.in_allowed(Self::assignment)?;
+            self.require(
+                &TokenKind::RightBracket,
+                "expected ']' after computed property name",
+            )?;
+            return Ok(PropertyKey::Computed(key));
+        }
+        Ok(PropertyKey::Static(self.property_name()?))
+    }
+
     fn property_name(&mut self) -> Result<String, JsError> {
         let token = self.advance();
         match token.kind {
             TokenKind::Identifier(name)
             | TokenKind::EscapedReserved(name)
             | TokenKind::String(name) => Ok(name),
-            TokenKind::Number(value) => Ok(value.to_string()),
+            // A numeric name is the ToString of its value: `1e21` is "1e+21".
+            TokenKind::Number(value) => Ok(number_to_string(value)),
             // Keywords are valid property names after `.`.
             TokenKind::Let => Ok("let".to_owned()),
             TokenKind::Const => Ok("const".to_owned()),
