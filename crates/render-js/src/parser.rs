@@ -15,6 +15,12 @@ use crate::module::{
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+/// Words that are reserved in every context but are not keyword tokens. The
+/// lexer hands them out as identifiers, so the parser refuses them where a name
+/// is bound or referenced. An escaped spelling decodes to the same name, which
+/// the spec also refuses (ECMA-262 12.7.2).
+const ALWAYS_RESERVED_NAMES: &[&str] = &["class", "debugger", "enum", "export", "extends", "super"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VariableKind {
     Let,
@@ -889,6 +895,9 @@ impl Parser {
     /// in generator code (ECMA-262 13.1.1, 14.1.1, 14.4.1). A module's top level
     /// counts as async, so `await` is reserved there too.
     fn check_contextual_binding(&self, name: &str) -> Result<(), JsError> {
+        if ALWAYS_RESERVED_NAMES.contains(&name) {
+            return Err(self.error("reserved word cannot be used as a binding name"));
+        }
         if self.in_async && name == "await" {
             return Err(self.error("await cannot be a binding name in async code"));
         }
@@ -2401,6 +2410,9 @@ impl Parser {
                 format!("private name #{name} must be followed by 'in'"),
                 token.offset,
             )),
+            TokenKind::Identifier(name) if ALWAYS_RESERVED_NAMES.contains(&name.as_str()) => Err(
+                JsError::syntax(format!("{name} is a reserved word"), token.offset),
+            ),
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
@@ -2777,6 +2789,7 @@ impl Parser {
                         TokenKind::Undefined => "undefined".to_owned(),
                         _ => return Err(self.error("expected a parameter name")),
                     };
+                    self.check_contextual_binding(&parameter)?;
                     bound_names.push(parameter);
                 }
                 let has_default = self.take(&TokenKind::Equal);

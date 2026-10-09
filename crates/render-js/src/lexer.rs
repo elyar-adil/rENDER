@@ -165,14 +165,29 @@ struct Lexer<'a> {
     newline: bool,
 }
 
+/// ECMA-262 12.2 WhiteSpace: tab, vertical tab, form feed, space, no-break
+/// space, the byte-order mark, and the Unicode `Zs` (space separator) category.
+fn is_js_whitespace(character: char) -> bool {
+    matches!(
+        character,
+        '\t' | '\u{b}' | '\u{c}' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'
+            ..='\u{200a}' | '\u{202f}' | '\u{205f}' | '\u{3000}' | '\u{feff}'
+    )
+}
+
+/// ECMA-262 12.3 LineTerminator.
+fn is_js_line_terminator(character: char) -> bool {
+    matches!(character, '\n' | '\r' | '\u{2028}' | '\u{2029}')
+}
+
 impl Lexer<'_> {
     #[allow(clippy::too_many_lines)]
     fn run(mut self) -> Result<Vec<Token>, JsError> {
         while let Some(character) = self.peek() {
             // ECMA-262 WhiteSpace includes <ZWNBSP> (U+FEFF); source files
             // saved with a UTF-8 byte-order mark must still tokenize.
-            if character.is_ascii_whitespace() || character == '\u{feff}' {
-                if matches!(character, '\n' | '\r') {
+            if is_js_whitespace(character) || is_js_line_terminator(character) {
+                if is_js_line_terminator(character) {
                     self.newline = true;
                 }
                 self.advance();
