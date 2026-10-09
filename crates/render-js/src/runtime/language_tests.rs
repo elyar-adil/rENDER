@@ -716,3 +716,59 @@ fn shorthand_properties_must_name_an_identifier_reference() {
     assert_eq!(ok("var u = 1; ({ u, undefined: 2 }).u"), "1");
     assert_eq!(ok("var n = 3; var { n: m } = { n }; m"), "3");
 }
+
+#[test]
+fn super_is_valid_only_where_its_method_context_allows_it() {
+    assert_early_syntax_errors(&[
+        "function f() { super.x; }",
+        "function f() { super(); }",
+        "({ m() { function f() { super.x; } } })",
+        "class C { constructor() { super(); } }",
+        "class B {} class C extends B { m() { super(); } }",
+        "class B {} class C extends B { constructor(a = super()) {} }",
+        "class C { static { super(); } }",
+        "class C { x = super(); }",
+        "class C { m() { return () => super(); } }",
+        "class B {} class C extends B { get g() { super(); } }",
+    ]);
+    assert_eq!(
+        ok(
+            "class B { m() { return 1; } } class C extends B { constructor() { super(); this.v = super.m(); } } new C().v"
+        ),
+        "1"
+    );
+    assert_eq!(
+        ok(
+            "class B {} class C extends B { constructor() { var f = () => super(); f(); this.ok = true; } } String(new C().ok)"
+        ),
+        "true"
+    );
+    // Object literal methods may name `super` (the parse is what is checked here;
+    // running `super` in an object literal method is not implemented).
+    assert_eq!(
+        ok("var o = { m() { return super.x; } }; 'parsed'"),
+        "parsed"
+    );
+    assert_eq!(
+        ok(
+            "class B { static m() { return 2; } } class C extends B { static n() { return super.m(); } } C.n()"
+        ),
+        "2"
+    );
+    assert_eq!(
+        ok("class B {} class C extends B { x = super.constructor === B; } String(new C().x)"),
+        "true"
+    );
+}
+
+#[test]
+fn class_names_are_strict_code_even_in_sloppy_scripts() {
+    assert_early_syntax_errors(&[
+        "class let {}",
+        "class static {}",
+        "class arguments {}",
+        "var C = class yield {};",
+        "class l\\u0065t {}",
+    ]);
+    assert_eq!(ok("class C {} String(typeof C)"), "function");
+}

@@ -988,6 +988,8 @@ impl Parser {
             in_async: false,
             in_generator: false,
             in_parameters: false,
+            super_property_allowed: false,
+            super_call_allowed: false,
         }
     }
 }
@@ -1022,6 +1024,13 @@ struct Parser {
     /// Set while the formal parameters of a function are parsed. A `YieldExpression`
     /// or `AwaitExpression` there is an early error (ECMA-262 15.5.1, 15.8.1).
     in_parameters: bool,
+    /// `super.name` and `super[expression]` are valid: inside a method, a class
+    /// field initializer, or a static block, and in arrows nested in them
+    /// (ECMA-262 13.3.7.1).
+    super_property_allowed: bool,
+    /// `super(...)` is valid only in the constructor of a derived class, and in
+    /// arrows nested in it (ECMA-262 13.3.7.1, 15.7.1).
+    super_call_allowed: bool,
 }
 
 impl Parser {
@@ -1125,6 +1134,7 @@ impl Parser {
             let TokenKind::Identifier(name) = self.current().kind.clone() else {
                 return Err(self.error("class declaration requires a name"));
             };
+            self.check_class_name(&name)?;
             self.advance();
             let (super_class, elements) = self.class_tail()?;
             return Ok(Statement::Class {
@@ -2802,6 +2812,7 @@ impl Parser {
                 let name = if let TokenKind::Identifier(name) = self.current().kind.clone()
                     && name != "extends"
                 {
+                    self.check_class_name(&name)?;
                     self.advance();
                     Some(name)
                 } else {
@@ -2958,9 +2969,21 @@ impl Parser {
     /// postfix tail, which sees the resulting value expression.
     fn super_expression(&mut self, offset: usize) -> Result<Expr, JsError> {
         if self.at(&TokenKind::LeftParen) {
+            if !self.super_call_allowed {
+                return Err(JsError::syntax(
+                    "'super()' is only valid in a derived class constructor",
+                    offset,
+                ));
+            }
             self.advance();
             let arguments = self.arguments_after_left_paren()?;
             return Ok(Expr::SuperCall { arguments, offset });
+        }
+        if !self.super_property_allowed {
+            return Err(JsError::syntax(
+                "'super' property access is only valid in a method",
+                offset,
+            ));
         }
         if self.take(&TokenKind::Dot) {
             let property = self.property_name()?;
@@ -2999,7 +3022,7 @@ impl Parser {
         // The heritage above is evaluated outside this class's private
         // environment, so its references were recorded for the outer scope.
         self.private_references.push(Vec::new());
-        let elements = self.class_elements();
+        let elements = self.class_elements(super_class.is_some());
         let references = self.private_references.pop().unwrap_or_default();
         let elements = elements?;
         self.require(&TokenKind::RightBrace, "expected '}' after class body")?;
@@ -3009,7 +3032,7 @@ impl Parser {
     }
 
     /// The members of a class body up to, not including, its closing brace.
-    fn class_elements(&mut self) -> Result<Vec<ClassElement>, JsError> {
+    fn class_elements(&mut self, derived: bool) -> Result<Vec<ClassElement>, JsError> {
         let mut elements = Vec::new();
         while !self.at(&TokenKind::RightBrace) {
             if self.at(&TokenKind::Eof) {
@@ -3018,7 +3041,7 @@ impl Parser {
             if self.take(&TokenKind::Semicolon) {
                 continue;
             }
-            elements.push(self.class_element()?);
+            elements.push(self.class_element(derived)?);
         }
         Ok(elements)
     }
@@ -3072,7 +3095,7 @@ impl Parser {
 
     /// Parse one class body element: a method, accessor, constructor, field,
     /// or static initialization block.
-    fn class_element(&mut self) -> Result<ClassElement, JsError> {
+    fn class_element(&mut self, derived: bool) -> Result<ClassElement, JsError> {
         let offset = self.current().offset;
         let static_start = self.current().offset;
         let mut is_static = false;
@@ -3082,7 +3105,7 @@ impl Parser {
             self.advance();
             is_static = true;
             if self.take(&TokenKind::LeftBrace) {
-                let body = self.statement_list(true)?;
+                let body = self.with_super_property(|parser| parser.statement_list(true))?;
                 self.require(&TokenKind::RightBrace, "expected '}' after static block")?;
                 return Ok(ClassElement {
                     key: PropertyKey::Static("static".to_owned()),
@@ -3121,8 +3144,14 @@ impl Parser {
         let is_generator = self.take(&TokenKind::Star);
         let key = self.class_element_key()?;
         if self.at(&TokenKind::LeftParen) {
+            let is_constructor = derived
+                && !is_static
+                && kind == ClassElementKind::Method
+                && !is_async
+                && !is_generator
+                && matches!(&key, PropertyKey::Static(name) if name == "constructor");
             let (parameters, body) =
-                self.function_tail(FunctionKind::new(is_async, is_generator))?;
+                self.method_tail(FunctionKind::new(is_async, is_generator), is_constructor)?;
             let kind = if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
                 kind
             } else if !is_static
@@ -3151,7 +3180,7 @@ impl Parser {
             return Err(self.error("expected '(' after method name"));
         }
         let initializer = if self.take(&TokenKind::Equal) {
-            Some(self.assignment()?)
+            Some(self.with_super_property(Self::assignment)?)
         } else {
             None
         };
@@ -3261,6 +3290,8 @@ impl Parser {
         parser
             .private_references
             .clone_from(&self.private_references);
+        parser.super_property_allowed = self.super_property_allowed;
+        parser.super_call_allowed = self.super_call_allowed;
         parser.function_depth = self.function_depth;
         parser.module = self.module.as_ref().map(|_| ModuleInfo::default());
         let expression = parser.expression()?;
@@ -3296,23 +3327,75 @@ impl Parser {
         })
     }
 
+    /// A class name is strict-mode code even in a sloppy script (ECMA-262
+    /// 15.7.1), so the strict reserved words and `arguments`/`eval` are refused.
+    fn check_class_name(&self, name: &str) -> Result<(), JsError> {
+        if is_strict_reserved_word(name) || name == "arguments" {
+            return Err(self.error("class name is reserved in strict mode"));
+        }
+        Ok(())
+    }
+
+    /// Parse a class field initializer or static block: `super.name` is valid
+    /// there, and `super()` is not (ECMA-262 15.7.1).
+    fn with_super_property<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let previous_property = std::mem::replace(&mut self.super_property_allowed, true);
+        let previous_call = std::mem::replace(&mut self.super_call_allowed, false);
+        let result = parse(self);
+        self.super_property_allowed = previous_property;
+        self.super_call_allowed = previous_call;
+        result
+    }
+
+    /// The parameters and body of an ordinary function, which has no `super`.
     fn function_tail(
         &mut self,
         kind: FunctionKind,
     ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+        self.function_tail_with(kind, false, false)
+    }
+
+    /// The parameters and body of a method: `super.name` is valid in it, and
+    /// `super()` only when `super_call` (a derived class's constructor).
+    fn method_tail(
+        &mut self,
+        kind: FunctionKind,
+        super_call: bool,
+    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+        self.function_tail_with(kind, true, super_call)
+    }
+
+    fn function_tail_with(
+        &mut self,
+        kind: FunctionKind,
+        super_property: bool,
+        super_call: bool,
+    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
         let previous_async = std::mem::replace(&mut self.in_async, kind.is_async());
         let previous_generator = std::mem::replace(&mut self.in_generator, kind.is_generator());
         let previous_parameters = std::mem::replace(&mut self.in_parameters, false);
-        let result = self.function_tail_inner();
+        let previous_super_property =
+            std::mem::replace(&mut self.super_property_allowed, super_property);
+        let previous_super_call = std::mem::replace(&mut self.super_call_allowed, false);
+        let result = self.function_tail_inner(super_call);
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         self.in_parameters = previous_parameters;
+        self.super_property_allowed = previous_super_property;
+        self.super_call_allowed = previous_super_call;
         let (parameters, body) = result?;
         validate_declaration_conflicts(&body, true)?;
         Ok((parameters, body))
     }
 
-    fn function_tail_inner(&mut self) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    /// `super_call` is the call permission of the body; parameters never have it.
+    fn function_tail_inner(
+        &mut self,
+        super_call: bool,
+    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
         self.require(
             &TokenKind::LeftParen,
             "expected '(' before function parameters",
@@ -3379,6 +3462,7 @@ impl Parser {
         }
         self.require(&TokenKind::RightParen, "expected ')' after parameters")?;
         self.in_parameters = false;
+        self.super_call_allowed = super_call;
         self.require(&TokenKind::LeftBrace, "expected '{' before function body")?;
         let previous_function_depth = self.function_depth;
         let previous_loop_depth = self.loop_depth;
@@ -3473,7 +3557,7 @@ impl Parser {
                         let key = self.property_name()?;
                         (PropertyKey::Static(key.clone()), Some(key))
                     };
-                    let (parameters, body) = self.function_tail(kind)?;
+                    let (parameters, body) = self.method_tail(kind, false)?;
                     properties.push(ObjectProperty {
                         key,
                         value: Expr::Function {
@@ -3502,7 +3586,7 @@ impl Parser {
                         "expected ']' after computed property name",
                     )?;
                     let value = if self.at(&TokenKind::LeftParen) {
-                        let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
+                        let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
                         Expr::Function {
                             offset: self.previous_offset(),
                             name: None,
@@ -3551,7 +3635,7 @@ impl Parser {
                 if let Some(accessor_kind) = accessor_kind {
                     self.advance();
                     let key = self.property_name()?;
-                    let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
+                    let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
                     properties.push(ObjectProperty {
                         key: PropertyKey::Static(key.clone()),
                         value: Expr::Function {
@@ -3581,7 +3665,7 @@ impl Parser {
                 let (value, shorthand, method) = if self.take(&TokenKind::Colon) {
                     (self.assignment()?, false, false)
                 } else if self.at(&TokenKind::LeftParen) {
-                    let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
+                    let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
                     (
                         Expr::Function {
                             offset: self.previous_offset(),
