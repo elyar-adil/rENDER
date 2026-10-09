@@ -557,3 +557,108 @@ fn a_parenthesized_identifier_target_does_not_name_the_function() {
     assert_eq!(ok("var g; g = function() {}; g.name"), "g");
     assert_eq!(ok("var h; ((h)) = () => 1; h.name"), "");
 }
+
+/// Early errors that must be reported when the script is parsed, before any of
+/// it runs. Each group is paired with valid siblings in the tests below.
+fn assert_early_syntax_errors(sources: &[&str]) {
+    for source in sources {
+        match eval(source) {
+            Err(error) => assert_eq!(error.kind(), JsErrorKind::Syntax, "{source}"),
+            Ok(value) => panic!("{source} should be a SyntaxError, got {value:?}"),
+        }
+    }
+}
+
+#[test]
+fn use_strict_directive_is_refused_with_non_simple_parameters() {
+    assert_early_syntax_errors(&[
+        "function f(a = 1) { 'use strict'; }",
+        "function f([a]) { 'use strict'; }",
+        "function f({a}) { 'use strict'; }",
+        "function f(...a) { 'use strict'; }",
+        "(a = 1) => { 'use strict'; }",
+        "({ m(a = 1) { 'use strict'; } })",
+        "class C { m(a = 1) { 'use strict'; } }",
+    ]);
+    assert_eq!(ok("function f(a) { 'use strict'; return a; } f(4)"), "4");
+    assert_eq!(ok("function f(a = 2) { return a; } f()"), "2");
+    assert_eq!(ok("var g = (a = 3) => { return a; }; g()"), "3");
+}
+
+#[test]
+fn class_field_initializers_reject_arguments_and_super_calls() {
+    assert_early_syntax_errors(&[
+        "class C { x = arguments; }",
+        "class C { x = () => arguments; }",
+        "class C { x = typeof arguments; }",
+        "class C { static x = arguments; }",
+        "class B {} class C extends B { x = super(); }",
+        "class B {} class C extends B { x = () => super(); }",
+    ]);
+    assert_eq!(
+        ok("class C { x = function() { return arguments.length; }; } new C().x()"),
+        "0"
+    );
+    assert_eq!(
+        ok("class B { m() { return 5; } } class C extends B { x = super.m(); } new C().x"),
+        "5"
+    );
+}
+
+#[test]
+fn static_field_named_constructor_is_refused() {
+    assert_early_syntax_errors(&[
+        "class C { static constructor = 1; }",
+        "class C { static 'constructor'; }",
+    ]);
+    assert_eq!(
+        ok("class C { static constructor() { return 7; } } C.constructor()"),
+        "7"
+    );
+}
+
+#[test]
+fn private_names_must_be_declared_by_an_enclosing_class_body() {
+    assert_early_syntax_errors(&[
+        "this.#x;",
+        "class C { constructor() { this.#x; } }",
+        "class C { m() { return `${this.#y}`; } }",
+        "class C extends (class { x = this.#foo; }) { #foo; }",
+    ]);
+    // A declaration may follow its use, and a nested class may use a name
+    // declared by an enclosing class body.
+    assert_eq!(
+        ok("class C { m() { return this.#x; } #x = 9; } new C().m()"),
+        "9"
+    );
+    assert_eq!(
+        ok(
+            "class C { #x = 3; m() { return class { g(o) { return o.#x; } }; } } new (new C().m())().g(new C())"
+        ),
+        "3"
+    );
+    assert_eq!(
+        ok("class C { #x = 4; static has(o) { return #x in o; } } String(C.has(new C()))"),
+        "true"
+    );
+}
+
+#[test]
+fn declarations_are_refused_where_only_a_statement_can_stand() {
+    assert_early_syntax_errors(&[
+        "while (false) const x = 1;",
+        "for (;false;) let x = 1;",
+        "if (true) class C {}",
+        "do let x = 1; while (false);",
+        "if (true) function* g() {}",
+        "if (true) async function h() {}",
+        "while (false) function f() {}",
+        "while (false) l: function f() {}",
+        "if (true) l: function f() {}",
+        "while (false) let [a] = [1];",
+    ]);
+    // Sloppy code may put a plain function declaration in an `if` clause, and
+    // `let` followed by a line break is an expression statement (ASI).
+    assert_eq!(ok("var r = 'ok'; if (false) function f() {} r"), "ok");
+    assert_eq!(ok("var r = 'none'; if (false) let \n r = 1; r"), "1");
+}

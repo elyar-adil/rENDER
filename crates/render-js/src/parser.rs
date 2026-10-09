@@ -544,6 +544,40 @@ fn is_import_call(expression: &Expr) -> bool {
     }
 }
 
+/// The grammatical position a sub-statement occupies. Only a plain function
+/// declaration can be a statement at all, and then only as an `if` clause or a
+/// label body (ECMA-262 Annex B.3.2, B.3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyPosition {
+    IfClause,
+    LoopBody,
+    LabelBody,
+}
+
+/// Whether a statement is a declaration that the position does not admit.
+/// Labels are looked through: `while (x) l: function f() {}` is refused, since
+/// the labelled function is the loop's body (`IsLabelledFunction`).
+fn is_refused_body(statement: &Statement, position: BodyPosition) -> bool {
+    let mut innermost = statement;
+    let mut labelled = false;
+    while let Statement::Labeled { body, .. } = innermost {
+        labelled = true;
+        innermost = body;
+    }
+    match innermost {
+        Statement::Variable { kind, .. } | Statement::VariableList { kind, .. } => {
+            *kind != VariableKind::Var
+        }
+        Statement::Class { .. } => true,
+        Statement::Function { kind, .. } => match position {
+            BodyPosition::LoopBody => true,
+            BodyPosition::IfClause => labelled || *kind != FunctionKind::Normal,
+            BodyPosition::LabelBody => *kind != FunctionKind::Normal,
+        },
+        _ => false,
+    }
+}
+
 /// Whether the token after a class modifier keyword (`get`, `set`, `async`,
 /// `static`) lets it act as a modifier instead of an element name. A name
 /// followed by `(`/`=`/`;`/`}` (or nothing) is an ordinary element.
@@ -624,10 +658,317 @@ fn validate_class_elements(elements: &[ClassElement]) -> Result<(), JsError> {
                         element.offset,
                     ));
                 }
+                if element.kind == ClassElementKind::Field
+                    && matches!(&element.key, PropertyKey::Static(name) if name == "constructor")
+                {
+                    return Err(JsError::syntax(
+                        "static class field may not be named constructor",
+                        element.offset,
+                    ));
+                }
+            }
+        }
+        if let Some(initializer) = &element.initializer {
+            if reaches_in_context(initializer, is_arguments_reference) {
+                return Err(JsError::syntax(
+                    "'arguments' is not allowed in a class field initializer",
+                    element.offset,
+                ));
+            }
+            if reaches_in_context(initializer, is_super_call) {
+                return Err(JsError::syntax(
+                    "'super()' is not allowed in a class field initializer",
+                    element.offset,
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn is_arguments_reference(expression: &Expr) -> bool {
+    matches!(expression, Expr::Identifier(name) if name == "arguments")
+}
+
+fn is_super_call(expression: &Expr) -> bool {
+    matches!(expression, Expr::SuperCall { .. })
+}
+
+/// Whether `predicate` holds for `expression` or for a part of it that runs in
+/// the same function context: arrow function bodies do, while ordinary function
+/// bodies and class element bodies bring their own `arguments`, `super` and
+/// `this`. A nested class's heritage and computed keys run in this context.
+fn reaches_in_context(expression: &Expr, predicate: fn(&Expr) -> bool) -> bool {
+    if predicate(expression) {
+        return true;
+    }
+    let mut expressions = Vec::new();
+    let mut statements = Vec::new();
+    push_expression_parts(expression, &mut expressions, &mut statements);
+    expressions
+        .into_iter()
+        .any(|part| reaches_in_context(part, predicate))
+        || statements
+            .into_iter()
+            .any(|statement| statement_reaches(statement, predicate))
+}
+
+fn statement_reaches(statement: &Statement, predicate: fn(&Expr) -> bool) -> bool {
+    let mut expressions = Vec::new();
+    let mut statements = Vec::new();
+    push_statement_parts(statement, &mut expressions, &mut statements);
+    expressions
+        .into_iter()
+        .any(|part| reaches_in_context(part, predicate))
+        || statements
+            .into_iter()
+            .any(|statement| statement_reaches(statement, predicate))
+}
+
+/// The direct subexpressions and substatements of an expression that stay in
+/// the enclosing function context (see [`reaches_in_context`]).
+fn push_expression_parts<'a>(
+    expression: &'a Expr,
+    expressions: &mut Vec<&'a Expr>,
+    statements: &mut Vec<&'a Statement>,
+) {
+    match expression {
+        Expr::Literal(_)
+        | Expr::RegexLiteral { .. }
+        | Expr::This
+        | Expr::Identifier(_)
+        | Expr::Function { .. }
+        | Expr::SuperMember { .. }
+        | Expr::NewTarget => {}
+        Expr::Arrow { body, .. } => statements.extend(body.iter()),
+        Expr::Class {
+            super_class,
+            elements,
+            ..
+        } => {
+            expressions.extend(super_class.as_deref());
+            push_class_key_parts(elements, expressions);
+        }
+        Expr::Yield { argument, .. } => expressions.extend(argument.as_deref()),
+        Expr::Await(operand)
+        | Expr::Spread(operand)
+        | Expr::OptionalChain(operand)
+        | Expr::OptionalGuard(operand)
+        | Expr::Unary { operand, .. }
+        | Expr::Member {
+            object: operand, ..
+        }
+        | Expr::PrivateMember {
+            object: operand, ..
+        }
+        | Expr::PrivateIn {
+            object: operand, ..
+        }
+        | Expr::Update {
+            target: operand, ..
+        } => expressions.push(operand),
+        Expr::SuperComputedMember { property, .. } => expressions.push(property),
+        Expr::SuperCall { arguments, .. } => expressions.extend(arguments.iter()),
+        Expr::Object(properties) => {
+            for property in properties {
+                if let PropertyKey::Computed(key) = &property.key {
+                    expressions.push(key);
+                }
+                expressions.push(&property.value);
+            }
+        }
+        Expr::Array(items) | Expr::Sequence(items) => expressions.extend(items.iter()),
+        Expr::Binary { left, right, .. } => {
+            expressions.push(left);
+            expressions.push(right);
+        }
+        Expr::Conditional {
+            condition,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expressions.push(condition);
+            expressions.push(consequent);
+            expressions.push(alternate);
+        }
+        Expr::ComputedMember {
+            object, property, ..
+        } => {
+            expressions.push(object);
+            expressions.push(property);
+        }
+        Expr::New {
+            constructor: callee,
+            arguments,
+            ..
+        }
+        | Expr::Call {
+            callee, arguments, ..
+        } => {
+            expressions.push(callee);
+            expressions.extend(arguments.iter());
+        }
+        Expr::TaggedTemplate {
+            tag,
+            expressions: substitutions,
+            ..
+        } => {
+            expressions.push(tag);
+            expressions.extend(substitutions.iter());
+        }
+        Expr::Assignment { target, value, .. }
+        | Expr::CompoundAssignment { target, value, .. }
+        | Expr::LogicalAssignment { target, value, .. } => {
+            expressions.push(target);
+            expressions.push(value);
+        }
+    }
+}
+
+/// Keys of a nested class's elements are evaluated in the enclosing context.
+fn push_class_key_parts<'a>(elements: &'a [ClassElement], expressions: &mut Vec<&'a Expr>) {
+    for element in elements {
+        if let PropertyKey::Computed(key) = &element.key {
+            expressions.push(key);
+        }
+    }
+}
+
+/// The subexpressions and substatements of a statement that stay in the
+/// enclosing function context (see [`reaches_in_context`]).
+fn push_statement_parts<'a>(
+    statement: &'a Statement,
+    expressions: &mut Vec<&'a Expr>,
+    statements: &mut Vec<&'a Statement>,
+) {
+    match statement {
+        Statement::Variable { value, .. } => expressions.extend(value.as_ref()),
+        Statement::VariableList { declarations, .. } => {
+            for (target, value) in declarations {
+                expressions.extend(value.as_ref());
+                if let BindingTarget::Pattern(pattern) = target {
+                    push_pattern_parts(pattern, expressions);
+                }
+            }
+        }
+        Statement::Function { .. } | Statement::Break(_) | Statement::Continue(_) => {}
+        Statement::Class {
+            super_class,
+            elements,
+            ..
+        } => {
+            expressions.extend(super_class.as_deref());
+            push_class_key_parts(elements, expressions);
+        }
+        Statement::Return(value) => expressions.extend(value.as_ref()),
+        Statement::Throw(value) | Statement::Expression(value) => expressions.push(value),
+        Statement::ParameterDefault { value, .. } => expressions.push(value),
+        Statement::Try {
+            body,
+            catch,
+            finally,
+            ..
+        } => {
+            statements.extend(body.iter());
+            if let Some(catch) = catch {
+                if let Some(BindingTarget::Pattern(pattern)) = &catch.parameter {
+                    push_pattern_parts(pattern, expressions);
+                }
+                statements.extend(catch.body.iter());
+            }
+            statements.extend(finally.iter().flatten());
+        }
+        Statement::If {
+            condition,
+            consequent,
+            alternate,
+            ..
+        } => {
+            expressions.push(condition);
+            statements.push(consequent);
+            statements.extend(alternate.as_deref());
+        }
+        Statement::Switch {
+            expression, cases, ..
+        } => {
+            expressions.push(expression);
+            for (tests, body) in cases {
+                expressions.extend(tests.iter());
+                statements.extend(body.iter());
+            }
+        }
+        Statement::While {
+            condition, body, ..
+        } => {
+            expressions.push(condition);
+            statements.push(body);
+        }
+        Statement::DoWhile {
+            condition, body, ..
+        } => {
+            expressions.push(condition);
+            statements.push(body);
+        }
+        Statement::For {
+            initializer,
+            condition,
+            update,
+            body,
+            ..
+        } => {
+            statements.extend(initializer.as_deref());
+            expressions.extend(condition.as_ref());
+            expressions.extend(update.as_ref());
+            statements.push(body);
+        }
+        Statement::ForIn { iterable, body, .. } | Statement::ForOf { iterable, body, .. } => {
+            expressions.push(iterable);
+            statements.push(body);
+        }
+        Statement::ForInExpr {
+            target,
+            iterable,
+            body,
+            ..
+        } => {
+            expressions.push(target);
+            expressions.push(iterable);
+            statements.push(body);
+        }
+        Statement::Labeled { body, .. } => statements.push(body),
+        Statement::Block(body) => statements.extend(body.iter()),
+    }
+}
+
+/// Default values and computed keys inside a binding pattern.
+fn push_pattern_parts<'a>(pattern: &'a BindingPattern, expressions: &mut Vec<&'a Expr>) {
+    match pattern {
+        BindingPattern::Identifier(_) => {}
+        BindingPattern::Object { properties, rest } => {
+            for (key, nested) in properties {
+                if let PropertyKey::Computed(key) = key {
+                    expressions.push(key);
+                }
+                push_pattern_parts(nested, expressions);
+            }
+            if let Some(rest) = rest {
+                push_pattern_parts(rest, expressions);
+            }
+        }
+        BindingPattern::Array { elements, rest } => {
+            for nested in elements.iter().flatten() {
+                push_pattern_parts(nested, expressions);
+            }
+            if let Some(rest) = rest {
+                push_pattern_parts(rest, expressions);
+            }
+        }
+        BindingPattern::Default { pattern, value } => {
+            expressions.push(value);
+            push_pattern_parts(pattern, expressions);
+        }
+    }
 }
 
 impl Parser {
@@ -641,7 +982,7 @@ impl Parser {
             function_depth: 0,
             loop_depth: 0,
             switch_depth: 0,
-            class_depth: 0,
+            private_references: Vec::new(),
             no_in: false,
             module: None,
             in_async: false,
@@ -659,9 +1000,11 @@ struct Parser {
     function_depth: usize,
     loop_depth: usize,
     switch_depth: usize,
-    /// Nesting depth of class bodies currently being parsed; `#name`
-    /// references and `#name in` are only valid inside one.
-    class_depth: usize,
+    /// One entry per class body being parsed (innermost last), listing the
+    /// `#name` references written in it that no declaration has resolved yet.
+    /// A reference is valid only when some enclosing class body declares the
+    /// name (ECMA-262 `AllPrivateNamesValid`), whatever order they appear in.
+    private_references: Vec<Vec<(String, usize)>>,
     /// While set, `in` is not treated as a binary operator (for-heads).
     no_in: bool,
     /// Present while parsing a module; collects its import/export tables.
@@ -706,6 +1049,37 @@ impl Parser {
         }
         self.statement_count = self.statement_count.saturating_add(1);
         Ok(())
+    }
+
+    /// A statement that sits where only a `Statement` is grammatical, not a
+    /// `StatementListItem`: the clause of an `if`, a loop body, or a label body.
+    fn statement_in(&mut self, position: BodyPosition) -> Result<Statement, JsError> {
+        // ExpressionStatement excludes `let [` (ECMA-262 14.5), and `let` then a
+        // binding on the same line is a declaration. A line break after `let`
+        // ends the statement (ASI), leaving `let` as an expression of its own.
+        if self.at(&TokenKind::Let) {
+            let next = self.tokens.get(self.cursor + 1);
+            if next.is_some_and(|next| matches!(next.kind, TokenKind::LeftBracket)) {
+                return Err(self.error("'let [' is not allowed in statement position"));
+            }
+            if let Some(next) = next {
+                if !next.after_newline
+                    && matches!(next.kind, TokenKind::Identifier(_) | TokenKind::LeftBrace)
+                {
+                    return Err(self.error("declaration is not allowed in statement position"));
+                }
+                if next.after_newline && matches!(next.kind, TokenKind::Identifier(_)) {
+                    self.advance();
+                    self.end_statement();
+                    return Ok(Statement::Expression(Expr::Identifier("let".to_owned())));
+                }
+            }
+        }
+        let statement = self.statement()?;
+        if is_refused_body(&statement, position) {
+            return Err(self.error("declaration is not allowed in statement position"));
+        }
+        Ok(statement)
     }
 
     fn statement(&mut self) -> Result<Statement, JsError> {
@@ -790,7 +1164,7 @@ impl Parser {
             };
             self.check_contextual_binding(&label)?;
             self.advance();
-            let body = self.statement()?;
+            let body = self.statement_in(BodyPosition::LabelBody)?;
             return Ok(Statement::Labeled {
                 offset: self.previous_offset(),
                 label,
@@ -1363,9 +1737,9 @@ impl Parser {
         self.require(&TokenKind::LeftParen, "expected '(' after if")?;
         let condition = self.expression()?;
         self.require(&TokenKind::RightParen, "expected ')' after if condition")?;
-        let consequent = Box::new(self.statement()?);
+        let consequent = Box::new(self.statement_in(BodyPosition::IfClause)?);
         let alternate = if self.take(&TokenKind::Else) {
-            Some(Box::new(self.statement()?))
+            Some(Box::new(self.statement_in(BodyPosition::IfClause)?))
         } else {
             None
         };
@@ -1432,7 +1806,7 @@ impl Parser {
         let condition = self.expression()?;
         self.require(&TokenKind::RightParen, "expected ')' after while condition")?;
         self.loop_depth = self.loop_depth.saturating_add(1);
-        let body = self.statement();
+        let body = self.statement_in(BodyPosition::LoopBody);
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(Statement::While {
             offset: self.previous_offset(),
@@ -1443,7 +1817,7 @@ impl Parser {
 
     fn do_while_statement(&mut self) -> Result<Statement, JsError> {
         self.loop_depth = self.loop_depth.saturating_add(1);
-        let body = self.statement();
+        let body = self.statement_in(BodyPosition::LoopBody);
         self.loop_depth = self.loop_depth.saturating_sub(1);
         let body = body?;
         self.require(&TokenKind::While, "expected 'while' after do body")?;
@@ -1479,7 +1853,7 @@ impl Parser {
                 let iterable = self.expression()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
-                let body = self.statement();
+                let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 return Ok(Statement::ForIn {
                     offset: self.previous_offset(),
@@ -1498,7 +1872,7 @@ impl Parser {
                 let iterable = self.expression()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
-                let body = self.statement();
+                let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 let body = body?;
                 let pattern = pattern.expect("pattern parsed");
@@ -1555,7 +1929,7 @@ impl Parser {
                 self.validate_assignment_target(&expression)?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
-                let body = self.statement();
+                let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 return Ok(Statement::ForInExpr {
                     offset: self.previous_offset(),
@@ -1575,7 +1949,7 @@ impl Parser {
                 let iterable = self.assignment()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
-                let body = self.statement();
+                let body = self.statement_in(BodyPosition::LoopBody);
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 let offset = self.previous_offset();
                 let temporary = format!("\0for_of_expr_{}", self.cursor);
@@ -1611,7 +1985,7 @@ impl Parser {
         };
         self.require(&TokenKind::RightParen, "expected ')' after for clauses")?;
         self.loop_depth = self.loop_depth.saturating_add(1);
-        let body = self.statement();
+        let body = self.statement_in(BodyPosition::LoopBody);
         self.loop_depth = self.loop_depth.saturating_sub(1);
         Ok(Statement::For {
             offset: self.previous_offset(),
@@ -1841,6 +2215,9 @@ impl Parser {
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         let mut body = body?;
+        if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
+            return Err(self.error("'use strict' is not allowed with non-simple parameters"));
+        }
         if !defaults.is_empty() {
             defaults.extend(body);
             body = defaults;
@@ -2067,10 +2444,8 @@ impl Parser {
                 Some(TokenKind::In)
             )
         {
-            if self.class_depth == 0 {
-                return Err(self.error("private names are only allowed in class bodies"));
-            }
             let offset = self.current().offset;
+            self.private_reference(&name, offset)?;
             self.advance();
             self.advance();
             let object = self.unary()?;
@@ -2175,7 +2550,7 @@ impl Parser {
                 // `new.target` is only valid in function code, eval code
                 // contained in a function, and class field/static-block
                 // initializers.
-                if self.function_depth == 0 && self.class_depth == 0 {
+                if self.function_depth == 0 && self.private_references.is_empty() {
                     return Err(self.error("new.target is only allowed inside functions"));
                 }
                 return self.postfix_tail(Expr::NewTarget);
@@ -2280,9 +2655,7 @@ impl Parser {
                         property: Box::new(property),
                     };
                 } else if let TokenKind::PrivateName(name) = self.current().kind.clone() {
-                    if self.class_depth == 0 {
-                        return Err(self.error("private names are only allowed in class bodies"));
-                    }
+                    self.private_reference(&name, self.current().offset)?;
                     self.advance();
                     expression = Expr::PrivateMember {
                         offset: self.previous_offset(),
@@ -2299,9 +2672,7 @@ impl Parser {
                 }
             } else if self.take(&TokenKind::Dot) {
                 if let TokenKind::PrivateName(name) = self.current().kind.clone() {
-                    if self.class_depth == 0 {
-                        return Err(self.error("private names are only allowed in class bodies"));
-                    }
+                    self.private_reference(&name, self.current().offset)?;
                     self.advance();
                     expression = Expr::PrivateMember {
                         offset: self.previous_offset(),
@@ -2589,28 +2960,78 @@ impl Parser {
             None
         };
         self.require(&TokenKind::LeftBrace, "expected '{' after class header")?;
-        self.class_depth = self.class_depth.saturating_add(1);
+        // The heritage above is evaluated outside this class's private
+        // environment, so its references were recorded for the outer scope.
+        self.private_references.push(Vec::new());
+        let elements = self.class_elements();
+        let references = self.private_references.pop().unwrap_or_default();
+        let elements = elements?;
+        self.require(&TokenKind::RightBrace, "expected '}' after class body")?;
+        validate_class_elements(&elements)?;
+        self.close_private_scope(&elements, references)?;
+        Ok((super_class, elements))
+    }
+
+    /// The members of a class body up to, not including, its closing brace.
+    fn class_elements(&mut self) -> Result<Vec<ClassElement>, JsError> {
         let mut elements = Vec::new();
         while !self.at(&TokenKind::RightBrace) {
             if self.at(&TokenKind::Eof) {
-                self.class_depth = self.class_depth.saturating_sub(1);
                 return Err(self.error("unterminated class body"));
             }
             if self.take(&TokenKind::Semicolon) {
                 continue;
             }
-            match self.class_element() {
-                Ok(element) => elements.push(element),
-                Err(error) => {
-                    self.class_depth = self.class_depth.saturating_sub(1);
-                    return Err(error);
+            elements.push(self.class_element()?);
+        }
+        Ok(elements)
+    }
+
+    /// Record a `#name` reference in the innermost class body. Outside every
+    /// class body there is nothing that could declare it.
+    fn private_reference(&mut self, name: &str, offset: usize) -> Result<(), JsError> {
+        match self.private_references.last_mut() {
+            Some(references) => {
+                references.push((name.to_owned(), offset));
+                Ok(())
+            }
+            None => Err(JsError::syntax(
+                "private names are only allowed in class bodies",
+                offset,
+            )),
+        }
+    }
+
+    /// Resolve the references a finished class body made. Names it declares
+    /// are satisfied here; the rest belong to the enclosing class body, and
+    /// are an early error when no class body encloses this one.
+    fn close_private_scope(
+        &mut self,
+        elements: &[ClassElement],
+        references: Vec<(String, usize)>,
+    ) -> Result<(), JsError> {
+        let declared: BTreeSet<&str> = elements
+            .iter()
+            .filter_map(|element| match &element.key {
+                PropertyKey::Private(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        for (name, offset) in references {
+            if declared.contains(name.as_str()) {
+                continue;
+            }
+            match self.private_references.last_mut() {
+                Some(outer) => outer.push((name, offset)),
+                None => {
+                    return Err(JsError::syntax(
+                        format!("private name #{name} is not declared in an enclosing class"),
+                        offset,
+                    ));
                 }
             }
         }
-        self.class_depth = self.class_depth.saturating_sub(1);
-        self.require(&TokenKind::RightBrace, "expected '}' after class body")?;
-        validate_class_elements(&elements)?;
-        Ok((super_class, elements))
+        Ok(())
     }
 
     /// Parse one class body element: a method, accessor, constructor, field,
@@ -2801,7 +3222,9 @@ impl Parser {
         // so it sees the same `await`/`yield`, private names and `import.meta`.
         parser.in_async = self.in_async;
         parser.in_generator = self.in_generator;
-        parser.class_depth = self.class_depth;
+        parser
+            .private_references
+            .clone_from(&self.private_references);
         parser.function_depth = self.function_depth;
         parser.module = self.module.as_ref().map(|_| ModuleInfo::default());
         let expression = parser.expression()?;
@@ -2811,6 +3234,9 @@ impl Parser {
                 offset,
             ));
         }
+        // References the substitution made to an enclosing class body belong
+        // to that body now.
+        self.private_references = parser.private_references;
         Ok(expression)
     }
 
@@ -2926,6 +3352,11 @@ impl Parser {
         self.no_in = previous_no_in;
         let mut body = body?;
         self.require(&TokenKind::RightBrace, "expected '}' after function body")?;
+        // Checked before the lowering below moves the parameter defaults ahead
+        // of the body, which would hide the directive prologue.
+        if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
+            return Err(self.error("'use strict' is not allowed with non-simple parameters"));
+        }
         if !defaults.is_empty() {
             defaults.extend(body);
             body = defaults;
@@ -3648,6 +4079,17 @@ fn validate_strict_class(
 struct ReservedContext {
     async_context: bool,
     generator_context: bool,
+}
+
+/// Whether a parameter list is a `SimpleParameterList` (ECMA-262 15.1.1): plain
+/// names only, with no default, rest, or destructuring parameter. Destructuring
+/// parameters are recorded under the `\0`-prefixed temporaries of the lowering.
+fn is_simple_parameter_list(parameters: &[String]) -> bool {
+    parameters.iter().all(|parameter| {
+        !parameter.starts_with(PARAMETER_DEFAULT_MARKER)
+            && !parameter.starts_with(PARAMETER_REST_MARKER)
+            && !parameter.starts_with('\0')
+    })
 }
 
 /// Strip a parameter's default/rest marker to recover its binding name.
