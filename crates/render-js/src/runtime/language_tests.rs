@@ -791,3 +791,56 @@ fn destructuring_assignment_targets_follow_the_pattern_grammar() {
     assert_eq!(ok("var b; [, [b] = [5]] = [0, undefined]; b"), "5");
     assert_eq!(ok("var o = {}; [o.x, o['y']] = [1, 2]; o.x + o.y"), "3");
 }
+
+#[test]
+fn break_and_continue_targets_must_enclose_them_in_the_same_function() {
+    assert_early_syntax_errors(&[
+        "foo: { break bar; }",
+        "l: { continue l; }",
+        "while (false) { break nope; }",
+        "a: a: ;",
+        "l: while (false) { (function() { continue l; }); }",
+        "l: while (false) { (() => { break l; }); }",
+        "switch (1) { case 1: (function() { break; }); }",
+        "for (;;) { class C { static { break; } } }",
+    ]);
+    assert_eq!(
+        ok(
+            "var r = 0; outer: for (var i = 0; i < 3; i++) { inner: for (;;) { r++; break outer; } } r"
+        ),
+        "1"
+    );
+    assert_eq!(ok("var r = 0; blk: { r = 1; break blk; r = 2; } r"), "1");
+    assert_eq!(
+        ok("var r = 0; a: b: while (r < 2) { r++; continue a; } r"),
+        "2"
+    );
+}
+
+#[test]
+fn class_static_blocks_are_function_like_for_control_flow_and_names() {
+    assert_early_syntax_errors(&[
+        "class C { static { return; } }",
+        "class C { static { arguments; } }",
+        "class C { static { () => arguments; } }",
+        "class C { static { var await; } }",
+        "class C { static { (x = await) => 0; } }",
+        "class C { static { ({ await }); } }",
+        "class C { static { l: { break l2; } } }",
+    ]);
+    assert_eq!(ok("class C { static { var x = 5; this.y = x; } } C.y"), "5");
+}
+
+#[test]
+fn strict_class_code_refuses_reserved_identifier_references() {
+    assert_early_syntax_errors(&[
+        "class C { m() { return implements; } }",
+        "class C { m() { return yield; } }",
+        "class C { static { var x = package; } }",
+    ]);
+    // `eval` and `arguments` are ordinary references in strict code.
+    assert_eq!(
+        ok("class C { m() { var q = typeof eval; return q; } } 'ok'"),
+        "ok"
+    );
+}

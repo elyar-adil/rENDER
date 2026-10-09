@@ -990,6 +990,9 @@ impl Parser {
             in_parameters: false,
             super_property_allowed: false,
             super_call_allowed: false,
+            labels: Vec::new(),
+            static_block: false,
+            static_block_await: false,
         }
     }
 }
@@ -1031,6 +1034,15 @@ struct Parser {
     /// `super(...)` is valid only in the constructor of a derived class, and in
     /// arrows nested in it (ECMA-262 13.3.7.1, 15.7.1).
     super_call_allowed: bool,
+    /// The labels enclosing the statement being parsed, innermost last, with
+    /// whether each labels an iteration statement (`break`/`continue` targets).
+    labels: Vec<(String, bool)>,
+    /// Inside a class static block, where `arguments` is not an identifier
+    /// reference (ECMA-262 15.7.1). Arrows keep the restriction; functions drop it.
+    static_block: bool,
+    /// Inside a class static block's `await` restriction, which arrow parameters
+    /// keep but arrow bodies do not (ECMA-262 15.7.1, 15.3).
+    static_block_await: bool,
 }
 
 impl Parser {
@@ -1177,12 +1189,21 @@ impl Parser {
                 Some(TokenKind::Colon)
             )
         {
+            // The label is a loop label when the statement it names, past any
+            // further labels, is an iteration statement (ECMA-262 14.7.1).
+            let targets_loop = self.label_targets_loop();
             let TokenKind::Identifier(label) = self.advance().kind else {
                 unreachable!("checked above");
             };
             self.check_contextual_binding(&label)?;
+            if self.labels.iter().any(|(active, _)| *active == label) {
+                return Err(self.error("duplicate label in the label set"));
+            }
             self.advance();
-            let body = self.statement_in(BodyPosition::LabelBody)?;
+            self.labels.push((label.clone(), targets_loop));
+            let body = self.statement_in(BodyPosition::LabelBody);
+            self.labels.pop();
+            let body = body?;
             return Ok(Statement::Labeled {
                 offset: self.previous_offset(),
                 label,
@@ -1191,16 +1212,33 @@ impl Parser {
         }
         if self.take(&TokenKind::Break) {
             let label = self.take_loop_label();
-            if label.is_none() && self.loop_depth == 0 && self.switch_depth == 0 {
-                return Err(self.error("break is only valid inside a loop or switch"));
+            match &label {
+                Some(name) if !self.labels.iter().any(|(active, _)| active == name) => {
+                    return Err(self.error("break targets a label that does not enclose it"));
+                }
+                None if self.loop_depth == 0 && self.switch_depth == 0 => {
+                    return Err(self.error("break is only valid inside a loop or switch"));
+                }
+                _ => {}
             }
             self.end_statement();
             return Ok(Statement::Break(label));
         }
         if self.take(&TokenKind::Continue) {
             let label = self.take_loop_label();
-            if self.loop_depth == 0 {
-                return Err(self.error("continue is only valid inside a loop"));
+            match &label {
+                Some(name)
+                    if !self
+                        .labels
+                        .iter()
+                        .any(|(active, is_loop)| active == name && *is_loop) =>
+                {
+                    return Err(self.error("continue targets a label that is not a loop"));
+                }
+                None if self.loop_depth == 0 => {
+                    return Err(self.error("continue is only valid inside a loop"));
+                }
+                _ => {}
             }
             self.end_statement();
             return Ok(Statement::Continue(label));
@@ -1314,6 +1352,9 @@ impl Parser {
         }
         if self.in_generator && name == "yield" {
             return Err(self.error("yield cannot be a binding name in generator code"));
+        }
+        if self.static_block_await && name == "await" {
+            return Err(self.error("await cannot be a binding name in a class static block"));
         }
         Ok(())
     }
@@ -1545,6 +1586,24 @@ impl Parser {
 
     /// Consume an identifier in `break`/`continue` label position. A line
     /// terminator ends the statement instead of introducing a label.
+    /// Whether the labelled statement at the cursor (`label :`) names an
+    /// iteration statement, looking past any further labels (ECMA-262 14.7.1).
+    fn label_targets_loop(&self) -> bool {
+        let mut index = self.cursor + 2;
+        loop {
+            let next = self.tokens.get(index + 1).map(|token| &token.kind);
+            match self.tokens.get(index).map(|token| &token.kind) {
+                Some(TokenKind::Identifier(_)) if matches!(next, Some(TokenKind::Colon)) => {
+                    index += 2;
+                }
+                Some(kind) => {
+                    return matches!(kind, TokenKind::For | TokenKind::While | TokenKind::Do);
+                }
+                None => return false,
+            }
+        }
+    }
+
     fn take_loop_label(&mut self) -> Option<String> {
         if let TokenKind::Identifier(name) = &self.current().kind {
             if self.current().after_newline {
@@ -2259,6 +2318,12 @@ impl Parser {
         let previous_async = std::mem::replace(&mut self.in_async, is_async_arrow);
         let previous_generator = std::mem::replace(&mut self.in_generator, false);
         let previous_parameters = std::mem::replace(&mut self.in_parameters, false);
+        // An arrow body is a jump target of its own, like any function body.
+        let previous_labels = std::mem::take(&mut self.labels);
+        let previous_switch_depth = std::mem::replace(&mut self.switch_depth, 0);
+        // The parameters above keep the static block's `await` restriction; the
+        // body does not (ECMA-262 15.7.1).
+        let previous_static_await = std::mem::replace(&mut self.static_block_await, false);
         let body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
@@ -2281,9 +2346,16 @@ impl Parser {
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         self.in_parameters = previous_parameters;
+        self.labels = previous_labels;
+        self.switch_depth = previous_switch_depth;
+        self.static_block_await = previous_static_await;
         let mut body = body?;
         if !is_simple_parameter_list(&parameters) && has_use_strict_directive(&body) {
             return Err(self.error("'use strict' is not allowed with non-simple parameters"));
+        }
+        if has_use_strict_directive(&body) {
+            validate_strict_parameters(&parameters)?;
+            validate_strict_statements(&body)?;
         }
         if !defaults.is_empty() {
             defaults.extend(body);
@@ -2979,6 +3051,15 @@ impl Parser {
                     token.offset,
                 ))
             }
+            TokenKind::Identifier(name)
+                if (self.static_block_await && name == "await")
+                    || (self.static_block && name == "arguments") =>
+            {
+                Err(JsError::syntax(
+                    format!("{name} is not allowed in a class static block"),
+                    token.offset,
+                ))
+            }
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
@@ -3079,6 +3160,8 @@ impl Parser {
         let elements = elements?;
         self.require(&TokenKind::RightBrace, "expected '}' after class body")?;
         validate_class_elements(&elements)?;
+        // Every part of a class is strict code, whatever the enclosing script.
+        validate_strict_class(super_class.as_deref(), &elements)?;
         self.close_private_scope(&elements, references)?;
         Ok((super_class, elements))
     }
@@ -3157,7 +3240,7 @@ impl Parser {
             self.advance();
             is_static = true;
             if self.take(&TokenKind::LeftBrace) {
-                let body = self.with_super_property(|parser| parser.statement_list(true))?;
+                let body = self.static_block_body()?;
                 self.require(&TokenKind::RightBrace, "expected '}' after static block")?;
                 return Ok(ClassElement {
                     key: PropertyKey::Static("static".to_owned()),
@@ -3369,6 +3452,18 @@ impl Parser {
         } else {
             None
         };
+        // The name of a function expression takes its own kind's `yield`/`await`
+        // restriction (ECMA-262 15.5, 15.6, 15.8). Code inside a class body is
+        // strict, so the strict reserved words are refused too.
+        if let Some(name) = &name {
+            let restricted = (kind.is_generator() && name == "yield")
+                || (kind.is_async() && name == "await")
+                || (!self.private_references.is_empty()
+                    && (is_strict_reserved_word(name) || name == "arguments"));
+            if restricted {
+                return Err(self.error("function expression name is not allowed here"));
+            }
+        }
         let (parameters, body) = self.function_tail(kind)?;
         Ok(Expr::Function {
             offset: self.previous_offset(),
@@ -3386,6 +3481,32 @@ impl Parser {
             return Err(self.error("class name is reserved in strict mode"));
         }
         Ok(())
+    }
+
+    /// The statements of a class static block. It is a function-like boundary
+    /// of its own: no label or loop encloses it, `return` is not allowed, and
+    /// `await` and `arguments` are not identifiers (ECMA-262 15.7.1).
+    fn static_block_body(&mut self) -> Result<Vec<Statement>, JsError> {
+        let previous_labels = std::mem::take(&mut self.labels);
+        let previous_switch_depth = std::mem::replace(&mut self.switch_depth, 0);
+        let previous_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        let previous_function_depth = std::mem::replace(&mut self.function_depth, 0);
+        let previous_static_block = std::mem::replace(&mut self.static_block, true);
+        let previous_static_await = std::mem::replace(&mut self.static_block_await, true);
+        let previous_async = std::mem::replace(&mut self.in_async, false);
+        let previous_generator = std::mem::replace(&mut self.in_generator, false);
+        let result = self.with_super_property(|parser| parser.statement_list(true));
+        self.labels = previous_labels;
+        self.switch_depth = previous_switch_depth;
+        self.loop_depth = previous_loop_depth;
+        self.function_depth = previous_function_depth;
+        self.static_block = previous_static_block;
+        self.static_block_await = previous_static_await;
+        self.in_async = previous_async;
+        self.in_generator = previous_generator;
+        let body = result?;
+        validate_declaration_conflicts(&body, true)?;
+        Ok(body)
     }
 
     /// Parse a class field initializer or static block: `super.name` is valid
@@ -3432,14 +3553,29 @@ impl Parser {
         let previous_super_property =
             std::mem::replace(&mut self.super_property_allowed, super_property);
         let previous_super_call = std::mem::replace(&mut self.super_call_allowed, false);
+        // A function body is a new jump target: no label or loop encloses it.
+        let previous_labels = std::mem::take(&mut self.labels);
+        let previous_switch_depth = std::mem::replace(&mut self.switch_depth, 0);
+        let previous_static_block = std::mem::replace(&mut self.static_block, false);
+        let previous_static_await = std::mem::replace(&mut self.static_block_await, false);
         let result = self.function_tail_inner(super_call);
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         self.in_parameters = previous_parameters;
         self.super_property_allowed = previous_super_property;
         self.super_call_allowed = previous_super_call;
+        self.labels = previous_labels;
+        self.switch_depth = previous_switch_depth;
+        self.static_block = previous_static_block;
+        self.static_block_await = previous_static_await;
         let (parameters, body) = result?;
         validate_declaration_conflicts(&body, true)?;
+        // A function whose own body is strict is checked as strict code here,
+        // whatever the enclosing script is (ECMA-262 11.2.2).
+        if has_use_strict_directive(&body) {
+            validate_strict_parameters(&parameters)?;
+            validate_strict_statements(&body)?;
+        }
         Ok((parameters, body))
     }
 
@@ -3731,7 +3867,11 @@ impl Parser {
                     )
                 } else if shorthand_candidate {
                     // The shorthand is an IdentifierReference (ECMA-262 13.2.5.1).
-                    if (self.in_generator && key == "yield") || (self.in_async && key == "await") {
+                    let restricted = (self.in_generator && key == "yield")
+                        || (self.in_async && key == "await")
+                        || (self.static_block_await && key == "await")
+                        || (self.static_block && key == "arguments");
+                    if restricted {
                         return Err(self.error("name is not a valid identifier reference here"));
                     }
                     (Expr::Identifier(key.clone()), true, false)
@@ -3957,20 +4097,22 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             format!("{name} is reserved in strict mode"),
             0,
         )),
+        // Reached only from strict code, so the body is strict whatever its own
+        // directive says.
         Statement::Function {
-            parameters, body, ..
+            name,
+            parameters,
+            body,
+            ..
         } => {
-            if parameters.iter().any(|name| is_strict_reserved_word(name)) {
+            if is_strict_reserved_word(name) || name == "arguments" {
                 return Err(JsError::syntax(
-                    "strict mode parameter uses a reserved word",
+                    format!("{name} is reserved in strict mode"),
                     0,
                 ));
             }
-            if has_use_strict_directive(body) {
-                validate_strict_statements(body)
-            } else {
-                Ok(())
-            }
+            validate_strict_parameters(parameters)?;
+            validate_strict_statements(body)
         }
         Statement::Block(statements) => validate_strict_statements(statements),
         Statement::If {
@@ -4110,17 +4252,8 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         | Expr::Arrow {
             parameters, body, ..
         } => {
-            if parameters.iter().any(|name| is_strict_reserved_word(name)) {
-                return Err(JsError::syntax(
-                    "strict mode parameter uses a reserved word",
-                    0,
-                ));
-            }
-            if has_use_strict_directive(body) {
-                validate_strict_statements(body)
-            } else {
-                Ok(())
-            }
+            validate_strict_parameters(parameters)?;
+            validate_strict_statements(body)
         }
         Expr::Object(properties) => properties.iter().try_for_each(|property| {
             if let PropertyKey::Computed(key) = &property.key {
@@ -4192,6 +4325,11 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
             validate_strict_expression(tag)?;
             expressions.iter().try_for_each(validate_strict_expression)
         }
+        // `eval` and `arguments` are ordinary references in strict code; the
+        // other strict reserved words are not identifiers there.
+        Expr::Identifier(name) if name != "eval" && is_strict_reserved_word(name) => Err(
+            JsError::syntax(format!("{name} is reserved in strict mode"), 0),
+        ),
         Expr::Literal(_) | Expr::RegexLiteral { .. } | Expr::This | Expr::Identifier(_) => Ok(()),
         Expr::Sequence(expressions) => expressions.iter().try_for_each(validate_strict_expression),
         Expr::Class {
@@ -4291,6 +4429,21 @@ fn is_simple_parameter_list(parameters: &[String]) -> bool {
             && !parameter.starts_with(PARAMETER_REST_MARKER)
             && !parameter.starts_with('\0')
     })
+}
+
+/// Parameter names in strict code may be neither `eval`, `arguments`, nor a
+/// strict reserved word (ECMA-262 15.2.1).
+fn validate_strict_parameters(parameters: &[String]) -> Result<(), JsError> {
+    for parameter in parameters {
+        let name = parameter_binding_name(parameter);
+        if is_strict_reserved_word(name) || name == "arguments" {
+            return Err(JsError::syntax(
+                "strict mode parameter uses a reserved word",
+                0,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Strip a parameter's default/rest marker to recover its binding name.
@@ -4531,16 +4684,20 @@ fn validate_reserved_expression(
 ) -> Result<(), JsError> {
     match expression {
         Expr::Identifier(name) => check_reserved_identifier(name, context)?,
+        // A function expression's `yield`/`await` restrictions come from its own
+        // kind, not the enclosing one. The `name` of a method is a property name
+        // and is not checked here.
         Expr::Function {
-            name,
             parameters,
             body,
+            kind,
             ..
         } => {
-            if let Some(name) = name {
-                check_reserved_identifier(name, context)?;
-            }
-            validate_reserved_parameters(parameters, context)?;
+            let own = ReservedContext {
+                async_context: kind.is_async(),
+                generator_context: kind.is_generator(),
+            };
+            validate_reserved_parameters(parameters, own)?;
             validate_reserved_statements(body, ReservedContext::default())?;
         }
         Expr::Arrow {
