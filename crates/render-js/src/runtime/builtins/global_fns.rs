@@ -785,6 +785,15 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::CollectionUnion
+            | NativeFunction::CollectionIntersection
+            | NativeFunction::CollectionDifference
+            | NativeFunction::CollectionSymmetricDifference
+            | NativeFunction::CollectionIsSubsetOf
+            | NativeFunction::CollectionIsSupersetOf
+            | NativeFunction::CollectionIsDisjointFrom => {
+                self.dispatch_collections_native(dom, function, receiver, arguments)
+            }
             NativeFunction::CollectionEntries => self.dispatch_collections_native(
                 dom,
                 NativeFunction::CollectionEntries,

@@ -750,6 +750,13 @@ pub(crate) enum NativeFunction {
     CollectionKeys,
     CollectionValues,
     CollectionEntries,
+    CollectionUnion,
+    CollectionIntersection,
+    CollectionDifference,
+    CollectionSymmetricDifference,
+    CollectionIsSubsetOf,
+    CollectionIsSupersetOf,
+    CollectionIsDisjointFrom,
     CollectionIteratorNext,
     TypedArraySet,
     TypedArraySubarray,
@@ -2837,6 +2844,16 @@ impl Realm {
                     ("keys", NativeFunction::CollectionKeys),
                     ("values", NativeFunction::CollectionValues),
                     ("entries", NativeFunction::CollectionEntries),
+                    ("union", NativeFunction::CollectionUnion),
+                    ("intersection", NativeFunction::CollectionIntersection),
+                    ("difference", NativeFunction::CollectionDifference),
+                    (
+                        "symmetricDifference",
+                        NativeFunction::CollectionSymmetricDifference,
+                    ),
+                    ("isSubsetOf", NativeFunction::CollectionIsSubsetOf),
+                    ("isSupersetOf", NativeFunction::CollectionIsSupersetOf),
+                    ("isDisjointFrom", NativeFunction::CollectionIsDisjointFrom),
                 ]
             };
             for &(method_name, function) in methods {
@@ -2850,6 +2867,13 @@ impl Realm {
                             | NativeFunction::CollectionKeys
                             | NativeFunction::CollectionValues
                             | NativeFunction::CollectionEntries
+                            | NativeFunction::CollectionUnion
+                            | NativeFunction::CollectionIntersection
+                            | NativeFunction::CollectionDifference
+                            | NativeFunction::CollectionSymmetricDifference
+                            | NativeFunction::CollectionIsSubsetOf
+                            | NativeFunction::CollectionIsSupersetOf
+                            | NativeFunction::CollectionIsDisjointFrom
                     )
                 {
                     continue;
@@ -3590,6 +3614,13 @@ impl Realm {
             | "get"
             | "has"
             | "add"
+            | "union"
+            | "intersection"
+            | "difference"
+            | "symmetricDifference"
+            | "isSubsetOf"
+            | "isSupersetOf"
+            | "isDisjointFrom"
             | "bind"
             | "isArray"
             | "from"

@@ -31,6 +31,7 @@ pub(super) mod observers;
 pub(super) mod promise;
 pub(super) mod proxy;
 pub(super) mod regexp;
+pub(super) mod set_methods;
 pub(super) mod storage;
 pub(super) mod string;
 pub(super) mod structured_clone;

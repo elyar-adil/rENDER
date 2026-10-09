@@ -25,7 +25,7 @@ use crate::value::ObjectHost;
 use render_dom::Dom;
 
 impl JsRuntime {
-    fn collection_target(&self, receiver: ObjectId) -> ObjectId {
+    pub(in crate::runtime) fn collection_target(&self, receiver: ObjectId) -> ObjectId {
         let mut current = receiver;
         for _ in 0..8 {
             match self.realm.host(current) {
@@ -80,6 +80,15 @@ impl JsRuntime {
                 self.collection_iterator(receiver, CollectionView::Entries)
             }
             NativeFunction::CollectionIteratorNext => self.collection_iterator_next(receiver),
+            NativeFunction::CollectionUnion
+            | NativeFunction::CollectionIntersection
+            | NativeFunction::CollectionDifference
+            | NativeFunction::CollectionSymmetricDifference
+            | NativeFunction::CollectionIsSubsetOf
+            | NativeFunction::CollectionIsSupersetOf
+            | NativeFunction::CollectionIsDisjointFrom => {
+                self.dispatch_set_method(dom, function, receiver, arguments)
+            }
             other => match self.dispatch_iterator_native(dom, other, receiver, arguments) {
                 Some(result) => result,
                 None => self.dispatch_string_native(dom, other, receiver, arguments),
