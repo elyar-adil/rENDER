@@ -1075,13 +1075,19 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let key = required_argument(arguments, 0, "Object.prototype.propertyIsEnumerable")?
-            .to_js_string();
-        Ok(JsValue::Boolean(
-            self.realm
-                .own_property(receiver, &key)
+        let key_argument =
+            required_argument(arguments, 0, "Object.prototype.propertyIsEnumerable")?;
+        let enumerable = match &key_argument {
+            JsValue::Symbol(symbol) => self
+                .realm
+                .own_symbol_property(receiver, symbol)
                 .is_some_and(|descriptor| descriptor.enumerable),
-        ))
+            key => self
+                .realm
+                .own_property(receiver, &key.to_js_string())
+                .is_some_and(|descriptor| descriptor.enumerable),
+        };
+        Ok(JsValue::Boolean(enumerable))
     }
 
     /// `Object.prototype.toString` tag for any value (primitives included).

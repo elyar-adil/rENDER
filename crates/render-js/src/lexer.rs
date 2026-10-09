@@ -441,6 +441,7 @@ impl Lexer<'_> {
             Some(kind) => !matches!(
                 kind,
                 TokenKind::Identifier(_)
+                    | TokenKind::PrivateName(_)
                     | TokenKind::String(_)
                     | TokenKind::Number(_)
                     | TokenKind::BigInt(_)

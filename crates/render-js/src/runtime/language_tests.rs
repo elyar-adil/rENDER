@@ -1418,3 +1418,343 @@ fn a_unicode_back_reference_matches_whole_code_points() {
         "null"
     );
 }
+
+#[test]
+fn property_is_enumerable_reads_symbol_keyed_own_properties() {
+    // \u00A720.1.3.4: the key goes through ToPropertyKey, so a symbol key finds
+    // its own property the same way a string key does.
+    assert_eq!(
+        ok("var s = Symbol(); var o = {}; o[s] = 1; o.propertyIsEnumerable(s)"),
+        "true"
+    );
+    assert_eq!(
+        ok(
+            "var s = Symbol(); var o = {}; Object.defineProperty(o, s, { value: 1 }); o.propertyIsEnumerable(s)"
+        ),
+        "false"
+    );
+    assert_eq!(
+        ok("var s = Symbol(); var o = {}; o.propertyIsEnumerable(s)"),
+        "false"
+    );
+    assert_eq!(
+        ok(
+            "var s = Symbol(); var o = {}; o[s] = 1; Object.prototype.propertyIsEnumerable.call(o, s)"
+        ),
+        "true"
+    );
+    assert_eq!(ok("var o = { a: 1 }; o.propertyIsEnumerable('a')"), "true");
+}
+
+#[test]
+fn cover_initialized_names_are_patterns_only() {
+    // §13.2.5.1 CoverInitializedName: `{ name = value }` is an AssignmentPattern
+    // once the literal is the target of `=` or a for-in/of head.
+    assert_eq!(ok("var x; ({ x = 1 } = {}); x"), "1");
+    assert_eq!(ok("var x; ({ x = 2 } = { x: 5 }); x"), "5");
+    assert_eq!(ok("var a; [{ a = 3 }] = [{}]; a"), "3");
+    assert_eq!(ok("var n; for ({ n = 4 } of [{}]) ; n"), "4");
+    assert_eq!(ok("var b; ({ p: { b = 2 } } = { p: {} }); b"), "2");
+    assert_eq!(ok("var f; ({ f = function () {} } = {}); f.name"), "f");
+    assert_eq!(ok("var z; (({ z = 9 } = {})); z"), "9");
+    assert_eq!(ok("(({ x = 7 }) => x)({})"), "7");
+    // A `=` nested inside a pattern position resolves its own members.
+    assert_eq!(
+        ok("var p, q; [{ p = 1 }, { q = 2 }] = [{}, {}]; p + ':' + q"),
+        "1:2"
+    );
+    assert_eq!(ok("var r; [{ r = 5 } = {}] = []; r"), "5");
+    for source in [
+        "({ x = 1 })",
+        "var o = { x = 1 };",
+        "function f() {} f({ x = 1 });",
+        "var a = [{ x = 1 }];",
+        "var a; [{ a = 1 }.a] = [];",
+        "var a; ({ a = 1 }).a = 2;",
+        "var a; ({ a = 1 }) += 1;",
+        "var a; [{ a = 1 } += 1] = [];",
+        "for ({ x = 1 }; false;) ;",
+        "var a = true ? { x = 1 } : 2;",
+        "var a; [a = { x = 1 }] = [];",
+        "var a; ({ a = 1 } &&= 2);",
+        "'use strict'; var r; ({ eval = 1 } = {});",
+        "var o; ({ ...{ x = 1 } } = {});",
+        "var r; ({ if = 1 } = {});",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn for_in_destructuring_assigns_each_key_to_the_pattern() {
+    // §14.7.5.6: a for-in head may bind or assign a pattern from each key.
+    assert_eq!(ok("var a; for (var [a] in { xy: 1 }) ; a"), "x");
+    assert_eq!(ok("var z; for (var { 0: z } in { ab: 1 }) ; z"), "a");
+    assert_eq!(ok("var w; for ([w] in { ab: 1 }) ; w"), "a");
+    assert_eq!(ok("var v; for ({ 0: v } in { ab: 1 }) ; v"), "a");
+    assert_eq!(
+        ok(
+            "var fs = []; for (let [k] in { ab: 1, cd: 1 }) fs.push(function () { return k; }); fs[0]() + fs[1]()"
+        ),
+        "ac"
+    );
+    assert_eq!(ok("var t; for (t in { p: 1 }) ; t"), "p");
+    assert_eq!(ok("var o = {}; for (o.k in { q: 1 }) ; o.k"), "q");
+    // `var` may repeat a name, but a lexical head may not (ECMA-262 14.7.5.1).
+    assert_eq!(ok("var x, y; for (var [x, y] in { ab: 1 }) ; x + y"), "ab");
+    for source in [
+        "for (let [x, x] in {}) {}",
+        "for (const [x, x] of []) {}",
+        "for (let { a: x, b: x } of []) {}",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn private_methods_are_own_elements_installed_on_each_instance() {
+    // §7.3.31 PrivateMethodOrAccessorAdd and §7.3.32 PrivateElementFind: a
+    // private method is the instance's own element, so a prototype or a
+    // subclass cannot supply it, and a second initialization is a TypeError.
+    assert_eq!(
+        ok(
+            "class C { #m() { return 7; } get #g() { return 3; } t() { return this.#m() + this.#g; } } new C().t()"
+        ),
+        "10"
+    );
+    assert_eq!(
+        ok(
+            "class C { #m() { return 7; } static r(o) { return o.#m(); } } var r; try { C.r(Object.create(C.prototype)); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "class C { static #s() { return 1; } static s() { return this.#s(); } } class D extends C {} var r; try { D.s(); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "class C { #m() {} static has(o) { return #m in o; } } C.has(new C()) + ':' + C.has({})"
+        ),
+        "true:false"
+    );
+    assert_eq!(
+        ok(
+            "class Base { constructor(o) { return o; } } class C extends Base { #m() {} } var obj = {}; new C(obj); var r; try { new C(obj); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "class A { constructor(arg) { return arg; } } class C extends A { #x; constructor(arg) { super(arg); } } var holder = new C(); var r; try { new C(holder); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn switch_selects_the_matching_clause_before_falling_back_to_default() {
+    // §14.12.4 CaseBlockEvaluation: every case is tested before `default` is
+    // used, so a `default` that comes first does not run when a later case matches.
+    assert_eq!(
+        ok("var r = ''; switch (2) { default: r += 'd'; case 2: r += 'b'; } r"),
+        "b"
+    );
+    assert_eq!(
+        ok("var r = ''; switch (9) { default: r += 'd'; case 2: r += 'b'; } r"),
+        "db"
+    );
+    assert_eq!(
+        ok("var r = ''; switch (1) { case 0: r += 'a'; default: r += 'd'; case 1: r += 'b'; } r"),
+        "b"
+    );
+    assert_eq!(
+        ok("var r = ''; switch (7) { case 0: r += 'a'; default: r += 'd'; case 1: r += 'b'; } r"),
+        "db"
+    );
+    assert_eq!(
+        ok("var r = 'none'; switch (5) { case 1: r = 'one'; } r"),
+        "none"
+    );
+}
+
+#[test]
+fn switch_case_block_is_one_lexical_scope_with_hoisted_functions() {
+    // §14.12.4 step 2: the case block's declarations are instantiated before any
+    // clause runs, and they are scoped to the switch.
+    assert_eq!(
+        ok("var r; switch (1) { case 1: function f() { return 5; } r = f(); } r"),
+        "5"
+    );
+    assert_eq!(
+        ok("var r; switch (0) { default: function g() { return 6; } r = g(); } r"),
+        "6"
+    );
+    assert_eq!(
+        ok("switch (1) { case 1: let a = 4; } typeof a"),
+        "undefined"
+    );
+    assert_eq!(
+        ok("var r = 'ok'; switch (0) { case 1: function f() {} default: function f() {} } r"),
+        "ok"
+    );
+}
+
+#[test]
+fn object_literal_values_name_anonymous_functions_after_their_key() {
+    // §13.2.5.5 step 7: `key: AssignmentExpression` names an anonymous function,
+    // arrow or class after the key; a symbol key gives `[description]`.
+    assert_eq!(
+        ok(
+            "var o = { id: () => {}, f: function () {}, c: class {} }; [o.id.name, o.f.name, o.c.name].join()"
+        ),
+        "id,f,c"
+    );
+    assert_eq!(
+        ok(
+            "var s = Symbol('d'); var t = Symbol(); var o = { [s]: () => {}, [t]: function () {} }; o[s].name + '|' + o[t].name"
+        ),
+        "[d]|"
+    );
+    // A named function keeps its own name.
+    assert_eq!(ok("({ g: function h() {} }).g.name"), "h");
+}
+
+#[test]
+fn object_literal_methods_read_super_from_their_home_object() {
+    // §13.2.5.4 and §15.4.4: a method's [[HomeObject]] is its object literal, so
+    // `super.name` reads the prototype of that object, and a method is not a constructor.
+    assert_eq!(
+        ok(
+            "var proto = { m() { return 'p'; } }; var o = { __proto__: proto, m() { return super.m() + 'o'; } }; o.m()"
+        ),
+        "po"
+    );
+    assert_eq!(
+        ok("var o = { m() { return super.x; } }; Object.setPrototypeOf(o, { x: 5 }); o.m()"),
+        "5"
+    );
+    assert_eq!(
+        ok(
+            "var base = { get v() { return 2; } }; var o = { __proto__: base, get v() { return super.v * 10; } }; o.v"
+        ),
+        "20"
+    );
+    assert_eq!(
+        ok("var p = { x: 3 }; var o = { __proto__: p, m() { return (() => super.x)(); } }; o.m()"),
+        "3"
+    );
+    assert_eq!(
+        ok("var o = { __proto__: {}, m() { super.y = 4; return this.y; } }; o.m()"),
+        "4"
+    );
+    assert_eq!(
+        ok("var r; try { new ({ m() {} }).m(); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn labels_refuse_strict_reserved_words_and_labelled_functions_are_sloppy_only() {
+    // §13.1.1 and §14.13.1: a label is a LabelIdentifier, and Annex B.3.2 allows a
+    // labelled plain function only where the code is sloppy.
+    assert_eq!(ok("l: function f() {} 'ok'"), "ok");
+    assert_eq!(ok("yield: 1; 'ok'"), "ok");
+    for source in [
+        "'use strict'; l: function f() {}",
+        "'use strict'; yield: 1;",
+        "'use strict'; let: 1;",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn an_escaped_contextual_keyword_is_an_identifier_not_a_modifier() {
+    // §12.7.2: an identifier spelled with escapes is never the keyword it spells,
+    // so `get`, `async` and `new.target` are early errors where the keyword is required.
+    for source in [
+        "({ \\u0067et x() {} })",
+        "({ \\u0061sync m() {} })",
+        "class C { st\\u0061tic m() {} }",
+        "function f() { return new.\\u0074arget; }",
+        "\\u0061sync function f() {}",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_slash_after_a_private_name_is_division() {
+    // §12.5: a private name is an operand, so `/` after it is not a regex.
+    assert_eq!(
+        ok("class C { #f = 4; m() { return this.#f /= 2; } } new C().m()"),
+        "2"
+    );
+    assert_eq!(
+        ok("class C { #f = 4; m() { return this.#f / 2; } } new C().m()"),
+        "2"
+    );
+}
+
+#[test]
+fn array_assignment_pattern_takes_only_what_it_needs_and_closes_the_iterator() {
+    // §13.15.5.5: the pattern steps the iterator per element, and an early
+    // finish calls `return()`, which must produce an object.
+    assert_eq!(
+        ok("var r; try { [] = 1; } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var x; var it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { return null; } }; } }; var r; try { [x] = it; } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var q; var it = { [Symbol.iterator]() { return { next() { return { value: 1, done: false }; }, return() { throw new RangeError('stop'); } }; } }; var r; try { [q] = it; } catch (e) { r = e.name; } r"
+        ),
+        "RangeError"
+    );
+    assert_eq!(
+        ok(
+            "var n = 0; var a; var it = { [Symbol.iterator]() { return { next() { n++; return { value: n, done: false }; }, return() { return {}; } }; } }; [a] = it; a + ':' + n"
+        ),
+        "1:1"
+    );
+    assert_eq!(
+        ok("function* g() { var i = 0; while (true) yield i++; } var b, c; [b, c] = g(); b + c"),
+        "1"
+    );
+    assert_eq!(ok("var r; [...r] = [1, 2, 3]; r.join()"), "1,2,3");
+    // A `next()` that throws leaves the iterator done, so it is not closed.
+    assert_eq!(
+        ok(
+            "var n = 0, c = 0; var it = { [Symbol.iterator]() { return { next() { n++; throw new RangeError('x'); }, return() { c++; return {}; } }; } }; var a; try { [a] = it; } catch (e) {} n + ':' + c"
+        ),
+        "1:0"
+    );
+    assert_eq!(
+        ok("var a, b; [, a, , b] = [1, 2, 3, 4]; a + ':' + b"),
+        "2:4"
+    );
+}

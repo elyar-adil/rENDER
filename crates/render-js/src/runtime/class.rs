@@ -573,6 +573,22 @@ impl JsRuntime {
         class: &Rc<ClassFunction>,
         instance: ObjectId,
     ) -> Result<(), JsError> {
+        // InitializeInstanceElements (ECMA-262 7.3.34): the class's private
+        // methods and accessors become own private elements of the instance
+        // before any field is defined. They live on the class prototype, which
+        // is the constructor's [[HomeObject]].
+        let methods = class
+            .home_object
+            .map(|prototype| self.realm.private_method_entries(prototype))
+            .unwrap_or_default();
+        for (id, descriptor) in methods {
+            if self.realm.has_own_private_element(instance, id) {
+                return Err(JsError::type_error(
+                    "private methods are already initialized on this object",
+                ));
+            }
+            self.realm.define_private_method(instance, id, descriptor);
+        }
         if class.fields.is_empty() {
             return Ok(());
         }
@@ -620,6 +636,14 @@ impl JsRuntime {
                         );
                     }
                     ClassFieldKey::Private(id) => {
+                        // PrivateFieldAdd (ECMA-262 7.3.29): an element the
+                        // object already has (from a base constructor that
+                        // returned it) is an error, not an overwrite.
+                        if runtime.realm.has_own_private_element(instance, *id) {
+                            return Err(JsError::type_error(
+                                "private field is already initialized on this object",
+                            ));
+                        }
                         runtime.realm.set_private_field(instance, *id, value);
                     }
                 }
@@ -629,6 +653,33 @@ impl JsRuntime {
         self.class_frames.pop();
         self.environment = previous_environment;
         Ok(())
+    }
+
+    /// Give an object-literal method or accessor its `[[HomeObject]]`, the object
+    /// literal itself, so `super.name` in its body reads from that object's
+    /// prototype (ECMA-262 13.2.5.4 `MethodDefinitionEvaluation`). The method is not
+    /// a constructor, as a class method is not, so its metadata says so.
+    pub(super) fn set_method_home_object(&mut self, method: &JsValue, home: ObjectId) {
+        let JsValue::Object(method) = method else {
+            return;
+        };
+        let Some(ObjectHost::UserFunction(index)) = self.realm.host(*method) else {
+            return;
+        };
+        let private_names = self
+            .class_frames
+            .last()
+            .and_then(|frame| frame.private_scope.clone())
+            .unwrap_or_default();
+        let metadata = Rc::new(ClassFunction {
+            home_object: Some(home),
+            private_names,
+            environment: self.environment.clone(),
+            ..ClassFunction::default()
+        });
+        if let Some(function) = self.functions.get_mut(index) {
+            function.class = Some(metadata);
+        }
     }
 
     /// `super.property` read: the value found on the home object's prototype
