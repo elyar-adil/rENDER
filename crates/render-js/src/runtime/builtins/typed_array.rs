@@ -123,6 +123,10 @@ impl JsRuntime {
                 self.typed_array_from(dom, receiver, kind, arguments)
             }
             NativeFunction::TypedArrayOf => self.typed_array_of(dom, receiver, arguments),
+            NativeFunction::TypedArrayBufferGetter => {
+                let (_, buffer, _, _) = self.typed_array_parts(receiver)?;
+                Ok(JsValue::Object(self.array_buffer_object(&buffer)?))
+            }
             NativeFunction::TypedArrayLengthGetter => self.typed_array_length(receiver),
             NativeFunction::TypedArrayByteLengthGetter => self.typed_array_byte_length(receiver),
             NativeFunction::TypedArrayByteOffsetGetter => self.typed_array_byte_offset(receiver),
@@ -210,16 +214,9 @@ impl JsRuntime {
         self.create_typed_array_from_values(kind, &elements, prototype)
     }
 
-    /// A typed-array view over an existing `ArrayBuffer`.
-    ///
-    /// The buffer holds one slot per byte, so a view is byte-exact only when one
-    /// element is one byte *and* the stored representation is that byte:
-    /// `Uint8Array` and `Uint8ClampedArray` qualify, because their element
-    /// values are the bytes themselves. `Int8Array` stores signed values, and
-    /// the wider kinds store decoded numbers rather than bytes, so a view of
-    /// those over a shared buffer would have to compose each element from
-    /// several byte slots. That composition is not implemented, so it is
-    /// refused here rather than answered with a plausible-looking wrong number.
+    /// A typed-array view over an existing `ArrayBuffer` (ECMA-262 23.2.5.1
+    /// `InitializeTypedArrayFromArrayBuffer`). The view shares the buffer's store,
+    /// so a write through either is visible through the other.
     fn typed_array_over_buffer(
         &mut self,
         dom: &mut Dom,
@@ -229,16 +226,8 @@ impl JsRuntime {
         length: Option<&JsValue>,
         prototype: Option<ObjectId>,
     ) -> Result<JsValue, JsError> {
-        if !matches!(kind, TypedArrayKind::Uint8 | TypedArrayKind::Uint8Clamped) {
-            return Err(JsError::type_error(format!(
-                "{} cannot view a shared ArrayBuffer in this engine; \
-                 only Uint8Array and Uint8ClampedArray can",
-                kind.name()
-            )));
-        }
-        let total_bytes = buffer.0.borrow().len();
         let element_size = kind.element_size();
-        // §23.2.5.1 steps 7-8: `ToIndex(byteOffset)`.
+        // Steps 6-7: `ToIndex(byteOffset)` must be a multiple of the element size.
         let offset = self.optional_integer_value(dom, byte_offset)?;
         if !offset.is_finite() || offset < 0.0 {
             return Err(self.range_error("byteOffset must be a non-negative integer"));
@@ -247,22 +236,37 @@ impl JsRuntime {
         if !offset_value.is_multiple_of(element_size) {
             return Err(self.range_error("byteOffset must be a multiple of the element size"));
         }
-        if offset_value > total_bytes {
-            return Err(self.range_error("byteOffset is past the end of the buffer"));
-        }
-        let available = (total_bytes - offset_value) / element_size;
-        let count = match length {
-            None | Some(JsValue::Undefined) => available,
+        // Step 8: `ToIndex(length)` when it is given.
+        let requested = match length {
+            None | Some(JsValue::Undefined) => None,
             Some(value) => {
                 let requested = self.optional_integer_value(dom, Some(value))?;
                 if !requested.is_finite() || requested < 0.0 {
                     return Err(self.range_error("length must be a non-negative integer"));
                 }
-                let requested = requested as usize;
-                if requested > available {
+                Some(requested as usize)
+            }
+        };
+        // Step 9: a detached buffer cannot back a view.
+        buffer.ensure_attached()?;
+        let total_bytes = buffer.byte_length();
+        if offset_value > total_bytes {
+            return Err(self.range_error("byteOffset is past the end of the buffer"));
+        }
+        let count = match requested {
+            None => {
+                if !total_bytes.is_multiple_of(element_size) {
+                    return Err(self.range_error(
+                        "byte length of the buffer must be a multiple of the element size",
+                    ));
+                }
+                (total_bytes - offset_value) / element_size
+            }
+            Some(count) => {
+                if offset_value + count * element_size > total_bytes {
                     return Err(self.range_error("length is past the end of the buffer"));
                 }
-                requested
+                count
             }
         };
         self.ensure_heap_capacity(1)?;
@@ -287,13 +291,15 @@ impl JsRuntime {
             return Ok(Vec::new());
         };
         if let Some(ObjectHost::TypedArray {
+            kind,
             buffer,
             start,
             length,
-            ..
         }) = self.realm.host(*source)
         {
-            return Ok(buffer.0.borrow()[start..start + length].to_vec());
+            // InitializeTypedArrayFromTypedArray: a detached source is a TypeError.
+            buffer.ensure_attached()?;
+            return buffer.elements(kind, start, length);
         }
         // ECMA-262 23.2.5.1 step 6: an object with `@@iterator` supplies its
         // values through the iterator; anything else is an array-like.
@@ -390,7 +396,7 @@ impl JsRuntime {
         if length > Self::MAX_TYPED_ARRAY_ELEMENTS {
             return Err(self.range_error("typed array length exceeds the engine bound"));
         }
-        let buffer = TypedBuffer(std::rc::Rc::new(std::cell::RefCell::new(vec![0.0; length])));
+        let buffer = TypedBuffer::new(vec![0; length * kind.element_size()]);
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(
             self.realm.typed_array(kind, buffer, 0, length, prototype),
@@ -406,16 +412,21 @@ impl JsRuntime {
         if values.len() > Self::MAX_TYPED_ARRAY_ELEMENTS {
             return Err(self.range_error("typed array length exceeds the engine bound"));
         }
-        let encoded = values.iter().map(|value| kind.encode(*value)).collect();
-        let buffer = TypedBuffer(std::rc::Rc::new(std::cell::RefCell::new(encoded)));
-        let length = buffer.0.borrow().len();
+        let buffer = TypedBuffer::new(vec![0; values.len() * kind.element_size()]);
+        buffer.set_elements(kind, 0, values);
         self.ensure_heap_capacity(1)?;
-        Ok(JsValue::Object(
-            self.realm.typed_array(kind, buffer, 0, length, prototype),
-        ))
+        Ok(JsValue::Object(self.realm.typed_array(
+            kind,
+            buffer,
+            0,
+            values.len(),
+            prototype,
+        )))
     }
 
-    pub(in crate::runtime) fn typed_array_host(
+    /// The view's kind, buffer, element start and element count, with no check
+    /// on the buffer. The accessors that report a detached view as zero use this.
+    pub(in crate::runtime) fn typed_array_parts(
         &self,
         receiver: ObjectId,
     ) -> Result<(TypedArrayKind, TypedBuffer, usize, usize), JsError> {
@@ -432,12 +443,23 @@ impl JsRuntime {
         }
     }
 
+    /// `ValidateTypedArray` (ECMA-262 23.2.4.4): the view's parts, or a
+    /// `TypeError` when its buffer is detached.
+    pub(in crate::runtime) fn typed_array_host(
+        &self,
+        receiver: ObjectId,
+    ) -> Result<(TypedArrayKind, TypedBuffer, usize, usize), JsError> {
+        let parts = self.typed_array_parts(receiver)?;
+        parts.1.ensure_attached()?;
+        Ok(parts)
+    }
+
     pub(in crate::runtime) fn typed_array_elements(
         &self,
         receiver: ObjectId,
     ) -> Result<Vec<f64>, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
-        Ok(buffer.0.borrow()[start..start + length].to_vec())
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        buffer.elements(kind, start, length)
     }
 
     /// `%TypedArray%.prototype.set(source[, offset])` (ECMA-262 23.2.3.26): the
@@ -458,13 +480,16 @@ impl JsRuntime {
         let values: Vec<f64> = match &source {
             JsValue::Object(object) => {
                 if let Some(ObjectHost::TypedArray {
+                    kind: source_kind,
                     buffer: source_buffer,
                     start: source_start,
                     length: source_length,
-                    ..
                 }) = self.realm.host(*object)
                 {
-                    source_buffer.0.borrow()[source_start..source_start + source_length].to_vec()
+                    // The source is read in full before any write, so a source
+                    // over the same buffer copies correctly.
+                    source_buffer.ensure_attached()?;
+                    source_buffer.elements(source_kind, source_start, source_length)?
                 } else {
                     // SetTypedArrayFromArrayLike: the length is `ToLength` of the
                     // object's `length`, and each element goes through `ToNumber`.
@@ -493,13 +518,7 @@ impl JsRuntime {
         if offset + values.len() as f64 > length as f64 {
             return Err(self.range_error("source is too large"));
         }
-        let offset = offset as usize;
-        {
-            let mut elements = buffer.0.borrow_mut();
-            for (delta, value) in values.iter().enumerate() {
-                elements[start + offset + delta] = kind.encode(*value);
-            }
-        }
+        buffer.set_elements(kind, start + offset as usize, &values);
         Ok(JsValue::Undefined)
     }
 
@@ -604,14 +623,11 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-        let fill_value = kind.encode(self.to_number_value(dom, &value)?);
+        let fill_value = self.to_number_value(dom, &value)?;
         let rest = arguments.get(1..).unwrap_or(&[]);
         let (begin, end) = self.typed_range(dom, rest, length)?;
-        {
-            let mut elements = buffer.0.borrow_mut();
-            for slot in &mut elements[start + begin..start + end] {
-                *slot = fill_value;
-            }
+        for index in begin..end {
+            buffer.set_element(kind, start + index, fill_value);
         }
         Ok(JsValue::Object(receiver))
     }
@@ -631,13 +647,13 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let from = self.typed_from_index(dom, arguments.get(1), length)?;
         let Some(search) = Self::typed_search_number(arguments.first()) else {
             return Ok(JsValue::Number(-1.0));
         };
-        let elements = buffer.0.borrow();
-        for (delta, element) in elements[start + from..start + length].iter().enumerate() {
+        let elements = buffer.elements(kind, start, length)?;
+        for (delta, element) in elements[from..].iter().enumerate() {
             if *element == search {
                 return Ok(JsValue::Number((from + delta) as f64));
             }
@@ -653,7 +669,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         if length == 0 {
             return Ok(JsValue::Number(-1.0));
         }
@@ -673,9 +689,9 @@ impl JsRuntime {
         let Some(search) = Self::typed_search_number(arguments.first()) else {
             return Ok(JsValue::Number(-1.0));
         };
-        let elements = buffer.0.borrow();
+        let elements = buffer.elements(kind, start, length)?;
         while index >= 0.0 {
-            if elements[start + index as usize] == search {
+            if elements[index as usize] == search {
                 return Ok(JsValue::Number(index));
             }
             index -= 1.0;
@@ -704,13 +720,13 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let from = self.typed_from_index(dom, arguments.get(1), length)?;
         let Some(search) = Self::typed_search_number(arguments.first()) else {
             return Ok(JsValue::Boolean(false));
         };
-        let elements = buffer.0.borrow();
-        for element in &elements[start + from..start + length] {
+        let elements = buffer.elements(kind, start, length)?;
+        for element in &elements[from..] {
             // `includes` uses SameValueZero, so `NaN` finds `NaN`.
             if *element == search || (search.is_nan() && element.is_nan()) {
                 return Ok(JsValue::Boolean(true));
@@ -726,11 +742,11 @@ impl JsRuntime {
         callback: ObjectId,
         this_argument: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         for index in 0..length {
-            // Read each element through a short borrow so user callbacks can
-            // safely write back through the same view.
-            let Some(element) = buffer.0.borrow().get(start + index).copied() else {
+            // Each element is decoded at its visit, so user callbacks that write
+            // back through the same view are seen by later visits.
+            let Some(element) = buffer.element(kind, start + index) else {
                 break;
             };
             self.call_with_this(
@@ -760,7 +776,7 @@ impl JsRuntime {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let mut output = Vec::new();
         for index in 0..length {
-            let Some(element) = buffer.0.borrow().get(start + index).copied() else {
+            let Some(element) = buffer.element(kind, start + index) else {
                 break;
             };
             let mapped = self.call_with_this(
@@ -788,13 +804,13 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let separator = match arguments.first() {
             None | Some(JsValue::Undefined) => ",".to_owned(),
             Some(value) => value.to_js_string(),
         };
-        let elements = buffer.0.borrow();
-        let parts = elements[start..start + length]
+        let elements = buffer.elements(kind, start, length)?;
+        let parts = elements
             .iter()
             .map(|element| JsValue::Number(*element).to_js_string())
             .collect::<Vec<_>>();
@@ -831,7 +847,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let len = length as f64;
         let relative = self.optional_integer_value(dom, arguments.first())?;
         let index = if relative >= 0.0 {
@@ -842,8 +858,9 @@ impl JsRuntime {
         if index < 0.0 || index >= len {
             return Ok(JsValue::Undefined);
         }
-        let element = buffer.0.borrow()[start + index as usize];
-        Ok(JsValue::Number(element))
+        Ok(buffer
+            .element(kind, start + index as usize)
+            .map_or(JsValue::Undefined, JsValue::Number))
     }
 
     /// `%TypedArray%.prototype.copyWithin(target, start[, end])` (ECMA-262
@@ -855,7 +872,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let len = length as f64;
         let to = self.relative_position(dom, arguments.first(), len, 0.0)?;
         let from = self.relative_position(dom, arguments.get(1), len, 0.0)?;
@@ -863,8 +880,9 @@ impl JsRuntime {
         let count = (end - from).min(len - to);
         if count > 0.0 {
             let (to, from, count) = (to as usize, from as usize, count as usize);
-            let mut elements = buffer.0.borrow_mut();
-            elements[start..start + length].copy_within(from..from + count, to);
+            let mut elements = buffer.elements(kind, start, length)?;
+            elements.copy_within(from..from + count, to);
+            buffer.set_elements(kind, start, &elements);
         }
         Ok(JsValue::Object(receiver))
     }
@@ -880,7 +898,7 @@ impl JsRuntime {
         scan: Scan,
         last: bool,
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let callback = Self::require_callable_object(
             required_argument(arguments, 0, "callback")?,
             &self.realm,
@@ -892,7 +910,9 @@ impl JsRuntime {
             (0..length).collect()
         };
         for index in order {
-            let element = buffer.0.borrow()[start + index];
+            let Some(element) = buffer.element(kind, start + index) else {
+                break;
+            };
             let result = self.call_with_this(
                 dom,
                 callback,
@@ -928,7 +948,7 @@ impl JsRuntime {
         arguments: &[JsValue],
         right: bool,
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let callback =
             Self::require_callable_object(required_argument(arguments, 0, "reduce")?, &self.realm)?;
         let mut order: Vec<usize> = if right {
@@ -945,10 +965,14 @@ impl JsRuntime {
                 ));
             }
             let first = order.remove(0);
-            JsValue::Number(buffer.0.borrow()[start + first])
+            buffer
+                .element(kind, start + first)
+                .map_or(JsValue::Undefined, JsValue::Number)
         };
         for index in order {
-            let element = buffer.0.borrow()[start + index];
+            let Some(element) = buffer.element(kind, start + index) else {
+                break;
+            };
             accumulator = self.call_with_this(
                 dom,
                 callback,
@@ -966,8 +990,10 @@ impl JsRuntime {
 
     /// `%TypedArray%.prototype.reverse()`: in place, and returns the receiver.
     fn typed_array_reverse(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
-        buffer.0.borrow_mut()[start..start + length].reverse();
+        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        let mut elements = buffer.elements(kind, start, length)?;
+        elements.reverse();
+        buffer.set_elements(kind, start, &elements);
         Ok(JsValue::Object(receiver))
     }
 
@@ -1059,11 +1085,11 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, _) = self.typed_array_host(receiver)?;
         let comparator = self.typed_array_comparator(arguments.first())?;
         let mut elements = self.typed_array_elements(receiver)?;
         self.typed_array_sort_values(dom, comparator, &mut elements)?;
-        buffer.0.borrow_mut()[start..start + length].copy_from_slice(&elements);
+        buffer.set_elements(kind, start, &elements);
         Ok(JsValue::Object(receiver))
     }
 
@@ -1119,28 +1145,34 @@ impl JsRuntime {
         self.create_typed_array_from_values(kind, &elements, prototype)
     }
 
-    /// The `length` accessor of `%TypedArray%.prototype`.
+    /// The `length` accessor of `%TypedArray%.prototype`. A view whose buffer is
+    /// detached reports 0 rather than throwing (ECMA-262 23.2.4.1).
     fn typed_array_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let (_, _, _, length) = self.typed_array_host(receiver)?;
+        let (_, buffer, _, length) = self.typed_array_parts(receiver)?;
+        let length = if buffer.is_detached() { 0 } else { length };
         Ok(JsValue::Number(length as f64))
     }
 
-    /// The `byteLength` accessor: the element count times the element size.
+    /// The `byteLength` accessor: the element count times the element size, or
+    /// 0 for a detached view.
     fn typed_array_byte_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let (kind, _, _, length) = self.typed_array_host(receiver)?;
+        let (kind, buffer, _, length) = self.typed_array_parts(receiver)?;
+        let length = if buffer.is_detached() { 0 } else { length };
         Ok(JsValue::Number((length * kind.element_size()) as f64))
     }
 
-    /// The `byteOffset` accessor: the view's start, in bytes.
+    /// The `byteOffset` accessor: the view's start, in bytes, or 0 for a
+    /// detached view.
     fn typed_array_byte_offset(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let (kind, _, start, _) = self.typed_array_host(receiver)?;
+        let (kind, buffer, start, _) = self.typed_array_parts(receiver)?;
+        let start = if buffer.is_detached() { 0 } else { start };
         Ok(JsValue::Number((start * kind.element_size()) as f64))
     }
 
     /// The `@@toStringTag` accessor: the constructor's name for a typed array,
     /// and `undefined` for anything else (ECMA-262 23.2.3.32).
     fn typed_array_to_string_tag(&self, receiver: ObjectId) -> JsValue {
-        match self.typed_array_host(receiver) {
+        match self.typed_array_parts(receiver) {
             Ok((kind, _, _, _)) => JsValue::String(kind.name().to_owned()),
             Err(_) => JsValue::Undefined,
         }

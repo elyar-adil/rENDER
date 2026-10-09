@@ -279,24 +279,17 @@ impl JsRuntime {
             length,
         }) = self.realm.host(*object)
         {
-            let values = buffer.0.borrow();
-            return Ok(values[start..start.saturating_add(length)]
-                .iter()
-                .map(|value| kind.encode(*value) as u8)
-                .collect());
+            // The view's bytes, as they sit in the buffer.
+            let size = kind.element_size();
+            return buffer.read_bytes(start * size, length * size);
         }
         if let Some(ObjectHost::DataView {
             buffer,
             byte_offset,
             byte_length,
-            ..
         }) = self.realm.host(*object)
         {
-            let values = buffer.0.borrow();
-            return Ok(values[byte_offset..byte_offset + byte_length]
-                .iter()
-                .map(|value| *value as i64 as u8)
-                .collect());
+            return buffer.read_bytes(byte_offset, byte_length);
         }
         let length = self.array_like_length(dom, *object)?;
         let mut bytes = Vec::new();
@@ -467,7 +460,6 @@ impl JsRuntime {
         let mut written = 0usize;
         let mut read = 0usize;
         {
-            let mut slots = buffer.0.borrow_mut();
             let limit = start + length;
             for character in source.chars() {
                 let scalar = if is_unpaired_surrogate(character) {
@@ -480,10 +472,8 @@ impl JsRuntime {
                 if start + written + encoded.len() > limit {
                     break;
                 }
-                for byte in encoded {
-                    slots[start + written] = f64::from(byte);
-                    written += 1;
-                }
+                buffer.write_bytes(start + written, &encoded);
+                written += encoded.len();
                 // `read` is "the number of code units read from source", so it is
                 // counted in the same units `String.prototype.length` reports.
                 // A placeholder stands for exactly *one* surrogate, and

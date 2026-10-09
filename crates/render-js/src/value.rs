@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::num::FpCategory;
 
+use crate::JsError;
 use render_dom::NodeId;
 use url::Url;
 
@@ -956,6 +957,11 @@ pub(crate) enum NativeFunction {
     VideoPause,
     VideoLoad,
     VideoCanPlayType,
+    /// `%TypedArray%.prototype.buffer`: the `ArrayBuffer` the view is over.
+    TypedArrayBufferGetter,
+    /// A function an embedder defined with `JsRuntime::define_host_function`: the
+    /// index of its entry in the runtime's host-function table.
+    Host(usize),
 }
 
 /// One integer or float element type of the ECMAScript typed-array family.
@@ -1012,7 +1018,7 @@ impl TypedArrayKind {
     /// applying the integer-indexed wrapping (`Int8` through `Uint32`),
     /// clamping (`Uint8Clamped`), or float rounding (`Float32`) rules of
     /// the ECMA-262 `IntegerIndexedElementSet` operation.
-    pub(crate) fn encode(self, value: f64) -> f64 {
+    fn encode(self, value: f64) -> f64 {
         match self {
             Self::Float64 => value,
             Self::Float32 => {
@@ -1031,6 +1037,46 @@ impl TypedArrayKind {
             Self::Int16 => Self::wrap_integer(value, 16, true),
             Self::Uint32 => Self::wrap_integer(value, 32, false),
             Self::Int32 => Self::wrap_integer(value, 32, true),
+        }
+    }
+
+    /// Decode one element from the little-endian bytes of this kind (ECMA-262
+    /// 10.4.5.12 `RawBytesToNumeric`). `bytes` holds at least `element_size` bytes.
+    pub(crate) fn load(self, bytes: &[u8]) -> f64 {
+        match self {
+            Self::Int8 => f64::from(i8::from_le_bytes(le_bytes(bytes))),
+            Self::Uint8 | Self::Uint8Clamped => f64::from(u8::from_le_bytes(le_bytes(bytes))),
+            Self::Int16 => f64::from(i16::from_le_bytes(le_bytes(bytes))),
+            Self::Uint16 => f64::from(u16::from_le_bytes(le_bytes(bytes))),
+            Self::Int32 => f64::from(i32::from_le_bytes(le_bytes(bytes))),
+            Self::Uint32 => f64::from(u32::from_le_bytes(le_bytes(bytes))),
+            Self::Float32 => f64::from(f32::from_le_bytes(le_bytes(bytes))),
+            Self::Float64 => f64::from_le_bytes(le_bytes(bytes)),
+        }
+    }
+
+    /// Encode a JavaScript Number as one element of this kind, as little-endian
+    /// bytes (ECMA-262 10.4.5.11 `NumericToRawBytes`). `bytes` is exactly
+    /// `element_size` long.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the converted value is already within this kind's range"
+    )]
+    pub(crate) fn store(self, value: f64, bytes: &mut [u8]) {
+        let value = self.encode(value);
+        match self {
+            Self::Int8 | Self::Uint8 | Self::Uint8Clamped => {
+                bytes.copy_from_slice(&(value as i64 as u8).to_le_bytes());
+            }
+            Self::Int16 | Self::Uint16 => {
+                bytes.copy_from_slice(&(value as i64 as u16).to_le_bytes());
+            }
+            Self::Int32 | Self::Uint32 => {
+                bytes.copy_from_slice(&(value as i64 as u32).to_le_bytes());
+            }
+            Self::Float32 => bytes.copy_from_slice(&(value as f32).to_le_bytes()),
+            Self::Float64 => bytes.copy_from_slice(&value.to_le_bytes()),
         }
     }
 
@@ -1077,15 +1123,149 @@ impl TypedArrayKind {
     }
 }
 
-/// Shared element storage for typed-array views. Views created by `subarray`
-/// reference the same buffer so mutations stay visible through both views,
-/// matching the shared-ArrayBuffer contract.
+/// The shared backing store of one `ArrayBuffer` (ECMA-262 25.1.3). Typed arrays
+/// and `DataView`s hold a clone of the `Rc`, so every view of a buffer reads and
+/// writes the same bytes, and a detach is seen through all of them.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct TypedBuffer(pub std::rc::Rc<std::cell::RefCell<Vec<f64>>>);
+pub(crate) struct TypedBuffer(pub std::rc::Rc<std::cell::RefCell<BufferStore>>);
+
+#[derive(Debug, Default)]
+pub(crate) struct BufferStore {
+    /// The bytes. Multi-byte elements are little-endian (ECMA-262 10.4.5.12).
+    bytes: Vec<u8>,
+    /// Set by `DetachArrayBuffer` (ECMA-262 25.1.3.5). A detached buffer has no
+    /// bytes, and access through any view throws a `TypeError`.
+    detached: bool,
+    /// The `ArrayBuffer` object this store belongs to, once one exists. A view's
+    /// `buffer` getter returns it, so the collector keeps it alive.
+    object: Option<ObjectId>,
+}
 
 impl PartialEq for TypedBuffer {
     fn eq(&self, other: &Self) -> bool {
         std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// The first `N` bytes of `bytes` as an array, for decoding one element.
+fn le_bytes<const N: usize>(bytes: &[u8]) -> [u8; N] {
+    let mut array = [0_u8; N];
+    array.copy_from_slice(&bytes[..N]);
+    array
+}
+
+impl TypedBuffer {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(BufferStore {
+            bytes,
+            ..BufferStore::default()
+        })))
+    }
+
+    pub(crate) fn byte_length(&self) -> usize {
+        self.0.borrow().bytes.len()
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.0.borrow().detached
+    }
+
+    /// `TypeError` unless the buffer is attached: every view access starts here.
+    pub(crate) fn ensure_attached(&self) -> Result<(), JsError> {
+        if self.is_detached() {
+            return Err(JsError::type_error(
+                "operation on a typed array or DataView whose ArrayBuffer is detached",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `DetachArrayBuffer` (ECMA-262 25.1.3.5): releases the bytes and marks
+    /// every view of this store detached.
+    pub(crate) fn detach(&self) {
+        let mut store = self.0.borrow_mut();
+        store.bytes = Vec::new();
+        store.detached = true;
+    }
+
+    /// The `ArrayBuffer` object this store belongs to, if one exists yet.
+    pub(crate) fn object(&self) -> Option<ObjectId> {
+        self.0.borrow().object
+    }
+
+    /// Record `object` as this store's identity, unless one is recorded already.
+    pub(crate) fn identify(&self, object: ObjectId) {
+        self.0.borrow_mut().object.get_or_insert(object);
+    }
+
+    /// Write `bytes` at byte offset `at`. Bytes past the end of the store are
+    /// ignored, as an out-of-range typed-array store is.
+    pub(crate) fn write_bytes(&self, at: usize, bytes: &[u8]) {
+        let mut store = self.0.borrow_mut();
+        if let Some(target) = store.bytes.get_mut(at..at + bytes.len()) {
+            target.copy_from_slice(bytes);
+        }
+    }
+
+    /// Copy of `length` bytes from byte offset `at`.
+    pub(crate) fn read_bytes(&self, at: usize, length: usize) -> Result<Vec<u8>, JsError> {
+        self.ensure_attached()?;
+        self.0
+            .borrow()
+            .bytes
+            .get(at..at + length)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| JsError::type_error("byte range is outside the ArrayBuffer"))
+    }
+
+    /// A copy of every byte of the store.
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.0.borrow().bytes.clone()
+    }
+
+    /// Element `index` of `kind`, decoded from its bytes, or `None` past the end
+    /// of the store (a detached buffer has none).
+    pub(crate) fn element(&self, kind: TypedArrayKind, index: usize) -> Option<f64> {
+        let size = kind.element_size();
+        let store = self.0.borrow();
+        store
+            .bytes
+            .get(index * size..(index + 1) * size)
+            .map(|bytes| kind.load(bytes))
+    }
+
+    /// Store `value`, converted to `kind`, as element `index`. An index past the
+    /// end of the store is ignored.
+    pub(crate) fn set_element(&self, kind: TypedArrayKind, index: usize, value: f64) {
+        let size = kind.element_size();
+        let mut store = self.0.borrow_mut();
+        if let Some(bytes) = store.bytes.get_mut(index * size..(index + 1) * size) {
+            kind.store(value, bytes);
+        }
+    }
+
+    /// Decode `count` consecutive elements of `kind` from element `first`. A
+    /// missing element means the buffer was detached, which is a `TypeError`.
+    pub(crate) fn elements(
+        &self,
+        kind: TypedArrayKind,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<f64>, JsError> {
+        self.ensure_attached()?;
+        (first..first + count)
+            .map(|index| {
+                self.element(kind, index)
+                    .ok_or_else(|| JsError::type_error("typed array element is out of range"))
+            })
+            .collect()
+    }
+
+    /// Store `values`, converted to `kind`, from element `first` onward.
+    pub(crate) fn set_elements(&self, kind: TypedArrayKind, first: usize, values: &[f64]) {
+        for (offset, value) in values.iter().enumerate() {
+            self.set_element(kind, first + offset, *value);
+        }
     }
 }
 
@@ -1459,18 +1639,13 @@ pub(crate) enum ObjectHost {
     /// big-endian.
     DataView {
         buffer: TypedBuffer,
-        /// The `ArrayBuffer` object the view was built on, which the `buffer`
-        /// getter returns by identity.
-        buffer_object: ObjectId,
         /// Byte offset of the view within the shared buffer.
         byte_offset: usize,
         /// Byte length of the view.
         byte_length: usize,
     },
-    /// An `ArrayBuffer`: a byte-granular buffer the typed-array and `DataView`
-    /// families view. The engine's typed arrays store decoded element values in
-    /// an `Rc<RefCell<Vec<f64>>>`, so a buffer is one slot per *byte* and every
-    /// view over it is byte-exact.
+    /// An `ArrayBuffer`: the bytes that the typed-array and `DataView` families
+    /// view. Every view reads and writes the same store.
     ArrayBufferHost(TypedBuffer),
     TextDecoder {
         encoding: TextEncoding,
@@ -3221,6 +3396,7 @@ impl Realm {
             function_prototype,
             intrinsic_prototype,
             &[
+                ("buffer", NativeFunction::TypedArrayBufferGetter),
                 ("length", NativeFunction::TypedArrayLengthGetter),
                 ("byteLength", NativeFunction::TypedArrayByteLengthGetter),
                 ("byteOffset", NativeFunction::TypedArrayByteOffsetGetter),

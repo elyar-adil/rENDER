@@ -204,7 +204,6 @@ pub(super) fn mark_host(
         | ObjectHost::AggregateErrorConstructor
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
-        | ObjectHost::TypedArray { .. }
         | ObjectHost::DataViewConstructor
         | ObjectHost::ArrayBufferHost(_)
         | ObjectHost::ArrayBufferConstructor
@@ -249,9 +248,12 @@ pub(super) fn mark_host(
         ObjectHost::BoundFunction { receiver, .. } => {
             mark_object(runtime, marked, work, marked_environments, *receiver);
         }
-        ObjectHost::DataView { buffer_object, .. } => {
-            // The `buffer` getter hands out this object, so it must stay alive.
-            mark_object(runtime, marked, work, marked_environments, *buffer_object);
+        ObjectHost::TypedArray { buffer, .. } | ObjectHost::DataView { buffer, .. } => {
+            // A view's `buffer` getter hands out its store's ArrayBuffer object,
+            // so that object must stay alive while the view does.
+            if let Some(object) = buffer.object() {
+                mark_object(runtime, marked, work, marked_environments, object);
+            }
         }
         ObjectHost::BoundCallable {
             target,

@@ -14,10 +14,10 @@
 //! shipping engine, so a view built that way still reads big-endian unless each
 //! call passes `true`.
 //!
-//! **Buffer granularity.** A buffer is one byte per slot, and a view over it is
-//! byte-exact, so `new Uint8Array(buffer)` and `new DataView(buffer)` see the
-//! same bytes. A typed array of a wider element type over a buffer composes its
-//! element from consecutive byte slots, which is the standard's model.
+//! **Storage.** A buffer is one store of bytes that every view of it shares, so
+//! `new Uint8Array(buffer)`, `new Float64Array(buffer)` and `new DataView(buffer)`
+//! read and write the same bytes. Element conversion is `TypedArrayKind::load`
+//! and `TypedArrayKind::store`, which the `DataView` accessors also use.
 
 use super::array::MAX_SAFE_INTEGER;
 use crate::JsError;
@@ -49,6 +49,22 @@ impl Access {
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
             Self::Float64 => 8,
         }
+    }
+
+    /// The typed-array element type this accessor converts with. `Float16` has
+    /// no typed-array counterpart, so it converts through `f16_bits`.
+    const fn kind(self) -> Option<TypedArrayKind> {
+        Some(match self {
+            Self::Int8 => TypedArrayKind::Int8,
+            Self::Uint8 => TypedArrayKind::Uint8,
+            Self::Int16 => TypedArrayKind::Int16,
+            Self::Uint16 => TypedArrayKind::Uint16,
+            Self::Int32 => TypedArrayKind::Int32,
+            Self::Uint32 => TypedArrayKind::Uint32,
+            Self::Float32 => TypedArrayKind::Float32,
+            Self::Float64 => TypedArrayKind::Float64,
+            Self::Float16 => return None,
+        })
     }
 
     fn from_native(function: NativeFunction) -> Option<Self> {
@@ -89,62 +105,27 @@ fn is_write(function: NativeFunction) -> bool {
     )
 }
 
-/// Widen a narrow little-endian pattern into the 8-byte buffer the byte-order
-/// step works on.
-fn widen<const N: usize>(source: [u8; N]) -> [u8; 8] {
-    let mut bytes = [0u8; 8];
-    bytes[..N].copy_from_slice(&source);
-    bytes
-}
-
-/// The `width` bytes of `value` in the requested order, produced from the
-/// little-endian pattern the element's own representation uses.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "each integer is already wrapped into its element range by `encode`"
-)]
+/// The `width` bytes that store `value` for this accessor, in the requested
+/// order. An element is little-endian in the buffer, so a big-endian accessor
+/// reverses those bytes.
 fn encode_bytes(access: Access, value: f64, big_endian: bool) -> Vec<u8> {
-    let pattern: [u8; 8] = match access {
-        // The integer kinds wrap modulo 2^N as `ToInt8`..`ToUint32` do, which is
-        // the same conversion a typed array store performs.
-        Access::Int8 => widen([TypedArrayKind::Int8.encode(value) as i64 as u8]),
-        Access::Uint8 => widen([TypedArrayKind::Uint8.encode(value) as u8]),
-        Access::Int16 => widen((TypedArrayKind::Int16.encode(value) as i64 as i16).to_le_bytes()),
-        Access::Uint16 => widen((TypedArrayKind::Uint16.encode(value) as u16).to_le_bytes()),
-        Access::Int32 => widen((TypedArrayKind::Int32.encode(value) as i64 as i32).to_le_bytes()),
-        Access::Uint32 => widen((TypedArrayKind::Uint32.encode(value) as u32).to_le_bytes()),
-        Access::Float16 => widen(f16_bits(value).to_le_bytes()),
-        Access::Float32 => {
-            #[allow(
-                clippy::cast_possible_truncation,
-                reason = "a Float32 view accessor rounds to IEEE binary32"
-            )]
-            let narrowed = value as f32;
-            widen(narrowed.to_bits().to_le_bytes())
-        }
-        Access::Float64 => value.to_bits().to_le_bytes(),
-    };
-    let mut bytes = pattern[..access.width()].to_vec();
+    let mut bytes = vec![0_u8; access.width()];
+    match access.kind() {
+        Some(kind) => kind.store(value, &mut bytes),
+        None => bytes.copy_from_slice(&f16_bits(value).to_le_bytes()),
+    }
     if big_endian {
         bytes.reverse();
     }
     bytes
 }
 
-/// The `Number` a getter returns for a little-endian byte pattern.
-fn decode_number(access: Access, pattern: u64) -> f64 {
-    match access {
-        Access::Int8 => f64::from(pattern as u8 as i8),
-        Access::Uint8 => f64::from(pattern as u8),
-        Access::Int16 => f64::from(pattern as u16 as i16),
-        Access::Uint16 => f64::from(pattern as u16),
-        Access::Int32 => f64::from(pattern as u32 as i32),
-        Access::Uint32 => f64::from(pattern as u32),
-        Access::Float16 => f16_value(pattern as u16),
-        // A float accessor reinterprets the pattern; it does not convert it.
-        Access::Float32 => f64::from(f32::from_bits(pattern as u32)),
-        Access::Float64 => f64::from_bits(pattern),
+/// The `Number` a getter returns for an element's bytes, given in little-endian
+/// order. A float accessor reinterprets the bits; it does not convert them.
+fn decode_number(access: Access, bytes: &[u8]) -> f64 {
+    match access.kind() {
+        Some(kind) => kind.load(bytes),
+        None => f16_value(u16::from_le_bytes([bytes[0], bytes[1]])),
     }
 }
 
@@ -199,16 +180,6 @@ fn f16_value(bits: u16) -> f64 {
     sign * magnitude
 }
 
-/// Reverse the low `width` bytes of a little-endian pattern.
-fn reverse_bytes(pattern: u64, width: usize) -> u64 {
-    let mut reversed = 0u64;
-    for step in 0..width {
-        let shift = (step * 8) as u32;
-        reversed |= ((pattern >> shift) & 0xff) << ((width - 1 - step) * 8) as u32;
-    }
-    reversed
-}
-
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_data_view_native(
         &mut self,
@@ -222,11 +193,13 @@ impl JsRuntime {
             NativeFunction::ArrayBufferByteLengthGetter => self.array_buffer_byte_length(receiver),
             NativeFunction::DataViewBufferGetter => self.data_view_buffer(receiver),
             NativeFunction::DataViewByteLengthGetter => {
-                let (_, _, byte_length) = self.data_view_host(receiver)?;
+                let (buffer, _, byte_length) = self.data_view_host(receiver)?;
+                buffer.ensure_attached()?;
                 Ok(JsValue::Number(byte_length as f64))
             }
             NativeFunction::DataViewByteOffsetGetter => {
-                let (_, byte_offset, _) = self.data_view_host(receiver)?;
+                let (buffer, byte_offset, _) = self.data_view_host(receiver)?;
+                buffer.ensure_attached()?;
                 Ok(JsValue::Number(byte_offset as f64))
             }
             _ => self.data_view_access(dom, function, receiver, arguments),
@@ -273,16 +246,76 @@ impl JsRuntime {
                 JsValue::Object(object) => Some(object),
                 _ => None,
             });
-        let buffer = TypedBuffer(std::rc::Rc::new(std::cell::RefCell::new(vec![0.0; length])));
-        self.ensure_heap_capacity(1)?;
-        let object = self.realm.create_object(prototype);
-        if let Some(host) = self.realm.host_mut(object) {
-            *host = ObjectHost::ArrayBufferHost(buffer);
-        }
+        let object = self.new_array_buffer(prototype, &TypedBuffer::new(vec![0; length]))?;
         Ok(JsValue::Object(object))
     }
 
-    /// The `ArrayBuffer.prototype.byteLength` getter.
+    /// A new `ArrayBuffer` object over `buffer`. The object becomes the store's
+    /// identity, so every view of the buffer reports this object as its `buffer`.
+    fn new_array_buffer(
+        &mut self,
+        prototype: Option<ObjectId>,
+        buffer: &TypedBuffer,
+    ) -> Result<ObjectId, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let object = self.realm.create_object(prototype);
+        if let Some(host) = self.realm.host_mut(object) {
+            *host = ObjectHost::ArrayBufferHost(buffer.clone());
+        }
+        buffer.identify(object);
+        Ok(object)
+    }
+
+    /// The `ArrayBuffer` object of `buffer`. A store that a typed array made
+    /// internally has no object until something asks for its `buffer`, so one is
+    /// created then, and every later request returns that same object.
+    pub(in crate::runtime) fn array_buffer_object(
+        &mut self,
+        buffer: &TypedBuffer,
+    ) -> Result<ObjectId, JsError> {
+        if let Some(object) = buffer.object() {
+            return Ok(object);
+        }
+        let prototype = self
+            .realm
+            .global("ArrayBuffer")
+            .and_then(|value| match value {
+                JsValue::Object(constructor) => self.realm.get_property(constructor, "prototype"),
+                _ => None,
+            })
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.new_array_buffer(prototype, buffer)
+    }
+
+    /// `DetachArrayBuffer` (ECMA-262 25.1.3.5) for an embedder, such as the
+    /// test262 host's `$262.detachArrayBuffer`. Anything but an `ArrayBuffer` is a
+    /// `TypeError`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TypeError` when `value` is not an `ArrayBuffer`.
+    pub fn detach_array_buffer(&mut self, value: &JsValue) -> Result<(), JsError> {
+        match value {
+            JsValue::Object(object) => match self.realm.host(*object) {
+                Some(ObjectHost::ArrayBufferHost(buffer)) => {
+                    buffer.detach();
+                    Ok(())
+                }
+                _ => Err(JsError::type_error(
+                    "detachArrayBuffer requires an ArrayBuffer",
+                )),
+            },
+            _ => Err(JsError::type_error(
+                "detachArrayBuffer requires an ArrayBuffer",
+            )),
+        }
+    }
+
+    /// The `ArrayBuffer.prototype.byteLength` getter. A detached buffer has no
+    /// bytes, so it reports 0.
     fn array_buffer_byte_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::ArrayBufferHost(buffer)) => {
@@ -290,7 +323,7 @@ impl JsRuntime {
                     clippy::cast_precision_loss,
                     reason = "buffer lengths stay far below any precision boundary"
                 )]
-                let length = buffer.0.borrow().len() as f64;
+                let length = buffer.byte_length() as f64;
                 Ok(JsValue::Number(length))
             }
             _ => Err(JsError::type_error(
@@ -316,7 +349,9 @@ impl JsRuntime {
                 ));
             }
         };
-        let total = buffer.0.borrow().len();
+        // §25.1.6.7 step 4: a detached buffer cannot be sliced.
+        buffer.ensure_attached()?;
+        let total = buffer.byte_length();
         #[allow(
             clippy::cast_precision_loss,
             reason = "buffer lengths stay far below any precision boundary"
@@ -342,16 +377,13 @@ impl JsRuntime {
             clippy::cast_sign_loss,
             reason = "both bounds are clamped into 0..=total"
         )]
+        // The conversions above can run user code, and that code may detach the
+        // buffer before the copy is made.
+        buffer.ensure_attached()?;
         let (start, end) = (start as usize, end as usize);
-        let copied = buffer.0.borrow()[start.min(end)..end].to_vec();
+        let copied = buffer.read_bytes(start.min(end), end - start.min(end))?;
         let prototype = self.realm.get_prototype(receiver);
-        self.ensure_heap_capacity(1)?;
-        let object = self.realm.create_object(prototype);
-        if let Some(host) = self.realm.host_mut(object) {
-            *host = ObjectHost::ArrayBufferHost(TypedBuffer(std::rc::Rc::new(
-                std::cell::RefCell::new(copied),
-            )));
-        }
+        let object = self.new_array_buffer(prototype, &TypedBuffer::new(copied))?;
         Ok(JsValue::Object(object))
     }
 
@@ -379,35 +411,22 @@ impl JsRuntime {
             // The per-access `littleEndian` argument defaults to false, so an
             // accessor that omits it is big-endian.
             let big_endian = !arguments.get(2).is_some_and(JsValue::is_truthy);
+            buffer.ensure_attached()?;
             self.data_view_bounds(index, access.width(), byte_length)?;
             let bytes = encode_bytes(access, number, big_endian);
-            let mut slots = buffer.0.borrow_mut();
-            for (step, byte) in bytes.into_iter().enumerate() {
-                let slot = byte_offset + index as usize + step;
-                if let Some(cell) = slots.get_mut(slot) {
-                    *cell = f64::from(byte);
-                }
-            }
+            buffer.write_bytes(byte_offset + index as usize, &bytes);
             return Ok(JsValue::Undefined);
         }
         let big_endian = !arguments.get(1).is_some_and(JsValue::is_truthy);
+        buffer.ensure_attached()?;
         self.data_view_bounds(index, access.width(), byte_length)?;
-        // Reading a big-endian view means the first byte it covers is the most
-        // significant one, so the raw pattern is assembled in view order and
-        // then reversed for the conversion.
-        let slots = buffer.0.borrow();
-        let mut pattern = 0u64;
-        for step in 0..access.width() {
-            let byte = slots
-                .get(byte_offset + index as usize + step)
-                .map_or(0u8, |cell| *cell as i64 as u8);
-            let shift = (step * 8) as u32;
-            pattern |= u64::from(byte) << shift;
-        }
+        // The bytes are read in view order, which is big-endian unless the
+        // accessor asked otherwise; `decode_number` takes little-endian bytes.
+        let mut bytes = buffer.read_bytes(byte_offset + index as usize, access.width())?;
         if big_endian {
-            pattern = reverse_bytes(pattern, access.width());
+            bytes.reverse();
         }
-        Ok(JsValue::Number(decode_number(access, pattern)))
+        Ok(JsValue::Number(decode_number(access, &bytes)))
     }
 
     /// `GetViewValue` step 6 and `SetViewValue` step 10: the requested bytes must
@@ -448,13 +467,13 @@ impl JsRuntime {
 
     /// The `DataView.prototype.buffer` getter: the `ArrayBuffer` the view was
     /// built on, by identity.
-    fn data_view_buffer(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        match self.realm.host(receiver) {
-            Some(ObjectHost::DataView { buffer_object, .. }) => Ok(JsValue::Object(buffer_object)),
-            _ => Err(JsError::type_error(
+    fn data_view_buffer(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::DataView { buffer, .. }) = self.realm.host(receiver) else {
+            return Err(JsError::type_error(
                 "DataView.prototype.buffer called on an incompatible receiver",
-            )),
-        }
+            ));
+        };
+        Ok(JsValue::Object(self.array_buffer_object(&buffer)?))
     }
 
     /// `new DataView(buffer[, byteOffset[, byteLength]])` (ECMA-262 25.2.2.1).
@@ -472,23 +491,22 @@ impl JsRuntime {
             ));
         };
         let source = *source;
-        let (buffer, total) = match self.realm.host(source) {
-            Some(ObjectHost::ArrayBufferHost(buffer)) => {
-                let total = buffer.0.borrow().len();
-                (buffer, total)
-            }
+        let buffer = match self.realm.host(source) {
+            Some(ObjectHost::ArrayBufferHost(buffer)) => buffer,
             _ => {
                 return Err(JsError::type_error(
                     "DataView requires an ArrayBuffer argument",
                 ));
             }
         };
+        let offset = self.to_index_value(dom, arguments.get(1))?;
+        // §25.2.2.1 step 5: a detached buffer cannot be viewed.
+        buffer.ensure_attached()?;
         #[allow(
             clippy::cast_precision_loss,
             reason = "buffer lengths stay far below any precision boundary"
         )]
-        let total_value = total as f64;
-        let offset = self.to_index_value(dom, arguments.get(1))?;
+        let total_value = buffer.byte_length() as f64;
         if offset > total_value {
             return Err(self.range_error("DataView byteOffset extends past the end of the buffer"));
         }
@@ -521,11 +539,12 @@ impl JsRuntime {
                 _ => None,
             });
         self.ensure_heap_capacity(1)?;
+        // The `buffer` getter answers with `source`, which made this store.
+        buffer.identify(source);
         let object = self.realm.create_object(prototype);
         if let Some(host) = self.realm.host_mut(object) {
             *host = ObjectHost::DataView {
                 buffer,
-                buffer_object: source,
                 byte_offset: offset,
                 byte_length,
             };
@@ -536,7 +555,7 @@ impl JsRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{Access, decode_number, encode_bytes, is_write, reverse_bytes};
+    use super::{Access, decode_number, encode_bytes, is_write};
     use crate::runtime::JsRuntime;
     use crate::value::NativeFunction;
     use render_html::parse_document;
@@ -726,15 +745,116 @@ mod tests {
             "),
             "9"
         );
-        // A wider view over a shared buffer is refused rather than mis-composed.
+        // A wider view reads the same bytes in little-endian order, and its
+        // `buffer` is the object the buffer was made with.
+        assert_eq!(
+            run(r"
+                var buffer = new ArrayBuffer(4);
+                new Uint8Array(buffer).set([0x34, 0x12, 0, 0]);
+                var wide = new Uint16Array(buffer);
+                [wide[0], wide.length, wide.buffer === buffer].join(',')
+            "),
+            "4660,2,true"
+        );
+        assert_eq!(
+            run(r"
+                var buffer = new ArrayBuffer(4);
+                var view = new Int16Array(buffer);
+                view[1] = -2;
+                Array.from(new Uint8Array(buffer)).join(',')
+            "),
+            "0,0,254,255"
+        );
+    }
+
+    #[test]
+    fn a_view_over_a_buffer_must_fit_its_element_size() {
         assert_eq!(
             run(r"
                 function thrown(fn) { try { fn(); return 'no throw'; } catch (e) { return e.name; } }
-                [thrown(function () { return new Int32Array(new ArrayBuffer(8)); }),
-                 thrown(function () { return new Int8Array(new ArrayBuffer(1)); })].join(',')
+                [thrown(function () { new Int16Array(new ArrayBuffer(3)); }),
+                 thrown(function () { new Int16Array(new ArrayBuffer(4), 1); }),
+                 new Int16Array(new ArrayBuffer(4), 2, 1).length].join(',')
             "),
-            "TypeError,TypeError"
+            "RangeError,RangeError,1"
         );
+    }
+
+    #[test]
+    fn a_float_view_decodes_the_bytes_a_dataview_wrote() {
+        assert_eq!(
+            run(r"
+                var buffer = new ArrayBuffer(4);
+                new DataView(buffer).setFloat32(0, 1.5, true);
+                [new Float32Array(buffer)[0], new Uint8Array(buffer)[3]].join(',')
+            "),
+            "1.5,63"
+        );
+    }
+
+    #[test]
+    fn views_of_one_buffer_report_the_same_buffer_object() {
+        assert_eq!(
+            run(r"
+                var made = new Float64Array(2);
+                [made.buffer.byteLength,
+                 made.buffer === made.buffer,
+                 new Uint8Array(made.buffer).length,
+                 new DataView(made.buffer).buffer === made.buffer,
+                 new Uint16Array(made.buffer).buffer === made.buffer].join(',')
+            "),
+            "16,true,16,true,true"
+        );
+    }
+
+    #[test]
+    fn a_detached_buffer_is_empty_and_its_views_refuse_access() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        runtime
+            .execute(
+                &mut parsed.dom,
+                r"var buffer = new ArrayBuffer(8);
+                  var bytes = new Uint8Array(buffer);
+                  var wide = new Float64Array(buffer);
+                  var view = new DataView(buffer);",
+            )
+            .expect("views build over a fresh buffer");
+        let buffer = runtime.realm().global("buffer").expect("buffer is defined");
+        runtime
+            .detach_array_buffer(&buffer)
+            .expect("an ArrayBuffer detaches");
+        let outcome = runtime
+            .execute(
+                &mut parsed.dom,
+                r"function thrown(fn) { try { fn(); return 'no throw'; } catch (e) { return e.name; } }
+                  [buffer.byteLength, bytes.length, bytes.byteLength, wide.length,
+                   wide.byteOffset, wide[0] === undefined,
+                   thrown(function () { bytes.fill(0); }),
+                   thrown(function () { return view.byteLength; }),
+                   thrown(function () { view.getUint8(0); }),
+                   thrown(function () { buffer.slice(0); }),
+                   thrown(function () { new DataView(buffer); }),
+                   thrown(function () { new Uint8Array(buffer); }),
+                   wide.buffer === buffer,
+                   Object.prototype.toString.call(wide)].join(',')",
+            )
+            .expect("the detached views answer");
+        assert_eq!(
+            outcome.value.to_js_string(),
+            "0,0,0,0,0,true,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,true,[object Float64Array]"
+        );
+    }
+
+    #[test]
+    fn detaching_something_that_is_not_a_buffer_is_a_type_error() {
+        let mut parsed = parse_document("<!doctype html><p></p>");
+        let mut runtime = JsRuntime::new(&parsed.dom);
+        let plain = runtime
+            .execute(&mut parsed.dom, "({})")
+            .expect("an object literal evaluates")
+            .value;
+        assert!(runtime.detach_array_buffer(&plain).is_err());
     }
 
     #[test]
@@ -904,46 +1024,27 @@ mod tests {
             (Access::Uint32, 4_000_000_000.0),
         ] {
             for big_endian in [false, true] {
-                let bytes = encode_bytes(access, value, big_endian);
+                let mut bytes = encode_bytes(access, value, big_endian);
                 assert_eq!(bytes.len(), access.width());
-                // The stored order is the pattern the getter assembles.
-                let mut stored = 0u64;
-                for (step, byte) in bytes.iter().enumerate() {
-                    stored |= u64::from(*byte) << (step * 8);
+                // A getter reads a big-endian view back to little-endian first.
+                if big_endian {
+                    bytes.reverse();
                 }
-                let pattern = if big_endian {
-                    reverse_bytes(stored, access.width())
-                } else {
-                    stored
-                };
-                assert_eq!(decode_number(access, pattern), value);
+                assert_eq!(decode_number(access, &bytes), value);
             }
         }
     }
 
     #[test]
     fn floats_round_trip_through_a_bit_pattern() {
-        let value = 0.5_f64;
-        let bytes = encode_bytes(Access::Float64, value, true);
-        let mut stored = 0u64;
-        for (step, byte) in bytes.iter().enumerate() {
-            stored |= u64::from(*byte) << (step * 8);
-        }
-        assert_eq!(
-            decode_number(Access::Float64, reverse_bytes(stored, 8)),
-            value
-        );
+        let mut bytes = encode_bytes(Access::Float64, 0.5, true);
+        bytes.reverse();
+        assert_eq!(decode_number(Access::Float64, &bytes), 0.5);
         // A float accessor reinterprets bits, so the pattern is the IEEE binary
         // encoding of the value rather than the value itself.
-        let half = encode_bytes(Access::Float32, 0.5, true);
+        let mut half = encode_bytes(Access::Float32, 0.5, true);
         assert_eq!(half, vec![0x3f, 0x00, 0x00, 0x00]);
-        let mut half_stored = 0u64;
-        for (step, byte) in half.iter().enumerate() {
-            half_stored |= u64::from(*byte) << (step * 8);
-        }
-        assert_eq!(
-            decode_number(Access::Float32, reverse_bytes(half_stored, 4)),
-            0.5
-        );
+        half.reverse();
+        assert_eq!(decode_number(Access::Float32, &half), 0.5);
     }
 }
