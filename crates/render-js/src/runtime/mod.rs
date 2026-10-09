@@ -94,6 +94,9 @@ fn same_history_origin(new: &Url, current: &Url) -> bool {
 #[derive(Debug)]
 pub struct JsRuntime {
     realm: Realm,
+    /// Functions embedders defined with `define_host_function`, indexed by the
+    /// `NativeFunction::Host` that calls them.
+    host_functions: Vec<HostFunction>,
     limits: RuntimeLimits,
     steps_remaining: usize,
     calls_active: usize,
@@ -189,6 +192,10 @@ impl From<DomError> for JsError {
 /// The self-hosted standard library; see `JsRuntime::ensure_prelude`.
 const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
 
+/// A Rust function an embedder installs in the realm with
+/// [`JsRuntime::define_host_function`]. It receives the arguments of each call.
+pub type HostFunction = fn(&mut JsRuntime, &mut Dom, &[JsValue]) -> Result<JsValue, JsError>;
+
 impl JsRuntime {
     #[must_use]
     ///
@@ -224,6 +231,7 @@ impl JsRuntime {
     pub fn with_limits_and_url(dom: &Dom, limits: RuntimeLimits, document_url: &Url) -> Self {
         Self {
             realm: Realm::bootstrap(dom.document(), document_url),
+            host_functions: Vec::new(),
             steps_remaining: limits.max_execution_steps,
             calls_active: 0,
             dom_nodes_created: 0,
@@ -870,6 +878,17 @@ impl JsRuntime {
             }
         };
         self.execute_compiled(dom, &script)
+    }
+
+    /// Defines `name` on `target` as a function that runs `host` when called. An
+    /// embedder uses this for host-defined functions, such as the test262 host's
+    /// `$262.detachArrayBuffer`.
+    pub fn define_host_function(&mut self, target: ObjectId, name: &str, host: HostFunction) {
+        let index = self.host_functions.len();
+        self.host_functions.push(host);
+        let function = self.realm.native_object(NativeFunction::Host(index));
+        self.realm
+            .set_property(target, name.to_owned(), JsValue::Object(function));
     }
 
     /// Install the built-ins that are written in JavaScript (`prelude.js`).

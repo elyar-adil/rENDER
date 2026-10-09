@@ -127,6 +127,10 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            NativeFunction::Host(index) => {
+                let host = self.host_functions[index];
+                host(self, dom, arguments)
+            }
             NativeFunction::DomExceptionNameGetter
             | NativeFunction::DomExceptionMessageGetter
             | NativeFunction::DomExceptionCodeGetter => {
@@ -1459,6 +1463,7 @@ impl JsRuntime {
             | NativeFunction::TypedArrayToReversed
             | NativeFunction::TypedArrayToSorted
             | NativeFunction::TypedArrayWith
+            | NativeFunction::TypedArrayBufferGetter
             | NativeFunction::TypedArrayLengthGetter
             | NativeFunction::TypedArrayByteLengthGetter
             | NativeFunction::TypedArrayByteOffsetGetter

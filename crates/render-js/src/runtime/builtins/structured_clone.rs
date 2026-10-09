@@ -102,17 +102,16 @@ impl JsRuntime {
                 start,
                 length,
             }) => {
-                let values = buffer.0.borrow()[start..start + length].to_vec();
+                let size = kind.element_size();
+                let bytes = buffer.read_bytes(start * size, length * size)?;
                 let prototype = self.typed_array_prototype(kind);
-                self.clone_typed_array(
-                    kind,
-                    &TypedBuffer(std::rc::Rc::new(std::cell::RefCell::new(values))),
-                    prototype,
-                )
+                self.clone_typed_array(kind, &TypedBuffer::new(bytes), length, prototype)
             }
             Some(ObjectHost::ArrayBufferHost(buffer)) => {
-                let bytes = buffer.0.borrow().clone();
-                Ok(JsValue::Object(self.clone_array_buffer(&bytes)))
+                let bytes = buffer.bytes();
+                Ok(JsValue::Object(
+                    self.array_buffer_object(&TypedBuffer::new(bytes))?,
+                ))
             }
             // A callable, a promise, a weak collection, a proxy, and every
             // other host the algorithm lists as non-cloneable.
@@ -223,58 +222,17 @@ impl JsRuntime {
         &mut self,
         kind: TypedArrayKind,
         buffer: &TypedBuffer,
+        length: usize,
         prototype: Option<ObjectId>,
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "typed-array lengths stay far below any precision boundary"
-        )]
-        let length = buffer.0.borrow().len() as f64;
         Ok(JsValue::Object(self.realm.typed_array(
             kind,
             buffer.clone(),
             0,
-            length as usize,
+            length,
             prototype,
         )))
-    }
-
-    fn clone_array_buffer(&mut self, bytes: &[f64]) -> ObjectId {
-        let prototype = self
-            .realm
-            .global("ArrayBuffer")
-            .and_then(|value| match value {
-                JsValue::Object(constructor) => self.realm.get_property(constructor, "prototype"),
-                _ => None,
-            })
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        let object = self.realm.create_object(prototype);
-        if let Some(host) = self.realm.host_mut(object) {
-            *host = ObjectHost::ArrayBufferHost(TypedBuffer(std::rc::Rc::new(
-                std::cell::RefCell::new(bytes.to_vec()),
-            )));
-        }
-        self.realm.define_property(
-            object,
-            "byteLength",
-            crate::PropertyDescriptor {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "buffer lengths stay far below any precision boundary"
-                )]
-                value: JsValue::Number(bytes.len() as f64),
-                writable: false,
-                getter: None,
-                setter: None,
-                enumerable: true,
-                configurable: true,
-            },
-        );
-        object
     }
 
     fn typed_array_prototype(&self, kind: TypedArrayKind) -> Option<ObjectId> {

@@ -96,10 +96,8 @@ impl JsRuntime {
                     start,
                     length,
                 }) => {
-                    let values = buffer.0.borrow();
-                    for value in &values[start..start.saturating_add(length)] {
-                        bytes.push(kind.encode(*value) as u8);
-                    }
+                    let size = kind.element_size();
+                    bytes.extend(buffer.read_bytes(start * size, length * size)?);
                 }
                 _ => {
                     let length = self.array_like_length(dom, *object)?;

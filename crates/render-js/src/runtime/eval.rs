@@ -4190,7 +4190,7 @@ impl JsRuntime {
                             reason = "the index is a non-negative integer below the length"
                         )]
                         let index = number as usize;
-                        buffer.0.borrow().get(start + index).copied()
+                        buffer.element(kind, start + index)
                     } else {
                         None
                     };
@@ -4535,12 +4535,12 @@ impl JsRuntime {
                     // Out-of-bounds indexed writes are silently ignored and
                     // never create ordinary properties, per the
                     // integer-indexed exotic object contract.
+                    // Only a valid index converts and stores. This path does not
+                    // know the receiver, and §10.4.5.5 converts an out-of-range
+                    // value only when the receiver is the typed array itself.
                     if index < length {
-                        let encoded = kind.encode(to_number(&value)?);
-                        let mut elements = buffer.0.borrow_mut();
-                        if let Some(slot) = elements.get_mut(start + index) {
-                            *slot = encoded;
-                        }
+                        let number = to_number(&value)?;
+                        buffer.set_element(kind, start + index, number);
                     }
                     return Ok(());
                 }

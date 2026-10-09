@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use render_core::html::parse_document;
-use render_core::js::{CompiledScript, JsError, JsErrorKind, JsRuntime, RuntimeLimits};
+use render_core::js::{CompiledScript, JsError, JsErrorKind, JsRuntime, JsValue, RuntimeLimits};
 
 const TEST262_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/test262");
 const REVISION: &str = "5ef1e5723be95296f36afb0386676fed0205869c";
@@ -1037,11 +1037,39 @@ fn default_harness_sources() -> io::Result<Vec<String>> {
         .collect()
 }
 
+/// The `$262` host object (INTERPRETING.md, "Host-defined functions"). Only the
+/// member the measured directories use is provided: `detachArrayBuffer`.
+fn install_test262_host(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+) -> Result<(), String> {
+    let script = CompiledScript::compile("var $262 = {};", &RuntimeLimits::default())
+        .map_err(|error| error.message().to_owned())?;
+    runtime
+        .execute_compiled(dom, &script)
+        .map_err(|error| error.message().to_owned())?;
+    let Some(JsValue::Object(host)) = runtime.realm().global("$262") else {
+        return Err("the $262 host object is not defined".to_owned());
+    };
+    runtime.define_host_function(host, "detachArrayBuffer", detach_array_buffer_host);
+    Ok(())
+}
+
+fn detach_array_buffer_host(
+    runtime: &mut JsRuntime,
+    _dom: &mut render_core::dom::Dom,
+    arguments: &[JsValue],
+) -> Result<JsValue, JsError> {
+    runtime.detach_array_buffer(arguments.first().unwrap_or(&JsValue::Undefined))?;
+    Ok(JsValue::Undefined)
+}
+
 fn install_harness(
     runtime: &mut JsRuntime,
     dom: &mut render_core::dom::Dom,
     includes: &[String],
 ) -> Result<(), String> {
+    install_test262_host(runtime, dom)?;
     let harness = DEFAULT_HARNESS.get_or_init(|| {
         default_harness_sources()
             .and_then(|sources| {

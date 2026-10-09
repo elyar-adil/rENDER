@@ -310,7 +310,9 @@ impl JsRuntime {
     /// indexed properties of string wrappers and typed arrays.
     fn has_indexed(&self, object: ObjectId, index: f64) -> bool {
         match self.realm.host(object) {
-            Some(ObjectHost::TypedArray { length, .. }) => index < length as f64,
+            Some(ObjectHost::TypedArray { buffer, length, .. }) => {
+                index < length as f64 && !buffer.is_detached()
+            }
             Some(ObjectHost::StringPrimitive(text)) => index < utf16::utf16_length(&text) as f64,
             _ => self
                 .realm
@@ -334,15 +336,15 @@ impl JsRuntime {
                 }
             }
             Some(ObjectHost::TypedArray {
+                kind,
                 buffer,
                 start,
                 length,
-                ..
             }) => {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let index = index as usize;
                 if index < length {
-                    let element = buffer.0.borrow().get(start + index).copied();
+                    let element = buffer.element(kind, start + index);
                     return Ok(element.map_or(JsValue::Undefined, JsValue::Number));
                 }
             }
