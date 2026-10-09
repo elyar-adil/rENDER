@@ -337,7 +337,7 @@ pub(in crate::runtime) fn char_at_value(units: &[u16], position: f64) -> JsValue
 /// advancement; used by global matching.
 pub(in crate::runtime) fn collect_global_matches(
     compiled: &crate::regex::Compiled,
-    input: &[char],
+    input: &[u16],
 ) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut cursor = 0usize;
@@ -347,7 +347,7 @@ pub(in crate::runtime) fn collect_global_matches(
         };
         spans.push((found.start, found.end));
         cursor = if found.end == found.start {
-            found.end + 1
+            crate::regex::advance_index(input, found.end, compiled.flags().unicode)
         } else {
             found.end
         };
@@ -358,7 +358,7 @@ pub(in crate::runtime) fn collect_global_matches(
 /// Split `input` around each match of `compiled`, returning piece spans.
 pub(in crate::runtime) fn split_by_regex(
     compiled: &crate::regex::Compiled,
-    input: &[char],
+    input: &[u16],
     limit: usize,
 ) -> Vec<(usize, usize)> {
     let mut pieces = Vec::new();
@@ -368,7 +368,7 @@ pub(in crate::runtime) fn split_by_regex(
             Some(found) => {
                 pieces.push((cursor, found.start));
                 cursor = if found.end == found.start {
-                    found.end + 1
+                    crate::regex::advance_index(input, found.end, compiled.flags().unicode)
                 } else {
                     found.end
                 };
@@ -388,7 +388,7 @@ pub(in crate::runtime) fn split_by_regex(
 /// Expand `$&`, `` $` ``, `$'`, `$$`, and `$1`–`$9` in a replacement string.
 pub(in crate::runtime) fn expand_replacement(
     replacement: &str,
-    input: &[char],
+    input: &[u16],
     found: &crate::regex::MatchRanges,
 ) -> String {
     let characters: Vec<char> = replacement.chars().collect();
@@ -408,15 +408,17 @@ pub(in crate::runtime) fn expand_replacement(
                 index += 2;
             }
             '&' => {
-                output.extend(&input[found.start..found.end]);
+                output.push_str(&utf16::string_from_utf16(&input[found.start..found.end]));
                 index += 2;
             }
             '`' => {
-                output.extend(&input[..found.start]);
+                output.push_str(&utf16::string_from_utf16(&input[..found.start]));
                 index += 2;
             }
             '\'' => {
-                output.extend(&input[found.end.min(input.len())..]);
+                output.push_str(&utf16::string_from_utf16(
+                    &input[found.end.min(input.len())..],
+                ));
                 index += 2;
             }
             digit @ '1'..='9' => {
@@ -432,7 +434,7 @@ pub(in crate::runtime) fn expand_replacement(
                     }
                 }
                 if let Some(Some((start, end))) = found.groups.get(group) {
-                    output.extend(&input[*start..*end]);
+                    output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
                 }
             }
             '<' if !found.names.is_empty() => {
@@ -442,7 +444,7 @@ pub(in crate::runtime) fn expand_replacement(
                         found.names.iter().find(|(candidate, _)| *candidate == name)
                         && let Some(Some((start, end))) = found.groups.get(group - 1)
                     {
-                        output.extend(&input[*start..*end]);
+                        output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
                     }
                     index += close + 3;
                 } else {
@@ -1205,12 +1207,12 @@ impl JsRuntime {
         let pieces = match arguments.first() {
             None | Some(JsValue::Undefined) => vec![text],
             Some(separator) => {
-                let characters: Vec<char> = text.chars().collect();
+                let characters = utf16::utf16_units(&text);
                 if let JsValue::Object(_) = separator {
                     let (index, _) = self.coerce_pattern_argument(separator)?;
                     split_by_regex(&self.regexes[index].compiled, &characters, limit)
                         .into_iter()
-                        .map(|span| characters[span.0..span.1].iter().collect())
+                        .map(|span| utf16::string_from_utf16(&characters[span.0..span.1]))
                         .collect()
                 } else {
                     let separator = separator.to_js_string();
@@ -1250,7 +1252,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
-        let characters: Vec<char> = text.chars().collect();
+        let characters = utf16::utf16_units(&text);
         let Some(argument) = arguments.first() else {
             let object = self.construct_regex("", "")?;
             let Some(ObjectHost::RegExp(index)) = self.realm.host(object) else {
@@ -1271,7 +1273,7 @@ impl JsRuntime {
         let spans = collect_global_matches(&self.regexes[index].compiled, &characters);
         let values = spans
             .into_iter()
-            .map(|(start, end)| JsValue::String(characters[start..end].iter().collect()))
+            .map(|(start, end)| JsValue::String(utf16::string_from_utf16(&characters[start..end])))
             .collect::<Vec<_>>();
         if values.is_empty() {
             return Ok(JsValue::Null);
@@ -1290,7 +1292,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
-        let characters: Vec<char> = text.chars().collect();
+        let characters = utf16::utf16_units(&text);
         let argument = required_argument(arguments, 0, "search")?;
         let (index, _) = self.coerce_pattern_argument(argument)?;
         Ok(match self.regexes[index].compiled.find(&characters, 0) {
@@ -1299,7 +1301,7 @@ impl JsRuntime {
                     clippy::cast_precision_loss,
                     reason = "string lengths stay far below any precision boundary"
                 )]
-                let start = utf16::utf16_offset_of_char(&text, found.start) as f64;
+                let start = found.start as f64;
                 JsValue::Number(start)
             }
             None => JsValue::Number(-1.0),
@@ -1340,7 +1342,7 @@ impl JsRuntime {
         let text = self.require_string_receiver(receiver)?;
         let search = required_argument(arguments, 0, "replace")?;
         let replacement = required_argument(arguments, 1, "replace")?.clone();
-        let characters: Vec<char> = text.chars().collect();
+        let characters = utf16::utf16_units(&text);
         let (index, global) = self.coerce_pattern_argument(search)?;
         let compiled = self.regexes[index].compiled.clone();
 
@@ -1355,13 +1357,13 @@ impl JsRuntime {
         while let Some(found) = compiled.find(&characters, cursor) {
             let replaced: Vec<u16> = match &replacement {
                 JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
-                    let mut call_arguments = vec![JsValue::String(
-                        characters[found.start..found.end].iter().collect(),
-                    )];
+                    let mut call_arguments = vec![JsValue::String(utf16::string_from_utf16(
+                        &characters[found.start..found.end],
+                    ))];
                     for group in &found.groups {
                         call_arguments.push(match group {
                             Some((start, end)) => {
-                                JsValue::String(characters[*start..*end].iter().collect())
+                                JsValue::String(utf16::string_from_utf16(&characters[*start..*end]))
                             }
                             None => JsValue::Undefined,
                         });
@@ -1370,7 +1372,7 @@ impl JsRuntime {
                         clippy::cast_precision_loss,
                         reason = "string lengths stay far below any precision boundary"
                     )]
-                    let position = utf16::utf16_offset_of_char(&text, found.start) as f64;
+                    let position = found.start as f64;
                     call_arguments.push(JsValue::Number(position));
                     call_arguments.push(JsValue::String(text.clone()));
                     if !found.names.is_empty() {
@@ -1386,9 +1388,7 @@ impl JsRuntime {
                     &found,
                 )),
             };
-            for character in &characters[last_end..found.start] {
-                output.extend_from_slice(character.encode_utf16(&mut [0u16; 2]));
-            }
+            output.extend_from_slice(&characters[last_end..found.start]);
             output.extend(replaced);
             last_end = found.end;
             if found.end == found.start {
@@ -1396,7 +1396,8 @@ impl JsRuntime {
                 if found.end >= characters.len() {
                     break;
                 }
-                cursor = found.end + 1;
+                cursor =
+                    crate::regex::advance_index(&characters, found.end, compiled.flags().unicode);
             } else {
                 cursor = found.end;
             }
@@ -1404,9 +1405,7 @@ impl JsRuntime {
                 break;
             }
         }
-        for character in &characters[last_end.min(characters.len())..] {
-            output.extend_from_slice(character.encode_utf16(&mut [0u16; 2]));
-        }
+        output.extend_from_slice(&characters[last_end.min(characters.len())..]);
         Ok(JsValue::String(utf16::string_from_utf16(&output)))
     }
 }

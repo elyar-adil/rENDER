@@ -16,6 +16,7 @@
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
+use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::RegexRecord;
@@ -107,49 +108,56 @@ impl JsRuntime {
         Ok((index, false))
     }
 
-    /// `RegExpBuiltinExec`'s result array.
-    ///
-    /// The matcher walks code points, but `index` is a position in a String
-    /// value, so it is reported in code units: `'\u{1F600}a'.match(/a/).index`
-    /// is 2, not 1. `input` is the same String the caller passed rather than a
-    /// rebuild, so it cannot drift from what was matched.
-    pub(in crate::runtime) fn regex_exec_value(
+    /// `RegExpBuiltinExec`'s result array for a match found in `input`, the code
+    /// units of `text`. The matcher works in code units, so `index` is reported as
+    /// matched: `'\u{1F600}a'.match(/a/).index` is 2.
+    pub(in crate::runtime) fn regex_result(
         &mut self,
-        index: usize,
-        input: &[char],
+        input: &[u16],
         text: &str,
-        start: usize,
-    ) -> Result<Option<JsValue>, JsError> {
-        let Some(found) = self.regexes[index].compiled.find(input, start) else {
-            return Ok(None);
-        };
+        found: &MatchRanges,
+    ) -> Result<JsValue, JsError> {
         let mut values = Vec::with_capacity(found.groups.len() + 1);
-        values.push(JsValue::String(
-            input[found.start..found.end].iter().collect(),
-        ));
+        values.push(JsValue::String(utf16::string_from_utf16(
+            &input[found.start..found.end],
+        )));
         for group in &found.groups {
             values.push(match group {
-                Some((start, end)) => JsValue::String(input[*start..*end].iter().collect()),
+                Some((start, end)) => {
+                    JsValue::String(utf16::string_from_utf16(&input[*start..*end]))
+                }
                 None => JsValue::Undefined,
             });
         }
         let array = self.create_array_from_values(&values)?;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "string lengths stay far below any precision boundary"
-        )]
-        let index_number = utf16::utf16_offset_of_char(text, found.start) as f64;
-        self.realm
-            .set_property(array, "index".to_owned(), JsValue::Number(index_number));
+        self.realm.set_property(
+            array,
+            "index".to_owned(),
+            JsValue::Number(found.start as f64),
+        );
         self.realm
             .set_property(array, "input".to_owned(), JsValue::String(text.to_owned()));
         let groups = if found.names.is_empty() {
             JsValue::Undefined
         } else {
-            self.named_groups_object(&found, input)?
+            self.named_groups_object(found, input)?
         };
         self.realm.set_property(array, "groups".to_owned(), groups);
-        Ok(Some(JsValue::Object(array)))
+        Ok(JsValue::Object(array))
+    }
+
+    /// The first match at or after `start` as a result array, or `None`.
+    pub(in crate::runtime) fn regex_exec_value(
+        &mut self,
+        index: usize,
+        input: &[u16],
+        text: &str,
+        start: usize,
+    ) -> Result<Option<JsValue>, JsError> {
+        match self.regexes[index].compiled.find(input, start) {
+            Some(found) => self.regex_result(input, text, &found).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The `groups` object of a match: a prototype-less object mapping each
@@ -157,8 +165,8 @@ impl JsRuntime {
     /// participate (ECMA-262 §22.2.7.2 `RegExpBuiltinExec`).
     pub(in crate::runtime) fn named_groups_object(
         &mut self,
-        found: &crate::regex::MatchRanges,
-        input: &[char],
+        found: &MatchRanges,
+        input: &[u16],
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let groups = self.realm.create_object(None);
@@ -167,7 +175,9 @@ impl JsRuntime {
         let mut entries: Vec<(&String, JsValue)> = Vec::new();
         for (name, index) in found.names.iter() {
             let value = match found.groups.get(index - 1) {
-                Some(Some((start, end))) => JsValue::String(input[*start..*end].iter().collect()),
+                Some(Some((start, end))) => {
+                    JsValue::String(utf16::string_from_utf16(&input[*start..*end]))
+                }
                 _ => JsValue::Undefined,
             };
             match entries.iter_mut().find(|(existing, _)| *existing == name) {
@@ -192,46 +202,41 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
         let text = required_argument(arguments, 0, "exec")?.to_js_string();
-        let input: Vec<char> = text.chars().collect();
-        let flags = self.regexes[index].compiled.flags();
-        let track_last_index = flags.global || flags.sticky;
-        // `lastIndex` is a String index, so it counts code units, while the
-        // matcher walks characters: convert on the way in and on the way out.
+        let input = utf16::utf16_units(&text);
+        let track_last_index = {
+            let flags = self.regexes[index].compiled.flags();
+            flags.global || flags.sticky
+        };
+        // `lastIndex` is a code-unit index, which is how the matcher addresses
+        // `input`. Past the end of the input there is no match.
         let from = if track_last_index {
-            utf16::char_offset_of_utf16(&text, self.regexes[index].last_index).min(input.len())
+            self.regexes[index].last_index
         } else {
             0
         };
-        let found = self.regexes[index].compiled.find(&input, from);
-        if let Some(value) = self.regex_exec_value(index, &input, &text, from)? {
-            if track_last_index && let Some(found) = found {
-                self.store_regex_last_index(receiver, index, &text, found.end);
-            }
-            Ok(value)
+        let found = if from > input.len() {
+            None
         } else {
+            self.regexes[index].compiled.find(&input, from)
+        };
+        let Some(found) = found else {
             if track_last_index {
-                self.store_regex_last_index(receiver, index, &text, 0);
+                self.store_regex_last_index(receiver, index, 0);
             }
-            Ok(JsValue::Null)
+            return Ok(JsValue::Null);
+        };
+        let value = self.regex_result(&input, &text, &found)?;
+        if track_last_index {
+            self.store_regex_last_index(receiver, index, found.end);
         }
+        Ok(value)
     }
 
-    /// Record `character_end` as the regex's `lastIndex`, in the code units
-    /// script reads back.
-    fn store_regex_last_index(
-        &mut self,
-        receiver: ObjectId,
-        index: usize,
-        text: &str,
-        character_end: usize,
-    ) {
-        let last = utf16::utf16_offset_of_char(text, character_end);
-        self.regexes[index].last_index = last;
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "string lengths stay far below any precision boundary"
-        )]
-        let stored = last as f64;
+    /// Record `last_index` (a code-unit index) as the regex's `lastIndex`, both
+    /// in the record and in the property script reads back.
+    fn store_regex_last_index(&mut self, receiver: ObjectId, index: usize, last_index: usize) {
+        self.regexes[index].last_index = last_index;
+        let stored = last_index as f64;
         self.realm
             .set_property(receiver, "lastIndex".to_owned(), JsValue::Number(stored));
     }
@@ -243,27 +248,32 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
         let text = required_argument(arguments, 0, "test")?.to_js_string();
-        let input: Vec<char> = text.chars().collect();
-        let flags = self.regexes[index].compiled.flags();
-        let track_last_index = flags.global || flags.sticky;
+        let input = utf16::utf16_units(&text);
+        let track_last_index = {
+            let flags = self.regexes[index].compiled.flags();
+            flags.global || flags.sticky
+        };
         let from = if track_last_index {
-            utf16::char_offset_of_utf16(&text, self.regexes[index].last_index).min(input.len())
+            self.regexes[index].last_index
         } else {
             0
         };
-        Ok(
-            if let Some(found) = self.regexes[index].compiled.find(&input, from) {
-                if track_last_index {
-                    self.store_regex_last_index(receiver, index, &text, found.end);
-                }
-                JsValue::Boolean(true)
-            } else {
-                if track_last_index {
-                    self.store_regex_last_index(receiver, index, &text, 0);
-                }
-                JsValue::Boolean(false)
-            },
-        )
+        let found = if from > input.len() {
+            None
+        } else {
+            self.regexes[index].compiled.find(&input, from)
+        };
+        if let Some(found) = found {
+            if track_last_index {
+                self.store_regex_last_index(receiver, index, found.end);
+            }
+            Ok(JsValue::Boolean(true))
+        } else {
+            if track_last_index {
+                self.store_regex_last_index(receiver, index, 0);
+            }
+            Ok(JsValue::Boolean(false))
+        }
     }
 
     pub(in crate::runtime) fn regexp_to_string(
