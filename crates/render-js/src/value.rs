@@ -791,6 +791,12 @@ pub(crate) enum NativeFunction {
     GeneratorNext,
     GeneratorReturn,
     GeneratorThrow,
+    AsyncGeneratorNext,
+    AsyncGeneratorReturn,
+    AsyncGeneratorThrow,
+    AsyncFromSyncNext,
+    AsyncFromSyncReturn,
+    AsyncFromSyncThrow,
     IteratorHelperNext,
     IteratorHelperReturn,
     IteratorMap,
@@ -1307,6 +1313,24 @@ pub(crate) enum ObjectHost {
         coroutine: usize,
         rejected: bool,
     },
+    /// An async generator object; the index names its coroutine.
+    AsyncGenerator(usize),
+    /// An async-from-sync iterator (ECMA-262 27.1.4): the sync iterator and its
+    /// `next` method, captured when the wrapper was created.
+    AsyncFromSyncIterator {
+        iterator: ObjectId,
+        next: ObjectId,
+    },
+    /// The `onFulfilled` callback of an async-from-sync step: resolves with the
+    /// unwrapped value as an iterator result carrying `done`.
+    AsyncFromSyncValue {
+        done: bool,
+    },
+    /// The `onRejected` callback of an async-from-sync step: closes the sync
+    /// iterator, then rethrows the reason.
+    AsyncFromSyncClose {
+        iterator: ObjectId,
+    },
     CollectionConstructor(CollectionKind),
     Collection {
         kind: CollectionKind,
@@ -1482,6 +1506,8 @@ impl ObjectHost {
                 | Self::TextDecoderConstructor
                 | Self::PromiseSettler { .. }
                 | Self::AsyncResume { .. }
+                | Self::AsyncFromSyncValue { .. }
+                | Self::AsyncFromSyncClose { .. }
         )
     }
 }
@@ -1714,6 +1740,13 @@ pub struct Realm {
     iterator_prototype: ObjectId,
     /// `%GeneratorPrototype%`: `next`, `return` and `throw` of every generator.
     generator_prototype: ObjectId,
+    /// `%AsyncGeneratorPrototype%` (ECMA-262 27.6.1).
+    async_generator_prototype: ObjectId,
+    /// `%AsyncGeneratorFunction.prototype%` (ECMA-262 27.7.1): the prototype of
+    /// every async generator function.
+    async_generator_function_prototype: ObjectId,
+    /// `%AsyncFromSyncIteratorPrototype%` (ECMA-262 27.1.4).
+    async_from_sync_iterator_prototype: ObjectId,
     /// `%Storage.prototype%` shared by `localStorage` and `sessionStorage`.
     storage_prototype: ObjectId,
     /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
@@ -1879,6 +1912,11 @@ impl Realm {
             Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
         let generator_prototype =
             Self::install_generator(&mut objects, function_prototype, iterator_prototype);
+        let (
+            async_generator_prototype,
+            async_from_sync_iterator_prototype,
+            async_generator_function_prototype,
+        ) = Self::install_async_iteration(&mut objects, object_prototype, function_prototype);
         let storage_prototype =
             Self::install_storage(&mut objects, global, object_prototype, function_prototype);
         for name in ["localStorage", "sessionStorage"] {
@@ -2045,6 +2083,8 @@ impl Realm {
                     | ObjectHost::BoundCallable { .. }
                     | ObjectHost::PromiseSettler { .. }
                     | ObjectHost::AsyncResume { .. }
+                    | ObjectHost::AsyncFromSyncValue { .. }
+                    | ObjectHost::AsyncFromSyncClose { .. }
             ) && object.prototype.is_none()
             {
                 object.prototype = Some(function_prototype);
@@ -2483,6 +2523,8 @@ impl Realm {
                     | ObjectHost::ErrorConstructor(_)
                     | ObjectHost::PromiseSettler { .. }
                     | ObjectHost::AsyncResume { .. }
+                    | ObjectHost::AsyncFromSyncValue { .. }
+                    | ObjectHost::AsyncFromSyncClose { .. }
                     | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
                     _ if index != object_prototype.0 => Some(object_prototype),
                     _ => None,
@@ -2508,6 +2550,9 @@ impl Realm {
             dom_prototypes,
             iterator_prototype,
             generator_prototype,
+            async_generator_prototype,
+            async_generator_function_prototype,
+            async_from_sync_iterator_prototype,
             iterator_helper_prototype,
             storage_prototype,
             media_query_list_prototype,
@@ -3310,6 +3355,135 @@ impl Realm {
             ],
             "DataView",
         );
+    }
+
+    /// `%AsyncIteratorPrototype%` with `[Symbol.asyncIterator]`, and its
+    /// descendants `%AsyncGeneratorPrototype%` (ECMA-262 27.6.1) and
+    /// `%AsyncFromSyncIteratorPrototype%` (27.1.4). Returns those two.
+    fn install_async_iteration(
+        objects: &mut Vec<JsObject>,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        let async_iterator = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let self_iterator = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::IteratorPrototypeIterator),
+            ..JsObject::default()
+        });
+        let symbol = JsSymbol::well_known("@@asyncIterator");
+        objects[async_iterator.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol.clone(),
+                PropertyDescriptor::builtin(JsValue::Object(self_iterator)),
+            ),
+        );
+
+        let generator = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(async_iterator),
+            ..JsObject::default()
+        });
+        Self::install_methods(
+            objects,
+            generator,
+            function_prototype,
+            [
+                ("next", NativeFunction::AsyncGeneratorNext),
+                ("return", NativeFunction::AsyncGeneratorReturn),
+                ("throw", NativeFunction::AsyncGeneratorThrow),
+            ],
+        );
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[generator.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String("AsyncGenerator".to_owned()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+
+        let from_sync = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(async_iterator),
+            ..JsObject::default()
+        });
+        Self::install_methods(
+            objects,
+            from_sync,
+            function_prototype,
+            [
+                ("next", NativeFunction::AsyncFromSyncNext),
+                ("return", NativeFunction::AsyncFromSyncReturn),
+                ("throw", NativeFunction::AsyncFromSyncThrow),
+            ],
+        );
+
+        // %AsyncGeneratorFunction.prototype% (ECMA-262 27.7.1) and its links.
+        let generator_function = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            ..JsObject::default()
+        });
+        let link = |value: JsValue, writable: bool| PropertyDescriptor {
+            getter: None,
+            setter: None,
+            value,
+            writable,
+            enumerable: false,
+            configurable: true,
+        };
+        objects[generator_function.0].properties.insert(
+            "prototype".to_owned(),
+            link(JsValue::Object(generator), false),
+        );
+        objects[generator.0].properties.insert(
+            "constructor".to_owned(),
+            link(JsValue::Object(generator_function), false),
+        );
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[generator_function.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                link(JsValue::String("AsyncGeneratorFunction".to_owned()), false),
+            ),
+        );
+        (generator, from_sync, generator_function)
+    }
+
+    /// Give `target` one builtin method object per `(name, function)` pair.
+    fn install_methods<const N: usize>(
+        objects: &mut Vec<JsObject>,
+        target: ObjectId,
+        function_prototype: ObjectId,
+        methods: [(&str, NativeFunction); N],
+    ) {
+        for (name, function) in methods {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[target.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
     }
 
     /// `%GeneratorPrototype%` (ECMA-262 §27.5.1): inherits the iterator
@@ -6466,6 +6640,9 @@ impl Realm {
         // which may all be garbage at collection time; keep them rooted.
         roots.push(self.iterator_prototype);
         roots.push(self.generator_prototype);
+        roots.push(self.async_generator_prototype);
+        roots.push(self.async_generator_function_prototype);
+        roots.push(self.async_from_sync_iterator_prototype);
         roots.push(self.iterator_helper_prototype);
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
@@ -7074,10 +7251,32 @@ impl Realm {
         object
     }
 
-    pub(crate) fn user_function(&mut self, function: usize, name: &str, length: usize) -> ObjectId {
-        let prototype = self.create_ordinary_object();
+    /// A user function object. An async generator function inherits from
+    /// `%AsyncGeneratorFunction.prototype%` and its `prototype` object inherits
+    /// from `%AsyncGeneratorPrototype%`, with no `constructor` (ECMA-262 27.7.4 and
+    /// 27.6.1.1 / MakeConstructor is not applied to generators).
+    pub(crate) fn user_function(
+        &mut self,
+        function: usize,
+        name: &str,
+        length: usize,
+        async_generator: bool,
+    ) -> ObjectId {
+        let prototype = if async_generator {
+            self.allocate(JsObject {
+                prototype: Some(self.async_generator_prototype),
+                ..JsObject::default()
+            })
+        } else {
+            self.create_ordinary_object()
+        };
+        let function_prototype = if async_generator {
+            self.async_generator_function_prototype
+        } else {
+            self.function_prototype
+        };
         let callable = self.allocate(JsObject {
-            prototype: Some(self.function_prototype),
+            prototype: Some(function_prototype),
             host: ObjectHost::UserFunction(function),
             ..JsObject::default()
         });
@@ -7092,17 +7291,19 @@ impl Realm {
                 configurable: false,
             },
         );
-        self.objects[prototype.0].properties.insert(
-            "constructor".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Object(callable),
-                writable: true,
-                enumerable: false,
-                configurable: true,
-            },
-        );
+        if !async_generator {
+            self.objects[prototype.0].properties.insert(
+                "constructor".to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(callable),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
         self.install_function_metadata(callable, name, length);
         callable
     }
@@ -7178,6 +7379,44 @@ impl Realm {
         self.allocate(JsObject {
             prototype: Some(self.generator_prototype),
             host: ObjectHost::Generator(coroutine),
+            ..JsObject::default()
+        })
+    }
+
+    /// A new async generator object whose behaviour lives in coroutine `coroutine`.
+    pub(crate) fn async_generator_object(&mut self, coroutine: usize) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.async_generator_prototype),
+            host: ObjectHost::AsyncGenerator(coroutine),
+            ..JsObject::default()
+        })
+    }
+
+    /// CreateAsyncFromSyncIterator's wrapper object (ECMA-262 27.1.4.1).
+    pub(crate) fn async_from_sync_iterator(
+        &mut self,
+        iterator: ObjectId,
+        next: ObjectId,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.async_from_sync_iterator_prototype),
+            host: ObjectHost::AsyncFromSyncIterator { iterator, next },
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn async_from_sync_value(&mut self, done: bool) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::AsyncFromSyncValue { done },
+            ..JsObject::default()
+        })
+    }
+
+    pub(crate) fn async_from_sync_close(&mut self, iterator: ObjectId) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::AsyncFromSyncClose { iterator },
             ..JsObject::default()
         })
     }

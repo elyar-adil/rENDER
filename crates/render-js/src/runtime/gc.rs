@@ -17,6 +17,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::coroutine_run::Resume;
 use crate::runtime::builtins::promise::PromiseState;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::JsMicrotask;
@@ -163,6 +164,8 @@ pub(super) fn mark_host(
         | ObjectHost::NativeFunction(_)
         | ObjectHost::Generator(_)
         | ObjectHost::AsyncResume { .. }
+        | ObjectHost::AsyncGenerator(_)
+        | ObjectHost::AsyncFromSyncValue { .. }
         | ObjectHost::PromiseConstructor
         | ObjectHost::ObjectConstructor
         | ObjectHost::FunctionConstructor
@@ -265,6 +268,13 @@ pub(super) fn mark_host(
         }
         ObjectHost::Promise(index) | ObjectHost::PromiseSettler { promise: index, .. } => {
             mark_promise(runtime, marked, work, marked_environments, *index);
+        }
+        ObjectHost::AsyncFromSyncIterator { iterator, next } => {
+            mark_object(runtime, marked, work, marked_environments, *iterator);
+            mark_object(runtime, marked, work, marked_environments, *next);
+        }
+        ObjectHost::AsyncFromSyncClose { iterator } => {
+            mark_object(runtime, marked, work, marked_environments, *iterator);
         }
         ObjectHost::Collection { entries, .. } => {
             for (key, value) in entries {
@@ -492,6 +502,22 @@ impl JsRuntime {
                     &mut work,
                     &mut marked_environments,
                     environment,
+                );
+            }
+        }
+        // Queued async generator requests keep their promises and resumption
+        // values alive until they are settled.
+        for generator in self.async_generators.values() {
+            for request in &generator.queue {
+                let (Resume::Next(value) | Resume::Throw(value) | Resume::Return(value)) =
+                    &request.completion;
+                mark_value(self, &mut marked, &mut work, &mut marked_environments, value);
+                mark_promise(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    request.promise,
                 );
             }
         }

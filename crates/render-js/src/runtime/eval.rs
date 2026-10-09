@@ -561,7 +561,12 @@ impl JsRuntime {
         let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
-            self.realm.user_function(function_index, name, length)
+            self.realm.user_function(
+                function_index,
+                name,
+                length,
+                kind == FunctionKind::AsyncGenerator,
+            )
         };
         Ok(JsValue::Object(function))
     }
@@ -845,6 +850,16 @@ impl JsRuntime {
                 body,
                 ..
             } => self.evaluate_for_in_statement(dom, *kind, name, iterable, body),
+            // `for await` suspends, so it runs in a coroutine. Only module
+            // bodies reach this evaluator, and they have no coroutine to run in.
+            Statement::ForOf {
+                is_await: true,
+                offset,
+                ..
+            } => Err(JsError::syntax(
+                "`for await` outside an async function is not supported yet",
+                *offset,
+            )),
             Statement::ForOf {
                 kind,
                 name,
@@ -4911,6 +4926,16 @@ impl JsRuntime {
                 };
                 self.async_continue(dom, coroutine, resume);
                 Ok(JsValue::Undefined)
+            }
+            Some(ObjectHost::AsyncFromSyncValue { done }) => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                self.iteration_result(value, done)
+            }
+            Some(ObjectHost::AsyncFromSyncClose { iterator }) => {
+                let reason = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                // IteratorClose with a throw completion: errors from closing are dropped.
+                let _ = self.close_iterator_object(dom, iterator);
+                Err(JsError::thrown(reason))
             }
             Some(ObjectHost::PromiseSettler { promise, fulfilled }) => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);

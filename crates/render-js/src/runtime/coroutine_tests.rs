@@ -415,3 +415,144 @@ fn suspended_coroutines_survive_garbage_collection() {
         .expect("resume");
     assert_eq!(outcome.value.to_js_string(), "async-local,2,2,kept,3");
 }
+
+#[test]
+fn async_generator_yields_values_and_then_completes() {
+    assert_eq!(
+        ok(
+            "async function* g() { yield 1; yield 2; return 3; } \
+            var it = g(); \
+            it.next().then(function (r) { log.push(r.value, r.done); }); \
+            it.next().then(function (r) { log.push(r.value, r.done); }); \
+            it.next().then(function (r) { log.push(r.value, r.done); }); \
+            it.next().then(function (r) { log.push(r.value, r.done); });"
+        ),
+        "1,false,2,false,3,true,,true"
+    );
+}
+
+#[test]
+fn async_generator_body_starts_on_the_first_next() {
+    assert_eq!(
+        ok("async function* g() { log.push('started'); } var it = g(); log.push('created'); it.next();"),
+        "created,started"
+    );
+}
+
+#[test]
+fn async_generator_queues_requests_in_order() {
+    assert_eq!(
+        ok(
+            "async function* g() { var a = yield 1; log.push('a' + a); var b = yield 2; log.push('b' + b); } \
+            var it = g(); it.next('x'); it.next('p'); it.next('q');"
+        ),
+        "ap,bq"
+    );
+}
+
+#[test]
+fn async_generator_yield_awaits_its_operand() {
+    assert_eq!(
+        ok("async function* g() { yield Promise.resolve(7); } g().next().then(function (r) { log.push(r.value, r.done); });"),
+        "7,false"
+    );
+}
+
+#[test]
+fn async_generator_return_awaits_its_operand() {
+    assert_eq!(
+        ok("async function* g() { return Promise.resolve(9); } g().next().then(function (r) { log.push(r.value, r.done); });"),
+        "9,true"
+    );
+}
+
+#[test]
+fn async_generator_return_resumes_through_finally() {
+    assert_eq!(
+        ok(
+            "async function* g() { try { yield 1; } finally { log.push('fin'); } } \
+            var it = g(); it.next().then(function () { return it.return(5); }) \
+              .then(function (r) { log.push(r.value, r.done); });"
+        ),
+        "fin,5,true"
+    );
+}
+
+#[test]
+fn async_generator_throw_is_delivered_into_the_body_at_yield() {
+    assert_eq!(
+        ok(
+            "async function* g() { try { yield 1; } catch (e) { log.push('caught' + e); yield 2; } } \
+            var it = g(); it.next().then(function () { return it.throw('boom'); }) \
+              .then(function (r) { log.push(r.value, r.done); });"
+        ),
+        "caughtboom,2,false"
+    );
+}
+
+#[test]
+fn async_generator_return_before_start_completes_without_running_the_body() {
+    assert_eq!(
+        ok(
+            "async function* g() { log.push('never'); } var it = g(); \
+            it.return(4).then(function (r) { log.push(r.value, r.done); });"
+        ),
+        "4,true"
+    );
+}
+
+#[test]
+fn async_generator_throw_before_start_rejects() {
+    assert_eq!(
+        ok(
+            "async function* g() { log.push('never'); } var it = g(); \
+            it.throw('x').catch(function (e) { log.push('rejected' + e); });"
+        ),
+        "rejectedx"
+    );
+}
+
+#[test]
+fn async_generator_after_completion_answers_done() {
+    assert_eq!(
+        ok(
+            "async function* g() {} var it = g(); \
+            it.next().then(function () { return it.next(); }).then(function (r) { log.push(r.value, r.done); });"
+        ),
+        ",true"
+    );
+}
+
+#[test]
+fn for_await_reads_an_async_generator() {
+    assert_eq!(
+        ok(
+            "async function* g() { yield 1; yield 2; } \
+            (async function () { for await (var x of g()) { log.push(x); } })();"
+        ),
+        "1,2"
+    );
+}
+
+#[test]
+fn for_await_over_a_sync_iterable_awaits_each_value() {
+    assert_eq!(
+        ok(
+            "(async function () { for await (var x of [Promise.resolve('a'), 'b']) { log.push(x); } })();"
+        ),
+        "a,b"
+    );
+}
+
+#[test]
+fn breaking_out_of_for_await_awaits_return() {
+    assert_eq!(
+        ok(
+            "var iterable = { [Symbol.asyncIterator]() { var i = 0; return { \
+                next() { return Promise.resolve({ value: i++, done: false }); }, \
+                return() { log.push('return'); return Promise.resolve({ done: true }); } }; } }; \
+            (async function () { for await (var x of iterable) { log.push(x); if (x === 1) { break; } } log.push('after'); })();"
+        ),
+        "0,1,return,after"
+    );
+}

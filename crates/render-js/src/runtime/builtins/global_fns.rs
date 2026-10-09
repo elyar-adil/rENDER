@@ -20,6 +20,7 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
+use crate::runtime::async_iteration::AsyncFromSyncMethod;
 use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::ConsoleLevel;
 use crate::runtime::types::ConsoleMessage;
@@ -682,6 +683,39 @@ impl JsRuntime {
                 dom,
                 receiver,
                 Resume::Throw(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::AsyncGeneratorNext => self.async_generator_request(
+                dom,
+                receiver,
+                Resume::Next(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::AsyncGeneratorReturn => self.async_generator_request(
+                dom,
+                receiver,
+                Resume::Return(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::AsyncGeneratorThrow => self.async_generator_request(
+                dom,
+                receiver,
+                Resume::Throw(arguments.first().cloned().unwrap_or(JsValue::Undefined)),
+            ),
+            NativeFunction::AsyncFromSyncNext => self.async_from_sync_method(
+                dom,
+                receiver,
+                AsyncFromSyncMethod::Next,
+                arguments,
+            ),
+            NativeFunction::AsyncFromSyncReturn => self.async_from_sync_method(
+                dom,
+                receiver,
+                AsyncFromSyncMethod::Return,
+                arguments,
+            ),
+            NativeFunction::AsyncFromSyncThrow => self.async_from_sync_method(
+                dom,
+                receiver,
+                AsyncFromSyncMethod::Throw,
+                arguments,
             ),
             NativeFunction::IteratorConstructor
             | NativeFunction::IteratorFrom
