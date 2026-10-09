@@ -1107,19 +1107,26 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        // §23.1.2.1 step 3 validates the mapper before the items are read, and
+        // step 6 reads `items[@@iterator]`, which throws for null and undefined.
+        let mapper = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => None,
+            Some(value) => Some(Self::require_callable_object(value, &self.realm)?),
+        };
+        if matches!(source, JsValue::Null | JsValue::Undefined) {
+            return Err(JsError::type_error(
+                "Array.from requires an iterable or array-like, not null or undefined",
+            ));
+        }
         // §23.1.2.1: iterables go through their iterator (Set, Map, generators,
         // array iterators, user-defined); everything else is read as an
         // array-like. `iterate_values` implements exactly that split.
         let mut values = match source {
-            JsValue::Null | JsValue::Undefined => Vec::new(),
             JsValue::Object(_) | JsValue::String(_) => self.iterate_values(dom, &source)?,
-            // A number or boolean has no `length`, so as an array-like it is empty.
+            // A number, boolean or symbol has no `length`, so as an array-like it is empty.
             _ => Vec::new(),
         };
-        if let Some(mapper) = arguments.get(1)
-            && let JsValue::Object(mapper) = mapper
-        {
-            let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
+        if let Some(mapper) = mapper {
             let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
             for (index, value) in values.iter_mut().enumerate() {
                 #[allow(clippy::cast_precision_loss)]

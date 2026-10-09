@@ -113,7 +113,7 @@ pub(super) enum Instr {
         slot: usize,
     },
     CatchBind {
-        parameter: Rc<str>,
+        parameter: Option<BindingTarget>,
         lexicals: Rc<Vec<Statement>>,
         slot: usize,
     },
@@ -826,7 +826,7 @@ impl Compiler {
         if let Some(catch) = catch {
             catch_pc = Some(self.here());
             self.emit(Instr::CatchBind {
-                parameter: Rc::from(catch.parameter.as_str()),
+                parameter: catch.parameter.clone(),
                 lexicals: Rc::new(catch.body.clone()),
                 slot,
             });

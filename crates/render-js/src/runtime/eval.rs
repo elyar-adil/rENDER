@@ -1303,18 +1303,27 @@ impl JsRuntime {
             // engine inside catch blocks.
             let value = self.error_to_thrown_value(error)?;
             let catch_environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
-            catch_environment.borrow_mut().bindings.insert(
-                catch.parameter.clone(),
-                Binding {
-                    value,
-                    mutable: true,
-                    initialized: true,
-                    kind: VariableKind::Let,
-                },
-            );
+            if let Some(parameter) = &catch.parameter {
+                // The parameter's names exist, uninitialized, while a pattern's
+                // defaults run, so a default that reads a later name is a
+                // ReferenceError rather than a leak from an outer scope.
+                let mut scope = catch_environment.borrow_mut();
+                for name in parameter.names() {
+                    scope.bindings.insert(
+                        name,
+                        Binding {
+                            value: JsValue::Undefined,
+                            mutable: true,
+                            initialized: false,
+                            kind: VariableKind::Let,
+                        },
+                    );
+                }
+            }
             self.environment.push(catch_environment);
             result = self
-                .instantiate_block_lexicals(&catch.body)
+                .bind_catch_parameter(dom, catch.parameter.as_ref(), value)
+                .and_then(|()| self.instantiate_block_lexicals(&catch.body))
                 .and_then(|()| self.evaluate_statements(dom, &catch.body));
             self.environment.pop();
         }
@@ -1325,6 +1334,26 @@ impl JsRuntime {
             }
         }
         result
+    }
+
+    /// Initializes a `catch` clause's parameter from the thrown value. A pattern
+    /// destructures it, so a `null` or `undefined` value throws, as it does for a
+    /// `let` declaration.
+    pub(super) fn bind_catch_parameter(
+        &mut self,
+        dom: &mut Dom,
+        parameter: Option<&BindingTarget>,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        match parameter {
+            None => Ok(()),
+            Some(BindingTarget::Name(name)) => {
+                self.initialize_binding(name, value, VariableKind::Let)
+            }
+            Some(BindingTarget::Pattern(pattern)) => {
+                self.initialize_binding_pattern(dom, pattern, value, VariableKind::Let)
+            }
+        }
     }
 
     /// The JavaScript value a `catch` clause (or a rejected promise) sees for

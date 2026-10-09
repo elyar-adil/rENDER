@@ -315,3 +315,86 @@ fn subclasses_of_built_ins_are_instances_of_themselves() {
         "true,true,true,true,z"
     );
 }
+
+#[test]
+fn a_catch_parameter_may_be_a_destructuring_pattern() {
+    assert_eq!(
+        ok(
+            "var r; try { throw {message: 'm', code: 7}; } catch ({ message, code: c }) { r = message + c; } r"
+        ),
+        "m7"
+    );
+    assert_eq!(
+        ok("var r; try { throw [1, [2]]; } catch ([a, [b = 9]]) { r = a + b; } r"),
+        "3"
+    );
+    // A default can read an earlier name of the same pattern.
+    assert_eq!(
+        ok("var r; try { throw {}; } catch ({ x = 4, y = x + 1 }) { r = y; } r"),
+        "5"
+    );
+}
+
+#[test]
+fn destructuring_a_null_catch_parameter_throws_a_type_error() {
+    assert_eq!(
+        ok(
+            "var r; try { try { throw null; } catch ({ a }) { r = 'no'; } } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn a_generator_catch_parameter_may_be_a_destructuring_pattern() {
+    assert_eq!(
+        ok(r"
+            function* g() {
+                try { yield 1; throw { v: 'thrown' }; } catch ({ v }) { yield v; }
+            }
+            var it = g(); it.next(); it.next().value
+        "),
+        "thrown"
+    );
+}
+
+#[test]
+fn for_of_assigns_identifier_member_and_destructuring_targets() {
+    assert_eq!(
+        ok("var x, out = []; for (x of [1, 2]) out.push(x); out.join()"),
+        "1,2"
+    );
+    assert_eq!(
+        ok(
+            "var a, b, out = []; for ([a, b = 5] of [[1], [2, 3]]) out.push(a + ':' + b); out.join()"
+        ),
+        "1:5,2:3"
+    );
+    assert_eq!(
+        ok("var o = {}, out = []; for (o.p of ['x']) out.push(o.p); out.join()"),
+        "x"
+    );
+    assert_eq!(
+        ok(
+            "var x, out = []; for (x of [1, 2, 3]) { if (x == 2) continue; out.push(x); } out.join()"
+        ),
+        "1,3"
+    );
+}
+
+#[test]
+fn array_from_rejects_null_and_undefined_and_a_non_callable_mapper() {
+    assert_eq!(
+        ok("var r; try { Array.from(null); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("var r; try { Array.from(undefined); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("var r; try { Array.from([1], 5); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(ok("Array.from(new Set([1, 2])).join()"), "1,2");
+}

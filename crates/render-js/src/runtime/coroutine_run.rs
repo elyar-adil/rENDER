@@ -714,18 +714,25 @@ impl JsRuntime {
                 slot,
             } => {
                 let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
-                if !parameter.is_empty() {
-                    environment.borrow_mut().bindings.insert(
-                        parameter.to_string(),
-                        Binding {
-                            value: co.hidden(&format!("%e{slot}")),
-                            mutable: true,
-                            initialized: true,
-                            kind: VariableKind::Let,
-                        },
-                    );
+                if let Some(parameter) = &parameter {
+                    let mut scope = environment.borrow_mut();
+                    for name in parameter.names() {
+                        scope.bindings.insert(
+                            name,
+                            Binding {
+                                value: JsValue::Undefined,
+                                mutable: true,
+                                initialized: false,
+                                kind: VariableKind::Let,
+                            },
+                        );
+                    }
                 }
                 self.environment.push(environment);
+                if let Some(parameter) = &parameter {
+                    let thrown = co.hidden(&format!("%e{slot}"));
+                    self.bind_catch_parameter(dom, Some(parameter), thrown)?;
+                }
                 self.instantiate_block_lexicals(&lexicals)?;
                 co.pc += 1;
                 Ok(Flow::Next)

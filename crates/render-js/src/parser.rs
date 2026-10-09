@@ -109,7 +109,9 @@ pub(super) enum BinaryOp {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct CatchClause {
-    pub parameter: String,
+    /// `None` for the optional binding `catch { … }`. A name or a destructuring
+    /// pattern (`catch ({ message })`) otherwise.
+    pub parameter: Option<BindingTarget>,
     pub body: Vec<Statement>,
 }
 
@@ -1513,6 +1515,34 @@ impl Parser {
                     body: Box::new(body?),
                 });
             }
+            if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "of") {
+                // `for (LHS of iterable)` with an assignment target, which may be
+                // a destructuring pattern. The loop binds one temporary, and the
+                // body first assigns the pattern from it, so the target is
+                // evaluated and written each iteration as the spec requires.
+                self.advance();
+                self.no_in = false;
+                self.validate_assignment_target(&expression)?;
+                let iterable = self.assignment()?;
+                self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
+                self.loop_depth = self.loop_depth.saturating_add(1);
+                let body = self.statement();
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                let offset = self.previous_offset();
+                let temporary = format!("\0for_of_expr_{}", self.cursor);
+                let assign = Statement::Expression(Expr::Assignment {
+                    target: Box::new(expression),
+                    value: Box::new(Expr::Identifier(temporary.clone())),
+                    offset,
+                });
+                return Ok(Statement::ForOf {
+                    offset,
+                    kind: VariableKind::Var,
+                    name: temporary,
+                    iterable,
+                    body: Box::new(Statement::Block(vec![assign, body?])),
+                });
+            }
             self.require(&TokenKind::Semicolon, "expected ';' after for initializer")?;
             Some(Box::new(Statement::Expression(expression)))
         };
@@ -1546,13 +1576,18 @@ impl Parser {
         let body = self.required_block("expected '{' after try")?;
         let catch = if self.take(&TokenKind::Catch) {
             let parameter = if self.take(&TokenKind::LeftParen) {
-                let TokenKind::Identifier(parameter) = self.advance().kind else {
-                    return Err(self.error("expected catch parameter"));
+                let target = if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                    BindingTarget::Pattern(self.binding_pattern()?)
+                } else {
+                    let TokenKind::Identifier(name) = self.advance().kind else {
+                        return Err(self.error("expected catch parameter"));
+                    };
+                    BindingTarget::Name(name)
                 };
                 self.require(&TokenKind::RightParen, "expected ')' after catch parameter")?;
-                parameter
+                Some(target)
             } else {
-                "\0optional-catch-binding".to_owned()
+                None
             };
             Some(CatchClause {
                 parameter,
@@ -3657,7 +3692,11 @@ fn validate_reserved_statement(
         } => {
             validate_reserved_statements(body, context)?;
             if let Some(catch) = catch {
-                check_reserved_identifier(&catch.parameter, context)?;
+                if let Some(parameter) = &catch.parameter {
+                    for name in parameter.names() {
+                        check_reserved_identifier(&name, context)?;
+                    }
+                }
                 validate_reserved_statements(&catch.body, context)?;
             }
             if let Some(finally) = finally {
