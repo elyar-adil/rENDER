@@ -21,6 +21,7 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_number;
+use crate::runtime::convert::uint32_of_number;
 use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -41,7 +42,7 @@ impl JsRuntime {
             NativeFunction::ArrayKeys => self.array_view_iterator(receiver, ArrayView::Keys),
             NativeFunction::ArrayEntries => self.array_view_iterator(receiver, ArrayView::Entries),
             NativeFunction::ArraySplice => self.array_splice(dom, receiver, arguments),
-            NativeFunction::ArrayReverse => self.array_reverse(receiver),
+            NativeFunction::ArrayReverse => self.array_reverse(dom, receiver),
             NativeFunction::ArrayAt => self.array_at(dom, receiver, arguments),
             NativeFunction::ArrayFlat => self.array_flat(dom, receiver, arguments),
             NativeFunction::ArrayReduceRight => self.array_reduce_right(dom, receiver, arguments),
@@ -51,8 +52,8 @@ impl JsRuntime {
             }
             NativeFunction::ArraySort => self.array_sort(dom, receiver, arguments),
             NativeFunction::ArrayConcat => self.array_concat(receiver, arguments),
-            NativeFunction::ArrayShift => self.array_shift(receiver),
-            NativeFunction::ArrayUnshift => self.array_unshift(receiver, arguments),
+            NativeFunction::ArrayShift => self.array_shift(dom, receiver),
+            NativeFunction::ArrayUnshift => self.array_unshift(dom, receiver, arguments),
             NativeFunction::ArrayForEach => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "forEach")?,
@@ -99,8 +100,8 @@ impl JsRuntime {
                     if matches!(self.realm.host(*object), Some(ObjectHost::Array))
             ))),
             NativeFunction::ArrayFrom => self.array_from(dom, arguments),
-            NativeFunction::ArrayPush => self.array_push(receiver, arguments),
-            NativeFunction::ArrayPop => self.array_pop(receiver),
+            NativeFunction::ArrayPush => self.array_push(dom, receiver, arguments),
+            NativeFunction::ArrayPop => self.array_pop(dom, receiver),
             NativeFunction::ArrayJoin => self.array_join(dom, receiver, arguments),
             other => self.dispatch_typed_array_native(dom, other, receiver, arguments),
         }
@@ -378,10 +379,11 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn array_push(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let mut length = self.array_length(receiver)?;
+        let mut length = self.array_length_value(dom, receiver)?;
         for value in arguments {
             if !self
                 .realm
@@ -397,8 +399,12 @@ impl JsRuntime {
         Ok(JsValue::Number(f64::from(length)))
     }
 
-    pub(in crate::runtime) fn array_pop(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let length = self.array_length(receiver)?;
+    pub(in crate::runtime) fn array_pop(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let length = self.array_length_value(dom, receiver)?;
         if length == 0 {
             return Ok(JsValue::Undefined);
         }
@@ -542,10 +548,11 @@ impl JsRuntime {
     /// Replace the indexed elements of `receiver`, updating its length.
     pub(in crate::runtime) fn set_array_elements(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         values: &[JsValue],
     ) -> Result<(), JsError> {
-        let old_length = self.array_length(receiver)?;
+        let old_length = self.array_length_value(dom, receiver)?;
         for index in 0..old_length {
             self.realm.remove_property(receiver, &index.to_string());
         }
@@ -665,17 +672,18 @@ impl JsRuntime {
         for (offset, item) in arguments.iter().skip(2).enumerate() {
             result.insert(start + offset, item.clone());
         }
-        self.set_array_elements(receiver, &result)?;
+        self.set_array_elements(dom, receiver, &result)?;
         Ok(JsValue::Object(self.create_array_from_values(&removed)?))
     }
 
     pub(in crate::runtime) fn array_reverse(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let mut elements = self.array_elements(receiver)?;
         elements.reverse();
-        self.set_array_elements(receiver, &elements)?;
+        self.set_array_elements(dom, receiver, &elements)?;
         Ok(JsValue::Object(self.create_array_from_values(&elements)?))
     }
 
@@ -932,7 +940,7 @@ impl JsRuntime {
                 position -= 1;
             }
         }
-        self.set_array_elements(receiver, &elements)?;
+        self.set_array_elements(dom, receiver, &elements)?;
         Ok(JsValue::Object(receiver))
     }
 
@@ -993,6 +1001,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn array_shift(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let mut elements = self.array_elements(receiver)?;
@@ -1001,19 +1010,20 @@ impl JsRuntime {
             return Ok(JsValue::Undefined);
         }
         let first = elements.remove(0);
-        self.set_array_elements(receiver, &elements)?;
+        self.set_array_elements(dom, receiver, &elements)?;
         Ok(first)
     }
 
     pub(in crate::runtime) fn array_unshift(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let mut elements = self.array_elements(receiver)?;
         elements.splice(0..0, arguments.iter().cloned());
         let new_length = elements.len();
-        self.set_array_elements(receiver, &elements)?;
+        self.set_array_elements(dom, receiver, &elements)?;
         #[allow(clippy::cast_precision_loss)]
         Ok(JsValue::Number(new_length as f64))
     }
@@ -1331,21 +1341,42 @@ impl JsRuntime {
         Ok(number.trunc() as u32)
     }
 
+    /// The `length` an Array method reads from its receiver: `[[Get]]` (so a
+    /// getter runs) and then `ToNumber`, which runs `ToPrimitive` on an object
+    /// length. A length the u32 representation cannot hold is a catchable error.
+    pub(in crate::runtime) fn array_length_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<u32, JsError> {
+        let value = self.get_value(dom, object, "length")?;
+        let number = self.to_number_value(dom, &value)?;
+        if number.is_nan() || number <= 0.0 {
+            return Ok(0);
+        }
+        if !number.is_finite() || number > f64::from(u32::MAX) {
+            return Err(JsError::resource(
+                "array-like length exceeds the engine bound",
+            ));
+        }
+        Ok(number.trunc() as u32)
+    }
+
     pub(in crate::runtime) fn set_array_length_value(
         &mut self,
+        dom: &mut Dom,
         object: ObjectId,
         value: &JsValue,
     ) -> Result<(), JsError> {
-        let number = to_number(value)?;
-        if !number.is_finite()
-            || number < 0.0
-            || number.fract() != 0.0
-            || number > f64::from(u32::MAX)
-        {
-            return Err(JsError::type_error("invalid array length"));
+        // ECMA-262 10.4.2.4 ArraySetLength: `newLen = ToUint32(value)` and then
+        // `numberLen = ToNumber(value)`, so an object's `valueOf` runs twice.
+        // A mismatch between the two is a RangeError.
+        let uint32_length = uint32_of_number(self.to_number_value(dom, value)?);
+        let number = self.to_number_value(dom, value)?;
+        if f64::from(uint32_length) != number {
+            return Err(self.range_error("Invalid array length"));
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let length = number as u32;
+        let length = uint32_length;
         let old_length = self.array_length(object)?;
         if length < old_length {
             for name in self.realm.own_property_names(object).unwrap_or_default() {

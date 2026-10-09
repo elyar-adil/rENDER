@@ -2504,6 +2504,9 @@ impl JsRuntime {
             Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
             Some(ObjectHost::BigIntPrimitive(value)) => return Ok(JsValue::BigInt(value)),
             Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
+            // §20.4.3 `Symbol.prototype[@@toPrimitive]` returns the symbol itself,
+            // so a symbol wrapper converts to the symbol (and not its description).
+            Some(ObjectHost::SymbolInstance(symbol)) => return Ok(JsValue::Symbol(symbol)),
             Some(ObjectHost::Array) => {
                 // An array already being joined further up the stack is a
                 // cycle and contributes nothing (ECMA-262 leaves this to the
@@ -4507,7 +4510,7 @@ impl JsRuntime {
         match self.realm.host(object) {
             Some(ObjectHost::Array) => {
                 if property == "length" {
-                    return self.set_array_length_value(object, &value);
+                    return self.set_array_length_value(dom, object, &value);
                 }
                 if let Some(index) = array_index(property) {
                     if !self.realm.set_property(object, property.to_owned(), value) {
@@ -5227,8 +5230,10 @@ impl JsRuntime {
                 // `toString.call(primitive)` never materializes an object.
                 Ok(JsValue::String(self.object_to_string_tag(&receiver)))
             }
+            // §20.1.3.7 `Object.prototype.valueOf` is `ToObject(this)`: a
+            // primitive yields its wrapper, and a nullish receiver throws.
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeValueOf)) => {
-                Ok(receiver.clone())
+                Ok(JsValue::Object(self.to_object(&receiver)?))
             }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionPrototype)) => {
                 Ok(JsValue::Undefined)
@@ -5276,6 +5281,16 @@ impl JsRuntime {
                 | NativeFunction::UrlSearchParamsToString
                 | NativeFunction::UrlSearchParamsForEach),
             )) => Ok(self.url_search_params_method(&receiver, function, arguments, dom)),
+            // A built-in whose receiver is `RequireObjectCoercible`d gets the
+            // nullish `this` as a `TypeError`, not the global object.
+            Some(ObjectHost::NativeFunction(function))
+                if matches!(receiver, JsValue::Null | JsValue::Undefined)
+                    && function.requires_coercible_this() =>
+            {
+                Err(JsError::type_error(format!(
+                    "{function:?} called on null or undefined"
+                )))
+            }
             Some(ObjectHost::NativeFunction(function)) => {
                 let receiver = match &receiver {
                     JsValue::Object(object) => *object,

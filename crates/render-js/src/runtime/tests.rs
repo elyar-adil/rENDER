@@ -4516,3 +4516,29 @@ fn define_properties_reads_symbol_keyed_descriptors_and_inherited_fields() {
         .expect("symbol-keyed descriptors should execute");
     assert_eq!(outcome.value, JsValue::String("5|9".to_owned()));
 }
+
+#[test]
+fn array_mutators_read_an_object_length_with_to_number_and_refuse_nullish_receivers() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var array_like = { 0: "a", length: { valueOf: function() { return 1; } } };
+                var popped = Array.prototype.pop.call(array_like);
+                var nullish = "no throw";
+                try { Array.prototype.push.call(undefined, 1); } catch (error) { nullish = error.name; }
+                var grown = [1, 2, 3];
+                grown.length = { valueOf: function() { return 1; } };
+                var fractional = "no throw";
+                try { grown.length = 1.5; } catch (error) { fractional = error.name; }
+                [popped, array_like.length, nullish, grown.length, fractional].join("|");
+            "#,
+        )
+        .expect("array mutators should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("a|0|TypeError|1|RangeError".to_owned())
+    );
+}
