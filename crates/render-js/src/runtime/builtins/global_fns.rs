@@ -373,9 +373,9 @@ impl JsRuntime {
             }
             NativeFunction::StrCharAt => self.string_char_at(dom, receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(dom, receiver, arguments),
-            NativeFunction::StrIndexOf => self.string_index_of(receiver, arguments, false),
-            NativeFunction::StrLastIndexOf => self.string_index_of(receiver, arguments, true),
-            NativeFunction::StrIncludes => self.string_includes(receiver, arguments),
+            NativeFunction::StrIndexOf => self.string_index_of(dom, receiver, arguments, false),
+            NativeFunction::StrLastIndexOf => self.string_index_of(dom, receiver, arguments, true),
+            NativeFunction::StrIncludes => self.string_includes(dom, receiver, arguments),
             NativeFunction::StrStartsWith => {
                 self.string_starts_or_ends_with(dom, receiver, arguments, true)
             }
@@ -384,9 +384,9 @@ impl JsRuntime {
             }
             NativeFunction::StrSlice => self.string_slice(dom, receiver, arguments),
             NativeFunction::StrSubstring => self.string_substring(dom, receiver, arguments),
-            NativeFunction::StrToLowerCase => self.string_to_case(receiver, arguments, false),
-            NativeFunction::StrToUpperCase => self.string_to_case(receiver, arguments, true),
-            NativeFunction::StrTrim => self.string_trim(receiver),
+            NativeFunction::StrToLowerCase => self.string_to_case(dom, receiver, false),
+            NativeFunction::StrToUpperCase => self.string_to_case(dom, receiver, true),
+            NativeFunction::StrTrim => self.string_trim(dom, receiver),
             NativeFunction::ArrayAt
             | NativeFunction::ArrayFlat
             | NativeFunction::ArrayReduceRight
@@ -408,12 +408,12 @@ impl JsRuntime {
             NativeFunction::StrMatch => self.string_match(dom, receiver, arguments),
             NativeFunction::StrMatchAll => self.string_match_all(dom, receiver, arguments),
             NativeFunction::StrSearch => self.string_search(dom, receiver, arguments),
-            NativeFunction::StrConcat => self.string_concat(receiver, arguments),
+            NativeFunction::StrConcat => self.string_concat(dom, receiver, arguments),
             NativeFunction::StrToString => {
                 Ok(JsValue::String(self.require_string_object(receiver)?))
             }
             NativeFunction::StrForEach => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "String.forEach")?,
                     &self.realm,
@@ -443,9 +443,9 @@ impl JsRuntime {
                 Ok(JsValue::Undefined)
             }
             NativeFunction::StrPush => Ok(JsValue::Number(utf16::utf16_length(
-                &self.require_string_receiver(receiver)?,
+                &self.require_string_receiver(dom, receiver)?,
             ) as f64)),
-            NativeFunction::StrIterator => self.string_iterator(receiver),
+            NativeFunction::StrIterator => self.string_iterator(dom, receiver),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "queueMicrotask")?,

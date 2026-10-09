@@ -84,71 +84,28 @@ impl JsRuntime {
         let argument = |index: usize| arguments.get(index).cloned().unwrap_or(JsValue::Undefined);
         match function {
             NativeFunction::RegExpSymbolMatch => {
-                let text = self.to_string_argument(dom, &argument(0))?;
+                let text = self.to_string_coerced(dom, &argument(0))?;
                 self.symbol_match(dom, rx, &text)
             }
             NativeFunction::RegExpSymbolMatchAll => {
-                let text = self.to_string_argument(dom, &argument(0))?;
+                let text = self.to_string_coerced(dom, &argument(0))?;
                 self.symbol_match_all(dom, rx, &text)
             }
             NativeFunction::RegExpSymbolReplace => {
-                let text = self.to_string_argument(dom, &argument(0))?;
+                let text = self.to_string_coerced(dom, &argument(0))?;
                 self.symbol_replace(dom, rx, &text, &argument(1))
             }
             NativeFunction::RegExpSymbolSearch => {
-                let text = self.to_string_argument(dom, &argument(0))?;
+                let text = self.to_string_coerced(dom, &argument(0))?;
                 self.symbol_search(dom, rx, &text)
             }
             NativeFunction::RegExpSymbolSplit => {
-                let text = self.to_string_argument(dom, &argument(0))?;
+                let text = self.to_string_coerced(dom, &argument(0))?;
                 self.symbol_split(dom, rx, &text, &argument(1))
             }
             other => Err(JsError::type_error(format!(
                 "{other:?} is not a RegExp symbol method"
             ))),
-        }
-    }
-
-    /// `ToString(value)` for an argument the specification converts. A Symbol,
-    /// or a Symbol wrapper, is a `TypeError` rather than a string.
-    pub(in crate::runtime) fn to_string_argument(
-        &mut self,
-        dom: &mut Dom,
-        value: &JsValue,
-    ) -> Result<String, JsError> {
-        let is_symbol = match value {
-            JsValue::Symbol(_) => true,
-            JsValue::Object(object) => {
-                matches!(
-                    self.realm.host(*object),
-                    Some(ObjectHost::SymbolInstance(_))
-                )
-            }
-            _ => false,
-        };
-        if is_symbol {
-            return Err(JsError::type_error(
-                "Cannot convert a Symbol value to a string",
-            ));
-        }
-        self.to_string_value(dom, value)
-    }
-
-    /// `ToString(this)` for a String.prototype method whose receiver is the
-    /// object `receiver`: a String, Number or Boolean wrapper is read directly,
-    /// and any other object goes through `ToPrimitive`, which can throw.
-    pub(in crate::runtime) fn this_string(
-        &mut self,
-        dom: &mut Dom,
-        receiver: ObjectId,
-    ) -> Result<String, JsError> {
-        match self.realm.host(receiver) {
-            Some(
-                ObjectHost::StringPrimitive(_)
-                | ObjectHost::NumberPrimitive(_)
-                | ObjectHost::BooleanPrimitive(_),
-            ) => self.require_string_receiver(receiver),
-            _ => self.to_string_argument(dom, &JsValue::Object(receiver)),
         }
     }
 
@@ -574,7 +531,7 @@ impl JsRuntime {
         let template = if replacer.is_some() {
             Vec::new()
         } else {
-            let template = self.to_string_argument(dom, replace_value)?;
+            let template = self.to_string_coerced(dom, replace_value)?;
             utf16::utf16_units(&template)
         };
         let flags = self.regexp_flags(dom, rx)?;

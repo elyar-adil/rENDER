@@ -4468,3 +4468,77 @@ fn history_length_is_the_embedding_count_and_state_round_trips_as_json() {
         }]
     );
 }
+
+#[test]
+fn define_property_converts_object_keys_and_reads_descriptor_fields_through_get() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var keyed = {};
+                Object.defineProperty(keyed, [1, 2], {});
+                var attributes = {};
+                Object.defineProperty(attributes, "value", {
+                    get: function() { return "from getter"; }
+                });
+                var target = {};
+                Object.defineProperty(target, "field", attributes);
+                [keyed.hasOwnProperty("1,2"), target.field, Object.hasOwn(keyed, [1, 2])].join("|");
+            "#,
+        )
+        .expect("object keys and descriptor getters should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true|from getter|true".to_owned())
+    );
+}
+
+#[test]
+fn define_properties_reads_symbol_keyed_descriptors_and_inherited_fields() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var key = Symbol("k");
+                var inherited = Object.create({ value: 5 });
+                inherited.enumerable = true;
+                var properties = {};
+                properties[key] = inherited;
+                properties.named = { value: 9, enumerable: true };
+                var target = Object.defineProperties({}, properties);
+                [target[key], target.named].join("|");
+            "#,
+        )
+        .expect("symbol-keyed descriptors should execute");
+    assert_eq!(outcome.value, JsValue::String("5|9".to_owned()));
+}
+
+#[test]
+fn array_mutators_read_an_object_length_with_to_number_and_refuse_nullish_receivers() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var array_like = { 0: "a", length: { valueOf: function() { return 1; } } };
+                var popped = Array.prototype.pop.call(array_like);
+                var nullish = "no throw";
+                try { Array.prototype.push.call(undefined, 1); } catch (error) { nullish = error.name; }
+                var grown = [1, 2, 3];
+                grown.length = { valueOf: function() { return 1; } };
+                var fractional = "no throw";
+                try { grown.length = 1.5; } catch (error) { fractional = error.name; }
+                [popped, array_like.length, nullish, grown.length, fractional].join("|");
+            "#,
+        )
+        .expect("array mutators should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("a|0|TypeError|1|RangeError".to_owned())
+    );
+}

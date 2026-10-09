@@ -489,6 +489,82 @@ pub(crate) enum RegExpAccessor {
     HasIndices,
 }
 
+impl NativeFunction {
+    /// Whether the built-in begins with `RequireObjectCoercible(this)` or
+    /// `ToObject(this)`, so a `null` or `undefined` receiver is a `TypeError`.
+    /// An ordinary sloppy call would substitute the global object instead,
+    /// which is wrong for a built-in. The call path checks this before it
+    /// substitutes anything.
+    pub(crate) const fn requires_coercible_this(self) -> bool {
+        matches!(
+            self,
+            // String.prototype (ECMA-262 22.1.3), and Symbol.iterator on it.
+            Self::StrCharAt
+                | Self::StrCharCodeAt
+                | Self::StrCodePointAt
+                | Self::StrAt
+                | Self::StrIndexOf
+                | Self::StrLastIndexOf
+                | Self::StrIncludes
+                | Self::StrStartsWith
+                | Self::StrEndsWith
+                | Self::StrSlice
+                | Self::StrSubstring
+                | Self::StringSubstr
+                | Self::StrPadStart
+                | Self::StrPadEnd
+                | Self::StrTrim
+                | Self::StrTrimStart
+                | Self::StrTrimEnd
+                | Self::StrRepeat
+                | Self::StrLocaleCompare
+                | Self::StrReplace
+                | Self::StrReplaceAll
+                | Self::StrSplit
+                | Self::StrMatch
+                | Self::StrMatchAll
+                | Self::StrSearch
+                | Self::StrConcat
+                | Self::StrToLowerCase
+                | Self::StrToUpperCase
+                | Self::StrIterator
+                // Array.prototype (ECMA-262 23.1.3): every method begins with ToObject.
+                | Self::ArrayJoin
+                | Self::ArrayIndexOf
+                | Self::ArraySlice
+                | Self::ArrayValues
+                | Self::ArrayKeys
+                | Self::ArrayEntries
+                | Self::ArraySplice
+                | Self::ArrayReverse
+                | Self::ArraySort
+                | Self::ArrayConcat
+                | Self::ArrayShift
+                | Self::ArrayUnshift
+                | Self::ArrayForEach
+                | Self::ArrayMap
+                | Self::ArrayFilter
+                | Self::ArraySome
+                | Self::ArrayFind
+                | Self::ArrayFindIndex
+                | Self::ArrayFindLast
+                | Self::ArrayFindLastIndex
+                | Self::ArrayAt
+                | Self::ArrayFlat
+                | Self::ArrayReduceRight
+                | Self::ArrayEvery
+                | Self::ArrayIncludes
+                | Self::ArrayReduce
+                | Self::ArrayPrototypeToString
+                | Self::ArrayPush
+                | Self::ArrayPop
+                // Object.prototype methods that begin with ToObject(this).
+                | Self::ObjectPrototypeHasOwnProperty
+                | Self::ObjectPrototypePropertyIsEnumerable
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     MathOp(MathOp),
@@ -4364,9 +4440,6 @@ impl Realm {
             | "isSealed"
             | "isExtensible"
             | "getOwnPropertyNames"
-            | "trim"
-            | "trimStart"
-            | "trimEnd"
             // Math (ECMA-262 21.3.2): one argument.
             | "abs" | "acos" | "acosh" | "asin" | "asinh" | "atan" | "atanh" | "cbrt"
             | "ceil" | "clz32" | "cos" | "cosh" | "exp" | "expm1" | "floor" | "fround"

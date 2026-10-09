@@ -22,11 +22,20 @@ use crate::PropertyDescriptor;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::format_number_precision;
 use crate::runtime::convert::required_argument;
+use crate::runtime::eval::PrimitiveHint;
 use crate::runtime::types::ObjectEntryKind;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
+
+/// A property key after `ToPropertyKey` (ECMA-262 7.1.19): a string name, or a
+/// symbol that addresses the object's symbol slots and never its string form.
+#[derive(Clone)]
+pub(in crate::runtime) enum PropertyName {
+    String(String),
+    Symbol(JsSymbol),
+}
 
 /// A `ToPropertyDescriptor` result (ECMA-262 6.2.6.5). Each field is `None` when
 /// the descriptor object does not have it, so an absent field is told apart
@@ -141,11 +150,11 @@ impl JsRuntime {
             NativeFunction::ObjectEntries => {
                 self.object_entries(dom, arguments, ObjectEntryKind::Entries)
             }
-            NativeFunction::ObjectCreate => self.object_create(arguments),
-            NativeFunction::ObjectDefineProperty => self.object_define_property(arguments),
-            NativeFunction::ObjectDefineProperties => self.object_define_properties(arguments),
+            NativeFunction::ObjectCreate => self.object_create(dom, arguments),
+            NativeFunction::ObjectDefineProperty => self.object_define_property(dom, arguments),
+            NativeFunction::ObjectDefineProperties => self.object_define_properties(dom, arguments),
             NativeFunction::ObjectGetOwnPropertyDescriptor => {
-                self.object_get_own_property_descriptor(arguments)
+                self.object_get_own_property_descriptor(dom, arguments)
             }
             NativeFunction::ObjectGetOwnPropertyDescriptors => {
                 self.object_get_own_property_descriptors(arguments)
@@ -155,9 +164,9 @@ impl JsRuntime {
             }
             NativeFunction::ObjectGetPrototypeOf => self.object_get_prototype_of(arguments),
             NativeFunction::ObjectSetPrototypeOf => self.object_set_prototype_of(arguments),
-            NativeFunction::ObjectHasOwn => self.object_has_own(arguments),
+            NativeFunction::ObjectHasOwn => self.object_has_own(dom, arguments),
             NativeFunction::ObjectPrototypeHasOwnProperty => {
-                self.object_prototype_has_own_property(receiver, arguments)
+                self.object_prototype_has_own_property(dom, receiver, arguments)
             }
             NativeFunction::ObjectPrototypeIsPrototypeOf => {
                 Ok(self.object_prototype_is_prototype_of(receiver, arguments))
@@ -290,7 +299,7 @@ impl JsRuntime {
                 }
             }
             NativeFunction::ObjectPrototypePropertyIsEnumerable => {
-                self.object_prototype_property_is_enumerable(receiver, arguments)
+                self.object_prototype_property_is_enumerable(dom, receiver, arguments)
             }
             NativeFunction::ObjectPrototypeToString => Ok(JsValue::String(
                 self.object_to_string_tag_for_object(receiver),
@@ -689,6 +698,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn object_create(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.2 step 1: the prototype is an object or null, nothing else.
@@ -708,13 +718,61 @@ impl JsRuntime {
         if let Some(properties) = arguments.get(1)
             && !matches!(properties, JsValue::Undefined)
         {
-            self.object_define_properties(&[JsValue::Object(object), properties.clone()])?;
+            self.object_define_properties(dom, &[JsValue::Object(object), properties.clone()])?;
         }
         Ok(JsValue::Object(object))
     }
 
+    /// ECMA-262 7.1.19 `ToPropertyKey`. An object key runs `ToPrimitive` with
+    /// the string hint first, so `[1, 2]` names `"1,2"`; a symbol that comes out
+    /// of that stays a symbol, which addresses the object's symbol slots.
+    pub(in crate::runtime) fn to_property_name(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<PropertyName, JsError> {
+        match value {
+            JsValue::Symbol(symbol) => Ok(PropertyName::Symbol(symbol.clone())),
+            JsValue::Object(_) => {
+                match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)? {
+                    JsValue::Symbol(symbol) => Ok(PropertyName::Symbol(symbol)),
+                    primitive => Ok(PropertyName::String(primitive.to_js_string())),
+                }
+            }
+            other => Ok(PropertyName::String(other.to_js_string())),
+        }
+    }
+
+    /// ECMA-262 7.3.12 `HasProperty` for a string key: an ordinary chain lookup,
+    /// or the proxy `has` trap.
+    fn has_property_named(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &str,
+    ) -> Result<bool, JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_has(dom, object, key);
+        }
+        Ok(self.realm.get_descriptor(object, key).is_some())
+    }
+
+    /// `[[Get]]` of a field of a descriptor object, for a string or symbol key.
+    fn get_named_or_symbol(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &PropertyName,
+    ) -> Result<JsValue, JsError> {
+        match key {
+            PropertyName::String(name) => self.get_member(dom, object, name),
+            PropertyName::Symbol(symbol) => self.get_symbol_value(dom, object, symbol),
+        }
+    }
+
     pub(in crate::runtime) fn object_define_property(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.4 step 1: a target that is not an object is a TypeError. Unlike
@@ -726,15 +784,11 @@ impl JsRuntime {
             ));
         };
         let object = *object;
-        let key_argument = required_argument(arguments, 1, "Object.defineProperty")?;
-        // `ToPropertyKey` keeps symbols as symbols: a symbol key must address
-        // the object's symbol slots, never the string `Symbol(desc)` form.
-        // core-js (bilibili log-reporter) installs `Symbol.unscopables` on
-        // `Array.prototype` through this path.
-        let (symbol_key, key) = match key_argument {
-            JsValue::Symbol(symbol) => (Some(symbol.clone()), String::new()),
-            other => (None, other.to_js_string()),
-        };
+        // Step 2 is `ToPropertyKey(P)`. core-js (bilibili log-reporter) installs
+        // `Symbol.unscopables` on `Array.prototype` through this path, so a
+        // symbol key must keep addressing the symbol slots.
+        let key_argument = arguments.get(1).unwrap_or(&JsValue::Undefined);
+        let key = self.to_property_name(dom, key_argument)?;
         let descriptor_value = required_argument(arguments, 2, "Object.defineProperty")?;
         // §6.2.6.5 step 1: a descriptor that is not an object (undefined included)
         // is a TypeError.
@@ -743,13 +797,14 @@ impl JsRuntime {
                 "Property description must be an object",
             ));
         };
-        let partial = self.to_property_descriptor(*descriptor)?;
-        self.apply_property_descriptor(object, symbol_key.as_ref(), &key, partial)?;
+        let partial = self.to_property_descriptor(dom, *descriptor)?;
+        self.apply_property_descriptor(object, &key, partial)?;
         Ok(JsValue::Object(object))
     }
 
     pub(in crate::runtime) fn object_define_properties(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.3 step 1: a target that is not an object is a TypeError.
@@ -763,51 +818,83 @@ impl JsRuntime {
         // §20.1.2.3 step 2: `ToObject(Properties)`, so undefined and null throw.
         let descriptors_value = required_argument(arguments, 1, "Object.defineProperties")?;
         let descriptors = self.to_object(descriptors_value)?;
-        // Every descriptor is read before any property is defined (steps 3-4).
-        let properties = self
+        // Steps 3-4: every descriptor is read before any property is defined. The
+        // keys are `OwnPropertyKeys(props)`, strings then symbols; each enumerable
+        // one is re-checked and read with [[Get]] when the loop reaches it.
+        let mut keys = self
             .realm
-            .enumerable_own_properties(descriptors)
-            .unwrap_or_default();
-        let mut pending = Vec::with_capacity(properties.len());
-        for (key, descriptor) in properties {
-            let JsValue::Object(descriptor) = descriptor else {
+            .own_property_names(descriptors)
+            .unwrap_or_default()
+            .into_iter()
+            .map(PropertyName::String)
+            .collect::<Vec<_>>();
+        keys.extend(
+            self.realm
+                .own_symbols(descriptors)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PropertyName::Symbol),
+        );
+        let mut pending = Vec::with_capacity(keys.len());
+        for key in keys {
+            let enumerable = match &key {
+                PropertyName::String(name) => self
+                    .realm
+                    .own_property(descriptors, name)
+                    .is_some_and(|descriptor| descriptor.enumerable),
+                PropertyName::Symbol(symbol) => self
+                    .realm
+                    .own_symbol_property(descriptors, symbol)
+                    .is_some_and(|descriptor| descriptor.enumerable),
+            };
+            if !enumerable {
+                continue;
+            }
+            let JsValue::Object(descriptor) = self.get_named_or_symbol(dom, descriptors, &key)?
+            else {
                 return Err(JsError::type_error(
                     "Property description must be an object",
                 ));
             };
-            pending.push((key, self.to_property_descriptor(descriptor)?));
+            pending.push((key, self.to_property_descriptor(dom, descriptor)?));
         }
         for (key, partial) in pending {
-            self.apply_property_descriptor(target, None, &key, partial)?;
+            self.apply_property_descriptor(target, &key, partial)?;
         }
         Ok(JsValue::Object(target))
     }
 
     /// ECMA-262 6.2.6.5 `ToPropertyDescriptor`. A field counts as present when
     /// the descriptor has it through `HasProperty`, so an inherited field counts
-    /// too, and an absent field stays `None` so the caller can keep the current
-    /// value.
+    /// too; its value is read with [[Get]], so an accessor runs. An absent field
+    /// stays `None` so the caller can keep the current value.
     fn to_property_descriptor(
         &mut self,
+        dom: &mut Dom,
         descriptor: ObjectId,
     ) -> Result<PartialDescriptor, JsError> {
         let mut partial = PartialDescriptor::default();
-        if let Some(value) = self.realm.get_property(descriptor, "enumerable") {
+        if self.has_property_named(dom, descriptor, "enumerable")? {
+            let value = self.get_member(dom, descriptor, "enumerable")?;
             partial.enumerable = Some(value.is_truthy());
         }
-        if let Some(value) = self.realm.get_property(descriptor, "configurable") {
+        if self.has_property_named(dom, descriptor, "configurable")? {
+            let value = self.get_member(dom, descriptor, "configurable")?;
             partial.configurable = Some(value.is_truthy());
         }
-        if let Some(value) = self.realm.get_property(descriptor, "value") {
-            partial.value = Some(value);
+        if self.has_property_named(dom, descriptor, "value")? {
+            partial.value = Some(self.get_member(dom, descriptor, "value")?);
         }
-        if let Some(value) = self.realm.get_property(descriptor, "writable") {
+        if self.has_property_named(dom, descriptor, "writable")? {
+            let value = self.get_member(dom, descriptor, "writable")?;
             partial.writable = Some(value.is_truthy());
         }
-        if let Some(value) = self.realm.get_property(descriptor, "get") {
+        if self.has_property_named(dom, descriptor, "get")? {
+            let value = self.get_member(dom, descriptor, "get")?;
             partial.get = AccessorField::Present(self.accessor_slot(&value, "get")?);
         }
-        if let Some(value) = self.realm.get_property(descriptor, "set") {
+        if self.has_property_named(dom, descriptor, "set")? {
+            let value = self.get_member(dom, descriptor, "set")?;
             partial.set = AccessorField::Present(self.accessor_slot(&value, "set")?);
         }
         let accessor_present = !matches!(partial.get, AccessorField::Absent)
@@ -840,18 +927,20 @@ impl JsRuntime {
     fn apply_property_descriptor(
         &mut self,
         object: ObjectId,
-        symbol: Option<&JsSymbol>,
-        key: &str,
+        key: &PropertyName,
         partial: PartialDescriptor,
     ) -> Result<(), JsError> {
-        let current = match symbol {
-            Some(symbol) => self.realm.own_symbol_property(object, symbol),
-            None => self.realm.own_property(object, key),
-        };
-        let merged = merge_partial_descriptor(current.as_ref(), partial);
-        let applied = match symbol {
-            Some(symbol) => self.realm.define_symbol_property(object, symbol, merged),
-            None => self.realm.define_property(object, key.to_owned(), merged),
+        let applied = match key {
+            PropertyName::String(name) => {
+                let current = self.realm.own_property(object, name);
+                let merged = merge_partial_descriptor(current.as_ref(), partial);
+                self.realm.define_property(object, name.clone(), merged)
+            }
+            PropertyName::Symbol(symbol) => {
+                let current = self.realm.own_symbol_property(object, symbol);
+                let merged = merge_partial_descriptor(current.as_ref(), partial);
+                self.realm.define_symbol_property(object, symbol, merged)
+            }
         };
         if applied {
             Ok(())
@@ -862,6 +951,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn object_get_own_property_descriptor(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.4: `ToObject` first, so
@@ -872,10 +962,11 @@ impl JsRuntime {
             0,
             "Object.getOwnPropertyDescriptor",
         )?)?;
-        let key_argument = required_argument(arguments, 1, "Object.getOwnPropertyDescriptor")?;
-        let descriptor = match &key_argument {
-            JsValue::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
-            key => self.realm.own_property(object, &key.to_js_string()),
+        let key_argument = arguments.get(1).unwrap_or(&JsValue::Undefined);
+        let key = self.to_property_name(dom, key_argument)?;
+        let descriptor = match &key {
+            PropertyName::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
+            PropertyName::String(name) => self.realm.own_property(object, name),
         };
         let Some(descriptor) = descriptor else {
             return Ok(JsValue::Undefined);
@@ -1012,39 +1103,40 @@ impl JsRuntime {
         Ok(JsValue::Object(self.create_array_from_values(&names)?))
     }
 
+    /// Whether `object` has an own property under `key`, string or symbol.
+    fn has_own_named(&self, object: ObjectId, key: &PropertyName) -> bool {
+        match key {
+            PropertyName::Symbol(symbol) => {
+                self.realm.own_symbol_property(object, symbol).is_some()
+            }
+            PropertyName::String(name) => self.realm.own_property(object, name).is_some(),
+        }
+    }
+
     pub(in crate::runtime) fn object_has_own(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.18: `ToObject` first, so `Object.hasOwn("a", "0")` is true
-        // against a String wrapper's indexed characters.
+        // against a String wrapper's indexed characters; then `ToPropertyKey`.
         let value = required_argument(arguments, 0, "Object.hasOwn")?;
         let object = self.to_object(value)?;
-        let key_argument = required_argument(arguments, 1, "Object.hasOwn")?;
-        let owned = match &key_argument {
-            JsValue::Symbol(symbol) => self.realm.own_symbol_property(object, symbol).is_some(),
-            key => self
-                .realm
-                .own_property(object, &key.to_js_string())
-                .is_some(),
-        };
-        Ok(JsValue::Boolean(owned))
+        let key_argument = arguments.get(1).unwrap_or(&JsValue::Undefined);
+        let key = self.to_property_name(dom, key_argument)?;
+        Ok(JsValue::Boolean(self.has_own_named(object, &key)))
     }
 
     pub(in crate::runtime) fn object_prototype_has_own_property(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let key_argument = required_argument(arguments, 0, "Object.prototype.hasOwnProperty")?;
-        let owned = match &key_argument {
-            JsValue::Symbol(symbol) => self.realm.own_symbol_property(receiver, symbol).is_some(),
-            key => self
-                .realm
-                .own_property(receiver, &key.to_js_string())
-                .is_some(),
-        };
-        Ok(JsValue::Boolean(owned))
+        // §20.1.3.2: `ToPropertyKey(V)` comes before `ToObject(this)`.
+        let key_argument = arguments.first().unwrap_or(&JsValue::Undefined);
+        let key = self.to_property_name(dom, key_argument)?;
+        Ok(JsValue::Boolean(self.has_own_named(receiver, &key)))
     }
 
     pub(in crate::runtime) fn object_prototype_is_prototype_of(
@@ -1071,20 +1163,22 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn object_prototype_property_is_enumerable(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let key_argument =
-            required_argument(arguments, 0, "Object.prototype.propertyIsEnumerable")?;
-        let enumerable = match &key_argument {
-            JsValue::Symbol(symbol) => self
+        // §20.1.3.4: `ToPropertyKey(V)` first, then `ToObject(this)`.
+        let key_argument = arguments.first().unwrap_or(&JsValue::Undefined);
+        let key = self.to_property_name(dom, key_argument)?;
+        let enumerable = match &key {
+            PropertyName::Symbol(symbol) => self
                 .realm
                 .own_symbol_property(receiver, symbol)
                 .is_some_and(|descriptor| descriptor.enumerable),
-            key => self
+            PropertyName::String(name) => self
                 .realm
-                .own_property(receiver, &key.to_js_string())
+                .own_property(receiver, name)
                 .is_some_and(|descriptor| descriptor.enumerable),
         };
         Ok(JsValue::Boolean(enumerable))

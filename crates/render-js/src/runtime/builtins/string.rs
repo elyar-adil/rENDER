@@ -19,14 +19,31 @@ use crate::ObjectId;
 use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::MAX_MATERIALIZED_ELEMENTS;
+use crate::runtime::convert::integer_or_infinity;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::slice_range;
 use crate::runtime::convert::uint32_of_number;
+use crate::runtime::eval::PrimitiveHint;
 use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
-use crate::value::number_to_string;
 use render_dom::Dom;
+
+/// Clamp a `ToIntegerOrInfinity` position to `0..=length`, the clamp that the
+/// search methods (`indexOf`, `includes`, `startsWith`, `endsWith`) apply before
+/// they look at the string. NaN never reaches here, and negative infinity clamps
+/// to 0.
+fn clamp_position(position: f64, length: usize) -> usize {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss,
+        reason = "the position is clamped to the code-unit length first"
+    )]
+    {
+        position.max(0.0).min(length as f64) as usize
+    }
+}
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_string_native(
@@ -55,7 +72,7 @@ impl JsRuntime {
             // and a negative one is outside too, because step 5 is a plain
             // bounds check - unlike `at`, which counts from the end.
             NativeFunction::StrCodePointAt => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 let position = self.optional_integer_value(dom, arguments.first())?;
                 if !position.is_finite() || position < 0.0 {
                     return Ok(JsValue::Undefined);
@@ -80,7 +97,7 @@ impl JsRuntime {
             // surrogate pair returns that half - the same answer `charAt` gives,
             // which is exactly why the two agree on `codePointAt`'s subject.
             NativeFunction::StrAt => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "a code-unit length is a usize and f64 represents every usize on this target"
@@ -123,7 +140,7 @@ impl JsRuntime {
             //    lone high surrogate. That is the specified answer, and it is
             //    the same rule that lets `slice` cut a pair in half.
             NativeFunction::StrPadStart | NativeFunction::StrPadEnd => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 // Step 2 is `ToLength(maxLength)`, which truncates toward zero
                 // and clamps a negative or non-finite argument to 0.
                 let target =
@@ -147,7 +164,10 @@ impl JsRuntime {
                 }
                 let filler = match arguments.get(1) {
                     Some(JsValue::Undefined) | None => vec![0x20],
-                    Some(value) => utf16::utf16_units(&value.to_js_string()),
+                    Some(value) => {
+                        let filler_text = self.to_string_coerced(dom, value)?;
+                        utf16::utf16_units(&filler_text)
+                    }
                 };
                 // Step 3 of `StringPad`: an empty filler pads by nothing at all.
                 if filler.is_empty() {
@@ -176,8 +196,8 @@ impl JsRuntime {
                 }
                 Ok(JsValue::String(utf16::string_from_utf16(&units)))
             }
-            NativeFunction::StrTrimStart => self.string_trim_end(receiver, true),
-            NativeFunction::StrTrimEnd => self.string_trim_end(receiver, false),
+            NativeFunction::StrTrimStart => self.string_trim_end(dom, receiver, true),
+            NativeFunction::StrTrimEnd => self.string_trim_end(dom, receiver, false),
             // ECMA-262 22.1.3.19 `String.prototype.repeat`. A negative or
             // infinite count is a `RangeError` from `StringRepeat`, and a `NaN`
             // count is `0` because `ToIntegerOrInfinity(NaN)` is 0. The copies
@@ -185,7 +205,7 @@ impl JsRuntime {
             // lone surrogates rather than one pair: `repeat` neither splits a
             // pair nor joins two halves that were not one.
             NativeFunction::StrRepeat => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 let count = self.optional_integer_value(dom, arguments.first())?;
                 if count < 0.0 || !count.is_finite() {
                     return Err(self.range_error("String.prototype.repeat count is out of range"));
@@ -222,8 +242,9 @@ impl JsRuntime {
             // answer: `sort` would treat every pair as equal and leave the input
             // order in place.
             NativeFunction::StrLocaleCompare => {
-                let text = self.require_string_receiver(receiver)?;
-                let other = required_argument(arguments, 0, "localeCompare")?.to_js_string();
+                let text = self.require_string_receiver(dom, receiver)?;
+                let other =
+                    self.to_string_coerced(dom, required_argument(arguments, 0, "localeCompare")?)?;
                 Ok(JsValue::Number(match text.as_str().cmp(other.as_str()) {
                     std::cmp::Ordering::Less => -1.0,
                     std::cmp::Ordering::Equal => 0.0,
@@ -253,7 +274,7 @@ impl JsRuntime {
                 if !matches!(search, JsValue::Undefined | JsValue::Null)
                     && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
                 {
-                    let text = self.this_string(dom, receiver)?;
+                    let text = self.require_string_receiver(dom, receiver)?;
                     return self.call_with_this(
                         dom,
                         replacer,
@@ -261,8 +282,11 @@ impl JsRuntime {
                         search,
                     );
                 }
-                let needle = self.to_string_argument(dom, &search)?;
-                self.string_replace_all_literal(dom, receiver, &needle, &replacement)
+                // ECMA-262 22.1.3.20 step 3 converts `this` before step 4 converts
+                // the search value.
+                let text = self.require_string_receiver(dom, receiver)?;
+                let needle = self.to_string_coerced(dom, &search)?;
+                self.string_replace_all_literal(dom, text, &needle, &replacement)
             }
             // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units.
             // `intStart` is `ToClampedIndex(start, size)` - a negative start
@@ -270,7 +294,7 @@ impl JsRuntime {
             // rather than resolved from the end, so `substr(0, -1)` is empty
             // and `substr(-1)` is the last code unit.
             NativeFunction::StringSubstr => {
-                let text = self.require_string_receiver(receiver)?;
+                let text = self.require_string_receiver(dom, receiver)?;
                 let units = utf16::utf16_units(&text);
                 let size = units.len();
                 let start = slice_range(
@@ -556,59 +580,42 @@ impl JsRuntime {
         self.realm.string_wrapper(value)
     }
 
-    /// Resolve the string a `%String.prototype%` method operates on.
-    ///
-    /// Per spec, general string methods coerce any non-null receiver through
-    /// the `ToString` abstract operation instead of requiring an actual string
-    /// wrapper. Real-world bundles routinely call `String.prototype.indexOf`,
-    /// `slice`, `match` and friends with `.call(anyObject)` as a coercion and
-    /// feature probe, so plain objects must not throw here. The couple of
-    /// brand-checking methods (`toString`, `valueOf`) use
-    /// [`Self::require_string_object`] instead.
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "callers share the fallible native-string method path"
-    )]
+    /// Resolve the string a `%String.prototype%` method operates on:
+    /// `ToString(this)` after `RequireObjectCoercible` (ECMA-262 22.1.3 step 1-2).
+    /// A nullish receiver never reaches here, because the native call path
+    /// refuses it first (see `NativeFunction::requires_coercible_this`). A string
+    /// wrapper answers from its host; anything else runs `ToPrimitive` with the
+    /// string hint, so a user `toString` supplies the text.
     pub(in crate::runtime) fn require_string_receiver(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<String, JsError> {
-        match self.realm.host(receiver) {
-            Some(ObjectHost::StringPrimitive(text)) => Ok(text.clone()),
-            Some(ObjectHost::NumberPrimitive(number)) => Ok(number_to_string(number)),
-            Some(ObjectHost::BooleanPrimitive(value)) => {
-                Ok(if value { "true" } else { "false" }.to_owned())
+        if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(receiver) {
+            return Ok(text);
+        }
+        self.to_string_coerced(dom, &JsValue::Object(receiver))
+    }
+
+    /// ECMA-262 7.1.17 `ToString`, for a value that may be an object. Unlike
+    /// the `String(value)` conversion, a symbol is a `TypeError` here, both
+    /// directly and when `ToPrimitive` produces one.
+    pub(in crate::runtime) fn to_string_coerced(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<String, JsError> {
+        let primitive = match value {
+            JsValue::Object(_) => {
+                self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?
             }
-            Some(ObjectHost::Array) => {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "array length is a validated finite non-negative integer"
-                )]
-                let length = self
-                    .realm
-                    .get_property(receiver, "length")
-                    .and_then(|value| match &value {
-                        JsValue::Number(number)
-                            if number.is_finite() && number.is_sign_positive() =>
-                        {
-                            Some(*number as usize)
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                let joined = (0..length)
-                    .map(|index| self.realm.get_property(receiver, &index.to_string()))
-                    .map(|value| value.unwrap_or(JsValue::Undefined).to_js_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                Ok(joined)
-            }
-            // `String.prototype.toString`/`valueOf` brand-check below, so every
-            // other host (ordinary objects, DOM nodes, collections, helpers)
-            // falls back to the ordinary object string form this runtime
-            // already produces for concatenation and logging.
-            _ => Ok("[object Object]".to_owned()),
+            other => other.clone(),
+        };
+        match primitive {
+            JsValue::Symbol(_) => Err(JsError::type_error(
+                "Cannot convert a Symbol value to a string",
+            )),
+            other => Ok(other.to_js_string()),
         }
     }
 
@@ -693,7 +700,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let position = self.optional_integer_value(dom, arguments.first())?;
         Ok(char_at_value(&utf16::utf16_units(&text), position))
     }
@@ -710,7 +717,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let position = self.optional_integer_value(dom, arguments.first())?;
         let units = utf16::utf16_units(&text);
         let Some(position) = valid_position(position, units.len()) else {
@@ -793,33 +800,43 @@ impl JsRuntime {
     /// *is* `0xDE00` even though it is the trailing half of a pair. An
     /// implementation that searches by code point cannot answer that at all.
     pub(in crate::runtime) fn string_index_of(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
         from_end: bool,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        let needle = required_argument(arguments, 0, "indexOf")?.to_js_string();
+        let text = self.require_string_receiver(dom, receiver)?;
+        let search = arguments.first().unwrap_or(&JsValue::Undefined);
+        let needle = self.to_string_coerced(dom, search)?;
         let units = utf16::utf16_units(&text);
         let needle = utf16::utf16_units(&needle);
-        // §6.1.4.1 step 3: the empty String is found at `fromIndex`, and
-        // `StringLastIndexOf` step 3 asserts the same for the end position, so
-        // `indexOf('')` is 0 and `lastIndexOf('')` is the length.
-        if needle.is_empty() {
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "string lengths stay far below any precision boundary"
-            )]
-            let position = if from_end { units.len() as f64 } else { 0.0 };
-            return Ok(JsValue::Number(position));
-        }
-        let found = if from_end {
-            (0..=units.len().saturating_sub(needle.len()))
-                .rev()
-                .find(|start| units[*start..].starts_with(&needle))
+        let length = units.len();
+        let start = if from_end {
+            // §22.1.3.12 steps 3-4: `ToNumber(position)`, where NaN means +∞, so
+            // an absent position searches from the end.
+            let number =
+                self.to_number_value(dom, arguments.get(1).unwrap_or(&JsValue::Undefined))?;
+            if number.is_nan() {
+                length
+            } else {
+                clamp_position(integer_or_infinity(number), length)
+            }
         } else {
-            (0..=units.len().saturating_sub(needle.len()))
-                .find(|start| units[*start..].starts_with(&needle))
+            // §22.1.3.9 steps 3-4: `ToIntegerOrInfinity(position)`, absent is 0.
+            let position = self.optional_integer_value(dom, arguments.get(1))?;
+            clamp_position(position, length)
+        };
+        // §6.1.4.1 `StringIndexOf` and §6.1.4.2 `StringLastIndexOf`: the empty
+        // needle is found at the clamped position itself.
+        let found = if needle.len() > length {
+            None
+        } else if from_end {
+            (0..=start.min(length - needle.len()))
+                .rev()
+                .find(|index| units[*index..].starts_with(&needle))
+        } else {
+            (start..=length - needle.len()).find(|index| units[*index..].starts_with(&needle))
         };
         Ok(match found {
             #[allow(
@@ -831,30 +848,35 @@ impl JsRuntime {
         })
     }
 
-    /// ECMA-262 22.1.3.8 `String.prototype.includes`, which is `StringIndexOf`
-    /// over code units for its truthiness. The engine previously answered this
-    /// with `str::contains`, which cannot find a lone surrogate that is the
-    /// trailing half of a pair.
+    /// ECMA-262 22.1.3.8 `String.prototype.includes`: `StringIndexOf` over code
+    /// units from the clamped position, after rejecting a `RegExp` search value.
     pub(in crate::runtime) fn string_includes(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        let needle = required_argument(arguments, 0, "includes")?.to_js_string();
+        let text = self.require_string_receiver(dom, receiver)?;
+        let search = arguments.first().unwrap_or(&JsValue::Undefined);
+        if self.is_regexp(dom, search)? {
+            return Err(JsError::type_error(
+                "First argument to String.prototype.includes must not be a regular expression",
+            ));
+        }
+        let needle = self.to_string_coerced(dom, search)?;
+        let position = self.optional_integer_value(dom, arguments.get(1))?;
         let units = utf16::utf16_units(&text);
         let needle = utf16::utf16_units(&needle);
-        Ok(JsValue::Boolean(
-            (0..=units.len().saturating_sub(needle.len()))
-                .any(|start| units[start..].starts_with(&needle)),
-        ))
+        let start = clamp_position(position, units.len());
+        let found = needle.len() <= units.len()
+            && (start..=units.len() - needle.len())
+                .any(|index| units[index..].starts_with(&needle));
+        Ok(JsValue::Boolean(found))
     }
 
     /// ECMA-262 22.1.3.24 `startsWith` and 22.1.3.7 `endsWith`, which compare
     /// the code-unit substring at the clamped end of the string against the
-    /// search value. Comparing Rust `&str` prefixes/suffixes would be wrong for
-    /// a lone-surrogate needle against a pair, for the same reason `includes`
-    /// needed the code-unit view.
+    /// search value. A `RegExp` search value is a `TypeError` for both.
     pub(in crate::runtime) fn string_starts_or_ends_with(
         &mut self,
         dom: &mut Dom,
@@ -862,35 +884,28 @@ impl JsRuntime {
         arguments: &[JsValue],
         starts: bool,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        // `ToString(searchString)`, so an absent argument searches for "undefined".
-        let needle = self.to_string_value(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
+        let text = self.require_string_receiver(dom, receiver)?;
+        let search = arguments.first().unwrap_or(&JsValue::Undefined);
+        if self.is_regexp(dom, search)? {
+            return Err(JsError::type_error(
+                "First argument to String.prototype.startsWith/endsWith must not be a regular expression",
+            ));
+        }
+        let needle = self.to_string_coerced(dom, search)?;
         let units = utf16::utf16_units(&text);
         let needle = utf16::utf16_units(&needle);
         let length = units.len();
-        // The position is converted even when the search string is empty, and
-        // an absent position is 0 for `startsWith` and the length for `endsWith`.
-        let position = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => {
-                if starts {
-                    0.0
-                } else {
-                    length as f64
-                }
-            }
-            Some(value) => self.to_integer_value(dom, value)?,
-        };
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            clippy::cast_precision_loss,
-            reason = "the position is clamped to the code-unit length first"
-        )]
-        let clamped = position.max(0.0).min(length as f64) as usize;
         let matched = if starts {
-            clamped + needle.len() <= length && units[clamped..clamped + needle.len()] == needle
+            // §22.1.3.24 steps 6-9: `ToIntegerOrInfinity(position)`, absent is 0.
+            let start = clamp_position(self.optional_integer_value(dom, arguments.get(1))?, length);
+            start + needle.len() <= length && units[start..start + needle.len()] == needle
         } else {
-            clamped >= needle.len() && units[clamped - needle.len()..clamped] == needle
+            // §22.1.3.7 steps 6-8: an absent end position is the length.
+            let end = match arguments.get(1) {
+                None | Some(JsValue::Undefined) => length,
+                Some(value) => clamp_position(self.to_integer_value(dom, value)?, length),
+            };
+            end >= needle.len() && units[end - needle.len()..end] == needle
         };
         Ok(JsValue::Boolean(matched))
     }
@@ -903,7 +918,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let units = utf16::utf16_units(&text);
         let start = self.optional_integer_value(dom, arguments.first())?;
         let end = match arguments.get(1) {
@@ -924,7 +939,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let units = utf16::utf16_units(&text);
         let start = self.optional_integer_value(dom, arguments.first())?;
         let end = match arguments.get(1) {
@@ -936,12 +951,12 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn string_to_case(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
-        _arguments: &[JsValue],
         upper: bool,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         Ok(JsValue::String(if upper {
             text.to_uppercase()
         } else {
@@ -949,19 +964,29 @@ impl JsRuntime {
         }))
     }
 
-    pub(in crate::runtime) fn string_trim(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
-        Ok(JsValue::String(text.trim().to_owned()))
+    /// ECMA-262 22.1.3.30 `String.prototype.trim`: `TrimString` over the
+    /// `WhiteSpace` and `LineTerminator` code points, which is not Rust's
+    /// `char::is_whitespace` set (U+FEFF is trimmed, and U+0085 is not).
+    pub(in crate::runtime) fn string_trim(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let text = self.require_string_receiver(dom, receiver)?;
+        Ok(JsValue::String(
+            text.trim_matches(is_js_whitespace).to_owned(),
+        ))
     }
 
-    /// ECMA-262 22.1.3.17 `String.prototype.trimStart` and 22.1.3.18
-    /// `trimEnd`, which are `trim` restricted to one end.
+    /// ECMA-262 22.1.3.31 `trimStart` and 22.1.3.32 `trimEnd`, which are `trim`
+    /// restricted to one end.
     pub(in crate::runtime) fn string_trim_end(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         start: bool,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         Ok(JsValue::String(if start {
             text.trim_start_matches(is_js_whitespace).to_owned()
         } else {
@@ -983,11 +1008,10 @@ impl JsRuntime {
     pub(in crate::runtime) fn string_replace_all_literal(
         &mut self,
         dom: &mut Dom,
-        receiver: ObjectId,
+        text: String,
         needle: &str,
         replacement: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let text = self.this_string(dom, receiver)?;
         let units = utf16::utf16_units(&text);
         let pattern = utf16::utf16_units(needle);
         // The output is accumulated as code units rather than as text, because a
@@ -1066,12 +1090,14 @@ impl JsRuntime {
     /// one pair, because the result is read back as a code-unit sequence.
     pub(in crate::runtime) fn string_concat(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let mut units = utf16::utf16_units(&self.require_string_receiver(receiver)?);
+        let mut units = utf16::utf16_units(&self.require_string_receiver(dom, receiver)?);
         for argument in arguments {
-            units.extend(utf16::utf16_units(&argument.to_js_string()));
+            let text = self.to_string_coerced(dom, argument)?;
+            units.extend(utf16::utf16_units(&text));
         }
         Ok(JsValue::String(utf16::string_from_utf16(&units)))
     }
@@ -1083,7 +1109,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.this_string(dom, receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let separator = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let limit = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
         // ECMA-262 22.1.3.23 steps 3-4: a `@@split` method takes over.
@@ -1104,29 +1130,29 @@ impl JsRuntime {
                 uint32_of_number(number) as usize
             }
         };
+        // Step 5 converts the separator before step 6 returns for a zero limit.
+        let separator = match &separator {
+            JsValue::Undefined => None,
+            value => Some(self.to_string_coerced(dom, value)?),
+        };
         if limit == 0 {
             return Ok(JsValue::Object(self.create_array_from_values(&[])?));
         }
-        let pieces = if matches!(separator, JsValue::Undefined) {
-            vec![text]
-        } else {
-            let separator = self.to_string_argument(dom, &separator)?;
-            if separator.is_empty() {
-                // §22.1.3.23: an empty separator "returns the List containing the
-                // String values for each code unit", so `'\u{1F600}'.split('')`
-                // has two elements. This is the same code-unit notion `length`
-                // reports, so `split('')`, `length` and `charAt` agree.
-                utf16::utf16_units(&text)
-                    .iter()
-                    .take(limit)
-                    .map(|unit| utf16::string_from_unit(*unit))
-                    .collect()
-            } else {
-                // A non-empty separator is matched as a substring of the
-                // code-unit sequence, so `'\u{1F600}a'.split('\uDE00')` splits
-                // inside the pair, which a `&str` search could not do.
-                split_by_units(&text, &separator, limit)
-            }
+        let pieces = match separator {
+            None => vec![text],
+            // §22.1.3.23: an empty separator "returns the List containing the
+            // String values for each code unit", so `'\u{1F600}'.split('')` has
+            // two elements. This is the same code-unit notion `length` reports,
+            // so `split('')`, `length` and `charAt` agree.
+            Some(separator) if separator.is_empty() => utf16::utf16_units(&text)
+                .iter()
+                .take(limit)
+                .map(|unit| utf16::string_from_unit(*unit))
+                .collect(),
+            // A non-empty separator is matched as a substring of the code-unit
+            // sequence, so `'\u{1F600}a'.split('\uDE00')` splits inside the pair,
+            // which a `&str` search could not do.
+            Some(separator) => split_by_units(&text, &separator, limit),
         };
         let values = pieces.into_iter().map(JsValue::String).collect::<Vec<_>>();
         Ok(JsValue::Object(self.create_array_from_values(&values)?))
@@ -1140,7 +1166,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.this_string(dom, receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         if !matches!(regexp, JsValue::Undefined | JsValue::Null)
             && let Some(matcher) = self.symbol_method_of(dom, &regexp, "@@match")?
@@ -1158,7 +1184,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.this_string(dom, receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         if !matches!(regexp, JsValue::Undefined | JsValue::Null) {
             if let JsValue::Object(object) = regexp
@@ -1191,7 +1217,7 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.this_string(dom, receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         let regexp = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         if !matches!(regexp, JsValue::Undefined | JsValue::Null)
             && let Some(searcher) = self.symbol_method_of(dom, &regexp, "@@search")?
@@ -1214,9 +1240,10 @@ impl JsRuntime {
     /// *values* are code points - `length` and every index remain code units.
     pub(in crate::runtime) fn string_iterator(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         self.ensure_heap_capacity(1)?;
         let values = text
             .chars()
@@ -1237,7 +1264,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let search = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let replace_value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-        let text = self.this_string(dom, receiver)?;
+        let text = self.require_string_receiver(dom, receiver)?;
         if !matches!(search, JsValue::Undefined | JsValue::Null)
             && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
         {
@@ -1248,7 +1275,7 @@ impl JsRuntime {
                 search,
             );
         }
-        let needle = self.to_string_argument(dom, &search)?;
+        let needle = self.to_string_coerced(dom, &search)?;
         let replacer = match &replace_value {
             JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
                 Some(*callable)
@@ -1258,7 +1285,7 @@ impl JsRuntime {
         let template = if replacer.is_some() {
             Vec::new()
         } else {
-            let template = self.to_string_argument(dom, &replace_value)?;
+            let template = self.to_string_coerced(dom, &replace_value)?;
             utf16::utf16_units(&template)
         };
         let units = utf16::utf16_units(&text);
@@ -2081,5 +2108,70 @@ mod tests {
             run("var s = 'a\\u{1f600}'; s.length + ':' + [...s].length"),
             "3:2"
         );
+    }
+
+    #[test]
+    fn search_methods_clamp_positions_and_reject_regexps() {
+        // §22.1.3.8: a position past the end finds nothing, even an empty needle
+        // at the end is clamped, not searched past.
+        assert_eq!(run("'word'.includes('w', 5)"), "false");
+        assert_eq!(run("'word'.includes('o', 3)"), "false");
+        assert_eq!(run("'word'.includes('d', 3)"), "true");
+        assert_eq!(run("'word'.includes('', 9)"), "true");
+        // §22.1.3.9: `indexOf` honours its position, `ToIntegerOrInfinity` of it.
+        assert_eq!(run("'abcabc'.indexOf('c', 3)"), "5");
+        assert_eq!(run("'abcabc'.indexOf('a', -10)"), "0");
+        assert_eq!(run("'abc'.indexOf('', 9)"), "3");
+        // §22.1.3.12: `lastIndexOf` treats a NaN position as +∞.
+        assert_eq!(run("'abcabc'.lastIndexOf('c')"), "5");
+        assert_eq!(run("'abcabc'.lastIndexOf('c', NaN)"), "5");
+        assert_eq!(run("'abcabc'.lastIndexOf('c', 3)"), "2");
+        assert_eq!(run("'abc'.lastIndexOf('', 1)"), "1");
+        // The search and position arguments are converted with ToString/ToNumber,
+        // which run `valueOf`/`toString`.
+        assert_eq!(
+            run("'AB'.indexOf({ toString: function() { return 'B'; } })"),
+            "1"
+        );
+        assert_eq!(
+            run("'ABB'.indexOf('B', { valueOf: function() { return 2; } })"),
+            "2"
+        );
+        // §22.1.3.8 / §22.1.3.7 / §22.1.3.24 step 3: a RegExp is a TypeError.
+        assert_eq!(
+            caught("'a/b'.includes(/a/)"),
+            "TypeError: First argument to String.prototype.includes must not be a regular expression"
+        );
+        assert!(caught("'a'.startsWith(/a/)").starts_with("TypeError: "));
+        assert!(caught("'a'.endsWith(/a/)").starts_with("TypeError: "));
+        // A `Symbol.match` of false lets a RegExp through as an ordinary string.
+        assert_eq!(
+            run("var re = /a/; re[Symbol.match] = false; 'x/a/y'.includes(re)"),
+            "true"
+        );
+        // `endsWith` clamps its end position and ignores a missing one.
+        assert_eq!(run("'abc'.endsWith('b', 2)"), "true");
+        assert_eq!(run("'abc'.endsWith('c', undefined)"), "true");
+        assert_eq!(run("'abc'.endsWith('b', 99)"), "false");
+    }
+
+    #[test]
+    fn string_methods_coerce_the_receiver_and_refuse_nullish_this() {
+        // RequireObjectCoercible(this): a nullish receiver is a TypeError, not
+        // the global object the call path would otherwise substitute.
+        assert!(caught("String.prototype.trim.call(undefined)").starts_with("TypeError: "));
+        assert!(caught("String.prototype.indexOf.call(null, 'a')").starts_with("TypeError: "));
+        // ToString(this) runs a user `toString`, and whitespace is the JS set.
+        assert_eq!(
+            run("String.prototype.trim.call({ toString: function() { return ' abc '; } })"),
+            "abc"
+        );
+        assert_eq!(run("'\\uFEFFx\\u00A0'.trim()"), "x");
+        assert_eq!(run("'\\u0085x'.trim() === '\\u0085x'"), "true");
+        assert_eq!(run("String.prototype.trim.length"), "0");
+        // A Symbol is not convertible to a string, as a search value or receiver.
+        assert!(caught("'a'.indexOf(Symbol())").starts_with("TypeError: "));
+        assert!(caught("'a'.concat(Symbol())").starts_with("TypeError: "));
+        assert!(caught("String.prototype.replace.call(Symbol())").starts_with("TypeError: "));
     }
 }
