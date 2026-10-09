@@ -61,6 +61,7 @@ impl JsRuntime {
         let multiline = compiled.flags().multiline;
         let dot_all = compiled.flags().dot_all;
         let sticky = compiled.flags().sticky;
+        let has_indices = compiled.flags().has_indices;
         let index = self.regexes.len();
         self.regexes.push(RegexRecord {
             compiled,
@@ -75,6 +76,7 @@ impl JsRuntime {
             ("multiline", JsValue::Boolean(multiline)),
             ("dotAll", JsValue::Boolean(dot_all)),
             ("sticky", JsValue::Boolean(sticky)),
+            ("hasIndices", JsValue::Boolean(has_indices)),
             ("lastIndex", JsValue::Number(0.0)),
         ] {
             self.realm.set_property(object, name.to_owned(), value);
@@ -116,6 +118,7 @@ impl JsRuntime {
         input: &[u16],
         text: &str,
         found: &MatchRanges,
+        has_indices: bool,
     ) -> Result<JsValue, JsError> {
         let mut values = Vec::with_capacity(found.groups.len() + 1);
         values.push(JsValue::String(utf16::string_from_utf16(
@@ -143,7 +146,63 @@ impl JsRuntime {
             self.named_groups_object(found, input)?
         };
         self.realm.set_property(array, "groups".to_owned(), groups);
+        if has_indices {
+            let indices = self.match_indices(found)?;
+            self.realm
+                .set_property(array, "indices".to_owned(), JsValue::Object(indices));
+        }
         Ok(JsValue::Object(array))
+    }
+
+    /// The `[start, end]` pair of a span, or `undefined` for a group that did
+    /// not participate.
+    fn index_pair(&mut self, span: Option<(usize, usize)>) -> Result<JsValue, JsError> {
+        Ok(match span {
+            Some((start, end)) => JsValue::Object(self.create_array_from_values(&[
+                JsValue::Number(start as f64),
+                JsValue::Number(end as f64),
+            ])?),
+            None => JsValue::Undefined,
+        })
+    }
+
+    /// The `indices` array of a `d`-flag match: a pair for the whole match and
+    /// for each group, plus a `groups` object for named groups (ECMA-262
+    /// `MakeMatchIndicesIndexPairArray`). A repeated name takes the group that
+    /// participated, as `groups` does.
+    fn match_indices(&mut self, found: &MatchRanges) -> Result<ObjectId, JsError> {
+        let mut values = Vec::with_capacity(found.groups.len() + 1);
+        values.push(self.index_pair(Some((found.start, found.end)))?);
+        for span in &found.groups {
+            values.push(self.index_pair(*span)?);
+        }
+        let indices = self.create_array_from_values(&values)?;
+        let groups = if found.names.is_empty() {
+            JsValue::Undefined
+        } else {
+            self.ensure_heap_capacity(1)?;
+            let mut entries: Vec<(&String, Option<(usize, usize)>)> = Vec::new();
+            for (name, index) in found.names.iter() {
+                let span = found.groups.get(index - 1).copied().flatten();
+                match entries.iter_mut().find(|(existing, _)| *existing == name) {
+                    Some((_, current)) => {
+                        if current.is_none() {
+                            *current = span;
+                        }
+                    }
+                    None => entries.push((name, span)),
+                }
+            }
+            let object = self.realm.create_object(None);
+            for (name, span) in entries {
+                let value = self.index_pair(span)?;
+                self.realm.set_property(object, name.clone(), value);
+            }
+            JsValue::Object(object)
+        };
+        self.realm
+            .set_property(indices, "groups".to_owned(), groups);
+        Ok(indices)
     }
 
     /// The first match at or after `start` as a result array, or `None`.
@@ -154,8 +213,11 @@ impl JsRuntime {
         text: &str,
         start: usize,
     ) -> Result<Option<JsValue>, JsError> {
+        let has_indices = self.regexes[index].compiled.flags().has_indices;
         match self.regexes[index].compiled.find(input, start) {
-            Some(found) => self.regex_result(input, text, &found).map(Some),
+            Some(found) => self
+                .regex_result(input, text, &found, has_indices)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -225,7 +287,8 @@ impl JsRuntime {
             }
             return Ok(JsValue::Null);
         };
-        let value = self.regex_result(&input, &text, &found)?;
+        let has_indices = self.regexes[index].compiled.flags().has_indices;
+        let value = self.regex_result(&input, &text, &found, has_indices)?;
         if track_last_index {
             self.store_regex_last_index(receiver, index, found.end);
         }

@@ -106,7 +106,12 @@ impl Flags {
                 'm' => parsed.multiline = true,
                 's' => parsed.dot_all = true,
                 'u' => parsed.unicode = true,
-                'v' => parsed.unicode_sets = true,
+                // `v` reads patterns with the `u` semantics; its set notation
+                // is not implemented (see `compile`).
+                'v' => {
+                    parsed.unicode = true;
+                    parsed.unicode_sets = true;
+                }
                 'y' => parsed.sticky = true,
                 other => {
                     return Err(RegexSyntaxError::new(format!(
@@ -115,7 +120,7 @@ impl Flags {
                 }
             }
         }
-        if parsed.unicode && parsed.unicode_sets {
+        if seen.contains('u') && seen.contains('v') {
             return Err(RegexSyntaxError::new(
                 "flags u and v are mutually exclusive",
             ));
@@ -133,7 +138,7 @@ impl Flags {
             (self.ignore_case, 'i'),
             (self.multiline, 'm'),
             (self.dot_all, 's'),
-            (self.unicode, 'u'),
+            (self.unicode && !self.unicode_sets, 'u'),
             (self.unicode_sets, 'v'),
             (self.sticky, 'y'),
         ] {
@@ -1012,6 +1017,18 @@ type NamedGroup = (String, usize, Vec<(usize, usize)>);
 /// engine deliberately does not support.
 pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
     let parsed_flags = Flags::parse(flags)?;
+    compile_flags(pattern, parsed_flags).map_err(|error| {
+        // Set notation under `v` is not implemented, so a pattern that fails the
+        // `u` grammar may still be valid `v` syntax: defer it, do not reject it.
+        if parsed_flags.unicode_sets {
+            RegexSyntaxError::unsupported(error.message)
+        } else {
+            error
+        }
+    })
+}
+
+fn compile_flags(pattern: &str, parsed_flags: Flags) -> Result<Compiled, RegexSyntaxError> {
     let characters = pattern_characters(pattern, parsed_flags.unicode);
     let (names, total_groups) = scan_group_names(&characters);
     let mut parser = PatternParser {
@@ -1235,10 +1252,14 @@ impl PatternParser<'_> {
                 "quantifier upper bound below lower bound".to_owned(),
             ));
         }
-        Ok(Some((min, max)))
+        // The engine counts repetitions in u32; no input is long enough to tell
+        // a larger bound apart from u32::MAX.
+        let clamp = |count: u64| u32::try_from(count).unwrap_or(u32::MAX);
+        Ok(Some((clamp(min), max.map(clamp))))
     }
 
-    fn digits(&mut self) -> Option<u32> {
+    /// A decimal count. A count beyond `u64` saturates: no input is that long.
+    fn digits(&mut self) -> Option<u64> {
         let start = self.cursor;
         while self.peek().is_some_and(|value| value.is_ascii_digit()) {
             self.cursor += 1;
@@ -1246,8 +1267,15 @@ impl PatternParser<'_> {
         if self.cursor == start {
             return None;
         }
-        let text: String = self.characters[start..self.cursor].iter().collect();
-        text.parse().ok()
+        Some(
+            self.characters[start..self.cursor]
+                .iter()
+                .fold(0u64, |count, digit| {
+                    count
+                        .saturating_mul(10)
+                        .saturating_add(u64::from(digit.to_digit(10).unwrap_or_default()))
+                }),
+        )
     }
 
     fn atom(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
@@ -1925,7 +1953,7 @@ mod property {
 
 #[cfg(test)]
 mod tests {
-    use super::{Compiled, compile, validate};
+    use super::{Compiled, Flags, compile, validate};
 
     fn units(input: &str) -> Vec<u16> {
         input.encode_utf16().collect()
@@ -2147,6 +2175,15 @@ mod tests {
         assert_eq!(matches(r"\udf06", "u", "𝌆"), None);
         assert_eq!(matches(r"\udf06", "", "𝌆"), Some((1, 2)));
         assert_eq!(matches(r"(?<=😀)a", "u", "😀a"), Some((2, 3)));
+        // `v` reads code points too; its set notation is not implemented.
+        assert_eq!(matches(r"\p{Script=Han}", "v", "𠮷"), Some((0, 2)));
+        assert_eq!(
+            Flags::parse("v").map(Flags::describe).ok().as_deref(),
+            Some("v")
+        );
+        // A count beyond u32 is a valid, saturated bound.
+        assert!(validate("b{9007199254740991}", "u").is_ok());
+        assert_eq!(matches("a{4294967296}", "", "a"), None);
     }
 
     #[test]
