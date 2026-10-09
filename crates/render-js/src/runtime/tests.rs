@@ -4228,6 +4228,34 @@ fn repeated_gc_preserves_live_count_and_prototype_walks() {
 }
 
 #[test]
+fn a_with_body_object_survives_collection_through_its_environment_record() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let JsValue::Object(object) = runtime
+        .execute(&mut parsed.dom, "({x: 42})")
+        .expect("object literal evaluates")
+        .value
+    else {
+        panic!("an object literal evaluates to an object");
+    };
+    // Nothing but the `with` record references the object while its body runs.
+    runtime
+        .environment
+        .push(std::rc::Rc::new(std::cell::RefCell::new(
+            super::types::EnvironmentRecord {
+                with_object: Some(object),
+                ..Default::default()
+            },
+        )));
+    runtime.collect_garbage();
+    runtime.environment.pop();
+    assert_eq!(
+        runtime.realm.own_property(object, "x").map(|d| d.value),
+        Some(JsValue::Number(42.0))
+    );
+}
+
+#[test]
 fn object_set_prototype_of_changes_lookup_and_rejects_cycles() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

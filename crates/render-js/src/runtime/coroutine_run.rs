@@ -608,7 +608,7 @@ impl JsRuntime {
                     return Ok(Flow::Next);
                 }
                 let value = self.get_member(dom, result, "value")?;
-                self.bind_loop_value(&binding, value)?;
+                self.bind_loop_value(dom, &binding, value)?;
                 co.pc += 1;
                 Ok(Flow::Next)
             }
@@ -661,7 +661,7 @@ impl JsRuntime {
                     return Ok(Flow::Next);
                 };
                 co.set_hidden(&format!("%x{slot}"), JsValue::Number(index + 1.0));
-                self.bind_loop_value(&binding, value)?;
+                self.bind_loop_value(dom, &binding, value)?;
                 co.pc += 1;
                 Ok(Flow::Next)
             }
@@ -774,9 +774,14 @@ impl JsRuntime {
         }
     }
 
-    fn bind_loop_value(&mut self, binding: &LoopBinding, value: JsValue) -> Result<(), JsError> {
+    fn bind_loop_value(
+        &mut self,
+        dom: &mut Dom,
+        binding: &LoopBinding,
+        value: JsValue,
+    ) -> Result<(), JsError> {
         if binding.kind == VariableKind::Var {
-            return self.assign_binding(&binding.name, value);
+            return self.assign_binding(dom, &binding.name, value);
         }
         let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
         environment.borrow_mut().bindings.insert(

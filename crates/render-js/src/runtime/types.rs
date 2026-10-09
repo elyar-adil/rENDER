@@ -62,6 +62,10 @@ pub(super) struct EnvironmentRecord {
     pub(super) function_scope: bool,
     /// Live import bindings of a module environment; empty elsewhere.
     pub(super) imports: BTreeMap<String, super::module::ImportRef>,
+    /// The binding object of a `with` statement's object environment record
+    /// (ECMA-262 9.1.1.2). Its properties are bindings, consulted before the
+    /// records outside the `with` body.
+    pub(super) with_object: Option<ObjectId>,
 }
 
 pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;

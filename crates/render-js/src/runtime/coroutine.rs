@@ -201,6 +201,9 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
                     tests.iter().any(expr_has_suspend) || statements_have_suspend(body)
                 })
         }
+        Statement::With { object, body, .. } => {
+            expr_has_suspend(object) || statement_has_suspend(body)
+        }
         Statement::While {
             condition, body, ..
         } => expr_has_suspend(condition) || statement_has_suspend(body),
@@ -636,6 +639,9 @@ impl Compiler {
             } => self.for_each(false, *kind, name, iterable, body)?,
             Statement::ForInExpr { offset, .. } => {
                 return Err(unsupported("a `for…in` with an assignment target", *offset));
+            }
+            Statement::With { offset, .. } => {
+                return Err(unsupported("a `with` statement", *offset));
             }
             Statement::Labeled { label, body, .. } => {
                 self.pending_labels.push(Rc::from(label.as_str()));

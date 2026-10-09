@@ -110,11 +110,29 @@ pub(super) enum Completion {
 
 #[derive(Clone, Debug)]
 pub(super) enum AssignmentReference {
-    Binding(String),
-    Property { object: ObjectId, property: String },
-    SymbolProperty { object: ObjectId, symbol: JsSymbol },
-    Private { object: ObjectId, name: String },
-    SuperProperty { property: String },
+    /// An identifier, resolved when the reference is created (ECMA-262
+    /// 13.15.2 evaluates the target before the value), so a write goes to the
+    /// record that was found even if the value expression changes the scope.
+    /// `scope` is `None` for the global environment.
+    Binding {
+        name: String,
+        scope: Option<usize>,
+    },
+    Property {
+        object: ObjectId,
+        property: String,
+    },
+    SymbolProperty {
+        object: ObjectId,
+        symbol: JsSymbol,
+    },
+    Private {
+        object: ObjectId,
+        name: String,
+    },
+    SuperProperty {
+        property: String,
+    },
 }
 
 /// One live iterator being consumed by an array binding pattern.
@@ -379,7 +397,7 @@ impl JsRuntime {
         }
         for (name, parameters, body, kind) in functions {
             let value = self.create_function(Some(name), parameters, body, kind)?;
-            self.initialize_binding(name, value, VariableKind::Var)?;
+            self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
     }
@@ -461,7 +479,7 @@ impl JsRuntime {
         }
         for (name, parameters, body, kind) in functions {
             let value = self.create_function(Some(name), parameters, body, kind)?;
-            self.initialize_binding(name, value, VariableKind::Var)?;
+            self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
     }
@@ -659,7 +677,7 @@ impl JsRuntime {
                     Some(expression) => self.evaluate_named(dom, expression, name)?,
                     None => JsValue::Undefined,
                 };
-                self.initialize_binding(name, value.clone(), *kind)?;
+                self.initialize_binding(dom, name, value.clone(), *kind)?;
                 Ok(Completion::Normal(value))
             }
             Statement::VariableList {
@@ -676,7 +694,7 @@ impl JsRuntime {
                         };
                         match target {
                             BindingTarget::Name(name) => {
-                                self.initialize_binding(name, value.clone(), *kind)?;
+                                self.initialize_binding(dom, name, value.clone(), *kind)?;
                             }
                             BindingTarget::Pattern(pattern) => {
                                 self.initialize_binding_pattern(
@@ -690,12 +708,14 @@ impl JsRuntime {
                     } else if *kind == VariableKind::Let
                         && let BindingTarget::Name(name) = target
                     {
-                        self.initialize_binding(name, JsValue::Undefined, *kind)?;
+                        self.initialize_binding(dom, name, JsValue::Undefined, *kind)?;
                     }
                 }
                 Ok(Completion::Normal(value))
             }
-            Statement::Function { name, .. } => self.lookup_binding(name).map(Completion::Normal),
+            Statement::Function { name, .. } => {
+                self.lookup_binding(dom, name).map(Completion::Normal)
+            }
             Statement::Class {
                 name,
                 super_class,
@@ -704,7 +724,7 @@ impl JsRuntime {
             } => {
                 let value =
                     self.evaluate_class(dom, Some(name), super_class.as_deref(), elements)?;
-                self.initialize_binding(name, value.clone(), VariableKind::Const)?;
+                self.initialize_binding(dom, name, value.clone(), VariableKind::Const)?;
                 Ok(Completion::Normal(value))
             }
             Statement::Return(value) => {
@@ -889,6 +909,7 @@ impl JsRuntime {
             Statement::Break(label) => Ok(Completion::Break(label.clone())),
             Statement::Continue(label) => Ok(Completion::Continue(label.clone())),
             Statement::Block(statements) => self.evaluate_scoped_statements(dom, statements),
+            Statement::With { object, body, .. } => self.evaluate_with_statement(dom, object, body),
             Statement::Expression(expression) => {
                 self.evaluate(dom, expression).map(Completion::Normal)
             }
@@ -1058,7 +1079,7 @@ impl JsRuntime {
                 Some(environment)
             };
             if kind == VariableKind::Var {
-                self.assign_binding(name, JsValue::String(property))?;
+                self.assign_binding(dom, name, JsValue::String(property))?;
             }
             let completion = self.evaluate_statement(dom, body);
             if iteration_environment.is_some() {
@@ -1176,7 +1197,7 @@ impl JsRuntime {
                 Some(environment)
             };
             let completion = if kind == VariableKind::Var {
-                self.assign_binding(name, item)
+                self.assign_binding(dom, name, item)
                     .and_then(|()| self.evaluate_statement(dom, body))
             } else {
                 self.evaluate_statement(dom, body)
@@ -1272,7 +1293,7 @@ impl JsRuntime {
         match parameter {
             None => Ok(()),
             Some(BindingTarget::Name(name)) => {
-                self.initialize_binding(name, value, VariableKind::Let)
+                self.initialize_binding(dom, name, value, VariableKind::Let)
             }
             Some(BindingTarget::Pattern(pattern)) => {
                 self.initialize_binding_pattern(dom, pattern, value, VariableKind::Let)
@@ -1353,7 +1374,7 @@ impl JsRuntime {
                 Ok(JsValue::Object(object))
             }
             Expr::This => self.current_this(),
-            Expr::Identifier(name) => self.lookup_binding(name),
+            Expr::Identifier(name) => self.lookup_binding(dom, name),
             Expr::Function {
                 name,
                 parameters,
@@ -1468,8 +1489,16 @@ impl JsRuntime {
                 operator: UnaryOp::Typeof,
                 operand,
                 ..
-            } if matches!(operand.as_ref(), Expr::Identifier(name) if !self.binding_exists(name)) => {
-                Ok(JsValue::String("undefined".to_owned()))
+            } if matches!(operand.as_ref(), Expr::Identifier(_)) => {
+                let Expr::Identifier(name) = operand.as_ref() else {
+                    unreachable!("matched by the guard")
+                };
+                let scope = self.resolve_name(dom, name)?;
+                if scope.is_none() && !self.global_name_exists(name) {
+                    return Ok(JsValue::String("undefined".to_owned()));
+                }
+                let value = self.read_resolved_binding(dom, scope, name)?;
+                self.evaluate_unary(dom, UnaryOp::Typeof, &value)
             }
             Expr::Unary {
                 operator, operand, ..
@@ -1658,7 +1687,10 @@ impl JsRuntime {
         target: &Expr,
     ) -> Result<AssignmentReference, JsError> {
         match target {
-            Expr::Identifier(name) => Ok(AssignmentReference::Binding(name.clone())),
+            Expr::Identifier(name) => Ok(AssignmentReference::Binding {
+                name: name.clone(),
+                scope: self.resolve_name(dom, name)?,
+            }),
             Expr::Member {
                 object, property, ..
             } => {
@@ -1724,7 +1756,7 @@ impl JsRuntime {
         kind: VariableKind,
     ) -> Result<(), JsError> {
         match pattern {
-            BindingPattern::Identifier(name) => self.initialize_binding(name, value, kind),
+            BindingPattern::Identifier(name) => self.initialize_binding(dom, name, value, kind),
             BindingPattern::Default {
                 pattern,
                 value: fallback,
@@ -1927,7 +1959,9 @@ impl JsRuntime {
         reference: &AssignmentReference,
     ) -> Result<JsValue, JsError> {
         match reference {
-            AssignmentReference::Binding(name) => self.lookup_binding(name),
+            AssignmentReference::Binding { name, scope } => {
+                self.read_resolved_binding(dom, *scope, name)
+            }
             AssignmentReference::Property { object, property } => {
                 self.get_member(dom, *object, property)
             }
@@ -1950,7 +1984,9 @@ impl JsRuntime {
         value: JsValue,
     ) -> Result<(), JsError> {
         match reference {
-            AssignmentReference::Binding(name) => self.assign_binding(name, value),
+            AssignmentReference::Binding { name, scope } => {
+                self.write_resolved_binding(dom, *scope, name, value)
+            }
             AssignmentReference::Property { object, property } => {
                 self.set_member(dom, *object, property, value)
             }
@@ -1994,12 +2030,24 @@ impl JsRuntime {
                         "private and super members cannot be deleted",
                         None,
                     )),
-                    AssignmentReference::Binding(_) => {
+                    AssignmentReference::Binding { .. } => {
                         unreachable!("member expressions resolve to property references");
                     }
                 }
             }
-            Expr::Identifier(_) => Ok(JsValue::Boolean(false)),
+            // A binding in a `with` object environment is deleted from that
+            // object (ECMA-262 9.1.1.2.7); other bindings cannot be deleted.
+            Expr::Identifier(name) => {
+                match self
+                    .resolve_name(dom, name)?
+                    .and_then(|depth| self.with_object_at(depth))
+                {
+                    Some(object) => Ok(JsValue::Boolean(
+                        self.delete_property_value(dom, object, name)?,
+                    )),
+                    None => Ok(JsValue::Boolean(false)),
+                }
+            }
             _ => {
                 self.evaluate(dom, operand)?;
                 Ok(JsValue::Boolean(true))
@@ -2446,18 +2494,6 @@ impl JsRuntime {
         Ok(JsValue::String("[object Object]".to_owned()))
     }
 
-    /// Whether `name` resolves in any scope, the global bindings, or the
-    /// global object itself.
-    pub(super) fn binding_exists(&self, name: &str) -> bool {
-        if self.environment.iter().rev().any(|scope| {
-            let scope = scope.borrow();
-            scope.bindings.contains_key(name) || scope.imports.contains_key(name)
-        }) {
-            return true;
-        }
-        self.global_bindings.contains_key(name) || self.realm.global(name).is_some()
-    }
-
     pub(super) fn evaluate_call(
         &mut self,
         dom: &mut Dom,
@@ -2545,6 +2581,16 @@ impl JsRuntime {
                     self.get_member(dom, object, &key)?
                 };
                 (callee, receiver)
+            }
+            Expr::Identifier(name) => {
+                let scope = self.resolve_name(dom, name)?;
+                // A function found on a `with` object is called with that
+                // object as `this` (ECMA-262 9.1.1.2.7, WithBaseObject).
+                let receiver = match scope.and_then(|depth| self.with_object_at(depth)) {
+                    Some(object) => JsValue::Object(object),
+                    None => JsValue::Undefined,
+                };
+                (self.read_resolved_binding(dom, scope, name)?, receiver)
             }
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
@@ -2646,7 +2692,7 @@ impl JsRuntime {
         let result = (|| {
             self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
             let value = self.create_function(Some(name), parameters, body, kind)?;
-            self.initialize_binding(name, value.clone(), VariableKind::Const)?;
+            self.initialize_declared_binding(name, value.clone(), VariableKind::Const)?;
             Ok(value)
         })();
         self.environment.pop();
@@ -3259,6 +3305,27 @@ impl JsRuntime {
 
     pub(super) fn initialize_binding(
         &mut self,
+        dom: &mut Dom,
+        name: &str,
+        value: JsValue,
+        kind: VariableKind,
+    ) -> Result<(), JsError> {
+        // `var x = v` is a PutValue on the resolved reference (ECMA-262
+        // 14.3.2.1), so inside a `with` body it writes the binding object.
+        if kind == VariableKind::Var
+            && let Some(depth) = self.resolve_name(dom, name)?
+            && let Some(object) = self.with_object_at(depth)
+        {
+            return self.set_with_binding(dom, object, name, value);
+        }
+        self.initialize_declared_binding(name, value, kind)
+    }
+
+    /// Initialize the innermost binding of `name` without consulting `with`
+    /// objects. Hoisted declarations use this: they are created before any
+    /// `with` body inside their scope runs.
+    pub(super) fn initialize_declared_binding(
+        &mut self,
         name: &str,
         value: JsValue,
         kind: VariableKind,
@@ -3308,21 +3375,127 @@ impl JsRuntime {
         Err(JsError::reference(format!("{name} is not defined")))
     }
 
-    pub(super) fn lookup_binding(&self, name: &str) -> Result<JsValue, JsError> {
-        for scope in self.environment.iter().rev() {
-            if let Some(binding) = scope.borrow().bindings.get(name) {
-                if !binding.initialized {
-                    return Err(JsError::reference(format!(
-                        "cannot access {name} before initialization"
-                    )));
-                }
-                return Ok(binding.value.clone());
+    /// Resolve `name` through the environment chain (ECMA-262 9.1.2.1
+    /// `GetIdentifierReference`). The result is the index in `self.environment`
+    /// of the innermost record that binds `name`, or `None` when only the
+    /// global environment can bind it.
+    pub(super) fn resolve_name(
+        &mut self,
+        dom: &mut Dom,
+        name: &str,
+    ) -> Result<Option<usize>, JsError> {
+        let mut depth = self.environment.len();
+        while depth > 0 {
+            depth -= 1;
+            let (declares, with_object) = {
+                let scope = self.environment[depth].borrow();
+                (
+                    scope.bindings.contains_key(name) || scope.imports.contains_key(name),
+                    scope.with_object,
+                )
+            };
+            if declares {
+                return Ok(Some(depth));
             }
-            let import = scope.borrow().imports.get(name).cloned();
-            if let Some(import) = import {
-                return self.read_import(&import);
+            if let Some(object) = with_object
+                && self.with_object_has_binding(dom, object, name)?
+            {
+                return Ok(Some(depth));
             }
         }
+        Ok(None)
+    }
+
+    /// The binding object of the `with` record at `depth`, if it is one.
+    fn with_object_at(&self, depth: usize) -> Option<ObjectId> {
+        self.environment
+            .get(depth)
+            .and_then(|scope| scope.borrow().with_object)
+    }
+
+    /// `HasBinding` of an object environment record with `withEnvironment`
+    /// (ECMA-262 9.1.1.2.1): the property exists and `@@unscopables` does not
+    /// block it.
+    fn with_object_has_binding(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        name: &str,
+    ) -> Result<bool, JsError> {
+        if !self.property_in(
+            dom,
+            &JsValue::String(name.to_owned()),
+            &JsValue::Object(object),
+        )? {
+            return Ok(false);
+        }
+        let unscopables =
+            self.get_symbol_value(dom, object, &JsSymbol::well_known("@@unscopables"))?;
+        if let JsValue::Object(unscopables) = unscopables {
+            return Ok(!self.get_member(dom, unscopables, name)?.is_truthy());
+        }
+        Ok(true)
+    }
+
+    /// `SetMutableBinding` of an object environment record (ECMA-262 9.1.1.2.5).
+    /// Sloppy code never throws for a property that has since gone, but the
+    /// existence check is still performed, as the specification does.
+    fn set_with_binding(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let _still_exists = self.property_in(
+            dom,
+            &JsValue::String(name.to_owned()),
+            &JsValue::Object(object),
+        )?;
+        self.set_member(dom, object, name, value)
+    }
+
+    /// `GetValue` of an identifier reference resolved by [`Self::resolve_name`];
+    /// `None` reads the global environment.
+    pub(super) fn read_resolved_binding(
+        &mut self,
+        dom: &mut Dom,
+        scope: Option<usize>,
+        name: &str,
+    ) -> Result<JsValue, JsError> {
+        let Some(depth) = scope else {
+            return self.read_global_binding(name);
+        };
+        if let Some(object) = self.with_object_at(depth) {
+            // GetBindingValue of an object environment record (ECMA-262
+            // 9.1.1.2.6): a property that has gone reads as `undefined`.
+            if !self.property_in(
+                dom,
+                &JsValue::String(name.to_owned()),
+                &JsValue::Object(object),
+            )? {
+                return Ok(JsValue::Undefined);
+            }
+            return self.get_member(dom, object, name);
+        }
+        let environment = self.environment[depth].borrow();
+        if let Some(binding) = environment.bindings.get(name) {
+            if !binding.initialized {
+                return Err(JsError::reference(format!(
+                    "cannot access {name} before initialization"
+                )));
+            }
+            return Ok(binding.value.clone());
+        }
+        let import = environment.imports.get(name).cloned();
+        drop(environment);
+        match import {
+            Some(import) => self.read_import(&import),
+            None => unreachable!("resolution found a binding or import in this record"),
+        }
+    }
+
+    fn read_global_binding(&self, name: &str) -> Result<JsValue, JsError> {
         if let Some(binding) = self.global_bindings.get(name)
             && !binding.initialized
         {
@@ -3342,29 +3515,48 @@ impl JsRuntime {
             .ok_or_else(|| JsError::reference(format!("{name} is not defined")))
     }
 
-    pub(super) fn assign_binding(&mut self, name: &str, value: JsValue) -> Result<(), JsError> {
-        for scope in self.environment.iter().rev() {
-            let mut scope = scope.borrow_mut();
-            if let Some(binding) = scope.bindings.get_mut(name) {
-                if !binding.initialized {
-                    return Err(JsError::reference(format!(
-                        "cannot access {name} before initialization"
-                    )));
-                }
-                if !binding.mutable {
-                    return Err(JsError::type_error(format!(
-                        "assignment to constant binding {name:?}"
-                    )));
-                }
-                binding.value = value;
-                return Ok(());
+    pub(super) fn lookup_binding(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
+        let scope = self.resolve_name(dom, name)?;
+        self.read_resolved_binding(dom, scope, name)
+    }
+
+    /// `PutValue` of an identifier reference resolved by [`Self::resolve_name`];
+    /// `None` writes the global environment.
+    pub(super) fn write_resolved_binding(
+        &mut self,
+        dom: &mut Dom,
+        scope: Option<usize>,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let Some(depth) = scope else {
+            return self.write_global_binding(name, value);
+        };
+        if let Some(object) = self.with_object_at(depth) {
+            return self.set_with_binding(dom, object, name, value);
+        }
+        let mut environment = self.environment[depth].borrow_mut();
+        if let Some(binding) = environment.bindings.get_mut(name) {
+            if !binding.initialized {
+                return Err(JsError::reference(format!(
+                    "cannot access {name} before initialization"
+                )));
             }
-            if scope.imports.contains_key(name) {
+            if !binding.mutable {
                 return Err(JsError::type_error(format!(
                     "assignment to constant binding {name:?}"
                 )));
             }
+            binding.value = value;
+            return Ok(());
         }
+        // Only an import binding is left, and imports are immutable.
+        Err(JsError::type_error(format!(
+            "assignment to constant binding {name:?}"
+        )))
+    }
+
+    fn write_global_binding(&mut self, name: &str, value: JsValue) -> Result<(), JsError> {
         if let Some(binding) = self.global_bindings.get(name) {
             if !binding.initialized {
                 return Err(JsError::reference(format!(
@@ -3386,6 +3578,42 @@ impl JsRuntime {
                 "global property {name:?} is not writable"
             )))
         }
+    }
+
+    pub(super) fn assign_binding(
+        &mut self,
+        dom: &mut Dom,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let scope = self.resolve_name(dom, name)?;
+        self.write_resolved_binding(dom, scope, name, value)
+    }
+
+    /// Whether `name` is bound in the global environment (its global
+    /// bindings or the global object).
+    fn global_name_exists(&self, name: &str) -> bool {
+        self.global_bindings.contains_key(name) || self.realm.global(name).is_some()
+    }
+
+    /// `with (object) body` (ECMA-262 14.11.2): the body runs in an object
+    /// environment record over `ToObject(object)`.
+    pub(super) fn evaluate_with_statement(
+        &mut self,
+        dom: &mut Dom,
+        object: &Expr,
+        body: &Statement,
+    ) -> Result<Completion, JsError> {
+        let value = self.evaluate(dom, object)?;
+        let object = self.to_object(&value)?;
+        self.environment
+            .push(Rc::new(RefCell::new(EnvironmentRecord {
+                with_object: Some(object),
+                ..EnvironmentRecord::default()
+            })));
+        let result = self.evaluate_statement(dom, body);
+        self.environment.pop();
+        result
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5384,6 +5612,7 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
         | Statement::Try { offset, .. }
         | Statement::If { offset, .. }
         | Statement::Switch { offset, .. }
+        | Statement::With { offset, .. }
         | Statement::While { offset, .. }
         | Statement::DoWhile { offset, .. }
         | Statement::For { offset, .. }

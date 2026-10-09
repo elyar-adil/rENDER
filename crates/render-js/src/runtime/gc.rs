@@ -82,6 +82,11 @@ pub(super) fn mark_environment(
     for binding in environment.borrow().bindings.values() {
         mark_value(runtime, marked, work, marked_environments, &binding.value);
     }
+    // A `with` body's binding object is reachable only through its record.
+    let with_object = environment.borrow().with_object;
+    if let Some(object) = with_object {
+        mark_object(runtime, marked, work, marked_environments, object);
+    }
 }
 
 pub(super) fn mark_function(
@@ -498,15 +503,13 @@ impl JsRuntime {
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.
         for scope in &self.environment {
-            for binding in scope.borrow().bindings.values() {
-                mark_value(
-                    self,
-                    &mut marked,
-                    &mut work,
-                    &mut marked_environments,
-                    &binding.value,
-                );
-            }
+            mark_environment(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                scope,
+            );
         }
         while let Some(object) = work.pop() {
             let index = object.as_usize();

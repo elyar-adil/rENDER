@@ -20,7 +20,9 @@ use std::collections::BTreeSet;
 /// lexer hands them out as identifiers, so the parser refuses them where a name
 /// is bound or referenced. An escaped spelling decodes to the same name, which
 /// the spec also refuses (ECMA-262 12.7.2).
-const ALWAYS_RESERVED_NAMES: &[&str] = &["class", "debugger", "enum", "export", "extends", "super"];
+const ALWAYS_RESERVED_NAMES: &[&str] = &[
+    "class", "debugger", "enum", "export", "extends", "super", "with",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum VariableKind {
@@ -296,6 +298,12 @@ pub(super) enum Statement {
         cases: Vec<(Vec<Expr>, Vec<Statement>)>,
         offset: usize,
     },
+    /// `with (object) body` (ECMA-262 14.11). Sloppy code only.
+    With {
+        object: Expr,
+        body: Box<Statement>,
+        offset: usize,
+    },
     While {
         condition: Expr,
         body: Box<Statement>,
@@ -524,6 +532,8 @@ pub(super) fn parse_module(
     parser.module = Some(ModuleInfo::default());
     // Top-level `await` is part of the module grammar (ECMA-262 §16.2).
     parser.in_async = true;
+    // Module code is always strict (ECMA-262 11.2.2).
+    parser.strict = true;
     let statements = parser.statement_list(false)?;
     validate_declaration_conflicts(&statements, true)?;
     let info = parser.module.take().unwrap_or_default();
@@ -862,6 +872,10 @@ fn push_statement_parts<'a>(
                 }
             }
         }
+        Statement::With { object, body, .. } => {
+            expressions.push(object);
+            statements.push(body);
+        }
         Statement::Function { .. } | Statement::Break(_) | Statement::Continue(_) => {}
         Statement::Class {
             super_class,
@@ -1003,13 +1017,14 @@ impl Parser {
             labels: Vec::new(),
             static_block: false,
             static_block_await: false,
+            strict: false,
         }
     }
 }
 
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "each flag is an independent grammar context (no_in, async, generator, parameters, ...)"
+    reason = "each flag is an independent grammar context (no_in, async, generator, parameters, strict, ...)"
 )]
 struct Parser {
     previous_offset: usize,
@@ -1053,10 +1068,16 @@ struct Parser {
     /// Inside a class static block's `await` restriction, which arrow parameters
     /// keep but arrow bodies do not (ECMA-262 15.7.1, 15.3).
     static_block_await: bool,
+    /// Whether the code being parsed is strict: a `"use strict"` directive
+    /// is in force in an enclosing program or function body. `with` is an
+    /// early error there (ECMA-262 14.11.1), and it must be known while the
+    /// body is parsed because the directive comes before the `with`.
+    strict: bool,
 }
 
 impl Parser {
     fn program(mut self) -> Result<Vec<Statement>, JsError> {
+        self.strict = self.prologue_is_strict(self.cursor);
         let statements = self.statement_list(false)?;
         validate_declaration_conflicts(&statements, true)?;
         if has_use_strict_directive(&statements) {
@@ -1192,6 +1213,13 @@ impl Parser {
         }
         if self.take(&TokenKind::For) {
             return self.for_statement();
+        }
+        // `with` is a reserved word (ECMA-262 13.1.1), so at statement start
+        // it always begins a `with` statement. An escaped spelling never acts
+        // as a keyword, and then the reserved-name check refuses it instead.
+        if self.at_contextual("with") && !self.current().escaped {
+            self.advance();
+            return self.with_statement();
         }
         if matches!(&self.current().kind, TokenKind::Identifier(_))
             && matches!(
@@ -1841,6 +1869,85 @@ impl Parser {
         })
     }
 
+    fn with_statement(&mut self) -> Result<Statement, JsError> {
+        // Class bodies are strict code too (ECMA-262 11.2.2).
+        if self.strict {
+            return Err(self.error("with statement is not allowed in strict mode"));
+        }
+        self.require(&TokenKind::LeftParen, "expected '(' after with")?;
+        let object = self.expression()?;
+        self.require(&TokenKind::RightParen, "expected ')' after with object")?;
+        let body = if self.at(&TokenKind::Let) {
+            self.let_expression_body()?
+        } else {
+            let body = self.statement()?;
+            if is_declaration(&body) {
+                return Err(self.error("a declaration cannot be the body of a with statement"));
+            }
+            body
+        };
+        Ok(Statement::With {
+            offset: self.previous_offset(),
+            object,
+            body: Box::new(body),
+        })
+    }
+
+    /// A `with` body that starts with `let`. A lexical declaration is not a
+    /// `Statement` (ECMA-262 14.11), so `let` is an identifier there and a line
+    /// break ends the expression statement (ASI). `let [` can never begin an
+    /// expression statement (ECMA-262 14.1.1), line break or not.
+    fn let_expression_body(&mut self) -> Result<Statement, JsError> {
+        let next = self.tokens.get(self.cursor + 1);
+        if matches!(next.map(|token| &token.kind), Some(TokenKind::LeftBracket)) {
+            return Err(self.error("let [ cannot begin a statement"));
+        }
+        let ends_statement = next.is_none_or(|token| {
+            token.after_newline
+                || matches!(
+                    token.kind,
+                    TokenKind::Semicolon | TokenKind::RightBrace | TokenKind::Eof
+                )
+        });
+        if !ends_statement {
+            return Err(self.error("a declaration cannot be the body of a with statement"));
+        }
+        self.advance();
+        self.end_statement()?;
+        Ok(Statement::Expression(Expr::Identifier("let".to_owned())))
+    }
+
+    /// Whether the directive prologue starting at token `index` contains
+    /// `"use strict"` (ECMA-262 11.2.1). Each directive is a string literal
+    /// that forms a whole expression statement.
+    fn prologue_is_strict(&self, mut index: usize) -> bool {
+        loop {
+            let Some(TokenKind::String(text)) = self.tokens.get(index).map(|token| &token.kind)
+            else {
+                return false;
+            };
+            let next = index + 1;
+            index = match self.tokens.get(next) {
+                Some(Token {
+                    kind: TokenKind::Semicolon,
+                    ..
+                }) => next + 1,
+                Some(Token {
+                    kind: TokenKind::RightBrace | TokenKind::Eof,
+                    ..
+                })
+                | None => next,
+                // A line break ends the directive only when the next token
+                // cannot continue the expression (`"a"\n(b)` is a call).
+                Some(token) if token.after_newline && !continues_expression(&token.kind) => next,
+                Some(_) => return false,
+            };
+            if text == "use strict" {
+                return true;
+            }
+        }
+    }
+
     fn switch_statement(&mut self) -> Result<Statement, JsError> {
         self.require(&TokenKind::LeftParen, "expected '(' after switch")?;
         let expression = self.expression()?;
@@ -2333,11 +2440,14 @@ impl Parser {
         let body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
+            let previous_strict = self.strict;
             self.function_depth = self.function_depth.saturating_add(1);
             self.loop_depth = 0;
+            self.strict = previous_strict || self.prologue_is_strict(self.cursor);
             let body = self.statement_list(true);
             self.function_depth = previous_function_depth;
             self.loop_depth = previous_loop_depth;
+            self.strict = previous_strict;
             body.and_then(|body| {
                 self.require(
                     &TokenKind::RightBrace,
@@ -3161,6 +3271,14 @@ impl Parser {
     /// Parse the `[extends Base] { elements }` tail shared by class
     /// declarations and expressions, with the class name already consumed.
     fn class_tail(&mut self) -> Result<(Option<Box<Expr>>, Vec<ClassElement>), JsError> {
+        // All parts of a class, including its heritage, are strict code (ECMA-262 11.2.2).
+        let previous_strict = std::mem::replace(&mut self.strict, true);
+        let result = self.class_tail_body();
+        self.strict = previous_strict;
+        result
+    }
+
+    fn class_tail_body(&mut self) -> Result<(Option<Box<Expr>>, Vec<ClassElement>), JsError> {
         let super_class = if matches!(&self.current().kind, TokenKind::Identifier(value) if value == "extends")
         {
             self.advance();
@@ -3675,13 +3793,16 @@ impl Parser {
         let previous_function_depth = self.function_depth;
         let previous_loop_depth = self.loop_depth;
         let previous_no_in = self.no_in;
+        let previous_strict = self.strict;
         self.function_depth = self.function_depth.saturating_add(1);
         self.loop_depth = 0;
         self.no_in = false;
+        self.strict = previous_strict || self.prologue_is_strict(self.cursor);
         let body = self.statement_list(true);
         self.function_depth = previous_function_depth;
         self.loop_depth = previous_loop_depth;
         self.no_in = previous_no_in;
+        self.strict = previous_strict;
         let mut body = body?;
         self.require(&TokenKind::RightBrace, "expected '}' after function body")?;
         // Checked before the lowering below moves the parameter defaults ahead
@@ -3791,7 +3912,7 @@ impl Parser {
             self.advance();
             let key = self.property_key()?;
             let name = static_key_name(&key);
-            let (parameters, body) = self.function_tail(FunctionKind::Normal)?;
+            let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
             return Ok(ObjectProperty {
                 key,
                 value: Expr::Function {
@@ -3861,7 +3982,7 @@ impl Parser {
         kind: FunctionKind,
     ) -> Result<ObjectProperty, JsError> {
         let name = static_key_name(&key);
-        let (parameters, body) = self.function_tail(kind)?;
+        let (parameters, body) = self.method_tail(kind, false)?;
         Ok(ObjectProperty {
             key,
             value: Expr::Function {
@@ -4022,6 +4143,61 @@ impl Parser {
     }
 }
 
+/// Whether a token after a line break continues the expression before it, so
+/// no automatic semicolon is inserted there (ECMA-262 12.9.1).
+fn continues_expression(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::LeftParen
+            | TokenKind::LeftBracket
+            | TokenKind::Dot
+            | TokenKind::QuestionDot
+            | TokenKind::Question
+            | TokenKind::QuestionQuestion
+            | TokenKind::Template(_)
+            | TokenKind::Comma
+            | TokenKind::Equal
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Star
+            | TokenKind::StarStar
+            | TokenKind::Slash
+            | TokenKind::Percent
+            | TokenKind::Less
+            | TokenKind::LessEqual
+            | TokenKind::Greater
+            | TokenKind::GreaterEqual
+            | TokenKind::LeftShift
+            | TokenKind::RightShift
+            | TokenKind::UnsignedRightShift
+            | TokenKind::EqualEqual
+            | TokenKind::EqualEqualEqual
+            | TokenKind::BangEqual
+            | TokenKind::BangEqualEqual
+            | TokenKind::Ampersand
+            | TokenKind::Pipe
+            | TokenKind::Caret
+            | TokenKind::AndAnd
+            | TokenKind::OrOr
+            | TokenKind::In
+            | TokenKind::Instanceof
+    )
+}
+
+/// Whether `statement` is a declaration rather than a `Statement` (ECMA-262
+/// 14.1, 14.11): a function, class, or `let`/`const` declaration, possibly
+/// labelled.
+fn is_declaration(statement: &Statement) -> bool {
+    match statement {
+        Statement::Function { .. } | Statement::Class { .. } => true,
+        Statement::Variable { kind, .. } | Statement::VariableList { kind, .. } => {
+            *kind != VariableKind::Var
+        }
+        Statement::Labeled { body, .. } => is_declaration(body),
+        _ => false,
+    }
+}
+
 fn has_use_strict_directive(statements: &[Statement]) -> bool {
     statements
         .iter()
@@ -4133,6 +4309,10 @@ fn validate_strict_statement(statement: &Statement) -> Result<(), JsError> {
             Ok(())
         }
         Statement::While { body, .. } | Statement::For { body, .. } => {
+            validate_strict_statement(body)
+        }
+        Statement::With { object, body, .. } => {
+            validate_strict_expression(object)?;
             validate_strict_statement(body)
         }
         Statement::DoWhile {
@@ -4596,6 +4776,10 @@ fn validate_reserved_statement(
                 validate_reserved_statements(statements, context)?;
             }
         }
+        Statement::With { object, body, .. } => {
+            validate_reserved_expression(object, context)?;
+            validate_reserved_statement(body, context)?;
+        }
         Statement::While {
             condition, body, ..
         } => {
@@ -4878,6 +5062,7 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
             }
         }
         Statement::While { body, .. }
+        | Statement::With { body, .. }
         | Statement::Labeled { body, .. }
         | Statement::ForInExpr { body, .. }
         | Statement::DoWhile { body, .. } => collect_var_names(body, names),

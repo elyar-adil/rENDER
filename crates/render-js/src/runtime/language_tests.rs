@@ -963,3 +963,148 @@ fn computed_object_accessor_keys_parse_inside_a_for_initializer() {
         "hit"
     );
 }
+#[test]
+fn with_reads_and_writes_consult_the_object_before_outer_scopes() {
+    assert_eq!(ok("var r; with ({a: 1}) { r = a; } r"), "1");
+    assert_eq!(ok("var o = {a: 1}; with (o) { a = 2; } o.a"), "2");
+    assert_eq!(
+        ok("var a = 0; var o = {}; with (o) { a = 5; } a + ':' + ('a' in o)"),
+        "5:false"
+    );
+    assert_eq!(ok("var o = {n: 2}; with (o) { n++; n += 3; } o.n"), "6");
+}
+
+#[test]
+fn with_resolves_inherited_properties_and_calls_with_the_object_as_this() {
+    assert_eq!(ok("with ([1, 2, 3]) { join('-') }"), "1-2-3");
+    assert_eq!(
+        ok("var o = {f: function() { return this === o; }}; var r; with (o) { r = f(); } r"),
+        "true"
+    );
+}
+
+#[test]
+fn with_honours_unscopables_before_the_object_property() {
+    assert_eq!(
+        ok(
+            "var a = 'outer'; var o = {a: 'inner', [Symbol.unscopables]: {a: true}}; var r; with (o) { r = a; } r"
+        ),
+        "outer"
+    );
+}
+
+#[test]
+fn var_initializers_inside_with_write_the_object() {
+    assert_eq!(
+        ok("var o = {x: 1}; with (o) { var x = 2; } o.x + ':' + x"),
+        "2:undefined"
+    );
+    assert_eq!(ok("var o = {}; with (o) { var y; } 'y' in o"), "false");
+}
+
+#[test]
+fn functions_created_in_with_keep_the_scope_they_were_created_in() {
+    assert_eq!(
+        ok(
+            "var o = {p: 'before'}; var f; with (o) { f = function() { return p; }; } o.p = 'after'; f()"
+        ),
+        "after"
+    );
+}
+
+#[test]
+fn typeof_and_delete_follow_the_with_object() {
+    assert_eq!(
+        ok("var o = {a: 1}; var r; with (o) { r = typeof a; } r"),
+        "number"
+    );
+    assert_eq!(
+        ok("var r; with ({}) { r = typeof nothingHere; } r"),
+        "undefined"
+    );
+    assert_eq!(
+        ok("var o = {a: 1}; with (o) { delete a; } 'a' in o"),
+        "false"
+    );
+}
+
+#[test]
+fn with_assignment_target_is_resolved_before_the_value_is_evaluated() {
+    // The target resolves to the object while it still has `x`; the value
+    // then deletes that property, so the write creates it on the object.
+    assert_eq!(
+        ok("var o = {x: 1}; var x = 'g'; with (o) { x = (delete o.x, 2); } o.x + ':' + x"),
+        "2:g"
+    );
+}
+
+#[test]
+fn with_restores_the_scope_when_its_body_throws() {
+    assert_eq!(
+        ok(
+            "var a = 1; var o = {a: 2}; try { with (o) { a = 3; throw 1; } } catch (e) {} a + ':' + o.a"
+        ),
+        "1:3"
+    );
+}
+
+#[test]
+fn with_object_must_not_be_null_or_undefined() {
+    let error = eval("with (null) {}").expect_err("null has no object form");
+    assert_eq!(error.kind(), JsErrorKind::Type);
+    let error = eval("with (undefined) x = 2").expect_err("undefined has no object form");
+    assert_eq!(error.kind(), JsErrorKind::Type);
+}
+
+#[test]
+fn with_is_an_early_error_in_strict_code() {
+    for source in [
+        "'use strict'; with ({}) {}",
+        "'use strict'; function f() { with ({}) {} }",
+        "function f() { 'use strict'; with ({}) {} }",
+        "'use strict'; function f() { return function() { with ({}) {} }; }",
+        "class C { m() { with ({}) {} } }",
+    ] {
+        let error = eval(source).expect_err("with is forbidden in strict code");
+        assert_eq!(error.kind(), JsErrorKind::Syntax, "{source}");
+    }
+    assert_eq!(
+        ok("function f() { var o = {a: 3}; with (o) return a; } f()"),
+        "3"
+    );
+}
+
+#[test]
+fn with_completion_value_follows_its_body_and_a_let_body_ends_at_the_line_break() {
+    assert_eq!(ok("1; with({}) { }"), "undefined");
+    assert_eq!(ok("2; with({}) { 3; }"), "3");
+    // `let` is an identifier here: the line break ends the statement, so the
+    // assignment on the next line is a separate statement.
+    assert_eq!(ok("if (false) { with ({}) let \n x = 1; } 'ok'"), "ok");
+    assert_eq!(ok("if (false) { with ({}) let \n {} } 'ok'"), "ok");
+    for source in [
+        "if (false) { with ({}) let \n [a] = 0; }",
+        "if (false) { with ({}) let x; }",
+    ] {
+        let error = eval(source).expect_err("let begins a declaration here");
+        assert_eq!(error.kind(), JsErrorKind::Syntax, "{source}");
+    }
+}
+
+#[test]
+fn with_is_a_reserved_word_and_its_body_is_a_statement() {
+    for source in [
+        "var with = 1;",
+        // An escaped spelling is not the keyword, and `with` is reserved.
+        "w\\u0069th ({}) {}",
+        "with ({}) let x;",
+        "with ({}) const x = 1;",
+        "with ({}) function f() {}",
+        "with ({}) class C {}",
+        "with ({}) label: function f() {}",
+    ] {
+        let error = eval(source).expect_err("not valid with syntax");
+        assert_eq!(error.kind(), JsErrorKind::Syntax, "{source}");
+    }
+    assert_eq!(ok("var o = {with: 1}; o.with"), "1");
+}
