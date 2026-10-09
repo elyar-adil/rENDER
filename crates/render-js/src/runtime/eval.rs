@@ -13,6 +13,7 @@
     clippy::wrong_self_convention
 )]
 
+use crate::JsBigInt;
 use crate::JsError;
 use crate::JsErrorKind;
 use crate::JsObject;
@@ -46,7 +47,7 @@ use crate::runtime::builtins::string::string_method_native;
 use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
 use crate::runtime::convert::abstract_equal;
 use crate::runtime::convert::bitwise_binary;
-use crate::runtime::convert::compare;
+use crate::runtime::convert::relational_compare;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::shift_left;
 use crate::runtime::convert::shift_right;
@@ -84,7 +85,7 @@ const CUSTOM_ELEMENT_REACTION: &str = "__customElementReaction";
 /// Coercion hint passed to `ToPrimitive` (`Symbol.toPrimitive` receives the
 /// name, `OrdinaryToPrimitive` uses the method order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PrimitiveHint {
+pub(super) enum PrimitiveHint {
     Default,
     Number,
     String,
@@ -262,6 +263,15 @@ impl ArrayDestructuring {
     }
 }
 
+/// ECMA-262 6.1.6.1.3 `Number::exponentiate`. A NaN exponent gives NaN, and so
+/// does a base of ±1 raised to ±Infinity; `powf` answers 1 for both.
+fn number_exponentiate(base: f64, exponent: f64) -> f64 {
+    if exponent.is_nan() || (base.abs() == 1.0 && exponent.is_infinite()) {
+        return f64::NAN;
+    }
+    base.powf(exponent)
+}
+
 /// The wording a `TypeError` uses for a non-iterable source. The
 /// specification's own text differs per type, and matching the common cases is
 /// what a bundle's error handling keys on.
@@ -271,6 +281,7 @@ fn describe_source(value: &JsValue) -> String {
         JsValue::Undefined => "undefined".to_owned(),
         JsValue::Object(_) => "object".to_owned(),
         JsValue::Number(number) => format!("number {number}"),
+        JsValue::BigInt(value) => format!("bigint {}", value.to_string_radix(10)),
         JsValue::Boolean(value) => format!("boolean {value}"),
         JsValue::Symbol(_) => "symbol".to_owned(),
         JsValue::String(text) => text.clone(),
@@ -1562,10 +1573,17 @@ impl JsRuntime {
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let previous = self.read_assignment_reference(dom, &reference)?;
-                let numeric = self.to_numeric_primitive(dom, previous.clone())?;
-                let next = self.binary_operation(dom, *operator, numeric, JsValue::Number(1.0))?;
+                // ECMA-262 13.4.2: the operand is converted with ToNumeric, and
+                // the step is 1 of that same numeric type (`1n` for a BigInt).
+                // A postfix expression answers the converted old value.
+                let numeric = self.to_numeric_value(dom, &previous)?;
+                let step = match numeric {
+                    JsValue::BigInt(_) => JsValue::BigInt(JsBigInt::from_i64(1)),
+                    _ => JsValue::Number(1.0),
+                };
+                let next = self.binary_operation(dom, *operator, numeric.clone(), step)?;
                 self.write_assignment_reference(dom, &reference, next.clone())?;
-                Ok(if *prefix { next } else { previous })
+                Ok(if *prefix { next } else { numeric })
             }
             Expr::Member {
                 object, property, ..
@@ -2341,14 +2359,31 @@ impl JsRuntime {
         Ok(())
     }
 
-    /// `ToPrimitive` with the default hint, as used by the `+` operator and
-    /// the parser's template-literal lowering (`"" + value`).
-    pub(super) fn to_numeric_primitive(
+    /// ECMA-262 `ToNumeric` (7.1.3): the primitive a numeric operator works
+    /// on, which is a `BigInt` or a Number. The hint is `number`, as the spec
+    /// requests for every numeric operator.
+    pub(super) fn to_numeric_value(
         &mut self,
         dom: &mut Dom,
-        value: JsValue,
+        value: &JsValue,
     ) -> Result<JsValue, JsError> {
-        self.to_primitive_with_hint(dom, value, PrimitiveHint::Default)
+        match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Number)? {
+            primitive @ JsValue::BigInt(_) => Ok(primitive),
+            primitive => Ok(JsValue::Number(to_number(&primitive)?)),
+        }
+    }
+
+    /// `Number(value)` (ECMA-262 21.1.1.1): `ToNumeric`, then a `BigInt` becomes
+    /// the Number nearest its value. Unlike `ToNumber`, this accepts a `BigInt`.
+    pub(super) fn number_conversion(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<f64, JsError> {
+        match self.to_numeric_value(dom, value)? {
+            JsValue::BigInt(number) => Ok(number.to_f64()),
+            primitive => to_number(&primitive),
+        }
     }
 
     /// ECMA-262 `ToNumber` for values that may be objects: run `ToPrimitive`
@@ -2425,6 +2460,22 @@ impl JsRuntime {
         Ok(primitive.to_js_string())
     }
 
+    /// `ToString` of one template substitution (ECMA-262 13.2.8.6): an object
+    /// takes the string hint, and a `Symbol` is a `TypeError`.
+    fn template_substitution_text(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<String, JsError> {
+        match value {
+            JsValue::Symbol(_) => Err(JsError::type_error(
+                "Cannot convert a Symbol value to a string",
+            )),
+            JsValue::Object(_) => self.to_string_value(dom, value),
+            other => Ok(other.to_js_string()),
+        }
+    }
+
     fn join_array_elements(&mut self, dom: &mut Dom, array: ObjectId) -> Result<String, JsError> {
         let mut parts = Vec::new();
         for value in self.array_elements_for(array)? {
@@ -2436,7 +2487,7 @@ impl JsRuntime {
         Ok(parts.join(","))
     }
 
-    fn to_primitive_with_hint(
+    pub(super) fn to_primitive_with_hint(
         &mut self,
         dom: &mut Dom,
         value: JsValue,
@@ -2451,6 +2502,7 @@ impl JsRuntime {
             }
             Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
             Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
+            Some(ObjectHost::BigIntPrimitive(value)) => return Ok(JsValue::BigInt(value)),
             Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
             Some(ObjectHost::Array) => {
                 // An array already being joined further up the stack is a
@@ -2468,32 +2520,40 @@ impl JsRuntime {
         }
         // An exotic `Symbol.toPrimitive` method gets first refusal, called
         // with the coercion hint; a primitive result short-circuits.
-        let to_primitive_method = self
+        let exotic_method = self
             .realm
             .get_symbol_descriptor(object, &JsSymbol::well_known("@@toPrimitive"))
-            .and_then(|descriptor| {
+            .map(|descriptor| {
                 if descriptor.is_accessor() {
-                    descriptor.getter
+                    descriptor
+                        .getter
+                        .map_or(JsValue::Undefined, JsValue::Object)
                 } else {
-                    match descriptor.value {
-                        JsValue::Object(function) => Some(function),
-                        _ => None,
-                    }
+                    descriptor.value
                 }
             });
-        if let Some(method) = to_primitive_method {
-            let invoked = self.call_with_this(
-                dom,
-                method,
-                &[JsValue::String(hint.name().to_owned())],
-                JsValue::Object(object),
-            )?;
-            if !matches!(invoked, JsValue::Object(_)) {
-                return Ok(invoked);
+        // ECMA-262 7.1.1 `GetMethod`: `undefined` and `null` mean there is no
+        // exotic method, and any other value must be callable or the
+        // conversion throws.
+        match exotic_method {
+            None | Some(JsValue::Undefined | JsValue::Null) => {}
+            Some(JsValue::Object(method)) if Self::is_callable_object(method, &self.realm) => {
+                let invoked = self.call_with_this(
+                    dom,
+                    method,
+                    &[JsValue::String(hint.name().to_owned())],
+                    JsValue::Object(object),
+                )?;
+                if !matches!(invoked, JsValue::Object(_)) {
+                    return Ok(invoked);
+                }
+                return Err(JsError::type_error(
+                    "Cannot convert object to primitive value",
+                ));
             }
-            return Err(JsError::type_error(
-                "Cannot convert object to primitive value",
-            ));
+            Some(_) => {
+                return Err(JsError::type_error("Symbol.toPrimitive is not a function"));
+            }
         }
         // OrdinaryToPrimitive: `number` tries valueOf then toString; `string`
         // reverses the order; `default` follows the number order.
@@ -2638,6 +2698,13 @@ impl JsRuntime {
             | JsValue::Number(_)
             | JsValue::Boolean(_)
             | JsValue::Symbol(_) => return Ok(None),
+            // A BigInt is a primitive that is never callable, so unlike the
+            // missing host hooks above it is a TypeError (ECMA-262 13.3.6.2).
+            JsValue::BigInt(_) => {
+                return Err(JsError::type_error(format!(
+                    "value of callee{callee_label} is undefined or not callable"
+                )));
+            }
             value @ JsValue::Object(_) => Self::require_object(&value).map_err(|_| {
                 JsError::type_error(format!(
                     "value of callee{callee_label} is undefined or not callable"
@@ -2770,7 +2837,10 @@ impl JsRuntime {
                             }
                         }
                     }
-                    JsValue::Boolean(_) | JsValue::Number(_) | JsValue::Symbol(_) => {}
+                    JsValue::Boolean(_)
+                    | JsValue::Number(_)
+                    | JsValue::BigInt(_)
+                    | JsValue::Symbol(_) => {}
                 }
                 continue;
             }
@@ -2970,23 +3040,23 @@ impl JsRuntime {
                     JsValue::Null | JsValue::Object(_) => "object",
                     JsValue::Boolean(_) => "boolean",
                     JsValue::Number(_) => "number",
+                    JsValue::BigInt(_) => "bigint",
                     JsValue::String(_) => "string",
                     JsValue::Symbol(_) => "symbol",
                 }
                 .to_owned(),
             )),
-            UnaryOp::Plus => {
-                let primitive = self.to_numeric_primitive(dom, value.clone())?;
-                Ok(JsValue::Number(to_number(&primitive)?))
-            }
-            UnaryOp::Minus => {
-                let primitive = self.to_numeric_primitive(dom, value.clone())?;
-                Ok(JsValue::Number(-to_number(&primitive)?))
-            }
-            UnaryOp::BitwiseNot => {
-                let primitive = self.to_numeric_primitive(dom, value.clone())?;
-                Ok(JsValue::Number(f64::from(!to_int32(&primitive)?)))
-            }
+            // Unary `+` is `ToNumber`, which throws for a BigInt; `-` and `~`
+            // are `ToNumeric` and keep a BigInt operand a BigInt.
+            UnaryOp::Plus => Ok(JsValue::Number(self.to_number_value(dom, value)?)),
+            UnaryOp::Minus => match self.to_numeric_value(dom, value)? {
+                JsValue::BigInt(number) => Ok(JsValue::BigInt(number.negate())),
+                primitive => Ok(JsValue::Number(-to_number(&primitive)?)),
+            },
+            UnaryOp::BitwiseNot => match self.to_numeric_value(dom, value)? {
+                JsValue::BigInt(number) => Ok(JsValue::BigInt(number.bit_not())),
+                primitive => Ok(JsValue::Number(f64::from(!to_int32(&primitive)?))),
+            },
             UnaryOp::Void => Ok(JsValue::Undefined),
             UnaryOp::Delete => unreachable!("delete evaluates an assignment reference"),
         }
@@ -3032,7 +3102,8 @@ impl JsRuntime {
     /// The value of `left op right` once both operands are evaluated. Binary
     /// expressions and compound assignment both come here, so `x op= y` and
     /// `x = x op y` cannot disagree. `+` converts with the default hint, as
-    /// ECMA-262 13.15.3 requires, and the other operators with `ToNumeric`.
+    /// ECMA-262 13.15.3 requires, the relational operators with the number hint
+    /// (13.10.1), and the other operators with `ToNumeric`.
     pub(super) fn binary_operation(
         &mut self,
         dom: &mut Dom,
@@ -3054,59 +3125,89 @@ impl JsRuntime {
             }
             BinaryOp::In => return self.property_in(dom, &left, &right).map(JsValue::Boolean),
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => return Ok(right),
-            BinaryOp::Add => {
-                let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Default)?;
-                let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Default)?;
-                if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
-                    // `+` on strings is §13.15.2 `StringAdd`, which concatenates
-                    // two code-unit sequences. The engine holds a lone surrogate
-                    // as a private-use placeholder, so a plain `format!` would
-                    // keep two halves of a pair as two separate placeholders and
-                    // `'\uD83D' + '\uDE00'` would not equal `'\u{1F600}'`.
-                    // Decoding through the code units re-joins them, which is
-                    // what makes `charAt(0) + charAt(1)` and
-                    // `String.fromCharCode(0xD83D) + String.fromCharCode(0xDE00)`
-                    // both answer the original pair.
-                    let mut units = utf16::utf16_units(&left.to_js_string());
-                    units.extend(utf16::utf16_units(&right.to_js_string()));
-                    return Ok(JsValue::String(utf16::string_from_utf16(&units)));
-                }
-                let left = self.to_numeric_primitive(dom, left)?;
-                let right = self.to_numeric_primitive(dom, right)?;
-                return Ok(JsValue::Number(to_number(&left)? + to_number(&right)?));
+            BinaryOp::TemplateConcat => {
+                let text = self.template_substitution_text(dom, &right)?;
+                let mut units = utf16::utf16_units(&left.to_js_string());
+                units.extend(utf16::utf16_units(&text));
+                return Ok(JsValue::String(utf16::string_from_utf16(&units)));
+            }
+            BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
+                let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Number)?;
+                let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Number)?;
+                return relational_compare(operator, &left, &right).map(JsValue::Boolean);
             }
             _ => {}
         }
-        let left = self.to_numeric_primitive(dom, left)?;
-        let right = self.to_numeric_primitive(dom, right)?;
-        match operator {
-            BinaryOp::Subtract => Ok(JsValue::Number(to_number(&left)? - to_number(&right)?)),
-            BinaryOp::Multiply => Ok(JsValue::Number(to_number(&left)? * to_number(&right)?)),
-            BinaryOp::Exponentiate => {
-                Ok(JsValue::Number(to_number(&left)?.powf(to_number(&right)?)))
+        let (left, right) = if operator == BinaryOp::Add {
+            let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Default)?;
+            let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Default)?;
+            if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
+                // StringAdd converts both operands with ToString, which throws
+                // for a Symbol.
+                if matches!(left, JsValue::Symbol(_)) || matches!(right, JsValue::Symbol(_)) {
+                    return Err(JsError::type_error(
+                        "Cannot convert a Symbol value to a string",
+                    ));
+                }
+                // `+` on strings is §13.15.2 `StringAdd`, which concatenates
+                // two code-unit sequences. The engine holds a lone surrogate
+                // as a private-use placeholder, so a plain `format!` would
+                // keep two halves of a pair as two separate placeholders and
+                // `'\uD83D' + '\uDE00'` would not equal `'\u{1F600}'`.
+                // Decoding through the code units re-joins them, which is
+                // what makes `charAt(0) + charAt(1)` and
+                // `String.fromCharCode(0xD83D) + String.fromCharCode(0xDE00)`
+                // both answer the original pair.
+                let mut units = utf16::utf16_units(&left.to_js_string());
+                units.extend(utf16::utf16_units(&right.to_js_string()));
+                return Ok(JsValue::String(utf16::string_from_utf16(&units)));
             }
-            BinaryOp::Divide => Ok(JsValue::Number(to_number(&left)? / to_number(&right)?)),
-            BinaryOp::Remainder => Ok(JsValue::Number(to_number(&left)? % to_number(&right)?)),
-            BinaryOp::BitwiseAnd => bitwise_binary(&left, &right, |left, right| left & right),
-            BinaryOp::BitwiseXor => bitwise_binary(&left, &right, |left, right| left ^ right),
-            BinaryOp::BitwiseOr => bitwise_binary(&left, &right, |left, right| left | right),
-            BinaryOp::LeftShift => shift_left(&left, &right),
-            BinaryOp::RightShift => shift_right(&left, &right),
-            BinaryOp::UnsignedRightShift => unsigned_shift_right(&left, &right),
-            BinaryOp::Less => compare(&left, &right, |a, b| a < b, |a, b| a < b),
-            BinaryOp::LessEqual => compare(&left, &right, |a, b| a <= b, |a, b| a <= b),
-            BinaryOp::Greater => compare(&left, &right, |a, b| a > b, |a, b| a > b),
-            BinaryOp::GreaterEqual => compare(&left, &right, |a, b| a >= b, |a, b| a >= b),
-            BinaryOp::Add
-            | BinaryOp::StrictEqual
-            | BinaryOp::StrictNotEqual
-            | BinaryOp::Equal
-            | BinaryOp::NotEqual
-            | BinaryOp::Instanceof
-            | BinaryOp::In
-            | BinaryOp::LogicalAnd
-            | BinaryOp::LogicalOr
-            | BinaryOp::Nullish => unreachable!("operator is handled before numeric conversion"),
+            (left, right)
+        } else {
+            (left, right)
+        };
+        let left = self.to_numeric_value(dom, &left)?;
+        let right = self.to_numeric_value(dom, &right)?;
+        self.numeric_operation(operator, &left, &right)
+    }
+
+    /// The numeric operators on two `ToNumeric` results. A `BigInt` operates
+    /// only with another `BigInt` (ECMA-262 6.1.6.2), so the mixed pairing is a
+    /// `TypeError` rather than a silent conversion.
+    fn numeric_operation(
+        &mut self,
+        operator: BinaryOp,
+        left: &JsValue,
+        right: &JsValue,
+    ) -> Result<JsValue, JsError> {
+        match (left, right) {
+            (JsValue::BigInt(left), JsValue::BigInt(right)) => {
+                return self.bigint_binary_operation(operator, left, right);
+            }
+            (JsValue::BigInt(_), _) | (_, JsValue::BigInt(_)) => {
+                return Err(JsError::type_error(
+                    "Cannot mix BigInt and other types, use explicit conversions",
+                ));
+            }
+            _ => {}
+        }
+        match operator {
+            BinaryOp::Add => Ok(JsValue::Number(to_number(left)? + to_number(right)?)),
+            BinaryOp::Subtract => Ok(JsValue::Number(to_number(left)? - to_number(right)?)),
+            BinaryOp::Multiply => Ok(JsValue::Number(to_number(left)? * to_number(right)?)),
+            BinaryOp::Exponentiate => Ok(JsValue::Number(number_exponentiate(
+                to_number(left)?,
+                to_number(right)?,
+            ))),
+            BinaryOp::Divide => Ok(JsValue::Number(to_number(left)? / to_number(right)?)),
+            BinaryOp::Remainder => Ok(JsValue::Number(to_number(left)? % to_number(right)?)),
+            BinaryOp::BitwiseAnd => bitwise_binary(left, right, |left, right| left & right),
+            BinaryOp::BitwiseXor => bitwise_binary(left, right, |left, right| left ^ right),
+            BinaryOp::BitwiseOr => bitwise_binary(left, right, |left, right| left | right),
+            BinaryOp::LeftShift => shift_left(left, right),
+            BinaryOp::RightShift => shift_right(left, right),
+            BinaryOp::UnsignedRightShift => unsigned_shift_right(left, right),
+            _ => unreachable!("operator is handled before numeric conversion"),
         }
     }
 
@@ -4544,6 +4645,9 @@ impl JsRuntime {
                 | ObjectHost::ArrayConstructor
                 | ObjectHost::StringConstructor
                 | ObjectHost::NumberConstructor
+                // `BigInt` has [[Construct]] and throws from it (21.2.1.1),
+                // so it can be extended; a plain `new` still fails.
+                | ObjectHost::BigIntConstructor
                 | ObjectHost::BooleanConstructor
                 | ObjectHost::FunctionConstructor
                 | ObjectHost::DateConstructor
@@ -4732,7 +4836,7 @@ impl JsRuntime {
             Some(ObjectHost::NumberConstructor) => {
                 let number = match arguments.first() {
                     None | Some(JsValue::Undefined) => 0.0,
-                    Some(value) => self.to_number_value(dom, value)?,
+                    Some(value) => self.number_conversion(dom, value)?,
                 };
                 self.ensure_heap_capacity(1)?;
                 Ok(JsValue::Object(self.realm.number_primitive_wrapper(number)))
@@ -5024,8 +5128,9 @@ impl JsRuntime {
             })),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
                 None | Some(JsValue::Undefined) => 0.0,
-                Some(value) => self.to_number_value(dom, value)?,
+                Some(value) => self.number_conversion(dom, value)?,
             })),
+            Some(ObjectHost::BigIntConstructor) => self.bigint_function(dom, arguments),
             Some(ObjectHost::BooleanConstructor) => Ok(JsValue::Boolean(
                 arguments.first().is_none_or(JsValue::is_truthy),
             )),
@@ -5614,6 +5719,7 @@ impl JsRuntime {
             JsValue::String(text) => Ok(self.string_wrapper(text.clone())),
             JsValue::Symbol(symbol) => Ok(self.realm.symbol_instance_wrapper(symbol.clone())),
             JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value)),
+            JsValue::BigInt(value) => Ok(self.realm.bigint_primitive_wrapper(value.clone())),
             JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
         }
     }
@@ -5637,6 +5743,10 @@ impl JsRuntime {
             JsValue::Number(number) => {
                 self.ensure_heap_capacity(1)?;
                 self.realm.number_primitive_wrapper(*number)
+            }
+            JsValue::BigInt(number) => {
+                self.ensure_heap_capacity(1)?;
+                self.realm.bigint_primitive_wrapper(number.clone())
             }
             JsValue::Boolean(flag) => {
                 self.ensure_heap_capacity(1)?;

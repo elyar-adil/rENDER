@@ -2288,7 +2288,7 @@ fn to_primitive_and_has_instance_hooks_participate() {
                 boxed[Symbol.toPrimitive] = function (hint) { return 'prim:' + hint; };
                 results.push(String(boxed) === 'prim:string');
                 results.push(boxed * 1 === 'prim:default' * 1 || typeof (boxed * 1) === 'number');
-                results.push(`${boxed}` === 'prim:default');
+                results.push(`${boxed}` === 'prim:string');
                 classLike = function () {};
                 classLike[Symbol.hasInstance] = function (v) { return v === 'member'; };
                 results.push('member' instanceof classLike);

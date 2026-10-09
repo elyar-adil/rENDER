@@ -397,6 +397,10 @@ impl JsRuntime {
                 Some(crate::value::number_to_string(*value))
             }
             JsValue::Number(_) => Some("null".to_owned()),
+            // ECMA-262 25.5.2.2 SerializeJSONProperty: a BigInt has no JSON form.
+            JsValue::BigInt(_) => {
+                return Err(JsError::type_error("Do not know how to serialize a BigInt"));
+            }
             JsValue::String(value) => Some(json_quote(value)),
             JsValue::Object(object) => {
                 if !stack.insert(*object) {

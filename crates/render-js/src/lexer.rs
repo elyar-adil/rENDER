@@ -1,4 +1,5 @@
-use super::{JsError, JsErrorKind, RuntimeLimits};
+use super::{JsBigInt, JsError, JsErrorKind, RuntimeLimits};
+use crate::bigint::digit_count_fits;
 
 /// Reserved words in every context (ECMA-262 12.7.2, Table 37 minus the
 /// contextual and strict-only words). Spelled with an escape they are a
@@ -53,6 +54,8 @@ pub(super) enum TokenKind {
     PrivateName(String),
     String(String),
     Number(f64),
+    /// A `BigInt` literal: an integer with the `n` suffix (ECMA-262 12.9.6).
+    BigInt(JsBigInt),
     RegexLiteral {
         pattern: String,
         flags: String,
@@ -440,6 +443,7 @@ impl Lexer<'_> {
                 TokenKind::Identifier(_)
                     | TokenKind::String(_)
                     | TokenKind::Number(_)
+                    | TokenKind::BigInt(_)
                     | TokenKind::RegexLiteral { .. }
                     | TokenKind::Template(_)
                     | TokenKind::True
@@ -517,6 +521,7 @@ impl Lexer<'_> {
             TokenKind::Identifier(_)
             | TokenKind::String(_)
             | TokenKind::Number(_)
+            | TokenKind::BigInt(_)
             | TokenKind::RegexLiteral { .. }
             | TokenKind::Template(_)
             | TokenKind::True
@@ -926,13 +931,23 @@ impl Lexer<'_> {
                 self.advance();
                 let digits_start = self.offset;
                 let digits = self.digit_run(|value| value.is_digit(radix));
-                if digits == 0 || self.peek().is_some_and(is_identifier_continue) {
+                if digits == 0 {
                     return Err(JsError::syntax("invalid numeric literal", start));
                 }
                 let text: String = self.source[digits_start..self.offset]
                     .chars()
                     .filter(|value| *value != '_')
                     .collect();
+                if self.peek() == Some('n') {
+                    self.advance();
+                    if self.peek().is_some_and(is_identifier_continue) {
+                        return Err(JsError::syntax("invalid numeric literal", start));
+                    }
+                    return bigint_literal(&text, radix, start).map(TokenKind::BigInt);
+                }
+                if self.peek().is_some_and(is_identifier_continue) {
+                    return Err(JsError::syntax("invalid numeric literal", start));
+                }
                 return Ok(TokenKind::Number(radix_digits_to_number(&text, radix)));
             }
         }
@@ -940,7 +955,22 @@ impl Lexer<'_> {
         if self.peek() == Some('0') && self.peek_second() == Some('_') {
             return Err(JsError::syntax("invalid numeric literal", start));
         }
-        self.digit_run(|value| value.is_ascii_digit());
+        let integer_digits = self.digit_run(|value| value.is_ascii_digit());
+        if self.peek() == Some('n') {
+            // A BigInt literal is a plain integer: a fraction or an exponent
+            // makes `n` invalid. A leading zero before more digits is the legacy
+            // octal form, which takes no suffix (`01n`, `08n`).
+            let legacy_octal = self.source[start..].starts_with('0') && integer_digits > 1;
+            let text: String = self.source[start..self.offset]
+                .chars()
+                .filter(|value| *value != '_')
+                .collect();
+            self.advance();
+            if legacy_octal || self.peek().is_some_and(is_identifier_continue) {
+                return Err(JsError::syntax("invalid numeric literal", start));
+            }
+            return bigint_literal(&text, 10, start).map(TokenKind::BigInt);
+        }
         if self.peek() == Some('.') {
             self.advance();
             self.digit_run(|value| value.is_ascii_digit());
@@ -1344,6 +1374,19 @@ fn radix_digits_to_number(digits: &str, radix: u32) -> f64 {
     }
     let exponent = i32::try_from(bit_len - 53).expect("bounded by binary64 exponent range");
     (top as f64) * 2_f64.powi(exponent)
+}
+
+/// The value of a `BigInt` literal's digits, with separators already removed.
+/// A run too long to represent is a `SyntaxError` here rather than a long wait.
+fn bigint_literal(digits: &str, radix: u32, start: usize) -> Result<JsBigInt, JsError> {
+    if !digit_count_fits(digits.len()) {
+        return Err(JsError::syntax(
+            "BigInt literal exceeds the supported size",
+            start,
+        ));
+    }
+    JsBigInt::parse_digits(digits, radix)
+        .ok_or_else(|| JsError::syntax("invalid numeric literal", start))
 }
 
 fn is_identifier_start(character: char) -> bool {

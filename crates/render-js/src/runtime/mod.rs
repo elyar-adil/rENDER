@@ -42,6 +42,8 @@ use std::collections::BTreeMap;
 use url::Url;
 
 mod async_iteration;
+#[cfg(test)]
+mod bigint_tests;
 mod builtins;
 mod class;
 mod convert;

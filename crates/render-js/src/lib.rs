@@ -5,6 +5,7 @@
 //! host objects mutate the existing arena so downstream rendering can consume
 //! its [`render_dom::MutationBatch`] without reparsing HTML.
 
+mod bigint;
 mod lexer;
 mod module;
 mod parser;
@@ -21,6 +22,7 @@ pub mod video;
 use std::error::Error;
 use std::fmt;
 
+pub use bigint::JsBigInt;
 pub use runtime::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
     JsMicrotask, JsRuntime, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,

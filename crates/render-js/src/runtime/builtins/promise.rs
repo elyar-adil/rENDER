@@ -706,6 +706,7 @@ fn describe_iterable(value: &JsValue) -> String {
         JsValue::Null => "null".to_owned(),
         JsValue::Undefined => "undefined".to_owned(),
         JsValue::Number(number) => format!("number {number}"),
+        JsValue::BigInt(value) => format!("bigint {}", value.to_string_radix(10)),
         JsValue::Boolean(boolean) => format!("boolean {boolean}"),
         JsValue::Symbol(_) => "symbol".to_owned(),
         JsValue::Object(_) => "object".to_owned(),

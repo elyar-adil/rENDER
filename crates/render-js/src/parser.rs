@@ -89,6 +89,10 @@ pub(super) enum UnaryOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BinaryOp {
     Add,
+    /// Joins a template literal's text with one substitution. It is not a
+    /// source operator: a substitution converts with `ToString` (the string
+    /// hint), where `+` uses the default hint.
+    TemplateConcat,
     Subtract,
     Multiply,
     Exponentiate,
@@ -3247,6 +3251,7 @@ impl Parser {
             }
             TokenKind::Template(parts) => self.template_literal(parts, token.offset),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
+            TokenKind::BigInt(value) => Ok(Expr::Literal(JsValue::BigInt(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
             TokenKind::Null => Ok(Expr::Literal(JsValue::Null)),
@@ -3563,7 +3568,7 @@ impl Parser {
             };
             result = Expr::Binary {
                 offset: self.previous_offset(),
-                operator: BinaryOp::Add,
+                operator: BinaryOp::TemplateConcat,
                 left: Box::new(result),
                 right: Box::new(next),
             };
@@ -4088,6 +4093,8 @@ impl Parser {
             | TokenKind::String(name) => Ok(name),
             // A numeric name is the ToString of its value: `1e21` is "1e+21".
             TokenKind::Number(value) => Ok(number_to_string(value)),
+            // A BigInt name is the ToString of its value, which is decimal.
+            TokenKind::BigInt(value) => Ok(value.to_string_radix(10)),
             // Keywords are valid property names after `.`.
             TokenKind::Let => Ok("let".to_owned()),
             TokenKind::Const => Ok("const".to_owned()),
