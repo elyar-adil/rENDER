@@ -203,7 +203,6 @@ pub(super) fn mark_host(
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::TypedArray { .. }
-        | ObjectHost::DataView { .. }
         | ObjectHost::DataViewConstructor
         | ObjectHost::ArrayBufferHost(_)
         | ObjectHost::ArrayBufferConstructor
@@ -247,6 +246,10 @@ pub(super) fn mark_host(
         }
         ObjectHost::BoundFunction { receiver, .. } => {
             mark_object(runtime, marked, work, marked_environments, *receiver);
+        }
+        ObjectHost::DataView { buffer_object, .. } => {
+            // The `buffer` getter hands out this object, so it must stay alive.
+            mark_object(runtime, marked, work, marked_environments, *buffer_object);
         }
         ObjectHost::BoundCallable {
             target,

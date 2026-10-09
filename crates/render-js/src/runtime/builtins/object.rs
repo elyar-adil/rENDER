@@ -28,6 +28,85 @@ use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
 
+/// A `ToPropertyDescriptor` result (ECMA-262 6.2.6.5). Each field is `None` when
+/// the descriptor object does not have it, so an absent field is told apart
+/// from one that is explicitly `undefined`.
+#[derive(Default)]
+struct PartialDescriptor {
+    value: Option<JsValue>,
+    writable: Option<bool>,
+    get: AccessorField,
+    set: AccessorField,
+    enumerable: Option<bool>,
+    configurable: Option<bool>,
+}
+
+/// A `get` or `set` field of a `ToPropertyDescriptor` result: absent, or present
+/// with a function or with `undefined`.
+#[derive(Clone, Copy, Default)]
+enum AccessorField {
+    #[default]
+    Absent,
+    Present(Option<ObjectId>),
+}
+
+impl AccessorField {
+    /// The function this field sets, or the current one when the field is absent.
+    const fn or_current(self, current: Option<ObjectId>) -> Option<ObjectId> {
+        match self {
+            Self::Absent => current,
+            Self::Present(function) => function,
+        }
+    }
+}
+
+/// Fills a partial descriptor's absent fields from the current own property
+/// (ECMA-262 10.1.6.3 defaults). A new property starts with every attribute
+/// false, and a generic descriptor (neither a value nor an accessor field) keeps
+/// an existing accessor an accessor.
+fn merge_partial_descriptor(
+    current: Option<&PropertyDescriptor>,
+    partial: PartialDescriptor,
+) -> PropertyDescriptor {
+    let enumerable = partial
+        .enumerable
+        .unwrap_or_else(|| current.is_some_and(|property| property.enumerable));
+    let configurable = partial
+        .configurable
+        .unwrap_or_else(|| current.is_some_and(|property| property.configurable));
+    let data_requested = partial.value.is_some() || partial.writable.is_some();
+    let accessor_requested = !matches!(partial.get, AccessorField::Absent)
+        || !matches!(partial.set, AccessorField::Absent);
+    let current_accessor = current.filter(|property| property.is_accessor());
+    if accessor_requested || (!data_requested && current_accessor.is_some()) {
+        // The current (getter, setter) pair, kept for each field the descriptor omits.
+        let kept =
+            current_accessor.map_or((None, None), |property| (property.getter, property.setter));
+        return PropertyDescriptor {
+            value: JsValue::Undefined,
+            writable: false,
+            getter: partial.get.or_current(kept.0),
+            setter: partial.set.or_current(kept.1),
+            enumerable,
+            configurable,
+        };
+    }
+    let current_data = current.filter(|property| !property.is_accessor());
+    PropertyDescriptor {
+        value: partial
+            .value
+            .or_else(|| current_data.map(|property| property.value.clone()))
+            .unwrap_or(JsValue::Undefined),
+        writable: partial
+            .writable
+            .unwrap_or_else(|| current_data.is_some_and(|property| property.writable)),
+        getter: None,
+        setter: None,
+        enumerable,
+        configurable,
+    }
+}
+
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_object_native(
         &mut self,
@@ -610,181 +689,60 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // §20.1.2.2 step 1: the prototype is an object or null, nothing else.
         let prototype = match required_argument(arguments, 0, "Object.create")? {
             JsValue::Null => None,
             JsValue::Object(object) => Some(*object),
-            // A missing optional base class is represented by `undefined` in
-            // transpiled bundles.  Treat it as a null prototype so helper
-            // setup can continue and the eventual subclass remains usable.
-            _ => None,
+            _ => {
+                return Err(JsError::type_error(
+                    "Object prototype may only be an Object or null",
+                ));
+            }
         };
         self.ensure_heap_capacity(1)?;
-        Ok(JsValue::Object(self.realm.create_object(prototype)))
+        let object = self.realm.create_object(prototype);
+        // §20.1.2.2 step 2: an absent or undefined `Properties` defines nothing;
+        // any other value goes through `ObjectDefineProperties`.
+        if let Some(properties) = arguments.get(1)
+            && !matches!(properties, JsValue::Undefined)
+        {
+            self.object_define_properties(&[JsValue::Object(object), properties.clone()])?;
+        }
+        Ok(JsValue::Object(object))
     }
 
     pub(in crate::runtime) fn object_define_property(
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target = required_argument(arguments, 0, "Object.defineProperty")?;
-        if matches!(target, JsValue::Null | JsValue::Undefined) {
-            // Keep descriptor-heavy compatibility shims from aborting an
-            // entire page when an optional host object is absent.
-            return Ok(target.clone());
-        }
-        // §20.1.2.3 step 1 is `ToObject`, so a primitive target is defined on
-        // a fresh wrapper and that wrapper is returned.
-        let object = self.to_object(target)?;
+        // §20.1.2.4 step 1: a target that is not an object is a TypeError. Unlike
+        // the other `Object` statics there is no `ToObject` here.
+        let JsValue::Object(object) = required_argument(arguments, 0, "Object.defineProperty")?
+        else {
+            return Err(JsError::type_error(
+                "Object.defineProperty called on non-object",
+            ));
+        };
+        let object = *object;
         let key_argument = required_argument(arguments, 1, "Object.defineProperty")?;
         // `ToPropertyKey` keeps symbols as symbols: a symbol key must address
         // the object's symbol slots, never the string `Symbol(desc)` form.
         // core-js (bilibili log-reporter) installs `Symbol.unscopables` on
         // `Array.prototype` through this path.
-        let symbol_key = match &key_argument {
-            JsValue::Symbol(symbol) => Some(symbol.clone()),
-            _ => None,
+        let (symbol_key, key) = match key_argument {
+            JsValue::Symbol(symbol) => (Some(symbol.clone()), String::new()),
+            other => (None, other.to_js_string()),
         };
         let descriptor_value = required_argument(arguments, 2, "Object.defineProperty")?;
-        if matches!(descriptor_value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Object(object));
-        }
-        let descriptor = match descriptor_value {
-            JsValue::Object(descriptor) => *descriptor,
-            // Descriptor objects are often assembled by feature-detection
-            // shims.  A primitive here has no descriptor fields; accepting it
-            // as an empty descriptor keeps the target usable like browsers do
-            // for permissive host objects.
-            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) | JsValue::Symbol(_) => {
-                return Ok(JsValue::Object(object));
-            }
-            JsValue::Null | JsValue::Undefined => unreachable!(),
-        };
-        let existing = match &symbol_key {
-            Some(symbol) => self.realm.own_symbol_property(object, symbol),
-            None => self
-                .realm
-                .own_property(object, &key_argument.to_js_string()),
-        };
-        // Field presence uses own-property checks: per spec, `{get:
-        // undefined}` means "accessor with no getter", not "field absent".
-        let get_field = self
-            .realm
-            .own_property(descriptor, "get")
-            .map(|field| field.value);
-        let set_field = self
-            .realm
-            .own_property(descriptor, "set")
-            .map(|field| field.value);
-        let has_value_field = self.realm.own_property(descriptor, "value").is_some();
-        let has_writable_field = self.realm.own_property(descriptor, "writable").is_some();
-        if (get_field.is_some() || set_field.is_some()) && (has_value_field || has_writable_field) {
+        // §6.2.6.5 step 1: a descriptor that is not an object (undefined included)
+        // is a TypeError.
+        let JsValue::Object(descriptor) = descriptor_value else {
             return Err(JsError::type_error(
-                "Invalid property descriptor: cannot specify accessors together with value or writable",
+                "Property description must be an object",
             ));
-        }
-        let callable_slot =
-            |field: Option<JsValue>, name: &str| -> Result<Option<ObjectId>, JsError> {
-                match field {
-                    // `{ set: undefined }` is an accessor with no setter (§6.2.6.5).
-                    None | Some(JsValue::Undefined) => Ok(None),
-                    Some(JsValue::Object(function))
-                        if JsRuntime::is_callable_object(function, &self.realm) =>
-                    {
-                        Ok(Some(function))
-                    }
-                    Some(_) => Err(JsError::type_error(format!(
-                        "Property accessor {name:?} must be a function"
-                    ))),
-                }
-            };
-        let getter = callable_slot(get_field, "get")?;
-        let setter = callable_slot(set_field, "set")?;
-        let enumerable = self
-            .realm
-            .get_property(descriptor, "enumerable")
-            .map_or_else(
-                || {
-                    existing
-                        .as_ref()
-                        .is_some_and(|property| property.enumerable)
-                },
-                |value| value.is_truthy(),
-            );
-        let configurable = self
-            .realm
-            .get_property(descriptor, "configurable")
-            .map_or_else(
-                || {
-                    existing
-                        .as_ref()
-                        .is_some_and(|property| property.configurable)
-                },
-                |value| value.is_truthy(),
-            );
-        let descriptor = if getter.is_some() || setter.is_some() {
-            PropertyDescriptor {
-                value: JsValue::Undefined,
-                writable: false,
-                getter,
-                setter,
-                enumerable,
-                configurable,
-            }
-        } else {
-            PropertyDescriptor {
-                value: self
-                    .realm
-                    .get_property(descriptor, "value")
-                    .or_else(|| existing.as_ref().map(|property| property.value.clone()))
-                    .unwrap_or(JsValue::Undefined),
-                writable: self.realm.get_property(descriptor, "writable").map_or_else(
-                    || existing.as_ref().is_some_and(|property| property.writable),
-                    |value| value.is_truthy(),
-                ),
-                getter: None,
-                setter: None,
-                enumerable,
-                configurable,
-            }
         };
-        let descriptor_value = descriptor.value.clone();
-        if let Some(symbol) = &symbol_key {
-            if !self
-                .realm
-                .define_symbol_property(object, symbol, descriptor)
-            {
-                // Mirror the string-key fallback for polyfills that re-run
-                // their descriptor installer: applying the value is the
-                // observable part callers rely on when the existing property
-                // is writable.
-                let applied = match self.realm.own_symbol_property(object, symbol) {
-                    Some(current) if current.writable => self.realm.define_symbol_property(
-                        object,
-                        symbol,
-                        PropertyDescriptor {
-                            value: descriptor_value,
-                            ..current
-                        },
-                    ),
-                    _ => false,
-                };
-                if !applied {
-                    return Err(JsError::type_error("cannot redefine object property"));
-                }
-            }
-            return Ok(JsValue::Object(object));
-        }
-        let key = key_argument.to_js_string();
-        if !self.realm.define_property(object, key.clone(), descriptor) {
-            // Browser polyfills frequently re-run their descriptor installer
-            // after a partial initialization. If the existing property is
-            // writable, applying its value is the observable part callers
-            // rely on; keep the descriptor's non-configurable guard for
-            // genuinely read-only properties.
-            if !self.realm.set_property(object, key, descriptor_value) {
-                return Err(JsError::type_error("cannot redefine object property"));
-            }
-        }
+        let partial = self.to_property_descriptor(*descriptor)?;
+        self.apply_property_descriptor(object, symbol_key.as_ref(), &key, partial)?;
         Ok(JsValue::Object(object))
     }
 
@@ -792,30 +750,112 @@ impl JsRuntime {
         &mut self,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target_value = required_argument(arguments, 0, "Object.defineProperties")?;
-        if matches!(target_value, JsValue::Null | JsValue::Undefined) {
-            return Ok(target_value.clone());
-        }
-        // §20.1.2.2 step 1: `ToObject(O)`.
-        let target = self.to_object(target_value)?;
+        // §20.1.2.3 step 1: a target that is not an object is a TypeError.
+        let JsValue::Object(target) = required_argument(arguments, 0, "Object.defineProperties")?
+        else {
+            return Err(JsError::type_error(
+                "Object.defineProperties called on non-object",
+            ));
+        };
+        let target = *target;
+        // §20.1.2.3 step 2: `ToObject(Properties)`, so undefined and null throw.
         let descriptors_value = required_argument(arguments, 1, "Object.defineProperties")?;
-        if matches!(descriptors_value, JsValue::Null | JsValue::Undefined) {
-            return Ok(JsValue::Object(target));
-        }
-        // §20.1.2.2 step 2: `ToObject(Properties)`.
         let descriptors = self.to_object(descriptors_value)?;
+        // Every descriptor is read before any property is defined (steps 3-4).
         let properties = self
             .realm
             .enumerable_own_properties(descriptors)
             .unwrap_or_default();
+        let mut pending = Vec::with_capacity(properties.len());
         for (key, descriptor) in properties {
-            self.object_define_property(&[
-                JsValue::Object(target),
-                JsValue::String(key),
-                descriptor,
-            ])?;
+            let JsValue::Object(descriptor) = descriptor else {
+                return Err(JsError::type_error(
+                    "Property description must be an object",
+                ));
+            };
+            pending.push((key, self.to_property_descriptor(descriptor)?));
+        }
+        for (key, partial) in pending {
+            self.apply_property_descriptor(target, None, &key, partial)?;
         }
         Ok(JsValue::Object(target))
+    }
+
+    /// ECMA-262 6.2.6.5 `ToPropertyDescriptor`. A field counts as present when
+    /// the descriptor has it through `HasProperty`, so an inherited field counts
+    /// too, and an absent field stays `None` so the caller can keep the current
+    /// value.
+    fn to_property_descriptor(
+        &mut self,
+        descriptor: ObjectId,
+    ) -> Result<PartialDescriptor, JsError> {
+        let mut partial = PartialDescriptor::default();
+        if let Some(value) = self.realm.get_property(descriptor, "enumerable") {
+            partial.enumerable = Some(value.is_truthy());
+        }
+        if let Some(value) = self.realm.get_property(descriptor, "configurable") {
+            partial.configurable = Some(value.is_truthy());
+        }
+        if let Some(value) = self.realm.get_property(descriptor, "value") {
+            partial.value = Some(value);
+        }
+        if let Some(value) = self.realm.get_property(descriptor, "writable") {
+            partial.writable = Some(value.is_truthy());
+        }
+        if let Some(value) = self.realm.get_property(descriptor, "get") {
+            partial.get = AccessorField::Present(self.accessor_slot(&value, "get")?);
+        }
+        if let Some(value) = self.realm.get_property(descriptor, "set") {
+            partial.set = AccessorField::Present(self.accessor_slot(&value, "set")?);
+        }
+        let accessor_present = !matches!(partial.get, AccessorField::Absent)
+            || !matches!(partial.set, AccessorField::Absent);
+        if accessor_present && (partial.value.is_some() || partial.writable.is_some()) {
+            return Err(JsError::type_error(
+                "Invalid property descriptor: cannot specify accessors together with value or writable",
+            ));
+        }
+        Ok(partial)
+    }
+
+    /// A `get` or `set` field: `undefined` is an accessor with no function, and
+    /// anything that is not callable is a `TypeError` (§6.2.6.5 steps 8-9).
+    fn accessor_slot(&self, value: &JsValue, name: &str) -> Result<Option<ObjectId>, JsError> {
+        match value {
+            JsValue::Undefined => Ok(None),
+            JsValue::Object(function) if JsRuntime::is_callable_object(*function, &self.realm) => {
+                Ok(Some(*function))
+            }
+            _ => Err(JsError::type_error(format!(
+                "Property accessor {name:?} must be a function"
+            ))),
+        }
+    }
+
+    /// `DefinePropertyOrThrow`: merge the partial descriptor into the current own
+    /// property, then apply it. The object refusing the change (non-extensible
+    /// target, or a non-configurable property that cannot take it) is a `TypeError`.
+    fn apply_property_descriptor(
+        &mut self,
+        object: ObjectId,
+        symbol: Option<&JsSymbol>,
+        key: &str,
+        partial: PartialDescriptor,
+    ) -> Result<(), JsError> {
+        let current = match symbol {
+            Some(symbol) => self.realm.own_symbol_property(object, symbol),
+            None => self.realm.own_property(object, key),
+        };
+        let merged = merge_partial_descriptor(current.as_ref(), partial);
+        let applied = match symbol {
+            Some(symbol) => self.realm.define_symbol_property(object, symbol, merged),
+            None => self.realm.define_property(object, key.to_owned(), merged),
+        };
+        if applied {
+            Ok(())
+        } else {
+            Err(JsError::type_error("cannot redefine object property"))
+        }
     }
 
     pub(in crate::runtime) fn object_get_own_property_descriptor(

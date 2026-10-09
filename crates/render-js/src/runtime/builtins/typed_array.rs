@@ -19,12 +19,24 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::TypedArrayKind;
 use crate::value::TypedBuffer;
 use render_dom::Dom;
+
+/// What a callback scan over a typed array reports (ECMA-262 23.2.3.x).
+#[derive(Clone, Copy)]
+enum Scan {
+    /// `every`: `false` at the first falsy result, otherwise `true`.
+    Every,
+    /// `some`: `true` at the first truthy result, otherwise `false`.
+    Some,
+    /// `find` and `findLast`: the first element whose result is truthy.
+    Find,
+    /// `findIndex` and `findLastIndex`: the index of that element, or -1.
+    FindIndex,
+}
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_typed_array_native(
@@ -35,12 +47,24 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
+            NativeFunction::TypedArrayIntrinsic => Err(JsError::type_error(
+                "Abstract class TypedArray not directly constructable",
+            )),
             NativeFunction::TypedArraySet => self.typed_array_set(dom, receiver, arguments),
-            NativeFunction::TypedArraySubarray => self.typed_array_subarray(receiver, arguments),
-            NativeFunction::TypedArraySlice => self.typed_array_slice(receiver, arguments),
-            NativeFunction::TypedArrayFill => self.typed_array_fill(receiver, arguments),
-            NativeFunction::TypedArrayIndexOf => self.typed_array_index_of(receiver, arguments),
-            NativeFunction::TypedArrayIncludes => self.typed_array_includes(receiver, arguments),
+            NativeFunction::TypedArraySubarray => {
+                self.typed_array_subarray(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArraySlice => self.typed_array_slice(dom, receiver, arguments),
+            NativeFunction::TypedArrayFill => self.typed_array_fill(dom, receiver, arguments),
+            NativeFunction::TypedArrayIndexOf => {
+                self.typed_array_index_of(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArrayLastIndexOf => {
+                self.typed_array_last_index_of(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArrayIncludes => {
+                self.typed_array_includes(dom, receiver, arguments)
+            }
             NativeFunction::TypedArrayJoin => self.typed_array_join(receiver, arguments),
             NativeFunction::TypedArrayValues => {
                 let values = self
@@ -50,6 +74,43 @@ impl JsRuntime {
                     .collect();
                 Ok(JsValue::Object(self.realm.collection_iterator(values)))
             }
+            NativeFunction::TypedArrayKeys => self.typed_array_keys(receiver),
+            NativeFunction::TypedArrayEntries => self.typed_array_entries(receiver),
+            NativeFunction::TypedArrayAt => self.typed_array_at(dom, receiver, arguments),
+            NativeFunction::TypedArrayCopyWithin => {
+                self.typed_array_copy_within(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArrayEvery => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::Every, false)
+            }
+            NativeFunction::TypedArraySome => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::Some, false)
+            }
+            NativeFunction::TypedArrayFind => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::Find, false)
+            }
+            NativeFunction::TypedArrayFindIndex => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::FindIndex, false)
+            }
+            NativeFunction::TypedArrayFindLast => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::Find, true)
+            }
+            NativeFunction::TypedArrayFindLastIndex => {
+                self.typed_array_scan(dom, receiver, arguments, Scan::FindIndex, true)
+            }
+            NativeFunction::TypedArrayReduce => {
+                self.typed_array_reduce(dom, receiver, arguments, false)
+            }
+            NativeFunction::TypedArrayReduceRight => {
+                self.typed_array_reduce(dom, receiver, arguments, true)
+            }
+            NativeFunction::TypedArrayReverse => self.typed_array_reverse(receiver),
+            NativeFunction::TypedArraySort => self.typed_array_sort(dom, receiver, arguments),
+            NativeFunction::TypedArrayToReversed => self.typed_array_to_reversed(receiver),
+            NativeFunction::TypedArrayToSorted => {
+                self.typed_array_to_sorted(dom, receiver, arguments)
+            }
+            NativeFunction::TypedArrayWith => self.typed_array_with(dom, receiver, arguments),
             NativeFunction::TypedArrayFrom => {
                 let kind = match self.realm.host(receiver) {
                     Some(ObjectHost::TypedArrayConstructor(kind)) => kind,
@@ -60,6 +121,13 @@ impl JsRuntime {
                     }
                 };
                 self.typed_array_from(dom, receiver, kind, arguments)
+            }
+            NativeFunction::TypedArrayOf => self.typed_array_of(dom, receiver, arguments),
+            NativeFunction::TypedArrayLengthGetter => self.typed_array_length(receiver),
+            NativeFunction::TypedArrayByteLengthGetter => self.typed_array_byte_length(receiver),
+            NativeFunction::TypedArrayByteOffsetGetter => self.typed_array_byte_offset(receiver),
+            NativeFunction::TypedArrayToStringTagGetter => {
+                Ok(self.typed_array_to_string_tag(receiver))
             }
             NativeFunction::TypedArrayForEach => {
                 let callback = Self::require_callable_object(
@@ -123,8 +191,9 @@ impl JsRuntime {
             _ => None,
         } {
             return self.typed_array_over_buffer(
+                dom,
                 kind,
-                buffer.clone(),
+                buffer,
                 arguments.get(1),
                 arguments.get(2),
                 prototype,
@@ -134,7 +203,7 @@ impl JsRuntime {
             JsValue::Undefined | JsValue::Null => Vec::new(),
             JsValue::Object(_) => self.typed_array_source_values(dom, first)?,
             other => {
-                let length = self.typed_index(other)?;
+                let length = self.typed_index(dom, other)?;
                 return self.create_typed_array(kind, length, prototype);
             }
         };
@@ -153,6 +222,7 @@ impl JsRuntime {
     /// refused here rather than answered with a plausible-looking wrong number.
     fn typed_array_over_buffer(
         &mut self,
+        dom: &mut Dom,
         kind: TypedArrayKind,
         buffer: TypedBuffer,
         byte_offset: Option<&JsValue>,
@@ -168,17 +238,11 @@ impl JsRuntime {
         }
         let total_bytes = buffer.0.borrow().len();
         let element_size = kind.element_size();
-        let offset = match byte_offset {
-            None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
-        };
-        if !offset.is_finite() || offset < 0.0 || offset.trunc() != offset {
+        // §23.2.5.1 steps 7-8: `ToIndex(byteOffset)`.
+        let offset = self.optional_integer_value(dom, byte_offset)?;
+        if !offset.is_finite() || offset < 0.0 {
             return Err(self.range_error("byteOffset must be a non-negative integer"));
         }
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "buffer lengths stay far below any precision boundary"
-        )]
         let offset_value = offset as usize;
         if !offset_value.is_multiple_of(element_size) {
             return Err(self.range_error("byteOffset must be a multiple of the element size"));
@@ -186,23 +250,14 @@ impl JsRuntime {
         if offset_value > total_bytes {
             return Err(self.range_error("byteOffset is past the end of the buffer"));
         }
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "buffer lengths stay far below any precision boundary"
-        )]
         let available = (total_bytes - offset_value) / element_size;
         let count = match length {
             None | Some(JsValue::Undefined) => available,
             Some(value) => {
-                let requested = to_number(value)?;
-                if !requested.is_finite() || requested < 0.0 || requested.trunc() != requested {
+                let requested = self.optional_integer_value(dom, Some(value))?;
+                if !requested.is_finite() || requested < 0.0 {
                     return Err(self.range_error("length must be a non-negative integer"));
                 }
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    reason = "the value is validated as a non-negative integer"
-                )]
                 let requested = requested as usize;
                 if requested > available {
                     return Err(self.range_error("length is past the end of the buffer"));
@@ -250,9 +305,9 @@ impl JsRuntime {
         Ok(values)
     }
 
-    /// `TypedArray.from(source[, mapper])`: build one typed array from
-    /// another typed array, an array-like, or a string's characters, with an
-    /// optional mapping callback.
+    /// `TypedArray.from(source[, mapper[, thisArg]])` (ECMA-262 23.2.2.1): build
+    /// one typed array from another typed array, an array-like, or a string's
+    /// characters, with an optional mapping callback.
     pub(in crate::runtime) fn typed_array_from(
         &mut self,
         dom: &mut Dom,
@@ -277,10 +332,6 @@ impl JsRuntime {
             let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
             let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
             for (index, value) in values.iter_mut().enumerate() {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "source indices stay far below any precision boundary"
-                )]
                 let index_value = JsValue::Number(index as f64);
                 let element = self.call_with_this(
                     dom,
@@ -290,6 +341,35 @@ impl JsRuntime {
                 )?;
                 *value = self.to_number_value(dom, &element)?;
             }
+        }
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(object) => Some(object),
+                _ => None,
+            });
+        self.create_typed_array_from_values(kind, &values, prototype)
+    }
+
+    /// `TypedArray.of(...items)` (ECMA-262 23.2.2.2), for a concrete constructor.
+    fn typed_array_of(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let kind = match self.realm.host(constructor) {
+            Some(ObjectHost::TypedArrayConstructor(kind)) => kind,
+            _ => {
+                return Err(JsError::type_error(
+                    "TypedArray.of requires a typed-array constructor receiver",
+                ));
+            }
+        };
+        let mut values = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            values.push(self.to_number_value(dom, argument)?);
         }
         let prototype = self
             .realm
@@ -328,10 +408,6 @@ impl JsRuntime {
         }
         let encoded = values.iter().map(|value| kind.encode(*value)).collect();
         let buffer = TypedBuffer(std::rc::Rc::new(std::cell::RefCell::new(encoded)));
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "typed-array lengths stay far below any precision boundary"
-        )]
         let length = buffer.0.borrow().len();
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(
@@ -364,6 +440,9 @@ impl JsRuntime {
         Ok(buffer.0.borrow()[start..start + length].to_vec())
     }
 
+    /// `%TypedArray%.prototype.set(source[, offset])` (ECMA-262 23.2.3.26): the
+    /// offset is converted before the source is read, and the method returns
+    /// `undefined`.
     pub(in crate::runtime) fn typed_array_set(
         &mut self,
         dom: &mut Dom,
@@ -371,58 +450,57 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
-        let Some(source) = arguments.first() else {
-            return Err(JsError::type_error("set requires a source argument"));
-        };
-        let offset = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => 0,
-            Some(value) => self.typed_index(value)?,
-        };
-        let values: Vec<f64> = match source {
-            JsValue::Object(object) => match self.realm.host(*object) {
-                Some(ObjectHost::TypedArray {
+        let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let offset = self.optional_integer_value(dom, arguments.get(1))?;
+        if offset < 0.0 {
+            return Err(self.range_error("offset is out of bounds"));
+        }
+        let values: Vec<f64> = match &source {
+            JsValue::Object(object) => {
+                if let Some(ObjectHost::TypedArray {
                     buffer: source_buffer,
                     start: source_start,
                     length: source_length,
                     ..
-                }) => source_buffer.0.borrow()[source_start..source_start + source_length].to_vec(),
-                Some(ObjectHost::Array) => {
-                    let elements = self.array_elements_for(*object)?;
-                    let mut values = Vec::with_capacity(elements.len());
-                    for element in &elements {
-                        values.push(self.to_number_value(dom, element)?);
-                    }
-                    values
-                }
-                _ => {
+                }) = self.realm.host(*object)
+                {
+                    source_buffer.0.borrow()[source_start..source_start + source_length].to_vec()
+                } else {
+                    // SetTypedArrayFromArrayLike: the length is `ToLength` of the
+                    // object's `length`, and each element goes through `ToNumber`.
                     let count = self.array_like_length(dom, *object)?;
-                    let mut values = Vec::new();
+                    let mut values = Vec::with_capacity(count);
                     for index in 0..count {
                         let element = self.get_member(dom, *object, &index.to_string())?;
                         values.push(self.to_number_value(dom, &element)?);
                     }
                     values
                 }
-            },
-            _ => {
+            }
+            JsValue::String(text) => text
+                .chars()
+                .map(|character| f64::from(u32::from(character)))
+                .collect(),
+            JsValue::Undefined | JsValue::Null => {
                 return Err(JsError::type_error(
                     "typed-array set requires an array-like source",
                 ));
             }
+            // Other primitives box to an object with no `length`, so there are
+            // no elements to copy.
+            _ => Vec::new(),
         };
-        if offset
-            .checked_add(values.len())
-            .is_none_or(|end| end > length)
-        {
+        if offset + values.len() as f64 > length as f64 {
             return Err(self.range_error("source is too large"));
         }
+        let offset = offset as usize;
         {
             let mut elements = buffer.0.borrow_mut();
             for (delta, value) in values.iter().enumerate() {
                 elements[start + offset + delta] = kind.encode(*value);
             }
         }
-        Ok(JsValue::Object(receiver))
+        Ok(JsValue::Undefined)
     }
 
     /// Prototype for views/copies derived from `receiver`'s constructor.
@@ -446,11 +524,12 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn typed_array_subarray(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
-        let (begin, end) = Self::typed_range(arguments, length)?;
+        let (begin, end) = self.typed_range(dom, arguments, length)?;
         self.ensure_heap_capacity(1)?;
         let prototype = self.typed_array_derived_prototype(receiver);
         Ok(JsValue::Object(self.realm.typed_array(
@@ -464,60 +543,70 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn typed_array_slice(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (kind, _, _, length) = self.typed_array_host(receiver)?;
-        let (begin, end) = Self::typed_range(arguments, length)?;
+        let (begin, end) = self.typed_range(dom, arguments, length)?;
         let elements = self.typed_array_elements(receiver)?;
         let prototype = self.typed_array_derived_prototype(receiver);
         self.create_typed_array_from_values(kind, &elements[begin..end], prototype)
     }
 
-    /// Resolve the half-open [begin, end) element range shared by `fill`,
-    /// `subarray`, and `slice`, with clamping and negative relative indices.
+    /// The half-open element range `[begin, end)` that `subarray` and `slice`
+    /// select from their first two arguments (ECMA-262 `relativeStart` and
+    /// `relativeEnd`). An end before the begin is an empty range.
     pub(in crate::runtime) fn typed_range(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         length: usize,
     ) -> Result<(usize, usize), JsError> {
-        let relative = |value: Option<&JsValue>, fallback: f64| -> Result<f64, JsError> {
-            match value {
-                None | Some(JsValue::Undefined) => Ok(fallback),
-                Some(value) => Ok(to_number(value)?),
-            }
+        let len = length as f64;
+        let begin = self.relative_position(dom, arguments.first(), len, 0.0)?;
+        let end = self.relative_position(dom, arguments.get(1), len, len)?;
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "both bounds are clamped into 0..=length"
+        )]
+        let (begin, end) = (begin as usize, end as usize);
+        Ok((begin, end.max(begin)))
+    }
+
+    /// One relative index argument: `ToIntegerOrInfinity` of it, with a negative
+    /// value counting back from `length`, clamped into `0..=length`. An absent or
+    /// `undefined` argument selects `default`.
+    fn relative_position(
+        &mut self,
+        dom: &mut Dom,
+        value: Option<&JsValue>,
+        length: f64,
+        default: f64,
+    ) -> Result<f64, JsError> {
+        let relative = match value {
+            None | Some(JsValue::Undefined) => return Ok(default),
+            Some(value) => self.to_integer_value(dom, value)?,
         };
-        let begin = relative(arguments.first(), 0.0)?;
-        let end = relative(arguments.get(1), length as f64)?;
-        let clamp_index = |value: f64| -> usize {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "range endpoints clamp into 0..=length"
-            )]
-            let index = if value < 0.0 {
-                length as f64 + value
-            } else {
-                value
-            };
-            index.clamp(0.0, length as f64) as usize
-        };
-        let begin = clamp_index(begin);
-        let end = clamp_index(end);
-        Ok((begin.min(end), begin.max(end)))
+        Ok(if relative < 0.0 {
+            (length + relative).max(0.0)
+        } else {
+            relative.min(length)
+        })
     }
 
     pub(in crate::runtime) fn typed_array_fill(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
-        let fill_value = match arguments.first() {
-            Some(value) => kind.encode(to_number(value)?),
-            None => kind.encode(f64::NAN),
-        };
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let fill_value = kind.encode(self.to_number_value(dom, &value)?);
         let rest = arguments.get(1..).unwrap_or(&[]);
-        let (begin, end) = Self::typed_range(rest, length)?;
+        let (begin, end) = self.typed_range(dom, rest, length)?;
         {
             let mut elements = buffer.0.borrow_mut();
             for slot in &mut elements[start + begin..start + end] {
@@ -527,28 +616,69 @@ impl JsRuntime {
         Ok(JsValue::Object(receiver))
     }
 
+    /// The number a search argument names. Only a number can equal an element,
+    /// so any other value matches nothing.
+    fn typed_search_number(value: Option<&JsValue>) -> Option<f64> {
+        match value {
+            Some(JsValue::Number(number)) => Some(*number),
+            _ => None,
+        }
+    }
+
     pub(in crate::runtime) fn typed_array_index_of(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (_, buffer, start, length) = self.typed_array_host(receiver)?;
-        let Some(search) = arguments.first().and_then(|value| match to_number(value) {
-            Ok(number) if !number.is_nan() => Some(number),
-            _ => None,
-        }) else {
+        let from = self.typed_from_index(dom, arguments.get(1), length)?;
+        let Some(search) = Self::typed_search_number(arguments.first()) else {
             return Ok(JsValue::Number(-1.0));
         };
-        let from = Self::typed_from_index(arguments.get(1), length)?;
         let elements = buffer.0.borrow();
         for (delta, element) in elements[start + from..start + length].iter().enumerate() {
             if *element == search {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "index results stay far below any precision boundary"
-                )]
                 return Ok(JsValue::Number((from + delta) as f64));
             }
+        }
+        Ok(JsValue::Number(-1.0))
+    }
+
+    /// `%TypedArray%.prototype.lastIndexOf(searchElement[, fromIndex])`
+    /// (ECMA-262 23.2.3.18).
+    pub(in crate::runtime) fn typed_array_last_index_of(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        if length == 0 {
+            return Ok(JsValue::Number(-1.0));
+        }
+        let len = length as f64;
+        let from = match arguments.get(1) {
+            Some(value) => self.to_integer_value(dom, value)?,
+            None => len - 1.0,
+        };
+        if from == f64::NEG_INFINITY {
+            return Ok(JsValue::Number(-1.0));
+        }
+        let mut index = if from >= 0.0 {
+            from.min(len - 1.0)
+        } else {
+            len + from
+        };
+        let Some(search) = Self::typed_search_number(arguments.first()) else {
+            return Ok(JsValue::Number(-1.0));
+        };
+        let elements = buffer.0.borrow();
+        while index >= 0.0 {
+            if elements[start + index as usize] == search {
+                return Ok(JsValue::Number(index));
+            }
+            index -= 1.0;
         }
         Ok(JsValue::Number(-1.0))
     }
@@ -556,41 +686,29 @@ impl JsRuntime {
     /// Resolve an optional `fromIndex` argument shared by `indexOf` and
     /// `includes`: negative values count back from the end, and the result
     /// clamps into `0..=length`.
-    pub(in crate::runtime) fn typed_from_index(
+    fn typed_from_index(
+        &mut self,
+        dom: &mut Dom,
         value: Option<&JsValue>,
         length: usize,
     ) -> Result<usize, JsError> {
-        let Some(value) = value else {
-            return Ok(0);
-        };
-        if matches!(value, JsValue::Undefined) {
-            return Ok(0);
-        }
-        let number = to_number(value)?;
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "negative from-index wraps relative to the array length"
-        )]
-        let index = if number < 0.0 {
-            length as f64 + number
-        } else {
-            number
-        };
-        Ok(index.clamp(0.0, length as f64) as usize)
+        let number = self.optional_integer_value(dom, value)?;
+        let len = length as f64;
+        let index = if number < 0.0 { len + number } else { number };
+        Ok(index.clamp(0.0, len) as usize)
     }
 
     pub(in crate::runtime) fn typed_array_includes(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (_, buffer, start, length) = self.typed_array_host(receiver)?;
-        let Some(value) = arguments.first() else {
+        let from = self.typed_from_index(dom, arguments.get(1), length)?;
+        let Some(search) = Self::typed_search_number(arguments.first()) else {
             return Ok(JsValue::Boolean(false));
         };
-        let search = to_number(value)?;
-        let from = Self::typed_from_index(arguments.get(1), length)?;
         let elements = buffer.0.borrow();
         for element in &elements[start + from..start + length] {
             // `includes` uses SameValueZero, so `NaN` finds `NaN`.
@@ -683,21 +801,362 @@ impl JsRuntime {
         Ok(JsValue::String(parts.join(&separator)))
     }
 
+    /// `%TypedArray%.prototype.keys()`: an iterator over the indices.
+    fn typed_array_keys(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (_, _, _, length) = self.typed_array_host(receiver)?;
+        let keys = (0..length)
+            .map(|index| JsValue::Number(index as f64))
+            .collect();
+        Ok(JsValue::Object(self.realm.collection_iterator(keys)))
+    }
+
+    /// `%TypedArray%.prototype.entries()`: an iterator over `[index, value]`.
+    fn typed_array_entries(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let elements = self.typed_array_elements(receiver)?;
+        let mut entries = Vec::with_capacity(elements.len());
+        for (index, element) in elements.into_iter().enumerate() {
+            let pair = self.create_array_from_values(&[
+                JsValue::Number(index as f64),
+                JsValue::Number(element),
+            ])?;
+            entries.push(JsValue::Object(pair));
+        }
+        Ok(JsValue::Object(self.realm.collection_iterator(entries)))
+    }
+
+    /// `%TypedArray%.prototype.at(index)` (ECMA-262 23.2.3.1).
+    fn typed_array_at(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let len = length as f64;
+        let relative = self.optional_integer_value(dom, arguments.first())?;
+        let index = if relative >= 0.0 {
+            relative
+        } else {
+            len + relative
+        };
+        if index < 0.0 || index >= len {
+            return Ok(JsValue::Undefined);
+        }
+        let element = buffer.0.borrow()[start + index as usize];
+        Ok(JsValue::Number(element))
+    }
+
+    /// `%TypedArray%.prototype.copyWithin(target, start[, end])` (ECMA-262
+    /// 23.2.3.6): the copy behaves as if through a temporary, so overlapping
+    /// ranges copy correctly.
+    fn typed_array_copy_within(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let len = length as f64;
+        let to = self.relative_position(dom, arguments.first(), len, 0.0)?;
+        let from = self.relative_position(dom, arguments.get(1), len, 0.0)?;
+        let end = self.relative_position(dom, arguments.get(2), len, len)?;
+        let count = (end - from).min(len - to);
+        if count > 0.0 {
+            let (to, from, count) = (to as usize, from as usize, count as usize);
+            let mut elements = buffer.0.borrow_mut();
+            elements[start..start + length].copy_within(from..from + count, to);
+        }
+        Ok(JsValue::Object(receiver))
+    }
+
+    /// The shared loop of `every`, `some`, `find`, `findIndex`, `findLast` and
+    /// `findLastIndex`: visit the elements in index order, or in reverse when
+    /// `last` is set, and report according to `scan`.
+    fn typed_array_scan(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        scan: Scan,
+        last: bool,
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let callback = Self::require_callable_object(
+            required_argument(arguments, 0, "callback")?,
+            &self.realm,
+        )?;
+        let this_argument = callback_this_argument(arguments);
+        let order: Vec<usize> = if last {
+            (0..length).rev().collect()
+        } else {
+            (0..length).collect()
+        };
+        for index in order {
+            let element = buffer.0.borrow()[start + index];
+            let result = self.call_with_this(
+                dom,
+                callback,
+                &[
+                    JsValue::Number(element),
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+                this_argument.clone(),
+            )?;
+            let truthy = result.is_truthy();
+            match (scan, truthy) {
+                (Scan::Every, false) => return Ok(JsValue::Boolean(false)),
+                (Scan::Some, true) => return Ok(JsValue::Boolean(true)),
+                (Scan::Find, true) => return Ok(JsValue::Number(element)),
+                (Scan::FindIndex, true) => return Ok(JsValue::Number(index as f64)),
+                _ => {}
+            }
+        }
+        Ok(match scan {
+            Scan::Every => JsValue::Boolean(true),
+            Scan::Some => JsValue::Boolean(false),
+            Scan::Find => JsValue::Undefined,
+            Scan::FindIndex => JsValue::Number(-1.0),
+        })
+    }
+
+    /// `%TypedArray%.prototype.reduce` and `reduceRight` (ECMA-262 23.2.3.19).
+    fn typed_array_reduce(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        right: bool,
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let callback =
+            Self::require_callable_object(required_argument(arguments, 0, "reduce")?, &self.realm)?;
+        let mut order: Vec<usize> = if right {
+            (0..length).rev().collect()
+        } else {
+            (0..length).collect()
+        };
+        let mut accumulator = if let Some(initial) = arguments.get(1) {
+            initial.clone()
+        } else {
+            if order.is_empty() {
+                return Err(JsError::type_error(
+                    "Reduce of empty typed array with no initial value",
+                ));
+            }
+            let first = order.remove(0);
+            JsValue::Number(buffer.0.borrow()[start + first])
+        };
+        for index in order {
+            let element = buffer.0.borrow()[start + index];
+            accumulator = self.call_with_this(
+                dom,
+                callback,
+                &[
+                    accumulator,
+                    JsValue::Number(element),
+                    JsValue::Number(index as f64),
+                    JsValue::Object(receiver),
+                ],
+                JsValue::Undefined,
+            )?;
+        }
+        Ok(accumulator)
+    }
+
+    /// `%TypedArray%.prototype.reverse()`: in place, and returns the receiver.
+    fn typed_array_reverse(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        buffer.0.borrow_mut()[start..start + length].reverse();
+        Ok(JsValue::Object(receiver))
+    }
+
+    /// The comparator argument of `sort` and `toSorted`: absent or `undefined`
+    /// for the numeric default, otherwise it must be callable.
+    fn typed_array_comparator(&self, value: Option<&JsValue>) -> Result<Option<ObjectId>, JsError> {
+        match value {
+            None | Some(JsValue::Undefined) => Ok(None),
+            Some(JsValue::Object(object)) if Self::is_callable_object(*object, &self.realm) => {
+                Ok(Some(*object))
+            }
+            Some(_) => Err(JsError::type_error(
+                "The comparison function must be either a function or undefined",
+            )),
+        }
+    }
+
+    /// The signed order of two elements: negative when `left` sorts first. The
+    /// default is numeric, with `NaN` last and `-0` before `+0`.
+    fn typed_array_order(
+        &mut self,
+        dom: &mut Dom,
+        comparator: Option<ObjectId>,
+        left: f64,
+        right: f64,
+    ) -> Result<f64, JsError> {
+        if let Some(function) = comparator {
+            let result = self.call_with_this(
+                dom,
+                function,
+                &[JsValue::Number(left), JsValue::Number(right)],
+                JsValue::Undefined,
+            )?;
+            let order = self.to_number_value(dom, &result)?;
+            return Ok(if order.is_nan() { 0.0 } else { order });
+        }
+        Ok(match (left.is_nan(), right.is_nan()) {
+            (true, true) => 0.0,
+            (true, false) => 1.0,
+            (false, true) => -1.0,
+            (false, false) => {
+                if left < right {
+                    -1.0
+                } else if left > right {
+                    1.0
+                } else if left == 0.0 && right == 0.0 {
+                    // `-0` sorts before `+0`: a negative `left` with a positive
+                    // `right` is -1, and the reverse is +1.
+                    f64::from(u8::from(left.is_sign_positive()))
+                        - f64::from(u8::from(right.is_sign_positive()))
+                } else {
+                    0.0
+                }
+            }
+        })
+    }
+
+    /// A stable insertion sort of `elements` under [`Self::typed_array_order`].
+    fn typed_array_sort_values(
+        &mut self,
+        dom: &mut Dom,
+        comparator: Option<ObjectId>,
+        elements: &mut [f64],
+    ) -> Result<(), JsError> {
+        for index in 1..elements.len() {
+            let mut position = index;
+            while position > 0 {
+                let order = self.typed_array_order(
+                    dom,
+                    comparator,
+                    elements[position - 1],
+                    elements[position],
+                )?;
+                if order <= 0.0 {
+                    break;
+                }
+                elements.swap(position - 1, position);
+                position -= 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// `%TypedArray%.prototype.sort(comparefn)` (ECMA-262 23.2.3.29): sorts the
+    /// receiver's elements in place.
+    fn typed_array_sort(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (_, buffer, start, length) = self.typed_array_host(receiver)?;
+        let comparator = self.typed_array_comparator(arguments.first())?;
+        let mut elements = self.typed_array_elements(receiver)?;
+        self.typed_array_sort_values(dom, comparator, &mut elements)?;
+        buffer.0.borrow_mut()[start..start + length].copy_from_slice(&elements);
+        Ok(JsValue::Object(receiver))
+    }
+
+    /// `%TypedArray%.prototype.toReversed()`: a reversed copy of the same kind.
+    fn typed_array_to_reversed(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (kind, _, _, _) = self.typed_array_host(receiver)?;
+        let mut elements = self.typed_array_elements(receiver)?;
+        elements.reverse();
+        let prototype = self.typed_array_derived_prototype(receiver);
+        self.create_typed_array_from_values(kind, &elements, prototype)
+    }
+
+    /// `%TypedArray%.prototype.toSorted(comparefn)`: a sorted copy of the same
+    /// kind, leaving the receiver alone.
+    fn typed_array_to_sorted(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (kind, _, _, _) = self.typed_array_host(receiver)?;
+        let comparator = self.typed_array_comparator(arguments.first())?;
+        let mut elements = self.typed_array_elements(receiver)?;
+        self.typed_array_sort_values(dom, comparator, &mut elements)?;
+        let prototype = self.typed_array_derived_prototype(receiver);
+        self.create_typed_array_from_values(kind, &elements, prototype)
+    }
+
+    /// `%TypedArray%.prototype.with(index, value)` (ECMA-262 23.2.3.38): the
+    /// value converts before the index is range-checked.
+    fn typed_array_with(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let (kind, _, _, length) = self.typed_array_host(receiver)?;
+        let len = length as f64;
+        let relative = self.optional_integer_value(dom, arguments.first())?;
+        let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let number = self.to_number_value(dom, &value)?;
+        let index = if relative >= 0.0 {
+            relative
+        } else {
+            len + relative
+        };
+        if index < 0.0 || index >= len {
+            return Err(self.range_error("Invalid typed array index"));
+        }
+        let mut elements = self.typed_array_elements(receiver)?;
+        elements[index as usize] = number;
+        let prototype = self.typed_array_derived_prototype(receiver);
+        self.create_typed_array_from_values(kind, &elements, prototype)
+    }
+
+    /// The `length` accessor of `%TypedArray%.prototype`.
+    fn typed_array_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (_, _, _, length) = self.typed_array_host(receiver)?;
+        Ok(JsValue::Number(length as f64))
+    }
+
+    /// The `byteLength` accessor: the element count times the element size.
+    fn typed_array_byte_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (kind, _, _, length) = self.typed_array_host(receiver)?;
+        Ok(JsValue::Number((length * kind.element_size()) as f64))
+    }
+
+    /// The `byteOffset` accessor: the view's start, in bytes.
+    fn typed_array_byte_offset(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        let (kind, _, start, _) = self.typed_array_host(receiver)?;
+        Ok(JsValue::Number((start * kind.element_size()) as f64))
+    }
+
+    /// The `@@toStringTag` accessor: the constructor's name for a typed array,
+    /// and `undefined` for anything else (ECMA-262 23.2.3.32).
+    fn typed_array_to_string_tag(&self, receiver: ObjectId) -> JsValue {
+        match self.typed_array_host(receiver) {
+            Ok((kind, _, _, _)) => JsValue::String(kind.name().to_owned()),
+            Err(_) => JsValue::Undefined,
+        }
+    }
+
     /// `ToIndex` for typed-array lengths and offsets: `NaN` clamps to zero and
     /// negative or non-finite values raise a `RangeError`.
-    pub(in crate::runtime) fn typed_index(&mut self, value: &JsValue) -> Result<usize, JsError> {
-        let number = to_number(value)?;
-        if number.is_nan() {
-            return Ok(0);
-        }
+    pub(in crate::runtime) fn typed_index(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<usize, JsError> {
+        let number = self.to_integer_value(dom, value)?;
         if !number.is_finite() || number < 0.0 || number > Self::MAX_TYPED_ARRAY_ELEMENTS as f64 {
             return Err(self.range_error("invalid typed array index"));
         }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "index is validated as a finite non-negative integer"
-        )]
-        Ok(number.trunc() as usize)
+        Ok(number as usize)
     }
 }

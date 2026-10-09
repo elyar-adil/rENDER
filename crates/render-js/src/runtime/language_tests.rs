@@ -17,6 +17,167 @@ fn ok(source: &str) -> String {
 }
 
 #[test]
+fn typed_array_prototype_is_shared_through_the_intrinsic() {
+    // §23.2.1: %TypedArray% is the abstract constructor the concrete ones inherit
+    // from, and its prototype holds the methods every concrete prototype shares.
+    assert_eq!(
+        ok(
+            "var TA = Object.getPrototypeOf(Int8Array); [TA.name, TA.length, typeof TA.prototype.map, Object.getPrototypeOf(Int8Array.prototype) === TA.prototype, Object.getPrototypeOf(Uint8Array) === TA, new Int8Array(2).hasOwnProperty('length')].join()"
+        ),
+        "TypedArray,0,function,true,true,false"
+    );
+    assert_eq!(
+        ok("var r; try { Object.getPrototypeOf(Int8Array)(); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("Object.prototype.toString.call(new Float64Array(1))"),
+        "[object Float64Array]"
+    );
+}
+
+#[test]
+fn typed_array_methods_read_the_view_and_follow_the_spec() {
+    assert_eq!(
+        ok(
+            "var a = new Int8Array([3, 1, 2]); [a.at(-1), a.at(5) === undefined, a.every(function (x) { return x > 0; }), a.some(function (x) { return x > 2; }), a.find(function (x) { return x < 3; }), a.findIndex(function (x) { return x === 2; }), a.findLast(function (x) { return x < 3; }), a.reduce(function (s, x) { return s + x; }), a.reduceRight(function (s, x) { return s + '' + x; }, '')].join()"
+        ),
+        "2,true,true,true,1,2,2,6,213"
+    );
+    // Numeric sort puts `NaN` last and `-0` before `+0`.
+    assert_eq!(
+        ok(
+            "var a = new Float64Array([3, NaN, -0, 0, -1]); a.sort(); var out = []; for (var i = 0; i < a.length; i++) out.push(Object.is(a[i], -0) ? '-0' : String(a[i])); out.join('|')"
+        ),
+        "-1|-0|0|3|NaN"
+    );
+    assert_eq!(
+        ok(
+            "var a = new Int8Array([1, 2, 3, 4, 5]); a.copyWithin(0, 3); var out = []; for (var i = 0; i < a.length; i++) out.push(a[i]); out.join()"
+        ),
+        "4,5,3,4,5"
+    );
+    assert_eq!(
+        ok(
+            "var a = new Int8Array([1, 2, 3]); var w = a.with(-1, 9); [a.join(), w.join(), a.toReversed().join(), a.toSorted(function (x, y) { return y - x; }).join(), a.reverse() === a, a.join()].join(' ')"
+        ),
+        "1,2,3 1,2,9 3,2,1 3,2,1 true 3,2,1"
+    );
+    assert_eq!(
+        ok(
+            "var a = new Int16Array([7, 8]); var r = []; for (var p of a.entries()) r.push(p.join(':')); for (var k of a.keys()) r.push(k); r.join()"
+        ),
+        "0:7,1:8,0,1"
+    );
+    assert_eq!(
+        ok(
+            "var r = []; var a = Int8Array.of(1, 2); r.push(a.length, a instanceof Int8Array, Int8Array.from([4, 5], function (x) { return x * 2; }).join()); r.join('|')"
+        ),
+        "2|true|8,10"
+    );
+    assert_eq!(
+        ok(
+            "var a = new Float64Array(3); [a.length, a.byteLength, a.byteOffset, a.hasOwnProperty('byteLength')].join()"
+        ),
+        "3,24,0,false"
+    );
+}
+
+#[test]
+fn integer_indexed_reads_never_consult_the_prototype_for_numeric_keys() {
+    // §10.4.5.4 [[Get]]: a canonical numeric key is an element read, so a
+    // prototype property with that name is not reached.
+    assert_eq!(
+        ok(
+            "var a = new Int8Array(2); Object.defineProperty(Object.getPrototypeOf(Int8Array.prototype), '1.5', { get: function () { throw new Error('reached'); } }); [a['1.5'], a[-0], a[2], a['01']].join()"
+        ),
+        ",0,,"
+    );
+}
+
+#[test]
+fn array_and_object_members_report_the_spec_lengths() {
+    assert_eq!(
+        ok(
+            "[Array.prototype.concat.length, Array.prototype.unshift.length, Object.setPrototypeOf.length, Object.hasOwn.length, Object.prototype.__defineGetter__.length, DataView.prototype.setFloat16.length].join()"
+        ),
+        "1,1,2,2,2,2"
+    );
+    // `indexOf` reports `+0` for a `-0` start.
+    assert_eq!(ok("Object.is([1].indexOf(1, -0), 0)"), "true");
+}
+
+#[test]
+fn define_property_rejects_a_non_object_target_or_descriptor() {
+    // §20.1.2.4 step 1 and §6.2.6.5 step 1: a primitive target, and a descriptor
+    // that is not an object (undefined included), are TypeErrors.
+    assert_eq!(
+        ok(
+            "var r = []; try { Object.defineProperty(1, 'x', {}); } catch (e) { r.push(e.name); } try { Object.defineProperty(null, 'x', {}); } catch (e) { r.push(e.name); } try { Object.defineProperty({}, 'x', undefined); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError,TypeError,TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var r = []; try { Object.create(1); } catch (e) { r.push(e.name); } try { Object.create({}, { prop: undefined }); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError,TypeError"
+    );
+}
+
+#[test]
+fn object_create_defines_the_properties_it_is_given() {
+    assert_eq!(
+        ok(
+            "var o = Object.create({ inherited: 1 }, { x: { value: 2, enumerable: true }, y: { get: function () { return 3; } } }); [o.x, o.y, o.inherited, Object.keys(o).join()].join()"
+        ),
+        "2,3,1,x"
+    );
+}
+
+#[test]
+fn non_configurable_properties_accept_only_the_allowed_redefinitions() {
+    // A writable, non-configurable data property takes a new value.
+    assert_eq!(
+        ok(
+            "var o = {}; Object.defineProperty(o, 'x', { value: 1, writable: true }); Object.defineProperty(o, 'x', { value: 2 }); o.x"
+        ),
+        "2"
+    );
+    // A read-only one keeps its value, and a different value is a TypeError.
+    assert_eq!(
+        ok(
+            "var o = {}; Object.defineProperty(o, 'x', { value: 1 }); var r; try { Object.defineProperty(o, 'x', { value: 2 }); } catch (e) { r = e.name; } [r, o.x].join()"
+        ),
+        "TypeError,1"
+    );
+    // It cannot become configurable, but re-stating its value is a no-op.
+    assert_eq!(
+        ok(
+            "var o = {}; Object.defineProperty(o, 'x', { value: 1 }); var r = []; try { Object.defineProperty(o, 'x', { configurable: true }); } catch (e) { r.push(e.name); } Object.defineProperty(o, 'x', { value: 1 }); r.push(o.x); r.join()"
+        ),
+        "TypeError,1"
+    );
+    // A non-extensible object takes no new property.
+    assert_eq!(
+        ok(
+            "var o = Object.preventExtensions({}); var r; try { Object.defineProperty(o, 'x', { value: 1 }); } catch (e) { r = e.name; } [r, 'x' in o].join()"
+        ),
+        "TypeError,false"
+    );
+}
+
+#[test]
+fn a_generic_descriptor_keeps_an_existing_accessor() {
+    assert_eq!(
+        ok(
+            "var o = { get x() { return 7; } }; Object.defineProperty(o, 'x', { enumerable: false }); [o.x, Object.getOwnPropertyDescriptor(o, 'x').enumerable, typeof Object.getOwnPropertyDescriptor(o, 'x').get].join()"
+        ),
+        "7,false,function"
+    );
+}
+
+#[test]
 fn optional_member_access_short_circuits_the_whole_chain() {
     assert_eq!(ok("var a = null; String(a?.b)"), "undefined");
     assert_eq!(ok("var a = null; String(a?.b.c.d)"), "undefined");

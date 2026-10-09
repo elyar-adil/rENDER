@@ -208,12 +208,10 @@ impl JsRuntime {
         dom: &mut Dom,
         object: ObjectId,
     ) -> Result<usize, JsError> {
+        // ECMA-262 7.3.18 `LengthOfArrayLike`: `ToLength` of the `length`, so a
+        // negative or `NaN` length reads as zero.
         let length = self.get_member(dom, object, "length")?;
-        let length = self.to_number_value(dom, &length)?;
-        if !length.is_finite() || length < 0.0 {
-            return Err(self.range_error("invalid typed array length"));
-        }
-        let length = length.trunc();
+        let length = self.to_length_value(dom, &length)?;
         if length > Self::MAX_TYPED_ARRAY_ELEMENTS as f64 {
             return Err(self.range_error("typed array length exceeds the engine bound"));
         }
@@ -591,7 +589,8 @@ impl JsRuntime {
         let mut index = if raw == f64::INFINITY {
             return Ok(JsValue::Number(-1.0));
         } else if raw >= 0.0 {
-            raw.min(length)
+            // `+ 0.0` turns a `-0` start into `+0`, the index the result reports.
+            raw.min(length) + 0.0
         } else {
             (length + raw).max(0.0)
         };

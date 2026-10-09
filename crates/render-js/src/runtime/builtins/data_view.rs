@@ -19,12 +19,12 @@
 //! same bytes. A typed array of a wider element type over a buffer composes its
 //! element from consecutive byte slots, which is the standard's model.
 
+use super::array::MAX_SAFE_INTEGER;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
-use crate::runtime::convert::to_number;
-use crate::value::{NativeFunction, ObjectHost, TypedBuffer};
+use crate::value::{NativeFunction, ObjectHost, TypedArrayKind, TypedBuffer};
 use render_dom::Dom;
 
 /// One accessor: the element width in bytes and the conversion to apply.
@@ -36,6 +36,7 @@ enum Access {
     Uint16,
     Int32,
     Uint32,
+    Float16,
     Float32,
     Float64,
 }
@@ -44,7 +45,7 @@ impl Access {
     const fn width(self) -> usize {
         match self {
             Self::Int8 | Self::Uint8 => 1,
-            Self::Int16 | Self::Uint16 => 2,
+            Self::Int16 | Self::Uint16 | Self::Float16 => 2,
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
             Self::Float64 => 8,
         }
@@ -58,6 +59,9 @@ impl Access {
             NativeFunction::DataViewGetUint16 | NativeFunction::DataViewSetUint16 => Self::Uint16,
             NativeFunction::DataViewGetInt32 | NativeFunction::DataViewSetInt32 => Self::Int32,
             NativeFunction::DataViewGetUint32 | NativeFunction::DataViewSetUint32 => Self::Uint32,
+            NativeFunction::DataViewGetFloat16 | NativeFunction::DataViewSetFloat16 => {
+                Self::Float16
+            }
             NativeFunction::DataViewGetFloat32 | NativeFunction::DataViewSetFloat32 => {
                 Self::Float32
             }
@@ -79,6 +83,7 @@ fn is_write(function: NativeFunction) -> bool {
             | NativeFunction::DataViewSetUint16
             | NativeFunction::DataViewSetInt32
             | NativeFunction::DataViewSetUint32
+            | NativeFunction::DataViewSetFloat16
             | NativeFunction::DataViewSetFloat32
             | NativeFunction::DataViewSetFloat64
     )
@@ -94,11 +99,22 @@ fn widen<const N: usize>(source: [u8; N]) -> [u8; 8] {
 
 /// The `width` bytes of `value` in the requested order, produced from the
 /// little-endian pattern the element's own representation uses.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "each integer is already wrapped into its element range by `encode`"
+)]
 fn encode_bytes(access: Access, value: f64, big_endian: bool) -> Vec<u8> {
     let pattern: [u8; 8] = match access {
-        Access::Int8 | Access::Uint8 => widen([value as i64 as u8]),
-        Access::Int16 | Access::Uint16 => widen((value as i64 as i16).to_le_bytes()),
-        Access::Int32 | Access::Uint32 => widen((value as i64 as i32).to_le_bytes()),
+        // The integer kinds wrap modulo 2^N as `ToInt8`..`ToUint32` do, which is
+        // the same conversion a typed array store performs.
+        Access::Int8 => widen([TypedArrayKind::Int8.encode(value) as i64 as u8]),
+        Access::Uint8 => widen([TypedArrayKind::Uint8.encode(value) as u8]),
+        Access::Int16 => widen((TypedArrayKind::Int16.encode(value) as i64 as i16).to_le_bytes()),
+        Access::Uint16 => widen((TypedArrayKind::Uint16.encode(value) as u16).to_le_bytes()),
+        Access::Int32 => widen((TypedArrayKind::Int32.encode(value) as i64 as i32).to_le_bytes()),
+        Access::Uint32 => widen((TypedArrayKind::Uint32.encode(value) as u32).to_le_bytes()),
+        Access::Float16 => widen(f16_bits(value).to_le_bytes()),
         Access::Float32 => {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -125,10 +141,62 @@ fn decode_number(access: Access, pattern: u64) -> f64 {
         Access::Uint16 => f64::from(pattern as u16),
         Access::Int32 => f64::from(pattern as u32 as i32),
         Access::Uint32 => f64::from(pattern as u32),
+        Access::Float16 => f16_value(pattern as u16),
         // A float accessor reinterprets the pattern; it does not convert it.
         Access::Float32 => f64::from(f32::from_bits(pattern as u32)),
         Access::Float64 => f64::from_bits(pattern),
     }
+}
+
+/// Round a number to the nearest IEEE 754 binary16 value, ties to even, and
+/// return its 16-bit pattern (ECMA-262 `Float16Round`). A magnitude from 65520
+/// up is past the halfway point to 2^16, so it rounds to infinity.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    reason = "every value here is a small integer checked against the binary16 ranges"
+)]
+fn f16_bits(value: f64) -> u16 {
+    if value.is_nan() {
+        return 0x7E00;
+    }
+    let sign: u16 = if value.is_sign_negative() { 0x8000 } else { 0 };
+    let magnitude = value.abs();
+    if magnitude >= 65520.0 {
+        return sign | 0x7C00;
+    }
+    if magnitude < 2f64.powi(-14) {
+        // Subnormal: the quantum is 2^-24. A mantissa that rounds up to 1024
+        // is the smallest normal, and that is exactly the bit pattern 1024.
+        let mantissa = (magnitude * 2f64.powi(24)).round_ties_even();
+        return sign | mantissa as u16;
+    }
+    // Normal: the exponent is the binary64 one, and the 11-bit significand
+    // rounds to ten stored bits.
+    let exponent = ((magnitude.to_bits() >> 52) & 0x7FF) as i32 - 1023;
+    let scaled = magnitude * 2f64.powi(10 - exponent);
+    let mut significand = scaled.round_ties_even() as u32;
+    let mut biased = exponent + 15;
+    if significand == 2048 {
+        significand = 1024;
+        biased += 1;
+    }
+    sign | ((biased as u16) << 10) | ((significand - 1024) as u16)
+}
+
+/// The number a binary16 bit pattern denotes.
+fn f16_value(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1F);
+    let significand = f64::from(bits & 0x3FF);
+    let magnitude = match exponent {
+        0 => significand * 2f64.powi(-24),
+        31 if significand == 0.0 => f64::INFINITY,
+        31 => f64::NAN,
+        _ => (1024.0 + significand) * 2f64.powi(exponent - 25),
+    };
+    sign * magnitude
 }
 
 /// Reverse the low `width` bytes of a little-endian pattern.
@@ -144,40 +212,60 @@ fn reverse_bytes(pattern: u64, width: usize) -> u64 {
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_data_view_native(
         &mut self,
-        _dom: &mut Dom,
+        dom: &mut Dom,
         function: NativeFunction,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
-            NativeFunction::ArrayBufferSlice => self.array_buffer_slice(receiver, arguments),
-            _ => self.data_view_access(function, receiver, arguments),
+            NativeFunction::ArrayBufferSlice => self.array_buffer_slice(dom, receiver, arguments),
+            NativeFunction::ArrayBufferByteLengthGetter => self.array_buffer_byte_length(receiver),
+            NativeFunction::DataViewBufferGetter => self.data_view_buffer(receiver),
+            NativeFunction::DataViewByteLengthGetter => {
+                let (_, _, byte_length) = self.data_view_host(receiver)?;
+                Ok(JsValue::Number(byte_length as f64))
+            }
+            NativeFunction::DataViewByteOffsetGetter => {
+                let (_, byte_offset, _) = self.data_view_host(receiver)?;
+                Ok(JsValue::Number(byte_offset as f64))
+            }
+            _ => self.data_view_access(dom, function, receiver, arguments),
         }
+    }
+
+    /// ECMA-262 `ToIndex`: `ToIntegerOrInfinity` of the value, through its
+    /// `valueOf` when it is an object, and a `RangeError` for anything outside
+    /// `0..=2^53-1`. An absent or `undefined` value reads as 0.
+    fn to_index_value(&mut self, dom: &mut Dom, value: Option<&JsValue>) -> Result<f64, JsError> {
+        let integer = match value {
+            None | Some(JsValue::Undefined) => 0.0,
+            Some(value) => self.to_integer_value(dom, value)?,
+        };
+        if !(0.0..=MAX_SAFE_INTEGER).contains(&integer) {
+            return Err(self.range_error("index is outside the supported range"));
+        }
+        Ok(integer)
     }
 
     /// `new ArrayBuffer(byteLength)`: one byte per slot, so a buffer is
     /// byte-granular and every view over it is byte-exact.
     pub(in crate::runtime) fn array_buffer_constructor(
         &mut self,
+        dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let length = match arguments.first() {
-            None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
-        };
-        if !length.is_finite() || length < 0.0 || length.trunc() != length {
-            return Err(self.range_error("ArrayBuffer length must be a non-negative integer"));
+        // §25.1.4.1 step 2: `ToIndex(length)`.
+        let length = self.to_index_value(dom, arguments.first())?;
+        if length > Self::MAX_TYPED_ARRAY_ELEMENTS as f64 {
+            return Err(self.range_error("ArrayBuffer length exceeds the engine bound"));
         }
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the value is validated as a non-negative integer"
+            reason = "the value is validated as a non-negative integer within the engine bound"
         )]
         let length = length as usize;
-        if length > Self::MAX_TYPED_ARRAY_ELEMENTS {
-            return Err(self.range_error("ArrayBuffer length exceeds the engine bound"));
-        }
         let prototype = self
             .realm
             .get_property(constructor, "prototype")
@@ -191,32 +279,42 @@ impl JsRuntime {
         if let Some(host) = self.realm.host_mut(object) {
             *host = ObjectHost::ArrayBufferHost(buffer);
         }
-        self.realm.define_property(
-            object,
-            "byteLength",
-            crate::PropertyDescriptor {
-                value: JsValue::Number(length as f64),
-                writable: false,
-                getter: None,
-                setter: None,
-                enumerable: true,
-                configurable: true,
-            },
-        );
         Ok(JsValue::Object(object))
     }
 
-    /// `ArrayBuffer.prototype.slice`, which copies rather than shares, so
-    /// writing the copy leaves the original alone.
+    /// The `ArrayBuffer.prototype.byteLength` getter.
+    fn array_buffer_byte_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::ArrayBufferHost(buffer)) => {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "buffer lengths stay far below any precision boundary"
+                )]
+                let length = buffer.0.borrow().len() as f64;
+                Ok(JsValue::Number(length))
+            }
+            _ => Err(JsError::type_error(
+                "ArrayBuffer.prototype.byteLength called on an incompatible receiver",
+            )),
+        }
+    }
+
+    /// `ArrayBuffer.prototype.slice(start, end)`, which copies rather than
+    /// shares, so writing the copy leaves the original alone. Both bounds go
+    /// through `ToIntegerOrInfinity`, so an object's `valueOf` runs.
     fn array_buffer_slice(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let Some(ObjectHost::ArrayBufferHost(buffer)) = self.realm.host(receiver) else {
-            return Err(JsError::type_error(
-                "ArrayBuffer.prototype.slice called on an incompatible receiver",
-            ));
+        let buffer = match self.realm.host(receiver) {
+            Some(ObjectHost::ArrayBufferHost(buffer)) => buffer,
+            _ => {
+                return Err(JsError::type_error(
+                    "ArrayBuffer.prototype.slice called on an incompatible receiver",
+                ));
+            }
         };
         let total = buffer.0.borrow().len();
         #[allow(
@@ -224,29 +322,27 @@ impl JsRuntime {
             reason = "buffer lengths stay far below any precision boundary"
         )]
         let total_value = total as f64;
-        let relative = |value: Option<&JsValue>, default: f64| -> f64 {
-            let number = match value {
-                None | Some(JsValue::Undefined) => return default,
-                Some(value) => to_number(value).unwrap_or(f64::NAN),
-            };
-            if number.is_nan() {
-                return 0.0;
-            }
-            if number < 0.0 {
-                (total_value + number).max(0.0)
+        // §25.1.6.5 steps 5-6: a negative relative index counts back from the
+        // end, and the result clamps into `0..=total`.
+        let relative = |integer: f64| -> f64 {
+            if integer < 0.0 {
+                (total_value + integer).max(0.0)
             } else {
-                number.min(total_value)
+                integer.min(total_value)
             }
         };
-        let start = relative(arguments.first(), 0.0).trunc();
-        let end = relative(arguments.get(1), total_value).trunc();
-        let start = start.clamp(0.0, total_value) as usize;
+        let start_value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let start = relative(self.to_integer_value(dom, &start_value)?);
+        let end = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => total_value,
+            Some(value) => relative(self.to_integer_value(dom, value)?),
+        };
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the value is clamped to the buffer length"
+            reason = "both bounds are clamped into 0..=total"
         )]
-        let end = end.clamp(0.0, total_value) as usize;
+        let (start, end) = (start as usize, end as usize);
         let copied = buffer.0.borrow()[start.min(end)..end].to_vec();
         let prototype = self.realm.get_prototype(receiver);
         self.ensure_heap_capacity(1)?;
@@ -256,27 +352,16 @@ impl JsRuntime {
                 std::cell::RefCell::new(copied),
             )));
         }
-        self.realm.define_property(
-            object,
-            "byteLength",
-            crate::PropertyDescriptor {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "buffer lengths stay far below any precision boundary"
-                )]
-                value: JsValue::Number(end.saturating_sub(start) as f64),
-                writable: false,
-                getter: None,
-                setter: None,
-                enumerable: true,
-                configurable: true,
-            },
-        );
         Ok(JsValue::Object(object))
     }
 
+    /// Reads one `DataView` method: `GetViewValue` (§25.2.1.5) for a getter, and
+    /// `SetViewValue` (§25.2.1.6) for a setter. The request index and, for a
+    /// setter, the value are converted before the bounds check, as the spec
+    /// orders them.
     fn data_view_access(
         &mut self,
+        dom: &mut Dom,
         function: NativeFunction,
         receiver: ObjectId,
         arguments: &[JsValue],
@@ -287,20 +372,18 @@ impl JsRuntime {
             )));
         };
         let (buffer, byte_offset, byte_length) = self.data_view_host(receiver)?;
-        let index = self.data_view_index(arguments.first(), byte_length, access.width())?;
+        let index = self.to_index_value(dom, arguments.first())?;
         if is_write(function) {
-            let value = to_number(
-                arguments
-                    .get(1)
-                    .ok_or_else(|| JsError::type_error("DataView setter requires a value"))?,
-            )?;
+            let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+            let number = self.to_number_value(dom, &value)?;
             // The per-access `littleEndian` argument defaults to false, so an
             // accessor that omits it is big-endian.
             let big_endian = !arguments.get(2).is_some_and(JsValue::is_truthy);
-            let bytes = encode_bytes(access, value, big_endian);
+            self.data_view_bounds(index, access.width(), byte_length)?;
+            let bytes = encode_bytes(access, number, big_endian);
             let mut slots = buffer.0.borrow_mut();
             for (step, byte) in bytes.into_iter().enumerate() {
-                let slot = byte_offset + index + step;
+                let slot = byte_offset + index as usize + step;
                 if let Some(cell) = slots.get_mut(slot) {
                     *cell = f64::from(byte);
                 }
@@ -308,6 +391,7 @@ impl JsRuntime {
             return Ok(JsValue::Undefined);
         }
         let big_endian = !arguments.get(1).is_some_and(JsValue::is_truthy);
+        self.data_view_bounds(index, access.width(), byte_length)?;
         // Reading a big-endian view means the first byte it covers is the most
         // significant one, so the raw pattern is assembled in view order and
         // then reversed for the conversion.
@@ -315,7 +399,7 @@ impl JsRuntime {
         let mut pattern = 0u64;
         for step in 0..access.width() {
             let byte = slots
-                .get(byte_offset + index + step)
+                .get(byte_offset + index as usize + step)
                 .map_or(0u8, |cell| *cell as i64 as u8);
             let shift = (step * 8) as u32;
             pattern |= u64::from(byte) << shift;
@@ -326,12 +410,35 @@ impl JsRuntime {
         Ok(JsValue::Number(decode_number(access, pattern)))
     }
 
+    /// `GetViewValue` step 6 and `SetViewValue` step 10: the requested bytes must
+    /// lie wholly inside the view, which is the check that makes a read at the
+    /// tail a `RangeError` rather than a zero-filled answer.
+    fn data_view_bounds(
+        &mut self,
+        index: f64,
+        width: usize,
+        byte_length: usize,
+    ) -> Result<(), JsError> {
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "view lengths stay far below any precision boundary"
+        )]
+        let view_length = byte_length as f64;
+        if index + width as f64 > view_length {
+            return Err(self.range_error("DataView request is outside the bounds of the view"));
+        }
+        Ok(())
+    }
+
+    /// The `DataView` host state of `receiver`, or a `TypeError` when it is not
+    /// a `DataView`.
     fn data_view_host(&self, receiver: ObjectId) -> Result<(TypedBuffer, usize, usize), JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::DataView {
                 buffer,
                 byte_offset,
                 byte_length,
+                ..
             }) => Ok((buffer, byte_offset, byte_length)),
             _ => Err(JsError::type_error(
                 "DataView method called on an incompatible receiver",
@@ -339,36 +446,36 @@ impl JsRuntime {
         }
     }
 
-    /// `new DataView(buffer[, byteOffset[, byteLength]])`.
-    ///
-    /// `buffer` is an `ArrayBuffer` or a one-byte-element typed array, both of
-    /// which are byte-granular in this engine. There is no fourth parameter, so
-    /// a call that passes one is not asking for a view-level byte order.
+    /// The `DataView.prototype.buffer` getter: the `ArrayBuffer` the view was
+    /// built on, by identity.
+    fn data_view_buffer(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::DataView { buffer_object, .. }) => Ok(JsValue::Object(buffer_object)),
+            _ => Err(JsError::type_error(
+                "DataView.prototype.buffer called on an incompatible receiver",
+            )),
+        }
+    }
+
+    /// `new DataView(buffer[, byteOffset[, byteLength]])` (ECMA-262 25.2.2.1).
+    /// The buffer must be an `ArrayBuffer`, and both offsets go through `ToIndex`
+    /// before the range checks.
     pub(in crate::runtime) fn data_view_constructor(
         &mut self,
+        dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let Some(JsValue::Object(source)) = arguments.first() else {
-            return Err(self.range_error("DataView requires an ArrayBuffer argument"));
+            return Err(JsError::type_error(
+                "DataView requires an ArrayBuffer argument",
+            ));
         };
-        let (buffer, base, total) = match self.realm.host(*source) {
+        let source = *source;
+        let (buffer, total) = match self.realm.host(source) {
             Some(ObjectHost::ArrayBufferHost(buffer)) => {
                 let total = buffer.0.borrow().len();
-                (buffer, 0, total)
-            }
-            Some(ObjectHost::TypedArray {
-                kind,
-                buffer,
-                start,
-                length,
-            }) => {
-                if kind.element_size() != 1 {
-                    return Err(JsError::type_error(
-                        "DataView requires a byte-granular buffer in this engine",
-                    ));
-                }
-                (buffer, start, length)
+                (buffer, total)
             }
             _ => {
                 return Err(JsError::type_error(
@@ -376,15 +483,23 @@ impl JsRuntime {
                 ));
             }
         };
-        let offset = self.data_view_to_index(arguments.get(1), total)?;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "buffer lengths stay far below any precision boundary"
+        )]
+        let total_value = total as f64;
+        let offset = self.to_index_value(dom, arguments.get(1))?;
+        if offset > total_value {
+            return Err(self.range_error("DataView byteOffset extends past the end of the buffer"));
+        }
         // ECMAScript 25.2.5.1: an absent `byteLength` is clamped to what is
         // left of the buffer, while a present one that does not fit is a
         // `RangeError`.
         let byte_length = match arguments.get(2) {
-            None | Some(JsValue::Undefined) => total - offset,
+            None | Some(JsValue::Undefined) => total_value - offset,
             Some(value) => {
-                let requested = self.data_view_to_index(Some(value), total)?;
-                if requested > total - offset {
+                let requested = self.to_index_value(dom, Some(value))?;
+                if offset + requested > total_value {
                     return Err(
                         self.range_error("DataView byteLength extends past the end of the buffer")
                     );
@@ -392,6 +507,12 @@ impl JsRuntime {
                 requested
             }
         };
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "both values are validated against the buffer length"
+        )]
+        let (offset, byte_length) = (offset as usize, byte_length as usize);
         let prototype = self
             .realm
             .get_property(constructor, "prototype")
@@ -404,82 +525,12 @@ impl JsRuntime {
         if let Some(host) = self.realm.host_mut(object) {
             *host = ObjectHost::DataView {
                 buffer,
-                byte_offset: base + offset,
+                buffer_object: source,
+                byte_offset: offset,
                 byte_length,
             };
         }
-        for (name, value) in [
-            ("buffer", JsValue::Object(*source)),
-            ("byteLength", JsValue::Number(byte_length as f64)),
-            ("byteOffset", JsValue::Number(offset as f64)),
-        ] {
-            self.realm.define_property(
-                object,
-                name,
-                crate::PropertyDescriptor {
-                    value,
-                    writable: false,
-                    getter: None,
-                    setter: None,
-                    enumerable: true,
-                    configurable: true,
-                },
-            );
-        }
         Ok(JsValue::Object(object))
-    }
-
-    /// `ToIndex` for the constructor's offset and length arguments.
-    fn data_view_to_index(
-        &mut self,
-        value: Option<&JsValue>,
-        total: usize,
-    ) -> Result<usize, JsError> {
-        let number = match value {
-            None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
-        };
-        if !number.is_finite() || number < 0.0 || number.trunc() != number {
-            return Err(self.range_error("DataView offset and length must be integers"));
-        }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the value is validated as a non-negative integer"
-        )]
-        let index = number as usize;
-        if index > total {
-            return Err(self.range_error("DataView byteOffset extends past the end of the buffer"));
-        }
-        Ok(index)
-    }
-
-    /// ECMAScript 25.2.5.5 `GetViewValue`: the requested bytes must lie wholly
-    /// inside the view, which is the check that makes a read at the tail a
-    /// `RangeError` rather than a zero-filled answer.
-    fn data_view_index(
-        &mut self,
-        value: Option<&JsValue>,
-        byte_length: usize,
-        width: usize,
-    ) -> Result<usize, JsError> {
-        let number = match value {
-            None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
-        };
-        if !number.is_finite() || number < 0.0 || number.trunc() != number {
-            return Err(self.range_error("DataView request index must be an integer"));
-        }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the value is validated as a non-negative integer"
-        )]
-        let index = number as usize;
-        if index + width > byte_length {
-            return Err(self.range_error("DataView request is outside the bounds of the view"));
-        }
-        Ok(index)
     }
 }
 
@@ -644,13 +695,14 @@ mod tests {
                 [thrown(function () { new DataView(new ArrayBuffer(4)).getUint32(1); }),
                  thrown(function () { new DataView(new ArrayBuffer(4), 0, 5); }),
                  thrown(function () { new DataView(new ArrayBuffer(4), 5); }),
-                 thrown(function () { new DataView(new ArrayBuffer(4)).getUint8(-1); }),
-                 thrown(function () { new DataView(new ArrayBuffer(4)).getUint8(1.5); })].join(',')
+                 thrown(function () { new DataView(new ArrayBuffer(4)).getUint8(-1); })].join(',')
             "),
-            "RangeError,RangeError,RangeError,RangeError,RangeError"
+            "RangeError,RangeError,RangeError,RangeError"
         );
         // A one-byte read at the last index is in bounds.
         assert_eq!(run("new DataView(new ArrayBuffer(4)).getUint8(3)"), "0");
+        // `ToIndex` truncates a fractional index rather than rejecting it.
+        assert_eq!(run("new DataView(new ArrayBuffer(4)).getUint8(1.5)"), "0");
     }
 
     #[test]
@@ -702,6 +754,98 @@ mod tests {
                 new Uint8Array(buffer)[0]
             "),
             "0"
+        );
+    }
+
+    #[test]
+    fn view_geometry_is_read_through_prototype_accessors() {
+        assert_eq!(
+            run(r"
+                var buffer = new ArrayBuffer(8);
+                var view = new DataView(buffer, 2, 4);
+                [view.buffer === buffer, view.byteOffset, view.byteLength,
+                 view.hasOwnProperty('byteLength'), buffer.byteLength,
+                 typeof Object.getOwnPropertyDescriptor(DataView.prototype, 'byteOffset').get].join(',')
+            "),
+            "true,2,4,false,8,function"
+        );
+        // A typed array is not an `ArrayBuffer`, so it cannot back a view.
+        assert_eq!(
+            run("var r; try { new DataView(new Uint8Array(4)); } catch (e) { r = e.name; } r"),
+            "TypeError"
+        );
+    }
+
+    #[test]
+    fn value_of_runs_before_the_range_check_and_lengths_are_to_index() {
+        assert_eq!(
+            run(r"
+                var calls = [];
+                var view = new DataView(new ArrayBuffer(4));
+                var result = [];
+                try {
+                    view.setUint8(9, { valueOf: function () { calls.push('value'); return 1; } });
+                } catch (e) { result.push(e.name); }
+                result.push(calls.join('|'));
+                result.push(new ArrayBuffer({ valueOf: function () { return 3; } }).byteLength);
+                result.push(new DataView(new ArrayBuffer(4), { valueOf: function () { return 1; } }).byteOffset);
+                result.join(',')
+            "),
+            "RangeError,value,3,1"
+        );
+        // An absent value converts as `undefined`, which is NaN and stores 0.
+        assert_eq!(
+            run("var v = new DataView(new ArrayBuffer(1)); v.setUint8(0); v.getUint8(0)"),
+            "0"
+        );
+    }
+
+    #[test]
+    fn float16_accessors_round_to_binary16() {
+        // 1.5 is 0x3E00 and 1 is 0x3C00, read big-endian by default.
+        assert_eq!(
+            run(r"
+                var view = new DataView(new ArrayBuffer(4));
+                view.setFloat16(0, 1.5);
+                var one = new DataView(new ArrayBuffer(2));
+                one.setUint8(0, 0x3C);
+                [view.getFloat16(0), one.getFloat16(0), view.getUint8(0), view.getUint8(1)].join(',')
+            "),
+            "1.5,1,62,0"
+        );
+        // 65520 is the first value that rounds to infinity; 65519.99 rounds down
+        // to the largest finite binary16, and the smallest subnormal is exact.
+        assert_eq!(
+            run(r"
+                var view = new DataView(new ArrayBuffer(2));
+                view.setFloat16(0, 65520);
+                var overflow = view.getFloat16(0);
+                view.setFloat16(0, 65519.99);
+                var below = view.getFloat16(0);
+                view.setFloat16(0, 5.960464477539063e-8);
+                var smallest = view.getFloat16(0);
+                [overflow, below, smallest === 5.960464477539063e-8].join(',')
+            "),
+            "Infinity,65504,true"
+        );
+        // 2049 is halfway between 2048 and 2050, and ties go to the even one.
+        assert_eq!(
+            run(
+                "var view = new DataView(new ArrayBuffer(2)); view.setFloat16(0, 2049); view.getFloat16(0)"
+            ),
+            "2048"
+        );
+    }
+
+    #[test]
+    fn integer_setters_wrap_modulo_their_width() {
+        // `ToInt8` and `ToUint8` reduce modulo 2^8, so 2^40 + 1 stores 1 and -1
+        // stores 255.
+        assert_eq!(
+            run(
+                "var v = new DataView(new ArrayBuffer(2)); v.setInt8(0, Math.pow(2, 40) + 1); v.setUint8(1, -1); [v.getInt8(0), v.getUint8(1), v.getUint8(0)].join(',')"
+            ),
+            "1,255,1"
         );
     }
 
