@@ -20,7 +20,6 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::same_value_zero;
-use crate::runtime::convert::to_number;
 use crate::value::CollectionKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -110,7 +109,7 @@ impl JsRuntime {
         };
         let object = *object;
         let raw_size = self.get_member(dom, object, "size")?;
-        let number = to_number(&raw_size)?;
+        let number = self.to_number_value(dom, &raw_size)?;
         if number.is_nan() {
             return Err(JsError::type_error("set-like size is not a number"));
         }

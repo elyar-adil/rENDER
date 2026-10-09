@@ -17,6 +17,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::convert::uint32_of_number;
 use crate::value::{MathOp, NativeFunction, NumberOp};
 use render_dom::Dom;
 
@@ -137,10 +138,11 @@ impl JsRuntime {
             MathOp::Trunc => argument(0)?.trunc(),
             MathOp::Cbrt => argument(0)?.cbrt(),
             MathOp::Fround => f64::from(argument(0)? as f32),
-            MathOp::Clz32 => f64::from(to_uint32(argument(0)?).leading_zeros()),
-            MathOp::Imul => {
-                f64::from((to_uint32(argument(0)?).wrapping_mul(to_uint32(argument(1)?))) as i32)
-            }
+            MathOp::Clz32 => f64::from(uint32_of_number(argument(0)?).leading_zeros()),
+            MathOp::Imul => f64::from(
+                (uint32_of_number(argument(0)?).wrapping_mul(uint32_of_number(argument(1)?)))
+                    as i32,
+            ),
             MathOp::Atan2 => argument(0)?.atan2(argument(1)?),
             MathOp::Hypot => {
                 let mut sum = 0.0_f64;
@@ -205,12 +207,4 @@ impl JsRuntime {
         let exponent = self.to_number_value(dom, &exponent)?;
         Ok(JsValue::Number(base.powf(exponent)))
     }
-}
-
-/// ECMA-262 §7.1.7 `ToUint32` on an already-numeric value.
-fn to_uint32(value: f64) -> u32 {
-    if !value.is_finite() {
-        return 0;
-    }
-    value.trunc().rem_euclid(4_294_967_296.0) as u32
 }

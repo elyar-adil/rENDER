@@ -503,7 +503,7 @@ impl JsRuntime {
             if let Some(value) = arguments.get(index)
                 && !matches!(value, JsValue::Undefined)
             {
-                let number = to_number(value)?.max(0.0).floor();
+                let number = self.to_number_value(dom, value)?.max(0.0).floor();
                 dom.set_attribute(image, name, number.to_string())?;
             }
         }

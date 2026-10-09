@@ -1103,6 +1103,7 @@ impl Compiler {
                 target,
                 value,
                 offset,
+                parenthesized_target,
             } => {
                 let target = self.explode_target(target, expr_has_suspend(value))?;
                 let value = self.explode(value)?;
@@ -1110,6 +1111,7 @@ impl Compiler {
                     target: Box::new(target),
                     value: Box::new(value),
                     offset: *offset,
+                    parenthesized_target: *parenthesized_target,
                 })
             }
             Expr::CompoundAssignment {
@@ -1131,6 +1133,7 @@ impl Compiler {
                         offset: *offset,
                     }),
                     offset: *offset,
+                    parenthesized_target: false,
                 })
             }
             Expr::TaggedTemplate {

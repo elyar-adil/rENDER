@@ -480,6 +480,10 @@ pub(super) enum Expr {
         target: Box<Self>,
         value: Box<Self>,
         offset: usize,
+        /// The target was written in parentheses. `(f) = function() {}` does
+        /// not name the function, because a parenthesized target is not an
+        /// `IdentifierReference` (ECMA-262 13.15.2).
+        parenthesized_target: bool,
     },
     CompoundAssignment {
         target: Box<Self>,
@@ -1579,6 +1583,7 @@ impl Parser {
                     target: Box::new(expression),
                     value: Box::new(Expr::Identifier(temporary.clone())),
                     offset,
+                    parenthesized_target: false,
                 });
                 return Ok(Statement::ForOf {
                     offset,
@@ -1668,33 +1673,38 @@ impl Parser {
         if let Some(arrow) = self.arrow_function()? {
             return Ok(arrow);
         }
+        let parenthesized_target = self.at(&TokenKind::LeftParen);
         let target = self.conditional()?;
         if self.take(&TokenKind::Equal) {
-            self.assignment_value(target, None)
+            self.assignment_value(target, None, parenthesized_target)
         } else if self.take(&TokenKind::PlusEqual) {
-            self.assignment_value(target, Some(BinaryOp::Add))
+            self.assignment_value(target, Some(BinaryOp::Add), parenthesized_target)
         } else if self.take(&TokenKind::MinusEqual) {
-            self.assignment_value(target, Some(BinaryOp::Subtract))
+            self.assignment_value(target, Some(BinaryOp::Subtract), parenthesized_target)
         } else if self.take(&TokenKind::StarStarEqual) {
-            self.assignment_value(target, Some(BinaryOp::Exponentiate))
+            self.assignment_value(target, Some(BinaryOp::Exponentiate), parenthesized_target)
         } else if self.take(&TokenKind::StarEqual) {
-            self.assignment_value(target, Some(BinaryOp::Multiply))
+            self.assignment_value(target, Some(BinaryOp::Multiply), parenthesized_target)
         } else if self.take(&TokenKind::SlashEqual) {
-            self.assignment_value(target, Some(BinaryOp::Divide))
+            self.assignment_value(target, Some(BinaryOp::Divide), parenthesized_target)
         } else if self.take(&TokenKind::PercentEqual) {
-            self.assignment_value(target, Some(BinaryOp::Remainder))
+            self.assignment_value(target, Some(BinaryOp::Remainder), parenthesized_target)
         } else if self.take(&TokenKind::AmpersandEqual) {
-            self.assignment_value(target, Some(BinaryOp::BitwiseAnd))
+            self.assignment_value(target, Some(BinaryOp::BitwiseAnd), parenthesized_target)
         } else if self.take(&TokenKind::CaretEqual) {
-            self.assignment_value(target, Some(BinaryOp::BitwiseXor))
+            self.assignment_value(target, Some(BinaryOp::BitwiseXor), parenthesized_target)
         } else if self.take(&TokenKind::PipeEqual) {
-            self.assignment_value(target, Some(BinaryOp::BitwiseOr))
+            self.assignment_value(target, Some(BinaryOp::BitwiseOr), parenthesized_target)
         } else if self.take(&TokenKind::LeftShiftEqual) {
-            self.assignment_value(target, Some(BinaryOp::LeftShift))
+            self.assignment_value(target, Some(BinaryOp::LeftShift), parenthesized_target)
         } else if self.take(&TokenKind::RightShiftEqual) {
-            self.assignment_value(target, Some(BinaryOp::RightShift))
+            self.assignment_value(target, Some(BinaryOp::RightShift), parenthesized_target)
         } else if self.take(&TokenKind::UnsignedRightShiftEqual) {
-            self.assignment_value(target, Some(BinaryOp::UnsignedRightShift))
+            self.assignment_value(
+                target,
+                Some(BinaryOp::UnsignedRightShift),
+                parenthesized_target,
+            )
         } else if self.take(&TokenKind::AndAndEqual) {
             self.logical_assignment_value(target, BinaryOp::LogicalAnd)
         } else if self.take(&TokenKind::OrOrEqual) {
@@ -1862,6 +1872,7 @@ impl Parser {
         &mut self,
         target: Expr,
         operator: Option<BinaryOp>,
+        parenthesized_target: bool,
     ) -> Result<Expr, JsError> {
         self.validate_assignment_target(&target)?;
         let value = self.assignment()?;
@@ -1876,6 +1887,7 @@ impl Parser {
                 offset: self.previous_offset(),
                 target: Box::new(target),
                 value: Box::new(value),
+                parenthesized_target,
             },
         })
     }
@@ -2219,7 +2231,11 @@ impl Parser {
     fn postfix(&mut self) -> Result<Expr, JsError> {
         let expression = self.primary()?;
         let expression = self.postfix_tail(expression)?;
-        let operator = if self.take(&TokenKind::PlusPlus) {
+        // [no LineTerminator here] (ECMA-262 13.4): a line terminator before
+        // the operator ends the statement, so `a` then `++b` is two statements.
+        let operator = if self.current().after_newline {
+            None
+        } else if self.take(&TokenKind::PlusPlus) {
             Some(BinaryOp::Add)
         } else if self.take(&TokenKind::MinusMinus) {
             Some(BinaryOp::Subtract)
@@ -2340,15 +2356,30 @@ impl Parser {
         Ok(expression)
     }
 
+    /// Runs `parse` with the `in` operator allowed. A bracketed context such
+    /// as call arguments or an import call is `[+In]` even inside a for-loop
+    /// initializer, where a bare declaration initializer is `[~In]`.
+    fn in_allowed<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let previous_no_in = std::mem::replace(&mut self.no_in, false);
+        let result = parse(self);
+        self.no_in = previous_no_in;
+        result
+    }
+
     fn arguments_after_left_paren(&mut self) -> Result<Vec<Expr>, JsError> {
         let mut arguments = Vec::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
-                let argument = if self.take(&TokenKind::Ellipsis) {
-                    Expr::Spread(Box::new(self.assignment()?))
-                } else {
-                    self.assignment()?
-                };
+                let argument = self.in_allowed(|parser| {
+                    if parser.take(&TokenKind::Ellipsis) {
+                        Ok(Expr::Spread(Box::new(parser.assignment()?)))
+                    } else {
+                        parser.assignment()
+                    }
+                })?;
                 arguments.push(argument);
                 if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
@@ -2398,16 +2429,23 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Identifier(IMPORT_META_BINDING.to_owned()))
             }
+            // An escaped spelling is not the keyword (ECMA-262 12.7.2), so it is
+            // refused wherever the keyword would start an import form.
+            TokenKind::Identifier(name) if name == "import" && token.escaped => Err(
+                JsError::syntax("'import' must not contain escape characters", token.offset),
+            ),
             // `import(specifier[, options][,])` (ECMA-262 13.3.10). It is a call
             // of the host's `import`, with one or two arguments and no spread.
             TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::LeftParen) => {
                 self.advance();
-                let specifier = self.assignment()?;
-                let mut arguments = vec![specifier];
-                if self.take(&TokenKind::Comma) && !self.at(&TokenKind::RightParen) {
-                    arguments.push(self.assignment()?);
-                    let _ = self.take(&TokenKind::Comma);
-                }
+                let arguments = self.in_allowed(|parser| {
+                    let mut arguments = vec![parser.assignment()?];
+                    if parser.take(&TokenKind::Comma) && !parser.at(&TokenKind::RightParen) {
+                        arguments.push(parser.assignment()?);
+                        let _ = parser.take(&TokenKind::Comma);
+                    }
+                    Ok(arguments)
+                })?;
                 self.require(
                     &TokenKind::RightParen,
                     "expected ')' after import() arguments",
@@ -2419,14 +2457,15 @@ impl Parser {
                 })
             }
             // `import.defer(specifier)` and `import.source(specifier)` (the
-            // source-phase import proposals). The host does not define them, so
-            // they read as properties of `import` and fail when called. Any
-            // other `import.` form is a syntax error, and `import.meta` is only
+            // source-phase import proposals). They take exactly one argument, with
+            // no trailing comma, and reach the host's `import` hook like `import()`.
+            // Any other `import.` form is a syntax error, and `import.meta` is only
             // valid in modules. A bare `import` is a reserved word.
             TokenKind::Identifier(name) if name == "import" && self.at(&TokenKind::Dot) => {
                 self.advance();
-                let phase = match &self.advance().kind {
-                    TokenKind::Identifier(phase) => phase.clone(),
+                let phase_token = self.advance();
+                let phase = match &phase_token.kind {
+                    TokenKind::Identifier(phase) if !phase_token.escaped => phase.clone(),
                     _ => String::new(),
                 };
                 if phase == "meta" {
@@ -2443,8 +2482,7 @@ impl Parser {
                     ));
                 }
                 self.advance();
-                let specifier = self.assignment()?;
-                let _ = self.take(&TokenKind::Comma);
+                let specifier = self.in_allowed(Self::assignment)?;
                 self.require(
                     &TokenKind::RightParen,
                     "expected ')' after import.defer() or import.source() argument",

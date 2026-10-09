@@ -409,15 +409,151 @@ fn source_phase_import_calls_parse_and_only_other_import_forms_are_rejected() {
         ok("var f = () => import.source('./x.js'); typeof f"),
         "function"
     );
-    assert!(eval("import.defer('./x.js', 'extra')").is_err());
-    assert!(eval("import.defer").is_err());
-    assert!(eval("new import.defer('./x.js')").is_err());
-    assert!(eval("new import.source('./x.js').x").is_err());
-    assert!(eval("new import('./x.js')").is_err());
+    // The arguments are evaluated before the call, as for any call.
+    assert_eq!(ok("var n = 0; import.defer(n++); n"), "1");
+    // A bracketed argument allows `in` even inside a for-initializer.
+    assert_eq!(
+        ok("var p; for (p = import.defer('a' in {a: 1}); false;) {} typeof p"),
+        "object"
+    );
+    assert_eq!(
+        ok("var p; for (var q = Math.max('a' in {a: 1}); false;) {} typeof q"),
+        "number"
+    );
+    for source in [
+        "import.defer('./x.js', 'extra')",
+        "import.defer('./x.js',)",
+        "import.source('./x.js',)",
+        "import.defer",
+        "new import.defer('./x.js')",
+        "new import.source('./x.js').x",
+        "new import('./x.js')",
+        "import.foo",
+        "import.meta",
+        "\\u0069mport.defer('./x.js')",
+        "import.\\u0064efer('./x.js')",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
     assert_eq!(
         ok("var r; try { new (import('')); } catch (e) { r = e.name; } r"),
         "TypeError"
     );
-    assert!(eval("import.foo").is_err());
-    assert!(eval("import.meta").is_err());
+}
+
+#[test]
+fn string_positions_convert_with_to_integer_or_infinity() {
+    // NaN is 0 (ToIntegerOrInfinity), so these read the first unit.
+    assert_eq!(ok("'abc'.codePointAt(NaN)"), "97");
+    assert_eq!(ok("'abc'.charAt(NaN)"), "a");
+    assert_eq!(ok("'abc'.charCodeAt(NaN)"), "97");
+    // An empty string has no unit at any index, and this must not panic.
+    assert_eq!(ok("String(''.at(NaN))"), "undefined");
+    assert_eq!(ok("'abc'.at(-0.5)"), "a");
+    assert_eq!(ok("'ab'.repeat(2.9)"), "abab");
+    assert_eq!(ok("'abc'.substr(-1)"), "c");
+    assert_eq!(ok("'abc'.slice(NaN, 2)"), "ab");
+}
+
+#[test]
+fn string_methods_call_valueof_on_object_arguments_and_keep_its_errors() {
+    assert_eq!(
+        ok("var n = 0; var p = {valueOf() { n++; return 1; }}; 'abc'.slice(p, p); n"),
+        "2"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { 'abc'.charAt({valueOf() { throw new TypeError('boom'); }}); } catch (e) { r = e.message; } r"
+        ),
+        "boom"
+    );
+    assert_eq!(ok("'abc'.charAt({valueOf() { return 2; }})"), "c");
+    assert_eq!(ok("'ab'.repeat({valueOf() { return 3; }})"), "ababab");
+    assert_eq!(ok("'x'.padStart({valueOf() { return 3; }}, 'ab')"), "abx");
+    assert_eq!(ok("String.fromCharCode({valueOf() { return 65; }})"), "A");
+    assert_eq!(
+        ok("String.raw({raw: {length: '2', 0: 'a', 1: 'b'}}, 'X')"),
+        "aXb"
+    );
+}
+
+#[test]
+fn starts_with_and_ends_with_honor_the_position() {
+    assert_eq!(ok("'abc'.startsWith('b', 1)"), "true");
+    assert_eq!(ok("'abc'.startsWith('a', 1)"), "false");
+    assert_eq!(ok("'abc'.endsWith('ab', -1)"), "false");
+    assert_eq!(ok("'abc'.endsWith('ab', 2)"), "true");
+    assert_eq!(ok("'abc'.endsWith('c')"), "true");
+    assert_eq!(ok("'abc'.startsWith('')"), "true");
+    assert_eq!(ok("'abc'.startsWith(undefined)"), "false");
+    assert_eq!(ok("'undefined'.startsWith()"), "true");
+}
+
+#[test]
+fn from_code_point_rejects_invalid_points_with_a_range_error() {
+    assert_eq!(
+        ok("var r; try { String.fromCodePoint(-1); } catch (e) { r = e.name; } r"),
+        "RangeError"
+    );
+    assert_eq!(
+        ok("var r; try { String.fromCodePoint(1.5); } catch (e) { r = e.name; } r"),
+        "RangeError"
+    );
+}
+
+#[test]
+fn split_limit_is_touint32_so_a_negative_limit_is_the_full_split() {
+    assert_eq!(ok("'a,b,c'.split(',', -1).length"), "3");
+    assert_eq!(ok("'a,b,c'.split(',', 2).join('|')"), "a|b");
+    assert_eq!(ok("'a,b,c'.split(',', 0).length"), "0");
+}
+
+#[test]
+fn to_precision_takes_to_integer_or_infinity_and_a_range_error() {
+    assert_eq!(ok("(123.456).toPrecision(1.9)"), "1e+2");
+    assert_eq!(
+        ok("var r; try { (1).toPrecision(0); } catch (e) { r = e.name; } r"),
+        "RangeError"
+    );
+}
+
+#[test]
+fn an_ordinary_object_with_no_primitive_value_throws_a_type_error() {
+    assert_eq!(
+        ok("var r; try { '' + Object.create(null); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("var r; try { [1].flat(Object.create(null)); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn a_line_terminator_before_a_postfix_operator_ends_the_statement() {
+    // [no LineTerminator here] before `++`, and U+2028 is a line terminator.
+    for source in [
+        "var x = 0; x\n++;",
+        "var x = 0; x\u{2028}++;",
+        "var x = 0; x\u{2029}--;",
+    ] {
+        assert_eq!(
+            eval(source).unwrap_err().kind(),
+            JsErrorKind::Syntax,
+            "{source}"
+        );
+    }
+    assert_eq!(ok("var x = 0; x\n++x; x"), "1");
+    assert_eq!(ok("var x = 0; x++\n x"), "1");
+}
+
+#[test]
+fn a_parenthesized_identifier_target_does_not_name_the_function() {
+    assert_eq!(ok("var fn; (fn) = function() {}; fn.name"), "");
+    assert_eq!(ok("var g; g = function() {}; g.name"), "g");
+    assert_eq!(ok("var h; ((h)) = () => 1; h.name"), "");
 }

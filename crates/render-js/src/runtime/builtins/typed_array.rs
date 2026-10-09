@@ -288,7 +288,7 @@ impl JsRuntime {
                     &[JsValue::Number(*value), index_value],
                     this_argument.clone(),
                 )?;
-                *value = to_number(&element)?;
+                *value = self.to_number_value(dom, &element)?;
             }
         }
         let prototype = self
@@ -386,17 +386,20 @@ impl JsRuntime {
                     length: source_length,
                     ..
                 }) => source_buffer.0.borrow()[source_start..source_start + source_length].to_vec(),
-                Some(ObjectHost::Array) => self
-                    .array_elements_for(*object)?
-                    .iter()
-                    .map(to_number)
-                    .collect::<Result<Vec<_>, _>>()?,
+                Some(ObjectHost::Array) => {
+                    let elements = self.array_elements_for(*object)?;
+                    let mut values = Vec::with_capacity(elements.len());
+                    for element in &elements {
+                        values.push(self.to_number_value(dom, element)?);
+                    }
+                    values
+                }
                 _ => {
                     let count = self.array_like_length(dom, *object)?;
                     let mut values = Vec::new();
                     for index in 0..count {
                         let element = self.get_member(dom, *object, &index.to_string())?;
-                        values.push(to_number(&element)?);
+                        values.push(self.to_number_value(dom, &element)?);
                     }
                     values
                 }
@@ -653,7 +656,7 @@ impl JsRuntime {
                 this_argument.clone(),
             )?;
             if map {
-                output.push(to_number(&mapped)?);
+                output.push(self.to_number_value(dom, &mapped)?);
             } else if mapped.is_truthy() {
                 output.push(element);
             }

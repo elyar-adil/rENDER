@@ -32,18 +32,6 @@ impl JsValue {
 /// Coerce an optional argument into a character index (negative counts from
 /// the end, matching `String.prototype` slice semantics for the callers that
 /// need it; `charAt`-style callers pass the raw value through).
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    reason = "array indices stay far below any precision boundary"
-)]
-pub(super) fn optional_index(value: Option<&JsValue>) -> Result<f64, JsError> {
-    match value {
-        None | Some(JsValue::Undefined) => Ok(0.0),
-        Some(other) => to_number(other),
-    }
-}
-
 /// Resolve a slice/substring range over a collection of `length` elements:
 /// negative bounds count from the end and are clamped. When `swap` is set
 /// (slice semantics) reversed bounds clamp to an empty range; otherwise they
@@ -175,15 +163,17 @@ pub(super) fn format_number_precision(value: f64, precision: usize) -> String {
     }
 }
 
+/// ECMA-262 §7.1.7 `ToUint32` on an already-numeric value.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(super) fn to_uint32(value: &JsValue) -> Result<u32, JsError> {
-    let number = to_number(value)?;
-    if !number.is_finite() || number == 0.0 {
-        return Ok(0);
+pub(super) fn uint32_of_number(number: f64) -> u32 {
+    if !number.is_finite() {
+        return 0;
     }
-    let integer = number.trunc();
-    let modulo = integer.rem_euclid(4_294_967_296.0);
-    Ok(modulo as u32)
+    number.trunc().rem_euclid(4_294_967_296.0) as u32
+}
+
+pub(super) fn to_uint32(value: &JsValue) -> Result<u32, JsError> {
+    Ok(uint32_of_number(to_number(value)?))
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -298,12 +288,6 @@ pub(super) fn required_argument<'a>(
             index.saturating_add(1)
         ))
     })
-}
-
-/// `ToIntegerOrInfinity` (§7.1.5).
-pub(super) fn to_integer_or_infinity(value: &JsValue) -> Result<f64, JsError> {
-    let number = to_number(value)?;
-    Ok(integer_or_infinity(number))
 }
 
 /// `ToIntegerOrInfinity` for an already-numeric value.

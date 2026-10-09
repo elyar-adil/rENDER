@@ -360,19 +360,19 @@ impl JsRuntime {
             NativeFunction::ObjectLookupSetter => {
                 self.object_lookup_accessor(receiver, arguments, false)
             }
-            NativeFunction::StrCharAt => self.string_char_at(receiver, arguments),
-            NativeFunction::StrCharCodeAt => self.string_char_code_at(receiver, arguments),
+            NativeFunction::StrCharAt => self.string_char_at(dom, receiver, arguments),
+            NativeFunction::StrCharCodeAt => self.string_char_code_at(dom, receiver, arguments),
             NativeFunction::StrIndexOf => self.string_index_of(receiver, arguments, false),
             NativeFunction::StrLastIndexOf => self.string_index_of(receiver, arguments, true),
             NativeFunction::StrIncludes => self.string_includes(receiver, arguments),
             NativeFunction::StrStartsWith => {
-                self.string_starts_or_ends_with(receiver, arguments, true)
+                self.string_starts_or_ends_with(dom, receiver, arguments, true)
             }
             NativeFunction::StrEndsWith => {
-                self.string_starts_or_ends_with(receiver, arguments, false)
+                self.string_starts_or_ends_with(dom, receiver, arguments, false)
             }
-            NativeFunction::StrSlice => self.string_slice(receiver, arguments),
-            NativeFunction::StrSubstring => self.string_substring(receiver, arguments),
+            NativeFunction::StrSlice => self.string_slice(dom, receiver, arguments),
+            NativeFunction::StrSubstring => self.string_substring(dom, receiver, arguments),
             NativeFunction::StrToLowerCase => self.string_to_case(receiver, arguments, false),
             NativeFunction::StrToUpperCase => self.string_to_case(receiver, arguments, true),
             NativeFunction::StrTrim => self.string_trim(receiver),
@@ -392,7 +392,7 @@ impl JsRuntime {
             | NativeFunction::StrReplaceAll => {
                 self.dispatch_string_native(dom, function, receiver, arguments)
             }
-            NativeFunction::StrSplit => self.string_split(receiver, arguments),
+            NativeFunction::StrSplit => self.string_split(dom, receiver, arguments),
             NativeFunction::StrReplace => self.string_replace(dom, receiver, arguments),
             NativeFunction::StrMatch => self.string_match(receiver, arguments),
             NativeFunction::StrSearch => self.string_search(receiver, arguments),

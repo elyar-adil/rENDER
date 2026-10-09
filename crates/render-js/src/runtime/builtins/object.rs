@@ -22,7 +22,6 @@ use crate::PropertyDescriptor;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::format_number_precision;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::runtime::types::ObjectEntryKind;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
@@ -157,12 +156,11 @@ impl JsRuntime {
                 if matches!(argument, JsValue::Undefined) {
                     return Ok(JsValue::String(crate::value::number_to_string(value)));
                 }
-                let precision = to_number(argument)?;
-                if !precision.is_finite()
-                    || precision.fract() != 0.0
-                    || !(1.0..=100.0).contains(&precision)
-                {
-                    return Err(JsError::type_error("invalid toPrecision precision"));
+                let precision = self.to_integer_value(dom, argument)?;
+                if !(1.0..=100.0).contains(&precision) {
+                    return Err(
+                        self.range_error("toPrecision() argument must be between 1 and 100")
+                    );
                 }
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -191,8 +189,7 @@ impl JsRuntime {
                             clippy::cast_sign_loss,
                             reason = "the range check below bounds the value to 2..=36"
                         )]
-                        let radix =
-                            crate::runtime::convert::to_integer_or_infinity(argument)? as u32;
+                        let radix = self.to_integer_value(dom, argument)? as u32;
                         if !(2..=36).contains(&radix) {
                             return Err(self.range_error(
                                 "toString() radix must be an integer between 2 and 36",

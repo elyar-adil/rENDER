@@ -19,11 +19,9 @@ use crate::ObjectId;
 use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::MAX_MATERIALIZED_ELEMENTS;
-use crate::runtime::builtins::array::to_length;
-use crate::runtime::convert::optional_index;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::slice_range;
-use crate::runtime::convert::to_number;
+use crate::runtime::convert::uint32_of_number;
 use crate::utf16;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -39,8 +37,8 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
-            NativeFunction::StringFromCharCode => Self::string_from_char_code(arguments),
-            NativeFunction::StringFromCodePoint => Self::string_from_code_point(arguments),
+            NativeFunction::StringFromCharCode => self.string_from_char_code(dom, arguments),
+            NativeFunction::StringFromCodePoint => self.string_from_code_point(dom, arguments),
             NativeFunction::StringRaw => self.string_raw(dom, arguments),
             // ECMA-262 22.1.3.4 `String.prototype.codePointAt`, which is
             // §11.1.4 `CodePointAt` over the code-unit list. This is the one
@@ -58,10 +56,7 @@ impl JsRuntime {
             // bounds check - unlike `at`, which counts from the end.
             NativeFunction::StrCodePointAt => {
                 let text = self.require_string_receiver(receiver)?;
-                let position = match arguments.first() {
-                    Some(value) => to_number(value)?.trunc(),
-                    None => 0.0,
-                };
+                let position = self.optional_integer_value(dom, arguments.first())?;
                 if !position.is_finite() || position < 0.0 {
                     return Ok(JsValue::Undefined);
                 }
@@ -91,10 +86,7 @@ impl JsRuntime {
                     reason = "a code-unit length is a usize and f64 represents every usize on this target"
                 )]
                 let length = utf16::utf16_length(&text) as f64;
-                let relative = match arguments.first() {
-                    Some(value) => to_number(value)?.trunc(),
-                    None => 0.0,
-                };
+                let relative = self.optional_integer_value(dom, arguments.first())?;
                 let index = if relative >= 0.0 {
                     relative
                 } else {
@@ -134,9 +126,8 @@ impl JsRuntime {
                 let text = self.require_string_receiver(receiver)?;
                 // Step 2 is `ToLength(maxLength)`, which truncates toward zero
                 // and clamps a negative or non-finite argument to 0.
-                let target = to_number(arguments.first().unwrap_or(&JsValue::Number(0.0)))?
-                    .trunc()
-                    .max(0.0);
+                let target =
+                    self.to_length_value(dom, arguments.first().unwrap_or(&JsValue::Number(0.0)))?;
                 // The engine's materialization cap is the bound here for the same
                 // reason it bounds every other array/string materialization: a
                 // `padStart(1e9)` must not allocate a gigabyte.
@@ -195,11 +186,7 @@ impl JsRuntime {
             // pair nor joins two halves that were not one.
             NativeFunction::StrRepeat => {
                 let text = self.require_string_receiver(receiver)?;
-                let count = to_number(arguments.first().unwrap_or(&JsValue::Number(0.0)))?;
-                if count.is_nan() {
-                    return Ok(JsValue::String(String::new()));
-                }
-                let count = count.trunc();
+                let count = self.optional_integer_value(dom, arguments.first())?;
                 if count < 0.0 || !count.is_finite() {
                     return Err(self.range_error("String.prototype.repeat count is out of range"));
                 }
@@ -278,22 +265,24 @@ impl JsRuntime {
                 let text = self.require_string_receiver(receiver)?;
                 let units = utf16::utf16_units(&text);
                 let size = units.len();
-                let start = slice_range(size, optional_index(arguments.first())?, None, true).start;
+                let start = slice_range(
+                    size,
+                    self.optional_integer_value(dom, arguments.first())?,
+                    None,
+                    true,
+                )
+                .start;
                 let length = match arguments.get(1) {
                     None | Some(JsValue::Undefined) => size - start,
                     Some(value) => {
-                        let requested = to_number(value)?;
+                        let requested = self.to_integer_value(dom, value)?;
                         #[allow(
                             clippy::cast_possible_truncation,
                             clippy::cast_sign_loss,
                             reason = "the length is clamped to the string size first"
                         )]
                         {
-                            if requested.is_nan() {
-                                0
-                            } else {
-                                requested.trunc().max(0.0).min(size as f64) as usize
-                            }
+                            requested.max(0.0).min(size as f64) as usize
                         }
                     }
                 };
@@ -777,12 +766,10 @@ impl JsRuntime {
             .ok_or_else(|| JsError::type_error("String.raw template has no 'raw' property"))?;
         let literals = self.to_object(&raw)?;
         // Step 4: `LengthOfArrayLike`.
-        let length = self
-            .realm
-            .get_property(literals, "length")
-            .map(|value| to_length(&value))
-            .transpose()?
-            .unwrap_or(0.0);
+        let length = match self.realm.get_property(literals, "length") {
+            Some(value) => self.to_length_value(dom, &value)?,
+            None => 0.0,
+        };
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(
                 self.range_error("String.raw template literal count exceeds the engine limit")
@@ -816,12 +803,13 @@ impl JsRuntime {
 
     /// ECMA-262 22.1.3.2 `String.prototype.charAt`, over code units.
     pub(in crate::runtime) fn string_char_at(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
-        let position = optional_index(arguments.first()).unwrap_or(0.0);
+        let position = self.optional_integer_value(dom, arguments.first())?;
         Ok(char_at_value(&utf16::utf16_units(&text), position))
     }
 
@@ -832,12 +820,13 @@ impl JsRuntime {
     /// offset and whose answer is a code unit, so it is the direct evidence
     /// that this engine addresses strings in code units.
     pub(in crate::runtime) fn string_char_code_at(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
-        let position = optional_index(arguments.first()).unwrap_or(0.0);
+        let position = self.optional_integer_value(dom, arguments.first())?;
         let units = utf16::utf16_units(&text);
         let Some(position) = valid_position(position, units.len()) else {
             return Ok(JsValue::Number(f64::NAN));
@@ -846,11 +835,13 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn string_from_char_code(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let mut units = Vec::with_capacity(arguments.len());
         for value in arguments {
-            let number = to_number(value)?;
+            let number = self.to_number_value(dom, value)?;
             let integer = if number.is_finite() {
                 number.trunc()
             } else {
@@ -872,16 +863,18 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn string_from_code_point(
+        &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let mut text = String::with_capacity(arguments.len());
         for value in arguments {
-            let number = to_number(value)?;
+            let number = self.to_number_value(dom, value)?;
             if !number.is_finite()
                 || number.fract() != 0.0
                 || !(0.0..=1_114_111.0).contains(&number)
             {
-                return Err(JsError::type_error("invalid code point"));
+                return Err(self.range_error("invalid code point"));
             }
             #[allow(
                 clippy::cast_possible_truncation,
@@ -890,7 +883,7 @@ impl JsRuntime {
             )]
             let code = number as u32;
             let Some(character) = char::from_u32(code) else {
-                return Err(JsError::type_error("invalid code point"));
+                return Err(self.range_error("invalid code point"));
             };
             text.push(character);
         }
@@ -969,30 +962,41 @@ impl JsRuntime {
     /// a lone-surrogate needle against a pair, for the same reason `includes`
     /// needed the code-unit view.
     pub(in crate::runtime) fn string_starts_or_ends_with(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
         starts: bool,
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
-        let needle = required_argument(arguments, 0, "startsWith")?.to_js_string();
+        // `ToString(searchString)`, so an absent argument searches for "undefined".
+        let needle = self.to_string_value(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
         let units = utf16::utf16_units(&text);
         let needle = utf16::utf16_units(&needle);
-        // Both algorithms return true for an empty search value before
-        // computing any bound.
-        if needle.is_empty() {
-            return Ok(JsValue::Boolean(true));
-        }
-        let offset = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(to_number(value)?),
+        let length = units.len();
+        // The position is converted even when the search string is empty, and
+        // an absent position is 0 for `startsWith` and the length for `endsWith`.
+        let position = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => {
+                if starts {
+                    0.0
+                } else {
+                    length as f64
+                }
+            }
+            Some(value) => self.to_integer_value(dom, value)?,
         };
-        let range = slice_range(units.len(), 0.0, offset, true);
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "the position is clamped to the code-unit length first"
+        )]
+        let clamped = position.max(0.0).min(length as f64) as usize;
         let matched = if starts {
-            units.len() >= needle.len() && units[..needle.len()] == needle
+            clamped + needle.len() <= length && units[clamped..clamped + needle.len()] == needle
         } else {
-            let end = range.end.min(units.len());
-            end >= needle.len() && units[end - needle.len()..end] == needle
+            clamped >= needle.len() && units[clamped - needle.len()..clamped] == needle
         };
         Ok(JsValue::Boolean(matched))
     }
@@ -1000,16 +1004,17 @@ impl JsRuntime {
     /// ECMA-262 22.1.3.22 `String.prototype.slice`, over code units: both
     /// bounds are `ToClampedIndex` and step 6 returns empty when `from ≥ to`.
     pub(in crate::runtime) fn string_slice(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
         let units = utf16::utf16_units(&text);
-        let start = optional_index(arguments.first())?;
+        let start = self.optional_integer_value(dom, arguments.first())?;
         let end = match arguments.get(1) {
             None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(to_number(value)?),
+            Some(value) => Some(self.to_integer_value(dom, value)?),
         };
         let range = slice_range(units.len(), start, end, true);
         Ok(JsValue::String(utf16::string_from_utf16(&units[range])))
@@ -1020,16 +1025,17 @@ impl JsRuntime {
     /// `from = min(finalStart, finalEnd)`, so reversed bounds are swapped
     /// rather than yielding the empty String.
     pub(in crate::runtime) fn string_substring(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(receiver)?;
         let units = utf16::utf16_units(&text);
-        let start = optional_index(arguments.first())?;
+        let start = self.optional_integer_value(dom, arguments.first())?;
         let end = match arguments.get(1) {
             None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(to_number(value)?),
+            Some(value) => Some(self.to_integer_value(dom, value)?),
         };
         let range = slice_range(units.len(), start, end, false);
         Ok(JsValue::String(utf16::string_from_utf16(&units[range])))
@@ -1179,6 +1185,7 @@ impl JsRuntime {
     /// Split by a literal separator or a regular expression.
     pub(in crate::runtime) fn string_split(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -1190,7 +1197,10 @@ impl JsRuntime {
         )]
         let limit = match arguments.get(1) {
             None | Some(JsValue::Undefined) => usize::MAX,
-            Some(value) => to_number(value)?.max(0.0).min(f64::from(u32::MAX)) as usize,
+            Some(value) => {
+                let number = self.to_number_value(dom, value)?;
+                uint32_of_number(number) as usize
+            }
         };
         let pieces = match arguments.first() {
             None | Some(JsValue::Undefined) => vec![text],

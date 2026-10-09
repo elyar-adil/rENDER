@@ -124,6 +124,10 @@ pub(super) struct Token {
     /// token. Restricted productions such as `return` need this for correct
     /// automatic semicolon insertion.
     pub after_newline: bool,
+    /// Whether the identifier spelling contained a Unicode escape. An escaped
+    /// spelling never acts as a keyword (ECMA-262 12.7.2), so the parser
+    /// refuses it where a keyword is required.
+    pub escaped: bool,
 }
 
 pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token>, JsError> {
@@ -146,6 +150,7 @@ pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token
         brace_stack: Vec::new(),
         last_block_close: true,
         newline: false,
+        escaped_name: false,
     }
     .run()
 }
@@ -163,6 +168,9 @@ struct Lexer<'a> {
     last_block_close: bool,
     /// Whether a line terminator was seen since the previous token.
     newline: bool,
+    /// Whether the identifier being scanned contained a Unicode escape. Taken
+    /// by the next `push`, which records it on the token.
+    escaped_name: bool,
 }
 
 /// ECMA-262 12.2 `WhiteSpace`: tab, vertical tab, form feed, space, no-break
@@ -795,6 +803,7 @@ impl Lexer<'_> {
     }
 
     fn identifier_escape(&mut self, start: usize) -> Result<char, JsError> {
+        self.escaped_name = true;
         self.advance();
         if self.peek() != Some('u') {
             return Err(JsError::syntax(
@@ -1197,6 +1206,7 @@ impl Lexer<'_> {
             kind,
             offset,
             after_newline: std::mem::take(&mut self.newline),
+            escaped: std::mem::take(&mut self.escaped_name),
         });
         Ok(())
     }

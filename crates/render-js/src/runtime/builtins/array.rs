@@ -836,7 +836,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let depth = match arguments.first() {
-            Some(value) => to_number(value)?.trunc().max(0.0),
+            Some(value) => self.to_integer_value(dom, value)?.max(0.0),
             None => 1.0,
         };
         // The walk is over *indices*, not over a materialized element list,

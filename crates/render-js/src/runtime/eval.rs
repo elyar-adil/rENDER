@@ -1604,7 +1604,12 @@ impl JsRuntime {
                 self.write_assignment_reference(dom, &reference, combined.clone())?;
                 Ok(combined)
             }
-            Expr::Assignment { target, value, .. } => {
+            Expr::Assignment {
+                target,
+                value,
+                parenthesized_target,
+                ..
+            } => {
                 if matches!(target.as_ref(), Expr::Array(_) | Expr::Object(_)) {
                     let value = self.evaluate(dom, value)?;
                     self.assign_destructuring_target(dom, target, value.clone())?;
@@ -1612,7 +1617,9 @@ impl JsRuntime {
                 }
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let value = match target.as_ref() {
-                    Expr::Identifier(name) => self.evaluate_named(dom, value, name)?,
+                    Expr::Identifier(name) if !parenthesized_target => {
+                        self.evaluate_named(dom, value, name)?
+                    }
                     _ => self.evaluate(dom, value)?,
                 };
                 self.write_assignment_reference(dom, &reference, value.clone())?;
@@ -2279,6 +2286,19 @@ impl JsRuntime {
         to_number(value)
     }
 
+    /// `ToIntegerOrInfinity` for an optional position argument, where an absent
+    /// argument and `undefined` both read as 0.
+    pub(super) fn optional_integer_value(
+        &mut self,
+        dom: &mut Dom,
+        value: Option<&JsValue>,
+    ) -> Result<f64, JsError> {
+        match value {
+            None | Some(JsValue::Undefined) => Ok(0.0),
+            Some(other) => self.to_integer_value(dom, other),
+        }
+    }
+
     /// ECMA-262 `ToIntegerOrInfinity` for a value that may be an object, so a
     /// built-in's index or count argument can carry a `valueOf`.
     pub(super) fn to_integer_value(
@@ -2413,10 +2433,16 @@ impl JsRuntime {
                 return Ok(result);
             }
         }
-        // Host objects without a usable `valueOf`/`toString` still have the
-        // ordinary object string representation.  Returning it keeps string
-        // concatenation and URL/logging code from aborting on an incomplete
-        // platform object.
+        // OrdinaryToPrimitive has no primitive left to return for an ordinary
+        // object (ECMA-262 7.1.1.1), so the conversion throws. A host object
+        // without a usable `valueOf`/`toString` keeps the ordinary object string
+        // representation, so string concatenation and URL/logging code do not
+        // abort on an incomplete platform object.
+        if matches!(self.realm.host(object), Some(ObjectHost::Ordinary) | None) {
+            return Err(JsError::type_error(
+                "Cannot convert object to primitive value",
+            ));
+        }
         Ok(JsValue::String("[object Object]".to_owned()))
     }
 

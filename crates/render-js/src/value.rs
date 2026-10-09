@@ -1948,6 +1948,23 @@ impl Realm {
             "meta".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(import_meta)),
         );
+        // The source-phase proposals' `import.defer(...)` and `import.source(...)`
+        // reach the same host hook as `import()`, so their arguments evaluate
+        // before the call like any other call's.
+        for phase in ["defer", "source"] {
+            let phase_import = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::BoundFunction {
+                    function: NativeFunction::GlobalImport,
+                    receiver: global,
+                },
+                ..JsObject::default()
+            });
+            objects[dynamic_import.0].properties.insert(
+                phase.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(phase_import)),
+            );
+        }
         objects[global.0].properties.insert(
             "import".to_owned(),
             PropertyDescriptor {
