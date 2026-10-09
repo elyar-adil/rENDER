@@ -13,6 +13,7 @@
 //! and hands unmatched functions to `dom.rs`.
 
 pub(super) mod array;
+pub(super) mod bigint;
 pub(super) mod blob;
 pub(super) mod collections;
 pub(super) mod data_view;

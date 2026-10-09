@@ -521,7 +521,9 @@ impl JsRuntime {
         };
         for source in &arguments[1..] {
             match source {
-                JsValue::Symbol(_) => {}
+                // A symbol or BigInt source wraps to an object with no own
+                // enumerable properties, so there is nothing to copy.
+                JsValue::Symbol(_) | JsValue::BigInt(_) => {}
                 JsValue::Object(source) => {
                     let properties = self
                         .realm
@@ -654,7 +656,11 @@ impl JsRuntime {
             // shims.  A primitive here has no descriptor fields; accepting it
             // as an empty descriptor keeps the target usable like browsers do
             // for permissive host objects.
-            JsValue::String(_) | JsValue::Number(_) | JsValue::Boolean(_) | JsValue::Symbol(_) => {
+            JsValue::String(_)
+            | JsValue::Number(_)
+            | JsValue::BigInt(_)
+            | JsValue::Boolean(_)
+            | JsValue::Symbol(_) => {
                 return Ok(JsValue::Object(object));
             }
             JsValue::Null | JsValue::Undefined => unreachable!(),
@@ -1049,6 +1055,7 @@ impl JsRuntime {
             JsValue::Null => return "[object Null]".to_owned(),
             JsValue::Boolean(_) => "Boolean",
             JsValue::Number(_) => "Number",
+            JsValue::BigInt(_) => "BigInt",
             JsValue::String(_) => "String",
             JsValue::Symbol(_) => "Symbol",
             JsValue::Object(object) => {

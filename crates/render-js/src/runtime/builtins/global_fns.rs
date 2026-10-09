@@ -1456,6 +1456,12 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::BigIntAsIntN
+            | NativeFunction::BigIntAsUintN
+            | NativeFunction::BigIntToString
+            | NativeFunction::BigIntValueOf => {
+                self.dispatch_bigint_native(dom, function, receiver, arguments)
+            }
         }
     }
 }

@@ -41,6 +41,8 @@ use render_dom::NodeId;
 use std::collections::BTreeMap;
 use url::Url;
 
+#[cfg(test)]
+mod bigint_tests;
 mod builtins;
 mod class;
 mod convert;

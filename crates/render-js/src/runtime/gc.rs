@@ -173,12 +173,14 @@ pub(super) fn mark_host(
         | ObjectHost::FunctionConstructor
         | ObjectHost::StringConstructor
         | ObjectHost::NumberConstructor
+        | ObjectHost::BigIntConstructor
         | ObjectHost::BooleanConstructor
         | ObjectHost::DateConstructor
         | ObjectHost::SymbolConstructor
         | ObjectHost::ArrayConstructor
         | ObjectHost::StringPrimitive(_)
         | ObjectHost::NumberPrimitive(_)
+        | ObjectHost::BigIntPrimitive(_)
         | ObjectHost::BooleanPrimitive(_)
         | ObjectHost::DateInstance(_)
         | ObjectHost::NamedNodeMap(_)

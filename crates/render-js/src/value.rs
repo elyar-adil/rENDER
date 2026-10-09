@@ -7,6 +7,7 @@ use std::num::FpCategory;
 use render_dom::NodeId;
 use url::Url;
 
+use crate::bigint::JsBigInt;
 use crate::utf16;
 
 /// Stable identity for an object allocated in a [`Realm`].
@@ -35,6 +36,8 @@ pub enum JsValue {
     Null,
     Boolean(bool),
     Number(f64),
+    /// The `BigInt` primitive (ECMA-262 6.1.6.2): an exact integer.
+    BigInt(JsBigInt),
     String(String),
     Symbol(JsSymbol),
     Object(ObjectId),
@@ -109,6 +112,7 @@ impl JsValue {
             Self::Null => "null".to_owned(),
             Self::Boolean(value) => value.to_string(),
             Self::Number(value) => number_to_string(*value),
+            Self::BigInt(value) => value.to_string_radix(10),
             Self::String(value) => value.clone(),
             Self::Symbol(symbol) => symbol.to_display(),
             Self::Object(_) => "[object Object]".to_owned(),
@@ -498,6 +502,10 @@ pub(crate) enum NativeFunction {
     UrlToString,
     SymbolToString,
     SymbolValueOf,
+    BigIntAsIntN,
+    BigIntAsUintN,
+    BigIntToString,
+    BigIntValueOf,
     NumToFixed,
     NumToPrecision,
     NumToString,
@@ -1228,10 +1236,12 @@ pub(crate) enum ObjectHost {
     FunctionConstructor,
     StringConstructor,
     NumberConstructor,
+    BigIntConstructor,
     BooleanConstructor,
     DateConstructor,
     SymbolConstructor,
     SymbolInstance(JsSymbol),
+    BigIntPrimitive(JsBigInt),
     ArrayConstructor,
     StringPrimitive(String),
     NumberPrimitive(f64),
@@ -1449,6 +1459,7 @@ impl ObjectHost {
                 | Self::FunctionConstructor
                 | Self::StringConstructor
                 | Self::NumberConstructor
+                | Self::BigIntConstructor
                 | Self::BooleanConstructor
                 | Self::DateConstructor
                 | Self::SymbolConstructor
@@ -1706,6 +1717,8 @@ pub struct Realm {
     regexp_prototype: ObjectId,
     date_prototype: ObjectId,
     symbol_prototype: ObjectId,
+    /// `%BigInt.prototype%`, the prototype of every `BigInt` wrapper.
+    bigint_prototype: ObjectId,
     promise_prototype: ObjectId,
     element_prototype: ObjectId,
     /// The prototype of every DOM interface, by interface name.
@@ -1865,6 +1878,8 @@ impl Realm {
             Self::install_date(&mut objects, global, object_prototype, function_prototype);
         let symbol_prototype =
             Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
+        let bigint_prototype =
+            Self::install_bigint(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
         let promise_prototype = Self::install_promise(
             &mut objects,
@@ -2468,6 +2483,7 @@ impl Realm {
                     | ObjectHost::FunctionConstructor
                     | ObjectHost::StringConstructor
                     | ObjectHost::NumberConstructor
+                    | ObjectHost::BigIntConstructor
                     | ObjectHost::BooleanConstructor
                     | ObjectHost::DateConstructor
                     | ObjectHost::SymbolConstructor
@@ -2503,6 +2519,7 @@ impl Realm {
             regexp_prototype,
             date_prototype,
             symbol_prototype,
+            bigint_prototype,
             promise_prototype,
             element_prototype,
             dom_prototypes,
@@ -3718,8 +3735,9 @@ impl Realm {
             | "WeakMap" | "WeakSet" | "Iterator" | "Uint8Array" | "Uint8ClampedArray"
             | "Int8Array" | "Uint16Array" | "Int16Array" | "Uint32Array" | "Int32Array"
             | "Float32Array" | "Float64Array" => 1,
+            "BigInt" => 1,
             "Date" | "UTC" => 7,
-            "RegExp" => 2,
+            "RegExp" | "asIntN" | "asUintN" => 2,
             _ => 0,
         }
     }
@@ -4860,6 +4878,112 @@ impl Realm {
             },
         );
         prototype
+    }
+
+    /// Install the `BigInt` function and `BigInt.prototype` (ECMA-262 21.2).
+    /// `BigInt` is callable but not a constructor: its host is absent from the
+    /// constructor list, so `new BigInt()` takes the usual `TypeError` path.
+    fn install_bigint(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::BigIntConstructor,
+            ..JsObject::default()
+        });
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        for (name, function) in [
+            ("asIntN", NativeFunction::BigIntAsIntN),
+            ("asUintN", NativeFunction::BigIntAsUintN),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        for (name, function) in [
+            ("toString", NativeFunction::BigIntToString),
+            ("valueOf", NativeFunction::BigIntValueOf),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        // `BigInt.prototype[Symbol.toStringTag] === "BigInt"`
+        {
+            let tag = JsSymbol::well_known("@@toStringTag");
+            objects[prototype.0].symbols.insert(
+                tag.id(),
+                (
+                    tag,
+                    // Unlike the usual built-in property, the tag is read-only.
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::String("BigInt".to_owned()),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                ),
+            );
+        }
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        objects[global.0].properties.insert(
+            "BigInt".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        prototype
+    }
+
+    /// A fresh wrapper object hosting a `BigInt` primitive, so its methods are
+    /// reachable through `BigInt.prototype` (`Object(1n)`, `(1n).toString()`).
+    pub(crate) fn bigint_primitive_wrapper(&mut self, value: JsBigInt) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.bigint_prototype),
+            host: ObjectHost::BigIntPrimitive(value),
+            ..JsObject::default()
+        })
     }
 
     /// A fresh wrapper object hosting a symbol primitive, used when a
@@ -7153,6 +7277,7 @@ impl Realm {
             ObjectHost::NumberPrimitive(_) => Some(self.number_primitive_prototype),
             ObjectHost::BooleanPrimitive(_) => Some(self.boolean_primitive_prototype),
             ObjectHost::SymbolInstance(_) => Some(self.symbol_prototype),
+            ObjectHost::BigIntPrimitive(_) => Some(self.bigint_prototype),
             _ => None,
         }
     }

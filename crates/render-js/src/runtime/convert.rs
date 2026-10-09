@@ -13,8 +13,14 @@
     clippy::wrong_self_convention
 )]
 
+use std::cmp::Ordering;
+
+use crate::JsBigInt;
 use crate::JsError;
 use crate::JsValue;
+use crate::parser::BinaryOp;
+use crate::runtime::builtins::bigint::StringToBigInt;
+use crate::runtime::builtins::bigint::string_to_bigint;
 
 impl JsValue {
     pub(super) fn is_truthy(&self) -> bool {
@@ -22,6 +28,7 @@ impl JsValue {
             Self::Undefined | Self::Null => false,
             Self::Boolean(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
+            Self::BigInt(value) => !value.is_zero(),
             Self::String(value) => !value.is_empty(),
             Self::Symbol(_) => true,
             Self::Object(_) => true,
@@ -93,6 +100,11 @@ pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
         JsValue::Null => Ok(0.0),
         JsValue::Symbol(_) => Err(JsError::type_error(
             "Cannot convert a Symbol value to a number",
+        )),
+        // ECMA-262 7.1.4 `ToNumber` has no BigInt case: it throws, and only
+        // `Number(value)` and the explicit `ToNumeric` path convert a BigInt.
+        JsValue::BigInt(_) => Err(JsError::type_error(
+            "Cannot convert a BigInt value to a number",
         )),
         JsValue::Boolean(value) => Ok(u8::from(*value).into()),
         JsValue::Number(value) => Ok(*value),
@@ -214,19 +226,63 @@ pub(super) fn unsigned_shift_right(left: &JsValue, right: &JsValue) -> Result<Js
     )))
 }
 
-pub(super) fn compare(
+/// The truth of `left op right` for a relational operator over two primitives
+/// (ECMA-262 13.10.1). An `undefined` comparison, from a NaN or a string that
+/// is not a `BigInt`, makes all four operators false.
+pub(super) fn relational_compare(
+    operator: BinaryOp,
     left: &JsValue,
     right: &JsValue,
-    numeric: impl FnOnce(f64, f64) -> bool,
-    string: impl FnOnce(&str, &str) -> bool,
-) -> Result<JsValue, JsError> {
-    if let (JsValue::String(left), JsValue::String(right)) = (left, right) {
-        return Ok(JsValue::Boolean(string(left, right)));
+) -> Result<bool, JsError> {
+    // `a > b` asks whether `b < a`, and `a <= b` is "not `b < a`". Negating
+    // only the definite answer keeps `undefined` false in every operator.
+    let (first, second, negate) = match operator {
+        BinaryOp::Less => (left, right, false),
+        BinaryOp::Greater => (right, left, false),
+        BinaryOp::LessEqual => (right, left, true),
+        BinaryOp::GreaterEqual => (left, right, true),
+        _ => unreachable!("relational_compare takes only the relational operators"),
+    };
+    Ok(match less_than(first, second)? {
+        Some(answer) => answer != negate,
+        None => false,
+    })
+}
+
+/// ECMA-262 7.2.13 `IsLessThan` over two primitives, `None` for `undefined`.
+fn less_than(left: &JsValue, right: &JsValue) -> Result<Option<bool>, JsError> {
+    Ok(match (left, right) {
+        (JsValue::String(left), JsValue::String(right)) => Some(left < right),
+        (JsValue::BigInt(left), JsValue::BigInt(right)) => Some(left < right),
+        (JsValue::BigInt(left), JsValue::String(right)) => {
+            bigint_from_text(right).map(|right| *left < right)
+        }
+        (JsValue::String(left), JsValue::BigInt(right)) => {
+            bigint_from_text(left).map(|left| left < *right)
+        }
+        // A BigInt against a Number compares mathematical values exactly.
+        (JsValue::BigInt(left), other) => left
+            .cmp_f64(to_number(other)?)
+            .map(|ordering| ordering == Ordering::Less),
+        (other, JsValue::BigInt(right)) => right
+            .cmp_f64(to_number(other)?)
+            .map(|ordering| ordering == Ordering::Greater),
+        _ => {
+            let left = to_number(left)?;
+            let right = to_number(right)?;
+            (!left.is_nan() && !right.is_nan()).then_some(left < right)
+        }
+    })
+}
+
+/// `StringToBigInt` for a comparison or an equality test. A string that is not
+/// a `BigInt` literal, or whose value is beyond the supported size, has no `BigInt`
+/// to compare with, so the answer is `None`.
+fn bigint_from_text(text: &str) -> Option<JsBigInt> {
+    match string_to_bigint(text) {
+        StringToBigInt::Value(value) => Some(value),
+        StringToBigInt::Invalid | StringToBigInt::TooLarge => None,
     }
-    Ok(JsValue::Boolean(numeric(
-        to_number(left)?,
-        to_number(right)?,
-    )))
 }
 
 pub(super) fn strict_equal(left: &JsValue, right: &JsValue) -> bool {
@@ -234,6 +290,7 @@ pub(super) fn strict_equal(left: &JsValue, right: &JsValue) -> bool {
         (JsValue::Undefined, JsValue::Undefined) | (JsValue::Null, JsValue::Null) => true,
         (JsValue::Boolean(left), JsValue::Boolean(right)) => left == right,
         (JsValue::Number(left), JsValue::Number(right)) => number_equal(*left, *right),
+        (JsValue::BigInt(left), JsValue::BigInt(right)) => left == right,
         (JsValue::String(left), JsValue::String(right)) => left == right,
         (JsValue::Symbol(left), JsValue::Symbol(right)) => left == right,
         (JsValue::Object(left), JsValue::Object(right)) => left == right,
@@ -271,6 +328,16 @@ pub(super) fn abstract_equal(left: &JsValue, right: &JsValue) -> Result<bool, Js
     match (left, right) {
         (JsValue::Number(left), JsValue::String(_)) => Ok(number_equal(*left, to_number(right)?)),
         (JsValue::String(_), JsValue::Number(right)) => Ok(number_equal(to_number(left)?, *right)),
+        // A BigInt equals a Number only when their mathematical values are
+        // equal; NaN and the infinities match no BigInt.
+        (JsValue::BigInt(left), JsValue::Number(right))
+        | (JsValue::Number(right), JsValue::BigInt(left)) => {
+            Ok(left.cmp_f64(*right) == Some(Ordering::Equal))
+        }
+        (JsValue::BigInt(left), JsValue::String(right))
+        | (JsValue::String(right), JsValue::BigInt(left)) => {
+            Ok(bigint_from_text(right).is_some_and(|right| right == *left))
+        }
         (JsValue::Boolean(_), _) => abstract_equal(&JsValue::Number(to_number(left)?), right),
         (_, JsValue::Boolean(_)) => abstract_equal(left, &JsValue::Number(to_number(right)?)),
         _ => Ok(false),
