@@ -61,6 +61,7 @@ pub(super) enum TokenKind {
     MinusEqual,
     Star,
     StarStar,
+    StarStarEqual,
     StarEqual,
     Slash,
     SlashEqual,
@@ -250,6 +251,12 @@ impl Lexer<'_> {
                     TokenKind::MinusEqual
                 }
                 '-' => self.single(TokenKind::Minus),
+                '*' if self.peek_second() == Some('*') && self.peek_third() == Some('=') => {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    TokenKind::StarStarEqual
+                }
                 '*' if self.peek_second() == Some('*') => {
                     self.advance();
                     self.advance();
@@ -468,6 +475,7 @@ impl Lexer<'_> {
             | TokenKind::Star
             | TokenKind::StarEqual
             | TokenKind::StarStar
+            | TokenKind::StarStarEqual
             | TokenKind::Slash
             | TokenKind::SlashEqual
             | TokenKind::Percent

@@ -1630,6 +1630,8 @@ impl Parser {
             self.assignment_value(target, Some(BinaryOp::Add))
         } else if self.take(&TokenKind::MinusEqual) {
             self.assignment_value(target, Some(BinaryOp::Subtract))
+        } else if self.take(&TokenKind::StarStarEqual) {
+            self.assignment_value(target, Some(BinaryOp::Exponentiate))
         } else if self.take(&TokenKind::StarEqual) {
             self.assignment_value(target, Some(BinaryOp::Multiply))
         } else if self.take(&TokenKind::SlashEqual) {

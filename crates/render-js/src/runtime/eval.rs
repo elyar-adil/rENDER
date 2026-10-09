@@ -1580,8 +1580,7 @@ impl JsRuntime {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let previous = self.read_assignment_reference(dom, &reference)?;
                 let numeric = self.to_numeric_primitive(dom, previous.clone())?;
-                let next =
-                    Self::evaluate_binary_values(*operator, &numeric, &JsValue::Number(1.0))?;
+                let next = self.binary_operation(dom, *operator, numeric, JsValue::Number(1.0))?;
                 self.write_assignment_reference(dom, &reference, next.clone())?;
                 Ok(if *prefix { next } else { previous })
             }
@@ -1677,20 +1676,7 @@ impl JsRuntime {
                 let current = self.read_assignment_reference(dom, &reference)?;
                 let right = self.evaluate(dom, value)?;
                 // Match the plain binary path: object operands go through
-                // ToPrimitive so `x += value` agrees with `x = x + value`.
-                let combined = match *operator {
-                    BinaryOp::Add
-                    | BinaryOp::Subtract
-                    | BinaryOp::Multiply
-                    | BinaryOp::Divide
-                    | BinaryOp::Remainder
-                    | BinaryOp::Exponentiate => {
-                        let current = self.to_numeric_primitive(dom, current)?;
-                        let right = self.to_numeric_primitive(dom, right)?;
-                        Self::evaluate_binary_values(*operator, &current, &right)?
-                    }
-                    _ => Self::evaluate_binary_values(*operator, &current, &right)?,
-                };
+                let combined = self.binary_operation(dom, *operator, current, right)?;
                 self.write_assignment_reference(dom, &reference, combined.clone())?;
                 Ok(combined)
             }
@@ -2487,36 +2473,6 @@ impl JsRuntime {
         self.global_bindings.contains_key(name) || self.realm.global(name).is_some()
     }
 
-    pub(super) fn evaluate_binary_values(
-        operator: BinaryOp,
-        left: &JsValue,
-        right: &JsValue,
-    ) -> Result<JsValue, JsError> {
-        match operator {
-            BinaryOp::Add => {
-                if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
-                    // Same `StringAdd` as the plain binary path, so `x += y` and
-                    // `x = x + y` agree on a pair split across the operator.
-                    let mut units = utf16::utf16_units(&left.to_js_string());
-                    units.extend(utf16::utf16_units(&right.to_js_string()));
-                    Ok(JsValue::String(utf16::string_from_utf16(&units)))
-                } else {
-                    Ok(JsValue::Number(to_number(left)? + to_number(right)?))
-                }
-            }
-            BinaryOp::Subtract => Ok(JsValue::Number(to_number(left)? - to_number(right)?)),
-            BinaryOp::BitwiseAnd => bitwise_binary(left, right, |left, right| left & right),
-            BinaryOp::BitwiseXor => bitwise_binary(left, right, |left, right| left ^ right),
-            BinaryOp::BitwiseOr => bitwise_binary(left, right, |left, right| left | right),
-            BinaryOp::LeftShift => shift_left(left, right),
-            BinaryOp::RightShift => shift_right(left, right),
-            BinaryOp::UnsignedRightShift => unsigned_shift_right(left, right),
-            _ => Err(JsError::type_error(
-                "unsupported compound assignment operator",
-            )),
-        }
-    }
-
     pub(super) fn evaluate_call(
         &mut self,
         dom: &mut Dom,
@@ -2967,31 +2923,37 @@ impl JsRuntime {
         if operator == BinaryOp::In {
             return self.property_in(dom, &left, &right).map(JsValue::Boolean);
         }
-        // ECMA-262 IsLooselyEqual/IsStrictEqual: equality operators never
-        // coerce their operands through ToPrimitive here �?strict equality
-        // compares raw values and loose equality applies the spec algorithm
-        // in abstract_equal. Arithmetic and relational operators below keep
-        // the numeric conversion.
+        self.binary_operation(dom, operator, left, right)
+    }
+
+    /// The value of `left op right` once both operands are evaluated. Binary
+    /// expressions and compound assignment both come here, so `x op= y` and
+    /// `x = x op y` cannot disagree. `+` converts with the default hint, as
+    /// ECMA-262 13.15.3 requires, and the other operators with ToNumeric.
+    pub(super) fn binary_operation(
+        &mut self,
+        dom: &mut Dom,
+        operator: BinaryOp,
+        left: JsValue,
+        right: JsValue,
+    ) -> Result<JsValue, JsError> {
         match operator {
-            BinaryOp::StrictEqual => {
-                return Ok(JsValue::Boolean(strict_equal(&left, &right)));
-            }
+            BinaryOp::StrictEqual => return Ok(JsValue::Boolean(strict_equal(&left, &right))),
             BinaryOp::StrictNotEqual => {
                 return Ok(JsValue::Boolean(!strict_equal(&left, &right)));
             }
-            BinaryOp::Equal => {
-                return Ok(JsValue::Boolean(abstract_equal(&left, &right)?));
-            }
+            BinaryOp::Equal => return Ok(JsValue::Boolean(self.loose_equal(dom, &left, &right)?)),
             BinaryOp::NotEqual => {
-                return Ok(JsValue::Boolean(!abstract_equal(&left, &right)?));
+                return Ok(JsValue::Boolean(!self.loose_equal(dom, &left, &right)?));
             }
-            _ => {}
-        }
-        let left = self.to_numeric_primitive(dom, left)?;
-        let right = self.to_numeric_primitive(dom, right)?;
-        match operator {
-            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => Ok(right),
+            BinaryOp::Instanceof => {
+                return self.instanceof(dom, &left, &right).map(JsValue::Boolean);
+            }
+            BinaryOp::In => return self.property_in(dom, &left, &right).map(JsValue::Boolean),
+            BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => return Ok(right),
             BinaryOp::Add => {
+                let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Default)?;
+                let right = self.to_primitive_with_hint(dom, right, PrimitiveHint::Default)?;
                 if matches!(left, JsValue::String(_)) || matches!(right, JsValue::String(_)) {
                     // `+` on strings is §13.15.2 `StringAdd`, which concatenates
                     // two code-unit sequences. The engine holds a lone surrogate
@@ -3004,11 +2966,17 @@ impl JsRuntime {
                     // both answer the original pair.
                     let mut units = utf16::utf16_units(&left.to_js_string());
                     units.extend(utf16::utf16_units(&right.to_js_string()));
-                    Ok(JsValue::String(utf16::string_from_utf16(&units)))
-                } else {
-                    Ok(JsValue::Number(to_number(&left)? + to_number(&right)?))
+                    return Ok(JsValue::String(utf16::string_from_utf16(&units)));
                 }
+                let left = self.to_numeric_primitive(dom, left)?;
+                let right = self.to_numeric_primitive(dom, right)?;
+                return Ok(JsValue::Number(to_number(&left)? + to_number(&right)?));
             }
+            _ => {}
+        }
+        let left = self.to_numeric_primitive(dom, left)?;
+        let right = self.to_numeric_primitive(dom, right)?;
+        match operator {
             BinaryOp::Subtract => Ok(JsValue::Number(to_number(&left)? - to_number(&right)?)),
             BinaryOp::Multiply => Ok(JsValue::Number(to_number(&left)? * to_number(&right)?)),
             BinaryOp::Exponentiate => {
@@ -3026,12 +2994,44 @@ impl JsRuntime {
             BinaryOp::LessEqual => compare(&left, &right, |a, b| a <= b, |a, b| a <= b),
             BinaryOp::Greater => compare(&left, &right, |a, b| a > b, |a, b| a > b),
             BinaryOp::GreaterEqual => compare(&left, &right, |a, b| a >= b, |a, b| a >= b),
-            BinaryOp::StrictEqual => Ok(JsValue::Boolean(strict_equal(&left, &right))),
-            BinaryOp::StrictNotEqual => Ok(JsValue::Boolean(!strict_equal(&left, &right))),
-            BinaryOp::Equal => Ok(JsValue::Boolean(abstract_equal(&left, &right)?)),
-            BinaryOp::NotEqual => Ok(JsValue::Boolean(!abstract_equal(&left, &right)?)),
-            BinaryOp::Instanceof => unreachable!("instanceof is handled before numeric operators"),
-            BinaryOp::In => unreachable!("in is handled before numeric operators"),
+            BinaryOp::Add
+            | BinaryOp::StrictEqual
+            | BinaryOp::StrictNotEqual
+            | BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::Instanceof
+            | BinaryOp::In
+            | BinaryOp::LogicalAnd
+            | BinaryOp::LogicalOr
+            | BinaryOp::Nullish => unreachable!("operator is handled before numeric conversion"),
+        }
+    }
+
+    /// ECMA-262 7.2.14 IsLooselyEqual. An object compared with a string, number,
+    /// boolean, bigint or symbol is converted with ToPrimitive (default hint), so
+    /// `valueOf` and `toString` take part. An object is never loosely equal to
+    /// `null` or `undefined`.
+    pub(super) fn loose_equal(
+        &mut self,
+        dom: &mut Dom,
+        left: &JsValue,
+        right: &JsValue,
+    ) -> Result<bool, JsError> {
+        match (left, right) {
+            (JsValue::Object(_), JsValue::Object(_)) => abstract_equal(left, right),
+            (JsValue::Object(_), JsValue::Null | JsValue::Undefined)
+            | (JsValue::Null | JsValue::Undefined, JsValue::Object(_)) => Ok(false),
+            (JsValue::Object(_), _) => {
+                let primitive =
+                    self.to_primitive_with_hint(dom, left.clone(), PrimitiveHint::Default)?;
+                self.loose_equal(dom, &primitive, right)
+            }
+            (_, JsValue::Object(_)) => {
+                let primitive =
+                    self.to_primitive_with_hint(dom, right.clone(), PrimitiveHint::Default)?;
+                self.loose_equal(dom, left, &primitive)
+            }
+            _ => abstract_equal(left, right),
         }
     }
 
