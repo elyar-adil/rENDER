@@ -4368,11 +4368,11 @@ impl JsRuntime {
                             reason = "the index is a non-negative integer below the length"
                         )]
                         let index = number as usize;
-                        buffer.element(kind, start + index)
+                        buffer.element_value(kind, start + index)
                     } else {
                         None
                     };
-                    return Ok(element.map_or(JsValue::Undefined, JsValue::Number));
+                    return Ok(element.unwrap_or(JsValue::Undefined));
                 }
             }
             Some(ObjectHost::StringPrimitive(text)) => {
@@ -4720,8 +4720,13 @@ impl JsRuntime {
                     // know the receiver, and §10.4.5.5 converts an out-of-range
                     // value only when the receiver is the typed array itself.
                     if index < length {
-                        let number = to_number(&value)?;
-                        buffer.set_element(kind, start + index, number);
+                        if kind.is_bigint() {
+                            let bigint = self.to_bigint_value(dom, &value)?;
+                            buffer.set_bigint_element(kind, start + index, &bigint);
+                        } else {
+                            let number = to_number(&value)?;
+                            buffer.set_element(kind, start + index, number);
+                        }
                     }
                     return Ok(());
                 }

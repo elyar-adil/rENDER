@@ -1855,3 +1855,15 @@ fn data_view_bigint_accessors_read_and_write_both_byte_orders() {
         "TypeError,1,2"
     );
 }
+
+#[test]
+fn bigint_typed_arrays_store_and_read_bigints() {
+    // ECMA-262 23.2 and 10.4.5.11: BigInt64Array and BigUint64Array elements
+    // are BigInts, stored modulo 2^64.
+    assert_eq!(
+        ok(
+            "var a = new BigInt64Array(2); a[0] = -5n; a[1] = 2n ** 63n; [a[0], a[1], a.length, a.byteLength, BigInt64Array.BYTES_PER_ELEMENT, Object.prototype.toString.call(a)].join()"
+        ),
+        "-5,-9223372036854775808,2,16,8,[object BigInt64Array]"
+    );
+}

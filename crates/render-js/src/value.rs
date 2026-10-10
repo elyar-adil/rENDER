@@ -1072,10 +1072,14 @@ pub(crate) enum TypedArrayKind {
     Uint32,
     Float32,
     Float64,
+    /// `BigInt64Array` (ECMA-262 23.2.7): eight bytes read as a signed `BigInt`.
+    BigInt64,
+    /// `BigUint64Array`: eight bytes read as an unsigned `BigInt`.
+    BigUint64,
 }
 
 impl TypedArrayKind {
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::Int8,
         Self::Uint8,
         Self::Uint8Clamped,
@@ -1085,7 +1089,14 @@ impl TypedArrayKind {
         Self::Uint32,
         Self::Float32,
         Self::Float64,
+        Self::BigInt64,
+        Self::BigUint64,
     ];
+
+    /// Whether elements hold a `BigInt` rather than a Number.
+    pub(crate) const fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
+    }
 
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -1098,6 +1109,8 @@ impl TypedArrayKind {
             Self::Uint32 => "Uint32Array",
             Self::Float32 => "Float32Array",
             Self::Float64 => "Float64Array",
+            Self::BigInt64 => "BigInt64Array",
+            Self::BigUint64 => "BigUint64Array",
         }
     }
 
@@ -1106,8 +1119,29 @@ impl TypedArrayKind {
             Self::Int8 | Self::Uint8 | Self::Uint8Clamped => 1,
             Self::Int16 | Self::Uint16 => 2,
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
-            Self::Float64 => 8,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
         }
+    }
+
+    /// Decode one `BigInt` element from its little-endian bytes (ECMA-262
+    /// 10.4.5.12 `RawBytesToNumeric` for the `BigInt` element types).
+    pub(crate) fn load_bigint(self, bytes: &[u8]) -> JsBigInt {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&bytes[..8]);
+        match self {
+            Self::BigInt64 => JsBigInt::from_i64(i64::from_le_bytes(raw)),
+            _ => JsBigInt::from_u64(u64::from_le_bytes(raw)),
+        }
+    }
+
+    /// Store a `BigInt` element as its value modulo 2^64 (ECMA-262 7.1.15
+    /// `ToBigInt64` and 7.1.16 `ToBigUint64`), little-endian.
+    pub(crate) fn store_bigint(value: &JsBigInt, bytes: &mut [u8]) {
+        let modulo = value
+            .as_uint_n(64)
+            .and_then(|wrapped| wrapped.magnitude_u64())
+            .unwrap_or(0);
+        bytes.copy_from_slice(&modulo.to_le_bytes());
     }
 
     /// Convert a JavaScript Number into one element of this array kind,
@@ -1116,7 +1150,8 @@ impl TypedArrayKind {
     /// the ECMA-262 `IntegerIndexedElementSet` operation.
     fn encode(self, value: f64) -> f64 {
         match self {
-            Self::Float64 => value,
+            // BigInt elements convert through `ToBigInt`, never a Number.
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => value,
             Self::Float32 => {
                 #[allow(
                     clippy::cast_possible_truncation,
@@ -1138,6 +1173,10 @@ impl TypedArrayKind {
 
     /// Decode one element from the little-endian bytes of this kind (ECMA-262
     /// 10.4.5.12 `RawBytesToNumeric`). `bytes` holds at least `element_size` bytes.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "BigInt elements have an approximate Number value for generic numeric code only"
+    )]
     pub(crate) fn load(self, bytes: &[u8]) -> f64 {
         match self {
             Self::Int8 => f64::from(i8::from_le_bytes(le_bytes(bytes))),
@@ -1148,6 +1187,11 @@ impl TypedArrayKind {
             Self::Uint32 => f64::from(u32::from_le_bytes(le_bytes(bytes))),
             Self::Float32 => f64::from(f32::from_le_bytes(le_bytes(bytes))),
             Self::Float64 => f64::from_le_bytes(le_bytes(bytes)),
+            // A BigInt element has no Number value; this approximation serves
+            // only generic numeric code, which reads BigInt kinds through
+            // `element_value` instead.
+            Self::BigInt64 => i64::from_le_bytes(le_bytes(bytes)) as f64,
+            Self::BigUint64 => u64::from_le_bytes(le_bytes(bytes)) as f64,
         }
     }
 
@@ -1173,6 +1217,11 @@ impl TypedArrayKind {
             }
             Self::Float32 => bytes.copy_from_slice(&(value as f32).to_le_bytes()),
             Self::Float64 => bytes.copy_from_slice(&value.to_le_bytes()),
+            // Numeric stores into a BigInt kind are approximations; BigInt
+            // elements are written through `set_bigint_element`.
+            Self::BigInt64 | Self::BigUint64 => {
+                bytes.copy_from_slice(&(value as i64).to_le_bytes());
+            }
         }
     }
 
@@ -1328,6 +1377,33 @@ impl TypedBuffer {
             .bytes
             .get(index * size..(index + 1) * size)
             .map(|bytes| kind.load(bytes))
+    }
+
+    /// Element `index` as the JavaScript value it reads as: a Number, or a
+    /// `BigInt` for the `BigInt` kinds.
+    pub(crate) fn element_value(&self, kind: TypedArrayKind, index: usize) -> Option<JsValue> {
+        let size = kind.element_size();
+        let store = self.0.borrow();
+        store
+            .bytes
+            .get(index * size..(index + 1) * size)
+            .map(|bytes| {
+                if kind.is_bigint() {
+                    JsValue::BigInt(kind.load_bigint(bytes))
+                } else {
+                    JsValue::Number(kind.load(bytes))
+                }
+            })
+    }
+
+    /// Store `value` as element `index` of a `BigInt` kind, wrapping modulo 2^64.
+    /// An index past the end of the store is ignored.
+    pub(crate) fn set_bigint_element(&self, kind: TypedArrayKind, index: usize, value: &JsBigInt) {
+        let size = kind.element_size();
+        let mut store = self.0.borrow_mut();
+        if let Some(bytes) = store.bytes.get_mut(index * size..(index + 1) * size) {
+            TypedArrayKind::store_bigint(value, bytes);
+        }
     }
 
     /// Store `value`, converted to `kind`, as element `index`. An index past the
