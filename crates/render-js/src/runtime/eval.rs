@@ -468,10 +468,11 @@ impl JsRuntime {
                     parameters,
                     body,
                     kind,
+                    strict,
                     ..
                 } => {
                     var_names.insert(name.clone());
-                    functions.push((name, parameters, body, *kind));
+                    functions.push((name, parameters, body, *kind, *strict));
                 }
                 Statement::Class { name, .. } => {
                     // A class declaration is a mutable `let`-style binding; only
@@ -505,8 +506,8 @@ impl JsRuntime {
         for name in var_names {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
-        for (name, parameters, body, kind) in functions {
-            let value = self.create_function(Some(name), parameters, body, kind)?;
+        for (name, parameters, body, kind, strict) in functions {
+            let value = self.create_function(Some(name), parameters, body, kind, strict)?;
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -555,6 +556,7 @@ impl JsRuntime {
                     parameters,
                     body,
                     kind,
+                    strict,
                     ..
                 } => {
                     // Sloppy code may repeat a block-level function declaration
@@ -570,7 +572,7 @@ impl JsRuntime {
                         ));
                     }
                     function_names.insert(name.clone());
-                    functions.push((name, parameters, body, *kind));
+                    functions.push((name, parameters, body, *kind, *strict));
                 }
                 Statement::Class { name, .. }
                     if declarations
@@ -588,8 +590,8 @@ impl JsRuntime {
         for (name, kind) in declarations {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
-        for (name, parameters, body, kind) in functions {
-            let value = self.create_function(Some(name), parameters, body, kind)?;
+        for (name, parameters, body, kind, strict) in functions {
+            let value = self.create_function(Some(name), parameters, body, kind, strict)?;
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -600,8 +602,9 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
         kind: FunctionKind,
+        strict: bool,
     ) -> Result<JsValue, JsError> {
-        self.create_function(None, parameters, body, kind)
+        self.create_function(None, parameters, body, kind, strict)
     }
 
     pub(super) fn create_arrow_function(
@@ -610,6 +613,7 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
         is_async: bool,
+        strict: bool,
     ) -> Result<JsValue, JsError> {
         // Arrows inherit `super` and `this` lexically from the function they
         // execute inside, so they carry that class's metadata and bind no
@@ -624,7 +628,7 @@ impl JsRuntime {
             body,
             FunctionFlags {
                 arrow: true,
-                strict: false,
+                strict,
                 class,
                 kind: FunctionKind::new(is_async, false),
             },
@@ -637,6 +641,7 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
         kind: FunctionKind,
+        strict: bool,
     ) -> Result<JsValue, JsError> {
         self.create_function_meta(
             name,
@@ -644,7 +649,7 @@ impl JsRuntime {
             body,
             FunctionFlags {
                 arrow: false,
-                strict: false,
+                strict,
                 class: None,
                 kind,
             },
@@ -1555,14 +1560,18 @@ impl JsRuntime {
                 parameters,
                 body,
                 kind,
+                strict,
                 ..
-            } => self.evaluate_function_expression(name.as_deref(), parameters, body, *kind),
+            } => {
+                self.evaluate_function_expression(name.as_deref(), parameters, body, *kind, *strict)
+            }
             Expr::Arrow {
                 parameters,
                 body,
                 is_async,
+                strict,
                 ..
-            } => self.create_arrow_function(None, parameters, body, *is_async),
+            } => self.create_arrow_function(None, parameters, body, *is_async, *strict),
             Expr::Class {
                 name,
                 super_class,
@@ -3027,14 +3036,16 @@ impl JsRuntime {
                 parameters,
                 body,
                 kind,
+                strict,
                 ..
-            } => self.create_function(Some(name), parameters, body, *kind),
+            } => self.create_function(Some(name), parameters, body, *kind, *strict),
             Expr::Arrow {
                 parameters,
                 body,
                 is_async,
+                strict,
                 ..
-            } => self.create_arrow_function(Some(name), parameters, body, *is_async),
+            } => self.create_arrow_function(Some(name), parameters, body, *is_async, *strict),
             Expr::Class {
                 name: None,
                 super_class,
@@ -3051,15 +3062,16 @@ impl JsRuntime {
         parameters: &[String],
         body: &[Statement],
         kind: FunctionKind,
+        strict: bool,
     ) -> Result<JsValue, JsError> {
         let Some(name) = name else {
-            return self.create_user_function(parameters, body, kind);
+            return self.create_user_function(parameters, body, kind, strict);
         };
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
             self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
-            let value = self.create_function(Some(name), parameters, body, kind)?;
+            let value = self.create_function(Some(name), parameters, body, kind, strict)?;
             self.initialize_declared_binding(name, value.clone(), VariableKind::Const)?;
             Ok(value)
         })();
@@ -5787,7 +5799,9 @@ impl JsRuntime {
         } else {
             match receiver {
                 JsValue::Undefined | JsValue::Null => JsValue::Object(self.realm.global_object()),
-                other => other,
+                JsValue::Object(object) => JsValue::Object(object),
+                // OrdinaryCallBindThis (ECMA-262 10.2.1.2): a primitive `this` is boxed.
+                primitive => JsValue::Object(self.to_object(&primitive)?),
             }
         };
         let previous_environment =

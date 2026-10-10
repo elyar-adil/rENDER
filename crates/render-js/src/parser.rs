@@ -273,6 +273,7 @@ pub(super) enum Statement {
         body: Vec<Statement>,
         offset: usize,
         kind: FunctionKind,
+        strict: bool,
     },
     /// `class Name extends Base { ... }`, a lexical binding like `let`.
     Class {
@@ -396,12 +397,14 @@ pub(super) enum Expr {
         body: Vec<Statement>,
         offset: usize,
         kind: FunctionKind,
+        strict: bool,
     },
     Arrow {
         parameters: Vec<String>,
         body: Vec<Statement>,
         offset: usize,
         is_async: bool,
+        strict: bool,
     },
     /// `yield`, `yield value`, `yield* iterable`.
     Yield {
@@ -1911,13 +1914,14 @@ impl Parser {
         let TokenKind::Identifier(name) = self.advance().kind else {
             return Err(self.error("expected a function name"));
         };
-        let (parameters, body) = self.function_tail(kind)?;
+        let (parameters, body, strict) = self.function_tail(kind)?;
         Ok(Statement::Function {
             offset: self.previous_offset(),
             name,
             parameters,
             body,
             kind,
+            strict,
         })
     }
 
@@ -2639,6 +2643,7 @@ impl Parser {
         // The parameters above keep the static block's `await` restriction; the
         // body does not (ECMA-262 15.7.1).
         let previous_static_await = std::mem::replace(&mut self.static_block_await, false);
+        let mut strict = self.strict;
         let body = if self.take(&TokenKind::LeftBrace) {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
@@ -2647,6 +2652,7 @@ impl Parser {
             self.loop_depth = 0;
             self.strict = previous_strict || self.prologue_is_strict(self.cursor);
             let body = self.statement_list(true);
+            strict = self.strict;
             self.function_depth = previous_function_depth;
             self.loop_depth = previous_loop_depth;
             self.strict = previous_strict;
@@ -2708,6 +2714,7 @@ impl Parser {
             parameters,
             body,
             is_async: is_async_arrow,
+            strict,
         }))
     }
 
@@ -3659,7 +3666,7 @@ impl Parser {
                 && !is_async
                 && !is_generator
                 && matches!(&key, PropertyKey::Static(name) if name == "constructor");
-            let (parameters, body) =
+            let (parameters, body, _) =
                 self.method_tail(FunctionKind::new(is_async, is_generator), is_constructor)?;
             // A getter takes no parameters; a setter takes exactly one, which may
             // carry a default but may not be a rest parameter.
@@ -3844,13 +3851,14 @@ impl Parser {
                 return Err(self.error("function expression name is not allowed here"));
             }
         }
-        let (parameters, body) = self.function_tail(kind)?;
+        let (parameters, body, strict) = self.function_tail(kind)?;
         Ok(Expr::Function {
             offset: self.previous_offset(),
             name,
             parameters,
             body,
             kind,
+            strict,
         })
     }
 
@@ -3909,7 +3917,7 @@ impl Parser {
     fn function_tail(
         &mut self,
         kind: FunctionKind,
-    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    ) -> Result<(Vec<String>, Vec<Statement>, bool), JsError> {
         self.function_tail_with(kind, false, false)
     }
 
@@ -3919,7 +3927,7 @@ impl Parser {
         &mut self,
         kind: FunctionKind,
         super_call: bool,
-    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    ) -> Result<(Vec<String>, Vec<Statement>, bool), JsError> {
         self.function_tail_with(kind, true, super_call)
     }
 
@@ -3928,7 +3936,7 @@ impl Parser {
         kind: FunctionKind,
         super_property: bool,
         super_call: bool,
-    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    ) -> Result<(Vec<String>, Vec<Statement>, bool), JsError> {
         let previous_async = std::mem::replace(&mut self.in_async, kind.is_async());
         let previous_generator = std::mem::replace(&mut self.in_generator, kind.is_generator());
         let previous_parameters = std::mem::replace(&mut self.in_parameters, false);
@@ -3950,7 +3958,7 @@ impl Parser {
         self.switch_depth = previous_switch_depth;
         self.static_block = previous_static_block;
         self.static_block_await = previous_static_await;
-        let (parameters, body) = result?;
+        let (parameters, body, strict) = result?;
         validate_declaration_conflicts(&body, true, self.strict)?;
         // A function whose own body is strict is checked as strict code here,
         // whatever the enclosing script is (ECMA-262 11.2.2).
@@ -3958,14 +3966,14 @@ impl Parser {
             validate_strict_parameters(&parameters)?;
             validate_strict_statements(&body)?;
         }
-        Ok((parameters, body))
+        Ok((parameters, body, strict))
     }
 
     /// `super_call` is the call permission of the body; parameters never have it.
     fn function_tail_inner(
         &mut self,
         super_call: bool,
-    ) -> Result<(Vec<String>, Vec<Statement>), JsError> {
+    ) -> Result<(Vec<String>, Vec<Statement>, bool), JsError> {
         self.require(
             &TokenKind::LeftParen,
             "expected '(' before function parameters",
@@ -4043,6 +4051,7 @@ impl Parser {
         self.no_in = false;
         self.strict = previous_strict || self.prologue_is_strict(self.cursor);
         let body = self.statement_list(true);
+        let strict = self.strict;
         self.function_depth = previous_function_depth;
         self.loop_depth = previous_loop_depth;
         self.no_in = previous_no_in;
@@ -4068,7 +4077,7 @@ impl Parser {
             markers.extend(body);
             body = markers;
         }
-        Ok((parameters, body))
+        Ok((parameters, body, strict))
     }
 
     fn object_literal(&mut self) -> Result<Expr, JsError> {
@@ -4155,7 +4164,7 @@ impl Parser {
             self.advance();
             let key = self.property_key()?;
             let name = static_key_name(&key);
-            let (parameters, body) = self.method_tail(FunctionKind::Normal, false)?;
+            let (parameters, body, strict) = self.method_tail(FunctionKind::Normal, false)?;
             return Ok(ObjectProperty {
                 key,
                 value: Expr::Function {
@@ -4164,6 +4173,7 @@ impl Parser {
                     parameters,
                     body,
                     kind: FunctionKind::Normal,
+                    strict,
                 },
                 accessor: Some(accessor),
                 shorthand: false,
@@ -4245,7 +4255,7 @@ impl Parser {
         kind: FunctionKind,
     ) -> Result<ObjectProperty, JsError> {
         let name = static_key_name(&key);
-        let (parameters, body) = self.method_tail(kind, false)?;
+        let (parameters, body, strict) = self.method_tail(kind, false)?;
         Ok(ObjectProperty {
             key,
             value: Expr::Function {
@@ -4254,6 +4264,7 @@ impl Parser {
                 parameters,
                 body,
                 kind,
+                strict,
             },
             accessor: None,
             shorthand: false,
