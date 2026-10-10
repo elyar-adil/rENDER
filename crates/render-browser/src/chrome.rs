@@ -159,11 +159,57 @@ pub struct ChromeLayout {
     pub forward_available: bool,
 }
 
+/// Toolbar buttons and the address bar for one row. Forward is left out when
+/// the active page has no forward entry, so Reload, Home and the address bar
+/// close up into its slot instead of leaving a gap.
+fn toolbar_geometry(
+    width: f32,
+    scale: f32,
+    button_y: f32,
+    forward_available: bool,
+) -> (Vec<ButtonGeometry>, Rect) {
+    let left = 12.0 * scale;
+    let button_size = 36.0 * scale;
+    let button_gap = 3.0 * scale;
+    let mut kinds = vec![ToolbarButton::Back];
+    if forward_available {
+        kinds.push(ToolbarButton::Forward);
+    }
+    kinds.extend([ToolbarButton::Reload, ToolbarButton::Home]);
+    let buttons = kinds
+        .iter()
+        .enumerate()
+        .map(|(index, button)| ButtonGeometry {
+            button: *button,
+            bounds: Rect {
+                x: left + index as f32 * (button_size + button_gap),
+                y: button_y,
+                width: button_size,
+                height: button_size,
+            },
+        })
+        .collect::<Vec<_>>();
+    let address_x = left + kinds.len() as f32 * (button_size + button_gap) + 7.0 * scale;
+    let address = Rect {
+        x: address_x,
+        y: button_y,
+        width: (width - address_x - 14.0 * scale).max(40.0 * scale),
+        height: button_size,
+    };
+    (buttons, address)
+}
+
 impl ChromeLayout {
-    /// Whether `button` is drawn and hit-testable.
-    #[must_use]
-    pub fn button_visible(&self, button: ToolbarButton) -> bool {
-        button != ToolbarButton::Forward || self.forward_available
+    /// Shows or hides the forward button and re-flows the toolbar around it.
+    pub fn set_forward_available(&mut self, available: bool) {
+        if self.forward_available == available {
+            return;
+        }
+        self.forward_available = available;
+        let (buttons, address) =
+            toolbar_geometry(self.content.width, self.scale, self.address.y, available);
+        self.buttons = buttons;
+        self.address = address;
     }
 
     #[must_use]
@@ -299,39 +345,8 @@ impl ChromeLayout {
         };
 
         let toolbar_y = tab_strip_height;
-        let button_size = 36.0 * scale;
-        let button_gap = 3.0 * scale;
-        let button_y = toolbar_y + (toolbar_height - button_size) * 0.5;
-        let button_kinds = [
-            ToolbarButton::Back,
-            ToolbarButton::Forward,
-            ToolbarButton::Reload,
-            ToolbarButton::Home,
-        ];
-        let buttons = button_kinds
-            .into_iter()
-            .enumerate()
-            .map(|(index, button)| {
-                #[allow(clippy::cast_precision_loss, reason = "there are exactly four buttons")]
-                let index = index as f32;
-                ButtonGeometry {
-                    button,
-                    bounds: Rect {
-                        x: left + index * (button_size + button_gap),
-                        y: button_y,
-                        width: button_size,
-                        height: button_size,
-                    },
-                }
-            })
-            .collect::<Vec<_>>();
-        let address_x = left + 4.0 * (button_size + button_gap) + 7.0 * scale;
-        let address = Rect {
-            x: address_x,
-            y: button_y,
-            width: (width_f - address_x - 14.0 * scale).max(40.0 * scale),
-            height: button_size,
-        };
+        let button_y = toolbar_y + (toolbar_height - 36.0 * scale) * 0.5;
+        let (buttons, address) = toolbar_geometry(width_f, scale, button_y, true);
         let content_y = chrome_height.min(height);
         Self {
             tabs: geometries,
@@ -374,7 +389,7 @@ impl ChromeLayout {
             return HitTarget::TitleBar;
         }
         for button in &self.buttons {
-            if self.button_visible(button.button) && button.bounds.contains(point) {
+            if button.bounds.contains(point) {
                 return HitTarget::Toolbar(button.button);
             }
         }
@@ -1393,11 +1408,7 @@ fn paint_outline_rect(canvas: &mut Canvas<'_>, rect: Rect, thickness: f32, color
 }
 
 fn paint_toolbar(canvas: &mut Canvas<'_>, layout: &ChromeLayout, hot: HitTarget, palette: Palette) {
-    for button in layout
-        .buttons
-        .iter()
-        .filter(|button| layout.button_visible(button.button))
-    {
+    for button in &layout.buttons {
         if hot == HitTarget::Toolbar(button.button) {
             canvas.rounded_rect(button.bounds, 8.0 * layout.scale, palette.button_hover);
         }
@@ -2097,27 +2108,46 @@ mod tests {
     fn forward_button_is_hidden_until_the_page_can_go_forward() {
         let tabs = TabModel::new("One", "about:home");
         let mut layout = ChromeLayout::new(1_000, 700, 1.0, tabs.tabs());
-        let forward = layout
-            .buttons
-            .iter()
-            .find(|button| button.button == ToolbarButton::Forward)
-            .expect("the toolbar lays out a forward button")
-            .bounds;
+        let has_forward = |layout: &ChromeLayout| {
+            layout
+                .buttons
+                .iter()
+                .any(|button| button.button == ToolbarButton::Forward)
+        };
+        let bounds_of = |layout: &ChromeLayout, kind: ToolbarButton| {
+            layout
+                .buttons
+                .iter()
+                .find(|button| button.button == kind)
+                .expect("toolbar button")
+                .bounds
+        };
+        assert!(
+            has_forward(&layout),
+            "a fresh layout shows forward by default"
+        );
+        let reload_shown = bounds_of(&layout, ToolbarButton::Reload).x;
+        let address_shown = layout.address;
+
+        // A fresh page has no forward entry: the button is gone, and Reload,
+        // Home and the address bar close up into its slot.
+        layout.set_forward_available(false);
+        assert!(!has_forward(&layout));
+        assert!(bounds_of(&layout, ToolbarButton::Reload).x < reload_shown);
+        assert!(layout.address.x < address_shown.x);
+        assert!(layout.address.width > address_shown.width);
+
+        // After going back, forward has an entry: the button returns and the
+        // toolbar re-opens at its original positions.
+        layout.set_forward_available(true);
+        assert!(has_forward(&layout));
+        assert!((bounds_of(&layout, ToolbarButton::Reload).x - reload_shown).abs() < 1e-3);
+        assert_eq!(layout.address, address_shown);
+        let forward = bounds_of(&layout, ToolbarButton::Forward);
         let center = Point {
             x: forward.x + forward.width * 0.5,
             y: forward.y + forward.height * 0.5,
         };
-        // A fresh page has no forward entry, so the button is not drawn and
-        // a click on its slot does nothing.
-        layout.forward_available = false;
-        assert!(!layout.button_visible(ToolbarButton::Forward));
-        assert_ne!(
-            layout.hit_test(center),
-            HitTarget::Toolbar(ToolbarButton::Forward)
-        );
-        // After going back, the button appears and responds to clicks.
-        layout.forward_available = true;
-        assert!(layout.button_visible(ToolbarButton::Forward));
         assert_eq!(
             layout.hit_test(center),
             HitTarget::Toolbar(ToolbarButton::Forward)

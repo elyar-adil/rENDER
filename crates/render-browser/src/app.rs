@@ -657,7 +657,7 @@ impl BrowserApp {
             .get(&self.tabs.active_id())
             .is_some_and(|page| page.history.can_go_forward());
         if let Some(layout) = self.layout.as_mut() {
-            layout.forward_available = forward_available;
+            layout.set_forward_available(forward_available);
         }
         let Some(layout) = &self.layout else {
             return;
