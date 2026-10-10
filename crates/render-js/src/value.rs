@@ -983,6 +983,8 @@ pub(crate) enum NativeFunction {
     IteratorJoin,
     IteratorWrapNext,
     IteratorWrapReturn,
+    IteratorZip,
+    IteratorZipKeyed,
     GlobalFetch,
     ReflectGet,
     ReflectSet,
@@ -1646,6 +1648,17 @@ pub(crate) enum IteratorHelperKind {
     Chunks(u64),
     /// `windows`: the window size, and whether a short first window is yielded (`allow-partial`).
     Windows(u64, bool),
+    /// `Iterator.zip` (`false`) and `Iterator.zipKeyed` (`true`): `buffer` holds four slots per
+    /// input (iterator or null when done, next, padding, key).
+    Zip(ZipMode, bool),
+}
+
+/// How `Iterator.zip` and `Iterator.zipKeyed` treat inputs that finish at different times.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1815,6 +1828,8 @@ pub(crate) enum ObjectHost {
         done: bool,
         /// Set while a `next`/`return` resumption runs (the generator "executing" state).
         running: bool,
+        /// Set once `next` has run, so `return` can tell "suspended-start" from "suspended-yield".
+        started: bool,
     },
     TypedArrayConstructor(TypedArrayKind),
     TypedArray {
@@ -4369,6 +4384,8 @@ impl Realm {
         for (name, function, arity) in [
             ("from", NativeFunction::IteratorFrom, 1.0),
             ("concat", NativeFunction::IteratorConcat, 0.0),
+            ("zip", NativeFunction::IteratorZip, 1.0),
+            ("zipKeyed", NativeFunction::IteratorZipKeyed, 1.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -8681,6 +8698,7 @@ impl Realm {
                 buffer: Vec::new(),
                 done: false,
                 running: false,
+                started: false,
             },
             ..JsObject::default()
         })

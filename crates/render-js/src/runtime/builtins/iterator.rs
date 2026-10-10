@@ -25,6 +25,7 @@ use crate::runtime::convert::same_value_zero;
 use crate::value::IteratorHelperKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::ZipMode;
 use render_dom::Dom;
 
 /// `2**53 - 1`: the largest count a `take`/`drop`/`includes` argument may name.
@@ -33,6 +34,30 @@ const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const MAX_CHUNK_SIZE: f64 = 4_294_967_295.0;
 /// Stands for `+∞` in a remaining count, which is never decremented.
 const UNBOUNDED: u64 = u64::MAX;
+/// Slots per input in a `zip` helper's buffer: iterator (null once finished), next, padding, key.
+const ZIP_STRIDE: usize = 4;
+
+/// The record of one `zip` input, or `None` once that input has finished.
+fn zip_input(buffer: &[JsValue], index: usize) -> Option<Record> {
+    let base = index * ZIP_STRIDE;
+    match buffer.get(base)? {
+        JsValue::Object(iterator) => Some(Record {
+            iterator: *iterator,
+            next: match buffer.get(base + 1) {
+                Some(JsValue::Object(next)) => Some(*next),
+                _ => None,
+            },
+        }),
+        _ => None,
+    }
+}
+
+/// The records of every unfinished `zip` input, in input order.
+fn zip_open_inputs(buffer: &[JsValue]) -> Vec<Record> {
+    (0..buffer.len() / ZIP_STRIDE)
+        .filter_map(|index| zip_input(buffer, index))
+        .collect()
+}
 
 /// An Iterator Record: the iterator object and its `next` method. `next` is
 /// `None` when the property was not callable. That is an error only when the
@@ -56,6 +81,7 @@ struct HelperState {
     buffer: Vec<JsValue>,
     done: bool,
     running: bool,
+    started: bool,
 }
 
 impl HelperState {
@@ -154,6 +180,8 @@ impl JsRuntime {
             N::IteratorJoin => self.iterator_join(dom, receiver, arguments),
             N::IteratorChunks => self.iterator_chunks(dom, receiver, arguments),
             N::IteratorWindows => self.iterator_windows(dom, receiver, arguments),
+            N::IteratorZip => self.iterator_zip(dom, arguments, false),
+            N::IteratorZipKeyed => self.iterator_zip(dom, arguments, true),
             _ => return None,
         };
         Some(result)
@@ -442,6 +470,7 @@ impl JsRuntime {
                 buffer,
                 done,
                 running,
+                started,
             }) => Some(HelperState {
                 kind,
                 source,
@@ -453,6 +482,7 @@ impl JsRuntime {
                 buffer,
                 done,
                 running,
+                started,
             }),
             _ => None,
         }
@@ -469,6 +499,7 @@ impl JsRuntime {
             buffer,
             done,
             running,
+            started,
             ..
         }) = self.realm.host_mut(receiver)
         {
@@ -481,6 +512,7 @@ impl JsRuntime {
             buffer.clone_from(&state.buffer);
             *done = state.done;
             *running = state.running;
+            *started = state.started;
         }
     }
 
@@ -769,6 +801,317 @@ impl JsRuntime {
         Ok(JsValue::Object(helper))
     }
 
+    // ----- Iterator.zip and Iterator.zipKeyed -------------------------------
+
+    /// `IteratorCloseAll(iterators, completion)`: close last-first, each close
+    /// seeing the completion the previous one produced.
+    fn iterator_close_all<T>(
+        &mut self,
+        dom: &mut Dom,
+        iterators: &[Record],
+        completion: Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let mut completion = completion;
+        for record in iterators.iter().rev() {
+            completion = self.iterator_close(dom, record.iterator, completion);
+        }
+        completion
+    }
+
+    /// Close every open `zip` input after `error`, and return that error.
+    fn close_zip_open(&mut self, dom: &mut Dom, buffer: &[JsValue], error: JsError) -> JsError {
+        let mut error = error;
+        for record in zip_open_inputs(buffer).iter().rev() {
+            error = self.close_on_throw(dom, record.iterator, error);
+        }
+        error
+    }
+
+    /// `GetIterator(object, sync)`: call `@@iterator` and read the result's `next`.
+    fn get_iterator_from_iterable(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<Record, JsError> {
+        let method = self.get_symbol_value(dom, object, &JsSymbol::well_known("@@iterator"))?;
+        let method = self
+            .callable_object(&method)
+            .ok_or_else(|| JsError::type_error("value is not iterable"))?;
+        match self.call_with_this(dom, method, &[], JsValue::Object(object))? {
+            JsValue::Object(iterator) => self.iterator_direct(dom, iterator),
+            _ => Err(JsError::type_error("iterator is not an object")),
+        }
+    }
+
+    /// `Iterator.zip(iterables, options)` and `Iterator.zipKeyed(iterables, options)`.
+    /// Options are read first, then the inputs are opened. A failure while opening
+    /// closes the inputs already opened, last first.
+    fn iterator_zip(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+        keyed: bool,
+    ) -> Result<JsValue, JsError> {
+        let JsValue::Object(iterables) = argument(arguments, 0).clone() else {
+            return Err(JsError::type_error(
+                "Iterator.zip iterables must be an object",
+            ));
+        };
+        let options = match argument(arguments, 1) {
+            JsValue::Undefined => None,
+            JsValue::Object(options) => Some(*options),
+            _ => {
+                return Err(JsError::type_error(
+                    "Iterator.zip options must be an object",
+                ));
+            }
+        };
+        let mode_value = match options {
+            Some(options) => self.get_member(dom, options, "mode")?,
+            None => JsValue::Undefined,
+        };
+        let mode = match &mode_value {
+            JsValue::Undefined => ZipMode::Shortest,
+            JsValue::String(mode) if mode == "shortest" => ZipMode::Shortest,
+            JsValue::String(mode) if mode == "longest" => ZipMode::Longest,
+            JsValue::String(mode) if mode == "strict" => ZipMode::Strict,
+            _ => {
+                return Err(JsError::type_error(
+                    "Iterator.zip mode must be shortest, longest or strict",
+                ));
+            }
+        };
+        let padding_option = match options {
+            Some(options) if mode == ZipMode::Longest => {
+                let padding = self.get_member(dom, options, "padding")?;
+                if !matches!(padding, JsValue::Undefined | JsValue::Object(_)) {
+                    return Err(JsError::type_error(
+                        "Iterator.zip padding must be an object",
+                    ));
+                }
+                padding
+            }
+            _ => JsValue::Undefined,
+        };
+
+        // Open the inputs, each paired with its key (`undefined` for zip).
+        let mut inputs: Vec<(Record, JsValue)> = Vec::new();
+        if keyed {
+            for key in self.proxy_own_keys(dom, iterables)? {
+                let enumerable = self
+                    .realm
+                    .own_property(iterables, &key)
+                    .is_some_and(|descriptor| descriptor.enumerable);
+                if !enumerable {
+                    continue;
+                }
+                let value = match self.get_member(dom, iterables, &key) {
+                    Ok(value) => value,
+                    Err(error) => return Err(self.close_zip_inputs(dom, None, &inputs, error)),
+                };
+                if matches!(value, JsValue::Undefined) {
+                    continue;
+                }
+                match self.get_iterator_flattenable(dom, &value, false) {
+                    Ok(record) => inputs.push((record, JsValue::String(key))),
+                    Err(error) => return Err(self.close_zip_inputs(dom, None, &inputs, error)),
+                }
+            }
+        } else {
+            let input = self.get_iterator_from_iterable(dom, iterables)?;
+            loop {
+                let next = match self.step_record(dom, input, true) {
+                    Ok(Some(value)) => value,
+                    Ok(None) => break,
+                    Err(error) => return Err(self.close_zip_inputs(dom, None, &inputs, error)),
+                };
+                match self.get_iterator_flattenable(dom, &next, false) {
+                    Ok(record) => inputs.push((record, JsValue::Undefined)),
+                    Err(error) => {
+                        return Err(self.close_zip_inputs(dom, Some(input), &inputs, error));
+                    }
+                }
+            }
+        }
+
+        let count = inputs.len();
+        let padding = if mode == ZipMode::Longest {
+            match self.zip_padding(dom, &padding_option, &inputs, keyed) {
+                Ok(padding) => padding,
+                Err(error) => return Err(self.close_zip_inputs(dom, None, &inputs, error)),
+            }
+        } else {
+            vec![JsValue::Undefined; count]
+        };
+        let mut buffer = Vec::with_capacity(count * ZIP_STRIDE);
+        for ((record, key), padding) in inputs.iter().zip(padding) {
+            buffer.push(JsValue::Object(record.iterator));
+            buffer.push(record.next.map_or(JsValue::Undefined, JsValue::Object));
+            buffer.push(padding);
+            buffer.push(key.clone());
+        }
+        self.ensure_heap_capacity(1)?;
+        let helper =
+            self.realm
+                .iterator_helper(IteratorHelperKind::Zip(mode, keyed), None, None, None, 0);
+        if let Some(ObjectHost::IteratorHelper { buffer: slot, .. }) = self.realm.host_mut(helper) {
+            *slot = buffer;
+        }
+        Ok(JsValue::Object(helper))
+    }
+
+    /// Close the inputs opened so far after `error`. `leading` is an iterator
+    /// that precedes the inputs in the close order (the `iterables` iterator).
+    fn close_zip_inputs(
+        &mut self,
+        dom: &mut Dom,
+        leading: Option<Record>,
+        inputs: &[(Record, JsValue)],
+        error: JsError,
+    ) -> JsError {
+        let mut error = error;
+        for (record, _) in inputs.iter().rev() {
+            error = self.close_on_throw(dom, record.iterator, error);
+        }
+        if let Some(leading) = leading {
+            error = self.close_on_throw(dom, leading.iterator, error);
+        }
+        error
+    }
+
+    /// The `longest` padding for each input: `Get(padding, key)` for zipKeyed, or
+    /// the values drawn from the padding iterable for zip.
+    fn zip_padding(
+        &mut self,
+        dom: &mut Dom,
+        option: &JsValue,
+        inputs: &[(Record, JsValue)],
+        keyed: bool,
+    ) -> Result<Vec<JsValue>, JsError> {
+        let JsValue::Object(option) = option else {
+            return Ok(vec![JsValue::Undefined; inputs.len()]);
+        };
+        if keyed {
+            let mut padding = Vec::with_capacity(inputs.len());
+            for (_, key) in inputs {
+                let key = key.to_js_string();
+                padding.push(self.get_member(dom, *option, &key)?);
+            }
+            return Ok(padding);
+        }
+        let iterator = self.get_iterator_from_iterable(dom, *option)?;
+        let mut padding = Vec::with_capacity(inputs.len());
+        let mut using_iterator = true;
+        for _ in 0..inputs.len() {
+            let mut value = JsValue::Undefined;
+            if using_iterator {
+                match self.step_record(dom, iterator, true)? {
+                    Some(next) => value = next,
+                    None => using_iterator = false,
+                }
+            }
+            padding.push(value);
+        }
+        if using_iterator {
+            self.iterator_close(dom, iterator.iterator, Ok(()))?;
+        }
+        Ok(padding)
+    }
+
+    /// One round of `zip`/`zipKeyed`: step every unfinished input in order.
+    fn zip_step(
+        &mut self,
+        dom: &mut Dom,
+        state: &mut HelperState,
+        mode: ZipMode,
+        keyed: bool,
+    ) -> Result<Option<JsValue>, JsError> {
+        let count = state.buffer.len() / ZIP_STRIDE;
+        if count == 0 {
+            return Ok(None);
+        }
+        let mut results = Vec::with_capacity(count);
+        for index in 0..count {
+            let base = index * ZIP_STRIDE;
+            let value = match zip_input(&state.buffer, index) {
+                // Finished in an earlier round (longest mode): its padding stands in.
+                None => state.buffer[base + 2].clone(),
+                Some(record) => match self.step_record(dom, record, true) {
+                    Ok(Some(value)) => value,
+                    Err(error) => {
+                        state.buffer[base] = JsValue::Null;
+                        return Err(self.close_zip_open(dom, &state.buffer, error));
+                    }
+                    Ok(None) => {
+                        state.buffer[base] = JsValue::Null;
+                        match mode {
+                            ZipMode::Shortest => {
+                                let open = zip_open_inputs(&state.buffer);
+                                self.iterator_close_all(dom, &open, Ok(()))?;
+                                return Ok(None);
+                            }
+                            ZipMode::Strict => {
+                                if index != 0 {
+                                    let error =
+                                        JsError::type_error("zip inputs have different lengths");
+                                    return Err(self.close_zip_open(dom, &state.buffer, error));
+                                }
+                                for other in 1..count {
+                                    let Some(record) = zip_input(&state.buffer, other) else {
+                                        continue;
+                                    };
+                                    match self.step_record(dom, record, false) {
+                                        Ok(None) => {
+                                            state.buffer[other * ZIP_STRIDE] = JsValue::Null;
+                                        }
+                                        Ok(Some(_)) => {
+                                            let error = JsError::type_error(
+                                                "zip inputs have different lengths",
+                                            );
+                                            return Err(self.close_zip_open(
+                                                dom,
+                                                &state.buffer,
+                                                error,
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            state.buffer[other * ZIP_STRIDE] = JsValue::Null;
+                                            return Err(self.close_zip_open(
+                                                dom,
+                                                &state.buffer,
+                                                error,
+                                            ));
+                                        }
+                                    }
+                                }
+                                return Ok(None);
+                            }
+                            ZipMode::Longest => {
+                                if zip_open_inputs(&state.buffer).is_empty() {
+                                    return Ok(None);
+                                }
+                                state.buffer[base + 2].clone()
+                            }
+                        }
+                    }
+                },
+            };
+            results.push(value);
+        }
+        let value = if keyed {
+            let object = self.realm.create_ordinary_object();
+            self.realm.set_prototype(object, None);
+            for (index, result) in results.into_iter().enumerate() {
+                let key = state.buffer[index * ZIP_STRIDE + 3].to_js_string();
+                self.realm.set_property(object, key, result);
+            }
+            JsValue::Object(object)
+        } else {
+            JsValue::Object(self.create_array_from_values(&results)?)
+        };
+        Ok(Some(value))
+    }
+
     // ----- Helper and wrapper prototypes ------------------------------------
 
     /// `%IteratorHelperPrototype%.next()`.
@@ -789,6 +1132,7 @@ impl JsRuntime {
         if state.done {
             return self.iterator_result(JsValue::Undefined, true);
         }
+        state.started = true;
         state.running = true;
         self.helper_store(receiver, &state);
         let outcome = self.helper_resume(dom, &mut state);
@@ -830,7 +1174,11 @@ impl JsRuntime {
         if state.done {
             return self.iterator_result(JsValue::Undefined, true);
         }
-        state.running = true;
+        // A helper that never ran is completed before its iterators close, so a
+        // re-entrant `next` sees a completed helper. A suspended one is executing.
+        let never_started = !state.started;
+        state.done = never_started;
+        state.running = !never_started;
         self.helper_store(receiver, &state);
         let outcome = self.helper_close(dom, &state);
         state.running = false;
@@ -843,6 +1191,10 @@ impl JsRuntime {
     /// Close the helper's open iterators, innermost first. A throwing inner
     /// close closes the source with that error (`flatMap`).
     fn helper_close(&mut self, dom: &mut Dom, state: &HelperState) -> Result<(), JsError> {
+        if let IteratorHelperKind::Zip(..) = state.kind {
+            let open = zip_open_inputs(&state.buffer);
+            return self.iterator_close_all(dom, &open, Ok(()));
+        }
         if let (IteratorHelperKind::FlatMap, Some(inner)) = (&state.kind, state.inner)
             && let Err(error) = self.iterator_close(dom, inner, Ok(()))
         {
@@ -925,6 +1277,7 @@ impl JsRuntime {
             IteratorHelperKind::Windows(size, partial) => {
                 self.windows_step(dom, state, size, partial)
             }
+            IteratorHelperKind::Zip(mode, keyed) => self.zip_step(dom, state, mode, keyed),
         }
     }
 

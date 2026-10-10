@@ -746,7 +746,9 @@ impl JsRuntime {
             | NativeFunction::IteratorIncludes
             | NativeFunction::IteratorJoin
             | NativeFunction::IteratorWrapNext
-            | NativeFunction::IteratorWrapReturn => self
+            | NativeFunction::IteratorWrapReturn
+            | NativeFunction::IteratorZip
+            | NativeFunction::IteratorZipKeyed => self
                 .dispatch_iterator_native(dom, function, receiver, arguments)
                 .unwrap_or_else(|| Err(JsError::type_error("iterator helper dispatch failed"))),
             NativeFunction::ArrayReduce => {

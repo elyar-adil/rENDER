@@ -4295,6 +4295,46 @@ fn iterator_chunks_and_windows_validate_sizes_and_yield_partial_windows() {
 }
 
 #[test]
+fn iterator_zip_follows_the_shortest_longest_strict_and_keyed_modes() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var out = [];
+                out.push(JSON.stringify(Array.from(Iterator.zip([[1, 2], [3]]))));
+                out.push(JSON.stringify(Array.from(Iterator.zip([[1, 2], [3]], { mode: 'longest', padding: [9, 8] }))));
+                try { Array.from(Iterator.zip([[1], [2, 3]], { mode: 'strict' })); } catch (e) { out.push(e.constructor.name); }
+                out.push(JSON.stringify(Array.from(Iterator.zipKeyed({ a: [1, 2], b: [3] }))));
+                out.join('|');
+            "
+        ),
+        r#"[[1,3]]|[[1,3],[2,8]]|TypeError|[{"a":1,"b":3}]"#
+    );
+}
+
+#[test]
+fn iterator_zip_closes_unfinished_inputs_last_first() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var log = [];
+                function input(name, done) {
+                    return {
+                        next() { log.push('next ' + name); return { done: done, value: 1 }; },
+                        return() { log.push('return ' + name); return {}; }
+                    };
+                }
+                var zipped = Iterator.zip([input('a', false), input('b', false), input('c', true)]);
+                var finished = zipped.next().done;
+                var suspended = Iterator.zip([input('d', false)]);
+                suspended.return();
+                finished + ':' + log.join(',');
+            "
+        ),
+        "true:next a,next b,next c,return b,return a,return d"
+    );
+}
+
+#[test]
 fn classes_can_extend_iterator_and_use_helpers() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
