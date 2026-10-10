@@ -52,6 +52,37 @@ deliberately not done, because it would also queue this crate's build behind the
 engine's. Nothing sets `CARGO_TARGET_DIR`. The nested `target/` directory is
 already covered by the root `.gitignore`'s unanchored `target/` rule.
 
+## Captures: facts measured from live pages
+
+The shape fixtures above are held to the shape contract, which asks every page
+for landmarks, declared scroll geometry, and similar. A live page does not owe
+the project any of that, so real captures live in a separate tier:
+`tests/real_site_tasks/src/captures.rs` and `tests/real_site_captures.rs`.
+
+Each capture is a reduced snapshot of a live page, in
+`tests/fixtures/real_sites/<label>.html` with its stylesheet in `<label>.css`.
+Its expectations are measured from the **raw** bytes with Python's
+`html.parser` (title, `a[href]`, named controls, submit inputs, image
+resources, stylesheet and script links, story rows), and the reduced fixture
+is checked to reproduce those numbers before it is committed. The engine is
+then held to what the page says: the title, the counts it discovers, and the
+boxes it lays out for the parts that matter. A failure is therefore a
+disagreement with the page, not a broken shape rule.
+
+Two rules that the captures already needed:
+
+- **A declaration the server sends in a header must be in the markup.** The
+  harness decodes fixture bytes without HTTP headers, and the sniffing
+  algorithm reads a `<meta charset>` only within the first 1024 bytes. The
+  Hacker News capture carries `<meta charset="utf-8">` at the top of the file,
+  because the server sends `charset=utf-8`.
+- **Count what the page means, not what the markup could match.** A search
+  form's submit buttons appear twice on Google's page, once visible in the
+  form and once in a hidden autocomplete popup, so the contract checks the
+  two buttons a user sees, by their labels.
+
+Run them with `cargo test --manifest-path tests/real_site_tasks/Cargo.toml --test real_site_captures`.
+
 ## The fixtures
 
 `tests/fixtures/real_sites/` holds five reduced page shapes. Each is one

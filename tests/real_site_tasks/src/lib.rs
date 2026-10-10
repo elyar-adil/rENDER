@@ -32,6 +32,7 @@
 
 //! * [`contract`] - the acceptance contract, as pure checks over a [`harness::Session`].
 
+pub mod captures;
 pub mod contract;
 pub mod diagnostic_set;
 pub mod diagnostics;
