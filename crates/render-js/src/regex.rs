@@ -2190,6 +2190,8 @@ impl PatternParser<'_> {
             };
             return match escaped {
                 'b' => Ok('\u{0008}'),
+                // `\0` is a CharacterEscape unless a decimal digit follows it.
+                '0' if !self.peek().is_some_and(|next| next.is_ascii_digit()) => Ok('\0'),
                 reserved if CLASS_SET_RESERVED_PUNCTUATORS.contains(reserved) => Ok(reserved),
                 other => self.escape_char(other, true),
             };
@@ -2870,6 +2872,7 @@ mod tests {
         assert_eq!(matches(r"^[\q{ab|c}&&\q{ab}]$", "v", "c"), None);
         assert_eq!(matches(r"^[\q{ab|c}--\q{ab}]$", "v", "c"), Some((0, 1)));
         assert_eq!(matches(r"^[\q{ab|c}--\q{ab}]$", "v", "ab"), None);
+        assert_eq!(matches(r"^[\0]$", "v", "\0"), Some((0, 1)));
         assert_eq!(
             matches(r"^\p{Emoji_Keycap_Sequence}$", "v", "#\u{fe0f}\u{20e3}"),
             Some((0, 3))
@@ -2900,7 +2903,7 @@ mod tests {
             );
         }
         // Escaped punctuators and a single `&` or `-` at the end are fine.
-        for pattern in [r"[\(\)]", r"[a&b]", r"[a\-]", r"[\&\&]", r"[a&&b]"] {
+        for pattern in [r"[\(\)]", r"[a&b]", r"[a\-]", r"[\&\&]", r"[a&&b]", r"[\0]"] {
             assert!(
                 compile(pattern, "v").is_ok(),
                 "/{pattern}/v must be accepted"
