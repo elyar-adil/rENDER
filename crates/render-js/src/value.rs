@@ -1368,17 +1368,6 @@ impl TypedBuffer {
         self.0.borrow().bytes.clone()
     }
 
-    /// Element `index` of `kind`, decoded from its bytes, or `None` past the end
-    /// of the store (a detached buffer has none).
-    pub(crate) fn element(&self, kind: TypedArrayKind, index: usize) -> Option<f64> {
-        let size = kind.element_size();
-        let store = self.0.borrow();
-        store
-            .bytes
-            .get(index * size..(index + 1) * size)
-            .map(|bytes| kind.load(bytes))
-    }
-
     /// Element `index` as the JavaScript value it reads as: a Number, or a
     /// `BigInt` for the `BigInt` kinds.
     pub(crate) fn element_value(&self, kind: TypedArrayKind, index: usize) -> Option<JsValue> {
@@ -1449,30 +1438,6 @@ impl TypedBuffer {
         let mut store = self.0.borrow_mut();
         if let Some(bytes) = store.bytes.get_mut(index * size..(index + 1) * size) {
             kind.store(value, bytes);
-        }
-    }
-
-    /// Decode `count` consecutive elements of `kind` from element `first`. A
-    /// missing element means the buffer was detached, which is a `TypeError`.
-    pub(crate) fn elements(
-        &self,
-        kind: TypedArrayKind,
-        first: usize,
-        count: usize,
-    ) -> Result<Vec<f64>, JsError> {
-        self.ensure_attached()?;
-        (first..first + count)
-            .map(|index| {
-                self.element(kind, index)
-                    .ok_or_else(|| JsError::type_error("typed array element is out of range"))
-            })
-            .collect()
-    }
-
-    /// Store `values`, converted to `kind`, from element `first` onward.
-    pub(crate) fn set_elements(&self, kind: TypedArrayKind, first: usize, values: &[f64]) {
-        for (offset, value) in values.iter().enumerate() {
-            self.set_element(kind, first + offset, *value);
         }
     }
 }

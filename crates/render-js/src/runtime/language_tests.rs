@@ -1877,3 +1877,15 @@ fn bigint_typed_arrays_store_and_read_bigints() {
         "0,0,3,6"
     );
 }
+
+#[test]
+fn bigint_typed_array_methods_work_on_bigints() {
+    // The element methods read and write BigInts, and compare and sort them as
+    // BigInts (ECMA-262 23.2.3).
+    assert_eq!(
+        ok(
+            "var a = new BigInt64Array([3n, -1n, 2n]); [a.indexOf(2n), a.includes(-1n), a.indexOf(2), a.join('|'), a.at(-1), a.slice(1).join(), a.map((x) => x * 2n).join(), a.filter((x) => x > 0n).join(), a.reduce((s, x) => s + x, 0n), a.sort().join(), a.toSorted().join(), a.with(0, 9n)[0], a.reverse().join()].join(';')"
+        ),
+        "2;true;-1;3|-1|2;2;-1,2;6,-2,4;3,2;4;-1,2,3;-1,2,3;9;3,2,-1"
+    );
+}

@@ -237,7 +237,6 @@ impl JsRuntime {
                 .typed_array_elements(object)
                 .unwrap_or_default()
                 .into_iter()
-                .map(JsValue::Number)
                 .collect());
         }
         let length = match self.realm.get_property(object, "length") {
@@ -345,8 +344,8 @@ impl JsRuntime {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let index = index as usize;
                 if index < length {
-                    let element = buffer.element(kind, start + index);
-                    return Ok(element.map_or(JsValue::Undefined, JsValue::Number));
+                    let element = buffer.element_value(kind, start + index);
+                    return Ok(element.unwrap_or(JsValue::Undefined));
                 }
             }
             _ => {}

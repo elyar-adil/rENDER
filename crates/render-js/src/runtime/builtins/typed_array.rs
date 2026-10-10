@@ -67,11 +67,7 @@ impl JsRuntime {
             }
             NativeFunction::TypedArrayJoin => self.typed_array_join(receiver, arguments),
             NativeFunction::TypedArrayValues => {
-                let values = self
-                    .typed_array_elements(receiver)?
-                    .into_iter()
-                    .map(JsValue::Number)
-                    .collect();
+                let values = self.typed_array_elements(receiver)?.into_iter().collect();
                 Ok(JsValue::Object(self.realm.collection_iterator(values)))
             }
             NativeFunction::TypedArrayKeys => self.typed_array_keys(receiver),
@@ -499,9 +495,9 @@ impl JsRuntime {
     pub(in crate::runtime) fn typed_array_elements(
         &self,
         receiver: ObjectId,
-    ) -> Result<Vec<f64>, JsError> {
+    ) -> Result<Vec<JsValue>, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
-        buffer.elements(kind, start, length)
+        buffer.elements_value(kind, start, length)
     }
 
     /// `%TypedArray%.prototype.set(source[, offset])` (ECMA-262 23.2.3.26): the
@@ -519,7 +515,7 @@ impl JsRuntime {
         if offset < 0.0 {
             return Err(self.range_error("offset is out of bounds"));
         }
-        let values: Vec<f64> = match &source {
+        let values: Vec<JsValue> = match &source {
             JsValue::Object(object) => {
                 if let Some(ObjectHost::TypedArray {
                     kind: source_kind,
@@ -528,26 +524,37 @@ impl JsRuntime {
                     length: source_length,
                 }) = self.realm.host(*object)
                 {
+                    if source_kind.is_bigint() != kind.is_bigint() {
+                        return Err(JsError::type_error(
+                            "cannot mix BigInt and other types in typed array copies",
+                        ));
+                    }
                     // The source is read in full before any write, so a source
                     // over the same buffer copies correctly.
                     source_buffer.ensure_attached()?;
-                    source_buffer.elements(source_kind, source_start, source_length)?
+                    source_buffer.elements_value(source_kind, source_start, source_length)?
                 } else {
                     // SetTypedArrayFromArrayLike: the length is `ToLength` of the
-                    // object's `length`, and each element goes through `ToNumber`.
+                    // object's `length`, and each element converts to the kind.
                     let count = self.array_like_length(dom, *object)?;
                     let mut values = Vec::with_capacity(count);
                     for index in 0..count {
                         let element = self.get_member(dom, *object, &index.to_string())?;
-                        values.push(self.to_number_value(dom, &element)?);
+                        values.push(self.typed_element_value(dom, kind, &element)?);
                     }
                     values
                 }
             }
-            JsValue::String(text) => text
-                .chars()
-                .map(|character| f64::from(u32::from(character)))
-                .collect(),
+            // A string is an array-like of its characters, each converted to the
+            // element type like any other value.
+            JsValue::String(text) => {
+                let mut values = Vec::new();
+                for character in text.chars() {
+                    let character = JsValue::String(character.to_string());
+                    values.push(self.typed_element_value(dom, kind, &character)?);
+                }
+                values
+            }
             JsValue::Undefined | JsValue::Null => {
                 return Err(JsError::type_error(
                     "typed-array set requires an array-like source",
@@ -560,7 +567,7 @@ impl JsRuntime {
         if offset + values.len() as f64 > length as f64 {
             return Err(self.range_error("source is too large"));
         }
-        buffer.set_elements(kind, start + offset as usize, &values);
+        store_typed_elements(&buffer, kind, start + offset as usize, &values);
         Ok(JsValue::Undefined)
     }
 
@@ -612,7 +619,7 @@ impl JsRuntime {
         let (begin, end) = self.typed_range(dom, arguments, length)?;
         let elements = self.typed_array_elements(receiver)?;
         let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_values(kind, &elements[begin..end], prototype)
+        self.create_typed_array_from_elements(kind, &elements[begin..end], prototype)
     }
 
     /// The half-open element range `[begin, end)` that `subarray` and `slice`
@@ -665,21 +672,36 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-        let fill_value = self.to_number_value(dom, &value)?;
+        let fill_value = self.typed_element_value(dom, kind, &value)?;
         let rest = arguments.get(1..).unwrap_or(&[]);
         let (begin, end) = self.typed_range(dom, rest, length)?;
         for index in begin..end {
-            buffer.set_element(kind, start + index, fill_value);
+            buffer.set_converted_element(kind, start + index, &fill_value);
         }
         Ok(JsValue::Object(receiver))
     }
 
     /// The number a search argument names. Only a number can equal an element,
     /// so any other value matches nothing.
-    fn typed_search_number(value: Option<&JsValue>) -> Option<f64> {
-        match value {
-            Some(JsValue::Number(number)) => Some(*number),
+    /// The search argument as an element of `kind`. Only a value of the element
+    /// type can equal an element, so any other value matches nothing.
+    fn typed_search_value(kind: TypedArrayKind, value: Option<&JsValue>) -> Option<JsValue> {
+        match (kind.is_bigint(), value) {
+            (false, Some(JsValue::Number(number))) => Some(JsValue::Number(*number)),
+            (true, Some(JsValue::BigInt(bigint))) => Some(JsValue::BigInt(bigint.clone())),
             _ => None,
+        }
+    }
+
+    /// Whether `element` equals `search`: strict equality, or `SameValueZero` for
+    /// `includes`, where `NaN` finds `NaN`.
+    fn element_equals(element: &JsValue, search: &JsValue, same_value_zero: bool) -> bool {
+        match (element, search) {
+            (JsValue::Number(left), JsValue::Number(right)) => {
+                left == right || (same_value_zero && left.is_nan() && right.is_nan())
+            }
+            (JsValue::BigInt(left), JsValue::BigInt(right)) => left == right,
+            _ => false,
         }
     }
 
@@ -691,12 +713,12 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let from = self.typed_from_index(dom, arguments.get(1), length)?;
-        let Some(search) = Self::typed_search_number(arguments.first()) else {
+        let Some(search) = Self::typed_search_value(kind, arguments.first()) else {
             return Ok(JsValue::Number(-1.0));
         };
-        let elements = buffer.elements(kind, start, length)?;
+        let elements = buffer.elements_value(kind, start, length)?;
         for (delta, element) in elements[from..].iter().enumerate() {
-            if *element == search {
+            if Self::element_equals(element, &search, false) {
                 return Ok(JsValue::Number((from + delta) as f64));
             }
         }
@@ -728,12 +750,12 @@ impl JsRuntime {
         } else {
             len + from
         };
-        let Some(search) = Self::typed_search_number(arguments.first()) else {
+        let Some(search) = Self::typed_search_value(kind, arguments.first()) else {
             return Ok(JsValue::Number(-1.0));
         };
-        let elements = buffer.elements(kind, start, length)?;
+        let elements = buffer.elements_value(kind, start, length)?;
         while index >= 0.0 {
-            if elements[index as usize] == search {
+            if Self::element_equals(&elements[index as usize], &search, false) {
                 return Ok(JsValue::Number(index));
             }
             index -= 1.0;
@@ -764,13 +786,12 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let from = self.typed_from_index(dom, arguments.get(1), length)?;
-        let Some(search) = Self::typed_search_number(arguments.first()) else {
+        let Some(search) = Self::typed_search_value(kind, arguments.first()) else {
             return Ok(JsValue::Boolean(false));
         };
-        let elements = buffer.elements(kind, start, length)?;
+        let elements = buffer.elements_value(kind, start, length)?;
         for element in &elements[from..] {
-            // `includes` uses SameValueZero, so `NaN` finds `NaN`.
-            if *element == search || (search.is_nan() && element.is_nan()) {
+            if Self::element_equals(element, &search, true) {
                 return Ok(JsValue::Boolean(true));
             }
         }
@@ -788,14 +809,14 @@ impl JsRuntime {
         for index in 0..length {
             // Each element is decoded at its visit, so user callbacks that write
             // back through the same view are seen by later visits.
-            let Some(element) = buffer.element(kind, start + index) else {
+            let Some(element) = buffer.element_value(kind, start + index) else {
                 break;
             };
             self.call_with_this(
                 dom,
                 callback,
                 &[
-                    JsValue::Number(element),
+                    element,
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
@@ -818,27 +839,27 @@ impl JsRuntime {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let mut output = Vec::new();
         for index in 0..length {
-            let Some(element) = buffer.element(kind, start + index) else {
+            let Some(element) = buffer.element_value(kind, start + index) else {
                 break;
             };
             let mapped = self.call_with_this(
                 dom,
                 callback,
                 &[
-                    JsValue::Number(element),
+                    element.clone(),
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
                 this_argument.clone(),
             )?;
             if map {
-                output.push(self.to_number_value(dom, &mapped)?);
+                output.push(self.typed_element_value(dom, kind, &mapped)?);
             } else if mapped.is_truthy() {
                 output.push(element);
             }
         }
         let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_values(kind, &output, prototype)
+        self.create_typed_array_from_elements(kind, &output, prototype)
     }
 
     pub(in crate::runtime) fn typed_array_join(
@@ -851,10 +872,10 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => ",".to_owned(),
             Some(value) => value.to_js_string(),
         };
-        let elements = buffer.elements(kind, start, length)?;
+        let elements = buffer.elements_value(kind, start, length)?;
         let parts = elements
             .iter()
-            .map(|element| JsValue::Number(*element).to_js_string())
+            .map(JsValue::to_js_string)
             .collect::<Vec<_>>();
         Ok(JsValue::String(parts.join(&separator)))
     }
@@ -873,10 +894,7 @@ impl JsRuntime {
         let elements = self.typed_array_elements(receiver)?;
         let mut entries = Vec::with_capacity(elements.len());
         for (index, element) in elements.into_iter().enumerate() {
-            let pair = self.create_array_from_values(&[
-                JsValue::Number(index as f64),
-                JsValue::Number(element),
-            ])?;
+            let pair = self.create_array_from_values(&[JsValue::Number(index as f64), element])?;
             entries.push(JsValue::Object(pair));
         }
         Ok(JsValue::Object(self.realm.collection_iterator(entries)))
@@ -901,8 +919,8 @@ impl JsRuntime {
             return Ok(JsValue::Undefined);
         }
         Ok(buffer
-            .element(kind, start + index as usize)
-            .map_or(JsValue::Undefined, JsValue::Number))
+            .element_value(kind, start + index as usize)
+            .unwrap_or(JsValue::Undefined))
     }
 
     /// `%TypedArray%.prototype.copyWithin(target, start[, end])` (ECMA-262
@@ -922,9 +940,14 @@ impl JsRuntime {
         let count = (end - from).min(len - to);
         if count > 0.0 {
             let (to, from, count) = (to as usize, from as usize, count as usize);
-            let mut elements = buffer.elements(kind, start, length)?;
-            elements.copy_within(from..from + count, to);
-            buffer.set_elements(kind, start, &elements);
+            let mut elements = buffer.elements_value(kind, start, length)?;
+            // The source range is copied out first, so overlapping ranges copy
+            // as if through a temporary.
+            let copied: Vec<JsValue> = elements[from..from + count].to_vec();
+            for (offset, value) in copied.into_iter().enumerate() {
+                elements[to + offset] = value;
+            }
+            store_typed_elements(&buffer, kind, start, &elements);
         }
         Ok(JsValue::Object(receiver))
     }
@@ -952,14 +975,14 @@ impl JsRuntime {
             (0..length).collect()
         };
         for index in order {
-            let Some(element) = buffer.element(kind, start + index) else {
+            let Some(element) = buffer.element_value(kind, start + index) else {
                 break;
             };
             let result = self.call_with_this(
                 dom,
                 callback,
                 &[
-                    JsValue::Number(element),
+                    element.clone(),
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
@@ -969,7 +992,7 @@ impl JsRuntime {
             match (scan, truthy) {
                 (Scan::Every, false) => return Ok(JsValue::Boolean(false)),
                 (Scan::Some, true) => return Ok(JsValue::Boolean(true)),
-                (Scan::Find, true) => return Ok(JsValue::Number(element)),
+                (Scan::Find, true) => return Ok(element),
                 (Scan::FindIndex, true) => return Ok(JsValue::Number(index as f64)),
                 _ => {}
             }
@@ -1008,11 +1031,11 @@ impl JsRuntime {
             }
             let first = order.remove(0);
             buffer
-                .element(kind, start + first)
-                .map_or(JsValue::Undefined, JsValue::Number)
+                .element_value(kind, start + first)
+                .unwrap_or(JsValue::Undefined)
         };
         for index in order {
-            let Some(element) = buffer.element(kind, start + index) else {
+            let Some(element) = buffer.element_value(kind, start + index) else {
                 break;
             };
             accumulator = self.call_with_this(
@@ -1020,7 +1043,7 @@ impl JsRuntime {
                 callback,
                 &[
                     accumulator,
-                    JsValue::Number(element),
+                    element,
                     JsValue::Number(index as f64),
                     JsValue::Object(receiver),
                 ],
@@ -1033,9 +1056,9 @@ impl JsRuntime {
     /// `%TypedArray%.prototype.reverse()`: in place, and returns the receiver.
     fn typed_array_reverse(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
-        let mut elements = buffer.elements(kind, start, length)?;
+        let mut elements = buffer.elements_value(kind, start, length)?;
         elements.reverse();
-        buffer.set_elements(kind, start, &elements);
+        store_typed_elements(&buffer, kind, start, &elements);
         Ok(JsValue::Object(receiver))
     }
 
@@ -1059,37 +1082,23 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         comparator: Option<ObjectId>,
-        left: f64,
-        right: f64,
+        left: &JsValue,
+        right: &JsValue,
     ) -> Result<f64, JsError> {
         if let Some(function) = comparator {
             let result = self.call_with_this(
                 dom,
                 function,
-                &[JsValue::Number(left), JsValue::Number(right)],
+                &[left.clone(), right.clone()],
                 JsValue::Undefined,
             )?;
             let order = self.to_number_value(dom, &result)?;
             return Ok(if order.is_nan() { 0.0 } else { order });
         }
-        Ok(match (left.is_nan(), right.is_nan()) {
-            (true, true) => 0.0,
-            (true, false) => 1.0,
-            (false, true) => -1.0,
-            (false, false) => {
-                if left < right {
-                    -1.0
-                } else if left > right {
-                    1.0
-                } else if left == 0.0 && right == 0.0 {
-                    // `-0` sorts before `+0`: a negative `left` with a positive
-                    // `right` is -1, and the reverse is +1.
-                    f64::from(u8::from(left.is_sign_positive()))
-                        - f64::from(u8::from(right.is_sign_positive()))
-                } else {
-                    0.0
-                }
-            }
+        Ok(match (left, right) {
+            (JsValue::Number(left), JsValue::Number(right)) => number_order(*left, *right),
+            (JsValue::BigInt(left), JsValue::BigInt(right)) => f64::from(left.cmp(right) as i8),
+            _ => 0.0,
         })
     }
 
@@ -1098,7 +1107,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         comparator: Option<ObjectId>,
-        elements: &mut [f64],
+        elements: &mut [JsValue],
     ) -> Result<(), JsError> {
         for index in 1..elements.len() {
             let mut position = index;
@@ -1106,8 +1115,8 @@ impl JsRuntime {
                 let order = self.typed_array_order(
                     dom,
                     comparator,
-                    elements[position - 1],
-                    elements[position],
+                    &elements[position - 1],
+                    &elements[position],
                 )?;
                 if order <= 0.0 {
                     break;
@@ -1131,7 +1140,7 @@ impl JsRuntime {
         let comparator = self.typed_array_comparator(arguments.first())?;
         let mut elements = self.typed_array_elements(receiver)?;
         self.typed_array_sort_values(dom, comparator, &mut elements)?;
-        buffer.set_elements(kind, start, &elements);
+        store_typed_elements(&buffer, kind, start, &elements);
         Ok(JsValue::Object(receiver))
     }
 
@@ -1141,7 +1150,7 @@ impl JsRuntime {
         let mut elements = self.typed_array_elements(receiver)?;
         elements.reverse();
         let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_values(kind, &elements, prototype)
+        self.create_typed_array_from_elements(kind, &elements, prototype)
     }
 
     /// `%TypedArray%.prototype.toSorted(comparefn)`: a sorted copy of the same
@@ -1157,7 +1166,7 @@ impl JsRuntime {
         let mut elements = self.typed_array_elements(receiver)?;
         self.typed_array_sort_values(dom, comparator, &mut elements)?;
         let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_values(kind, &elements, prototype)
+        self.create_typed_array_from_elements(kind, &elements, prototype)
     }
 
     /// `%TypedArray%.prototype.with(index, value)` (ECMA-262 23.2.3.38): the
@@ -1172,7 +1181,7 @@ impl JsRuntime {
         let len = length as f64;
         let relative = self.optional_integer_value(dom, arguments.first())?;
         let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-        let number = self.to_number_value(dom, &value)?;
+        let number = self.typed_element_value(dom, kind, &value)?;
         let index = if relative >= 0.0 {
             relative
         } else {
@@ -1184,7 +1193,7 @@ impl JsRuntime {
         let mut elements = self.typed_array_elements(receiver)?;
         elements[index as usize] = number;
         let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_values(kind, &elements, prototype)
+        self.create_typed_array_from_elements(kind, &elements, prototype)
     }
 
     /// The `length` accessor of `%TypedArray%.prototype`. A view whose buffer is
@@ -1232,5 +1241,41 @@ impl JsRuntime {
             return Err(self.range_error("invalid typed array index"));
         }
         Ok(number as usize)
+    }
+}
+
+/// Store `values`, each already converted to `kind`, from element `first` on.
+fn store_typed_elements(
+    buffer: &TypedBuffer,
+    kind: TypedArrayKind,
+    first: usize,
+    values: &[JsValue],
+) {
+    for (offset, value) in values.iter().enumerate() {
+        buffer.set_converted_element(kind, first + offset, value);
+    }
+}
+
+/// The signed order of two Numbers for the default `sort`: `NaN` last, and `-0`
+/// before `+0`.
+fn number_order(left: f64, right: f64) -> f64 {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => 0.0,
+        (true, false) => 1.0,
+        (false, true) => -1.0,
+        (false, false) => {
+            if left < right {
+                -1.0
+            } else if left > right {
+                1.0
+            } else if left == 0.0 && right == 0.0 {
+                // `-0` sorts before `+0`: a negative `left` with a positive
+                // `right` is -1, and the reverse is +1.
+                f64::from(u8::from(left.is_sign_positive()))
+                    - f64::from(u8::from(right.is_sign_positive()))
+            } else {
+                0.0
+            }
+        }
     }
 }
