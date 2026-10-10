@@ -489,6 +489,25 @@ pub(crate) enum RegExpAccessor {
     HasIndices,
 }
 
+/// The Annex B.2.2 HTML methods as `(method, tag, attribute)`, where an empty
+/// attribute means the method takes no argument. `NativeFunction::StrHtml`
+/// indexes this table, so a method's native and its name share one row.
+pub(crate) const HTML_METHODS: [(&str, &str, &str); 13] = [
+    ("anchor", "a", "name"),
+    ("big", "big", ""),
+    ("blink", "blink", ""),
+    ("bold", "b", ""),
+    ("fixed", "tt", ""),
+    ("fontcolor", "font", "color"),
+    ("fontsize", "font", "size"),
+    ("italics", "i", ""),
+    ("link", "a", "href"),
+    ("small", "small", ""),
+    ("strike", "strike", ""),
+    ("sub", "sub", ""),
+    ("sup", "sup", ""),
+];
+
 impl NativeFunction {
     /// Whether the built-in begins with `RequireObjectCoercible(this)` or
     /// `ToObject(this)`, so a `null` or `undefined` receiver is a `TypeError`.
@@ -529,6 +548,7 @@ impl NativeFunction {
                 | Self::StrToUpperCase
                 | Self::StrIsWellFormed
                 | Self::StrToWellFormed
+                | Self::StrHtml(_)
                 | Self::StrIterator
                 // Array.prototype (ECMA-262 23.1.3): every method begins with ToObject.
                 | Self::ArrayJoin
@@ -694,6 +714,8 @@ pub(crate) enum NativeFunction {
     StrIsWellFormed,
     /// ECMA-262 22.1.3.32 `String.prototype.toWellFormed` (ES2024).
     StrToWellFormed,
+    /// Annex B.2.2 `CreateHTML`, for the method at `index` in [`HTML_METHODS`].
+    StrHtml(usize),
     StringFromCharCode,
     StringFromCodePoint,
     StringRaw,
@@ -4399,7 +4421,12 @@ impl Realm {
                 if names[target.0].is_none()
                     && let Some(description) = symbol.description()
                 {
-                    names[target.0] = Some(format!("[{description}]"));
+                    // A well-known symbol is named by its specification name, which the
+                    // engine stores as `@@iterator` and reports as `[Symbol.iterator]`.
+                    names[target.0] = Some(match description.strip_prefix("@@") {
+                        Some(well_known) => format!("[Symbol.{well_known}]"),
+                        None => format!("[{description}]"),
+                    });
                 }
             }
         }
@@ -4566,7 +4593,16 @@ impl Realm {
             // Array, String and Object members whose `length` is one (ECMA-262
             // 23.1.3.1, 22.1.3.1, 20.1.2.x and B.2.2.x).
             "concat" | "unshift" | "join" | "fromEntries" | "__lookupGetter__"
-            | "__lookupSetter__" => 1,
+            | "__lookupSetter__"
+            | "padStart"
+            | "padEnd"
+            | "fromCharCode"
+            | "fromCodePoint"
+            | "raw"
+            | "anchor"
+            | "fontcolor"
+            | "fontsize"
+            | "link" => 1,
             // Math (ECMA-262 21.3.2): two arguments.
             "atan2" | "hypot" | "imul" | "max" | "min" | "pow" => 2,
             "then"
@@ -4576,12 +4612,11 @@ impl Realm {
             | "defineProperties"
             | "replace"
             | "replaceAll"
+            | "split"
             | "slice"
             | "substring"
             | "substr"
             | "splice"
-            | "padStart"
-            | "padEnd"
             | "parseInt"
             | "assign"
             | "getOwnPropertyDescriptor"
@@ -5131,12 +5166,33 @@ impl Realm {
         prototype
     }
 
-    /// ECMA-262 22.1.3.13 `String.prototype[Symbol.iterator]`, installed as the
-    /// same function object as `String.prototype.values`. Real bundles need it
+    /// ECMA-262 `String.prototype[Symbol.iterator]`, the only iterator String has
+    /// (there is no `values` alias). Real bundles need it
     /// for `get-intrinsic`, which reads
     /// `getProto(getProto("x"[Symbol.iterator]()))` to capture
     /// `%IteratorPrototype%`; without it the lenient missing-host-call path
     /// answers `undefined` and the whole intrinsic table is lost.
+    /// ECMA-262 Annex B.2.2 HTML methods on `String.prototype`: one native per
+    /// row of [`HTML_METHODS`], named by its row.
+    fn install_string_html(
+        objects: &mut Vec<JsObject>,
+        prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        for (index, &(name, _, _)) in HTML_METHODS.iter().enumerate() {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::StrHtml(index)),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+    }
+
     fn install_string_iterator(
         objects: &mut Vec<JsObject>,
         prototype: ObjectId,
@@ -5148,10 +5204,6 @@ impl Realm {
             host: ObjectHost::NativeFunction(NativeFunction::StrIterator),
             ..JsObject::default()
         });
-        objects[prototype.0].properties.insert(
-            "values".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(iterator)),
-        );
         let symbol = JsSymbol::well_known("@@iterator");
         objects[prototype.0].symbols.insert(
             symbol.id(),
@@ -5162,6 +5214,10 @@ impl Realm {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "String.prototype is one table of method names, one row per method"
+    )]
     fn install_string(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -5223,6 +5279,8 @@ impl Realm {
             ("padEnd", NativeFunction::StrPadEnd),
             ("toLowerCase", NativeFunction::StrToLowerCase),
             ("toUpperCase", NativeFunction::StrToUpperCase),
+            ("toLocaleLowerCase", NativeFunction::StrToLowerCase),
+            ("toLocaleUpperCase", NativeFunction::StrToUpperCase),
             ("trim", NativeFunction::StrTrim),
             ("trimStart", NativeFunction::StrTrimStart),
             ("trimEnd", NativeFunction::StrTrimEnd),
@@ -5253,9 +5311,8 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
-        // ECMA-262 22.1.3.13 `String.prototype[Symbol.iterator]`: the same
-        // function object as `String.prototype.values`.
         Self::install_string_iterator(objects, prototype, function_prototype);
+        Self::install_string_html(objects, prototype, function_prototype);
         objects[string.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor {

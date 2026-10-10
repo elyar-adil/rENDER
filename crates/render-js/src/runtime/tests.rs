@@ -2018,7 +2018,7 @@ fn string_prototype_symbol_iterator_yields_an_iterator_object() {
                 // to snapshot %IteratorPrototype%; an `undefined` answer there
                 // silently empties the whole intrinsic table.
                 results.push(typeof ''[Symbol.iterator] === 'function');
-                results.push(''[Symbol.iterator] === ''.values);
+                results.push(''.values === undefined);
                 var iterator = 'abc'[Symbol.iterator]();
                 results.push(typeof iterator === 'object' && typeof iterator.next === 'function');
                 var first = iterator.next();

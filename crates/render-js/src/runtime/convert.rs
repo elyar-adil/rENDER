@@ -36,64 +36,6 @@ impl JsValue {
     }
 }
 
-/// Coerce an optional argument into a character index (negative counts from
-/// the end, matching `String.prototype` slice semantics for the callers that
-/// need it; `charAt`-style callers pass the raw value through).
-/// Resolve a slice/substring range over a collection of `length` elements:
-/// negative bounds count from the end and are clamped. When `swap` is set
-/// (slice semantics) reversed bounds clamp to an empty range; otherwise they
-/// are swapped (substring semantics).
-///
-/// `length` is a count, not a slice, so the same resolution serves an array of
-/// elements and a string of UTF-16 code units.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "bounds are clamped before casting to usize"
-)]
-pub(super) fn slice_range(
-    length: usize,
-    start: f64,
-    end: Option<f64>,
-    swap: bool,
-) -> std::ops::Range<usize> {
-    let resolve = |value: f64| -> usize {
-        // §7.1.25 `ToAbsoluteIndex` then §7.1.26 `ToClampedIndex`:
-        // `ToIntegerOrInfinity` maps `NaN` to 0 and keeps `±∞` as infinities, and
-        // only then is a finite negative offset taken from the end. Treating
-        // `NaN` as "no bound" would be wrong: `'ab'.slice(NaN, 1)` is `'a'`
-        // because `NaN` becomes 0, not the whole string.
-        if value.is_nan() {
-            return 0;
-        }
-        if !value.is_finite() {
-            // `-∞` clamps to 0 and `+∞` to the length; the caller repairs the
-            // upper bound, and a start of `-∞` has to become 0 here or the
-            // range would start past its own end.
-            return if value > 0.0 { usize::MAX } else { 0 };
-        }
-        let mut value = value.floor();
-        #[allow(clippy::cast_precision_loss, reason = "length fits exactly")]
-        let length = length as f64;
-        if value < 0.0 {
-            value += length;
-        }
-        value.max(0.0).min(length) as usize
-    };
-    let mut start = resolve(start);
-    let mut end = resolve(end.unwrap_or(if swap { f64::INFINITY } else { f64::MAX }));
-    if end == usize::MAX {
-        end = length;
-    }
-    if swap && end < start {
-        return start..start;
-    }
-    if !swap && end < start {
-        std::mem::swap(&mut start, &mut end);
-    }
-    start..end.min(length)
-}
-
 pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
     match value {
         JsValue::Undefined => Ok(f64::NAN),
