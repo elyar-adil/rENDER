@@ -5385,3 +5385,94 @@ fn typed_array_copy_within_revalidates_after_its_arguments_detach_the_buffer() {
         "TypeError"
     );
 }
+
+#[test]
+fn array_from_keeps_its_iterator_alive_across_collections() {
+    // `Array.from` drives the iterator from Rust locals. With a heap this small,
+    // the allocations of each step collect garbage, so an iterator or `next` that
+    // is not pinned would be swept and its slot reused.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var source = [];
+                for (var i = 0; i < 3000; i++) source.push(i);
+                var copied = Array.from(source);
+                var sum = 0;
+                for (var j = 0; j < copied.length; j++) sum += copied[j];
+                [copied.length, sum].join(',');
+            ",
+        )
+        .expect("Array.from over an array executes");
+    assert_eq!(outcome.value, JsValue::String("3000,4498500".to_owned()));
+}
+
+#[test]
+fn typed_array_from_an_iterable_keeps_its_iterator_alive_across_collections() {
+    // The iterator object is referenced only by the Rust loop that drains it, so a
+    // collection during the drain must keep it and its `next` method alive.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var iterable = {};
+                iterable[Symbol.iterator] = function () {
+                    var i = 0;
+                    return {
+                        next: function () {
+                            return i < 3000
+                                ? { value: i++, done: false }
+                                : { value: undefined, done: true };
+                        }
+                    };
+                };
+                var copied = new Uint16Array(iterable);
+                [copied.length, copied[2999]].join(',');
+            ",
+        )
+        .expect("typed array over an iterable executes");
+    assert_eq!(outcome.value, JsValue::String("3000,2999".to_owned()));
+}
+
+#[test]
+fn a_caller_scope_survives_a_collection_during_the_call_it_makes() {
+    // `caller`'s binding is reachable only through its suspended frame while
+    // `callee` runs, and `callee` allocates enough to collect under this heap.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                function callee() {
+                    var last = null;
+                    for (var i = 0; i < 3000; i++) last = { i: i };
+                    return last.i;
+                }
+                function caller() {
+                    var keep = { tag: 'alive' };
+                    var seen = callee();
+                    return keep.tag + ':' + seen;
+                }
+                caller();
+            ",
+        )
+        .expect("a call that collects while its caller is suspended executes");
+    assert_eq!(outcome.value, JsValue::String("alive:2999".to_owned()));
+}

@@ -1870,16 +1870,26 @@ impl JsRuntime {
             }
             JsValue::Object(method) if Self::is_callable_object(method, &self.realm) => {
                 let result = self.array_from_constructor(dom, constructor, None)?;
+                // Every step allocates, and an allocation may collect garbage. The
+                // result, the iterator and its `next` are only held by these locals,
+                // so they stay pinned for the whole loop.
+                let pinned = self.transient_roots.len();
+                self.transient_roots.push(result);
                 let iterator = match self.call_with_this(dom, method, &[], items.clone())? {
                     JsValue::Object(iterator) => iterator,
                     _ => return Err(JsError::type_error("iterator is not an object")),
                 };
+                self.transient_roots.push(iterator);
                 let next = self.get_member(dom, iterator, "next")?;
+                let next = match next {
+                    JsValue::Object(next) => {
+                        self.transient_roots.push(next);
+                        next
+                    }
+                    _ => return Err(JsError::type_error("iterator has no callable 'next'")),
+                };
                 let mut index = 0.0;
                 loop {
-                    let JsValue::Object(next) = next.clone() else {
-                        return Err(JsError::type_error("iterator has no callable 'next'"));
-                    };
                     let step = self.call_with_this(dom, next, &[], JsValue::Object(iterator))?;
                     let JsValue::Object(step) = step else {
                         return Err(JsError::type_error("iterator result is not an object"));
@@ -1899,6 +1909,7 @@ impl JsRuntime {
                     }
                     index += 1.0;
                 }
+                self.transient_roots.truncate(pinned);
                 self.set_length_or_throw(dom, result, index)?;
                 Ok(JsValue::Object(result))
             }

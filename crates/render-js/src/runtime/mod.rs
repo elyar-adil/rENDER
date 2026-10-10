@@ -102,6 +102,10 @@ pub struct JsRuntime {
     calls_active: usize,
     dom_nodes_created: usize,
     environment: Vec<Environment>,
+    /// Scopes of callers whose frames are suspended while a callee runs. They
+    /// are held here, not only in the caller's Rust locals, so a collection
+    /// during the call still sees them.
+    suspended_environments: Vec<Environment>,
     /// Declared modules by key (the module's absolute URL).
     modules: BTreeMap<String, module::ModuleRecord>,
     /// Whether the self-hosted built-ins in `prelude.js` have been installed.
@@ -242,6 +246,7 @@ impl JsRuntime {
             calls_active: 0,
             dom_nodes_created: 0,
             environment: Vec::new(),
+            suspended_environments: Vec::new(),
             modules: BTreeMap::new(),
             prelude_installed: false,
             pending_loop_labels: Vec::new(),
@@ -1086,6 +1091,21 @@ impl JsRuntime {
         }
         self.steps_remaining = self.steps_remaining.saturating_sub(1);
         Ok(())
+    }
+
+    /// Keeps the current scope chain alive as a collector root before the
+    /// runtime swaps it for another one. Returns the depth to hand to
+    /// `resume_scopes` once the chain is back in place.
+    fn suspend_scopes(&mut self) -> usize {
+        let depth = self.suspended_environments.len();
+        self.suspended_environments
+            .extend(self.environment.iter().cloned());
+        depth
+    }
+
+    /// Releases the roots that `suspend_scopes` returned `depth` for.
+    fn resume_scopes(&mut self, depth: usize) {
+        self.suspended_environments.truncate(depth);
     }
 
     fn call_native_dispatch(

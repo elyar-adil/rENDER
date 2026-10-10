@@ -580,7 +580,7 @@ impl JsRuntime {
         }
         // Collecting mid-execution must also treat the active scopes as
         // roots; between scripts these are empty.
-        for scope in &self.environment {
+        for scope in self.environment.iter().chain(&self.suspended_environments) {
             mark_environment(
                 self,
                 &mut marked,

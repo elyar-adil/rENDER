@@ -2469,10 +2469,18 @@ impl JsRuntime {
                 .collect()),
             JsValue::Object(object) => {
                 if let Some((iterator, next)) = self.get_iterator(dom, value)? {
+                    // Each step may allocate and collect garbage, so the iterator,
+                    // its `next` and the values gathered so far stay pinned.
+                    let pinned = self.transient_roots.len();
+                    self.transient_roots.extend([iterator, next]);
                     let mut values = Vec::new();
                     while let Some(step) = self.iterator_next(dom, iterator, next)? {
+                        if let JsValue::Object(object) = step {
+                            self.transient_roots.push(object);
+                        }
                         values.push(step);
                     }
+                    self.transient_roots.truncate(pinned);
                     return Ok(values);
                 }
                 let array_like = self
@@ -5054,6 +5062,7 @@ impl JsRuntime {
         source: &str,
     ) -> Result<JsValue, JsError> {
         let script = crate::CompiledScript::compile(source, &self.limits)?;
+        let suspended = self.suspend_scopes();
         let environment = std::mem::take(&mut self.environment);
         let result = (|| {
             self.instantiate_statements(&script.statements)?;
@@ -5066,6 +5075,7 @@ impl JsRuntime {
             }
         })();
         self.environment = environment;
+        self.resume_scopes(suspended);
         result
     }
 
@@ -5811,6 +5821,7 @@ impl JsRuntime {
                 primitive => JsValue::Object(self.to_object(&primitive)?),
             }
         };
+        let suspended = self.suspend_scopes();
         let previous_environment =
             std::mem::replace(&mut self.environment, function.captured_environment.clone());
         let mut call_environment = EnvironmentRecord {
@@ -5920,6 +5931,7 @@ impl JsRuntime {
             .get("this")
             .is_some_and(|binding| binding.initialized);
         self.environment = previous_environment;
+        self.resume_scopes(suspended);
         match result? {
             Completion::Normal(_)
                 if function

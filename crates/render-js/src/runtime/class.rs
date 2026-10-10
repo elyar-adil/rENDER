@@ -660,6 +660,7 @@ impl JsRuntime {
         if class.fields.is_empty() {
             return Ok(());
         }
+        let suspended = self.suspend_scopes();
         let previous_environment =
             std::mem::replace(&mut self.environment, class.environment.clone());
         // Field initializers run with `this` bound and the class's own
@@ -707,6 +708,7 @@ impl JsRuntime {
         // initializer that throws leaves the caller's context intact.
         self.class_frames.pop();
         self.environment = previous_environment;
+        self.resume_scopes(suspended);
         result
     }
 

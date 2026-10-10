@@ -141,9 +141,11 @@ impl JsRuntime {
                 namespace: None,
             },
         );
+        let suspended = self.suspend_scopes();
         let saved = std::mem::replace(&mut self.environment, vec![environment]);
         let result = self.instantiate_statements(&statements);
         self.environment = saved;
+        self.resume_scopes(suspended);
         result
     }
 
@@ -168,9 +170,11 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
+        let suspended = self.suspend_scopes();
         let saved = std::mem::take(&mut self.environment);
         let result = self.evaluate_module_graph(dom, key);
         self.environment = saved;
+        self.resume_scopes(suspended);
         if let Err(error) = &result {
             self.report_uncaught_error(dom, error);
         }
@@ -246,9 +250,11 @@ impl JsRuntime {
             }
         }
         self.source_line_starts = build_line_starts(&source);
+        let suspended = self.suspend_scopes();
         let saved = std::mem::replace(&mut self.environment, vec![environment]);
         let completion = self.evaluate_statements(dom, &statements);
         self.environment = saved;
+        self.resume_scopes(suspended);
         completion
             .map(|_| ())
             .map_err(|error| self.position_error(error))
