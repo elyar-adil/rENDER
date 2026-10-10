@@ -130,6 +130,8 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::dpi::PhysicalPosition;
 use winit::dpi::PhysicalSize as WindowSize;
+use winit::event::DeviceEvent;
+use winit::event::DeviceId;
 use winit::event::ElementState;
 use winit::event::Ime;
 use winit::event::MouseButton;
@@ -3103,6 +3105,7 @@ impl BrowserApp {
 
     pub(super) fn handle_pointer_release(&mut self) {
         self.left_pointer_down = false;
+        let was_dragging = self.drag.is_some() || self.tab_drag_paint.is_some();
         let release_intent = self.layout.as_ref().and_then(|layout| {
             self.drag
                 .as_mut()
@@ -3113,6 +3116,11 @@ impl BrowserApp {
         self.scrollbar_drag = None;
         if let Some(intent) = release_intent {
             self.handle_tab_intent(intent);
+        }
+        if was_dragging {
+            // The last live-drag frame still shows the tab at the pointer;
+            // recompose so it returns to its slot even when nothing reordered.
+            self.repaint_chrome();
         }
         if self.address_selecting {
             self.address_selecting = false;
@@ -3655,7 +3663,36 @@ pub(super) struct ContentTextEditor {
     pub(super) editor: AddressEditor,
 }
 
+/// A primary-button release, as winit reports it for the left button. `AppKit`
+/// numbers the left button 0 and winit passes that number through unchanged.
+pub(super) fn is_primary_button_release(event: &DeviceEvent) -> bool {
+    matches!(
+        event,
+        DeviceEvent::Button {
+            button: 0,
+            state: ElementState::Released,
+        }
+    )
+}
+
 impl ApplicationHandler<UserEvent> for BrowserApp {
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // On macOS the release also arrives through the application's event
+        // stream, not only the window's view. When the window misses it, a
+        // tab drag would keep following the pointer, so the release ends the
+        // press here too. A release the window already handled is a no-op
+        // because the press is no longer recorded as down.
+        if cfg!(target_os = "macos") && is_primary_button_release(&event) && self.left_pointer_down
+        {
+            self.handle_pointer_release();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none()
             && let Err(error) = self.initialize(event_loop)
@@ -3685,6 +3722,14 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.address_selecting = false;
                 self.relayout_and_render(true);
                 self.request_redraw();
+            }
+            WindowEvent::Moved(_) => {
+                // A native window drag runs its own event loop and consumes the
+                // button release, so a move while a press is recorded means that
+                // press has ended.
+                if self.left_pointer_down {
+                    self.handle_pointer_release();
+                }
             }
             WindowEvent::ThemeChanged(theme) => {
                 self.theme = theme_from_winit(theme);

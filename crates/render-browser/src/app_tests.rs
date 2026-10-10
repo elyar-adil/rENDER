@@ -2943,3 +2943,26 @@ fn a_back_out_of_a_replaced_document_loads_the_entry_it_reaches() {
     assert_eq!(page.history.current().url.as_str(), "file:///app/one");
     assert_eq!(tab_address(&app, tab), "file:///app/one");
 }
+
+#[test]
+fn primary_button_release_is_recognised_for_the_left_button_only() {
+    use winit::event::{DeviceEvent, ElementState};
+    assert!(crate::app::is_primary_button_release(
+        &DeviceEvent::Button {
+            button: 0,
+            state: ElementState::Released,
+        }
+    ));
+    assert!(!crate::app::is_primary_button_release(
+        &DeviceEvent::Button {
+            button: 0,
+            state: ElementState::Pressed,
+        }
+    ));
+    assert!(!crate::app::is_primary_button_release(
+        &DeviceEvent::Button {
+            button: 1,
+            state: ElementState::Released,
+        }
+    ));
+}
