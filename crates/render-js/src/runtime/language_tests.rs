@@ -1802,3 +1802,14 @@ fn computed_keys_convert_after_the_base_check_and_the_value() {
         "rhs,key"
     );
 }
+
+#[test]
+fn unicode_property_space_is_the_white_space_alias() {
+    // ECMA-262 Table 67: `\p{space}` names the White_Space property.
+    assert_eq!(
+        ok(
+            "[/^\\p{space}+$/u.test(' \\t\\u00a0\\u3000\\u2028'), /\\p{space}/u.test('a'), /\\P{space}/u.test('a')].join()"
+        ),
+        "true,false,true"
+    );
+}

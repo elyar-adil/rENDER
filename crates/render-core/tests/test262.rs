@@ -858,7 +858,7 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
         }];
     }
     if metadata.flags.iter().any(|flag| flag == "module") {
-        return unsupported(relative_path, "module evaluation is not implemented");
+        return run_module_parse_negative(relative_path, &source, &metadata);
     }
 
     let variants = if metadata.flags.iter().any(|flag| flag == "raw") {
@@ -1187,6 +1187,48 @@ fn negative_matches(expected: &NegativeExpectation, error: &JsError) -> bool {
         "runtime"
     };
     expected.phase == actual_phase && expected.error_type == actual_type
+}
+
+/// A module test is judged only where it asserts a parse-phase error: the
+/// module must fail to compile with that error. Positive module tests need the
+/// module loader, which the runner does not drive yet, so they stay unsupported.
+fn run_module_parse_negative(path: &str, source: &str, metadata: &Metadata) -> Vec<ResultRecord> {
+    let Some(expected) = metadata
+        .negative
+        .as_ref()
+        .filter(|expected| expected.phase == "parse")
+    else {
+        return unsupported(path, "module evaluation is not implemented");
+    };
+    let (status, detail) = match CompiledScript::compile_module(source, &RuntimeLimits::default()) {
+        Err(error) if negative_matches(expected, &error) => (
+            Status::Pass,
+            format!(
+                "matched negative {}:{}",
+                expected.phase, expected.error_type
+            ),
+        ),
+        Err(error) => (
+            Status::Fail,
+            format!(
+                "negative mismatch expected {}:{} but got {error}",
+                expected.phase, expected.error_type
+            ),
+        ),
+        Ok(_) => (
+            Status::Fail,
+            format!(
+                "negative expected {}:{} but the module compiled",
+                expected.phase, expected.error_type
+            ),
+        ),
+    };
+    vec![ResultRecord {
+        path: path.to_owned(),
+        variant: "module".to_owned(),
+        status,
+        detail,
+    }]
 }
 
 fn unsupported(path: &str, detail: &str) -> Vec<ResultRecord> {

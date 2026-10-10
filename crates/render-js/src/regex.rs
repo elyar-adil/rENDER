@@ -1784,7 +1784,7 @@ mod property {
     //! data in `icu_properties`; every other name is a syntax error, because
     //! the table is complete rather than a subset of it.
 
-    use icu_properties::props::{GeneralCategory, GeneralCategoryGroup, Script};
+    use icu_properties::props::{GeneralCategory, GeneralCategoryGroup, Script, WhiteSpace};
     use icu_properties::script::ScriptWithExtensions;
     use icu_properties::{
         CodePointMapData, CodePointSetData, CodePointSetDataBorrowed, PropertyParser,
@@ -1829,6 +1829,9 @@ mod property {
                     "Any" => Some(Self::Any),
                     "ASCII" => Some(Self::Ascii),
                     "Assigned" => Some(Self::Assigned),
+                    // ECMA-262 Table 67 gives White_Space the short alias `space`,
+                    // which ICU's ECMA-262 lookup does not recognise.
+                    "space" => Some(Self::Binary(CodePointSetData::new::<WhiteSpace>())),
                     _ => CodePointSetData::new_for_ecma262(text.as_bytes())
                         .map(Self::Binary)
                         .or_else(|| parse_category(text).map(Self::Category)),
