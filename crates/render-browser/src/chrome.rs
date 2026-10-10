@@ -153,9 +153,19 @@ pub struct ChromeLayout {
     pub content: Rect,
     pub chrome_height: u32,
     pub scale: f32,
+    /// Whether the active page has a forward entry. The forward button is not
+    /// drawn or hit-testable while this is false; the other buttons keep their
+    /// slots so the toolbar does not shift under the pointer.
+    pub forward_available: bool,
 }
 
 impl ChromeLayout {
+    /// Whether `button` is drawn and hit-testable.
+    #[must_use]
+    pub fn button_visible(&self, button: ToolbarButton) -> bool {
+        button != ToolbarButton::Forward || self.forward_available
+    }
+
     #[must_use]
     pub fn new(width: u32, height: u32, scale: f32, tabs: &[Tab]) -> Self {
         Self::new_with_decorations(width, height, scale, tabs, false)
@@ -338,6 +348,7 @@ impl ChromeLayout {
             },
             chrome_height,
             scale,
+            forward_available: true,
         }
     }
 
@@ -363,7 +374,7 @@ impl ChromeLayout {
             return HitTarget::TitleBar;
         }
         for button in &self.buttons {
-            if button.bounds.contains(point) {
+            if self.button_visible(button.button) && button.bounds.contains(point) {
                 return HitTarget::Toolbar(button.button);
             }
         }
@@ -860,22 +871,99 @@ impl<'a> Canvas<'a> {
         reason = "line endpoints are finite DPI-scaled chrome coordinates"
     )]
     pub fn line(&mut self, from: Point, to: Point, thickness: f32, color: u32) {
+        // Anti-aliased capsule: coverage falls off over half a pixel at the
+        // stroke edge, so diagonal strokes and round joins stay smooth.
+        let half = thickness * 0.5;
+        let (min_x, min_y, max_x, max_y) = self.clamped_bounds(
+            from.x.min(to.x) - half - 1.0,
+            from.y.min(to.y) - half - 1.0,
+            from.x.max(to.x) + half + 1.0,
+            from.y.max(to.y) + half + 1.0,
+        );
         let dx = to.x - from.x;
         let dy = to.y - from.y;
-        let steps = dx.abs().max(dy.abs()).ceil().max(1.0) as u32;
-        for step in 0..=steps {
-            let t = step as f32 / steps as f32;
-            self.rounded_rect(
-                Rect {
-                    x: dx.mul_add(t, from.x) - thickness * 0.5,
-                    y: dy.mul_add(t, from.y) - thickness * 0.5,
-                    width: thickness,
-                    height: thickness,
-                },
-                thickness * 0.5,
-                color,
-            );
+        let length_squared = dx.mul_add(dx, dy * dy).max(f32::EPSILON);
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let px = x as f32 + 0.5 - from.x;
+                let py = y as f32 + 0.5 - from.y;
+                let t = (px.mul_add(dx, py * dy) / length_squared).clamp(0.0, 1.0);
+                let distance = (px - dx * t).hypot(py - dy * t);
+                let coverage = (half + 0.5 - distance).clamp(0.0, 1.0);
+                self.blend_coverage(x, y, color, coverage);
+            }
         }
+    }
+
+    /// A filled triangle whose outline anti-aliases like the strokes do: each
+    /// pixel's coverage is its signed distance inside the three edges.
+    pub fn fill_triangle(&mut self, a: Point, b: Point, c: Point, color: u32) {
+        let area = (b.x - a.x).mul_add(c.y - a.y, -((c.x - a.x) * (b.y - a.y)));
+        if area.abs() < f32::EPSILON {
+            return;
+        }
+        let orientation = area.signum();
+        let (min_x, min_y, max_x, max_y) = self.clamped_bounds(
+            a.x.min(b.x).min(c.x) - 1.0,
+            a.y.min(b.y).min(c.y) - 1.0,
+            a.x.max(b.x).max(c.x) + 1.0,
+            a.y.max(b.y).max(c.y) + 1.0,
+        );
+        let edge = |from: Point, to: Point, p: Point| {
+            let ex = to.x - from.x;
+            let ey = to.y - from.y;
+            let length = ex.hypot(ey).max(f32::EPSILON);
+            ex.mul_add(p.y - from.y, -(ey * (p.x - from.x))) * orientation / length
+        };
+        for y in min_y..max_y {
+            for x in min_x..max_x {
+                let p = Point {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                };
+                let distance = edge(a, b, p).min(edge(b, c, p)).min(edge(c, a, p));
+                self.blend_coverage(x, y, color, (distance + 0.5).clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    /// Clamps a bounding box to the clip and framebuffer, returning whole
+    /// pixel indices as `(min_x, min_y, max_x, max_y)` with an exclusive max.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounds are clamped to the finite framebuffer before conversion"
+    )]
+    fn clamped_bounds(&self, left: f32, top: f32, right: f32, bottom: f32) -> (u32, u32, u32, u32) {
+        let min_x = left.floor().max(self.clip.x).max(0.0);
+        let min_y = top.floor().max(self.clip.y).max(0.0);
+        let max_x = right
+            .ceil()
+            .min(self.clip.x + self.clip.width)
+            .min(self.width as f32)
+            .max(min_x);
+        let max_y = bottom
+            .ceil()
+            .min(self.clip.y + self.clip.height)
+            .min(self.height as f32)
+            .max(min_y);
+        (min_x as u32, min_y as u32, max_x as u32, max_y as u32)
+    }
+
+    /// Blends `color` into one pixel by `coverage` (0..=1); a zero-coverage
+    /// pixel is left untouched.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "coverage is clamped to 0..=1 before it scales to an alpha byte"
+    )]
+    fn blend_coverage(&mut self, x: u32, y: u32, color: u32, coverage: f32) {
+        if coverage <= 0.0 {
+            return;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        let alpha = (coverage * 255.0).round() as u8;
+        self.pixels[index] = blend(self.pixels[index], color, alpha);
     }
 
     pub fn blend_mask(&mut self, x: i32, y: i32, width: u32, mask: &[u8], color: u32) {
@@ -1305,7 +1393,11 @@ fn paint_outline_rect(canvas: &mut Canvas<'_>, rect: Rect, thickness: f32, color
 }
 
 fn paint_toolbar(canvas: &mut Canvas<'_>, layout: &ChromeLayout, hot: HitTarget, palette: Palette) {
-    for button in &layout.buttons {
+    for button in layout
+        .buttons
+        .iter()
+        .filter(|button| layout.button_visible(button.button))
+    {
         if hot == HitTarget::Toolbar(button.button) {
             canvas.rounded_rect(button.bounds, 8.0 * layout.scale, palette.button_hover);
         }
@@ -1595,42 +1687,36 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
     let line = 1.7 * scale;
     match geometry.button {
         ToolbarButton::Back | ToolbarButton::Forward => {
+            // `direction` is where the arrow points: -1 for Back, +1 for
+            // Forward. The head's tip sits at the shaft's end in that direction
+            // and its wings trail behind the tip.
             let direction = if geometry.button == ToolbarButton::Back {
                 -1.0
             } else {
                 1.0
             };
+            let tail = Point {
+                x: center.x - 6.0 * direction * scale,
+                y: center.y,
+            };
+            let tip = Point {
+                x: center.x + 6.0 * direction * scale,
+                y: center.y,
+            };
+            canvas.line(tail, tip, line, color);
             canvas.line(
+                tip,
                 Point {
-                    x: center.x - 6.0 * direction * scale,
-                    y: center.y,
-                },
-                Point {
-                    x: center.x + 6.0 * direction * scale,
-                    y: center.y,
-                },
-                line,
-                color,
-            );
-            canvas.line(
-                Point {
-                    x: center.x - 6.0 * direction * scale,
-                    y: center.y,
-                },
-                Point {
-                    x: center.x - direction * scale,
+                    x: center.x + direction * scale,
                     y: center.y - 5.0 * scale,
                 },
                 line,
                 color,
             );
             canvas.line(
+                tip,
                 Point {
-                    x: center.x - 6.0 * direction * scale,
-                    y: center.y,
-                },
-                Point {
-                    x: center.x - direction * scale,
+                    x: center.x + direction * scale,
                     y: center.y + 5.0 * scale,
                 },
                 line,
@@ -1638,60 +1724,47 @@ fn paint_toolbar_icon(canvas: &mut Canvas<'_>, geometry: ButtonGeometry, scale: 
             );
         }
         ToolbarButton::Reload => {
-            let radius = 6.5 * scale;
-            let start = 0.55_f32;
-            let end = std::f32::consts::TAU - 0.55_f32;
-            let segments = 24;
+            // A clockwise arc open on the right, with a solid head at its
+            // upper-right end pointing along the direction of travel.
+            let radius = 6.0 * scale;
+            let start = 0.5_f32;
+            let end = std::f32::consts::TAU - 0.5_f32;
+            let segments = 32;
+            let on_arc = |angle: f32| Point {
+                x: angle.cos().mul_add(radius, center.x),
+                y: angle.sin().mul_add(radius, center.y),
+            };
             for segment in 0..segments {
                 let first = start + (end - start) * segment as f32 / segments as f32;
                 let second = start + (end - start) * (segment + 1) as f32 / segments as f32;
-                canvas.line(
-                    Point {
-                        x: first.cos().mul_add(radius, center.x),
-                        y: first.sin().mul_add(radius, center.y),
-                    },
-                    Point {
-                        x: second.cos().mul_add(radius, center.x),
-                        y: second.sin().mul_add(radius, center.y),
-                    },
-                    line,
-                    color,
-                );
+                canvas.line(on_arc(first), on_arc(second), line, color);
             }
             let tangent = Point {
                 x: -end.sin(),
                 y: end.cos(),
             };
-            let wing = Point {
-                x: -tangent.y,
-                y: tangent.x,
+            let normal = Point {
+                x: end.cos(),
+                y: end.sin(),
             };
-            let arc_end = Point {
-                x: end.cos().mul_add(radius, center.x),
-                y: end.sin().mul_add(radius, center.y),
-            };
-            // Arrowhead as a closed triangle straddling the arc end: the tip
-            // extends past the arc into the gap so the head reads as an
-            // arrow pointing along the arc direction instead of a nub.
+            let arc_end = on_arc(end);
             let tip = Point {
-                x: tangent.x.mul_add(1.5 * scale, arc_end.x),
-                y: tangent.y.mul_add(1.5 * scale, arc_end.y),
+                x: tangent.x.mul_add(3.2 * scale, arc_end.x),
+                y: tangent.y.mul_add(3.2 * scale, arc_end.y),
             };
             let base = Point {
-                x: tangent.x.mul_add(-3.5 * scale, arc_end.x),
-                y: tangent.y.mul_add(-3.5 * scale, arc_end.y),
+                x: tangent.x.mul_add(-1.2 * scale, arc_end.x),
+                y: tangent.y.mul_add(-1.2 * scale, arc_end.y),
             };
             let wing_a = Point {
-                x: wing.x.mul_add(3.0 * scale, base.x),
-                y: wing.y.mul_add(3.0 * scale, base.y),
+                x: normal.x.mul_add(3.6 * scale, base.x),
+                y: normal.y.mul_add(3.6 * scale, base.y),
             };
             let wing_b = Point {
-                x: wing.x.mul_add(-3.0 * scale, base.x),
-                y: wing.y.mul_add(-3.0 * scale, base.y),
+                x: normal.x.mul_add(-3.6 * scale, base.x),
+                y: normal.y.mul_add(-3.6 * scale, base.y),
             };
-            canvas.line(tip, wing_a, line, color);
-            canvas.line(tip, wing_b, line, color);
-            canvas.line(wing_a, wing_b, line, color);
+            canvas.fill_triangle(tip, wing_a, wing_b, color);
         }
         ToolbarButton::Home => {
             canvas.line(
@@ -2013,11 +2086,42 @@ mod tests {
             ICON,
         );
         let colored = |x: u32, y: u32| pixels[(y * SIZE + x) as usize] != BACKGROUND;
-        // The arrowhead tip reaches past the arc end into the arc gap.
-        assert!(colored(22, 13), "missing arrowhead tip beyond the arc");
+        // The solid head sits on the arc end and points into the arc gap.
+        assert!(colored(22, 14), "missing arrowhead body");
         // Both wings of the head are drawn.
-        assert!(colored(17, 11), "missing inward arrowhead wing");
-        assert!(colored(22, 8), "missing outward arrowhead wing");
+        assert!(colored(18, 13), "missing inward arrowhead wing");
+        assert!(colored(23, 11), "missing outward arrowhead wing");
+    }
+
+    #[test]
+    fn forward_button_is_hidden_until_the_page_can_go_forward() {
+        let tabs = TabModel::new("One", "about:home");
+        let mut layout = ChromeLayout::new(1_000, 700, 1.0, tabs.tabs());
+        let forward = layout
+            .buttons
+            .iter()
+            .find(|button| button.button == ToolbarButton::Forward)
+            .expect("the toolbar lays out a forward button")
+            .bounds;
+        let center = Point {
+            x: forward.x + forward.width * 0.5,
+            y: forward.y + forward.height * 0.5,
+        };
+        // A fresh page has no forward entry, so the button is not drawn and
+        // a click on its slot does nothing.
+        layout.forward_available = false;
+        assert!(!layout.button_visible(ToolbarButton::Forward));
+        assert_ne!(
+            layout.hit_test(center),
+            HitTarget::Toolbar(ToolbarButton::Forward)
+        );
+        // After going back, the button appears and responds to clicks.
+        layout.forward_available = true;
+        assert!(layout.button_visible(ToolbarButton::Forward));
+        assert_eq!(
+            layout.hit_test(center),
+            HitTarget::Toolbar(ToolbarButton::Forward)
+        );
     }
 
     #[test]

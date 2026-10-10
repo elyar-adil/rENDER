@@ -650,6 +650,15 @@ impl BrowserApp {
         if self.frame_size != size {
             self.frame_damage.mark_full();
         }
+        // The forward button shows only while the active page has a forward
+        // entry, so the chrome state is synced from history on every compose.
+        let forward_available = self
+            .pages
+            .get(&self.tabs.active_id())
+            .is_some_and(|page| page.history.can_go_forward());
+        if let Some(layout) = self.layout.as_mut() {
+            layout.forward_available = forward_available;
+        }
         let Some(layout) = &self.layout else {
             return;
         };
