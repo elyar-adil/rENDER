@@ -1829,7 +1829,9 @@ fn number_to_string_honours_a_radix_and_parse_int_reads_one() {
 }
 
 #[test]
-fn date_prototype_methods_see_a_primitive_receiver_as_nan() {
+fn date_prototype_methods_reject_a_receiver_without_a_time_value() {
+    // ECMA-262 21.4.4.41.1 `thisTimeValue`: a primitive has no [[DateValue]]
+    // slot, so every Date method brand-checks it as a `TypeError`.
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);
     let outcome = runtime
@@ -1837,23 +1839,242 @@ fn date_prototype_methods_see_a_primitive_receiver_as_nan() {
             &mut parsed.dom,
             r"
                 var results = [];
-                // `Date.prototype.getTime.call(5)` has no Date this-value, so
-                // `thisTimeValue` answers NaN rather than a brand error.
-                results.push(Date.prototype.getTime.call(5));
-                results.push(Date.prototype.valueOf.call('x'));
-                results.push(Date.prototype.getFullYear.call(5));
-                results.push(Date.prototype.getTime.call(new Date(7)));
-                results.push(Date.prototype.toString.call(5));
-                // A genuine non-Date object is still a brand error.
                 function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                results.push(thrown(function () { return Date.prototype.getTime.call(5); }));
+                results.push(thrown(function () { return Date.prototype.valueOf.call('x'); }));
+                results.push(thrown(function () { return Date.prototype.getFullYear.call(5); }));
+                results.push(thrown(function () { return Date.prototype.toString.call(0); }));
+                results.push(thrown(function () { return Date.prototype.setHours.call(true, 1); }));
                 results.push(thrown(function () { return Date.prototype.getTime.call({}); }));
+                results.push(Date.prototype.getTime.call(new Date(7)));
                 results.join(',');
             ",
         )
         .expect("Date receiver probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("NaN,NaN,NaN,7,Invalid Date,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,7".to_owned())
+    );
+}
+
+#[test]
+fn date_setters_coerce_arguments_in_order_before_the_nan_check() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var log = [];
+                function arg(name, value) {
+                    return { valueOf: function () { log.push(name); return value; } };
+                }
+                var results = [];
+                // Every argument the method reads is coerced, even for an invalid date.
+                results.push(isNaN(new Date(NaN).setHours(arg('h', 1), arg('m', 2))));
+                results.push(log.join(' '));
+                // Only the arguments that are present are read.
+                log = [];
+                new Date(0).setMonth(arg('month', 1));
+                results.push(log.join(' '));
+                // An absent first argument is `undefined`, which is NaN.
+                results.push(isNaN(new Date(0).setMinutes()));
+                // Validation of the receiver precedes any argument coercion.
+                var calls = 0;
+                try { Date.prototype.setHours.call({}, { valueOf: function () { calls++; return 1; } }); } catch (e) {}
+                results.push(calls);
+                results.join(',');
+            ",
+        )
+        .expect("Date setter coercion probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,h m,month,true,0".to_owned())
+    );
+}
+
+#[test]
+fn date_setters_compute_fields_and_clip_like_the_spec() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                results.push(new Date(0).setFullYear(2000, 1, 29) === Date.UTC(2000, 1, 29));
+                // `setFullYear` reads an invalid date as +0.
+                results.push(new Date(NaN).setFullYear(2000) === Date.UTC(2000, 0, 1));
+                results.push(isNaN(new Date(NaN).setHours(1)));
+                results.push(new Date(0).setHours(1, 2, 3, 4) === Date.UTC(1970, 0, 1, 1, 2, 3, 4));
+                results.push(new Date(0).setMonth(13) === Date.UTC(1971, 1, 1));
+                results.push(new Date(0).setDate(0) === Date.UTC(1969, 11, 31));
+                results.push(new Date(0).setMilliseconds(1500) === 1500);
+                results.push(new Date(0).setUTCSeconds(90) === 90000);
+                // A result outside the time value range is NaN, and is stored as NaN.
+                // 1e8 days after the epoch is exactly 8.64e15, still in range; one more is not.
+                results.push(new Date(0).setDate(1e8 + 1) === 8.64e15);
+                results.push(isNaN(new Date(0).setDate(1e8 + 2)));
+                results.push(new Date(0).setTime(8.64e15 + 1));
+                results.push(new Date(0).setHours(1.9) === 3600000);
+                results.join(',');
+            ",
+        )
+        .expect("Date setter arithmetic probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true,true,true,true,true,NaN,true".to_owned())
+    );
+}
+
+#[test]
+fn date_setter_lengths_and_names_follow_the_spec() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var P = Date.prototype;
+                [P.setDate.length, P.setFullYear.length, P.setHours.length,
+                 P.setMilliseconds.length, P.setMinutes.length, P.setMonth.length,
+                 P.setSeconds.length, P.setTime.length, P.setYear.length,
+                 P.setUTCDate.length, P.setUTCFullYear.length, P.setUTCHours.length,
+                 P.setUTCMilliseconds.length, P.setUTCMinutes.length, P.setUTCMonth.length,
+                 P.setUTCSeconds.length, P.toJSON.length, P[Symbol.toPrimitive].length,
+                 P.getYear.length].join(',')
+            ",
+        )
+        .expect("Date length probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("1,3,4,1,3,2,2,1,1,1,3,4,1,3,2,2,1,1,0".to_owned())
+    );
+}
+
+#[test]
+fn date_symbol_to_primitive_orders_methods_by_hint() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                var d = new Date(0);
+                var toPrimitive = Date.prototype[Symbol.toPrimitive];
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                results.push(toPrimitive.call(d, 'number') === 0);
+                results.push(toPrimitive.call(d, 'string') === d.toString());
+                results.push(toPrimitive.call(d, 'default') === d.toString());
+                results.push(thrown(function () { return toPrimitive.call(d, 'bogus'); }));
+                results.push(thrown(function () { return toPrimitive.call(5, 'number'); }));
+                // The default hint is what `+` uses, so a date concatenates as a string.
+                results.push((d + 1) === d.toString() + '1');
+                results.push(d - 0 === 0);
+                // A user valueOf is reached through the number hint.
+                var custom = new Date(3);
+                custom.valueOf = function () { return 9; };
+                results.push(custom - 0 === 9);
+                var descriptor = Object.getOwnPropertyDescriptor(Date.prototype, Symbol.toPrimitive);
+                results.push(descriptor.writable === false && descriptor.configurable === true);
+                results.join(',');
+            ",
+        )
+        .expect("Date @@toPrimitive probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true,true,true,true".to_owned())
+    );
+}
+
+#[test]
+fn date_annex_b_year_accessors_and_gmt_alias() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                results.push(new Date(0).getYear());
+                results.push(isNaN(new Date(NaN).getYear()));
+                results.push(new Date(0).setYear(99) === Date.UTC(1999, 0, 1));
+                results.push(new Date(0).setYear(-1) === Date.UTC(-1, 0, 1));
+                results.push(isNaN(new Date(0).setYear(NaN)));
+                results.push(Date.prototype.toGMTString === Date.prototype.toUTCString);
+                results.push(Date.prototype.toUTCString.name);
+                results.push(new Date(0).toTimeString());
+                results.push(new Date(0).toLocaleTimeString());
+                results.push(new Date(0).toLocaleDateString());
+                results.push(new Date(0).toLocaleString() === new Date(0).toString());
+                results.join(',');
+            ",
+        )
+        .expect("Date Annex B probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String(
+            "70,true,true,true,true,true,toUTCString,00:00:00 GMT+0000,\
+             00:00:00 GMT+0000,Thu Jan 01 1970,true"
+                .to_owned()
+        )
+    );
+}
+
+#[test]
+fn date_constructor_reads_a_date_argument_without_valueof() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var source = new Date(5);
+                source.valueOf = function () { throw new Error('valueOf read'); };
+                var hints = [];
+                var custom = { [Symbol.toPrimitive]: function (hint) { hints.push(hint); return '2000-01-01T00:00:00Z'; } };
+                [new Date(source).getTime(),
+                 new Date(custom).getTime() === Date.UTC(2000, 0, 1),
+                 hints.join(',')].join(',')
+            ",
+        )
+        .expect("Date constructor argument probe executes");
+    assert_eq!(outcome.value, JsValue::String("5,true,default".to_owned()));
+}
+
+#[test]
+fn date_instances_take_new_target_prototype_and_to_json_brand_checks_its_receiver() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var results = [];
+                function thrown(fn) { try { fn(); return false; } catch (e) { return e instanceof TypeError; } }
+                // OrdinaryCreateFromConstructor: a newTarget with an object `prototype` supplies it.
+                var Ctor = function () {};
+                results.push(Object.getPrototypeOf(Reflect.construct(Date, [64], Ctor)) === Ctor.prototype);
+                // A non-object `prototype` falls back to %Date.prototype%.
+                Ctor.prototype = null;
+                results.push(Object.getPrototypeOf(Reflect.construct(Date, [64], Ctor)) === Date.prototype);
+                class Stamp extends Date {}
+                results.push(new Stamp(9).getTime() === 9 && new Stamp(9) instanceof Stamp);
+                // ToObject(this) runs first, so a nullish receiver is a TypeError.
+                results.push(thrown(function () { return Date.prototype.toJSON.call(undefined); }));
+                results.push(thrown(function () { return Date.prototype.toJSON.call(null); }));
+                var toJSON = Date.prototype.toJSON;
+                results.push(thrown(function () { return toJSON(); }));
+                Number.prototype.toISOString = function () { return 'str'; };
+                results.push(Date.prototype.toJSON.call(10) === 'str');
+                results.join(',');
+            ",
+        )
+        .expect("Date subclass and toJSON probe executes");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("true,true,true,true,true,true,true".to_owned())
     );
 }
 
