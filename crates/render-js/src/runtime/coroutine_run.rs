@@ -419,7 +419,7 @@ impl JsRuntime {
         match outcome {
             Ok(None) => {}
             Ok(Some(value)) => {
-                if let Err(error) = self.resolve_promise_value(promise, &value) {
+                if let Err(error) = self.resolve_promise_with(dom, promise, &value) {
                     self.reject_with_error(promise, &error);
                 }
             }
@@ -481,26 +481,7 @@ impl JsRuntime {
         let JsValue::Object(wrapper) = wrapper else {
             unreachable!("create_promise returns a promise object");
         };
-        if let JsValue::Object(object) = value {
-            let then = self.get_member(dom, *object, "then")?;
-            if let JsValue::Object(then) = then
-                && Self::is_callable_object(then, &self.realm)
-            {
-                self.ensure_heap_capacity(2)?;
-                let resolve = self.realm.promise_settler(index, true);
-                let reject = self.realm.promise_settler(index, false);
-                if let Err(error) = self.call_with_this(
-                    dom,
-                    then,
-                    &[JsValue::Object(resolve), JsValue::Object(reject)],
-                    value.clone(),
-                ) {
-                    self.reject_with_error(index, &error);
-                }
-                return Ok(wrapper);
-            }
-        }
-        self.resolve_promise(index, value);
+        self.resolve_promise_with(dom, index, value)?;
         Ok(wrapper)
     }
 

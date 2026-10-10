@@ -158,17 +158,6 @@
     return String(this).toUpperCase();
   });
 
-  // --------------------------------------------------------------- Promise
-  define(Promise, 'withResolvers', function withResolvers() {
-    var resolve;
-    var reject;
-    var promise = new Promise(function (onFulfilled, onRejected) {
-      resolve = onFulfilled;
-      reject = onRejected;
-    });
-    return { promise: promise, resolve: resolve, reject: reject };
-  });
-
   // ----------------------------------------------------------------- Error
   define(Error, 'captureStackTrace', function captureStackTrace(target) {
     if (target !== null && (typeof target === 'object' || typeof target === 'function')) {

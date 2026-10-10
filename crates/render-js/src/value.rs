@@ -739,6 +739,13 @@ pub(crate) enum NativeFunction {
     PromiseFinallyPass,
     PromiseFinallyReject,
     PromiseCatch,
+    PromiseSpecies,
+    PromiseWithResolvers,
+    PromiseTry,
+    PromiseValueThunk,
+    PromiseThrower,
+    PromiseResolveThenableJob,
+    PromiseCapabilityExecutor,
     ArrayIsArray,
     ArrayFrom,
     ArrayPush,
@@ -942,10 +949,9 @@ pub(crate) enum NativeFunction {
     PromiseAllSettledKeyed,
     PromiseAny,
     PromiseRace,
-    /// One element of a combinator settling. Bound with the combinator's store
-    /// object and the element's index so the handler knows where to record.
-    PromiseCombinatorFulfilled,
-    PromiseCombinatorRejected,
+    /// One element's settlement function of a combinator. Bound with the store,
+    /// the element's index, its pair and its role.
+    PromiseCombinatorElement,
     MutationObserve,
     MutationDisconnect,
     MutationTakeRecords,
@@ -1737,9 +1743,12 @@ pub(crate) enum ObjectHost {
         listeners: Vec<ObjectId>,
     },
     Promise(usize),
+    /// A resolve (`fulfilled`) or reject function of a promise. `pair` indexes
+    /// the `alreadyResolved` record the pair shares with its sibling function.
     PromiseSettler {
         promise: usize,
         fulfilled: bool,
+        pair: usize,
     },
     /// `Text`, `Comment` and `DocumentFragment`: the DOM interfaces a script can
     /// construct with `new`.
@@ -2181,6 +2190,8 @@ pub struct Realm {
     symbol_prototype: ObjectId,
     /// `%BigInt.prototype%`, the prototype of every `BigInt` wrapper.
     bigint_prototype: ObjectId,
+    /// `%Promise%`, the intrinsic constructor `SpeciesConstructor` falls back to.
+    promise_constructor: ObjectId,
     promise_prototype: ObjectId,
     element_prototype: ObjectId,
     /// The prototype of every DOM interface, by interface name.
@@ -2352,7 +2363,7 @@ impl Realm {
         let bigint_prototype =
             Self::install_bigint(&mut objects, global, object_prototype, function_prototype);
         Self::install_math(&mut objects, global, object_prototype);
-        let promise_prototype = Self::install_promise(
+        let (promise_constructor, promise_prototype) = Self::install_promise(
             &mut objects,
             global,
             object_prototype,
@@ -3004,6 +3015,7 @@ impl Realm {
             regexp_prototype,
             date_prototype,
             symbol_prototype,
+            promise_constructor,
             bigint_prototype,
             promise_prototype,
             element_prototype,
@@ -5284,7 +5296,10 @@ impl Realm {
 
     /// The `name` and `length` own properties of a built-in function whose
     /// arity the name table cannot give (a symbol-keyed or a species method).
-    fn function_metadata(name: &str, length: f64) -> BTreeMap<String, PropertyDescriptor> {
+    pub(crate) fn function_metadata(
+        name: &str,
+        length: f64,
+    ) -> BTreeMap<String, PropertyDescriptor> {
         let read_only = |value: JsValue| PropertyDescriptor {
             getter: None,
             setter: None,
@@ -6949,63 +6964,75 @@ impl Realm {
         );
     }
 
-    /// The statics on `Promise`: `resolve`, `reject`, and the four combinators, plus
-    /// the two keyed combinators.
-    fn install_promise_statics(objects: &mut Vec<JsObject>, promise: ObjectId) {
-        for (name, function) in [
-            ("resolve", NativeFunction::PromiseResolve),
-            ("reject", NativeFunction::PromiseReject),
-            // The combinators take one argument each, which is what their
-            // `length` reports.
-            ("all", NativeFunction::PromiseAll),
-            ("allSettled", NativeFunction::PromiseAllSettled),
-            ("allKeyed", NativeFunction::PromiseAllKeyed),
-            ("allSettledKeyed", NativeFunction::PromiseAllSettledKeyed),
-            ("any", NativeFunction::PromiseAny),
-            ("race", NativeFunction::PromiseRace),
+    /// The statics on `Promise` and the `get [Symbol.species]` accessor. Each
+    /// static is a plain native function, so the receiver it is called on reaches
+    /// it as `this`: the spec's generic `NewPromiseCapability(C)` depends on that.
+    fn install_promise_statics(
+        objects: &mut Vec<JsObject>,
+        promise: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        for (name, function, length) in [
+            ("resolve", NativeFunction::PromiseResolve, 1.0),
+            ("reject", NativeFunction::PromiseReject, 1.0),
+            ("withResolvers", NativeFunction::PromiseWithResolvers, 0.0),
+            ("try", NativeFunction::PromiseTry, 1.0),
+            ("all", NativeFunction::PromiseAll, 1.0),
+            ("allSettled", NativeFunction::PromiseAllSettled, 1.0),
+            ("allKeyed", NativeFunction::PromiseAllKeyed, 1.0),
+            (
+                "allSettledKeyed",
+                NativeFunction::PromiseAllSettledKeyed,
+                1.0,
+            ),
+            ("any", NativeFunction::PromiseAny, 1.0),
+            ("race", NativeFunction::PromiseRace, 1.0),
         ] {
             let method = ObjectId(objects.len());
-            let host = match function {
-                // The keyed forms read their receiver as the constructor they build
-                // a result for, so `this` must reach them rather than being bound
-                // to `Promise` as the other statics are.
-                NativeFunction::PromiseAllKeyed | NativeFunction::PromiseAllSettledKeyed => {
-                    ObjectHost::NativeFunction(function)
-                }
-                _ => ObjectHost::BoundFunction {
-                    function,
-                    receiver: promise,
-                },
-            };
             objects.push(JsObject {
-                host,
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                properties: Self::function_metadata(name, length),
                 ..JsObject::default()
             });
             objects[promise.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
-            // Every static on this constructor takes one argument, and `length`
-            // reports that. Without it a feature-detection bundle reading
-            // `Promise.all.length` sees `undefined`. `length` is read-only (ECMA-262
-            // 10.2.9 SetFunctionLength), unlike the methods around it.
-            objects[method.0].properties.insert(
-                "length".to_owned(),
-                PropertyDescriptor {
-                    writable: false,
-                    ..PropertyDescriptor::builtin(JsValue::Number(1.0))
-                },
-            );
         }
+        // ECMA-262 27.2.5.4.9: `get Promise[@@species]` returns `this`.
+        let species_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::PromiseSpecies),
+            properties: Self::function_metadata("get [Symbol.species]", 0.0),
+            ..JsObject::default()
+        });
+        let species = JsSymbol::well_known("@@species");
+        objects[promise.0].symbols.insert(
+            species.id(),
+            (
+                species,
+                PropertyDescriptor {
+                    getter: Some(species_getter),
+                    setter: None,
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
     }
 
+    /// Install `Promise`, returning the constructor and `Promise.prototype`.
     fn install_promise(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
         error_prototype: ObjectId,
-    ) -> ObjectId {
+    ) -> (ObjectId, ObjectId) {
         let promise = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(function_prototype),
@@ -7017,15 +7044,16 @@ impl Realm {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
-        for (name, function) in [
-            ("then", NativeFunction::PromiseThen),
-            ("catch", NativeFunction::PromiseCatch),
-            ("finally", NativeFunction::PromiseFinally),
+        for (name, function, length) in [
+            ("then", NativeFunction::PromiseThen, 2.0),
+            ("catch", NativeFunction::PromiseCatch, 1.0),
+            ("finally", NativeFunction::PromiseFinally, 1.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
                 prototype: Some(function_prototype),
                 host: ObjectHost::NativeFunction(function),
+                properties: Self::function_metadata(name, length),
                 ..JsObject::default()
             });
             objects[prototype.0].properties.insert(
@@ -7048,7 +7076,7 @@ impl Realm {
                 configurable: false,
             },
         );
-        Self::install_promise_statics(objects, promise);
+        Self::install_promise_statics(objects, promise, function_prototype);
         Self::install_aggregate_error(objects, global, function_prototype, error_prototype);
         // `Promise.prototype[Symbol.toStringTag] === "Promise"`
         {
@@ -7057,7 +7085,11 @@ impl Realm {
                 tag.id(),
                 (
                     tag,
-                    PropertyDescriptor::builtin(JsValue::String("Promise".to_owned())),
+                    // ECMA-262 27.2.5.5: the tag is read-only, unlike the methods.
+                    PropertyDescriptor {
+                        writable: false,
+                        ..PropertyDescriptor::builtin(JsValue::String("Promise".to_owned()))
+                    },
                 ),
             );
         }
@@ -7072,7 +7104,7 @@ impl Realm {
                 configurable: true,
             },
         );
-        prototype
+        (promise, prototype)
     }
 
     /// `AggregateError`, the rejection reason `Promise.any` produces.
@@ -8500,12 +8532,29 @@ impl Realm {
         })
     }
 
-    pub(crate) fn promise_settler(&mut self, promise: usize, fulfilled: bool) -> ObjectId {
+    /// A resolving function of `promise` (ECMA-262 27.2.1.3): a built-in
+    /// function of length 1 and empty name, not a constructor.
+    pub(crate) fn promise_settler(
+        &mut self,
+        promise: usize,
+        fulfilled: bool,
+        pair: usize,
+    ) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.object_prototype),
-            host: ObjectHost::PromiseSettler { promise, fulfilled },
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::PromiseSettler {
+                promise,
+                fulfilled,
+                pair,
+            },
+            properties: Self::function_metadata("", 1.0),
             ..JsObject::default()
         })
+    }
+
+    /// `%Promise%`, the intrinsic constructor.
+    pub(crate) const fn promise_constructor(&self) -> ObjectId {
+        self.promise_constructor
     }
 
     pub(crate) fn collection(
