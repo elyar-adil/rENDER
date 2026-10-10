@@ -5336,6 +5336,18 @@ fn regexp_match_all_consults_is_regexp_before_the_flags_string() {
 }
 
 #[test]
+fn regexp_search_sets_last_index_strictly() {
+    // ECMA-262 22.2.6.11 step 4: `Set(rx, "lastIndex", +0, true)` is a TypeError
+    // when the property is an accessor without a setter.
+    assert_eq!(
+        regexp_check(
+            "var o = { get lastIndex() { return undefined; }, exec: function () { return null; } }; var out = 'no throw'; try { RegExp.prototype[Symbol.search].call(o); } catch (e) { out = e.name; } out"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
 fn object_methods_and_accessors_do_not_bind_their_own_name() {
     // A method or accessor has no self-name binding, unlike a named function
     // expression, so assigning to the name reaches the enclosing binding.

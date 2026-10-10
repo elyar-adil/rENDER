@@ -221,6 +221,9 @@ impl JsRuntime {
                 self.realm.set_property(object, key.to_owned(), value);
                 Ok(())
             }
+            None if self.realm.own_accessor_lacks_setter(object, key) => Err(JsError::type_error(
+                format!("Cannot set property '{key}' which has only a getter"),
+            )),
             None => self.set_member(dom, object, key, value),
         }
     }

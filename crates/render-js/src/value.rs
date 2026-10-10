@@ -8267,6 +8267,15 @@ impl Realm {
         }
     }
 
+    /// Whether `object` has an own accessor `key` with no setter, so that a
+    /// [[Set]] of `key` fails. No descriptor is cloned.
+    pub(crate) fn own_accessor_lacks_setter(&self, object: ObjectId, key: &str) -> bool {
+        self.objects
+            .get(object.0)
+            .and_then(|record| record.properties.get(key))
+            .is_some_and(|property| property.is_accessor() && property.setter.is_none())
+    }
+
     /// The own property `key` of `object` when it is a data property: whether it
     /// is writable. `None` for an accessor or an absent property. No descriptor
     /// is cloned.
