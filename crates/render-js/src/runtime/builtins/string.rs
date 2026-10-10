@@ -288,37 +288,66 @@ impl JsRuntime {
                 let needle = self.to_string_coerced(dom, &search)?;
                 self.string_replace_all_literal(dom, &text, &needle, &replacement)
             }
-            // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units.
-            // `intStart` is `ToClampedIndex(start, size)` - a negative start
-            // counts from the end - and the run length is clamped to `[0, size]`
-            // rather than resolved from the end, so `substr(0, -1)` is empty
-            // and `substr(-1)` is the last code unit.
+            // ECMA-262 22.1.3.10 `String.prototype.isWellFormed` and 22.1.3.32
+            // `String.prototype.toWellFormed` (ES2024). A lone surrogate is the
+            // one thing a well-formed string cannot hold, and this engine keeps
+            // exactly the lone surrogates as placeholders: a valid pair is a
+            // single scalar, so "contains an unpaired surrogate" is "contains a
+            // placeholder". `toWellFormed` replaces each one with U+FFFD.
+            NativeFunction::StrIsWellFormed => {
+                let text = self.require_string_receiver(dom, receiver)?;
+                Ok(JsValue::Boolean(!text.chars().any(utf16::is_placeholder)))
+            }
+            NativeFunction::StrToWellFormed => {
+                let text = self.require_string_receiver(dom, receiver)?;
+                Ok(JsValue::String(
+                    text.chars()
+                        .map(|character| {
+                            if utf16::is_placeholder(character) {
+                                '\u{FFFD}'
+                            } else {
+                                character
+                            }
+                        })
+                        .collect(),
+                ))
+            }
+            // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units, in
+            // the spec's own arithmetic on `ToIntegerOrInfinity` values.
+            //
+            // Steps 5-7 clamp `intStart` into `[0, size]`: a negative start
+            // counts from the end and an infinite one clamps to the nearest
+            // bound. Steps 8-9 clamp `intLength` into `[0, size]`, and step 10
+            // ends the run at `min(intStart + intLength, size)`. Every clamp
+            // happens before any index is formed, so `+Infinity` never reaches
+            // a `usize` conversion: it is `size` by step 7 and the slice below
+            // is always in range.
             NativeFunction::StringSubstr => {
                 let text = self.require_string_receiver(dom, receiver)?;
                 let units = utf16::utf16_units(&text);
-                let size = units.len();
-                let start = slice_range(
-                    size,
-                    self.optional_integer_value(dom, arguments.first())?,
-                    None,
-                    true,
-                )
-                .start;
-                let length = match arguments.get(1) {
-                    None | Some(JsValue::Undefined) => size - start,
-                    Some(value) => {
-                        let requested = self.to_integer_value(dom, value)?;
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "the length is clamped to the string size first"
-                        )]
-                        {
-                            requested.max(0.0).min(size as f64) as usize
-                        }
-                    }
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a code-unit length is a usize and f64 represents every usize on this target"
+                )]
+                let size = units.len() as f64;
+                let start = self.optional_integer_value(dom, arguments.first())?;
+                let start = if start < 0.0 {
+                    (size + start).max(0.0)
+                } else {
+                    start.min(size)
                 };
-                let end = start.saturating_add(length).min(size);
+                let length = match arguments.get(1) {
+                    None | Some(JsValue::Undefined) => size,
+                    Some(value) => self.to_integer_value(dom, value)?,
+                };
+                let length = length.max(0.0).min(size);
+                let end = (start + length).min(size);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "start and end are integers clamped into [0, size] above"
+                )]
+                let (start, end) = (start as usize, end as usize);
                 Ok(JsValue::String(utf16::string_from_utf16(
                     &units[start..end],
                 )))
@@ -2173,5 +2202,49 @@ mod tests {
         assert!(caught("'a'.indexOf(Symbol())").starts_with("TypeError: "));
         assert!(caught("'a'.concat(Symbol())").starts_with("TypeError: "));
         assert!(caught("String.prototype.replace.call(Symbol())").starts_with("TypeError: "));
+    }
+
+    #[test]
+    fn is_well_formed_reports_an_unpaired_surrogate_and_to_well_formed_replaces_it() {
+        assert_eq!(run("'abc'.isWellFormed()"), "true");
+        assert_eq!(run("'\\uD83D\\uDE00'.isWellFormed()"), "true");
+        assert_eq!(run("'\\uD800'.isWellFormed()"), "false");
+        assert_eq!(run("'a\\uDC00b'.isWellFormed()"), "false");
+        // A pair split across a concatenation is re-joined, so it is well formed.
+        assert_eq!(run("('\\uD83D' + '\\uDE00').isWellFormed()"), "true");
+        // toWellFormed: each lone surrogate becomes U+FFFD, a pair is untouched.
+        assert_eq!(units_of("'a\\uDC00b'.toWellFormed()"), "0061 fffd 0062");
+        assert_eq!(
+            units_of("'\\uD83D\\uDE00\\uD800'.toWellFormed()"),
+            "d83d de00 fffd"
+        );
+        assert_eq!(units_of("'\\uD83D\\uDE00'.toWellFormed()"), "d83d de00");
+        assert_eq!(run("String.prototype.isWellFormed.length"), "0");
+        assert_eq!(run("String.prototype.toWellFormed.length"), "0");
+        // They coerce the receiver, and a nullish receiver is a TypeError.
+        assert_eq!(
+            run("String.prototype.isWellFormed.call({ toString: function() { return 'x'; } })"),
+            "true"
+        );
+        assert!(caught("String.prototype.toWellFormed.call(undefined)").starts_with("TypeError: "));
+        assert!(caught("String.prototype.isWellFormed.call(null)").starts_with("TypeError: "));
+    }
+
+    #[test]
+    fn substr_clamps_infinite_and_fractional_arguments_before_slicing() {
+        // B.2.2.1 steps 5-10: a `+Infinity` start is the end of the string, not an
+        // index, so it answers empty rather than slicing past the end.
+        assert_eq!(run("'abc'.substr(Infinity)"), "");
+        assert_eq!(run("'abc'.substr(Infinity, Infinity)"), "");
+        assert_eq!(run("'ab'.substr(Infinity, 2)"), "");
+        assert_eq!(run("'abc'.substr(-Infinity)"), "abc");
+        assert_eq!(run("'abc'.substr(-Infinity, Infinity)"), "abc");
+        assert_eq!(run("'abc'.substr(1, Infinity)"), "bc");
+        assert_eq!(run("'abc'.substr(-1)"), "c");
+        assert_eq!(run("'abc'.substr(-2, -Infinity)"), "");
+        assert_eq!(run("'abc'.substr(0, -1)"), "");
+        assert_eq!(run("'abc'.substr(NaN, 2)"), "ab");
+        assert_eq!(run("'abc'.substr(1.9, 1.9)"), "b");
+        assert_eq!(run("'abc'.substr(2, undefined)"), "c");
     }
 }

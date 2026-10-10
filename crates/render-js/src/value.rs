@@ -527,6 +527,8 @@ impl NativeFunction {
                 | Self::StrConcat
                 | Self::StrToLowerCase
                 | Self::StrToUpperCase
+                | Self::StrIsWellFormed
+                | Self::StrToWellFormed
                 | Self::StrIterator
                 // Array.prototype (ECMA-262 23.1.3): every method begins with ToObject.
                 | Self::ArrayJoin
@@ -688,6 +690,10 @@ pub(crate) enum NativeFunction {
     StrRepeat,
     StrLocaleCompare,
     StrReplaceAll,
+    /// ECMA-262 22.1.3.10 `String.prototype.isWellFormed` (ES2024).
+    StrIsWellFormed,
+    /// ECMA-262 22.1.3.32 `String.prototype.toWellFormed` (ES2024).
+    StrToWellFormed,
     StringFromCharCode,
     StringFromCodePoint,
     StringRaw,
@@ -5229,6 +5235,8 @@ impl Realm {
             ("matchAll", NativeFunction::StrMatchAll),
             ("search", NativeFunction::StrSearch),
             ("concat", NativeFunction::StrConcat),
+            ("isWellFormed", NativeFunction::StrIsWellFormed),
+            ("toWellFormed", NativeFunction::StrToWellFormed),
             ("toString", NativeFunction::StrToString),
             ("valueOf", NativeFunction::StrToString),
             ("forEach", NativeFunction::StrForEach),

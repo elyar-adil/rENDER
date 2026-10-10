@@ -405,7 +405,9 @@ impl JsRuntime {
             | NativeFunction::StrTrimEnd
             | NativeFunction::StrRepeat
             | NativeFunction::StrLocaleCompare
-            | NativeFunction::StrReplaceAll => {
+            | NativeFunction::StrReplaceAll
+            | NativeFunction::StrIsWellFormed
+            | NativeFunction::StrToWellFormed => {
                 self.dispatch_string_native(dom, function, receiver, arguments)
             }
             NativeFunction::StrSplit => self.string_split(dom, receiver, arguments),
