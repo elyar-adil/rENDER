@@ -1226,7 +1226,11 @@ impl JsRuntime {
     }
 
     /// Build one `{ value, done }` iterator result object.
-    fn iterator_result(&mut self, value: JsValue, done: bool) -> Result<JsValue, JsError> {
+    pub(in crate::runtime) fn iterator_result(
+        &mut self,
+        value: JsValue,
+        done: bool,
+    ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
         self.realm.set_property(result, "value".to_owned(), value);

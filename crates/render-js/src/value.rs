@@ -968,6 +968,7 @@ pub(crate) enum NativeFunction {
     CollectionIsSupersetOf,
     CollectionIsDisjointFrom,
     CollectionIteratorNext,
+    ArrayIteratorNext,
     TypedArraySet,
     TypedArraySubarray,
     TypedArraySlice,
@@ -1131,6 +1132,15 @@ pub(crate) enum NativeFunction {
     ArrayBufferByteLengthGetter,
     /// `ArrayBuffer.isView(arg)` (ECMA-262 25.1.5.1).
     ArrayBufferIsView,
+    /// The resizable-buffer surface of `ArrayBuffer.prototype` (ECMA-262 25.1.6):
+    /// the `resizable`, `maxByteLength` and `detached` accessors, `resize`, and
+    /// the two transfer methods.
+    ArrayBufferResizableGetter,
+    ArrayBufferMaxByteLengthGetter,
+    ArrayBufferDetachedGetter,
+    ArrayBufferResize,
+    ArrayBufferTransfer,
+    ArrayBufferTransferToFixedLength,
     GlobalStructuredClone,
     VideoPlay,
     VideoPause,
@@ -1367,6 +1377,9 @@ pub(crate) struct BufferStore {
     /// The `ArrayBuffer` object this store belongs to, once one exists. A view's
     /// `buffer` getter returns it, so the collector keeps it alive.
     object: Option<ObjectId>,
+    /// `[[ArrayBufferMaxByteLength]]` (ECMA-262 25.1.3.1). `Some` makes the
+    /// buffer resizable; `None` is a fixed-length buffer.
+    max_byte_length: Option<usize>,
 }
 
 impl PartialEq for TypedBuffer {
@@ -1390,12 +1403,70 @@ impl TypedBuffer {
         })))
     }
 
+    /// A resizable buffer of `bytes` whose `[[ArrayBufferMaxByteLength]]` is
+    /// `max_byte_length`.
+    pub(crate) fn new_resizable(bytes: Vec<u8>, max_byte_length: usize) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(BufferStore {
+            bytes,
+            max_byte_length: Some(max_byte_length),
+            ..BufferStore::default()
+        })))
+    }
+
     pub(crate) fn byte_length(&self) -> usize {
         self.0.borrow().bytes.len()
     }
 
+    /// `[[ArrayBufferMaxByteLength]]`, or `None` for a fixed-length buffer.
+    pub(crate) fn max_byte_length(&self) -> Option<usize> {
+        self.0.borrow().max_byte_length
+    }
+
+    /// Set the byte length, zero-filling any growth. The caller has checked the
+    /// new length against the maximum and the engine bound.
+    pub(crate) fn resize(&self, new_length: usize) {
+        self.0.borrow_mut().bytes.resize(new_length, 0);
+    }
+
     pub(crate) fn is_detached(&self) -> bool {
         self.0.borrow().detached
+    }
+
+    /// The element count of a view over this store, in `unit`-byte units: `start`
+    /// is the view's offset in those units and `length` its count, or `None` for
+    /// a length-tracking view. Returns `None` when the view is out of bounds or
+    /// the buffer is detached (ECMA-262 10.4.5.12 `IsTypedArrayOutOfBounds` and
+    /// `TypedArrayLength`, and 25.2.4 `IsViewOutOfBounds`).
+    pub(crate) fn view_length(
+        &self,
+        unit: usize,
+        start: usize,
+        length: Option<usize>,
+    ) -> Option<usize> {
+        let store = self.0.borrow();
+        if store.detached {
+            return None;
+        }
+        let total = store.bytes.len();
+        let begin = start * unit;
+        match length {
+            Some(length) => (begin + length * unit <= total).then_some(length),
+            None => (begin <= total).then(|| (total - begin) / unit),
+        }
+    }
+
+    /// The bytes an in-bounds view covers, or a `TypeError` when it is out of
+    /// bounds (the `ValidateTypedArray` and `GetViewValue` rule).
+    pub(crate) fn view_bytes(
+        &self,
+        unit: usize,
+        start: usize,
+        length: Option<usize>,
+    ) -> Result<Vec<u8>, JsError> {
+        let length = self.view_length(unit, start, length).ok_or_else(|| {
+            JsError::type_error("typed array or DataView is out of bounds of its ArrayBuffer")
+        })?;
+        self.read_bytes(start * unit, length * unit)
     }
 
     /// `TypeError` unless the buffer is attached: every view access starts here.
@@ -1523,6 +1594,14 @@ impl TypedBuffer {
             kind.store(value, bytes);
         }
     }
+}
+
+/// Which projection an array iterator yields: `keys`, `values` or `entries`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArrayView {
+    Keys,
+    Values,
+    Entries,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1863,6 +1942,14 @@ pub(crate) enum ObjectHost {
         kind: CollectionKind,
         entries: Vec<(JsValue, JsValue)>,
     },
+    /// A live `Array` or `TypedArray` iterator (ECMA-262 23.1.5
+    /// `CreateArrayIterator`). Each step reads the target's length, so a write or
+    /// resize during iteration is seen. `target` is `None` once exhausted.
+    ArrayIterator {
+        target: Option<ObjectId>,
+        index: usize,
+        view: ArrayView,
+    },
     CollectionIterator {
         values: Vec<JsValue>,
         index: usize,
@@ -1905,8 +1992,9 @@ pub(crate) enum ObjectHost {
         buffer: TypedBuffer,
         /// Element offset of this view within the shared buffer.
         start: usize,
-        /// Element count of this view.
-        length: usize,
+        /// Element count of this view, or `None` for a length-tracking view of
+        /// a resizable buffer, whose count follows the buffer's length.
+        length: Option<usize>,
     },
     /// A `DataView` over a byte-granular shared buffer. `byte_offset` and
     /// `byte_length` are byte positions. There is deliberately no endianness
@@ -1917,8 +2005,8 @@ pub(crate) enum ObjectHost {
         buffer: TypedBuffer,
         /// Byte offset of the view within the shared buffer.
         byte_offset: usize,
-        /// Byte length of the view.
-        byte_length: usize,
+        /// Byte length of the view, or `None` for a length-tracking view.
+        byte_length: Option<usize>,
     },
     /// An `ArrayBuffer`: the bytes that the typed-array and `DataView` families
     /// view. Every view reads and writes the same store.
@@ -3968,8 +4056,31 @@ impl Realm {
             objects,
             function_prototype,
             array_buffer_prototype,
-            &[("byteLength", NativeFunction::ArrayBufferByteLengthGetter)],
+            &[
+                ("byteLength", NativeFunction::ArrayBufferByteLengthGetter),
+                (
+                    "maxByteLength",
+                    NativeFunction::ArrayBufferMaxByteLengthGetter,
+                ),
+                ("resizable", NativeFunction::ArrayBufferResizableGetter),
+                ("detached", NativeFunction::ArrayBufferDetachedGetter),
+            ],
         );
+        for (name, function, arity) in [
+            ("resize", NativeFunction::ArrayBufferResize, 1.0),
+            ("transfer", NativeFunction::ArrayBufferTransfer, 0.0),
+            (
+                "transferToFixedLength",
+                NativeFunction::ArrayBufferTransferToFixedLength,
+                0.0,
+            ),
+        ] {
+            let method = Self::install_native_method(objects, function_prototype, function, arity);
+            objects[array_buffer_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         // §25.1.4.1 and §25.2.2.1: `ArrayBuffer(length)` and
         // `DataView(buffer [, byteOffset [, byteLength]])` both have a `length`
         // of 1.
@@ -9054,7 +9165,7 @@ impl Realm {
         kind: TypedArrayKind,
         buffer: TypedBuffer,
         start: usize,
-        length: usize,
+        length: Option<usize>,
         prototype: Option<ObjectId>,
     ) -> ObjectId {
         self.allocate(JsObject {
@@ -9086,6 +9197,19 @@ impl Realm {
                 global,
                 unicode,
                 done: false,
+            },
+            ..JsObject::default()
+        })
+    }
+
+    /// A live iterator over `target`'s indexed elements, yielding `view`.
+    pub(crate) fn array_iterator(&mut self, target: ObjectId, view: ArrayView) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.iterator_prototype),
+            host: ObjectHost::ArrayIterator {
+                target: Some(target),
+                index: 0,
+                view,
             },
             ..JsObject::default()
         })

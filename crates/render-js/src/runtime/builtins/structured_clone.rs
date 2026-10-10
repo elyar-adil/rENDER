@@ -103,9 +103,10 @@ impl JsRuntime {
                 length,
             }) => {
                 let size = kind.element_size();
-                let bytes = buffer.read_bytes(start * size, length * size)?;
+                let bytes = buffer.view_bytes(size, start, length)?;
+                let count = bytes.len() / size;
                 let prototype = self.typed_array_prototype(kind);
-                self.clone_typed_array(kind, &TypedBuffer::new(bytes), length, prototype)
+                self.clone_typed_array(kind, &TypedBuffer::new(bytes), count, prototype)
             }
             Some(ObjectHost::ArrayBufferHost(buffer)) => {
                 let bytes = buffer.bytes();
@@ -230,7 +231,7 @@ impl JsRuntime {
             kind,
             buffer.clone(),
             0,
-            length,
+            Some(length),
             prototype,
         )))
     }

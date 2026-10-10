@@ -280,8 +280,7 @@ impl JsRuntime {
         }) = self.realm.host(*object)
         {
             // The view's bytes, as they sit in the buffer.
-            let size = kind.element_size();
-            return buffer.read_bytes(start * size, length * size);
+            return buffer.view_bytes(kind.element_size(), start, length);
         }
         if let Some(ObjectHost::DataView {
             buffer,
@@ -289,7 +288,7 @@ impl JsRuntime {
             byte_length,
         }) = self.realm.host(*object)
         {
-            return buffer.read_bytes(byte_offset, byte_length);
+            return buffer.view_bytes(1, byte_offset, byte_length);
         }
         let length = self.array_like_length(dom, *object)?;
         let mut bytes = Vec::new();
@@ -457,10 +456,13 @@ impl JsRuntime {
                 "encodeInto destination must be a byte-sized typed array",
             ));
         }
+        let current = buffer
+            .view_length(1, start, length)
+            .ok_or_else(|| JsError::type_error("encodeInto destination is out of bounds"))?;
         let mut written = 0usize;
         let mut read = 0usize;
         {
-            let limit = start + length;
+            let limit = start + current;
             for character in source.chars() {
                 let scalar = if is_unpaired_surrogate(character) {
                     u32::from(REPLACEMENT)

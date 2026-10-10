@@ -320,6 +320,13 @@ pub(super) fn mark_host(
                 mark_value(runtime, marked, work, marked_environments, value);
             }
         }
+        ObjectHost::ArrayIterator {
+            target: Some(target),
+            ..
+        } => {
+            mark_object(runtime, marked, work, marked_environments, *target);
+        }
+        ObjectHost::ArrayIterator { target: None, .. } => {}
         ObjectHost::CollectionIterator { values, .. } => {
             for value in values {
                 mark_value(runtime, marked, work, marked_environments, value);

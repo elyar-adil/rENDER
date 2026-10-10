@@ -95,10 +95,7 @@ impl JsRuntime {
                     buffer,
                     start,
                     length,
-                }) => {
-                    let size = kind.element_size();
-                    bytes.extend(buffer.read_bytes(start * size, length * size)?);
-                }
+                }) => bytes.extend(buffer.view_bytes(kind.element_size(), start, length)?),
                 _ => {
                     let length = self.array_like_length(dom, *object)?;
                     if length > 0 {

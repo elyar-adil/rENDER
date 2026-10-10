@@ -4454,13 +4454,16 @@ impl JsRuntime {
                 // without consulting the prototype chain. Any other key is a
                 // method or property access.
                 if let Some(number) = crate::value::canonical_numeric_key(property) {
+                    // IsValidIntegerIndex: the index must lie below the view's
+                    // current length, which is zero-or-absent when out of bounds.
+                    let current = buffer.view_length(kind.element_size(), start, length);
                     #[allow(
                         clippy::cast_precision_loss,
                         reason = "typed-array lengths stay far below any precision boundary"
                     )]
                     let in_range = number.is_sign_positive()
                         && number.fract() == 0.0
-                        && number < length as f64;
+                        && current.is_some_and(|current| number < current as f64);
                     let element = if in_range {
                         #[allow(
                             clippy::cast_possible_truncation,
@@ -4626,6 +4629,9 @@ impl JsRuntime {
             (Some(ObjectHost::RegExp(_)), "toString") => Some(NativeFunction::RegExpToString),
             (Some(ObjectHost::CollectionIterator { .. }), "next") => {
                 Some(NativeFunction::CollectionIteratorNext)
+            }
+            (Some(ObjectHost::ArrayIterator { .. }), "next") => {
+                Some(NativeFunction::ArrayIteratorNext)
             }
             (Some(ObjectHost::IteratorHelper { .. }), "next") => {
                 Some(NativeFunction::IteratorHelperNext)
@@ -4831,15 +4837,25 @@ impl JsRuntime {
                     // Out-of-bounds indexed writes are silently ignored and
                     // never create ordinary properties, per the
                     // integer-indexed exotic object contract.
-                    // Only a valid index converts and stores. This path does not
-                    // know the receiver, and §10.4.5.5 converts an out-of-range
-                    // value only when the receiver is the typed array itself.
-                    if index < length {
-                        if kind.is_bigint() {
-                            let bigint = self.to_bigint_value(dom, &value)?;
+                    // TypedArraySetElement converts the value first and only then
+                    // checks the index against the view's current length. This
+                    // path does not know the receiver, and §10.4.5.5 converts an
+                    // out-of-range value only when the receiver is the typed array
+                    // itself.
+                    if kind.is_bigint() {
+                        let bigint = self.to_bigint_value(dom, &value)?;
+                        if buffer
+                            .view_length(kind.element_size(), start, length)
+                            .is_some_and(|current| index < current)
+                        {
                             buffer.set_bigint_element(kind, start + index, &bigint);
-                        } else {
-                            let number = to_number(&value)?;
+                        }
+                    } else {
+                        let number = to_number(&value)?;
+                        if buffer
+                            .view_length(kind.element_size(), start, length)
+                            .is_some_and(|current| index < current)
+                        {
                             buffer.set_element(kind, start + index, number);
                         }
                     }

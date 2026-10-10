@@ -222,7 +222,51 @@ fn f16_value(bits: u16) -> f64 {
     sign * magnitude
 }
 
+/// A byte or element count as a JavaScript Number. Buffer and view sizes are
+/// bounded by the engine far below the 2^53 precision limit.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "buffer and view sizes stay far below any precision boundary"
+)]
+pub(super) fn number_value(count: usize) -> JsValue {
+    JsValue::Number(count as f64)
+}
+
+/// A validated `ToIndex` result as a `usize`. `to_index_value` has already
+/// bounded it to `0..=2^53-1`, which fits a `usize` on every target.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the caller passes a value that to_index_value has bounded to a non-negative integer"
+)]
+fn usize_from(index: f64) -> usize {
+    index as usize
+}
+
+/// The length of a `DataView` that must be in bounds: `IsViewOutOfBounds` is a
+/// `TypeError` for the accessors that read or write through it.
+fn view_in_bounds(
+    buffer: &TypedBuffer,
+    byte_offset: usize,
+    byte_length: Option<usize>,
+) -> Result<usize, JsError> {
+    buffer
+        .view_length(1, byte_offset, byte_length)
+        .ok_or_else(|| JsError::type_error("DataView is out of bounds of its ArrayBuffer"))
+}
+
 impl JsRuntime {
+    /// The `ArrayBuffer` store of `receiver`, or a `TypeError` naming the
+    /// accessor that was called on something else.
+    fn array_buffer_host(&self, receiver: ObjectId, member: &str) -> Result<TypedBuffer, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::ArrayBufferHost(buffer)) => Ok(buffer),
+            _ => Err(JsError::type_error(format!(
+                "ArrayBuffer.prototype.{member} called on an incompatible receiver"
+            ))),
+        }
+    }
+
     pub(in crate::runtime) fn dispatch_data_view_native(
         &mut self,
         dom: &mut Dom,
@@ -236,16 +280,42 @@ impl JsRuntime {
                 self.is_array_buffer_view(arguments.first()),
             )),
             NativeFunction::ArrayBufferByteLengthGetter => self.array_buffer_byte_length(receiver),
+            NativeFunction::ArrayBufferResizableGetter => {
+                let buffer = self.array_buffer_host(receiver, "resizable")?;
+                Ok(JsValue::Boolean(buffer.max_byte_length().is_some()))
+            }
+            NativeFunction::ArrayBufferMaxByteLengthGetter => {
+                let buffer = self.array_buffer_host(receiver, "maxByteLength")?;
+                let length = if buffer.is_detached() {
+                    0
+                } else {
+                    buffer
+                        .max_byte_length()
+                        .unwrap_or_else(|| buffer.byte_length())
+                };
+                Ok(number_value(length))
+            }
+            NativeFunction::ArrayBufferDetachedGetter => {
+                let buffer = self.array_buffer_host(receiver, "detached")?;
+                Ok(JsValue::Boolean(buffer.is_detached()))
+            }
+            NativeFunction::ArrayBufferResize => self.array_buffer_resize(dom, receiver, arguments),
+            NativeFunction::ArrayBufferTransfer => {
+                self.array_buffer_transfer(dom, receiver, arguments, true)
+            }
+            NativeFunction::ArrayBufferTransferToFixedLength => {
+                self.array_buffer_transfer(dom, receiver, arguments, false)
+            }
             NativeFunction::DataViewBufferGetter => self.data_view_buffer(receiver),
             NativeFunction::DataViewByteLengthGetter => {
-                let (buffer, _, byte_length) = self.data_view_host(receiver)?;
-                buffer.ensure_attached()?;
-                Ok(JsValue::Number(byte_length as f64))
+                let (buffer, byte_offset, byte_length) = self.data_view_host(receiver)?;
+                let length = view_in_bounds(&buffer, byte_offset, byte_length)?;
+                Ok(number_value(length))
             }
             NativeFunction::DataViewByteOffsetGetter => {
-                let (buffer, byte_offset, _) = self.data_view_host(receiver)?;
-                buffer.ensure_attached()?;
-                Ok(JsValue::Number(byte_offset as f64))
+                let (buffer, byte_offset, byte_length) = self.data_view_host(receiver)?;
+                view_in_bounds(&buffer, byte_offset, byte_length)?;
+                Ok(number_value(byte_offset))
             }
             _ => self.data_view_access(dom, function, receiver, arguments),
         }
@@ -265,25 +335,23 @@ impl JsRuntime {
         Ok(integer)
     }
 
-    /// `new ArrayBuffer(byteLength)`: one byte per slot, so a buffer is
-    /// byte-granular and every view over it is byte-exact.
+    /// `new ArrayBuffer(byteLength[, options])`: one byte per slot, so a buffer
+    /// is byte-granular and every view over it is byte-exact. A `maxByteLength`
+    /// option makes the buffer resizable (ECMA-262 25.1.4.1).
     pub(in crate::runtime) fn array_buffer_constructor(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        // §25.1.4.1 step 2: `ToIndex(length)`.
-        let length = self.to_index_value(dom, arguments.first())?;
-        if length > Self::MAX_TYPED_ARRAY_ELEMENTS as f64 {
-            return Err(self.range_error("ArrayBuffer length exceeds the engine bound"));
+        // §25.1.4.1 steps 2-3: `ToIndex(length)`, then the options.
+        let length = usize_from(self.to_index_value(dom, arguments.first())?);
+        let max_byte_length = self.array_buffer_max_option(dom, arguments.get(1))?;
+        // §25.1.3.1 AllocateArrayBuffer: a length past the maximum is refused
+        // before the object is created.
+        if max_byte_length.is_some_and(|max| length > max) {
+            return Err(self.range_error("ArrayBuffer length exceeds maxByteLength"));
         }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "the value is validated as a non-negative integer within the engine bound"
-        )]
-        let length = length as usize;
         let prototype = self
             .realm
             .get_property(constructor, "prototype")
@@ -291,7 +359,106 @@ impl JsRuntime {
                 JsValue::Object(object) => Some(object),
                 _ => None,
             });
-        let object = self.new_array_buffer(prototype, &TypedBuffer::new(vec![0; length]))?;
+        // CreateByteDataBlock runs after the object exists (§25.1.3.1 step 5),
+        // and a size the engine cannot hold is a RangeError.
+        if length > Self::MAX_TYPED_ARRAY_ELEMENTS
+            || max_byte_length.is_some_and(|max| max > Self::MAX_TYPED_ARRAY_ELEMENTS)
+        {
+            return Err(self.range_error("ArrayBuffer size exceeds the engine bound"));
+        }
+        let bytes = vec![0; length];
+        let buffer = match max_byte_length {
+            Some(max) => TypedBuffer::new_resizable(bytes, max),
+            None => TypedBuffer::new(bytes),
+        };
+        let object = self.new_array_buffer(prototype, &buffer)?;
+        Ok(JsValue::Object(object))
+    }
+
+    /// §25.1.3.1 `GetArrayBufferMaxByteLengthOption`: the `maxByteLength` of an
+    /// options object, through `ToIndex`, or `None` when there is none.
+    fn array_buffer_max_option(
+        &mut self,
+        dom: &mut Dom,
+        options: Option<&JsValue>,
+    ) -> Result<Option<usize>, JsError> {
+        let Some(JsValue::Object(options)) = options else {
+            return Ok(None);
+        };
+        let max = self.get_member(dom, *options, "maxByteLength")?;
+        if matches!(max, JsValue::Undefined) {
+            return Ok(None);
+        }
+        let max = self.to_index_value(dom, Some(&max))?;
+        Ok(Some(usize_from(max)))
+    }
+
+    /// `ArrayBuffer.prototype.resize(newLength)` (ECMA-262 25.1.6.6). Only a
+    /// resizable buffer has the slot, so anything else is a `TypeError` before
+    /// the argument is converted.
+    fn array_buffer_resize(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let buffer = self.array_buffer_host(receiver, "resize")?;
+        let Some(max) = buffer.max_byte_length() else {
+            return Err(JsError::type_error(
+                "ArrayBuffer.prototype.resize called on a fixed-length buffer",
+            ));
+        };
+        let new_length = usize_from(self.to_index_value(dom, arguments.first())?);
+        buffer.ensure_attached()?;
+        if new_length > max || new_length > Self::MAX_TYPED_ARRAY_ELEMENTS {
+            return Err(self.range_error("new length is outside the buffer's maxByteLength"));
+        }
+        buffer.resize(new_length);
+        Ok(JsValue::Undefined)
+    }
+
+    /// `ArrayBuffer.prototype.transfer` and `transferToFixedLength`
+    /// (ECMA-262 25.1.3.3 `ArrayBufferCopyAndDetach`): a new buffer holds the
+    /// bytes, resized to `newLength`, and the receiver is detached. Only
+    /// `transfer` keeps a resizable receiver resizable.
+    fn array_buffer_transfer(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        preserve_resizability: bool,
+    ) -> Result<JsValue, JsError> {
+        let member = if preserve_resizability {
+            "transfer"
+        } else {
+            "transferToFixedLength"
+        };
+        let buffer = self.array_buffer_host(receiver, member)?;
+        let new_length = match arguments.first() {
+            None | Some(JsValue::Undefined) => buffer.byte_length(),
+            Some(value) => usize_from(self.to_index_value(dom, Some(value))?),
+        };
+        buffer.ensure_attached()?;
+        let max = if preserve_resizability {
+            buffer.max_byte_length()
+        } else {
+            None
+        };
+        if max.is_some_and(|max| new_length > max) || new_length > Self::MAX_TYPED_ARRAY_ELEMENTS {
+            return Err(self.range_error("new length is outside the buffer's maxByteLength"));
+        }
+        // The new buffer's object exists before the old one is detached, so an
+        // allocation failure leaves the receiver intact.
+        let prototype = self.array_buffer_prototype();
+        self.ensure_heap_capacity(1)?;
+        let mut bytes = buffer.bytes();
+        bytes.resize(new_length, 0);
+        let transferred = match max {
+            Some(max) => TypedBuffer::new_resizable(bytes, max),
+            None => TypedBuffer::new(bytes),
+        };
+        buffer.detach();
+        let object = self.new_array_buffer(prototype, &transferred)?;
         Ok(JsValue::Object(object))
     }
 
@@ -321,8 +488,13 @@ impl JsRuntime {
         if let Some(object) = buffer.object() {
             return Ok(object);
         }
-        let prototype = self
-            .realm
+        let prototype = self.array_buffer_prototype();
+        self.new_array_buffer(prototype, buffer)
+    }
+
+    /// `%ArrayBuffer.prototype%`, read from the global `ArrayBuffer`.
+    fn array_buffer_prototype(&self) -> Option<ObjectId> {
+        self.realm
             .global("ArrayBuffer")
             .and_then(|value| match value {
                 JsValue::Object(constructor) => self.realm.get_property(constructor, "prototype"),
@@ -331,8 +503,7 @@ impl JsRuntime {
             .and_then(|value| match value {
                 JsValue::Object(object) => Some(object),
                 _ => None,
-            });
-        self.new_array_buffer(prototype, buffer)
+            })
     }
 
     /// `DetachArrayBuffer` (ECMA-262 25.1.3.5) for an embedder, such as the
@@ -462,14 +633,14 @@ impl JsRuntime {
                 let number = self.to_number_value(dom, &value)?;
                 encode_bytes(access, number, big_endian)
             };
-            buffer.ensure_attached()?;
-            self.data_view_bounds(index, access.width(), byte_length)?;
+            let view_length = view_in_bounds(&buffer, byte_offset, byte_length)?;
+            self.data_view_bounds(index, access.width(), view_length)?;
             buffer.write_bytes(byte_offset + index as usize, &bytes);
             return Ok(JsValue::Undefined);
         }
         let big_endian = !arguments.get(1).is_some_and(JsValue::is_truthy);
-        buffer.ensure_attached()?;
-        self.data_view_bounds(index, access.width(), byte_length)?;
+        let view_length = view_in_bounds(&buffer, byte_offset, byte_length)?;
+        self.data_view_bounds(index, access.width(), view_length)?;
         // The bytes are read in view order, which is big-endian unless the
         // accessor asked otherwise; `decode_number` takes little-endian bytes.
         let mut bytes = buffer.read_bytes(byte_offset + index as usize, access.width())?;
@@ -513,8 +684,11 @@ impl JsRuntime {
     }
 
     /// The `DataView` host state of `receiver`, or a `TypeError` when it is not
-    /// a `DataView`.
-    fn data_view_host(&self, receiver: ObjectId) -> Result<(TypedBuffer, usize, usize), JsError> {
+    /// a `DataView`. The byte length is `None` for a length-tracking view.
+    fn data_view_host(
+        &self,
+        receiver: ObjectId,
+    ) -> Result<(TypedBuffer, usize, Option<usize>), JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::DataView {
                 buffer,
@@ -573,11 +747,13 @@ impl JsRuntime {
         if offset > total_value {
             return Err(self.range_error("DataView byteOffset extends past the end of the buffer"));
         }
-        // ECMAScript 25.2.5.1: an absent `byteLength` is clamped to what is
-        // left of the buffer, while a present one that does not fit is a
-        // `RangeError`.
+        // ECMAScript 25.2.2.1 steps 8-10: an absent `byteLength` views the rest
+        // of a fixed-length buffer, and tracks the length of a resizable one.
+        // A present one that does not fit is a `RangeError`.
+        let resizable = buffer.max_byte_length().is_some();
         let byte_length = match arguments.get(2) {
-            None | Some(JsValue::Undefined) => total_value - offset,
+            None | Some(JsValue::Undefined) if resizable => None,
+            None | Some(JsValue::Undefined) => Some(usize_from(total_value - offset)),
             Some(value) => {
                 let requested = self.to_index_value(dom, Some(value))?;
                 if offset + requested > total_value {
@@ -585,15 +761,10 @@ impl JsRuntime {
                         self.range_error("DataView byteLength extends past the end of the buffer")
                     );
                 }
-                requested
+                Some(usize_from(requested))
             }
         };
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "both values are validated against the buffer length"
-        )]
-        let (offset, byte_length) = (offset as usize, byte_length as usize);
+        let offset = usize_from(offset);
         let prototype = self
             .realm
             .get_property(constructor, "prototype")
@@ -1109,5 +1280,169 @@ mod tests {
         assert_eq!(half, vec![0x3f, 0x00, 0x00, 0x00]);
         half.reverse();
         assert_eq!(decode_number(Access::Float32, &half), 0.5);
+    }
+
+    /// Expectations measured against Node v22 running the same probe, so a
+    /// divergence is an engine change: resize growth and truncation, the
+    /// length-tracking and fixed views that follow or leave bounds, the
+    /// `maxByteLength` option, and `transfer` with its detach.
+    #[test]
+    fn a_resizable_buffer_resizes_and_its_views_follow_or_leave_bounds() {
+        assert_eq!(
+            run(r"
+(function () {
+function thrown(fn) {
+  try { fn(); return 'none'; } catch (e) { return e.constructor.name; }
+}
+var out = [];
+var rab = new ArrayBuffer(4, { maxByteLength: 8 });
+out.push(rab.resizable, rab.maxByteLength, rab.byteLength, rab.detached);
+var fixed = new ArrayBuffer(4);
+out.push(fixed.resizable, fixed.maxByteLength, typeof fixed.resize, fixed.transfer.length, fixed.resize.length);
+var u8 = new Uint8Array(rab);
+var u8fixed = new Uint8Array(rab, 0, 4);
+var u8off = new Uint8Array(rab, 2);
+for (var i = 0; i < 4; i++) u8[i] = i + 1;
+out.push(u8.length, u8fixed.length, u8off.length);
+rab.resize(6);
+out.push('grow', rab.byteLength, u8.length, u8fixed.length, u8off.length, u8[5], u8[4], Array.from(u8).join(','));
+rab.resize(3);
+out.push('shrink3', u8.length, u8fixed.length, u8off.length, u8fixed.byteLength, u8fixed.byteOffset, u8off.byteOffset, u8[2], u8[3]);
+rab.resize(1);
+out.push('shrink1', u8.length, u8.byteLength, u8.byteOffset, u8fixed.length, u8off.length, u8off.byteOffset, u8off.byteLength);
+out.push('oob get', String(u8fixed[0]), 'set', (u8fixed[0] = 9, u8fixed[0]));
+rab.resize(8);
+out.push('regrow', u8fixed.length, u8off.length, u8[7], u8fixed[0], u8off[0]);
+out.push('resize too big', thrown(function () { rab.resize(9); }));
+out.push('resize fixed', thrown(function () { fixed.resize(2); }));
+out.push('resize detached-like', thrown(function () { ArrayBuffer.prototype.resize.call(fixed, 1); }));
+rab.resize(2);
+var dv = new DataView(rab);
+var dvfixed = new DataView(rab, 0, 2);
+out.push('dv', dv.byteLength, dv.byteOffset, dvfixed.byteLength);
+rab.resize(5);
+out.push('dv grow', dv.byteLength, dvfixed.byteLength);
+rab.resize(1);
+out.push('dv oob', thrown(function () { return dvfixed.byteLength; }), thrown(function () { return dvfixed.byteOffset; }), thrown(function () { dvfixed.getUint8(0); }), dv.byteLength, dv.buffer === rab);
+out.push('ctor oob', thrown(function () { new Uint8Array(rab, 2); }), thrown(function () { new DataView(rab, 2); }));
+var lt = new Uint16Array(rab);
+out.push('u16 tracking', thrown(function () { new Uint16Array(rab, 0); }) );
+rab.resize(0);
+out.push('empty tracking', lt.length, lt.byteLength);
+rab.resize(8);
+out.push('u16 fixed buffer rule', new Uint16Array(new ArrayBuffer(4)).length);
+var t = new ArrayBuffer(4, { maxByteLength: 8 });
+new Uint8Array(t).set([1, 2, 3, 4]);
+var moved = t.transfer();
+out.push('transfer', t.detached, t.byteLength, t.maxByteLength, moved.byteLength, moved.resizable, moved.maxByteLength, Array.from(new Uint8Array(moved)).join(','));
+out.push('transfer detached', thrown(function () { t.transfer(); }), thrown(function () { t.slice(0); }));
+var m2 = moved.transfer(6);
+out.push('transfer grow', m2.byteLength, Array.from(new Uint8Array(m2)).join(','), m2.resizable);
+var fx = m2.transferToFixedLength(2);
+out.push('tofixed', fx.byteLength, fx.resizable, fx.maxByteLength, m2.detached);
+out.push('maxByteLength detached', m2.maxByteLength, m2.byteLength, m2.detached);
+out.push('max too large', thrown(function () { new ArrayBuffer(0, { maxByteLength: 9007199254740991 }); }));
+out.push('len over max', thrown(function () { new ArrayBuffer(5, { maxByteLength: 4 }); }));
+out.push('opt null', new ArrayBuffer(2, null).resizable, 'opt undef', new ArrayBuffer(2, { maxByteLength: undefined }).resizable);
+out.push('transfer no arg', new ArrayBuffer(3, { maxByteLength: 8 }).transfer().byteLength);
+return out.join(' | ');
+})()
+            "),
+            "true | 8 | 4 | false | false | 4 | function | 0 | 1 | 4 | 4 | 2 | grow | 6 | 6 | 4 | 4 | 0 | 0 | 1,2,3,4,0,0 | shrink3 | 3 | 0 | 1 | 0 | 0 | 2 | 3 |  | shrink1 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | oob get | undefined | set |  | regrow | 4 | 6 | 0 | 1 | 0 | resize too big | RangeError | resize fixed | TypeError | resize detached-like | TypeError | dv | 2 | 0 | 2 | dv grow | 5 | 2 | dv oob | TypeError | TypeError | TypeError | 1 | true | ctor oob | RangeError | RangeError | u16 tracking | none | empty tracking | 0 | 0 | u16 fixed buffer rule | 2 | transfer | true | 0 | 0 | 4 | true | 8 | 1,2,3,4 | transfer detached | TypeError | TypeError | transfer grow | 6 | 1,2,3,4,0,0 | true | tofixed | 2 | false | 2 | true | maxByteLength detached | 0 | 0 | true | max too large | RangeError | len over max | RangeError | opt null | false | opt undef | false | transfer no arg | 3"
+        );
+    }
+
+    /// Array and typed-array iterators read their target's length at each step,
+    /// so a write or a resize during iteration is seen (ECMA-262 23.1.5.2.1), and
+    /// an out-of-bounds typed array is a `TypeError` at the step that reads it.
+    /// Expectations were measured against Node v22 running the same program.
+    #[test]
+    fn array_iterators_read_the_live_length_at_each_step() {
+        assert_eq!(
+            run(r"
+(function () {
+function thrown(fn) {
+  try { fn(); return 'none'; } catch (e) { return e.constructor.name; }
+}
+var out = [];
+var a = [1, 2, 3];
+var it = a.values();
+it.next();
+a.push(4);
+out.push('arr live', it.next().value, it.next().value, it.next().done);
+a.push(5);
+out.push('done stays', it.next().done, it.next().value);
+var k = [7, 8].keys();
+out.push('keys', k.next().value, k.next().value, k.next().done);
+var e = ['x'].entries();
+out.push('entries', e.next().value.join(':'), e.next().done);
+var rab = new ArrayBuffer(4, { maxByteLength: 8 });
+var ta = new Uint8Array(rab);
+for (var i = 0; i < 4; i++) ta[i] = i + 1;
+var seen = [];
+var vit = ta.values();
+seen.push(vit.next().value);
+rab.resize(2);
+seen.push(String(vit.next().value), vit.next().done);
+out.push('ta values', seen.join(','));
+rab.resize(6);
+var seen2 = [];
+for (var x of ta.values()) seen2.push(x);
+out.push('for-of resized', seen2.join(','));
+var fixed = new Uint8Array(rab, 0, 4);
+var fit = fixed.keys();
+fit.next();
+rab.resize(3);
+out.push('fixed keys oob', thrown(function () { fit.next(); }));
+var eit = new Uint8Array(rab).entries();
+out.push('entries len', eit.next().value.join(':'));
+var oob = fixed;
+out.push('values oob at creation', thrown(function () { oob.values(); }), thrown(function () { oob.keys(); }));
+var grow = new Uint8Array(new ArrayBuffer(2, { maxByteLength: 4 }));
+var git = grow.values();
+git.next();
+grow.buffer.resize(4);
+out.push('grow visit', git.next().value, git.next().value, git.next().done);
+out.push('array-like done', [].values().next().done);
+out.push('spread', [...new Uint8Array(new ArrayBuffer(3))].join(','));
+out.push('from iterable', Array.from([5, 6].entries()).map(function (p) { return p.join(':'); }).join(' '));
+return out.join(' | ');
+})()
+            "),
+            "arr live | 2 | 3 | false | done stays | false |  | keys | 0 | 1 | true | entries | 0:x | true | ta values | 1,2,true | for-of resized | 1,2,0,0,0,0 | fixed keys oob | TypeError | entries len | 0:1 | values oob at creation | TypeError | TypeError | grow visit | 0 | 0 | false | array-like done | true | spread | 0,0,0 | from iterable | 0:5 1:6"
+        );
+    }
+
+    /// `fill` converts its value and range before it writes, and those conversions
+    /// can resize the buffer: a fixed-length view that is now out of bounds is a
+    /// `TypeError`, and a length-tracking view clamps its end to the new length
+    /// (ECMA-262 23.2.3.9 steps 7-9). Measured against Node v22.
+    #[test]
+    fn fill_revalidates_the_view_after_its_arguments_resize_the_buffer() {
+        assert_eq!(
+            run(r"
+(function () {
+var out = [];
+function attempt(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var rab = new ArrayBuffer(4, { maxByteLength: 8 });
+var fixed = new Uint8Array(rab, 0, 4);
+out.push(attempt(function () {
+  fixed.fill(3, { valueOf: function () { rab.resize(2); return 1; } }, 2);
+}));
+var rab2 = new ArrayBuffer(4, { maxByteLength: 8 });
+var lt = new Uint8Array(rab2);
+out.push(attempt(function () {
+  lt.fill(3, 1, { valueOf: function () { rab2.resize(2); return 4; } });
+}));
+out.push(Array.from(lt).join(','));
+out.push(attempt(function () {
+  lt.fill({ valueOf: function () { rab2.resize(1); return 9; } }, 0, 2);
+}));
+out.push(Array.from(new Uint8Array(rab2)).join(','));
+return out.join(' | ');
+})()
+            "),
+            "TypeError | none | 0,3 | none | 9"
+        );
     }
 }

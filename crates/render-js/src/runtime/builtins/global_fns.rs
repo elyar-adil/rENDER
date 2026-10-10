@@ -232,7 +232,13 @@ impl JsRuntime {
             | NativeFunction::DataViewByteOffsetGetter
             | NativeFunction::ArrayBufferSlice
             | NativeFunction::ArrayBufferIsView
-            | NativeFunction::ArrayBufferByteLengthGetter => {
+            | NativeFunction::ArrayBufferByteLengthGetter
+            | NativeFunction::ArrayBufferResizableGetter
+            | NativeFunction::ArrayBufferMaxByteLengthGetter
+            | NativeFunction::ArrayBufferDetachedGetter
+            | NativeFunction::ArrayBufferResize
+            | NativeFunction::ArrayBufferTransfer
+            | NativeFunction::ArrayBufferTransferToFixedLength => {
                 self.dispatch_encoding_native(dom, function, receiver, arguments)
             }
             NativeFunction::GlobalStructuredClone => {
@@ -652,7 +658,8 @@ impl JsRuntime {
             }
             NativeFunction::ArrayValues
             | NativeFunction::ArrayKeys
-            | NativeFunction::ArrayEntries => {
+            | NativeFunction::ArrayEntries
+            | NativeFunction::ArrayIteratorNext => {
                 self.dispatch_array_native(dom, function, receiver, arguments)
             }
             NativeFunction::GeneratorNext => self.generator_resume(

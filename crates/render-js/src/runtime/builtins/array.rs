@@ -35,6 +35,7 @@ use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_number;
 use crate::runtime::convert::uint32_of_number;
 use crate::utf16;
+use crate::value::ArrayView;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -54,6 +55,7 @@ impl JsRuntime {
             NativeFunction::ArrayValues => self.array_view_iterator(receiver, ArrayView::Values),
             NativeFunction::ArrayKeys => self.array_view_iterator(receiver, ArrayView::Keys),
             NativeFunction::ArrayEntries => self.array_view_iterator(receiver, ArrayView::Entries),
+            NativeFunction::ArrayIteratorNext => self.array_iterator_next(dom, receiver),
             NativeFunction::ArraySplice => self.array_splice(dom, receiver, arguments),
             NativeFunction::ArrayReverse => self.array_reverse(dom, receiver),
             NativeFunction::ArrayAt => self.array_at(dom, receiver, arguments),
@@ -126,12 +128,13 @@ pub(in crate::runtime) fn callback_this_argument(arguments: &[JsValue]) -> JsVal
     arguments.get(1).cloned().unwrap_or(JsValue::Undefined)
 }
 
-/// Which indexed projection `Array.prototype.keys/values/entries` produces.
-#[derive(Clone, Copy)]
-pub(in crate::runtime) enum ArrayView {
-    Keys,
-    Values,
-    Entries,
+/// An iterator index as a JavaScript Number. Indices stay far below 2^53.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "iterator indices stay far below any precision boundary"
+)]
+fn index_number(index: usize) -> JsValue {
+    JsValue::Number(index as f64)
 }
 
 /// The per-element behaviour shared by the callback-driven iteration methods.
@@ -406,9 +409,14 @@ impl JsRuntime {
             return self.proxy_has(dom, object, &index_key(index));
         }
         Ok(match self.realm.host(object) {
-            Some(ObjectHost::TypedArray { buffer, length, .. }) => {
-                index < length as f64 && !buffer.is_detached()
-            }
+            Some(ObjectHost::TypedArray {
+                buffer,
+                kind,
+                start,
+                length,
+            }) => buffer
+                .view_length(kind.element_size(), start, length)
+                .is_some_and(|current| index < current as f64),
             Some(ObjectHost::StringPrimitive(text)) => index < utf16::utf16_length(&text) as f64,
             _ => self.realm.get_property(object, &index_key(index)).is_some(),
         })
@@ -807,68 +815,78 @@ impl JsRuntime {
         Ok(JsValue::String(output))
     }
 
-    /// `Array.prototype.keys/values/entries`: a materialized indexed iterator
-    /// whose prototype carries the iterator-helper methods.
+    /// `Array.prototype.keys/values/entries` and the `TypedArray` counterparts: a
+    /// live iterator over `receiver`, read at each step (ECMA-262 23.1.5.1
+    /// `CreateArrayIterator`), so a write or resize during iteration is seen.
     pub(in crate::runtime) fn array_view_iterator(
         &mut self,
         receiver: ObjectId,
         view: ArrayView,
     ) -> Result<JsValue, JsError> {
-        let elements = self.array_elements(receiver)?;
-        let values = match view {
-            ArrayView::Values => elements,
-            ArrayView::Keys => elements
-                .iter()
-                .enumerate()
-                .map(|(index, _)| JsValue::Number(index as f64))
-                .collect(),
-            ArrayView::Entries => {
-                let mut values = Vec::with_capacity(elements.len());
-                for (index, element) in elements.iter().enumerate() {
-                    let pair = self.create_array_from_values(&[
-                        JsValue::Number(index as f64),
-                        element.clone(),
-                    ])?;
-                    values.push(JsValue::Object(pair));
-                }
-                values
-            }
-        };
         self.ensure_heap_capacity(1)?;
-        Ok(JsValue::Object(self.realm.collection_iterator(values)))
+        Ok(JsValue::Object(self.realm.array_iterator(receiver, view)))
     }
 
-    /// Read all indexed elements (holes become `undefined`), for the iterator
-    /// views. Lengths above the materialization bound are a catchable error.
-    pub(in crate::runtime) fn array_elements(
-        &self,
+    /// `%ArrayIteratorPrototype%.next` (ECMA-262 23.1.5.2.1): reads the target's
+    /// length, which is a `TypeError` for an out-of-bounds typed array, and yields
+    /// the element at the iterator's index. Once exhausted, the iterator stays done.
+    pub(in crate::runtime) fn array_iterator_next(
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
-    ) -> Result<Vec<JsValue>, JsError> {
-        let length = self.array_length(receiver)?;
-        if length as usize > MAX_MATERIALIZED_ELEMENTS {
-            return Err(JsError::resource(
-                "array length exceeds the materialization bound",
-            ));
+    ) -> Result<JsValue, JsError> {
+        let Some(ObjectHost::ArrayIterator {
+            target,
+            index,
+            view,
+        }) = self.realm.host(receiver)
+        else {
+            return Err(JsError::type_error("incompatible array iterator receiver"));
+        };
+        let Some(target) = target else {
+            return self.iterator_result(JsValue::Undefined, true);
+        };
+        let length = if matches!(self.realm.host(target), Some(ObjectHost::TypedArray { .. })) {
+            let (_, _, _, current) = self.typed_array_parts(target)?;
+            current.ok_or_else(|| {
+                JsError::type_error("typed array is out of bounds of its resized ArrayBuffer")
+            })?
+        } else {
+            self.array_like_length(dom, target)?
+        };
+        if index >= length {
+            if let Some(ObjectHost::ArrayIterator { target, .. }) = self.realm.host_mut(receiver) {
+                *target = None;
+            }
+            return self.iterator_result(JsValue::Undefined, true);
         }
-        let mut elements = Vec::new();
-        elements
-            .try_reserve_exact(length as usize)
-            .map_err(|_| JsError::resource("array exceeds the available heap"))?;
-        for index in 0..length {
-            elements.push(
-                self.realm
-                    .get_property(receiver, &index.to_string())
-                    .or_else(|| match self.realm.host(receiver) {
-                        Some(ObjectHost::StringPrimitive(text)) => utf16::utf16_units(&text)
-                            .get(index as usize)
-                            .copied()
-                            .map(|unit| JsValue::String(utf16::string_from_unit(unit))),
-                        _ => None,
-                    })
-                    .unwrap_or(JsValue::Undefined),
-            );
+        let value = match view {
+            ArrayView::Keys => index_number(index),
+            ArrayView::Values => self.array_iterator_element(dom, target, index)?,
+            ArrayView::Entries => {
+                let element = self.array_iterator_element(dom, target, index)?;
+                let pair = self.create_array_from_values(&[index_number(index), element])?;
+                JsValue::Object(pair)
+            }
+        };
+        if let Some(ObjectHost::ArrayIterator { index: next, .. }) = self.realm.host_mut(receiver) {
+            *next = index + 1;
         }
-        Ok(elements)
+        self.iterator_result(value, false)
+    }
+
+    /// The element an array iterator reads at `index`: [[Get]] for a typed array
+    /// (`undefined` past its current bounds) and for anything else.
+    fn array_iterator_element(
+        &mut self,
+        dom: &mut Dom,
+        target: ObjectId,
+        index: usize,
+    ) -> Result<JsValue, JsError> {
+        if matches!(self.realm.host(target), Some(ObjectHost::TypedArray { .. })) {
+            return Ok(self.typed_array_get_index(target, index));
+        }
+        self.get_index(dom, target, index as f64)
     }
 
     /// `Array.prototype.indexOf` (§23.1.3.17).
