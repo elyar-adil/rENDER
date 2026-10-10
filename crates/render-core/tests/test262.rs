@@ -924,8 +924,11 @@ fn run_variant(
 
 /// Captures what the harness prints. `$DONE` (from `doneprintHandle.js`)
 /// reports an async test's outcome through `print`.
-const PRINT_SHIM: &str = "var __test262_printed = []; function print(message) { __test262_printed.push(String(message)); }";
-const PRINTED_LOG: &str = "__test262_printed.join('\\n')";
+// The shim accumulates text rather than pushing into an array: an array write is a
+// [[Set]] that a test may have intercepted with an inherited setter, and that must not
+// break the host's own reporting (INTERPRETING.md "Asynchronous Tests").
+const PRINT_SHIM: &str = "var __test262_printed = ''; function print(message) { __test262_printed += String(message) + '\\n'; }";
+const PRINTED_LOG: &str = "__test262_printed";
 
 /// ECMA-262 `async` tests (INTERPRETING.md "Asynchronous Tests"): run the
 /// script, then every queued job, and only then read what `$DONE` printed. The
