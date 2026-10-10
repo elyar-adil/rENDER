@@ -1026,6 +1026,84 @@ fn class_methods_have_no_prototype_and_accessors_take_prefixed_names() {
 }
 
 #[test]
+fn private_elements_cannot_be_added_to_a_non_extensible_object() {
+    // PrivateFieldAdd and PrivateMethodOrAccessorAdd: a base constructor that
+    // sealed the instance leaves no room for the subclass's private elements.
+    for source in [
+        "class B { constructor(s) { if (s) Object.preventExtensions(this); } } class C extends B { #v = 1; } new C(true)",
+        "class B { constructor(s) { if (s) Object.preventExtensions(this); } } class C extends B { #m() {} m() { return this.#m; } } new C(true)",
+    ] {
+        assert_eq!(
+            ok(&format!(
+                "var r; try {{ {source}; r = 'no'; }} catch (e) {{ r = e.name; }} r"
+            )),
+            "TypeError",
+            "{source}"
+        );
+    }
+    assert_eq!(
+        ok(
+            "class B { constructor(s) { if (s) Object.preventExtensions(this); } } class C extends B { #v = 1; v() { return this.#v; } } new C(false).v()"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn class_heritage_must_be_a_constructor() {
+    // §15.7.14 step 6.a: IsConstructor(superclass) must hold. Arrows, methods,
+    // generators, and async functions have no [[Construct]].
+    for source in [
+        "class C extends (() => {}) {}",
+        "class C extends (async function () {}) {}",
+        "class C extends (function* () {}) {}",
+        "class C extends ({ m() {} }).m {}",
+        "class A { m() {} } class C extends A.prototype.m {}",
+    ] {
+        assert_eq!(
+            ok(&format!(
+                "var r; try {{ {source} }} catch (e) {{ r = e.name; }} r"
+            )),
+            "TypeError",
+            "{source}"
+        );
+    }
+    assert_eq!(
+        ok("function F() {} class C extends F {} new C() instanceof F"),
+        "true"
+    );
+    assert_eq!(ok("class C extends Symbol {} typeof C"), "function");
+}
+
+#[test]
+fn class_inner_name_rejects_assignment_in_members() {
+    for source in [
+        "class C { get x() { C = 42; } }; new C().x",
+        "class C { set x(_) { C = 42; } }; new C().x = 15;",
+        "(new (class C { get x() { C = 42; } })).x",
+        "(new (class C { set x(_) { C = 42; } })).x = 15;",
+    ] {
+        assert_eq!(
+            ok(&format!(
+                "var r; try {{ {source} }} catch (e) {{ r = e.name; }} r"
+            )),
+            "TypeError",
+            "{source}"
+        );
+    }
+    assert_eq!(
+        ok("var r; try { class C { m() { C = 42; } } new C().m(); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { class C { constructor() { C = 42; } } new C(); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
 fn this_before_super_is_a_reference_error_in_every_position() {
     assert_eq!(
         ok(

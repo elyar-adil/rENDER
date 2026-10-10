@@ -155,7 +155,15 @@ impl JsRuntime {
                 let value = self.evaluate(dom, expression)?;
                 match value {
                     JsValue::Null => (None, None),
-                    JsValue::Object(object) if Self::is_callable_object(object, &self.realm) => {
+                    // A user arrow, method, generator, or async function has no
+                    // [[Construct]], so it cannot be extended (§15.7.14 step 6.a).
+                    JsValue::Object(object)
+                        if Self::is_callable_object(object, &self.realm)
+                            && (!matches!(
+                                self.realm.host(object),
+                                Some(ObjectHost::UserFunction(_))
+                            ) || self.is_constructor(object)) =>
+                    {
                         // `Get(superclass, "prototype")` runs a getter, and the
                         // result must be an object or null (§15.7.14 step 7.a).
                         let prototype = match self.get_value(dom, object, "prototype")? {
@@ -638,9 +646,13 @@ impl JsRuntime {
             .map(|prototype| self.realm.private_method_entries(prototype))
             .unwrap_or_default();
         for (id, descriptor) in methods {
-            if self.realm.has_own_private_element(instance, id) {
+            // PrivateMethodOrAccessorAdd: a non-extensible object takes no new
+            // private elements, so the element cannot be added.
+            if self.realm.has_own_private_element(instance, id)
+                || !self.realm.is_extensible(instance)
+            {
                 return Err(JsError::type_error(
-                    "private methods are already initialized on this object",
+                    "private methods cannot be added to this object",
                 ));
             }
             self.realm.define_private_method(instance, id, descriptor);
@@ -677,9 +689,12 @@ impl JsRuntime {
                         // PrivateFieldAdd (ECMA-262 7.3.29): an element the
                         // object already has (from a base constructor that
                         // returned it) is an error, not an overwrite.
-                        if runtime.realm.has_own_private_element(instance, *id) {
+                        // PrivateFieldAdd likewise refuses a non-extensible object.
+                        if runtime.realm.has_own_private_element(instance, *id)
+                            || !runtime.realm.is_extensible(instance)
+                        {
                             return Err(JsError::type_error(
-                                "private field is already initialized on this object",
+                                "private field cannot be added to this object",
                             ));
                         }
                         runtime.realm.set_private_field(instance, *id, value);
