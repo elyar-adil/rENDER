@@ -2336,8 +2336,12 @@ fn promise_prototype_is_real_and_overridable() {
             .invoke_microtask(&mut parsed.dom, microtask)
             .expect("microtask executes");
     }
+    // `finally` invokes `then` on the promise (ECMA-262 27.2.5.3 step 7), and so
+    // does its `thenFinally` on the promise it resolves (step 1.a.vi), so the
+    // overridden `then` counts: one call from the first `then`, one from
+    // `finally`, one from `thenFinally`, and ten from the `onFinally` callback.
     let outcome = runtime
-        .execute(&mut parsed.dom, "results.join(',') + ':' + (calls === 11)")
+        .execute(&mut parsed.dom, "results.join(',') + ':' + (calls === 13)")
         .expect("results read executes");
     assert_eq!(
         outcome.value,
@@ -4644,6 +4648,102 @@ fn define_properties_reads_symbol_keyed_descriptors_and_inherited_fields() {
         )
         .expect("symbol-keyed descriptors should execute");
     assert_eq!(outcome.value, JsValue::String("5|9".to_owned()));
+}
+
+#[test]
+fn a_resolve_with_a_thenable_adopts_it_through_its_then_and_the_first_settlement_wins() {
+    assert_eq!(
+        settle_then_read(
+            "var out = []; var p = new Promise(function (resolve, reject) { resolve({ then: function (fulfil) { out.push('then'); fulfil(7); } }); reject('late'); }); p.then(function (v) { out.push('value:' + v); }, function () { out.push('rejected'); });",
+            "",
+            "out.join(',')",
+        ),
+        "then,value:7"
+    );
+}
+
+#[test]
+fn then_ignores_a_handler_that_is_not_callable_and_passes_the_value_through() {
+    assert_eq!(
+        settle_then_read(
+            "var out = 'none'; Promise.resolve(3).then(5).then(function (v) { out = 'value:' + v; });",
+            "",
+            "out",
+        ),
+        "value:3"
+    );
+}
+
+#[test]
+fn a_static_on_a_custom_constructor_settles_through_the_capability_its_executor_captured() {
+    assert_eq!(
+        settle_then_read(
+            "var log = []; function Custom(executor) { log.push('construct'); executor(function (value) { log.push('resolve:' + value); }, function (reason) { log.push('reject:' + reason); }); } Promise.resolve.call(Custom, 4); Promise.reject.call(Custom, 'no'); Promise.try.call(Custom, function () { return 'tried'; });",
+            "",
+            "log.join(',')",
+        ),
+        "construct,resolve:4,construct,reject:no,construct,resolve:tried"
+    );
+}
+
+#[test]
+fn then_builds_its_result_through_the_species_constructor() {
+    assert_eq!(
+        settle_then_read(
+            "class Sub extends Promise {} var out = []; var derived = Sub.resolve(1).then(function (v) { return v + 1; }); out.push(derived instanceof Sub); derived.then(function (v) { out.push(v); }); out.push(Promise[Symbol.species] === Promise);",
+            "",
+            "out.join(',')",
+        ),
+        "true,true,2"
+    );
+}
+
+#[test]
+fn catch_and_finally_call_the_then_their_receiver_provides() {
+    assert_eq!(
+        settle_then_read(
+            "var out = []; var receiver = { then: function (onFulfilled, onRejected) { out.push(typeof onFulfilled + '/' + typeof onRejected); return 'from-then'; } }; out.push(Promise.prototype.catch.call(receiver, function () {})); out.push(Promise.prototype.finally.call(receiver, function () {}));",
+            "",
+            "out.join('|')",
+        ),
+        "undefined/function|from-then|function/function|from-then"
+    );
+}
+
+#[test]
+fn combinator_and_finally_handlers_carry_the_length_and_empty_name_of_a_builtin() {
+    assert_eq!(
+        settle_then_read(
+            "var seen = []; var original = Promise.prototype.then; Promise.prototype.then = function (a, b) { seen.push(a.length + ':' + JSON.stringify(a.name) + ':' + b.length); return original.call(this, a, b); }; Promise.all([Promise.resolve(1)]); Promise.resolve(2).finally(function () {});",
+            "",
+            "seen.join('|')",
+        ),
+        "1:\"\":1|1:\"\":1"
+    );
+}
+
+#[test]
+fn promise_prototype_to_string_tag_is_read_only() {
+    assert_eq!(
+        settle_then_read(
+            "var descriptor = Object.getOwnPropertyDescriptor(Promise.prototype, Symbol.toStringTag); var out = descriptor.writable + ':' + descriptor.enumerable + ':' + descriptor.configurable + ':' + descriptor.value;",
+            "",
+            "out",
+        ),
+        "false:false:true:Promise"
+    );
+}
+
+#[test]
+fn promise_all_keyed_copies_enumerable_symbol_keys_and_skips_hidden_ones() {
+    assert_eq!(
+        settle_then_read(
+            "var s = Symbol('k'); var hidden = Symbol('h'); var input = { a: 1 }; input[s] = Promise.resolve(2); Object.defineProperty(input, hidden, { value: 9, enumerable: false }); var out = 'pending'; Promise.allKeyed(input).then(function (r) { out = r.a + ':' + r[s] + ':' + Object.getOwnPropertySymbols(r).length; });",
+            "",
+            "out",
+        ),
+        "1:2:1"
+    );
 }
 
 #[test]

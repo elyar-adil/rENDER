@@ -48,7 +48,6 @@ use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
 use crate::runtime::convert::abstract_equal;
 use crate::runtime::convert::bitwise_binary;
 use crate::runtime::convert::relational_compare;
-use crate::runtime::convert::required_argument;
 use crate::runtime::convert::shift_left;
 use crate::runtime::convert::shift_right;
 use crate::runtime::convert::strict_equal;
@@ -5076,31 +5075,7 @@ impl JsRuntime {
             Some(ObjectHost::AggregateErrorConstructor) => {
                 self.aggregate_error_constructor(dom, constructor, arguments)
             }
-            Some(ObjectHost::PromiseConstructor) => {
-                let executor = Self::require_callable_object(
-                    required_argument(arguments, 0, "Promise")?,
-                    &self.realm,
-                )?;
-                let (promise, value) = self.create_promise()?;
-                self.ensure_heap_capacity(2)?;
-                let resolve = self.realm.promise_settler(promise, true);
-                let reject = self.realm.promise_settler(promise, false);
-                if let Err(error) = self.call(
-                    dom,
-                    executor,
-                    &[JsValue::Object(resolve), JsValue::Object(reject)],
-                ) {
-                    if error.kind() == JsErrorKind::ResourceLimit {
-                        return Err(error);
-                    }
-                    let reason = error
-                        .thrown_value()
-                        .cloned()
-                        .unwrap_or_else(|| JsValue::String(error.to_string()));
-                    self.reject_promise(promise, &reason);
-                }
-                Ok(value)
-            }
+            Some(ObjectHost::PromiseConstructor) => self.construct_promise(dom, arguments),
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
             Some(ObjectHost::DomNodeConstructor(kind)) => {
                 self.construct_dom_node(dom, kind, arguments)
@@ -5594,13 +5569,13 @@ impl JsRuntime {
                 let _ = self.close_iterator_object(dom, iterator);
                 Err(JsError::thrown(reason))
             }
-            Some(ObjectHost::PromiseSettler { promise, fulfilled }) => {
+            Some(ObjectHost::PromiseSettler {
+                promise,
+                fulfilled,
+                pair,
+            }) => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-                if fulfilled {
-                    self.resolve_promise_value(promise, &value)?;
-                } else {
-                    self.reject_promise(promise, &value);
-                }
+                self.call_promise_settler(dom, promise, fulfilled, pair, &value)?;
                 Ok(JsValue::Undefined)
             }
             _ => Err(JsError::type_error(format!(
@@ -5923,19 +5898,6 @@ impl JsRuntime {
         self.call_stack.pop();
         self.transient_roots.truncate(pinned);
         result
-    }
-
-    pub(super) fn optional_callable(
-        &self,
-        value: Option<&JsValue>,
-    ) -> Result<Option<ObjectId>, JsError> {
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        if matches!(value, JsValue::Undefined | JsValue::Null) {
-            return Ok(None);
-        }
-        Self::require_callable_object(value, &self.realm).map(Some)
     }
 
     pub(super) fn require_callable_object(

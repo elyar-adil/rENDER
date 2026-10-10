@@ -129,6 +129,9 @@ pub struct JsRuntime {
     /// Counter allocating class-unique private-name ids.
     next_private_id: u64,
     promises: Vec<PromiseRecord>,
+    /// The `alreadyResolved` flag of each resolving-function pair, indexed by
+    /// the pair number a settlement function carries.
+    promise_pairs_resolved: Vec<bool>,
     pending_microtasks: Vec<JsMicrotask>,
     event_listeners: BTreeMap<NodeId, BTreeMap<String, Vec<types::Listener>>>,
     /// Per-event dispatch state, present only while the event is dispatched.
@@ -253,6 +256,7 @@ impl JsRuntime {
             arrays_joining: Vec::new(),
             next_private_id: 1,
             promises: Vec::new(),
+            promise_pairs_resolved: Vec::new(),
             pending_microtasks: Vec::new(),
             event_listeners: BTreeMap::new(),
             event_flags: BTreeMap::new(),
@@ -568,9 +572,6 @@ impl JsRuntime {
     /// microtask checkpoint); a failure rejects the promise with a
     /// `TypeError` or fires the `readystatechange`/`error` callbacks.
     pub fn settle_fetch(&mut self, dom: &mut Dom, id: u64, outcome: Result<FetchOutcome, String>) {
-        // The DOM handle is reserved for future direct event dispatch;
-        // settlement only enqueues microtasks today.
-        let _ = dom;
         let promise_index = self.pending_fetch_promises.remove(&id);
         let Some(target) = self.pending_fetch_targets.remove(&id) else {
             return;
@@ -583,7 +584,7 @@ impl JsRuntime {
                 match outcome {
                     Ok(outcome) => match self.build_response_value(&outcome) {
                         Ok(value) => {
-                            let _ = self.resolve_promise_value(promise_index, &value);
+                            let _ = self.resolve_promise_with(dom, promise_index, &value);
                         }
                         Err(error) => {
                             let reason = error
@@ -736,26 +737,8 @@ impl JsRuntime {
                 handler,
                 argument,
                 fulfilled,
-                result_promise,
-            } => {
-                let outcome = match handler {
-                    Some(handler) => self.call(dom, handler, std::slice::from_ref(&argument)),
-                    None if fulfilled => Ok(argument),
-                    None => Err(JsError::thrown(argument)),
-                };
-                match outcome {
-                    Ok(value) => self.resolve_promise_value(result_promise, &value)?,
-                    Err(error) if error.kind() != JsErrorKind::ResourceLimit => {
-                        let reason = error
-                            .thrown_value()
-                            .cloned()
-                            .unwrap_or_else(|| JsValue::String(error.to_string()));
-                        self.reject_promise(result_promise, &reason);
-                    }
-                    Err(error) => return Err(error),
-                }
-                Ok(JsValue::Undefined)
-            }
+                capability,
+            } => self.run_promise_reaction(dom, handler, argument, fulfilled, capability),
         };
         match outcome {
             Ok(value) => Ok(value),

@@ -1371,8 +1371,14 @@ impl JsRuntime {
             | NativeFunction::PromiseAllSettledKeyed
             | NativeFunction::PromiseAny
             | NativeFunction::PromiseRace
-            | NativeFunction::PromiseCombinatorFulfilled
-            | NativeFunction::PromiseCombinatorRejected => {
+            | NativeFunction::PromiseCombinatorElement
+            | NativeFunction::PromiseWithResolvers
+            | NativeFunction::PromiseTry
+            | NativeFunction::PromiseSpecies
+            | NativeFunction::PromiseValueThunk
+            | NativeFunction::PromiseThrower
+            | NativeFunction::PromiseResolveThenableJob
+            | NativeFunction::PromiseCapabilityExecutor => {
                 self.dispatch_promise_native(dom, function, receiver, arguments)
             }
             NativeFunction::TypedArrayForEach => self.dispatch_typed_array_native(

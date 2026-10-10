@@ -203,11 +203,22 @@ pub(super) struct CallFrame {
     pub(super) name: String,
 }
 
+/// Where the outcome of a promise reaction is delivered (ECMA-262 27.2.1.1).
+///
+/// `Record` is an intrinsic promise settled directly; its wrapper object is kept
+/// so the collector reaches the record through the object graph. `Functions`
+/// is the resolve and reject pair a constructor's executor captured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromiseCapability {
+    Record { promise: usize, object: ObjectId },
+    Functions { resolve: ObjectId, reject: ObjectId },
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct PromiseReaction {
     pub(super) on_fulfilled: Option<ObjectId>,
     pub(super) on_rejected: Option<ObjectId>,
-    pub(super) result_promise: usize,
+    pub(super) capability: Option<PromiseCapability>,
 }
 
 #[derive(Clone, Debug)]
@@ -231,7 +242,7 @@ pub enum JsMicrotask {
         handler: Option<ObjectId>,
         argument: JsValue,
         fulfilled: bool,
-        result_promise: usize,
+        capability: Option<PromiseCapability>,
     },
 }
 

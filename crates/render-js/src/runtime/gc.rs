@@ -21,6 +21,7 @@ use crate::runtime::builtins::promise::PromiseState;
 use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::JsMicrotask;
+use crate::runtime::types::PromiseCapability;
 use crate::value::ObjectHost;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -146,6 +147,29 @@ pub(super) fn mark_promise(
         }
         if let Some(handler) = reaction.on_rejected {
             mark_object(runtime, marked, work, marked_environments, handler);
+        }
+        if let Some(capability) = &reaction.capability {
+            mark_capability(runtime, marked, work, marked_environments, capability);
+        }
+    }
+}
+
+/// Trace the objects a reaction's capability keeps alive: a record's wrapper
+/// (which in turn reaches its state) or a constructor's resolve and reject.
+fn mark_capability(
+    runtime: &JsRuntime,
+    marked: &mut [bool],
+    work: &mut Vec<ObjectId>,
+    marked_environments: &mut BTreeSet<usize>,
+    capability: &PromiseCapability,
+) {
+    match capability {
+        PromiseCapability::Record { object, .. } => {
+            mark_object(runtime, marked, work, marked_environments, *object);
+        }
+        PromiseCapability::Functions { resolve, reject } => {
+            mark_object(runtime, marked, work, marked_environments, *resolve);
+            mark_object(runtime, marked, work, marked_environments, *reject);
         }
     }
 }
@@ -469,7 +493,7 @@ impl JsRuntime {
                     handler,
                     argument,
                     fulfilled: _,
-                    result_promise,
+                    capability,
                 } => {
                     if let Some(callback) = handler {
                         mark_object(
@@ -487,13 +511,15 @@ impl JsRuntime {
                         &mut marked_environments,
                         argument,
                     );
-                    mark_promise(
-                        self,
-                        &mut marked,
-                        &mut work,
-                        &mut marked_environments,
-                        *result_promise,
-                    );
+                    if let Some(capability) = capability {
+                        mark_capability(
+                            self,
+                            &mut marked,
+                            &mut work,
+                            &mut marked_environments,
+                            capability,
+                        );
+                    }
                 }
             }
         }
