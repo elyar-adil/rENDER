@@ -4095,7 +4095,7 @@ fn iterator_helpers_map_filter_take_and_terminals() {
                 var taken = [1, 2, 3].values().take(2).toArray().join(",");
                 var dropped = [1, 2, 3].values().drop(1).toArray().join(",");
                 var reduced = [1, 2, 3].values().reduce(function (a, b) { return a + b; }, 10);
-                var appended = [1, 2].values().concat([3, 4].values()).toArray().join(",");
+                var appended = Iterator.concat([1, 2].values(), [3, 4].values()).toArray().join(",");
                 var found = [1, 5, 3].values().find(function (x) { return x > 4; });
                 var some = [1, 2].values().some(function (x) { return x === 2; });
                 var every = [1, 2].values().every(function (x) { return x > 0; });
@@ -4114,6 +4114,183 @@ fn iterator_helpers_map_filter_take_and_terminals() {
         JsValue::String(
             "2,4,6|2,4|1,2|2,3|16|1,2,3,4|5|true|true|1+2|3+4|5|1-2|2-3|1,10,2,20|7,8".to_owned()
         )
+    );
+}
+
+/// Runs one iterator script and returns the string value of its completion.
+fn iterator_script_value(script: &str) -> String {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, script)
+        .expect("the iterator script should execute")
+        .value
+        .to_js_string()
+}
+
+#[test]
+fn iterator_arguments_close_the_receiver_before_next_is_read() {
+    // Argument validation closes the receiver and never reads `next`; a primitive
+    // receiver is a TypeError, not a wrapper with a coerced `next`.
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var log = [];
+                var source = {
+                    __proto__: Iterator.prototype,
+                    get next() { log.push('next'); return function () { return { done: false, value: 1 }; }; },
+                    return() { log.push('return'); return {}; }
+                };
+                var out = [];
+                try { source.map(); } catch (e) { out.push(e.constructor.name); }
+                try { source.take(NaN); } catch (e) { out.push(e.constructor.name); }
+                try { source.drop(9007199254740992); } catch (e) { out.push(e.constructor.name); }
+                try { Iterator.prototype.map.call(0, function () {}); } catch (e) { out.push(e.constructor.name); }
+                out.join(',') + '|' + log.join(',');
+            "
+        ),
+        "TypeError,RangeError,RangeError,TypeError|return,return,return"
+    );
+}
+
+#[test]
+fn iterator_helper_return_propagates_source_errors_once_then_completes() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var out = [];
+                var throwing = {
+                    __proto__: Iterator.prototype,
+                    next() { return { done: false, value: 1 }; },
+                    return() { throw new RangeError('boom'); }
+                };
+                var helper = throwing.map(function (x) { return x; });
+                try { helper.return(); } catch (e) { out.push('threw:' + e.message); }
+                out.push(helper.next().done);
+                var calls = 0;
+                var nonObject = {
+                    __proto__: Iterator.prototype,
+                    next() { return { done: false, value: 1 }; },
+                    return() { calls++; return 3; }
+                };
+                var filtered = nonObject.filter(function () { return true; });
+                try { filtered.return(); } catch (e) { out.push(e.constructor.name); }
+                out.push(filtered.return().done);
+                out.push(calls);
+                out.join(';');
+            "
+        ),
+        "threw:boom;true;TypeError;true;1"
+    );
+}
+
+#[test]
+fn iterator_helper_next_while_running_throws_and_then_completes() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var iter = (function* () { while (true) yield 1; })().map(function () { iter.next(); return 0; });
+                var out = [];
+                try { iter.next(); } catch (e) { out.push(e.constructor.name); }
+                out.push(iter.next().done);
+                out.join(';');
+            "
+        ),
+        "TypeError;true"
+    );
+}
+
+#[test]
+fn iterator_from_returns_iterator_instances_and_wraps_the_rest() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var gen = (function* () { yield 1; })();
+                var same = Iterator.from(gen) === gen;
+                var wrapped = Iterator.from({ next() { return { done: false, value: 7 }; } });
+                var inheritsIterator = Object.getPrototypeOf(Object.getPrototypeOf(wrapped)) === Iterator.prototype;
+                var value = wrapped.next().value;
+                var noReturn = JSON.stringify(wrapped.return());
+                var strings = Iterator.from('ab').toArray().join('');
+                [same, inheritsIterator, value, noReturn, strings].join(';');
+            "
+        ),
+        r#"true;true;7;{"done":true};ab"#
+    );
+}
+
+#[test]
+fn iterator_includes_and_join_follow_the_proposal_rules() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var out = [];
+                out.push([4, 5, 6, 7].values().includes(5, 1));
+                out.push([4, 5, 6, 7].values().includes(4, 1));
+                out.push([NaN].values().includes(NaN));
+                out.push([0].values().includes(-0));
+                out.push([1, null, undefined, 2].values().join('-'));
+                out.push([1, 2].values().join());
+                out.push([1, 2].values().join(null));
+                try { [1].values().includes(0, NaN); } catch (e) { out.push(e.constructor.name); }
+                try { [1].values().includes(0, -1); } catch (e) { out.push(e.constructor.name); }
+                out.join(';');
+            "
+        ),
+        "true;false;true;true;1---2;1,2;1null2;TypeError;RangeError"
+    );
+}
+
+#[test]
+fn iterator_concat_is_static_and_opens_its_inputs_lazily() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var out = [];
+                out.push(Iterator.concat.length);
+                out.push(typeof Iterator.prototype.concat);
+                try { Iterator.concat({}); } catch (e) { out.push(e.constructor.name); }
+                var calls = 0;
+                var lazy = { [Symbol.iterator]() { calls++; return [1, 2][Symbol.iterator](); } };
+                var concatenated = Iterator.concat(lazy, [3]);
+                out.push(calls);
+                out.push(Array.from(concatenated).join(','));
+                out.push(calls);
+                var closed = 0;
+                var source = {
+                    [Symbol.iterator]() {
+                        return { next() { return { done: false, value: 1 }; }, return() { closed++; return {}; } };
+                    }
+                };
+                Iterator.concat(source).return();
+                out.push(closed);
+                out.join(';');
+            "
+        ),
+        "0;undefined;TypeError;0;1,2,3;1;0"
+    );
+}
+
+#[test]
+fn iterator_chunks_and_windows_validate_sizes_and_yield_partial_windows() {
+    assert_eq!(
+        iterator_script_value(
+            r"
+                var out = [];
+                function outcome(run) { try { run(); return 'ok'; } catch (e) { return e.constructor.name; } }
+                function values() { return [1, 2, 3].values(); }
+                out.push(outcome(function () { values().chunks(0); }));
+                out.push(outcome(function () { values().chunks(1.5); }));
+                out.push(outcome(function () { values().chunks('1'); }));
+                out.push(outcome(function () { values().windows(1, 'bogus'); }));
+                out.push(Array.from([1, 2, 3, 4, 5].values().chunks(2)).map(function (c) { return c.join('+'); }).join('|'));
+                out.push(Array.from(values().windows(2)).map(function (c) { return c.join('-'); }).join('|'));
+                out.push(Array.from(values().windows(5, 'allow-partial')).map(function (c) { return c.join('-'); }).join('|'));
+                out.push(Array.from(values().windows(5)).length);
+                out.join(';');
+            "
+        ),
+        "RangeError;TypeError;TypeError;TypeError;1+2|3+4|5;1-2|2-3;1-2-3;0"
     );
 }
 
