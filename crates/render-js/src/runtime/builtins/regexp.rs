@@ -94,6 +94,73 @@ impl JsRuntime {
         Ok(object)
     }
 
+    /// ECMA-262 22.2.4.1 `RegExp(pattern, flags)`. `active` is the `RegExp`
+    /// constructor that runs. Called without `new`, a pattern that is a
+    /// RegExp-like object whose `constructor` is `active` is returned as is.
+    /// A `RegExp` takes its source and flags from its record, and any other
+    /// RegExp-like object through `source` and `flags`.
+    pub(in crate::runtime) fn regexp_constructor_value(
+        &mut self,
+        dom: &mut Dom,
+        active: ObjectId,
+        arguments: &[JsValue],
+        called_without_new: bool,
+    ) -> Result<JsValue, JsError> {
+        let pattern = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let flags = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let pattern_is_regexp = self.is_regexp(dom, &pattern)?;
+        if let JsValue::Object(object) = &pattern
+            && called_without_new
+            && pattern_is_regexp
+            && matches!(flags, JsValue::Undefined)
+        {
+            let constructor = self.get_member(dom, *object, "constructor")?;
+            if matches!(constructor, JsValue::Object(found) if found == active) {
+                return Ok(pattern);
+            }
+        }
+        let record = match &pattern {
+            JsValue::Object(object) => match self.realm.host(*object) {
+                Some(ObjectHost::RegExp(index)) => Some(index),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (source, flag_value) = match (record, &pattern) {
+            (Some(index), _) => {
+                let compiled = &self.regexes[index].compiled;
+                let original = JsValue::String(compiled.flags().describe());
+                let source = JsValue::String(compiled.source().to_owned());
+                let flag_value = if matches!(flags, JsValue::Undefined) {
+                    original
+                } else {
+                    flags.clone()
+                };
+                (source, flag_value)
+            }
+            (None, JsValue::Object(object)) if pattern_is_regexp => {
+                let source = self.get_member(dom, *object, "source")?;
+                let flag_value = if matches!(flags, JsValue::Undefined) {
+                    self.get_member(dom, *object, "flags")?
+                } else {
+                    flags.clone()
+                };
+                (source, flag_value)
+            }
+            _ => (pattern.clone(), flags.clone()),
+        };
+        let source = match source {
+            JsValue::Undefined => String::new(),
+            value => self.to_string_coerced(dom, &value)?,
+        };
+        let flags_text = match flag_value {
+            JsValue::Undefined => String::new(),
+            value => self.to_string_coerced(dom, &value)?,
+        };
+        let object = self.construct_regex(&source, &flags_text)?;
+        Ok(JsValue::Object(object))
+    }
+
     /// The accessors ECMA-262 22.2.6 defines on %RegExp.prototype%. An instance
     /// reads its record. The prototype itself answers the source as `(?:)` and
     /// every flag as undefined, and `flags` reads each flag through `Get`.

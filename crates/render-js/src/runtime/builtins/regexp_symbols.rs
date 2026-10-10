@@ -221,6 +221,9 @@ impl JsRuntime {
                 self.realm.set_property(object, key.to_owned(), value);
                 Ok(())
             }
+            None if self.realm.own_accessor_lacks_setter(object, key) => Err(JsError::type_error(
+                format!("Cannot set property '{key}' which has only a getter"),
+            )),
             None => self.set_member(dom, object, key, value),
         }
     }
@@ -821,7 +824,7 @@ impl JsRuntime {
             return Ok(text);
         }
         let value = self.get_member(dom, rx, "flags")?;
-        self.to_string_value(dom, &value)
+        self.to_string_coerced(dom, &value)
     }
 
     /// `RegExp.prototype[@@search]` (§22.2.6.11).
@@ -883,7 +886,7 @@ impl JsRuntime {
         };
         let limit = match limit {
             JsValue::Undefined => u32::MAX,
-            value => crate::runtime::convert::to_uint32(value)?,
+            value => crate::runtime::convert::uint32_of_number(self.to_number_value(dom, value)?),
         };
         let input = utf16::utf16_units(text);
         let mut pieces: Vec<JsValue> = Vec::new();

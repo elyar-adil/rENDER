@@ -21,10 +21,16 @@
 //! matching right to left. The two agree on whether a lookbehind succeeds;
 //! they can differ in what a capture group inside one captures.
 //!
+//! Under the `v` flag a class is ECMA-262 set notation: nested classes, the
+//! `&&` intersection and `--` subtraction, and `\q{…}` class strings. A class
+//! that may contain strings matches its longest strings first, then single
+//! characters. The properties of strings other than `Emoji_Keycap_Sequence`
+//! have no data here, so they are rejected when the literal is evaluated.
+//!
 //! Explicitly rejected with a syntax error rather than misinterpreted: a
-//! property name outside [`property`]'s table, and set operations inside
-//! classes (the `v` flag is accepted but its syntax is not implemented).
+//! property name outside [`property`]'s table.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::utf16;
@@ -76,8 +82,7 @@ pub struct Flags {
     pub unicode: bool,
     /// `d`: a match result carries the spans of its groups.
     pub has_indices: bool,
-    /// `v`: accepted and recorded, but its set-notation syntax is not
-    /// implemented, so it reads the pattern without `u`.
+    /// `v`: the pattern reads with `u` and its classes use set notation.
     pub unicode_sets: bool,
 }
 
@@ -106,8 +111,7 @@ impl Flags {
                 'm' => parsed.multiline = true,
                 's' => parsed.dot_all = true,
                 'u' => parsed.unicode = true,
-                // `v` reads patterns with the `u` semantics; its set notation
-                // is not implemented (see `compile`).
+                // `v` reads patterns with the `u` semantics and set notation.
                 'v' => {
                     parsed.unicode = true;
                     parsed.unicode_sets = true;
@@ -159,6 +163,15 @@ enum ClassItem {
     Space(bool),
     /// `\p{…}` (`true`) or `\P{…}` (`false`).
     Property(property::Property, bool),
+    /// `v` mode: a nested class `[…]` (`negated` for `[^…]`) and its items.
+    Nested {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
+    /// `v` mode: `a&&b&&…`, the code points every operand has.
+    Intersection(Vec<ClassItem>),
+    /// `v` mode: `a--b--…`, the first operand without the code points of the rest.
+    Subtraction(Vec<ClassItem>),
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +316,7 @@ impl Compiled {
                 steps: 0,
                 depth: 0,
                 max_depth,
+                backward: false,
             };
             let end = std::cell::Cell::new(None);
             let accepted = matcher.node(&self.root, start, &mut |_matcher, position| {
@@ -339,6 +353,10 @@ struct Matcher<'a> {
     steps: u32,
     depth: u32,
     max_depth: u32,
+    /// Matching right to left, as the body of a lookbehind does (ECMA-262
+    /// 22.2.2.9 `direction`): characters are read before the position, and a
+    /// sequence runs its items from the last.
+    backward: bool,
 }
 
 type Continuation<'k> = dyn FnMut(&mut Matcher<'_>, usize) -> Option<()> + 'k;
@@ -383,7 +401,7 @@ impl Matcher<'_> {
             Node::Empty => next(self, position),
             Node::Literal(_) | Node::AnyChar | Node::Class { .. } => {
                 let length = self.single_length(node, position)?;
-                next(self, position + length)
+                next(self, self.step(position, length))
             }
             Node::AnchorStart => {
                 let at_start = position == 0
@@ -412,7 +430,13 @@ impl Matcher<'_> {
                     None
                 }
             }
-            Node::Sequence(items) => self.sequence(items, position, next),
+            Node::Sequence(items) => {
+                if self.backward {
+                    self.sequence_backward(items, position, next)
+                } else {
+                    self.sequence(items, position, next)
+                }
+            }
             Node::Alternative(branches) => {
                 for branch in branches {
                     if let Some(result) = self.node(branch, position, next) {
@@ -455,7 +479,13 @@ impl Matcher<'_> {
                     let saved = self.captures[index];
                     let matched = self.node(body, position, &mut |matcher, end_position| {
                         let previous = matcher.captures[index];
-                        matcher.captures[index] = Some((position, end_position));
+                        // A backward group ends where it started, so its span
+                        // is always ordered left to right.
+                        matcher.captures[index] = Some(if matcher.backward {
+                            (end_position, position)
+                        } else {
+                            (position, end_position)
+                        });
                         if let Some(result) = next(matcher, end_position) {
                             Some(result)
                         } else {
@@ -470,30 +500,28 @@ impl Matcher<'_> {
                 }
             },
             Node::Lookahead { negated, body } => {
+                let saved = self.captures.clone();
                 let mut probe = Matcher {
                     input: self.input,
                     flags: self.flags,
-                    // The lookahead sees the same captures; restore on failure.
+                    // The lookahead sees the same captures.
                     captures: std::mem::take(&mut self.captures),
                     steps: self.steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
+                    backward: false,
                 };
                 let succeeded = probe
                     .node(body, position, &mut |_matcher, _position| Some(()))
                     .is_some();
                 self.steps = probe.steps;
                 self.captures = probe.captures;
-                if succeeded == *negated {
-                    None
-                } else {
-                    next(self, position)
-                }
+                self.resume_assertion(*negated, succeeded, saved, position, next)
             }
             Node::Lookbehind { negated, body } => {
-                // Try every start at or before `position` for a match of the
-                // body that ends exactly at `position`. Under `u` a start inside
-                // a surrogate pair is not a character boundary.
+                // The body matches right to left from `position`; any way it can
+                // match is a success, and its captures are those of that match.
+                let saved = self.captures.clone();
                 let mut probe = Matcher {
                     input: self.input,
                     flags: self.flags,
@@ -501,30 +529,14 @@ impl Matcher<'_> {
                     steps: self.steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
+                    backward: true,
                 };
-                let mut succeeded = false;
-                for start in (0..=position).rev() {
-                    if self.flags.unicode && is_trail_inside_pair(self.input, start) {
-                        continue;
-                    }
-                    let reached = probe.node(body, start, &mut |_matcher, end| {
-                        if end == position { Some(()) } else { None }
-                    });
-                    if reached.is_some() {
-                        succeeded = true;
-                        break;
-                    }
-                    if probe.steps > MAX_MATCH_STEPS {
-                        break;
-                    }
-                }
+                let succeeded = probe
+                    .node(body, position, &mut |_matcher, _position| Some(()))
+                    .is_some();
                 self.steps = probe.steps;
                 self.captures = probe.captures;
-                if succeeded == *negated {
-                    None
-                } else {
-                    next(self, position)
-                }
+                self.resume_assertion(*negated, succeeded, saved, position, next)
             }
             Node::Backreference(indices) => {
                 let captured = indices
@@ -534,25 +546,33 @@ impl Matcher<'_> {
                     return next(self, position);
                 };
                 let length = end - start;
-                if position + length > self.input.len() {
+                // The input span the reference matches: it ends at `position`
+                // when matching backward, and starts there otherwise.
+                let from = if self.backward {
+                    position.checked_sub(length)?
+                } else {
+                    position
+                };
+                if from + length > self.input.len() {
                     return None;
                 }
                 // Under `u` a back-reference matches whole code points, so it can
                 // neither start nor end inside a surrogate pair of the input.
                 if self.flags.unicode
-                    && (is_trail_inside_pair(self.input, position)
-                        || is_trail_inside_pair(self.input, position + length))
+                    && (is_trail_inside_pair(self.input, from)
+                        || is_trail_inside_pair(self.input, from + length))
                 {
                     return None;
                 }
                 for offset in 0..length {
                     let expected = u32::from(self.input[start + offset]);
-                    let actual = u32::from(self.input[position + offset]);
+                    let actual = u32::from(self.input[from + offset]);
                     if !self.chars_match(expected, actual) {
                         return None;
                     }
                 }
-                next(self, position + length)
+                let after = if self.backward { from } else { from + length };
+                next(self, after)
             }
             Node::Quantifier {
                 min,
@@ -572,10 +592,44 @@ impl Matcher<'_> {
         }
     }
 
+    /// The rest of a lookahead or lookbehind once its body was probed. A negative
+    /// assertion leaves no captures behind, and a continuation that fails hands
+    /// back the captures the assertion started with, so backtracking sees them.
+    fn resume_assertion(
+        &mut self,
+        negated: bool,
+        succeeded: bool,
+        saved: Vec<Option<(usize, usize)>>,
+        position: usize,
+        next: &mut Continuation<'_>,
+    ) -> Option<()> {
+        if negated {
+            self.captures = saved;
+            return if succeeded {
+                None
+            } else {
+                next(self, position)
+            };
+        }
+        if !succeeded {
+            self.captures = saved;
+            return None;
+        }
+        let result = next(self, position);
+        if result.is_none() {
+            self.captures = saved;
+        }
+        result
+    }
+
     /// The length of the single character `node` matches at `position`, if it
     /// matches there.
     fn single_length(&self, node: &Node, position: usize) -> Option<usize> {
-        let (actual, length) = code_point_at(self.input, position, self.flags.unicode)?;
+        let (actual, length) = if self.backward {
+            code_point_before(self.input, position, self.flags.unicode)?
+        } else {
+            code_point_at(self.input, position, self.flags.unicode)?
+        };
         let matched = match node {
             Node::Literal(expected) => self.chars_match(code_value(*expected), actual),
             Node::AnyChar => self.flags.dot_all || !is_line_terminator(actual),
@@ -605,7 +659,7 @@ impl Matcher<'_> {
             let Some(length) = self.single_length(body, last) else {
                 break;
             };
-            ends.push(last + length);
+            ends.push(self.step(last, length));
             self.tick()?;
         }
         let count = ends.len() - 1;
@@ -645,6 +699,31 @@ impl Matcher<'_> {
         })
     }
 
+    /// A sequence matched right to left: its last item is matched first.
+    fn sequence_backward(
+        &mut self,
+        items: &[Node],
+        position: usize,
+        next: &mut Continuation<'_>,
+    ) -> Option<()> {
+        let Some((last, rest)) = items.split_last() else {
+            return next(self, position);
+        };
+        self.node(last, position, &mut |matcher, mid_position| {
+            matcher.sequence_backward(rest, mid_position, next)
+        })
+    }
+
+    /// The position after consuming `length` code units in the matcher's
+    /// direction: forward from `position`, or backward ending at it.
+    fn step(&self, position: usize, length: usize) -> usize {
+        if self.backward {
+            position - length
+        } else {
+            position + length
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the continuation chain needs the full quantifier state"
@@ -674,9 +753,11 @@ impl Matcher<'_> {
                 saved
             });
             let result = matcher.node(body, position, &mut |inner, advanced| {
-                if advanced == position && min <= count + 1 {
-                    // An empty-body repetition would loop forever.
-                    return next(inner, advanced);
+                // ECMA-262 RepeatMatcher step 2.b: once the minimum is met, an
+                // iteration that consumed nothing fails, which also stops an
+                // empty-body loop. A mandatory iteration may match nothing.
+                if advanced == position && count >= min {
+                    return None;
                 }
                 inner.quantifier(min, max, greedy, body, reset, advanced, count + 1, next)
             });
@@ -754,6 +835,25 @@ fn code_point_at(input: &[u16], position: usize, unicode: bool) -> Option<(u32, 
         && is_trail(trail)
     {
         let value = 0x1_0000 + ((u32::from(unit) - 0xd800) << 10) + (u32::from(trail) - 0xdc00);
+        return Some((value, 2));
+    }
+    Some((u32::from(unit), 1))
+}
+
+/// The code point ending at `position` and its length in code units, read
+/// leftwards for backward matching. Under `u` a trail unit preceded by a lead
+/// unit is one code point.
+fn code_point_before(input: &[u16], position: usize, unicode: bool) -> Option<(u32, usize)> {
+    let index = position.checked_sub(1)?;
+    let unit = *input.get(index)?;
+    if unicode
+        && is_trail(unit)
+        && let Some(lead) = index
+            .checked_sub(1)
+            .and_then(|lead| input.get(lead).copied())
+        && is_lead(lead)
+    {
+        let value = 0x1_0000 + ((u32::from(lead) - 0xd800) << 10) + (u32::from(unit) - 0xdc00);
         return Some((value, 2));
     }
     Some((u32::from(unit), 1))
@@ -853,6 +953,16 @@ fn item_matches(item: &ClassItem, value: u32, flags: Flags) -> bool {
         ClassItem::Word(positive) => is_word(value, flags) == *positive,
         ClassItem::Space(positive) => is_space(value) == *positive,
         ClassItem::Property(property, positive) => property.contains(value) == *positive,
+        ClassItem::Nested { negated, items } => class_contains(items, value, flags) != *negated,
+        ClassItem::Intersection(operands) => operands
+            .iter()
+            .all(|operand| item_matches(operand, value, flags)),
+        ClassItem::Subtraction(operands) => operands.split_first().is_some_and(|(first, rest)| {
+            item_matches(first, value, flags)
+                && !rest
+                    .iter()
+                    .any(|operand| item_matches(operand, value, flags))
+        }),
     }
 }
 
@@ -1043,6 +1153,197 @@ impl ClassAtom {
     }
 }
 
+/// `ClassSetReservedPunctuator`: escapable in a `v`-mode class, where the escape
+/// stands for the character.
+const CLASS_SET_RESERVED_PUNCTUATORS: &str = "&-!#%,:;<=>@`~";
+/// `ClassSetSyntaxCharacter`: a `v`-mode class cannot contain one unescaped.
+const CLASS_SET_SYNTAX_CHARACTERS: &str = "()[]{}/-\\|";
+/// `ClassSetReservedDoublePunctuator`: a `v`-mode class cannot contain a pair.
+const CLASS_SET_DOUBLE_PUNCTUATORS: [&str; 19] = [
+    "&&", "!!", "##", "$$", "%%", "**", "++", ",,", "..", "::", ";;", "<<", "==", ">>", "??", "@@",
+    "^^", "``", "~~",
+];
+/// The properties of strings (ECMA-262 table 70).
+const STRING_PROPERTIES: [&str; 7] = [
+    "Basic_Emoji",
+    "Emoji_Keycap_Sequence",
+    "RGI_Emoji",
+    "RGI_Emoji_Flag_Sequence",
+    "RGI_Emoji_Modifier_Sequence",
+    "RGI_Emoji_Tag_Sequence",
+    "RGI_Emoji_ZWJ_Sequence",
+];
+
+/// A `v`-mode set under construction: the code points it names, the strings it
+/// names other than single characters, and whether it may contain strings (the
+/// `MayContainStrings` early error).
+#[derive(Clone, Debug, Default)]
+struct ClassValue {
+    items: Vec<ClassItem>,
+    strings: BTreeSet<Vec<char>>,
+    may_contain_strings: bool,
+    /// A property of strings whose strings this engine has no data for. It is
+    /// an early error inside a negated class, and otherwise fails when the
+    /// literal is evaluated (see [`finish_set`]).
+    unsupported: Option<String>,
+}
+
+impl ClassValue {
+    fn of_item(item: ClassItem) -> Self {
+        Self {
+            items: vec![item],
+            ..Self::default()
+        }
+    }
+
+    fn unsupported_strings(name: String) -> Self {
+        Self {
+            may_contain_strings: true,
+            unsupported: Some(name),
+            ..Self::default()
+        }
+    }
+
+    /// One `\q{…}` alternative: a single character is a code point, and any
+    /// other alternative, the empty one included, is a string.
+    fn add_alternative(&mut self, text: Vec<char>) {
+        match text.first() {
+            Some(&only) if text.len() == 1 => self.items.push(ClassItem::Char(only)),
+            _ => {
+                self.strings.insert(text);
+                self.may_contain_strings = true;
+            }
+        }
+    }
+
+    /// The union of this set and `other`.
+    fn absorb(&mut self, other: Self) {
+        self.items.extend(other.items);
+        self.strings.extend(other.strings);
+        self.may_contain_strings |= other.may_contain_strings;
+        self.unsupported = self.unsupported.take().or(other.unsupported);
+    }
+
+    /// This set as one operand of an intersection or subtraction.
+    fn into_operand(self) -> ClassItem {
+        ClassItem::Nested {
+            negated: false,
+            items: self.items,
+        }
+    }
+
+    fn intersection(operands: Vec<Self>) -> Self {
+        let may_contain_strings = operands.iter().all(|operand| operand.may_contain_strings);
+        let unsupported = operands
+            .iter()
+            .find_map(|operand| operand.unsupported.clone());
+        let strings = operands
+            .iter()
+            .map(|operand| operand.strings.clone())
+            .reduce(|mut kept, other| {
+                kept.retain(|text| other.contains(text));
+                kept
+            })
+            .unwrap_or_default();
+        Self {
+            items: vec![ClassItem::Intersection(
+                operands.into_iter().map(Self::into_operand).collect(),
+            )],
+            strings,
+            may_contain_strings,
+            unsupported,
+        }
+    }
+
+    /// The first operand without the code points and strings of the rest.
+    fn subtraction(operands: Vec<Self>) -> Self {
+        let may_contain_strings = operands
+            .first()
+            .is_some_and(|first| first.may_contain_strings);
+        let unsupported = operands
+            .iter()
+            .find_map(|operand| operand.unsupported.clone());
+        let mut strings = operands
+            .first()
+            .map(|first| first.strings.clone())
+            .unwrap_or_default();
+        for operand in operands.iter().skip(1) {
+            strings.retain(|text| !operand.strings.contains(text));
+        }
+        Self {
+            items: vec![ClassItem::Subtraction(
+                operands.into_iter().map(Self::into_operand).collect(),
+            )],
+            strings,
+            may_contain_strings,
+            unsupported,
+        }
+    }
+}
+
+/// A `v`-mode union member or operand: one character, or a set.
+enum SetMember {
+    Char(char),
+    Set(ClassValue),
+}
+
+impl SetMember {
+    fn into_value(self) -> ClassValue {
+        match self {
+            Self::Char(character) => ClassValue::of_item(ClassItem::Char(character)),
+            Self::Set(value) => value,
+        }
+    }
+}
+
+/// The node for a finished `v`-mode set. A property of strings without data is
+/// an unsupported construct, reported when the literal is evaluated.
+fn finish_set(value: ClassValue) -> Result<Node, RegexSyntaxError> {
+    match value.unsupported {
+        Some(name) => Err(RegexSyntaxError::unsupported(format!(
+            "the property of strings {name} is not supported"
+        ))),
+        None => Ok(class_value_node(value)),
+    }
+}
+
+/// The node that matches a `v`-mode set. A set with strings tries each string,
+/// longest first, and then a single character of its code points.
+fn class_value_node(value: ClassValue) -> Node {
+    if value.strings.is_empty() {
+        return Node::Class {
+            negated: false,
+            items: value.items,
+        };
+    }
+    let mut strings: Vec<Vec<char>> = value.strings.into_iter().collect();
+    strings.sort_by_key(|text| std::cmp::Reverse(text.len()));
+    let mut branches: Vec<Node> = strings
+        .into_iter()
+        .map(|text| {
+            if text.is_empty() {
+                Node::Empty
+            } else {
+                Node::Sequence(text.into_iter().map(Node::Literal).collect())
+            }
+        })
+        .collect();
+    branches.push(Node::Class {
+        negated: false,
+        items: value.items,
+    });
+    Node::Alternative(branches)
+}
+
+/// `Emoji_Keycap_Sequence` (ECMA-262 table 70): `[0-9#*]` then U+FE0F, U+20E3.
+fn keycap_sequences() -> ClassValue {
+    let mut value = ClassValue::default();
+    for base in "#*0123456789".chars() {
+        value.add_alternative(vec![base, '\u{fe0f}', '\u{20e3}']);
+    }
+    value
+}
+
 /// Type of a named group as parsed: its name, its capture index, and the
 /// enclosing `(disjunction, branch)` path.
 type NamedGroup = (String, usize, Vec<(usize, usize)>);
@@ -1055,25 +1356,6 @@ type NamedGroup = (String, usize, Vec<(usize, usize)>);
 /// engine deliberately does not support.
 pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
     let parsed_flags = Flags::parse(flags)?;
-    match compile_flags(pattern, parsed_flags) {
-        Ok(compiled) => Ok(compiled),
-        // Set notation under `v` is not implemented. A pattern that is not valid
-        // `u` syntax may still be valid `v` syntax, so it keeps the reading it
-        // had before `v` took `u` semantics; a pattern invalid under both is
-        // deferred to evaluation, not rejected at parse time.
-        Err(_) if parsed_flags.unicode_sets => compile_flags(
-            pattern,
-            Flags {
-                unicode: false,
-                ..parsed_flags
-            },
-        )
-        .map_err(|error| RegexSyntaxError::unsupported(error.message)),
-        Err(error) => Err(error),
-    }
-}
-
-fn compile_flags(pattern: &str, parsed_flags: Flags) -> Result<Compiled, RegexSyntaxError> {
     let characters = pattern_characters(pattern, parsed_flags.unicode);
     let (names, total_groups) = scan_group_names(&characters);
     let mut parser = PatternParser {
@@ -1086,6 +1368,7 @@ fn compile_flags(pattern: &str, parsed_flags: Flags) -> Result<Compiled, RegexSy
         path: Vec::new(),
         disjunctions: 0,
         unicode: parsed_flags.unicode,
+        unicode_sets: parsed_flags.unicode_sets,
     };
     let root = parser.alternative(true)?;
     if parser.cursor != characters.len() {
@@ -1156,6 +1439,8 @@ struct PatternParser<'a> {
     disjunctions: usize,
     /// Parsing under `u`: the stricter grammar of ECMA-262 §22.2.1.
     unicode: bool,
+    /// Parsing under `v`: classes use the set notation of ECMA-262 §22.2.1.
+    unicode_sets: bool,
 }
 
 /// The syntax characters, and `/`, that an identity escape may name under `u`.
@@ -1484,6 +1769,9 @@ impl PatternParser<'_> {
     }
 
     fn class(&mut self) -> Result<Node, RegexSyntaxError> {
+        if self.unicode_sets {
+            return finish_set(self.bracketed_class()?);
+        }
         let negated = self.eat('^');
         let mut items = Vec::new();
         let mut closed = false;
@@ -1553,6 +1841,7 @@ impl PatternParser<'_> {
                 negated: false,
                 items: vec![shorthand_item(character)],
             }),
+            'p' | 'P' if self.unicode_sets => finish_set(self.property_set(character == 'p')?),
             'p' | 'P' if self.unicode => {
                 let property = self.property_escape()?;
                 Ok(Node::Class {
@@ -1692,21 +1981,255 @@ impl PatternParser<'_> {
 
     /// The `{Name}` or `{Name=Value}` after `\p`/`\P`.
     fn property_escape(&mut self) -> Result<property::Property, RegexSyntaxError> {
+        let name = self.braced_name()?;
+        // The table is the specification's complete list, so a name it does not
+        // have is an early error rather than something to defer.
+        property::Property::parse(&name)
+            .ok_or_else(|| RegexSyntaxError::new(format!("invalid unicode property {name:?}")))
+    }
+
+    /// The text between the braces that follow `\p` or `\P`.
+    fn braced_name(&mut self) -> Result<String, RegexSyntaxError> {
         if !self.eat('{') {
             return Err(RegexSyntaxError::new("invalid property escape".to_owned()));
         }
         let mut name = String::new();
         loop {
             match self.bump() {
-                Some('}') => break,
+                Some('}') => return Ok(name),
                 Some(character) => name.push(character),
                 None => return Err(RegexSyntaxError::new("invalid property escape".to_owned())),
             }
         }
-        // The table is the specification's complete list, so a name it does not
-        // have is an early error rather than something to defer.
-        property::Property::parse(&name)
-            .ok_or_else(|| RegexSyntaxError::new(format!("invalid unicode property {name:?}")))
+    }
+
+    /// The set a `\p{…}` or `\P{…}` names under `v`: a property of code points,
+    /// or one of the properties of strings, which are the set of their strings.
+    fn property_set(&mut self, positive: bool) -> Result<ClassValue, RegexSyntaxError> {
+        let name = self.braced_name()?;
+        if STRING_PROPERTIES.contains(&name.as_str()) {
+            if !positive {
+                return Err(RegexSyntaxError::new(format!(
+                    "\\P{{{name}}} cannot name a property of strings"
+                )));
+            }
+            return Ok(match name.as_str() {
+                "Emoji_Keycap_Sequence" => keycap_sequences(),
+                _ => ClassValue::unsupported_strings(name),
+            });
+        }
+        let property = property::Property::parse(&name)
+            .ok_or_else(|| RegexSyntaxError::new(format!("invalid unicode property {name:?}")))?;
+        Ok(ClassValue::of_item(ClassItem::Property(property, positive)))
+    }
+
+    /// `v`-mode `ClassContents`, from just after a `[` up to and including its
+    /// `]`: an optional `^`, then the set (ECMA-262 §22.2.1 `ClassSetExpression`).
+    /// A negated class may not contain strings (`MayContainStrings`).
+    fn bracketed_class(&mut self) -> Result<ClassValue, RegexSyntaxError> {
+        let negated = self.eat('^');
+        let value = self.class_set_expression()?;
+        if !self.eat(']') {
+            return Err(RegexSyntaxError::new(
+                "unterminated character class".to_owned(),
+            ));
+        }
+        if !negated {
+            return Ok(value);
+        }
+        if value.may_contain_strings {
+            return Err(RegexSyntaxError::new(
+                "negated character class may contain strings".to_owned(),
+            ));
+        }
+        Ok(ClassValue::of_item(ClassItem::Nested {
+            negated: true,
+            items: value.items,
+        }))
+    }
+
+    /// `ClassSetExpression` up to, not including, the `]` that closes its class:
+    /// a union of members, or one intersection or subtraction of operands.
+    fn class_set_expression(&mut self) -> Result<ClassValue, RegexSyntaxError> {
+        if self.at_class_end() {
+            return Ok(ClassValue::default());
+        }
+        let first = self.class_set_member()?;
+        if self.starts_with("&&") {
+            return self.class_set_operation(first, "&&");
+        }
+        if self.starts_with("--") {
+            return self.class_set_operation(first, "--");
+        }
+        let mut value = ClassValue::default();
+        let mut member = first;
+        loop {
+            let operand = match member {
+                // A character followed by a single `-` opens a range.
+                SetMember::Char(low)
+                    if self.peek() == Some('-') && self.peek_at(1) != Some('-') =>
+                {
+                    self.cursor += 1;
+                    let high = self.class_set_character()?;
+                    if high < low {
+                        return Err(RegexSyntaxError::new("class range out of order".to_owned()));
+                    }
+                    ClassValue::of_item(ClassItem::Range(low, high))
+                }
+                other => other.into_value(),
+            };
+            value.absorb(operand);
+            if self.at_class_end() {
+                return Ok(value);
+            }
+            if self.starts_with("&&") || self.starts_with("--") {
+                return Err(RegexSyntaxError::new(
+                    "set operators cannot be mixed with a union in a class".to_owned(),
+                ));
+            }
+            member = self.class_set_member()?;
+        }
+    }
+
+    /// The operands of an intersection (`&&`) or subtraction (`--`) whose first
+    /// operand is `first`. Operands are single operands, never ranges.
+    fn class_set_operation(
+        &mut self,
+        first: SetMember,
+        operator: &str,
+    ) -> Result<ClassValue, RegexSyntaxError> {
+        let mut operands = vec![first.into_value()];
+        while self.starts_with(operator) {
+            self.cursor += 2;
+            if self.peek() == operator.chars().next() {
+                return Err(RegexSyntaxError::new(
+                    "invalid set operator in a class".to_owned(),
+                ));
+            }
+            operands.push(self.class_set_member()?.into_value());
+        }
+        if !self.at_class_end() {
+            return Err(RegexSyntaxError::new(
+                "invalid set operation in a class".to_owned(),
+            ));
+        }
+        Ok(if operator == "&&" {
+            ClassValue::intersection(operands)
+        } else {
+            ClassValue::subtraction(operands)
+        })
+    }
+
+    /// One union member or operand: a character, a nested class, a class string
+    /// disjunction, or a class escape.
+    fn class_set_member(&mut self) -> Result<SetMember, RegexSyntaxError> {
+        Ok(match (self.peek(), self.peek_at(1)) {
+            (Some('['), _) => {
+                self.cursor += 1;
+                SetMember::Set(self.bracketed_class()?)
+            }
+            (Some('\\'), Some('q')) => {
+                self.cursor += 2;
+                SetMember::Set(self.string_disjunction()?)
+            }
+            (Some('\\'), Some(letter @ ('d' | 'D' | 's' | 'S' | 'w' | 'W'))) => {
+                self.cursor += 2;
+                SetMember::Set(ClassValue::of_item(shorthand_item(letter)))
+            }
+            (Some('\\'), Some(letter @ ('p' | 'P'))) => {
+                self.cursor += 2;
+                SetMember::Set(self.property_set(letter == 'p')?)
+            }
+            _ => SetMember::Char(self.class_set_character()?),
+        })
+    }
+
+    /// `\q{…}` after its `\q`: alternatives separated by `|`. A single character
+    /// is a member of the class; any other alternative, the empty one included,
+    /// is a string of it.
+    fn string_disjunction(&mut self) -> Result<ClassValue, RegexSyntaxError> {
+        if !self.eat('{') {
+            return Err(RegexSyntaxError::new(
+                "invalid class string disjunction".to_owned(),
+            ));
+        }
+        let mut value = ClassValue::default();
+        let mut alternative = Vec::new();
+        loop {
+            match self.peek() {
+                Some(separator @ ('}' | '|')) => {
+                    self.cursor += 1;
+                    value.add_alternative(std::mem::take(&mut alternative));
+                    if separator == '}' {
+                        return Ok(value);
+                    }
+                }
+                Some(_) => alternative.push(self.class_set_character()?),
+                None => {
+                    return Err(RegexSyntaxError::new(
+                        "unterminated class string disjunction".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// One `ClassSetCharacter`: a character that is not a syntax character and
+    /// does not begin a doubled punctuator, or an escape naming one.
+    fn class_set_character(&mut self) -> Result<char, RegexSyntaxError> {
+        let Some(character) = self.bump() else {
+            return Err(RegexSyntaxError::new(
+                "unterminated character class".to_owned(),
+            ));
+        };
+        if character == '\\' {
+            let Some(escaped) = self.bump() else {
+                return Err(RegexSyntaxError::new(
+                    "class ends with a lone backslash".to_owned(),
+                ));
+            };
+            return match escaped {
+                'b' => Ok('\u{0008}'),
+                // `\0` is a CharacterEscape unless a decimal digit follows it.
+                '0' if !self.peek().is_some_and(|next| next.is_ascii_digit()) => Ok('\0'),
+                reserved if CLASS_SET_RESERVED_PUNCTUATORS.contains(reserved) => Ok(reserved),
+                other => self.escape_char(other, true),
+            };
+        }
+        if CLASS_SET_SYNTAX_CHARACTERS.contains(character) {
+            return Err(RegexSyntaxError::new(format!(
+                "{character:?} must be escaped in a class with the v flag"
+            )));
+        }
+        let doubled = self.peek().is_some_and(|next| {
+            CLASS_SET_DOUBLE_PUNCTUATORS.iter().any(|pair| {
+                let mut pair = pair.chars();
+                pair.next() == Some(character) && pair.next() == Some(next)
+            })
+        });
+        if doubled {
+            return Err(RegexSyntaxError::new(
+                "doubled punctuator in a class with the v flag".to_owned(),
+            ));
+        }
+        Ok(character)
+    }
+
+    /// Whether the input at the cursor starts with `text`.
+    fn starts_with(&self, text: &str) -> bool {
+        text.chars()
+            .enumerate()
+            .all(|(offset, expected)| self.peek_at(offset) == Some(expected))
+    }
+
+    /// The character `offset` places after the cursor.
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.characters.get(self.cursor + offset).copied()
+    }
+
+    /// Whether the cursor is at the `]` that closes a class (or at the end).
+    fn at_class_end(&self) -> bool {
+        matches!(self.peek(), None | Some(']'))
     }
 
     /// The character that an escape other than the class, decimal and `\k`
@@ -2269,10 +2792,131 @@ mod tests {
     }
 
     #[test]
+    fn optional_empty_iterations_fail_and_assertions_restore_captures() {
+        // RepeatMatcher step 2.b: an optional iteration that matches nothing
+        // fails, so its lookahead capture stays undefined; a mandatory one keeps it.
+        assert_eq!(groups("(?:(?=(abc)))?a", "", "abc"), vec![None::<String>]);
+        assert_eq!(
+            groups("(?:(?=(abc))){1,1}a", "", "abc"),
+            vec![Some("abc".to_owned())]
+        );
+        // A negative lookahead's inner capture is undone when the assertion
+        // fails, so the backreference to it matches nothing.
+        assert_eq!(
+            matches(r"(.*?)a(?!(a+)b\2c)\2(.*)", "", "baaabaac"),
+            Some((0, 8))
+        );
+        assert_eq!(
+            groups(r"(.*?)a(?!(a+)b\2c)\2(.*)", "", "baaabaac"),
+            vec![Some("ba".to_owned()), None, Some("abaac".to_owned())]
+        );
+    }
+
+    #[test]
+    fn lookbehind_matches_right_to_left_so_its_captures_are_greedy_from_the_end() {
+        // ECMA-262 22.2.2.9: the body reads leftwards from the position, so the
+        // rightmost group takes the longest digit run first.
+        assert_eq!(
+            groups(r"(?<=(\d+)(\d+))$", "", "1053"),
+            vec![Some("1".to_owned()), Some("053".to_owned())]
+        );
+        assert_eq!(
+            groups(r"(?<=(b+))c", "", "abbbbbbc"),
+            vec![Some("bbbbbb".to_owned())]
+        );
+        assert_eq!(matches(r"(?<=a)b", "", "ab"), Some((1, 2)));
+        assert_eq!(matches(r"(?<!a)b", "", "ab"), None);
+        assert_eq!(matches(r"(?<!a)b", "", "cb"), Some((1, 2)));
+        // A lookahead inside a lookbehind reads forwards again.
+        assert_eq!(matches(r"(?<=a(?=b))b", "", "ab"), Some((1, 2)));
+    }
+
+    #[test]
     fn pathological_patterns_stay_bounded() {
         // Catastrophic backtracking shape; the step cap keeps this finite.
         let compiled: Compiled = compile(r"(a+)+$", "").expect("compiles");
         let input = units("aaaaaaaaaaaaaaaaaaaaaaaaaaaaab");
         assert_eq!(compiled.find(&input, 0), None);
+    }
+
+    #[test]
+    fn class_set_nesting_union_intersection_and_subtraction() {
+        assert_eq!(matches("^[[a-z]--[aeiou]]+$", "v", "bcd"), Some((0, 3)));
+        assert_eq!(matches("^[[a-z]--[aeiou]]+$", "v", "bad"), None);
+        assert_eq!(matches(r"^[\w&&\d]+$", "v", "123"), Some((0, 3)));
+        assert_eq!(matches(r"^[\w&&\d]$", "v", "a"), None);
+        assert_eq!(matches("^[[a-c][x-z]]+$", "v", "axz"), Some((0, 3)));
+        assert_eq!(matches("^[^[a-c]]$", "v", "d"), Some((0, 1)));
+        assert_eq!(matches("^[^[a-c]]$", "v", "b"), None);
+        assert_eq!(
+            matches(r"^[\p{ASCII_Hex_Digit}--[0-9]]+$", "v", "abc"),
+            Some((0, 3))
+        );
+        assert_eq!(matches("^[[a-z]&&[^aeiou]]+$", "v", "bcd"), Some((0, 3)));
+        assert_eq!(matches("[]", "v", "a"), None);
+        assert_eq!(matches("^[^]$", "v", "\n"), Some((0, 1)));
+    }
+
+    #[test]
+    fn class_strings_match_longest_first_then_characters() {
+        assert_eq!(matches(r"[\q{abc|d}]", "v", "xabc"), Some((1, 4)));
+        assert_eq!(matches(r"^[\q{ab|abc}]$", "v", "abc"), Some((0, 3)));
+        assert_eq!(matches(r"^[\q{}a]$", "v", ""), Some((0, 0)));
+        assert_eq!(matches(r"^[\q{}a]$", "v", "a"), Some((0, 1)));
+        assert_eq!(matches(r"^[\q{0|2|4|9️⃣}]$", "v", "2"), Some((0, 1)));
+        assert_eq!(
+            matches(r"^[\q{0|2|4|9️⃣}]$", "v", "9\u{fe0f}\u{20e3}"),
+            Some((0, 3))
+        );
+        assert_eq!(matches(r"^[\q{ab|c}&&\q{ab}]$", "v", "ab"), Some((0, 2)));
+        assert_eq!(matches(r"^[\q{ab|c}&&\q{ab}]$", "v", "c"), None);
+        assert_eq!(matches(r"^[\q{ab|c}--\q{ab}]$", "v", "c"), Some((0, 1)));
+        assert_eq!(matches(r"^[\q{ab|c}--\q{ab}]$", "v", "ab"), None);
+        assert_eq!(matches(r"^[\0]$", "v", "\0"), Some((0, 1)));
+        assert_eq!(
+            matches(r"^\p{Emoji_Keycap_Sequence}$", "v", "#\u{fe0f}\u{20e3}"),
+            Some((0, 3))
+        );
+    }
+
+    #[test]
+    fn class_set_early_errors_and_property_of_strings_rules() {
+        for pattern in [
+            "[(]",
+            "[a-]",
+            "[a&&&b]",
+            "[a&&b-c]",
+            "[a--b&&c]",
+            "[a&&b--c]",
+            "[!!]",
+            "[z-a]",
+            r"[\q{a}-z]",
+            r"[[^\q{ab}]]",
+            r"[^\q{ab}]",
+            r"[^\p{Emoji_Keycap_Sequence}]",
+            r"\P{Emoji_Keycap_Sequence}",
+            r"[\q{a|}]--[^\q{ab}]",
+        ] {
+            assert!(
+                compile(pattern, "v").is_err(),
+                "/{pattern}/v must be an early error"
+            );
+        }
+        // Escaped punctuators and a single `&` or `-` at the end are fine.
+        for pattern in [r"[\(\)]", r"[a&b]", r"[a\-]", r"[\&\&]", r"[a&&b]", r"[\0]"] {
+            assert!(
+                compile(pattern, "v").is_ok(),
+                "/{pattern}/v must be accepted"
+            );
+        }
+        // A property of strings the engine has no data for is accepted here and
+        // fails when the literal is evaluated.
+        assert!(validate(r"[\p{Basic_Emoji}]", "v").is_ok());
+        assert!(compile(r"[\p{Basic_Emoji}]", "v").is_err());
+        // Inside a negated class it is still an early error.
+        assert!(validate(r"[^\p{Basic_Emoji}]", "v").is_err());
+        // Without v, these are ordinary syntax errors or ordinary characters.
+        assert!(compile(r"[\p{Emoji_Keycap_Sequence}]", "u").is_err());
+        assert!(compile("[(]", "").is_ok());
     }
 }

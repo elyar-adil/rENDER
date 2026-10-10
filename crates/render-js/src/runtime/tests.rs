@@ -5246,3 +5246,119 @@ fn array_is_array_throws_for_a_revoked_proxy() {
         "true"
     );
 }
+
+/// The string a script's last expression evaluates to, for `RegExp` checks.
+fn regexp_check(source: &str) -> String {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, source)
+        .expect("the RegExp check script should execute")
+        .value
+        .to_js_string()
+}
+
+#[test]
+fn regexp_call_returns_a_regexp_like_pattern_whose_constructor_is_regexp() {
+    // ECMA-262 22.2.4.1 step 2: `RegExp(re)` returns `re` itself only when
+    // IsRegExp(re) and its constructor is the active function.
+    assert_eq!(regexp_check("var r = /a/; String(RegExp(r) === r)"), "true");
+    assert_eq!(
+        regexp_check("var r = /a/; r[Symbol.match] = false; String(RegExp(r) !== r)"),
+        "true"
+    );
+    // A RegExp-like object is read through `source` and `flags`.
+    assert_eq!(
+        regexp_check(
+            "var o = { [Symbol.match]: true, source: 'ab', flags: 'g' }; var x = RegExp(o); x.source + ' ' + x.flags"
+        ),
+        "ab g"
+    );
+    // An explicit flags argument replaces the flags of a RegExp-like object.
+    assert_eq!(
+        regexp_check(
+            "var o = { [Symbol.match]: true, source: 'ab', flags: 'g' }; new RegExp(o, 'i').flags"
+        ),
+        "i"
+    );
+    // Without a truthy @@match the object is converted with ToString instead.
+    assert_eq!(
+        regexp_check("var o = { source: 'ab', flags: 'g' }; new RegExp(o).source"),
+        "[object Object]"
+    );
+}
+
+#[test]
+fn regexp_flags_accessor_on_a_primitive_is_a_type_error() {
+    assert_eq!(
+        regexp_check(
+            "var getter = Object.getOwnPropertyDescriptor(RegExp.prototype, 'flags').get; var out = 'no throw'; try { getter.call(1); } catch (e) { out = e.name; } out"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn regexp_split_converts_the_limit_and_flags_with_user_code() {
+    // The limit is coerced with `valueOf`, once.
+    assert_eq!(
+        regexp_check(
+            "var calls = 0; var out = /,/[Symbol.split]('a,b', { valueOf: function () { calls += 1; return 1; } }).join('|'); out + ' ' + calls"
+        ),
+        "a 1"
+    );
+    // A Symbol `flags` is a TypeError, not a converted string.
+    assert_eq!(
+        regexp_check(
+            "var out = 'no throw'; try { RegExp.prototype[Symbol.split].call({ flags: Symbol() }, 'a'); } catch (e) { out = e.name; } out"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn regexp_match_all_consults_is_regexp_before_the_flags_string() {
+    // The RegExp constructor run by @@matchAll reads @@match of the receiver
+    // once, after `flags` is read and coerced.
+    assert_eq!(
+        regexp_check(
+            "var log = []; var o = { get [Symbol.match]() { log.push('match'); return false; }, get flags() { log.push('flags'); return ''; } }; RegExp.prototype[Symbol.matchAll].call(o, 'x'); log.join(',')"
+        ),
+        "flags,match"
+    );
+    // A throwing @@match on the receiver surfaces from the same point.
+    assert_eq!(
+        regexp_check(
+            "var obj = { get [Symbol.match]() { throw new Error('boom'); } }; var out = 'no throw'; try { RegExp.prototype[Symbol.matchAll].call(obj, ''); } catch (e) { out = e.message; } out"
+        ),
+        "boom"
+    );
+}
+
+#[test]
+fn regexp_search_sets_last_index_strictly() {
+    // ECMA-262 22.2.6.11 step 4: `Set(rx, "lastIndex", +0, true)` is a TypeError
+    // when the property is an accessor without a setter.
+    assert_eq!(
+        regexp_check(
+            "var o = { get lastIndex() { return undefined; }, exec: function () { return null; } }; var out = 'no throw'; try { RegExp.prototype[Symbol.search].call(o); } catch (e) { out = e.name; } out"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn object_methods_and_accessors_do_not_bind_their_own_name() {
+    // A method or accessor has no self-name binding, unlike a named function
+    // expression, so assigning to the name reaches the enclosing binding.
+    assert_eq!(
+        regexp_check(
+            "var lastIndex = 0; var o = { set lastIndex(v) { lastIndex = v; } }; o.lastIndex = 3; String(lastIndex)"
+        ),
+        "3"
+    );
+    assert_eq!(
+        regexp_check("var f = 1; var o = { f() { f = 2; return f; } }; o.f() + ' ' + f"),
+        "2 2"
+    );
+}

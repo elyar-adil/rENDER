@@ -3175,6 +3175,18 @@ impl JsRuntime {
             let value = if property.accessor.is_none() && !property.method && !property.shorthand {
                 let name = property_key_function_name(&key_value);
                 self.evaluate_named(dom, &property.value, &name)?
+            } else if let Expr::Function {
+                name,
+                parameters,
+                body,
+                kind,
+                strict,
+                ..
+            } = &property.value
+            {
+                // A method or accessor does not bind its own name in its body,
+                // unlike a named function expression (ECMA-262 15.4).
+                self.create_function(name.as_deref(), parameters, body, *kind, *strict)?
             } else {
                 self.evaluate(dom, &property.value)?
             };
@@ -5057,50 +5069,6 @@ impl JsRuntime {
         result
     }
 
-    /// ECMA-262 22.2.4.1 `RegExp(pattern, flags)`: no arguments yields an
-    /// empty pattern, an existing `RegExp` supplies its source and flags, and
-    /// an explicit flags argument recompiles.
-    fn regexp_constructor_value(
-        &mut self,
-        dom: &mut Dom,
-        arguments: &[JsValue],
-        called_without_new: bool,
-    ) -> Result<JsValue, JsError> {
-        let pattern = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-        let flags = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-        if let JsValue::Object(object) = &pattern
-            && let Some(ObjectHost::RegExp(index)) = self.realm.host(*object)
-        {
-            if called_without_new
-                && matches!(flags, JsValue::Undefined)
-                && let Some(JsValue::Object(constructor)) = self.realm.global("RegExp")
-                && matches!(
-                    self.get_value(dom, *object, "constructor")?,
-                    JsValue::Object(pattern_constructor) if pattern_constructor == constructor
-                )
-            {
-                return Ok(pattern.clone());
-            }
-            let source = self.regexes[index].compiled.source().to_owned();
-            let flags_text = match &flags {
-                JsValue::Undefined => self.regexes[index].compiled.flags().describe(),
-                value => self.to_string_value(dom, value)?,
-            };
-            let object = self.construct_regex(&source, &flags_text)?;
-            return Ok(JsValue::Object(object));
-        }
-        let pattern_text = match &pattern {
-            JsValue::Undefined => String::new(),
-            value => self.to_string_value(dom, value)?,
-        };
-        let flags_text = match &flags {
-            JsValue::Undefined => String::new(),
-            value => self.to_string_value(dom, value)?,
-        };
-        let object = self.construct_regex(&pattern_text, &flags_text)?;
-        Ok(JsValue::Object(object))
-    }
-
     /// The `new.target` a constructor runs with: itself, except when it is the
     /// parent of a `super()` call, where it inherits the derived class's.
     fn dispatch_new_target(&mut self, constructor: ObjectId) -> JsValue {
@@ -5230,7 +5198,7 @@ impl JsRuntime {
                 self.typed_array_constructor(dom, constructor, kind, arguments)
             }
             Some(ObjectHost::RegExpConstructor) => {
-                self.regexp_constructor_value(dom, arguments, false)
+                self.regexp_constructor_value(dom, constructor, arguments, false)
             }
             Some(ObjectHost::UrlConstructor) => self.url_constructor(constructor, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
@@ -5515,7 +5483,7 @@ impl JsRuntime {
             Some(ObjectHost::RegExpConstructor) => {
                 // `RegExp(re)` called without `new` behaves like construction,
                 // except that a same-realm pattern is returned unchanged.
-                self.regexp_constructor_value(dom, arguments, true)
+                self.regexp_constructor_value(dom, callee, arguments, true)
             }
             Some(ObjectHost::UrlConstructor) => self.url_constructor(callee, arguments),
             Some(ObjectHost::UrlSearchParamsConstructor) => {
@@ -5628,6 +5596,14 @@ impl JsRuntime {
                 Err(JsError::type_error(format!(
                     "{function:?} called on null or undefined"
                 )))
+            }
+            // ECMA-262 22.2.6 accessors require an Object `this`; a primitive is a TypeError.
+            Some(ObjectHost::NativeFunction(NativeFunction::RegExpAccessor(_)))
+                if !matches!(receiver, JsValue::Object(_)) =>
+            {
+                Err(JsError::type_error(
+                    "RegExp accessor called on a non-object receiver",
+                ))
             }
             Some(ObjectHost::NativeFunction(
                 function @ (NativeFunction::RegExpSymbolMatch
