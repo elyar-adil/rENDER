@@ -22,6 +22,7 @@ pub(super) mod dom;
 pub(super) mod dom_exception;
 pub(super) mod encoding;
 pub(super) mod events;
+pub(super) mod explicit_resource;
 pub(super) mod fetch;
 pub(super) mod function;
 pub(super) mod global_fns;

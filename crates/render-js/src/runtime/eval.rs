@@ -4972,6 +4972,8 @@ impl JsRuntime {
                 | ObjectHost::DateConstructor
                 | ObjectHost::ErrorConstructor(_)
                 | ObjectHost::AggregateErrorConstructor
+                | ObjectHost::SuppressedErrorConstructor
+                | ObjectHost::DisposableStackConstructor(_)
                 | ObjectHost::PromiseConstructor
                 | ObjectHost::EventConstructor
                 | ObjectHost::DomConstructor
@@ -5161,6 +5163,13 @@ impl JsRuntime {
             // Like every `Error` subclass, `AggregateError` needs `new`.
             Some(ObjectHost::AggregateErrorConstructor) => {
                 self.aggregate_error_constructor(dom, constructor, arguments)
+            }
+            // `new.target` supplies the prototype; `SuppressedError` also works without `new`.
+            Some(ObjectHost::SuppressedErrorConstructor) => {
+                self.suppressed_error_constructor(dom, &new_target, arguments)
+            }
+            Some(ObjectHost::DisposableStackConstructor(kind)) => {
+                self.disposable_stack_constructor(dom, &new_target, kind)
             }
             Some(ObjectHost::PromiseConstructor) => self.construct_promise(dom, arguments),
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
@@ -5501,6 +5510,20 @@ impl JsRuntime {
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(callee, kind, arguments)
+            }
+            Some(ObjectHost::SuppressedErrorConstructor) => {
+                self.suppressed_error_constructor(dom, &JsValue::Object(callee), arguments)
+            }
+            Some(ObjectHost::DisposableStackConstructor(kind)) => {
+                Err(JsError::type_error(if kind.is_async() {
+                    "AsyncDisposableStack constructor requires 'new'"
+                } else {
+                    "DisposableStack constructor requires 'new'"
+                }))
+            }
+            Some(ObjectHost::DisposeAwaitResume { stack, rejected }) => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                self.resume_async_disposal(dom, stack, rejected, value)
             }
             // WebIDL §4.4's interface object has a constructor operation, so
             // `DOMException("m", "NotFoundError")` without `new` constructs one

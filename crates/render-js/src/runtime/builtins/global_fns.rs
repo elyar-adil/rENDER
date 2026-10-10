@@ -1413,6 +1413,9 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::DisposeStack(operation, kind) => {
+                self.dispose_stack_native(dom, operation, kind, receiver, arguments)
+            }
             NativeFunction::PromiseAll
             | NativeFunction::PromiseAllSettled
             | NativeFunction::PromiseAllKeyed

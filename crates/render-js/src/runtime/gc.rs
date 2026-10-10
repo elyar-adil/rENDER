@@ -226,6 +226,8 @@ pub(super) fn mark_host(
         | ObjectHost::DomExceptionConstructor
         | ObjectHost::DomException { .. }
         | ObjectHost::AggregateErrorConstructor
+        | ObjectHost::SuppressedErrorConstructor
+        | ObjectHost::DisposableStackConstructor(_)
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::DataViewConstructor
@@ -250,6 +252,25 @@ pub(super) fn mark_host(
         | ObjectHost::ResponseConstructor
         | ObjectHost::Response { .. } => {}
         ObjectHost::Blob { .. } | ObjectHost::BlobConstructor | ObjectHost::ProxyConstructor => {}
+        ObjectHost::DisposableStack(state) => {
+            // The resources, the throw completion of a pending `disposeAsync`
+            // and the promise it resolves are the stack's own references.
+            for resource in &state.resources {
+                mark_value(runtime, marked, work, marked_environments, &resource.value);
+                if let Some(method) = resource.method {
+                    mark_object(runtime, marked, work, marked_environments, method);
+                }
+            }
+            for completion in state.disposal.iter().filter_map(|d| d.completion.as_ref()) {
+                mark_value(runtime, marked, work, marked_environments, completion);
+            }
+            if let Some(disposal) = &state.disposal {
+                mark_promise(runtime, marked, work, marked_environments, disposal.promise);
+            }
+        }
+        ObjectHost::DisposeAwaitResume { stack, .. } => {
+            mark_object(runtime, marked, work, marked_environments, *stack);
+        }
         ObjectHost::Proxy { target, handler } => {
             mark_object(runtime, marked, work, marked_environments, *target);
             if let Some(handler) = handler {

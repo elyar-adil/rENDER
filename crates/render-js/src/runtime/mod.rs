@@ -56,6 +56,8 @@ mod dom_tests;
 mod eval;
 #[cfg(test)]
 mod event_tests;
+#[cfg(test)]
+mod explicit_resource_tests;
 mod gc;
 #[cfg(test)]
 mod language_tests;

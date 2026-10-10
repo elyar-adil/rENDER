@@ -64,7 +64,9 @@ impl JsSymbol {
     }
 
     /// The well-known symbol whose registry key is `name` ("@@iterator",
-    /// "@@toStringTag", ...). Descriptions mirror the registry keys.
+    /// "@@toStringTag", ...). Descriptions mirror the registry keys, except the
+    /// explicit-resource-management pair, which carries the specification's
+    /// `Symbol.dispose` and `Symbol.asyncDispose` names because `toString()` shows them.
     #[must_use]
     pub(crate) fn well_known(name: &str) -> Self {
         match name {
@@ -81,6 +83,8 @@ impl JsSymbol {
             "@@replace" => Self::new(11, Some("@@replace".to_owned())),
             "@@search" => Self::new(12, Some("@@search".to_owned())),
             "@@split" => Self::new(13, Some("@@split".to_owned())),
+            "@@dispose" => Self::new(14, Some("Symbol.dispose".to_owned())),
+            "@@asyncDispose" => Self::new(15, Some("Symbol.asyncDispose".to_owned())),
             _ => Self::new(0, None),
         }
     }
@@ -1020,6 +1024,9 @@ pub(crate) enum NativeFunction {
     /// One element's settlement function of a combinator. Bound with the store,
     /// the element's index, its pair and its role.
     PromiseCombinatorElement,
+    /// A method of `DisposableStack` (`DisposeStackKind::Sync`) or
+    /// `AsyncDisposableStack` (`DisposeStackKind::Async`).
+    DisposeStack(DisposeStackOp, DisposeStackKind),
     MutationObserve,
     MutationDisconnect,
     MutationTakeRecords,
@@ -1833,6 +1840,62 @@ pub(crate) enum ZipMode {
     Strict,
 }
 
+/// Whether a disposable stack is a `DisposableStack` (sync disposal) or an
+/// `AsyncDisposableStack` (awaited disposal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisposeStackKind {
+    Sync,
+    Async,
+}
+
+impl DisposeStackKind {
+    pub(crate) const fn is_async(self) -> bool {
+        matches!(self, Self::Async)
+    }
+}
+
+/// The methods of the two stack interfaces. `Dispose` is `dispose` on a
+/// `DisposableStack` and `disposeAsync` on an `AsyncDisposableStack`; `Disposed`
+/// is the `disposed` getter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisposeStackOp {
+    Adopt,
+    Defer,
+    Dispose,
+    Disposed,
+    Move,
+    Use,
+}
+
+/// One entry of a stack's `[[DisposeCapability]]`. `value` is the resource
+/// `Dispose` passes as `this` (`undefined` for `defer` and `adopt`), and
+/// `method` is what it calls, or `None` for a `null` or `undefined` resource.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DisposeResource {
+    pub(crate) value: JsValue,
+    pub(crate) method: Option<ObjectId>,
+}
+
+/// The progress of an `AsyncDisposableStack.prototype.disposeAsync` that is
+/// waiting on an `await`: the throw completion so far, and the promise the
+/// call returned.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingDisposal {
+    pub(crate) completion: Option<JsValue>,
+    pub(crate) promise: usize,
+}
+
+/// The internal slots of a `DisposableStack` or `AsyncDisposableStack`:
+/// `[[DisposableState]]` (`disposed`), `[[DisposeCapability]]` (`resources`, in
+/// insertion order) and the in-flight `disposeAsync` (`disposal`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DisposeStackState {
+    pub(crate) kind: DisposeStackKind,
+    pub(crate) disposed: bool,
+    pub(crate) resources: Vec<DisposeResource>,
+    pub(crate) disposal: Option<PendingDisposal>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum ObjectHost {
     #[default]
@@ -1901,6 +1964,18 @@ pub(crate) enum ObjectHost {
     ErrorConstructor(ErrorKind),
     /// An error instance; the stand-in for the spec's `[[ErrorData]]` slot.
     ErrorInstance,
+    /// `SuppressedError` (ECMA-262 explicit resource management).
+    SuppressedErrorConstructor,
+    /// `DisposableStack` or `AsyncDisposableStack`, by kind.
+    DisposableStackConstructor(DisposeStackKind),
+    /// A `DisposableStack` or `AsyncDisposableStack` instance.
+    DisposableStack(DisposeStackState),
+    /// The `onFulfilled` (`rejected == false`) or `onRejected` callback of an
+    /// `await` inside `disposeAsync` on `stack`: it resumes the disposal.
+    DisposeAwaitResume {
+        stack: ObjectId,
+        rejected: bool,
+    },
     /// The `DOMException` constructor object (`WebIDL` §4.4).
     DomExceptionConstructor,
     /// defines: its name and its message. `code` is *derived* from the name by
@@ -2168,6 +2243,9 @@ impl ObjectHost {
                 | Self::AsyncResume { .. }
                 | Self::AsyncFromSyncValue { .. }
                 | Self::AsyncFromSyncClose { .. }
+                | Self::DisposeAwaitResume { .. }
+                | Self::SuppressedErrorConstructor
+                | Self::DisposableStackConstructor(_)
         )
     }
 }
@@ -2415,6 +2493,12 @@ pub struct Realm {
     async_from_sync_iterator_prototype: ObjectId,
     /// `%Storage.prototype%` shared by `localStorage` and `sessionStorage`.
     storage_prototype: ObjectId,
+    /// `%DisposableStack.prototype%`, `%AsyncDisposableStack.prototype%` and
+    /// `%SuppressedError.prototype%`: the intrinsics `move` and disposal create
+    /// instances from, whatever `this` or `new.target` is.
+    disposable_stack_prototype: ObjectId,
+    async_disposable_stack_prototype: ObjectId,
+    suppressed_error_prototype: ObjectId,
     /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
     /// every reference to a list still gets a live list that must keep
     /// evaluating, so the prototype outlives the lists too.
@@ -2584,6 +2668,26 @@ impl Realm {
             object_prototype,
             function_prototype,
             error_prototype,
+        );
+        let suppressed_error_prototype = Self::install_suppressed_error(
+            &mut objects,
+            global,
+            function_prototype,
+            error_prototype,
+        );
+        let disposable_stack_prototype = Self::install_disposable_stack(
+            &mut objects,
+            global,
+            object_prototype,
+            function_prototype,
+            DisposeStackKind::Sync,
+        );
+        let async_disposable_stack_prototype = Self::install_disposable_stack(
+            &mut objects,
+            global,
+            object_prototype,
+            function_prototype,
+            DisposeStackKind::Async,
         );
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
@@ -2769,6 +2873,7 @@ impl Realm {
                     | ObjectHost::AsyncResume { .. }
                     | ObjectHost::AsyncFromSyncValue { .. }
                     | ObjectHost::AsyncFromSyncClose { .. }
+                    | ObjectHost::DisposeAwaitResume { .. }
             ) && object.prototype.is_none()
             {
                 object.prototype = Some(function_prototype);
@@ -3210,6 +3315,9 @@ impl Realm {
                     | ObjectHost::AsyncResume { .. }
                     | ObjectHost::AsyncFromSyncValue { .. }
                     | ObjectHost::AsyncFromSyncClose { .. }
+                    | ObjectHost::DisposeAwaitResume { .. }
+                    | ObjectHost::SuppressedErrorConstructor
+                    | ObjectHost::DisposableStackConstructor(_)
                     | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
                     _ if index != object_prototype.0 => Some(object_prototype),
                     _ => None,
@@ -3252,6 +3360,9 @@ impl Realm {
             iterator_helper_prototype,
             iterator_wrap_prototype,
             storage_prototype,
+            disposable_stack_prototype,
+            async_disposable_stack_prototype,
+            suppressed_error_prototype,
             media_query_list_prototype,
             node_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
@@ -6411,6 +6522,7 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Symbol(JsSymbol::well_known(key))),
             );
         }
+        Self::install_dispose_symbols(objects, constructor);
         // `Symbol.prototype[Symbol.toStringTag] === "Symbol"`
         {
             let tag = JsSymbol::well_known("@@toStringTag");
@@ -7816,6 +7928,243 @@ impl Realm {
         );
     }
 
+    /// `SuppressedError` (ECMA-262 explicit resource management), returning
+    /// `%SuppressedError.prototype%`. The constructor's `[[Prototype]]` is
+    /// `%Error%` and the prototype inherits `%Error.prototype%`. Instances get
+    /// `error` and `suppressed` as own, non-enumerable properties, which the
+    /// runtime defines itself (`runtime::builtins::explicit_resource`).
+    fn install_suppressed_error(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        function_prototype: ObjectId,
+        error_prototype: ObjectId,
+    ) -> ObjectId {
+        let error_constructor = match objects[error_prototype.0].properties.get("constructor") {
+            Some(PropertyDescriptor {
+                value: JsValue::Object(constructor),
+                ..
+            }) => *constructor,
+            _ => function_prototype,
+        };
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(error_prototype),
+            ..JsObject::default()
+        });
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(error_constructor),
+            host: ObjectHost::SuppressedErrorConstructor,
+            properties: Self::function_metadata("SuppressedError", 3.0),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        for (name, value) in [("name", "SuppressedError"), ("message", "")] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::String(value.to_owned())),
+            );
+        }
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        objects[global.0].properties.insert(
+            "SuppressedError".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        prototype
+    }
+
+    /// `DisposableStack` or `AsyncDisposableStack` (ECMA-262 explicit resource
+    /// management), returning the prototype. It holds the constructor's
+    /// `prototype`, the five methods, the `disposed` getter, `constructor`, and
+    /// `@@toStringTag`. The disposal method is one function object under its
+    /// name and under its symbol (`Symbol.dispose` or `Symbol.asyncDispose`).
+    fn install_disposable_stack(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+        kind: DisposeStackKind,
+    ) -> ObjectId {
+        let name = if kind.is_async() {
+            "AsyncDisposableStack"
+        } else {
+            "DisposableStack"
+        };
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::DisposableStackConstructor(kind),
+            properties: Self::function_metadata(name, 0.0),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        Self::install_disposable_stack_methods(objects, prototype, function_prototype, kind);
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        // `@@toStringTag` is read-only, like `Promise.prototype`'s.
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    writable: false,
+                    ..PropertyDescriptor::builtin(JsValue::String(name.to_owned()))
+                },
+            ),
+        );
+        objects[global.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(constructor),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        prototype
+    }
+
+    /// `Symbol.dispose` and `Symbol.asyncDispose` on the `Symbol` constructor
+    /// (ECMA-262 explicit resource management): non-writable, non-configurable
+    /// data properties, unlike the well-known symbols beside them.
+    fn install_dispose_symbols(objects: &mut [JsObject], symbol_constructor: ObjectId) {
+        for (name, key) in [("dispose", "@@dispose"), ("asyncDispose", "@@asyncDispose")] {
+            objects[symbol_constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Symbol(JsSymbol::well_known(key)),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
+    /// The five methods and the `disposed` getter of a stack prototype. The
+    /// disposal method is the same object under `dispose` (or `disposeAsync`)
+    /// and under `@@dispose` (or `@@asyncDispose`).
+    fn install_disposable_stack_methods(
+        objects: &mut Vec<JsObject>,
+        prototype: ObjectId,
+        function_prototype: ObjectId,
+        kind: DisposeStackKind,
+    ) {
+        let (dispose_name, dispose_symbol) = if kind.is_async() {
+            ("disposeAsync", "@@asyncDispose")
+        } else {
+            ("dispose", "@@dispose")
+        };
+        for (method, operation, length) in [
+            ("adopt", DisposeStackOp::Adopt, 2.0),
+            ("defer", DisposeStackOp::Defer, 1.0),
+            (dispose_name, DisposeStackOp::Dispose, 0.0),
+            ("move", DisposeStackOp::Move, 0.0),
+            ("use", DisposeStackOp::Use, 1.0),
+        ] {
+            let function = Self::push_native_method(
+                objects,
+                function_prototype,
+                NativeFunction::DisposeStack(operation, kind),
+                method,
+                length,
+            );
+            objects[prototype.0].properties.insert(
+                method.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(function)),
+            );
+            if operation == DisposeStackOp::Dispose {
+                let symbol = JsSymbol::well_known(dispose_symbol);
+                objects[prototype.0].symbols.insert(
+                    symbol.id(),
+                    (
+                        symbol,
+                        PropertyDescriptor::builtin(JsValue::Object(function)),
+                    ),
+                );
+            }
+        }
+        let getter = Self::push_native_method(
+            objects,
+            function_prototype,
+            NativeFunction::DisposeStack(DisposeStackOp::Disposed, kind),
+            "get disposed",
+            0.0,
+        );
+        objects[prototype.0].properties.insert(
+            "disposed".to_owned(),
+            PropertyDescriptor {
+                getter: Some(getter),
+                setter: None,
+                value: JsValue::Undefined,
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+    }
+
+    /// A built-in function object running `function`, with its `name` and
+    /// `length` set explicitly, because the arity table does not know it.
+    fn push_native_method(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        function: NativeFunction,
+        name: &str,
+        length: f64,
+    ) -> ObjectId {
+        let id = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(function),
+            properties: Self::function_metadata(name, length),
+            ..JsObject::default()
+        });
+        id
+    }
+
     /// `Array.of`, the `Array[Symbol.species]` getter (ECMA-262 23.1.2.5) and
     /// `Array.prototype[Symbol.unscopables]` (ECMA-262 23.1.3.41), which is a
     /// null-prototype object naming the methods `with` must not shadow.
@@ -8366,6 +8715,9 @@ impl Realm {
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
         roots.push(self.storage_prototype);
+        roots.push(self.disposable_stack_prototype);
+        roots.push(self.async_disposable_stack_prototype);
+        roots.push(self.suppressed_error_prototype);
         roots.push(self.media_query_list_prototype);
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
@@ -9237,6 +9589,45 @@ impl Realm {
             host: ObjectHost::AsyncFromSyncClose { iterator },
             ..JsObject::default()
         })
+    }
+
+    /// A `DisposableStack` or `AsyncDisposableStack` instance with `state`.
+    pub(crate) fn disposable_stack(
+        &mut self,
+        prototype: ObjectId,
+        state: DisposeStackState,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::DisposableStack(state),
+            ..JsObject::default()
+        })
+    }
+
+    /// The `onFulfilled` (`rejected == false`) or `onRejected` callback of an
+    /// `await` inside `disposeAsync` on `stack`.
+    pub(crate) fn dispose_resume_function(&mut self, stack: ObjectId, rejected: bool) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.function_prototype),
+            host: ObjectHost::DisposeAwaitResume { stack, rejected },
+            ..JsObject::default()
+        })
+    }
+
+    /// `%DisposableStack.prototype%` or `%AsyncDisposableStack.prototype%`.
+    pub(crate) const fn intrinsic_disposable_stack_prototype(
+        &self,
+        kind: DisposeStackKind,
+    ) -> ObjectId {
+        match kind {
+            DisposeStackKind::Sync => self.disposable_stack_prototype,
+            DisposeStackKind::Async => self.async_disposable_stack_prototype,
+        }
+    }
+
+    /// `%SuppressedError.prototype%`.
+    pub(crate) const fn intrinsic_suppressed_error_prototype(&self) -> ObjectId {
+        self.suppressed_error_prototype
     }
 
     pub(crate) fn async_resume(&mut self, coroutine: usize, rejected: bool) -> ObjectId {
