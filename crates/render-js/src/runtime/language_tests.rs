@@ -1866,4 +1866,14 @@ fn bigint_typed_arrays_store_and_read_bigints() {
         ),
         "-5,-9223372036854775808,2,16,8,[object BigInt64Array]"
     );
+    assert_eq!(
+        ok(
+            "var b = new BigUint64Array([1n, (2n ** 64n) - 1n]); var c = BigInt64Array.from([3n, -1n]); var d = BigInt64Array.of(7n); [b[0], b[1], typeof b[0], c[1], d[0]].join()"
+        ),
+        "1,18446744073709551615,bigint,-1,7"
+    );
+    assert_eq!(
+        ok("[Int8Array.from('ab').join(), Int8Array.from([1, 2], (x) => x * 3).join()].join()"),
+        "0,0,3,6"
+    );
 }

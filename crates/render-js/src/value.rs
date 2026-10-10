@@ -1396,6 +1396,42 @@ impl TypedBuffer {
             })
     }
 
+    /// Element `first` onward, `count` of them, as the values they read as. A
+    /// missing element means the buffer was detached, which is a `TypeError`.
+    pub(crate) fn elements_value(
+        &self,
+        kind: TypedArrayKind,
+        first: usize,
+        count: usize,
+    ) -> Result<Vec<JsValue>, JsError> {
+        self.ensure_attached()?;
+        (first..first + count)
+            .map(|index| {
+                self.element_value(kind, index)
+                    .ok_or_else(|| JsError::type_error("typed array element is out of range"))
+            })
+            .collect()
+    }
+
+    /// Store `value`, already converted to `kind` (a `BigInt` for the `BigInt`
+    /// kinds, a Number otherwise), as element `index`.
+    pub(crate) fn set_converted_element(
+        &self,
+        kind: TypedArrayKind,
+        index: usize,
+        value: &JsValue,
+    ) {
+        match value {
+            JsValue::BigInt(bigint) if kind.is_bigint() => {
+                self.set_bigint_element(kind, index, bigint);
+            }
+            JsValue::Number(number) if !kind.is_bigint() => {
+                self.set_element(kind, index, *number);
+            }
+            _ => {}
+        }
+    }
+
     /// Store `value` as element `index` of a `BigInt` kind, wrapping modulo 2^64.
     /// An index past the end of the store is ignored.
     pub(crate) fn set_bigint_element(&self, kind: TypedArrayKind, index: usize, value: &JsBigInt) {

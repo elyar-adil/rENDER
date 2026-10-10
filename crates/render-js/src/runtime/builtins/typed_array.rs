@@ -205,13 +205,13 @@ impl JsRuntime {
         }
         let elements = match first {
             JsValue::Undefined | JsValue::Null => Vec::new(),
-            JsValue::Object(_) => self.typed_array_source_values(dom, first)?,
+            JsValue::Object(_) => self.typed_array_source_values(dom, kind, first)?,
             other => {
                 let length = self.typed_index(dom, other)?;
                 return self.create_typed_array(kind, length, prototype);
             }
         };
-        self.create_typed_array_from_values(kind, &elements, prototype)
+        self.create_typed_array_from_elements(kind, &elements, prototype)
     }
 
     /// A typed-array view over an existing `ArrayBuffer` (ECMA-262 23.2.5.1
@@ -285,30 +285,52 @@ impl JsRuntime {
     pub(in crate::runtime) fn typed_array_source_values(
         &mut self,
         dom: &mut Dom,
+        kind: TypedArrayKind,
         source: &JsValue,
-    ) -> Result<Vec<f64>, JsError> {
+    ) -> Result<Vec<JsValue>, JsError> {
         let Some(JsValue::Object(source)) = Some(source) else {
             return Ok(Vec::new());
         };
         if let Some(ObjectHost::TypedArray {
-            kind,
+            kind: source_kind,
             buffer,
             start,
             length,
         }) = self.realm.host(*source)
         {
-            // InitializeTypedArrayFromTypedArray: a detached source is a TypeError.
-            buffer.ensure_attached()?;
-            return buffer.elements(kind, start, length);
+            // InitializeTypedArrayFromTypedArray: a detached source is a
+            // TypeError, and so is a source whose content type differs.
+            if source_kind.is_bigint() != kind.is_bigint() {
+                return Err(JsError::type_error(
+                    "cannot mix BigInt and other types in typed array copies",
+                ));
+            }
+            return buffer.elements_value(source_kind, start, length);
         }
         // ECMA-262 23.2.5.1 step 6: an object with `@@iterator` supplies its
         // values through the iterator; anything else is an array-like.
         let elements = self.iterate_values(dom, &JsValue::Object(*source))?;
         let mut values = Vec::with_capacity(elements.len());
         for element in &elements {
-            values.push(self.to_number_value(dom, element)?);
+            values.push(self.typed_element_value(dom, kind, element)?);
         }
         Ok(values)
+    }
+
+    /// Converts one value for an element of `kind`: `ToBigInt` for the `BigInt`
+    /// kinds and `ToNumber` for the rest, the conversion every typed array
+    /// element write uses.
+    pub(in crate::runtime) fn typed_element_value(
+        &mut self,
+        dom: &mut Dom,
+        kind: TypedArrayKind,
+        value: &JsValue,
+    ) -> Result<JsValue, JsError> {
+        if kind.is_bigint() {
+            Ok(JsValue::BigInt(self.to_bigint_value(dom, value)?))
+        } else {
+            Ok(JsValue::Number(self.to_number_value(dom, value)?))
+        }
     }
 
     /// `TypedArray.from(source[, mapper[, thisArg]])` (ECMA-262 23.2.2.1): build
@@ -323,11 +345,17 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let mut values = match &source {
-            JsValue::Object(_) => self.typed_array_source_values(dom, &source)?,
-            JsValue::String(text) => text
-                .chars()
-                .map(|character| f64::from(u32::from(character)))
-                .collect(),
+            JsValue::Object(_) => self.typed_array_source_values(dom, kind, &source)?,
+            // The string's code points are iterated as strings, and each one is
+            // converted like any other element (23.2.2.1 steps 5 and 6).
+            JsValue::String(text) => {
+                let mut converted = Vec::new();
+                for character in text.chars() {
+                    let character = JsValue::String(character.to_string());
+                    converted.push(self.typed_element_value(dom, kind, &character)?);
+                }
+                converted
+            }
             _ => {
                 return Err(JsError::type_error(
                     "TypedArray.from requires an array-like or iterable source",
@@ -342,10 +370,10 @@ impl JsRuntime {
                 let element = self.call_with_this(
                     dom,
                     mapper,
-                    &[JsValue::Number(*value), index_value],
+                    &[value.clone(), index_value],
                     this_argument.clone(),
                 )?;
-                *value = self.to_number_value(dom, &element)?;
+                *value = self.typed_element_value(dom, kind, &element)?;
             }
         }
         let prototype = self
@@ -355,7 +383,7 @@ impl JsRuntime {
                 JsValue::Object(object) => Some(object),
                 _ => None,
             });
-        self.create_typed_array_from_values(kind, &values, prototype)
+        self.create_typed_array_from_elements(kind, &values, prototype)
     }
 
     /// `TypedArray.of(...items)` (ECMA-262 23.2.2.2), for a concrete constructor.
@@ -375,7 +403,7 @@ impl JsRuntime {
         };
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
-            values.push(self.to_number_value(dom, argument)?);
+            values.push(self.typed_element_value(dom, kind, argument)?);
         }
         let prototype = self
             .realm
@@ -384,7 +412,7 @@ impl JsRuntime {
                 JsValue::Object(object) => Some(object),
                 _ => None,
             });
-        self.create_typed_array_from_values(kind, &values, prototype)
+        self.create_typed_array_from_elements(kind, &values, prototype)
     }
 
     pub(in crate::runtime) fn create_typed_array(
@@ -409,11 +437,25 @@ impl JsRuntime {
         values: &[f64],
         prototype: Option<ObjectId>,
     ) -> Result<JsValue, JsError> {
+        let elements: Vec<JsValue> = values.iter().map(|value| JsValue::Number(*value)).collect();
+        self.create_typed_array_from_elements(kind, &elements, prototype)
+    }
+
+    /// A typed array of `kind` holding `values`, each already converted to the
+    /// element type: a `BigInt` for the `BigInt` kinds, a Number otherwise.
+    pub(in crate::runtime) fn create_typed_array_from_elements(
+        &mut self,
+        kind: TypedArrayKind,
+        values: &[JsValue],
+        prototype: Option<ObjectId>,
+    ) -> Result<JsValue, JsError> {
         if values.len() > Self::MAX_TYPED_ARRAY_ELEMENTS {
             return Err(self.range_error("typed array length exceeds the engine bound"));
         }
         let buffer = TypedBuffer::new(vec![0; values.len() * kind.element_size()]);
-        buffer.set_elements(kind, 0, values);
+        for (index, value) in values.iter().enumerate() {
+            buffer.set_converted_element(kind, index, value);
+        }
         self.ensure_heap_capacity(1)?;
         Ok(JsValue::Object(self.realm.typed_array(
             kind,
