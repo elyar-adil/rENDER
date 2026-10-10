@@ -606,10 +606,10 @@ impl JsRuntime {
 
     /// Whether `object` is an Array exotic object, looking through proxies
     /// (ECMA-262 7.2.2 `IsArray`).
-    fn is_array_value(&self, object: ObjectId) -> bool {
+    fn is_array_object(&self, object: ObjectId) -> bool {
         match self.realm.host(object) {
             Some(ObjectHost::Array) => true,
-            Some(ObjectHost::Proxy { target, .. }) => self.is_array_value(target),
+            Some(ObjectHost::Proxy { target, .. }) => self.is_array_object(target),
             _ => false,
         }
     }
@@ -1683,7 +1683,7 @@ impl JsRuntime {
             JsValue::Null => return Ok("[object Null]".to_owned()),
             other => self.to_object(other)?,
         };
-        let builtin = if self.is_array_value(object) {
+        let builtin = if self.is_array_object(object) {
             "Array".to_owned()
         } else if self.is_callable_value(object) {
             "Function".to_owned()
