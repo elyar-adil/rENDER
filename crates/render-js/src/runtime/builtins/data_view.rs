@@ -190,6 +190,9 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::ArrayBufferSlice => self.array_buffer_slice(dom, receiver, arguments),
+            NativeFunction::ArrayBufferIsView => Ok(JsValue::Boolean(
+                self.is_array_buffer_view(arguments.first()),
+            )),
             NativeFunction::ArrayBufferByteLengthGetter => self.array_buffer_byte_length(receiver),
             NativeFunction::DataViewBufferGetter => self.data_view_buffer(receiver),
             NativeFunction::DataViewByteLengthGetter => {
@@ -447,6 +450,16 @@ impl JsRuntime {
             return Err(self.range_error("DataView request is outside the bounds of the view"));
         }
         Ok(())
+    }
+
+    /// §25.1.5.1 `ArrayBuffer.isView`: true for a `DataView` or a typed array,
+    /// judged by their internal slots rather than by prototype.
+    fn is_array_buffer_view(&self, argument: Option<&JsValue>) -> bool {
+        let Some(JsValue::Object(object)) = argument else {
+            return false;
+        };
+        matches!(self.realm.host(*object), Some(ObjectHost::DataView { .. }))
+            || self.typed_array_parts(*object).is_ok()
     }
 
     /// The `DataView` host state of `receiver`, or a `TypeError` when it is not

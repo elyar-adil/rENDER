@@ -1042,6 +1042,8 @@ pub(crate) enum NativeFunction {
     ArrayBufferSlice,
     /// `ArrayBuffer.prototype.byteLength`, an accessor on the prototype.
     ArrayBufferByteLengthGetter,
+    /// `ArrayBuffer.isView(arg)` (ECMA-262 25.1.5.1).
+    ArrayBufferIsView,
     GlobalStructuredClone,
     VideoPlay,
     VideoPause,
@@ -3699,6 +3701,7 @@ impl Realm {
             objects.push(JsObject {
                 prototype: Some(function_prototype),
                 host: ObjectHost::NativeFunction(getter),
+                properties: Self::function_metadata(&format!("get {name}"), 0.0),
                 ..JsObject::default()
             });
             objects[target.0].properties.insert(
@@ -3753,6 +3756,22 @@ impl Realm {
         // `DataView(buffer [, byteOffset [, byteLength]])` both have a `length`
         // of 1.
         Self::install_length(objects, array_buffer_constructor, 1.0);
+        // §25.1.5.1: `ArrayBuffer.isView` is a static, bound to the constructor
+        // the way `Array.isArray` is.
+        let is_view = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::ArrayBufferIsView,
+                receiver: array_buffer_constructor,
+            },
+            properties: Self::function_metadata("isView", 1.0),
+            ..JsObject::default()
+        });
+        objects[array_buffer_constructor.0].properties.insert(
+            "isView".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(is_view)),
+        );
 
         let encoder_prototype = ObjectId(objects.len());
         objects.push(JsObject {

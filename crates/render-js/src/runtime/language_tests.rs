@@ -1813,3 +1813,27 @@ fn unicode_property_space_is_the_white_space_alias() {
         "true,false,true"
     );
 }
+
+#[test]
+fn array_buffer_is_view_getter_names_and_buffer_constructors() {
+    // §25.1.5.1: `isView` is true for typed arrays and DataViews by slot; the
+    // getters are named `get <property>`; buffer hosts are constructors.
+    assert_eq!(
+        ok(
+            "[ArrayBuffer.isView(new Uint8Array(1)), ArrayBuffer.isView(new DataView(new ArrayBuffer(1))), ArrayBuffer.isView([]), ArrayBuffer.isView(), ArrayBuffer.isView.length, ArrayBuffer.isView.name].join()"
+        ),
+        "true,true,false,false,1,isView"
+    );
+    assert_eq!(
+        ok(
+            "var d = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength'); d.get.name"
+        ),
+        "get byteLength"
+    );
+    assert_eq!(
+        ok(
+            "class Sized extends ArrayBuffer {}; [new Sized(3).byteLength, Reflect.construct(ArrayBuffer, [5]).byteLength, Reflect.construct(DataView, [new ArrayBuffer(2)]).byteLength].join()"
+        ),
+        "3,5,2"
+    );
+}

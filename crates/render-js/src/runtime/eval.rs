@@ -4833,7 +4833,12 @@ impl JsRuntime {
                 | ObjectHost::TypedArrayConstructor(_)
                 | ObjectHost::RegExpConstructor
                 | ObjectHost::UrlConstructor
-                | ObjectHost::UrlSearchParamsConstructor,
+                | ObjectHost::UrlSearchParamsConstructor
+                // ArrayBuffer, DataView and the text codecs are constructors (ECMA-262 25.1.4.1, 25.2.2.1).
+                | ObjectHost::ArrayBufferConstructor
+                | ObjectHost::DataViewConstructor
+                | ObjectHost::TextEncoderConstructor
+                | ObjectHost::TextDecoderConstructor,
             ) => true,
             // Iterator is an abstract constructor: `new Iterator()` throws,
             // but a subclass's `super()` constructs through it.

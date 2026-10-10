@@ -225,6 +225,7 @@ impl JsRuntime {
             | NativeFunction::DataViewByteLengthGetter
             | NativeFunction::DataViewByteOffsetGetter
             | NativeFunction::ArrayBufferSlice
+            | NativeFunction::ArrayBufferIsView
             | NativeFunction::ArrayBufferByteLengthGetter => {
                 self.dispatch_encoding_native(dom, function, receiver, arguments)
             }
