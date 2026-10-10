@@ -5334,3 +5334,19 @@ fn regexp_match_all_consults_is_regexp_before_the_flags_string() {
         "boom"
     );
 }
+
+#[test]
+fn object_methods_and_accessors_do_not_bind_their_own_name() {
+    // A method or accessor has no self-name binding, unlike a named function
+    // expression, so assigning to the name reaches the enclosing binding.
+    assert_eq!(
+        regexp_check(
+            "var lastIndex = 0; var o = { set lastIndex(v) { lastIndex = v; } }; o.lastIndex = 3; String(lastIndex)"
+        ),
+        "3"
+    );
+    assert_eq!(
+        regexp_check("var f = 1; var o = { f() { f = 2; return f; } }; o.f() + ' ' + f"),
+        "2 2"
+    );
+}

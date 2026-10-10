@@ -3175,6 +3175,18 @@ impl JsRuntime {
             let value = if property.accessor.is_none() && !property.method && !property.shorthand {
                 let name = property_key_function_name(&key_value);
                 self.evaluate_named(dom, &property.value, &name)?
+            } else if let Expr::Function {
+                name,
+                parameters,
+                body,
+                kind,
+                strict,
+                ..
+            } = &property.value
+            {
+                // A method or accessor does not bind its own name in its body,
+                // unlike a named function expression (ECMA-262 15.4).
+                self.create_function(name.as_deref(), parameters, body, *kind, *strict)?
             } else {
                 self.evaluate(dom, &property.value)?
             };
