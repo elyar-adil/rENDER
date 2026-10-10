@@ -8351,6 +8351,16 @@ impl Realm {
         Some(names)
     }
 
+    /// Drop the `prototype` a user function is created with when it is a method
+    /// rather than a constructor (ECMA-262 15.4.4): methods, getters and setters
+    /// have none, and the slot is non-configurable, so it is removed directly.
+    pub(crate) fn remove_method_prototype(&mut self, object: ObjectId) {
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.properties.remove("prototype");
+            target.key_order.retain(|key| key != "prototype");
+        }
+    }
+
     pub(crate) fn delete_property(&mut self, object: ObjectId, key: &str) -> bool {
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
@@ -8659,6 +8669,15 @@ impl Realm {
             }
         }
         self.install_function_metadata(callable, name, length);
+        // A user function's own keys come first in the spec order: `length`,
+        // `name`, then `prototype`; the keys it gains later follow them.
+        let target = &mut self.objects[callable.0];
+        target
+            .key_order
+            .extend(["length", "name"].map(str::to_owned));
+        if prototype.is_some() {
+            target.key_order.push("prototype".to_owned());
+        }
         callable
     }
 

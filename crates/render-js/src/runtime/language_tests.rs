@@ -419,6 +419,34 @@ fn labeled_continue_and_break_target_the_labeled_loop() {
 }
 
 #[test]
+fn computed_class_element_keys_run_to_property_key_in_source_order() {
+    // §15.7.14 and §13.2.5.5: each computed key is converted with ToPropertyKey
+    // (string hint, so user toString runs) as soon as it is evaluated.
+    assert_eq!(
+        ok(
+            "var key = { toString() { return 'named'; } }; class C { [key]() { return 1; } static [key] = 2; } [new C().named(), C.named].join()"
+        ),
+        "1,2"
+    );
+    assert_eq!(
+        ok(
+            "var log = []; class C { [{ toString() { log.push('b'); return 'x'; } }]() {} [log.push('c')]() {} } log.join()"
+        ),
+        "b,c"
+    );
+    assert_eq!(
+        ok("class C { [() => 1]() { return 7; } } new C()[String(() => 1)]()"),
+        "7"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { class C { [{ toString: 1, valueOf: 2 }]() {} } } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
 fn static_blocks_can_name_their_class() {
     assert_eq!(
         ok("class B { static #x = 1; static { B.y = B.#x + 1; } } B.y"),
@@ -775,6 +803,306 @@ fn static_field_named_constructor_is_refused() {
     assert_eq!(
         ok("class C { static constructor() { return 7; } } C.constructor()"),
         "7"
+    );
+}
+
+#[test]
+fn private_names_resolve_where_the_code_is_written() {
+    // §9.2.1 and §15.7.14: a function reads `#name` through the class body it
+    // was created in, however it is later called.
+    assert_eq!(
+        ok(
+            "class C { #f = 'ok'; m() { let self = this; function inner() { return self.#f; } return inner(); } } new C().m()"
+        ),
+        "ok"
+    );
+    assert_eq!(
+        ok("var g; class C { #x = 5; m() { g = () => this.#x; } } new C().m(); g()"),
+        "5"
+    );
+    assert_eq!(
+        ok(
+            "class A { run(f) { return f(); } } class B { #x = 2; get() { return () => this.#x; } } new A().run(new B().get())"
+        ),
+        "2"
+    );
+}
+
+#[test]
+fn static_initializers_and_blocks_have_the_class_as_home_object() {
+    assert_eq!(
+        ok(
+            "class A { static f() { return 'A'; } } class B extends A { static x = super.f(); } B.x"
+        ),
+        "A"
+    );
+    assert_eq!(
+        ok(
+            "class A { static f() { return 'a'; } } class B extends A { static { this.y = super.f(); } } B.y"
+        ),
+        "a"
+    );
+    assert_eq!(
+        ok(
+            "class A { static f() { return 'k'; } } class B extends A { static g = () => super.f(); } B.g()"
+        ),
+        "k"
+    );
+}
+
+#[test]
+fn class_expression_heritage_closures_see_the_inner_name() {
+    assert_eq!(
+        ok(
+            "var probeBefore = function() { return C; }; var probeHeritage; var C = 'outside'; var cls = class C extends (probeHeritage = function() { return C; }, Object) { method() { return C; } }; [probeBefore(), probeHeritage() === cls, cls.prototype.method() === cls].join()"
+        ),
+        "outside,true,true"
+    );
+    assert_eq!(
+        ok(
+            "var r; function f() { try { var x = (class x extends x {}); } catch (e) { r = e.name; } return r; } f()"
+        ),
+        "ReferenceError"
+    );
+    // The heritage's `prototype` is read with [[Get]] once, and it must be an
+    // object or null.
+    assert_eq!(
+        ok(
+            "var calls = 0; var Base = function() {}.bind(); Object.defineProperty(Base, 'prototype', { get() { calls++; return null; }, configurable: true }); class C extends Base {} calls"
+        ),
+        "1"
+    );
+    assert_eq!(
+        ok(
+            "var r; var Base = function() {}.bind(); Object.defineProperty(Base, 'prototype', { get() { return 42; }, configurable: true }); try { class C extends Base {} } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn class_declarations_are_mutable_and_the_inner_name_is_separate() {
+    // §15.7.14: the outer declaration is a `let`-style binding, while the inner
+    // name is immutable and already live in the heritage (in its TDZ until the
+    // constructor exists).
+    assert_eq!(ok("class C {} C = 5; C"), "5");
+    // NamedEvaluation names an anonymous class but gives it no inner binding,
+    // so its methods read the outer variable.
+    assert_eq!(
+        ok("var C = class { m() { return C; } }; var D = C; C = null; D.prototype.m() === null"),
+        "true"
+    );
+    assert_eq!(
+        ok(
+            "var probe; class C extends (probe = function() { return C; }, Object) {} var cls = C; C = null; probe() === cls"
+        ),
+        "true"
+    );
+    assert_eq!(
+        ok("var r; try { var x = (class x extends x {}); } catch (e) { r = e.name; } r"),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn class_elements_the_class_refuses_throw_and_private_targets_destructure() {
+    // §15.7.14 and §7.3.8: a public element the class refuses (a static
+    // `prototype`) is a TypeError, not a silent no-op.
+    assert_eq!(
+        ok("var r; try { class C { static ['prototype'] = 1; } } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("var r; try { class C { static ['prototype']() {} } } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    // §13.15.5: a private member is a valid destructuring target.
+    assert_eq!(
+        ok("class C { #f; m() { [this.#f] = [7]; return this.#f; } } new C().m()"),
+        "7"
+    );
+    assert_eq!(
+        ok("class C { #f; m() { ({ a: this.#f } = { a: 8 }); return this.#f; } } new C().m()"),
+        "8"
+    );
+    // The target reference is evaluated before the property is read, so a
+    // `this` that is still uninitialized throws before the getter runs.
+    assert_eq!(
+        ok(
+            "var r; class A {} class C extends A { #field; constructor() { var init = () => super(); var object = { get a() { init(); } }; ({ a: this.#field } = object); } } try { new C(); } catch (e) { r = e.name; } r"
+        ),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn class_accessor_arity_and_private_accessor_pairs_are_early_errors() {
+    // §15.4.1 and §15.7.1: a getter takes no parameters, a setter exactly one
+    // non-rest parameter, and a private getter/setter pair must share staticness.
+    assert_early_syntax_errors(&[
+        "class C { get a(p) {} }",
+        "class C { get a(p = null) {} }",
+        "class C { set a() {} }",
+        "class C { set a(...p) {} }",
+        "class C { get #a() {} static set #a(v) {} }",
+        "class C { static get #a() {} set #a(v) {} }",
+        "class C { static { class await {} } }",
+    ]);
+    assert_eq!(
+        ok("class C { get #a() { return 4; } set #a(v) {} m() { return this.#a; } } new C().m()"),
+        "4"
+    );
+    assert_eq!(
+        ok("class C { set a(v = 1) { this.b = v; } } var c = new C(); c.a = undefined; c.b"),
+        "1"
+    );
+}
+
+#[test]
+fn parameter_expressions_run_in_their_own_scope_apart_from_the_body_vars() {
+    // §10.2.11 step 28: with a default initializer, body `var`s live in a separate
+    // environment, so the closure in a parameter does not see them.
+    assert_eq!(
+        ok(
+            "var x = 'outside'; var probeP, probeB; function f(_ = probeP = function() { return x; }) { var x = 'inside'; probeB = function() { return x; }; } f(); probeP() + ',' + probeB()"
+        ),
+        "outside,inside"
+    );
+    assert_eq!(
+        ok(
+            "var x = 'outside'; var probeP, probeB; function* g(_ = probeP = function() { return x; }) { var x = 'inside'; probeB = function() { return x; }; yield x; } g().next().value + ',' + probeP() + ',' + probeB()"
+        ),
+        "inside,outside,inside"
+    );
+    // A body `var` that shares a parameter's name starts with the argument's value.
+    assert_eq!(
+        ok("function f(a = 1) { var a; return a; } [f(), f(5)].join()"),
+        "1,5"
+    );
+}
+
+#[test]
+fn class_fields_are_defined_through_define_own_property() {
+    // §7.3.7 CreateDataPropertyOrThrow: a field on a proxy reaches its
+    // `defineProperty` trap, and a field a frozen object refuses is a TypeError.
+    assert_eq!(
+        ok(
+            "var log = []; var P = new Proxy({}, { defineProperty(t, k, d) { log.push(k + ':' + d.value); return Reflect.defineProperty(t, k, d); } }); class A { constructor() { return P; } } class B extends A { f = 7; } new B(); log.join()"
+        ),
+        "f:7"
+    );
+    assert_eq!(
+        ok(
+            "var r; class A { constructor() { return Object.freeze({}); } } class B extends A { f = 1; } try { new B(); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn class_constructor_own_keys_start_with_length_name_prototype() {
+    // §10.2.5 and §15.7.14: a class constructor's own keys are `length`, `name`,
+    // and `prototype`, and its static members follow them.
+    assert_eq!(
+        ok("class A { static method() {} } Object.getOwnPropertyNames(A).join()"),
+        "length,name,prototype,method"
+    );
+    assert_eq!(
+        ok("class B { static [String('length')]() {} } Object.getOwnPropertyNames(B).join()"),
+        "length,name,prototype"
+    );
+}
+
+#[test]
+fn class_methods_have_no_prototype_and_accessors_take_prefixed_names() {
+    // §15.4.4 and §15.4.5: a method, getter or setter is not a constructor, so
+    // it has no `prototype`; an accessor is named with its `get` or `set` prefix.
+    assert_eq!(
+        ok(
+            "class C { m() {} *g() {} get x() { return 1; } set x(v) {} } var d = Object.getOwnPropertyDescriptor(C.prototype, 'x'); [C.prototype.m.hasOwnProperty('prototype'), C.prototype.g.hasOwnProperty('prototype'), d.get.name, d.set.name].join()"
+        ),
+        "false,true,get x,set x"
+    );
+}
+
+#[test]
+fn this_before_super_is_a_reference_error_in_every_position() {
+    assert_eq!(
+        ok(
+            "class A {} class B extends A { constructor() { var e; try { this.p = 3; } catch (x) { e = x.name; } super(); this.r = e; } } new B().r"
+        ),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn super_property_reads_check_this_before_the_key_expression() {
+    assert_eq!(
+        ok(
+            "var r; class A {} class B extends A { constructor() { try { super[super()]; } catch (e) { r = e.name; } super(); } } new B(); r"
+        ),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn super_binds_this_once_after_the_parent_constructs() {
+    // §13.3.7.1 steps 3-6: the arguments and the parent construction happen
+    // before BindThisValue, which throws when `this` is already bound.
+    assert_eq!(
+        ok(
+            "var calls = 0; function f() { calls++; return 3; } class A {} class B extends A { constructor() { super(); try { super(f()); } catch (e) { this.r = e.name; this.calls = calls; } } } var b = new B(); b.r + ',' + b.calls"
+        ),
+        "ReferenceError,1"
+    );
+}
+
+#[test]
+fn class_field_initializers_name_their_anonymous_functions() {
+    // §15.7.10 and §8.4.5 NamedEvaluation: a field's anonymous function takes
+    // the field's key, and a private field's `#name`.
+    assert_eq!(
+        ok(
+            "class C { static #f = () => 1; static g = function() {}; static read() { return this.#f.name; } } C.read() + ',' + C.g.name"
+        ),
+        "#f,g"
+    );
+    assert_eq!(
+        ok(
+            "class D { h = () => 1; #p = function() {}; n() { return this.#p.name; } } var d = new D(); d.h.name + ',' + d.n()"
+        ),
+        "h,#p"
+    );
+}
+
+#[test]
+fn super_property_assignment_works_inside_a_field_arrow() {
+    assert_eq!(
+        ok(
+            "class B { set prop(v) { this.stored = v; } } class C extends B { func = () => { super.prop = 'x'; }; } var c = new C(); c.func(); c.stored"
+        ),
+        "x"
+    );
+}
+
+#[test]
+fn super_call_in_an_arrow_inside_a_derived_constructor_runs_later() {
+    assert_eq!(
+        ok(
+            "var iter = { [Symbol.iterator]() { return this; }, next() { return { done: false }; }, return() { this.f(); return { done: true }; } }; class C extends class {} { constructor() { iter.f = () => super(); for (var k of iter) { return; } } } var o = new C(); typeof o"
+        ),
+        "object"
+    );
+}
+
+#[test]
+fn a_throwing_field_initializer_restores_the_caller_environment() {
+    assert_eq!(
+        ok(
+            "function make() { return class C { x = (() => { throw 1; })(); }; } \
+            function g() { let q = 'Q'; try { new (make())(); } catch (e) {} return q; } g()"
+        ),
+        "Q"
     );
 }
 

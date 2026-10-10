@@ -634,9 +634,10 @@ fn static_key_name(key: &PropertyKey) -> Option<String> {
 /// private name `#constructor`, and no duplicate private names.
 fn validate_class_elements(elements: &[ClassElement]) -> Result<(), JsError> {
     let mut constructors = 0usize;
-    // Private name -> the kinds already declared under it; a getter/setter
-    // pair may share one name, anything else is a duplicate.
-    let mut private_kinds: BTreeMap<String, Vec<ClassElementKind>> = BTreeMap::new();
+    // Private name -> the kinds (and staticness) already declared under it; a
+    // getter/setter pair with matching staticness may share one name, anything
+    // else is a duplicate.
+    let mut private_kinds: BTreeMap<String, Vec<(ClassElementKind, bool)>> = BTreeMap::new();
     for element in elements {
         if let PropertyKey::Private(name) = &element.key {
             if name == "constructor" {
@@ -647,8 +648,9 @@ fn validate_class_elements(elements: &[ClassElement]) -> Result<(), JsError> {
             }
             let kinds = private_kinds.entry(name.clone()).or_default();
             let paired = kinds.len() == 1
+                && kinds[0].1 == element.is_static
                 && matches!(
-                    (kinds[0], element.kind),
+                    (kinds[0].0, element.kind),
                     (ClassElementKind::Get, ClassElementKind::Set)
                         | (ClassElementKind::Set, ClassElementKind::Get)
                 );
@@ -658,7 +660,7 @@ fn validate_class_elements(elements: &[ClassElement]) -> Result<(), JsError> {
                     element.offset,
                 ));
             }
-            kinds.push(element.kind);
+            kinds.push((element.kind, element.is_static));
         }
         match (element.kind, element.is_static) {
             (ClassElementKind::Constructor, false) => {
@@ -3659,6 +3661,20 @@ impl Parser {
                 && matches!(&key, PropertyKey::Static(name) if name == "constructor");
             let (parameters, body) =
                 self.method_tail(FunctionKind::new(is_async, is_generator), is_constructor)?;
+            // A getter takes no parameters; a setter takes exactly one, which may
+            // carry a default but may not be a rest parameter.
+            match kind {
+                ClassElementKind::Get if !parameters.is_empty() => {
+                    return Err(self.error("a class getter must not have parameters"));
+                }
+                ClassElementKind::Set
+                    if parameters.len() != 1
+                        || parameters[0].starts_with(PARAMETER_REST_MARKER) =>
+                {
+                    return Err(self.error("a class setter must have exactly one parameter"));
+                }
+                _ => {}
+            }
             let kind = if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
                 kind
             } else if !is_static
@@ -3844,7 +3860,9 @@ impl Parser {
         if is_strict_reserved_word(name) || name == "arguments" {
             return Err(self.error("class name is reserved in strict mode"));
         }
-        Ok(())
+        // A class name is a BindingIdentifier, so `await` and `yield` follow
+        // the same contextual rules as any other binding.
+        self.check_contextual_binding(name)
     }
 
     /// The statements of a class static block. It is a function-like boundary

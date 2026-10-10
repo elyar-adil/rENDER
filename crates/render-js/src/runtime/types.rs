@@ -120,6 +120,10 @@ pub(super) struct UserFunction {
     /// Class-specific metadata for methods and constructors; `None` for
     /// ordinary functions.
     pub(super) class: Option<Rc<ClassFunction>>,
+    /// The private-name scope lexically enclosing the function, captured when
+    /// it is created, so a call resolves `#name` where the code was written
+    /// rather than where it is called from.
+    pub(super) private_scope: Option<Rc<PrivateScope>>,
     /// The final parameter collects the remaining arguments into an array.
     pub(super) rest: bool,
     /// Whether calling the function starts a generator or an async activation.
@@ -181,7 +185,8 @@ pub(super) struct ClassFieldDefinition {
 pub(super) enum ClassFieldKey {
     Named(String),
     Symbol(crate::JsSymbol),
-    Private(u64),
+    /// The private name's id, and its written name for function naming.
+    Private(u64, String),
 }
 
 /// Per-call class context backing `super`, `new.target`, private names, and

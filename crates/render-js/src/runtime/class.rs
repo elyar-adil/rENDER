@@ -36,6 +36,7 @@ use crate::parser::PropertyKey;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::object::PropertyName;
 use crate::runtime::types::Binding;
 use crate::runtime::types::ClassFieldDefinition;
 use crate::runtime::types::ClassFieldKey;
@@ -112,7 +113,41 @@ impl JsRuntime {
         super_class: Option<&Expr>,
         elements: &[ClassElement],
     ) -> Result<JsValue, JsError> {
-        // 1. Heritage: the parent constructor and the prototype of the new
+        // 1. The class scope holds the immutable inner name binding. It exists
+        // while the heritage is evaluated, when the binding is still in its
+        // temporal dead zone (§15.7.14 steps 2-8).
+        let mut class_environment = EnvironmentRecord {
+            function_scope: false,
+            ..EnvironmentRecord::default()
+        };
+        if let Some(name) = name {
+            class_environment.bindings.insert(
+                name.to_owned(),
+                Binding {
+                    value: JsValue::Undefined,
+                    mutable: false,
+                    initialized: false,
+                    kind: VariableKind::Const,
+                },
+            );
+        }
+        self.environment
+            .push(Rc::new(RefCell::new(class_environment)));
+        let result = self.evaluate_class_in_scope(dom, name, function_name, super_class, elements);
+        self.environment.pop();
+        result
+    }
+
+    /// The body of `ClassDefinitionEvaluation`, run inside the class scope.
+    fn evaluate_class_in_scope(
+        &mut self,
+        dom: &mut Dom,
+        name: Option<&str>,
+        function_name: Option<&str>,
+        super_class: Option<&Expr>,
+        elements: &[ClassElement],
+    ) -> Result<JsValue, JsError> {
+        // 2. Heritage: the parent constructor and the prototype of the new
         // class's prototype object.
         let (super_constructor, super_prototype) = match super_class {
             None => (None, Some(self.realm.object_prototype())),
@@ -121,13 +156,17 @@ impl JsRuntime {
                 match value {
                     JsValue::Null => (None, None),
                     JsValue::Object(object) if Self::is_callable_object(object, &self.realm) => {
-                        let prototype =
-                            self.realm
-                                .get_property(object, "prototype")
-                                .and_then(|value| match value {
-                                    JsValue::Object(prototype) => Some(prototype),
-                                    _ => None,
-                                });
+                        // `Get(superclass, "prototype")` runs a getter, and the
+                        // result must be an object or null (§15.7.14 step 7.a).
+                        let prototype = match self.get_value(dom, object, "prototype")? {
+                            JsValue::Object(prototype) => Some(prototype),
+                            JsValue::Null => None,
+                            _ => {
+                                return Err(JsError::type_error(
+                                    "Class extends value does not have valid prototype property",
+                                ));
+                            }
+                        };
                         (Some(object), prototype)
                     }
                     _ => {
@@ -140,7 +179,7 @@ impl JsRuntime {
         };
         let derived = super_class.is_some();
 
-        // 2. Reserve a private-name id for every `#name` in the body, so
+        // 3. Reserve a private-name id for every `#name` in the body, so
         // fields, methods, and accessors of one class share identity. The
         // scope chains to the lexically enclosing class, letting a nested
         // class body reach outer private names.
@@ -161,36 +200,16 @@ impl JsRuntime {
                 .and_then(|frame| frame.private_scope.clone()),
         });
 
-        // 3. Class scope: the class name is visible inside the body.
-        let mut class_environment = EnvironmentRecord {
-            function_scope: false,
-            ..EnvironmentRecord::default()
-        };
-        if let Some(name) = name {
-            class_environment.bindings.insert(
-                name.to_owned(),
-                Binding {
-                    value: JsValue::Undefined,
-                    mutable: false,
-                    initialized: false,
-                    kind: VariableKind::Const,
-                },
-            );
-        }
-        self.environment
-            .push(Rc::new(RefCell::new(class_environment)));
-
-        let result = self.evaluate_class_body(
+        self.evaluate_class_body(
             dom,
             function_name,
+            name,
             super_constructor,
             super_prototype,
             derived,
             &private_names,
             elements,
-        );
-        self.environment.pop();
-        result
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -198,6 +217,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         name: Option<&str>,
+        binding: Option<&str>,
         super_constructor: Option<ObjectId>,
         super_prototype: Option<ObjectId>,
         derived: bool,
@@ -214,6 +234,7 @@ impl JsRuntime {
         let result = self.evaluate_class_body_inner(
             dom,
             name,
+            binding,
             super_constructor,
             super_prototype,
             derived,
@@ -229,6 +250,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         name: Option<&str>,
+        binding: Option<&str>,
         super_constructor: Option<ObjectId>,
         super_prototype: Option<ObjectId>,
         derived: bool,
@@ -241,10 +263,13 @@ impl JsRuntime {
         for element in elements {
             let key = match &element.key {
                 PropertyKey::Static(key) => ResolvedKey::Named(key.clone()),
-                PropertyKey::Computed(expression) => match self.evaluate(dom, expression)? {
-                    JsValue::Symbol(symbol) => ResolvedKey::Symbol(symbol),
-                    other => ResolvedKey::Named(other.to_js_string()),
-                },
+                PropertyKey::Computed(expression) => {
+                    let value = self.evaluate(dom, expression)?;
+                    match self.to_property_key_value(dom, value)? {
+                        JsValue::Symbol(symbol) => ResolvedKey::Symbol(symbol),
+                        other => ResolvedKey::Named(other.to_js_string()),
+                    }
+                }
                 PropertyKey::Private(private) => ResolvedKey::Private(
                     *private_names
                         .names
@@ -286,7 +311,7 @@ impl JsRuntime {
                 key: match key {
                     ResolvedKey::Named(key) => ClassFieldKey::Named(key.clone()),
                     ResolvedKey::Symbol(symbol) => ClassFieldKey::Symbol(symbol.clone()),
-                    ResolvedKey::Private(id, _) => ClassFieldKey::Private(*id),
+                    ResolvedKey::Private(id, name) => ClassFieldKey::Private(*id, name.clone()),
                 },
                 initializer: element.initializer.clone(),
             })
@@ -367,13 +392,11 @@ impl JsRuntime {
                 constructor: false,
                 environment: self.environment.clone(),
             });
-            let method_name = match key {
-                ResolvedKey::Named(key) => key.clone(),
-                // §15.4.4: a method named by a symbol is called `[description]`.
-                ResolvedKey::Symbol(symbol) => symbol
-                    .description()
-                    .map_or_else(String::new, |description| format!("[{description}]")),
-                ResolvedKey::Private(_, private) => format!("#{private}"),
+            // SetFunctionName with a prefix: an accessor is named `get x` or `set x`.
+            let method_name = match element.kind {
+                ClassElementKind::Get => format!("get {}", element_name(key)),
+                ClassElementKind::Set => format!("set {}", element_name(key)),
+                _ => element_name(key),
             };
             let method = self.create_function_meta(
                 Some(&method_name),
@@ -389,19 +412,24 @@ impl JsRuntime {
             let JsValue::Object(method) = method else {
                 continue;
             };
-            self.install_class_element(home, key, element.kind, method);
+            // Methods and accessors are not constructors, so they have no
+            // `prototype` (only a generator method keeps one).
+            if !element.is_generator {
+                self.realm.remove_method_prototype(method);
+            }
+            self.install_class_element(home, key, element.kind, method)?;
         }
 
         // 7. Initialize the inner class-name binding. Static fields and blocks run
         // after this, so they can name the class they belong to.
-        if let Some(name) = name {
+        if let Some(binding) = binding {
             self.environment
                 .last()
                 .expect("class scope was pushed")
                 .borrow_mut()
                 .bindings
                 .insert(
-                    name.to_owned(),
+                    binding.to_owned(),
                     Binding {
                         value: JsValue::Object(constructor),
                         mutable: false,
@@ -411,8 +439,37 @@ impl JsRuntime {
                 );
         }
 
-        // 8. Static fields and initialization blocks, in source order.
-        for (element, key) in elements.iter().zip(&resolved_keys) {
+        // 8. Static fields and initialization blocks, in source order. Their
+        // [[HomeObject]] is the constructor, so `super.x` reads from its parent.
+        self.class_frames.push(ClassFrame {
+            function: Some(Rc::new(ClassFunction {
+                home_object: Some(constructor),
+                super_constructor: None,
+                derived: false,
+                fields: Vec::new(),
+                private_names: private_names.clone(),
+                constructor: false,
+                environment: self.environment.clone(),
+            })),
+            private_scope: Some(private_names.clone()),
+        });
+        let result = self.define_static_elements(dom, constructor, elements, &resolved_keys);
+        self.class_frames.pop();
+        result?;
+
+        Ok(JsValue::Object(constructor))
+    }
+
+    /// Evaluate the static fields and initialization blocks of a class body,
+    /// in source order, against the constructor they initialize.
+    fn define_static_elements(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        elements: &[ClassElement],
+        resolved_keys: &[ResolvedKey],
+    ) -> Result<(), JsError> {
+        for (element, key) in elements.iter().zip(resolved_keys) {
             if !element.is_static {
                 continue;
             }
@@ -421,43 +478,11 @@ impl JsRuntime {
                     let value = match &element.initializer {
                         Some(initializer) => self
                             .with_this(JsValue::Object(constructor), |runtime| {
-                                runtime.evaluate(dom, initializer)
+                                runtime.evaluate_named(dom, initializer, &element_name(key))
                             })?,
                         None => JsValue::Undefined,
                     };
-                    match key {
-                        ResolvedKey::Named(key) => {
-                            self.realm.define_property(
-                                constructor,
-                                key.clone(),
-                                PropertyDescriptor {
-                                    getter: None,
-                                    setter: None,
-                                    value,
-                                    writable: true,
-                                    enumerable: true,
-                                    configurable: true,
-                                },
-                            );
-                        }
-                        ResolvedKey::Symbol(symbol) => {
-                            self.realm.define_symbol_property(
-                                constructor,
-                                symbol,
-                                PropertyDescriptor {
-                                    getter: None,
-                                    setter: None,
-                                    value,
-                                    writable: true,
-                                    enumerable: true,
-                                    configurable: true,
-                                },
-                            );
-                        }
-                        ResolvedKey::Private(id, _) => {
-                            self.realm.set_private_field(constructor, *id, value);
-                        }
-                    }
+                    self.define_field(dom, constructor, key, value)?;
                 }
                 ClassElementKind::StaticBlock => {
                     self.with_this(JsValue::Object(constructor), |runtime| {
@@ -470,8 +495,7 @@ impl JsRuntime {
                 _ => {}
             }
         }
-
-        Ok(JsValue::Object(constructor))
+        Ok(())
     }
 
     /// Run `body` with `this` bound to `value` in a temporary environment,
@@ -509,58 +533,90 @@ impl JsRuntime {
         key: &ResolvedKey,
         kind: ClassElementKind,
         method: ObjectId,
-    ) {
+    ) -> Result<(), JsError> {
         let (getter, setter) = match kind {
             ClassElementKind::Get => (Some(method), None),
             ClassElementKind::Set => (None, Some(method)),
             _ => (None, None),
         };
-        if getter.is_some() || setter.is_some() {
+        let descriptor = if getter.is_some() || setter.is_some() {
             let existing = match key {
                 ResolvedKey::Named(key) => self.realm.own_property(target, key),
                 ResolvedKey::Symbol(symbol) => self.realm.own_symbol_property(target, symbol),
                 ResolvedKey::Private(id, _) => self.realm.own_private_method(target, *id),
             };
-            let descriptor = PropertyDescriptor {
+            PropertyDescriptor {
                 getter: getter.or(existing.as_ref().and_then(|d| d.getter)),
                 setter: setter.or(existing.as_ref().and_then(|d| d.setter)),
                 value: JsValue::Undefined,
                 writable: false,
                 enumerable: false,
                 configurable: true,
-            };
-            match key {
-                ResolvedKey::Named(key) => {
-                    self.realm.define_property(target, key.clone(), descriptor);
-                }
-                ResolvedKey::Symbol(symbol) => {
-                    self.realm
-                        .define_symbol_property(target, symbol, descriptor);
-                }
-                ResolvedKey::Private(id, _) => {
-                    self.realm.define_private_method(target, *id, descriptor);
-                }
             }
-            return;
-        }
-        let descriptor = PropertyDescriptor {
-            getter: None,
-            setter: None,
-            value: JsValue::Object(method),
-            writable: true,
-            enumerable: false,
-            configurable: true,
+        } else {
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(method),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            }
         };
+        if self.define_class_element(target, key, descriptor) {
+            Ok(())
+        } else {
+            // DefinePropertyOrThrow (§7.3.8): a public element the target refuses,
+            // such as a static `prototype` of a class, is a TypeError.
+            Err(JsError::type_error(
+                "class element cannot be defined on its target",
+            ))
+        }
+    }
+
+    /// Define one class field on `object` (`DefineField`, ECMA-262 7.3.33): a
+    /// public field is `CreateDataPropertyOrThrow`, so a static field named
+    /// `prototype` is refused, and a private field is a private element.
+    fn define_field(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &ResolvedKey,
+        value: JsValue,
+    ) -> Result<(), JsError> {
         match key {
-            ResolvedKey::Named(key) => {
-                self.realm.define_property(target, key.clone(), descriptor);
+            ResolvedKey::Named(name) => {
+                let key = PropertyName::String(name.clone());
+                self.create_data_field_or_throw(dom, object, &key, value)
             }
             ResolvedKey::Symbol(symbol) => {
-                self.realm
-                    .define_symbol_property(target, symbol, descriptor);
+                let key = PropertyName::Symbol(symbol.clone());
+                self.create_data_field_or_throw(dom, object, &key, value)
             }
             ResolvedKey::Private(id, _) => {
+                self.realm.set_private_field(object, *id, value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Define a class element on `target`. Private elements always land in the
+    /// object's private-method table; public ones report whether the property
+    /// definition was accepted.
+    fn define_class_element(
+        &mut self,
+        target: ObjectId,
+        key: &ResolvedKey,
+        descriptor: PropertyDescriptor,
+    ) -> bool {
+        match key {
+            ResolvedKey::Named(key) => self.realm.define_property(target, key.clone(), descriptor),
+            ResolvedKey::Symbol(symbol) => self
+                .realm
+                .define_symbol_property(target, symbol, descriptor),
+            ResolvedKey::Private(id, _) => {
                 self.realm.define_private_method(target, *id, descriptor);
+                true
             }
         }
     }
@@ -600,42 +656,24 @@ impl JsRuntime {
             function: Some(class.clone()),
             private_scope: Some(class.private_names.clone()),
         });
-        self.with_this(JsValue::Object(instance), |runtime| {
+        let result = self.with_this(JsValue::Object(instance), |runtime| {
             for field in &class.fields {
                 let value = match &field.initializer {
-                    Some(initializer) => runtime.evaluate(dom, initializer)?,
+                    Some(initializer) => {
+                        runtime.evaluate_named(dom, initializer, &field_name(&field.key))?
+                    }
                     None => JsValue::Undefined,
                 };
                 match &field.key {
                     ClassFieldKey::Named(name) => {
-                        runtime.realm.define_property(
-                            instance,
-                            name.clone(),
-                            PropertyDescriptor {
-                                getter: None,
-                                setter: None,
-                                value,
-                                writable: true,
-                                enumerable: true,
-                                configurable: true,
-                            },
-                        );
+                        let key = PropertyName::String(name.clone());
+                        runtime.create_data_field_or_throw(dom, instance, &key, value)?;
                     }
                     ClassFieldKey::Symbol(symbol) => {
-                        runtime.realm.define_symbol_property(
-                            instance,
-                            symbol,
-                            PropertyDescriptor {
-                                getter: None,
-                                setter: None,
-                                value,
-                                writable: true,
-                                enumerable: true,
-                                configurable: true,
-                            },
-                        );
+                        let key = PropertyName::Symbol(symbol.clone());
+                        runtime.create_data_field_or_throw(dom, instance, &key, value)?;
                     }
-                    ClassFieldKey::Private(id) => {
+                    ClassFieldKey::Private(id, _) => {
                         // PrivateFieldAdd (ECMA-262 7.3.29): an element the
                         // object already has (from a base constructor that
                         // returned it) is an error, not an overwrite.
@@ -649,10 +687,12 @@ impl JsRuntime {
                 }
             }
             Ok(())
-        })?;
+        });
+        // The frame and environment are restored on failure too, so an
+        // initializer that throws leaves the caller's context intact.
         self.class_frames.pop();
         self.environment = previous_environment;
-        Ok(())
+        result
     }
 
     /// Give an object-literal method or accessor its `[[HomeObject]]`, the object
@@ -857,6 +897,29 @@ impl JsRuntime {
 }
 
 /// A class element key resolved once at class-definition time.
+/// The name `SetFunctionName` gives a class element with this key (§15.4.4 and
+/// §15.7.14): a symbol key contributes `[description]`, a private name `#name`.
+fn element_name(key: &ResolvedKey) -> String {
+    match key {
+        ResolvedKey::Named(key) => key.clone(),
+        ResolvedKey::Symbol(symbol) => symbol
+            .description()
+            .map_or_else(String::new, |description| format!("[{description}]")),
+        ResolvedKey::Private(_, private) => format!("#{private}"),
+    }
+}
+
+/// The name a field initializer's anonymous function takes (`NamedEvaluation`).
+fn field_name(key: &ClassFieldKey) -> String {
+    match key {
+        ClassFieldKey::Named(key) => key.clone(),
+        ClassFieldKey::Symbol(symbol) => symbol
+            .description()
+            .map_or_else(String::new, |description| format!("[{description}]")),
+        ClassFieldKey::Private(_, private) => format!("#{private}"),
+    }
+}
+
 enum ResolvedKey {
     Named(String),
     Symbol(JsSymbol),

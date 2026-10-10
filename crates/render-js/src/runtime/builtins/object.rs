@@ -1033,6 +1033,33 @@ impl JsRuntime {
         }
     }
 
+    /// `CreateDataPropertyOrThrow` (ECMA-262 7.3.7) for a class field: an
+    /// enumerable, writable, configurable data property defined through
+    /// `[[DefineOwnProperty]]`, so a proxy's `defineProperty` trap sees it. A
+    /// refusal is a `TypeError`.
+    pub(in crate::runtime) fn create_data_field_or_throw(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &PropertyName,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let partial = PartialDescriptor {
+            value: Some(value),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..PartialDescriptor::default()
+        };
+        if self.define_own_property(dom, object, key, partial)? {
+            Ok(())
+        } else {
+            Err(JsError::type_error(
+                "class field cannot be defined on its target",
+            ))
+        }
+    }
+
     /// ECMA-262 10.1.6 `[[DefineOwnProperty]]`, dispatched on the exotic kind
     /// of `object`: a proxy runs its `defineProperty` trap, an Array runs
     /// 10.4.2.1, and anything else is ordinary.

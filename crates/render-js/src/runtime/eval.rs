@@ -370,6 +370,54 @@ impl JsRuntime {
         Ok(Completion::Normal(value))
     }
 
+    /// `FunctionDeclarationInstantiation` for the body (ECMA-262 10.2.11). With
+    /// parameter expressions, the body's declarations get an environment of their
+    /// own (step 28), so a closure in a default initializer does not see them. A
+    /// body `var` that shares a parameter's name starts with that parameter's value.
+    fn instantiate_function_body(
+        &mut self,
+        function: &UserFunction,
+        parameters: &Environment,
+    ) -> Result<(), JsError> {
+        if !function.defaults.iter().any(Option::is_some) {
+            return self.instantiate_statements(&function.body);
+        }
+        self.environment
+            .push(Rc::new(RefCell::new(EnvironmentRecord {
+                function_scope: true,
+                ..EnvironmentRecord::default()
+            })));
+        self.instantiate_statements(&function.body)?;
+        let body = self
+            .environment
+            .last()
+            .cloned()
+            .expect("the body environment was pushed");
+        let parameter_values: Vec<(String, JsValue)> = {
+            let parameters = parameters.borrow();
+            function
+                .parameters
+                .iter()
+                .filter_map(|name| {
+                    parameters
+                        .bindings
+                        .get(name)
+                        .map(|binding| (name.clone(), binding.value.clone()))
+                })
+                .collect()
+        };
+        let mut body = body.borrow_mut();
+        for (name, value) in parameter_values {
+            if let Some(binding) = body.bindings.get_mut(&name)
+                && binding.kind == VariableKind::Var
+                && matches!(binding.value, JsValue::Undefined)
+            {
+                binding.value = value;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn instantiate_statements(
         &mut self,
         statements: &[Statement],
@@ -426,8 +474,10 @@ impl JsRuntime {
                     functions.push((name, parameters, body, *kind));
                 }
                 Statement::Class { name, .. } => {
+                    // A class declaration is a mutable `let`-style binding; only
+                    // the inner name the class body sees is immutable.
                     if lexical_declarations
-                        .insert(name.clone(), VariableKind::Const)
+                        .insert(name.clone(), VariableKind::Let)
                         .is_some()
                     {
                         return Err(JsError::syntax(
@@ -524,7 +574,7 @@ impl JsRuntime {
                 }
                 Statement::Class { name, .. }
                     if declarations
-                        .insert(name.clone(), VariableKind::Const)
+                        .insert(name.clone(), VariableKind::Let)
                         .is_some() =>
                 {
                     return Err(JsError::syntax(
@@ -624,6 +674,10 @@ impl JsRuntime {
         let patterns = (0..parameters.len())
             .map(|index| patterns.get(&index).cloned())
             .collect();
+        let private_scope = self
+            .class_frames
+            .last()
+            .and_then(|frame| frame.private_scope.clone());
         self.functions.push(UserFunction {
             name: name.map(str::to_owned),
             parameters,
@@ -634,6 +688,7 @@ impl JsRuntime {
             arrow,
             strict,
             class,
+            private_scope,
             rest,
             kind,
         });
@@ -811,7 +866,7 @@ impl JsRuntime {
             } => {
                 let value =
                     self.evaluate_class(dom, Some(name), super_class.as_deref(), elements)?;
-                self.initialize_binding(dom, name, value.clone(), VariableKind::Const)?;
+                self.initialize_binding(dom, name, value.clone(), VariableKind::Let)?;
                 Ok(Completion::Normal(value))
             }
             Statement::Return(value) => {
@@ -1516,7 +1571,10 @@ impl JsRuntime {
             } => self.evaluate_class(dom, name.as_deref(), super_class.as_deref(), elements),
             Expr::SuperMember { property, .. } => self.read_super_property(dom, property),
             Expr::SuperComputedMember { property, .. } => {
-                let key = self.evaluate(dom, property)?.to_js_string();
+                // `this` is checked before the key expression runs (§13.3.7.1).
+                self.current_this()?;
+                let key = self.evaluate(dom, property)?;
+                let key = self.to_property_key_value(dom, key)?.to_js_string();
                 self.read_super_property(dom, &key)
             }
             Expr::SuperCall { arguments, .. } => {
@@ -1560,7 +1618,7 @@ impl JsRuntime {
                 {
                     self.realm.set_prototype(instance, Some(prototype));
                 }
-                self.initialize_this(JsValue::Object(instance));
+                self.bind_this(JsValue::Object(instance))?;
                 self.run_instance_fields(dom, &class, instance)?;
                 Ok(JsValue::Object(instance))
             }
@@ -2039,7 +2097,12 @@ impl JsRuntime {
         value: JsValue,
     ) -> Result<(), JsError> {
         match target {
-            Expr::Identifier(_) | Expr::Member { .. } | Expr::ComputedMember { .. } => {
+            Expr::Identifier(_)
+            | Expr::Member { .. }
+            | Expr::ComputedMember { .. }
+            | Expr::PrivateMember { .. }
+            | Expr::SuperMember { .. }
+            | Expr::SuperComputedMember { .. } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 self.write_assignment_reference(dom, &reference, value)
             }
@@ -2131,6 +2194,25 @@ impl JsRuntime {
                             unreachable!("object literals cannot carry private names")
                         }
                     };
+                    // A simple target is a reference evaluated before the property
+                    // is read (§13.15.5.6 step 1), so a target that throws, such as
+                    // `this.#x` before `super()`, does so before any getter runs.
+                    let simple_target = matches!(
+                        property.value,
+                        Expr::Identifier(_)
+                            | Expr::Member { .. }
+                            | Expr::ComputedMember { .. }
+                            | Expr::PrivateMember { .. }
+                            | Expr::SuperMember { .. }
+                            | Expr::SuperComputedMember { .. }
+                    );
+                    if simple_target {
+                        let reference = self.resolve_assignment_reference(dom, &property.value)?;
+                        let property_value = self.get_member(dom, object, &key)?;
+                        excluded.push(key);
+                        self.write_assignment_reference(dom, &reference, property_value)?;
+                        continue;
+                    }
                     let property_value = self.get_member(dom, object, &key)?;
                     excluded.push(key);
                     self.assign_destructuring_target(dom, &property.value, property_value)?;
@@ -2269,17 +2351,24 @@ impl JsRuntime {
         Ok(JsValue::Object(self.realm.global_object()))
     }
 
-    /// Bind `this` in the nearest environment that declares the binding (the
-    /// active derived constructor's call environment).
-    pub(super) fn initialize_this(&mut self, value: JsValue) {
+    /// `BindThisValue` (ECMA-262 9.1.1.3.1): bind `this` in the nearest
+    /// environment that declares it (the active derived constructor's call
+    /// environment). A second `super()` finds the binding already initialized.
+    pub(super) fn bind_this(&mut self, value: JsValue) -> Result<(), JsError> {
         for environment in self.environment.iter().rev() {
             let mut environment = environment.borrow_mut();
             if let Some(binding) = environment.bindings.get_mut("this") {
+                if binding.initialized {
+                    return Err(JsError::reference(
+                        "super() may only be called once in a derived constructor",
+                    ));
+                }
                 binding.value = value;
                 binding.initialized = true;
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     pub(super) fn get_value(
@@ -5725,18 +5814,13 @@ impl JsRuntime {
         }
         let call_environment = Rc::new(RefCell::new(call_environment));
         self.environment.push(call_environment.clone());
-        // Arrows inherit the enclosing class context dynamically; named
-        // functions use their own class metadata.
-        let class_context = if function.arrow {
-            self.class_frames.last().cloned().unwrap_or_default()
-        } else {
-            ClassFrame {
-                function: function.class.clone(),
-                private_scope: function
-                    .class
-                    .as_ref()
-                    .map(|class| class.private_names.clone()),
-            }
+        // `super` and `#name` resolve through the class context the function
+        // was created in. An arrow's `class` was captured from the frame around
+        // it, so arrows and nested functions see their lexical class, not the
+        // caller's.
+        let class_context = ClassFrame {
+            function: function.class.clone(),
+            private_scope: function.private_scope.clone(),
         };
         self.class_frames.push(class_context);
         let label = function
@@ -5755,7 +5839,7 @@ impl JsRuntime {
         self.call_stack.push(CallFrame { name: label });
         let prepared = self
             .bind_parameters(dom, &function, arguments, &call_environment)
-            .and_then(|()| self.instantiate_statements(&function.body));
+            .and_then(|()| self.instantiate_function_body(&function, &call_environment));
         let result = match prepared {
             Ok(()) if function.kind.is_coroutine() => self
                 .start_coroutine(dom, callee, index, &function, &call_environment)
