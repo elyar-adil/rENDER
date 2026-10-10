@@ -1000,6 +1000,12 @@ pub(crate) enum NativeFunction {
     IteratorConcat,
     IteratorChunks,
     IteratorWindows,
+    IteratorIncludes,
+    IteratorJoin,
+    IteratorWrapNext,
+    IteratorWrapReturn,
+    IteratorZip,
+    IteratorZipKeyed,
     GlobalFetch,
     ReflectGet,
     ReflectSet,
@@ -1639,17 +1645,31 @@ pub(crate) fn dom_exception_code(name: &str) -> u16 {
 /// The behavior of one lazy iterator helper.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IteratorHelperKind {
-    /// `Iterator.from` wrapper around a foreign iterator (forwards `next`).
+    /// `Iterator.from` wrapper: `next` and `return` are forwarded, with no state machine.
     Wrap,
     Map,
     Filter,
-    Take(u64),
-    Drop(u64),
+    /// `take`: `counter` is the remaining count.
+    Take,
+    /// `drop`: `counter` is the number of values still to skip.
+    Drop,
     FlatMap,
-    /// `concat`: chains the receiver with the remaining iterators.
-    Concat(Vec<ObjectId>),
+    /// `Iterator.concat`: `buffer` holds (iterable, open method) pairs and `counter` the next pair.
+    Concat,
     Chunks(u64),
-    Windows(u64),
+    /// `windows`: the window size, and whether a short first window is yielded (`allow-partial`).
+    Windows(u64, bool),
+    /// `Iterator.zip` (`false`) and `Iterator.zipKeyed` (`true`): `buffer` holds four slots per
+    /// input (iterator or null when done, next, padding, key).
+    Zip(ZipMode, bool),
+}
+
+/// How `Iterator.zip` and `Iterator.zipKeyed` treat inputs that finish at different times.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ZipMode {
+    Shortest,
+    Longest,
+    Strict,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1817,9 +1837,13 @@ pub(crate) enum ObjectHost {
         inner_next: Option<ObjectId>,
         /// Generic per-helper counter (`take`/`drop`/`chunks`/`windows`).
         counter: u64,
-        /// Per-helper buffer (flatMap, concat, chunks, windows, reduce).
+        /// Per-helper buffer (concat pairs, chunks, windows).
         buffer: Vec<JsValue>,
         done: bool,
+        /// Set while a `next`/`return` resumption runs (the generator "executing" state).
+        running: bool,
+        /// Set once `next` has run, so `return` can tell "suspended-start" from "suspended-yield".
+        started: bool,
     },
     TypedArrayConstructor(TypedArrayKind),
     TypedArray {
@@ -2222,6 +2246,8 @@ pub struct Realm {
     media_query_list_prototype: ObjectId,
     /// `%IteratorHelperPrototype%` shared by helper result objects.
     iterator_helper_prototype: ObjectId,
+    /// `%WrapForValidIteratorPrototype%`: the prototype of `Iterator.from` wrappers.
+    iterator_wrap_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -2386,7 +2412,7 @@ impl Realm {
         );
         let array_prototype =
             Self::install_array(&mut objects, global, object_prototype, function_prototype);
-        let (iterator_prototype, iterator_helper_prototype) =
+        let (iterator_prototype, iterator_helper_prototype, iterator_wrap_prototype) =
             Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
         let regexp_string_iterator_prototype = Self::install_regexp_string_iterator(
             &mut objects,
@@ -3049,6 +3075,7 @@ impl Realm {
             async_generator_function_prototype,
             async_from_sync_iterator_prototype,
             iterator_helper_prototype,
+            iterator_wrap_prototype,
             storage_prototype,
             media_query_list_prototype,
             node_wrappers: BTreeMap::new(),
@@ -4291,7 +4318,7 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) -> (ObjectId, ObjectId) {
+    ) -> (ObjectId, ObjectId, ObjectId) {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -4302,21 +4329,24 @@ impl Realm {
             prototype: Some(prototype),
             ..JsObject::default()
         });
-        for (name, function) in [
-            ("map", NativeFunction::IteratorMap),
-            ("filter", NativeFunction::IteratorFilter),
-            ("take", NativeFunction::IteratorTake),
-            ("drop", NativeFunction::IteratorDrop),
-            ("flatMap", NativeFunction::IteratorFlatMap),
-            ("reduce", NativeFunction::IteratorReduce),
-            ("toArray", NativeFunction::IteratorToArray),
-            ("forEach", NativeFunction::IteratorForEach),
-            ("some", NativeFunction::IteratorSome),
-            ("every", NativeFunction::IteratorEvery),
-            ("find", NativeFunction::IteratorFind),
-            ("concat", NativeFunction::IteratorConcat),
-            ("chunks", NativeFunction::IteratorChunks),
-            ("windows", NativeFunction::IteratorWindows),
+        // Each method carries its spec `length`, set here because the name-based
+        // arity table cannot tell `Iterator.concat` (0) from `Array.prototype.concat` (1).
+        for (name, function, arity) in [
+            ("map", NativeFunction::IteratorMap, 1.0),
+            ("filter", NativeFunction::IteratorFilter, 1.0),
+            ("take", NativeFunction::IteratorTake, 1.0),
+            ("drop", NativeFunction::IteratorDrop, 1.0),
+            ("flatMap", NativeFunction::IteratorFlatMap, 1.0),
+            ("reduce", NativeFunction::IteratorReduce, 1.0),
+            ("toArray", NativeFunction::IteratorToArray, 0.0),
+            ("forEach", NativeFunction::IteratorForEach, 1.0),
+            ("some", NativeFunction::IteratorSome, 1.0),
+            ("every", NativeFunction::IteratorEvery, 1.0),
+            ("find", NativeFunction::IteratorFind, 1.0),
+            ("includes", NativeFunction::IteratorIncludes, 1.0),
+            ("join", NativeFunction::IteratorJoin, 1.0),
+            ("chunks", NativeFunction::IteratorChunks, 1.0),
+            ("windows", NativeFunction::IteratorWindows, 1.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -4324,6 +4354,17 @@ impl Realm {
                 host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Number(arity),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
@@ -4343,20 +4384,41 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(self_iterator)),
             ),
         );
-        for (name, function) in [
-            ("next", NativeFunction::IteratorHelperNext),
-            ("return", NativeFunction::IteratorHelperReturn),
+        // `%IteratorHelperPrototype%` and `%WrapForValidIteratorPrototype%` each
+        // carry their own `next`/`return` pair (ECMA-262 27.1.2.1, 27.1.3.2).
+        let wrap_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(prototype),
+            ..JsObject::default()
+        });
+        for (target, methods) in [
+            (
+                helper_prototype,
+                [
+                    ("next", NativeFunction::IteratorHelperNext),
+                    ("return", NativeFunction::IteratorHelperReturn),
+                ],
+            ),
+            (
+                wrap_prototype,
+                [
+                    ("next", NativeFunction::IteratorWrapNext),
+                    ("return", NativeFunction::IteratorWrapReturn),
+                ],
+            ),
         ] {
-            let method = ObjectId(objects.len());
-            objects.push(JsObject {
-                prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(function),
-                ..JsObject::default()
-            });
-            objects[helper_prototype.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(method)),
-            );
+            for (name, function) in methods {
+                let method = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(function),
+                    ..JsObject::default()
+                });
+                objects[target.0].properties.insert(
+                    name.to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(method)),
+                );
+            }
         }
         objects[helper_prototype.0].symbols.insert(
             symbol.id(),
@@ -4371,15 +4433,44 @@ impl Realm {
             host: ObjectHost::NativeFunction(NativeFunction::IteratorConstructor),
             ..JsObject::default()
         });
-        let from = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::NativeFunction(NativeFunction::IteratorFrom),
-            ..JsObject::default()
-        });
+        for (name, function, arity) in [
+            ("from", NativeFunction::IteratorFrom, 1.0),
+            ("concat", NativeFunction::IteratorConcat, 0.0),
+            ("zip", NativeFunction::IteratorZip, 1.0),
+            ("zipKeyed", NativeFunction::IteratorZipKeyed, 1.0),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                ..JsObject::default()
+            });
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Number(arity),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            objects[constructor.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
         objects[constructor.0].properties.insert(
-            "from".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(from)),
+            "length".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Number(0.0),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
         );
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
@@ -4403,7 +4494,7 @@ impl Realm {
                 configurable: true,
             },
         );
-        (prototype, helper_prototype)
+        (prototype, helper_prototype, wrap_prototype)
     }
 
     /// Attach spec-visible `name`/`length` own properties to built-in
@@ -7788,6 +7879,7 @@ impl Realm {
         roots.push(self.async_generator_function_prototype);
         roots.push(self.async_from_sync_iterator_prototype);
         roots.push(self.iterator_helper_prototype);
+        roots.push(self.iterator_wrap_prototype);
         roots.push(self.regexp_string_iterator_prototype);
         // The Storage prototype is only reachable through the two area
         // objects, whose own keys are the caller's data.
@@ -8739,7 +8831,9 @@ impl Realm {
         })
     }
 
-    /// Allocate a lazy iterator-helper state machine object.
+    /// Allocate a lazy iterator-helper state machine object. `Iterator.from`
+    /// wrappers take `%WrapForValidIteratorPrototype%`, every other kind takes
+    /// `%IteratorHelperPrototype%`.
     pub(crate) fn iterator_helper(
         &mut self,
         kind: IteratorHelperKind,
@@ -8748,8 +8842,13 @@ impl Realm {
         callback: Option<ObjectId>,
         counter: u64,
     ) -> ObjectId {
+        let prototype = if kind == IteratorHelperKind::Wrap {
+            self.iterator_wrap_prototype
+        } else {
+            self.iterator_helper_prototype
+        };
         self.allocate(JsObject {
-            prototype: Some(self.iterator_helper_prototype),
+            prototype: Some(prototype),
             host: ObjectHost::IteratorHelper {
                 kind,
                 source,
@@ -8760,9 +8859,16 @@ impl Realm {
                 counter,
                 buffer: Vec::new(),
                 done: false,
+                running: false,
+                started: false,
             },
             ..JsObject::default()
         })
+    }
+
+    /// `%Iterator.prototype%`, the intrinsic that `Iterator.from` tests against.
+    pub(crate) const fn iterator_prototype_id(&self) -> ObjectId {
+        self.iterator_prototype
     }
 
     fn allocate(&mut self, object: JsObject) -> ObjectId {

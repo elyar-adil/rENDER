@@ -5510,14 +5510,22 @@ impl JsRuntime {
                 self.transient_roots.truncate(pinned);
                 result
             }
-            Some(ObjectHost::NativeFunction(function)) => {
-                let receiver = match &receiver {
-                    JsValue::Object(object) => *object,
-                    JsValue::Null | JsValue::Undefined => self.realm.global_object(),
-                    _ => self.coerce_member_base(&receiver, &format!("{function:?} receiver"))?,
-                };
-                self.call_native(dom, function, receiver, arguments)
-            }
+            Some(ObjectHost::NativeFunction(function)) => match &receiver {
+                JsValue::Object(object) => self.call_native(dom, function, *object, arguments),
+                // Iterator methods read `this` unchanged: a primitive is a TypeError, not a wrapper.
+                _ if crate::runtime::builtins::iterator::reads_receiver_unchanged(function) => Err(
+                    JsError::type_error("iterator method called on a non-object receiver"),
+                ),
+                JsValue::Null | JsValue::Undefined => {
+                    let global = self.realm.global_object();
+                    self.call_native(dom, function, global, arguments)
+                }
+                _ => {
+                    let receiver =
+                        self.coerce_member_base(&receiver, &format!("{function:?} receiver"))?;
+                    self.call_native(dom, function, receiver, arguments)
+                }
+            },
             Some(ObjectHost::BoundFunction { function, receiver }) => {
                 self.call_native(dom, function, receiver, arguments)
             }
