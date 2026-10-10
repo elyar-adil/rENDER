@@ -194,11 +194,45 @@ fn optional_call_keeps_the_receiver_and_skips_arguments() {
         "6"
     );
     assert_eq!(ok("var o = {}; String(o.f?.())"), "undefined");
+    assert_eq!(ok("var hits = 0; var o = {}; o.f?.(hits++); hits"), "0");
+    // Not an optional call: the argument runs first, then the missing callee throws.
     assert_eq!(
-        ok("var hits = 0; var o = {}; o.f?.(hits++); o?.f(hits++); hits"),
-        "0"
+        ok(
+            "var hits = 0; var o = {}; var r; try { o?.f(hits++); r = 'no'; } catch (e) { r = e.name; } r + hits"
+        ),
+        "TypeError1"
     );
     assert_eq!(ok("var f; String(f?.(1))"), "undefined");
+}
+
+#[test]
+fn calling_a_nullish_or_primitive_callee_throws_after_the_arguments() {
+    // ECMA-262 13.3.6.1: only an optional call short-circuits; every other
+    // callee that is not callable is a TypeError, and the arguments run first.
+    for source in [
+        "var f; f(1)",
+        "var n = null; n()",
+        "var o = {}; o.missing()",
+        "var five = 5; five()",
+        "var s = 'x'; s.call(1)",
+        "var t; t`x`",
+    ] {
+        assert_eq!(
+            ok(&format!(
+                "var r; try {{ {source}; r = 'no'; }} catch (e) {{ r = e.name; }} r"
+            )),
+            "TypeError",
+            "{source}"
+        );
+    }
+    assert_eq!(
+        ok("var hits = 0; var f; var r; try { f(hits++); } catch (e) { r = e.name; } r + hits"),
+        "TypeError1"
+    );
+    assert_eq!(
+        ok("var five = 5; var r; try { five?.(); r = 'no'; } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
 }
 
 #[test]

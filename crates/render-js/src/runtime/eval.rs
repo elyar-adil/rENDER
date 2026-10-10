@@ -1796,15 +1796,14 @@ impl JsRuntime {
                 // §13.3.11: the tag is resolved first, then the template object
                 // is created, then the substitutions run left to right, and only
                 // then is the tag called with all of them.
-                let Some((callee, receiver)) = self.resolve_call_target(dom, tag)? else {
-                    return Ok(JsValue::Undefined);
-                };
+                let (callee_value, receiver) = self.call_reference(dom, tag)?;
                 let template = self.create_template_object(quasis)?;
                 let mut values = Vec::with_capacity(expressions.len() + 1);
                 values.push(JsValue::Object(template));
                 for expression in expressions {
                     self.evaluate_argument(dom, expression, &mut values)?;
                 }
+                let callee = Self::callable_callee(&callee_value, tag)?;
                 self.call_with_this(dom, callee, &values, receiver)
             }
             Expr::Sequence(expressions) => {
@@ -2868,14 +2867,13 @@ impl JsRuntime {
         callee: &Expr,
         arguments: &[Expr],
     ) -> Result<JsValue, JsError> {
-        let Some((callee, receiver)) = self.resolve_call_target(dom, callee)? else {
-            return Ok(JsValue::Undefined);
-        };
+        let (callee_value, receiver) = self.call_reference(dom, callee)?;
         let mut values = Vec::with_capacity(arguments.len());
         for argument in arguments {
             self.evaluate_argument(dom, argument, &mut values)?;
         }
-        self.call_with_this(dom, callee, &values, receiver)
+        let callee_object = Self::callable_callee(&callee_value, callee)?;
+        self.call_with_this(dom, callee_object, &values, receiver)
     }
 
     /// Resolve the callee of a call expression to the callable to invoke plus
@@ -2885,24 +2883,21 @@ impl JsRuntime {
     /// `None` is the engine's documented lenient path for a callee that is not
     /// a function at all: a nullish or primitive callee makes the whole
     /// expression evaluate to `undefined` without evaluating its arguments.
+    /// Resolves the callee of a call. `None` is returned only for an optional
+    /// call (`f?.()`) whose callee is nullish, which short-circuits the chain.
+    /// Every other callee that is not callable is a `TypeError` (ECMA-262
+    /// 13.3.6.1), including `undefined` and `null`.
     pub(super) fn resolve_call_target(
         &mut self,
         dom: &mut Dom,
         callee: &Expr,
-    ) -> Result<Option<(ObjectId, JsValue)>, JsError> {
-        let callee_label = match callee {
-            Expr::Member { property, .. } => format!(".{property}"),
-            Expr::ComputedMember { .. } => "[]".to_owned(),
-            Expr::SuperMember { property, .. } => format!(".{property}"),
-            Expr::SuperComputedMember { .. } => "[]".to_owned(),
-            Expr::PrivateMember { name, .. } => format!(".#{name}"),
-            _ => String::new(),
-        };
+        optional: bool,
+    ) -> Result<Option<(JsValue, JsValue)>, JsError> {
         let (callee_value, receiver) = match callee {
             // `f?.()` / `o.m?.()`: resolve the inner callee with its receiver;
             // a callee that is nullish ends the whole chain.
             Expr::OptionalGuard(inner) => {
-                return match self.resolve_call_target(dom, inner)? {
+                return match self.resolve_call_target(dom, inner, true)? {
                     Some(target) => Ok(Some(target)),
                     None => Err(JsError::optional_short_circuit()),
                 };
@@ -2964,31 +2959,44 @@ impl JsRuntime {
             }
             _ => (self.evaluate(dom, callee)?, JsValue::Undefined),
         };
-        let callee = match callee_value {
-            // Web pages routinely feature-detect optional host methods through
-            // a call guarded by a surrounding branch. Treat a missing host hook
-            // as an inert call so one telemetry shim cannot abort the entire
-            // application bootstrap.
-            JsValue::Undefined
-            | JsValue::Null
-            | JsValue::String(_)
-            | JsValue::Number(_)
-            | JsValue::Boolean(_)
-            | JsValue::Symbol(_) => return Ok(None),
-            // A BigInt is a primitive that is never callable, so unlike the
-            // missing host hooks above it is a TypeError (ECMA-262 13.3.6.2).
-            JsValue::BigInt(_) => {
-                return Err(JsError::type_error(format!(
-                    "value of callee{callee_label} is undefined or not callable"
-                )));
-            }
-            value @ JsValue::Object(_) => Self::require_object(&value).map_err(|_| {
-                JsError::type_error(format!(
-                    "value of callee{callee_label} is undefined or not callable"
-                ))
-            })?,
-        };
-        Ok(Some((callee, receiver)))
+        if optional && matches!(callee_value, JsValue::Undefined | JsValue::Null) {
+            return Ok(None);
+        }
+        Ok(Some((callee_value, receiver)))
+    }
+
+    /// The callee value and receiver of a call that is not optional. Only an
+    /// optional call yields no reference, so here one is always present.
+    fn call_reference(
+        &mut self,
+        dom: &mut Dom,
+        callee: &Expr,
+    ) -> Result<(JsValue, JsValue), JsError> {
+        self.resolve_call_target(dom, callee, false)?
+            .ok_or_else(|| JsError::type_error("value of callee is undefined or not callable"))
+    }
+
+    /// The object a call invokes. This runs after the arguments are evaluated,
+    /// because ECMA-262 13.3.6.1 checks callability last.
+    fn callable_callee(value: &JsValue, callee: &Expr) -> Result<ObjectId, JsError> {
+        match value {
+            JsValue::Object(object) => Ok(*object),
+            _ => Err(JsError::type_error(format!(
+                "value of callee{} is undefined or not callable",
+                Self::callee_label(callee)
+            ))),
+        }
+    }
+
+    fn callee_label(callee: &Expr) -> String {
+        match callee {
+            Expr::Member { property, .. } => format!(".{property}"),
+            Expr::ComputedMember { .. } => "[]".to_owned(),
+            Expr::SuperMember { property, .. } => format!(".{property}"),
+            Expr::SuperComputedMember { .. } => "[]".to_owned(),
+            Expr::PrivateMember { name, .. } => format!(".#{name}"),
+            _ => String::new(),
+        }
     }
 
     /// ECMA-262 13.3.6 `GetTemplateObject`: a template object is an array
