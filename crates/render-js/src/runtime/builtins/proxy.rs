@@ -322,7 +322,7 @@ impl JsRuntime {
         }
     }
 
-    fn proxy_trap(
+    pub(in crate::runtime) fn proxy_trap(
         &mut self,
         dom: &mut Dom,
         handler: ObjectId,
@@ -488,7 +488,7 @@ impl JsRuntime {
         Ok(JsValue::Object(result))
     }
 
-    fn property_descriptor_from_value(
+    pub(in crate::runtime) fn property_descriptor_from_value(
         &self,
         value: &JsValue,
     ) -> Result<PropertyDescriptor, JsError> {

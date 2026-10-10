@@ -1598,8 +1598,9 @@ fn object_statics_and_reflect_share_one_to_object() {
                 results.push(Object.getOwnPropertyDescriptor(1, 'x') === undefined);
                 results.push(Object.hasOwn('', 'length'));
                 results.push(Object.getOwnPropertySymbols(Symbol('a')).length === 0);
+                // §20.1.2.6 step 1: a primitive is returned unchanged.
                 var frozen = Object.freeze(1);
-                results.push(frozen instanceof Number && Object.isFrozen(frozen));
+                results.push(frozen === 1 && Object.isFrozen(frozen));
                 // §20.1.2.4 step 1: a primitive target is a TypeError, not a ToObject.
                 results.push(thrown(function () { Object.defineProperty(1, 'x', { value: 1 }); }));
                 var target = Object.assign(1, { a: 2 });
@@ -1607,8 +1608,10 @@ fn object_statics_and_reflect_share_one_to_object() {
                 // Integrity queries on a nullish target.
                 results.push(Object.isFrozen(null));
                 results.push(Object.isSealed(undefined));
-                results.push(thrown(function () { Object.isExtensible(null); }));
-                results.push(thrown(function () { Object.freeze(null); }));
+                // §20.1.2.13 and §20.1.2.6: a non-object answers `false` and is
+                // returned unchanged; nothing throws.
+                results.push(Object.isExtensible(null) === false);
+                results.push(Object.freeze(null) === null);
                 // Operations that must keep throwing on non-objects.
                 results.push(thrown(function () { new Proxy(1, {}); }));
                 // `OrdinaryHasInstance` answers false for a primitive left-hand

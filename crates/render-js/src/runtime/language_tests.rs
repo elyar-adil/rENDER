@@ -1889,3 +1889,239 @@ fn bigint_typed_array_methods_work_on_bigints() {
         "2;true;-1;3|-1|2;2;-1,2;6,-2,4;3,2;4;-1,2,3;-1,2,3;9;3,2,-1"
     );
 }
+
+#[test]
+fn array_define_own_property_grows_and_shrinks_length() {
+    // §10.4.2.1: an index at or past the length grows it; §10.4.2.4
+    // `ArraySetLength` deletes the top indices and stops at the first one that
+    // refuses, leaving `length` one past it and reporting failure.
+    assert_eq!(
+        ok(
+            "var a = []; Object.defineProperty(a, '5', { value: 1, writable: true, enumerable: true, configurable: true }); a.length"
+        ),
+        "6"
+    );
+    assert_eq!(
+        ok(
+            "var a = [0, 1, 2]; Object.defineProperty(a, 'length', { value: 1 }); a.length + ':' + a.join()"
+        ),
+        "1:0"
+    );
+    assert_eq!(
+        ok(
+            "var a = [0, 1, 2]; Object.defineProperty(a, '1', { configurable: false }); var r; try { Object.defineProperty(a, 'length', { value: 0 }); } catch (e) { r = e.name; } [r, a.length, a.hasOwnProperty('0')].join()"
+        ),
+        "TypeError,2,true"
+    );
+    // A non-writable length refuses an index at or past it.
+    assert_eq!(
+        ok(
+            "var a = []; Object.defineProperty(a, 'length', { writable: false }); var r; try { Object.defineProperty(a, '0', { value: 1, writable: true, enumerable: true, configurable: true }); } catch (e) { r = e.name; } [r, a.length, a.hasOwnProperty('0')].join()"
+        ),
+        "TypeError,0,false"
+    );
+    // §10.4.2.4 step 3: a length that is not a uint32 is a RangeError.
+    assert_eq!(
+        ok(
+            "var r; try { Object.defineProperty([], 'length', { value: -1 }); } catch (e) { r = e.name; } r"
+        ),
+        "RangeError"
+    );
+    // §10.4.2.4 step 16: `writable: false` in the same define takes effect last.
+    assert_eq!(
+        ok(
+            "var a = [1, 2, 3]; Object.defineProperty(a, 'length', { value: 1, writable: false }); var r; try { a.push(9); } catch (e) { r = e.name; } [a.length, a.join(), Object.getOwnPropertyDescriptor(a, 'length').writable, r].join()"
+        ),
+        "1,1,false,TypeError"
+    );
+}
+
+#[test]
+fn object_assign_reads_getters_copies_symbols_and_throws_on_refused_writes() {
+    // §20.1.2.1: [[Get]] on each enumerable own key (strings, then symbols),
+    // then a throwing [[Set]] on the target.
+    assert_eq!(ok("Object.assign({}, { get a() { return 1; } }).a"), "1");
+    assert_eq!(
+        ok("var s = Symbol('x'); var src = {}; src[s] = 2; Object.assign({}, src)[s]"),
+        "2"
+    );
+    assert_eq!(ok("Object.assign([], { 2: 'x' }).length"), "3");
+    assert_eq!(
+        ok(
+            "var r = []; try { Object.assign(Object.freeze({ a: 1 }), { a: 2 }); } catch (e) { r.push(e.name); } try { Object.assign(null); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError,TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var calls = []; var s = { get a() { calls.push('get a'); return 1; }, b: 2 }; Object.assign({}, s); calls.join()"
+        ),
+        "get a"
+    );
+}
+
+#[test]
+fn enumerable_own_property_helpers_use_get_and_throw_on_nullish() {
+    // §7.3.22 EnumerableOwnProperties: `values` and `entries` read through [[Get]].
+    assert_eq!(ok("Object.values({ get a() { return 7; } }).join()"), "7");
+    assert_eq!(
+        ok("Object.entries({ get a() { return 7; } })[0].join()"),
+        "a,7"
+    );
+    assert_eq!(
+        ok("var r; try { Object.keys(undefined); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn integrity_builtins_pass_non_objects_through() {
+    // §20.1.2.5, 20.1.2.6, 20.1.2.13, 20.1.2.14, 20.1.2.15, 20.1.2.16 (ECMA-262).
+    assert_eq!(
+        ok(
+            "[Object.isFrozen(1), Object.isSealed('s'), Object.isExtensible(1), Object.seal('s'), Object.freeze(true), Object.preventExtensions(null), Object.freeze(undefined) === undefined].join()"
+        ),
+        "true,true,false,s,true,,true"
+    );
+    // A string wrapper's virtual slots are already frozen-compatible.
+    assert_eq!(
+        ok("var s = Object.freeze(new String('ab')); [Object.isFrozen(s), s[0]].join()"),
+        "true,a"
+    );
+}
+
+#[test]
+fn object_to_string_tags_follow_builtin_and_symbol_to_string_tag() {
+    // §20.1.3.6: a string-valued @@toStringTag wins, a non-string one is
+    // ignored, and a function or array proxy tags as its target does.
+    assert_eq!(
+        ok(
+            "var t = Object.prototype.toString; [t.call(new Map()), t.call(new Set()), t.call(Symbol('d')), t.call(1n)].join()"
+        ),
+        "[object Map],[object Set],[object Symbol],[object BigInt]"
+    );
+    assert_eq!(
+        ok(
+            "var t = Object.prototype.toString; delete Set.prototype[Symbol.toStringTag]; var r = t.call(new Set()); Object.defineProperty(Math, Symbol.toStringTag, { value: Symbol() }); r + t.call(Math)"
+        ),
+        "[object Object][object Object]"
+    );
+    assert_eq!(
+        ok(
+            "var t = Object.prototype.toString; [t.call(new Proxy(function () {}, {})), t.call(new Proxy([], {}))].join()"
+        ),
+        "[object Function],[object Array]"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { Object.prototype.toString.call(Object.defineProperty({}, Symbol.toStringTag, { get() { throw new RangeError('tag'); } })); } catch (e) { r = e.name; } r"
+        ),
+        "RangeError"
+    );
+    // §20.1.3.5: `Object.prototype.toLocaleString` is `Invoke(this, "toString")`.
+    assert_eq!(
+        ok(
+            "({ toString() { return 'T'; } }).toLocaleString() + ':' + Object.prototype.toLocaleString.call(5)"
+        ),
+        "T:5"
+    );
+}
+
+#[test]
+fn annex_b_accessor_helpers_walk_the_chain_and_check_their_arguments() {
+    // B.2.2.4: `__lookupGetter__` reads the first own-or-inherited descriptor.
+    assert_eq!(
+        ok(
+            "var p = { get x() { return 1; } }; var o = Object.create(p); [typeof o.__lookupGetter__('x'), o.__lookupGetter__('x') === Object.getOwnPropertyDescriptor(p, 'x').get, o.__lookupSetter__('x')].join()"
+        ),
+        "function,true,"
+    );
+    // B.2.2.2: a non-callable getter is a TypeError.
+    assert_eq!(
+        ok("var r; try { ({}).__defineGetter__('x', 1); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+    assert_eq!(
+        ok("var o = {}; o.__defineSetter__('y', function (v) { this.z = v; }); o.y = 4; o.z"),
+        "4"
+    );
+}
+
+#[test]
+fn object_get_prototype_of_and_is_prototype_of_use_the_proxy_trap() {
+    // §10.5.1 [[GetPrototypeOf]] runs the handler's trap.
+    assert_eq!(
+        ok(
+            "Object.getPrototypeOf(new Proxy({}, { getPrototypeOf() { return Array.prototype; } })) === Array.prototype"
+        ),
+        "true"
+    );
+    assert_eq!(
+        ok("Array.prototype.isPrototypeOf(new Proxy([], {}))"),
+        "true"
+    );
+}
+
+#[test]
+fn proto_setter_and_entry_builders_follow_the_spec_on_edge_inputs() {
+    // B.2.2.1.2: `RequireObjectCoercible(this)` runs before the argument.
+    assert_eq!(
+        ok(
+            "var set = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__').set; var r; try { set.call(null, {}); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    // §20.1.2.7 `Object.fromEntries` uses CreateDataPropertyOrThrow, so an
+    // inherited setter does not run.
+    assert_eq!(
+        ok(
+            "Object.defineProperty(Object.prototype, 'fe_probe', { set() { throw new Error('setter ran'); }, configurable: true }); var v = Object.fromEntries([['fe_probe', 1]]).fe_probe; delete Object.prototype.fe_probe; v"
+        ),
+        "1"
+    );
+    // §20.1.2.10.1 `Object.groupBy` rejects a non-callable callback.
+    assert_eq!(
+        ok("var r; try { Object.groupBy([1], 5); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn proxy_own_keys_keep_symbols_and_reject_other_key_types() {
+    // §10.5.11 [[OwnPropertyKeys]]: the trap's symbols reach the descriptor
+    // trap as symbols, and Object.keys drops them.
+    assert_eq!(
+        ok(
+            "var s = Symbol('k'); var seen = []; var p = new Proxy({}, { ownKeys() { return [s, 'a']; }, getOwnPropertyDescriptor(t, k) { seen.push(typeof k); return { value: 1, enumerable: true, configurable: true, writable: true }; } }); Object.assign({}, p); seen.join()"
+        ),
+        "symbol,string"
+    );
+    assert_eq!(
+        ok(
+            "var p = new Proxy({}, { ownKeys() { return [Symbol('x'), 'b']; }, getOwnPropertyDescriptor() { return { value: 1, enumerable: true, configurable: true }; } }); Object.keys(p).join()"
+        ),
+        "b"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { Object.keys(new Proxy({}, { ownKeys() { return [1]; } })); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn boolean_value_of_returns_the_boolean_and_accessor_functions_are_named() {
+    // §20.3.3.3 `Boolean.prototype.valueOf` returns the Boolean, not its text.
+    assert_eq!(
+        ok("[new Boolean(true).valueOf() === true, String(new Boolean(false))].join()"),
+        "true,false"
+    );
+    // §10.2.9 SetFunctionName: an accessor's function is named with its prefix.
+    assert_eq!(
+        ok(
+            "var d = Object.getOwnPropertyDescriptor(Object.prototype, '__proto__'); [d.get.name, d.set.name, d.get.length, d.set.length].join()"
+        ),
+        "get __proto__,set __proto__,0,1"
+    );
+}

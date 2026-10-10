@@ -46,16 +46,6 @@ pub(super) enum ObjectEntryKind {
     Entries,
 }
 
-impl ObjectEntryKind {
-    pub(super) fn function_name(self) -> &'static str {
-        match self {
-            Self::Keys => "Object.keys",
-            Self::Values => "Object.values",
-            Self::Entries => "Object.entries",
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 pub(super) struct EnvironmentRecord {
     pub(super) bindings: BTreeMap<String, Binding>,

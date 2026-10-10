@@ -4706,6 +4706,21 @@ impl JsRuntime {
                     return self.set_array_length_value(dom, object, &value);
                 }
                 if let Some(index) = array_index(property) {
+                    // ECMA-262 10.1.9.2: an accessor at this index, own or
+                    // inherited, runs its setter instead of storing a value; one
+                    // without a setter refuses the write.
+                    if let Some(accessor) = self
+                        .realm
+                        .get_descriptor(object, property)
+                        .filter(crate::value::PropertyDescriptor::is_accessor)
+                    {
+                        if accessor.setter.is_none() {
+                            return Err(JsError::type_error(format!(
+                                "property {property:?} is not writable"
+                            )));
+                        }
+                        return self.set_value(dom, object, property, value);
+                    }
                     if !self.realm.set_property(object, property.to_owned(), value) {
                         return Err(JsError::type_error(format!(
                             "property {property:?} is not writable"
@@ -5422,9 +5437,19 @@ impl JsRuntime {
             Some(ObjectHost::DomExceptionConstructor) => {
                 self.dom_exception_constructor(callee, arguments)
             }
+            // Annex B.2.2.1.2 `RequireObjectCoercible(this)` runs before the
+            // argument, so a nullish receiver throws; a native call would
+            // otherwise see the global object in its place.
+            Some(ObjectHost::NativeFunction(NativeFunction::ObjectProtoSetter))
+                if matches!(receiver, JsValue::Null | JsValue::Undefined) =>
+            {
+                Err(JsError::type_error(
+                    "Object.prototype.__proto__ setter called on null or undefined",
+                ))
+            }
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeToString)) => {
                 // `toString.call(primitive)` never materializes an object.
-                Ok(JsValue::String(self.object_to_string_tag(&receiver)))
+                Ok(JsValue::String(self.object_to_string_tag(dom, &receiver)?))
             }
             // §20.1.3.7 `Object.prototype.valueOf` is `ToObject(this)`: a
             // primitive yields its wrapper, and a nullish receiver throws.
