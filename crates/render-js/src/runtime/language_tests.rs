@@ -2125,3 +2125,222 @@ fn boolean_value_of_returns_the_boolean_and_accessor_functions_are_named() {
         "get __proto__,set __proto__,0,1"
     );
 }
+
+/// Declares `thrown(f)`, which reports the class of the error `f` throws.
+const THROWN_HELPER: &str = "function thrown(f) { try { f(); return 'none'; } catch (e) { return e instanceof TypeError ? 'TypeError' : String(e); } }";
+
+fn with_thrown_helper(body: &str) -> String {
+    format!("{THROWN_HELPER}\n{body}")
+}
+
+#[test]
+fn proxy_revocable_drops_the_handler_and_every_operation_throws() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var r = Proxy.revocable({ x: 1 }, {}); var before = r.proxy.x;\
+             r.revoke(); r.revoke();\
+             before + ',' + thrown(function () { return r.proxy.x; }) + ',' + \
+             thrown(function () { return Object.getPrototypeOf(r.proxy); }) + ',' + \
+             thrown(function () { return 'x' in r.proxy; })"
+        )),
+        "1,TypeError,TypeError,TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var r = Proxy.revocable({}, {}); [typeof r.revoke, r.revoke.length, r.revoke.name, Object.keys(r).join()].join('|')"
+        ),
+        "function|0||proxy,revoke"
+    );
+}
+
+#[test]
+fn callable_proxy_forwards_calls_to_the_apply_trap() {
+    assert_eq!(
+        ok("var seen = [];\
+            var p = new Proxy(function (a, b) { return a + b; }, {\
+              apply: function (target, self, args) { seen.push(self === undefined, args.length, args[0]); return 42; }\
+            });\
+            p(1, 2) + ',' + seen.join('|') + ',' + typeof p"),
+        "42,true|2|1,function"
+    );
+    assert_eq!(
+        ok("var p = new Proxy(function (a) { return a * 2; }, {}); p(21)"),
+        "42"
+    );
+}
+
+#[test]
+fn constructable_proxy_forwards_new_to_the_construct_trap() {
+    assert_eq!(
+        ok("var P = new Proxy(function () { this.made = true; }, {\
+              construct: function (target, args, newTarget) { return { viaTrap: args[0], sameNewTarget: newTarget === P }; }\
+            });\
+            var o = new P(7); o.viaTrap + ',' + o.sameNewTarget + ',' + ('made' in o)"),
+        "7,true,false"
+    );
+    assert_eq!(
+        ok("var P = new Proxy(function () { this.made = true; }, {}); var o = new P(); o.made"),
+        "true"
+    );
+}
+
+#[test]
+fn get_own_property_descriptor_trap_keeps_the_target_invariants() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\
+             var p = new Proxy(t, { getOwnPropertyDescriptor: function () { return undefined; } });\
+             thrown(function () { return Object.getOwnPropertyDescriptor(p, 'x'); })"
+        )),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var p = new Proxy({}, { getOwnPropertyDescriptor: function () { return { value: 3, configurable: true }; } });\
+            var d = Object.getOwnPropertyDescriptor(p, 'k'); d.value + ',' + d.writable + ',' + d.enumerable + ',' + d.configurable"
+        ),
+        "3,false,false,true"
+    );
+}
+
+#[test]
+fn define_property_trap_result_must_agree_with_the_target() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var p = new Proxy({}, { defineProperty: function () { return true; } });\
+             thrown(function () { Object.defineProperty(p, 'x', { value: 1, configurable: false }); })"
+        )),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var p = new Proxy({}, { defineProperty: function () { return false; } });\
+            Reflect.defineProperty(p, 'x', { value: 1 }) + ',' + Object.keys(p).length"
+        ),
+        "false,0"
+    );
+}
+
+#[test]
+fn own_keys_trap_rejects_duplicates_and_missing_non_configurable_keys() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var p = new Proxy({}, { ownKeys: function () { return ['a', 'a']; } });\
+             thrown(function () { return Reflect.ownKeys(p); })"
+        )),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = {}; Object.defineProperty(t, 'k', { value: 1, configurable: false });\
+             var p = new Proxy(t, { ownKeys: function () { return []; } });\
+             thrown(function () { return Reflect.ownKeys(p); })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn own_keys_trap_returns_string_and_symbol_keys_in_order() {
+    assert_eq!(
+        ok("var s = Symbol('k');\
+            var p = new Proxy({}, { ownKeys: function () { return ['a', s]; },\
+              getOwnPropertyDescriptor: function () { return { value: 1, enumerable: true, configurable: true }; } });\
+            var keys = Reflect.ownKeys(p); keys.length + ',' + (keys[1] === s)"),
+        "2,true"
+    );
+}
+
+#[test]
+fn has_trap_cannot_hide_a_non_configurable_property() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\
+             var p = new Proxy(t, { has: function () { return false; } });\
+             thrown(function () { return 'x' in p; })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn set_trap_false_is_reported_by_reflect_and_ignored_by_assignment() {
+    assert_eq!(
+        ok(
+            "var p = new Proxy({}, { set: function () { return false; } });\
+            Reflect.set(p, 'a', 1) + ',' + (function () { p.a = 1; return 'silent'; })()"
+        ),
+        "false,silent"
+    );
+}
+
+#[test]
+fn get_trap_must_agree_with_a_non_writable_non_configurable_property() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = {}; Object.defineProperty(t, 'x', { value: 1, writable: false, configurable: false });\
+             var p = new Proxy(t, { get: function () { return 2; } });\
+             thrown(function () { return p.x; })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn delete_property_trap_cannot_delete_a_non_configurable_property() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = {}; Object.defineProperty(t, 'x', { value: 1, configurable: false });\
+             var p = new Proxy(t, { deleteProperty: function () { return true; } });\
+             thrown(function () { return Reflect.deleteProperty(p, 'x'); })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn get_prototype_of_trap_must_match_a_non_extensible_target() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "var t = Object.preventExtensions({});\
+             var p = new Proxy(t, { getPrototypeOf: function () { return Array.prototype; } });\
+             thrown(function () { return Object.getPrototypeOf(p); })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
+fn proxy_on_the_prototype_chain_answers_get_and_in_with_the_child_receiver() {
+    assert_eq!(
+        ok("var seen;\
+            var p = new Proxy({}, { get: function (t, k, receiver) { seen = receiver; return 'via-trap:' + k; } });\
+            var child = Object.create(p);\
+            child.foo + ',' + (seen === child)"),
+        "via-trap:foo,true"
+    );
+    assert_eq!(
+        ok(
+            "var p = new Proxy({}, { has: function (t, k) { return k === 'hit'; } });\
+            var child = Object.create(p);\
+            ('hit' in child) + ',' + ('miss' in child)"
+        ),
+        "true,false"
+    );
+}
+
+#[test]
+fn symbol_keyed_get_and_delete_run_the_proxy_traps() {
+    assert_eq!(
+        ok("var s = Symbol('s');\
+            var p = new Proxy({}, { get: function (t, k) { return k === s ? 'sym' : undefined; } });\
+            p[s]"),
+        "sym"
+    );
+    assert_eq!(
+        ok("var s = Symbol('s'); var seen = null;\
+            var p = new Proxy({}, { deleteProperty: function (t, k) { seen = k; return true; } });\
+            delete p[s]; seen === s"),
+        "true"
+    );
+}

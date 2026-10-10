@@ -1048,6 +1048,8 @@ pub(crate) enum NativeFunction {
     ReflectSetPrototypeOf,
     ReflectIsExtensible,
     ReflectPreventExtensions,
+    ProxyRevocable,
+    ProxyRevoke,
     ResponseText,
     ResponseJson,
     ResponseHeadersGet,
@@ -1953,9 +1955,11 @@ pub(crate) enum ObjectHost {
     },
     BlobConstructor,
     ProxyConstructor,
+    /// A Proxy exotic object. `handler` is `None` once the proxy is revoked;
+    /// `target` stays so the proxy keeps the callability it was created with.
     Proxy {
         target: ObjectId,
-        handler: ObjectId,
+        handler: Option<ObjectId>,
     },
     /// The `Video` (`HTMLVideoElement`) constructor object.
     VideoConstructor,
@@ -7068,6 +7072,28 @@ impl Realm {
             "Proxy".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(proxy_constructor)),
         );
+        // `Proxy.revocable` (ECMA-262 28.2.2.1) is a method of the constructor.
+        let revocable = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ProxyRevocable),
+            ..JsObject::default()
+        });
+        objects[revocable.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Number(2.0),
+                writable: false,
+                getter: None,
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        objects[proxy_constructor.0].properties.insert(
+            "revocable".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(revocable)),
+        );
 
         let reflect = ObjectId(objects.len());
         objects.push(JsObject {
@@ -7751,6 +7777,11 @@ impl Realm {
     #[must_use]
     pub(crate) const fn object_prototype(&self) -> ObjectId {
         self.object_prototype
+    }
+
+    /// The realm's `%Function.prototype%`.
+    pub(crate) const fn function_prototype(&self) -> ObjectId {
+        self.function_prototype
     }
 
     /// The realm's `%MediaQueryList.prototype%`, which `matchMedia` stamps onto

@@ -43,6 +43,7 @@ use crate::runtime::builtins::dom::css_prop_from_member;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
+use crate::runtime::builtins::object::PropertyName;
 use crate::runtime::builtins::string::string_method_native;
 use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
 use crate::runtime::convert::abstract_equal;
@@ -2212,9 +2213,12 @@ impl JsRuntime {
                             self.delete_property_value(dom, object, &property)?,
                         ))
                     }
-                    AssignmentReference::SymbolProperty { object, symbol } => Ok(JsValue::Boolean(
-                        self.realm.delete_symbol_property(object, &symbol),
-                    )),
+                    AssignmentReference::SymbolProperty { object, symbol } => {
+                        let key = PropertyName::Symbol(symbol);
+                        Ok(JsValue::Boolean(
+                            self.delete_property_on(dom, object, &key)?,
+                        ))
+                    }
                     AssignmentReference::Private { .. }
                     | AssignmentReference::SuperProperty { .. } => Err(JsError::new(
                         JsErrorKind::Syntax,
@@ -2411,6 +2415,10 @@ impl JsRuntime {
         object: ObjectId,
         symbol: &JsSymbol,
     ) -> Result<JsValue, JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            let key = PropertyName::Symbol(symbol.clone());
+            return self.proxy_get_property(dom, object, &key, JsValue::Object(object));
+        }
         match self.realm.get_symbol_descriptor(object, symbol) {
             Some(descriptor) if descriptor.is_accessor() => {
                 let Some(getter) = descriptor.getter else {
@@ -2431,6 +2439,12 @@ impl JsRuntime {
         symbol: &JsSymbol,
         value: JsValue,
     ) -> Result<(), JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            // Sloppy-mode assignment: a `false` from the proxy is ignored.
+            let key = PropertyName::Symbol(symbol.clone());
+            self.proxy_set_property(dom, object, &key, value, JsValue::Object(object))?;
+            return Ok(());
+        }
         if let Some(own) = self.realm.own_symbol_property(object, symbol) {
             if own.is_accessor() {
                 if let Some(setter) = own.setter {
@@ -3454,7 +3468,8 @@ impl JsRuntime {
         if let JsValue::Symbol(symbol) = key {
             return match container {
                 JsValue::Object(object) => {
-                    Ok(self.realm.get_symbol_descriptor(*object, symbol).is_some())
+                    let key = PropertyName::Symbol(symbol.clone());
+                    self.has_property_value(dom, *object, &key)
                 }
                 _ => Err(JsError::type_error(
                     "right-hand side of 'in' must be an object",
@@ -3479,7 +3494,8 @@ impl JsRuntime {
                     }
                     return Ok(name == "length");
                 }
-                Ok(false)
+                // Not an own property: a proxy on the prototype chain answers.
+                self.has_property_value(dom, *object, &PropertyName::String(name))
             }
             _ => Err(JsError::type_error(
                 "right-hand side of 'in' must be an object",
@@ -3972,6 +3988,10 @@ impl JsRuntime {
                 return self.get_value(dom, object, property);
             }
             return Ok(descriptor.value);
+        }
+        // A proxy on the prototype chain answers before any later holder.
+        if let Some(value) = self.proxy_inherited_get(dom, object, property)? {
+            return Ok(value);
         }
         let inherited_origin = self.realm.get_property_with_origin(object, property);
         if object == self.realm.global_object() {
@@ -4889,6 +4909,8 @@ impl JsRuntime {
             // A bound function is constructable exactly when its target is:
             // `IsConstructor` looks through the [[BoundFunction]] wrapper.
             Some(ObjectHost::BoundCallable { target, .. }) => self.is_constructor(target),
+            // A proxy is constructable exactly when its target is (ECMA-262 10.5.13).
+            Some(ObjectHost::Proxy { target, .. }) => self.is_constructor(target),
             _ => false,
         }
     }
@@ -5242,6 +5264,9 @@ impl JsRuntime {
             Some(ObjectHost::BoundCallable { .. }) => {
                 self.construct_bound_callable(dom, constructor, arguments)
             }
+            Some(ObjectHost::Proxy { .. }) => {
+                self.proxy_construct(dom, constructor, arguments, new_target.clone())
+            }
             _ => Err(JsError::type_error("value is not a constructor")),
         }
     }
@@ -5540,6 +5565,7 @@ impl JsRuntime {
                 combined.extend_from_slice(arguments);
                 self.call_with_this(dom, target, &combined, receiver)
             }
+            Some(ObjectHost::Proxy { .. }) => self.proxy_call(dom, callee, receiver, arguments),
             Some(ObjectHost::UserFunction(index)) => {
                 if self
                     .functions
@@ -5926,7 +5952,11 @@ impl JsRuntime {
     }
 
     pub(super) fn is_callable_object(object: ObjectId, realm: &Realm) -> bool {
-        realm.host(object).is_some_and(|host| host.is_callable())
+        match realm.host(object) {
+            // A proxy is callable exactly when its target is (ECMA-262 10.5.12).
+            Some(ObjectHost::Proxy { target, .. }) => Self::is_callable_object(target, realm),
+            host => host.is_some_and(|host| host.is_callable()),
+        }
     }
 
     /// Accept an object receiver for member access, wrapping primitives that

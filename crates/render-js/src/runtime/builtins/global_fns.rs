@@ -162,7 +162,9 @@ impl JsRuntime {
             | NativeFunction::ReflectGetPrototypeOf
             | NativeFunction::ReflectSetPrototypeOf
             | NativeFunction::ReflectIsExtensible
-            | NativeFunction::ReflectPreventExtensions => {
+            | NativeFunction::ReflectPreventExtensions
+            | NativeFunction::ProxyRevocable
+            | NativeFunction::ProxyRevoke => {
                 self.dispatch_proxy_native(dom, function, receiver, arguments)
             }
             NativeFunction::StorageGetItem
