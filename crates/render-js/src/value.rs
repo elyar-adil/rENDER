@@ -595,10 +595,40 @@ impl NativeFunction {
     }
 }
 
+/// The functions of the `Atomics` namespace (ECMA-262 25.4). The read-modify-write
+/// functions share one variant, since they differ only in how they combine bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomicsOp {
+    ReadModifyWrite(RmwOp),
+    CompareExchange,
+    IsLockFree,
+    Load,
+    Notify,
+    Store,
+    Wait,
+    WaitAsync,
+    /// The timeout job of an `Atomics.waitAsync` waiter. It is scheduled as a
+    /// timer and is not a property of the namespace object.
+    WaitAsyncTimeout,
+}
+
+/// How an `Atomics` read-modify-write combines the stored bits with its operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RmwOp {
+    Add,
+    And,
+    Exchange,
+    Or,
+    Sub,
+    Xor,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeFunction {
     MathOp(MathOp),
     NumberOp(NumberOp),
+    /// A function of the `Atomics` namespace object.
+    Atomics(AtomicsOp),
     GetElementById,
     QuerySelector,
     QuerySelectorAll,
@@ -2712,6 +2742,7 @@ impl Realm {
         }
         Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
+        Self::install_atomics(&mut objects, global, object_prototype, function_prototype);
         Self::install_encoding(&mut objects, global, object_prototype, function_prototype);
         Self::install_json(&mut objects, global, object_prototype, function_prototype);
         Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
@@ -4056,6 +4087,70 @@ impl Realm {
                 },
             );
         }
+    }
+
+    /// §25.4: the `Atomics` namespace object. It is an ordinary object, not a
+    /// function, so it is neither callable nor constructible. Its methods are
+    /// writable, non-enumerable and configurable, and its `@@toStringTag` is
+    /// read-only (§25.4.16).
+    fn install_atomics(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let atomics = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        // §25.4.2 through §25.4.15, with the function lengths those clauses give.
+        let methods: &[(&str, AtomicsOp, f64)] = &[
+            ("add", AtomicsOp::ReadModifyWrite(RmwOp::Add), 3.0),
+            ("and", AtomicsOp::ReadModifyWrite(RmwOp::And), 3.0),
+            ("compareExchange", AtomicsOp::CompareExchange, 4.0),
+            ("exchange", AtomicsOp::ReadModifyWrite(RmwOp::Exchange), 3.0),
+            ("isLockFree", AtomicsOp::IsLockFree, 1.0),
+            ("load", AtomicsOp::Load, 2.0),
+            ("notify", AtomicsOp::Notify, 3.0),
+            ("or", AtomicsOp::ReadModifyWrite(RmwOp::Or), 3.0),
+            ("store", AtomicsOp::Store, 3.0),
+            ("sub", AtomicsOp::ReadModifyWrite(RmwOp::Sub), 3.0),
+            ("wait", AtomicsOp::Wait, 4.0),
+            ("waitAsync", AtomicsOp::WaitAsync, 4.0),
+            ("xor", AtomicsOp::ReadModifyWrite(RmwOp::Xor), 3.0),
+        ];
+        for &(name, operation, arity) in methods {
+            let method = Self::install_native_method(
+                objects,
+                function_prototype,
+                NativeFunction::Atomics(operation),
+                arity,
+            );
+            objects[atomics.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[atomics.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    value: JsValue::String("Atomics".to_owned()),
+                    writable: false,
+                    getter: None,
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        objects[global.0].properties.insert(
+            "Atomics".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(atomics)),
+        );
     }
 
     /// A built-in method object with an explicit `length`.

@@ -20,6 +20,7 @@ use crate::parser::FunctionKind;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::builtins::promise::PromiseState;
+use crate::value::TypedBuffer;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -260,6 +261,24 @@ pub enum TimerKind {
     Interval,
     /// `requestAnimationFrame`: fires once per frame the embedding drives.
     AnimationFrame,
+}
+
+/// An `Atomics.waitAsync` waiter (ECMA-262 25.4.3.14 `AddWaiter`): the location it
+/// waits on, the promise its caller holds, and the timeout the embedding fires for
+/// it when the wait is finite. A waiter is removed when it is notified or times out.
+#[derive(Clone, Debug)]
+pub(super) struct AtomicsWaiter {
+    /// Identifies the waiter in the arguments of its timeout.
+    pub(super) id: u64,
+    /// The shared block the location belongs to.
+    pub(super) buffer: TypedBuffer,
+    /// Byte offset of the location in the block.
+    pub(super) byte_index: usize,
+    /// The promise record the result settles, and the object that wraps it.
+    pub(super) promise: usize,
+    pub(super) promise_object: ObjectId,
+    /// The timer that times the wait out, while it is still scheduled.
+    pub(super) timer: Option<u64>,
 }
 
 /// The `document.readyState` of the page that owns a runtime (HTML 3.1.3). A new

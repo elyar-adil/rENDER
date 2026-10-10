@@ -167,7 +167,11 @@ impl JsRuntime {
         Ok((index, JsValue::Object(object)))
     }
 
-    fn create_promise_record(&mut self) -> Result<(usize, ObjectId), JsError> {
+    /// A pending promise record and the promise object that wraps it, for
+    /// built-ins that keep the promise and its object themselves.
+    pub(in crate::runtime) fn create_promise_record(
+        &mut self,
+    ) -> Result<(usize, ObjectId), JsError> {
         self.ensure_heap_capacity(1)?;
         let index = self.promises.len();
         let object = self.realm.promise(index);

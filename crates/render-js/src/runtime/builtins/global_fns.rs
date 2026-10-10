@@ -250,6 +250,9 @@ impl JsRuntime {
             NativeFunction::GlobalStructuredClone => {
                 self.dispatch_structured_clone_native(dom, function, receiver, arguments)
             }
+            NativeFunction::Atomics(operation) => {
+                self.dispatch_atomics_native(dom, operation, arguments)
+            }
             NativeFunction::UrlCreateObjectUrl | NativeFunction::UrlRevokeObjectUrl => {
                 self.dispatch_url_native(dom, function, receiver, arguments)
             }

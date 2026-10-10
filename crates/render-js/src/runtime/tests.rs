@@ -5518,3 +5518,395 @@ fn native_error_constructor_name_and_length_are_not_writable() {
         "false,false,true,false,true"
     );
 }
+
+// ECMA-262 25.4: the `Atomics` namespace object and its single-agent behaviour.
+
+#[test]
+fn atomics_namespace_is_an_ordinary_object_with_spec_attributes() {
+    // 25.4 and 25.4.16: a plain object (not callable or constructible) whose
+    // `@@toStringTag` is read-only; its methods are writable, non-enumerable
+    // and configurable, with the lengths and names of 25.4.2 onward.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = [];
+                out.push(typeof Atomics);
+                out.push(Object.getPrototypeOf(Atomics) === Object.prototype);
+                out.push(Object.prototype.toString.call(Atomics));
+                try { Atomics(); out.push('called'); } catch (e) { out.push(e.name); }
+                try { new Atomics(); out.push('constructed'); } catch (e) { out.push(e.name); }
+                var global = Object.getOwnPropertyDescriptor(globalThis, 'Atomics');
+                out.push([global.writable, global.enumerable, global.configurable].join('/'));
+                var tag = Object.getOwnPropertyDescriptor(Atomics, Symbol.toStringTag);
+                out.push([tag.value, tag.writable, tag.enumerable, tag.configurable].join('/'));
+                var add = Object.getOwnPropertyDescriptor(Atomics, 'add');
+                out.push([add.writable, add.enumerable, add.configurable,
+                          Atomics.add.length, Atomics.add.name].join('/'));
+                var out = out.join(',');
+            ",
+            "",
+            "out",
+        ),
+        "object,true,[object Atomics],TypeError,TypeError,true/false/true,Atomics/false/false/true,true/false/true/3/add"
+    );
+}
+
+#[test]
+fn atomics_read_modify_write_returns_the_old_element_and_wraps_to_the_element_type() {
+    // 25.4.3.17 AtomicReadModifyWrite: the result is the element as it was read,
+    // and the stored value wraps to the element's width.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i8 = new Int8Array(new SharedArrayBuffer(4));
+                i8[0] = 127;
+                var u8 = new Uint8Array(4);
+                u8[0] = 3;
+                var u16 = new Uint16Array(4);
+                u16[1] = 0xF0F0;
+                var out = [
+                    Atomics.add(i8, 0, 1), i8[0],
+                    Atomics.sub(u8, 0, 5), u8[0],
+                    Atomics.and(u16, 1, 0x0FF0),
+                    Atomics.or(u16, 1, 0x000F),
+                    Atomics.xor(u16, 1, 0x00FF), u16[1],
+                    Atomics.exchange(new Int32Array(4), 2, -7),
+                ].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "127,-128,3,254,61680,240,255,0,0"
+    );
+}
+
+#[test]
+fn atomics_bigint_operations_use_the_full_sixty_four_bit_element() {
+    // 25.4.3.17 with a BigInt element type: the operand is `ToBigInt`, and the
+    // stored value wraps modulo 2^64.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var b = new BigInt64Array(new SharedArrayBuffer(16));
+                var bu = new BigUint64Array(new SharedArrayBuffer(16));
+                var out = [
+                    typeof Atomics.add(b, 0, 5n),
+                    String(Atomics.sub(b, 0, 7n)), String(b[0]),
+                    String(Atomics.exchange(b, 1, -1n)), String(b[1]),
+                    String(Atomics.sub(bu, 0, 1n)), String(bu[0]),
+                    String(Atomics.and(bu, 0, 0xFFn)), String(bu[0]),
+                ].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "bigint,5,-2,0,-1,0,18446744073709551615,18446744073709551615,255"
+    );
+}
+
+#[test]
+fn atomics_compare_exchange_compares_the_stored_element_bytes() {
+    // 25.4.5 AtomicCompareExchange: the expected value converts to the element
+    // type before the comparison, so -1 matches a stored 255 in a Uint8Array.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var u8 = new Uint8Array(new SharedArrayBuffer(2));
+                u8[0] = 255;
+                var hit = Atomics.compareExchange(u8, 0, -1, 7);
+                var miss = Atomics.compareExchange(u8, 0, 255, 9);
+                var out = [hit, u8[0], miss, u8[0]].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "255,7,7,7"
+    );
+}
+
+#[test]
+fn atomics_store_returns_the_converted_operand_not_the_wrapped_element() {
+    // 25.4.12 Atomics.store: the result is ToIntegerOrInfinity(value), with -0
+    // normalized to +0, while the element holds the wrapped value.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var negZero = Object.is(Atomics.store(i32, 0, -0), 0);
+                var truncated = Atomics.store(i32, 0, 3.9);
+                var wrapped = Atomics.store(i32, 1, 2 ** 32 + 5);
+                var out = [negZero, truncated, i32[0], wrapped, i32[1],
+                           Atomics.store(i32, 0, NaN)].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "true,3,3,4294967301,5,0"
+    );
+}
+
+#[test]
+fn atomics_load_and_is_lock_free_answer_for_the_spec_sizes() {
+    // 25.4.8 Atomics.isLockFree: 1, 2, 4 and 8 are lock-free here; any other
+    // size, and a coerced `'3'`, answers false.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i16 = new Int16Array(new SharedArrayBuffer(4));
+                i16[1] = -2;
+                var out = [Atomics.load(i16, 1), Atomics.load(i16),
+                           Atomics.isLockFree(4), Atomics.isLockFree(3),
+                           Atomics.isLockFree('8'), Atomics.isLockFree(NaN)].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "-2,0,true,false,true,false"
+    );
+}
+
+#[test]
+fn atomics_rejects_views_that_are_not_integer_element_types() {
+    // ValidateIntegerTypedArray (25.4.3.1): floats, the clamped array and
+    // non-typed-array receivers are TypeErrors before the index is read.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = [];
+                [Float32Array, Float64Array, Uint8ClampedArray].forEach(function (TA) {
+                    try { Atomics.load(new TA(new SharedArrayBuffer(8)), 0); out.push('ok'); }
+                    catch (e) { out.push(e.name); }
+                });
+                try { Atomics.add([1, 2], 0, 1); out.push('ok'); }
+                catch (e) { out.push(e.name); }
+                try { Atomics.add(new DataView(new ArrayBuffer(8)), 0, 1); out.push('ok'); }
+                catch (e) { out.push(e.name); }
+                var out = out.join(',');
+            ",
+            "",
+            "out",
+        ),
+        "TypeError,TypeError,TypeError,TypeError,TypeError"
+    );
+}
+
+#[test]
+fn atomics_index_out_of_range_is_a_range_error_and_fraction_truncates() {
+    // ValidateAtomicAccess (25.4.3.2): ToIndex, then a RangeError at or past the
+    // length. A fractional or `'-0'` index is accepted and truncated to 0 or 1.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var out = [];
+                [-1, 2, 2 ** 40, Infinity].forEach(function (index) {
+                    try { Atomics.load(i32, index); out.push('ok'); }
+                    catch (e) { out.push(e.name); }
+                });
+                out.push(Atomics.load(i32, 1.9), Atomics.load(i32, '-0'));
+                var out = out.join(',');
+            ",
+            "",
+            "out",
+        ),
+        "RangeError,RangeError,RangeError,RangeError,0,0"
+    );
+}
+
+#[test]
+fn atomics_wait_and_notify_validate_before_they_act() {
+    // 25.4.3.14 DoWait and 25.4.15 Atomics.notify: a non-shared buffer or a
+    // non-Int32/BigInt64 array throws for wait, and notify on a non-shared
+    // buffer answers 0 once its arguments are valid.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = [];
+                function attempt(run) {
+                    try { out.push(String(run())); } catch (e) { out.push(e.name); }
+                }
+                attempt(function () { return Atomics.wait(new Int8Array(new SharedArrayBuffer(4)), 0, 0, 0); });
+                attempt(function () { return Atomics.wait(new Int32Array(new ArrayBuffer(8)), 0, 0, 0); });
+                attempt(function () { return Atomics.wait(new Int32Array(new SharedArrayBuffer(8)), 2, 0, 0); });
+                attempt(function () { return Atomics.notify(new Int8Array(new SharedArrayBuffer(4)), 0); });
+                attempt(function () { return Atomics.notify(new Int32Array(new ArrayBuffer(8)), 0); });
+                var out = out.join(',');
+            ",
+            "",
+            "out",
+        ),
+        "TypeError,TypeError,RangeError,TypeError,0"
+    );
+}
+
+#[test]
+fn atomics_wait_reports_not_equal_or_times_out_on_one_agent() {
+    // With no other agent to notify it, a blocking wait can only answer
+    // "not-equal" at once, or "timed-out" for a zero or finite timeout.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                i32[0] = 5;
+                var out = [Atomics.wait(i32, 0, 4, 0), Atomics.wait(i32, 0, 5, 0),
+                           Atomics.wait(i32, 0, 5, -1), Atomics.wait(i32, 1, 0, 1)].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "not-equal,timed-out,timed-out,timed-out"
+    );
+}
+
+#[test]
+fn atomics_wait_async_answers_at_once_when_it_cannot_suspend() {
+    // 25.4.3.14 DoWait in async mode: "not-equal" or a zero timeout produce a
+    // result object whose `async` is false and whose `value` is a string.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var a = Atomics.waitAsync(i32, 0, 1, 1000);
+                var b = Atomics.waitAsync(i32, 0, 0, 0);
+                var out = [a.async, a.value, b.async, b.value].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "false,not-equal,false,timed-out"
+    );
+}
+
+#[test]
+fn atomics_wait_async_resolves_ok_when_notified_and_counts_the_wakeup() {
+    // 25.4.3.14 NotifyWaiter: `notify` wakes the first waiter in FIFO order and
+    // returns the count; the promise settles through a job, so it is still
+    // pending when `notify` returns.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var waiter = Atomics.waitAsync(i32, 0, 0, 1000);
+                var result = 'pending';
+                var summary = [waiter.async, waiter.value instanceof Promise,
+                               Atomics.notify(i32, 0, 1), Atomics.notify(i32, 0)].join(',');
+                waiter.value.then(function (value) { result = value; });
+            ",
+            "",
+            "summary + ' ' + result",
+        ),
+        "true,true,1,0 ok"
+    );
+}
+
+#[test]
+fn atomics_wait_async_keeps_its_promise_alive_until_it_is_notified() {
+    // The waiter list is a GC root: a promise nothing else references still
+    // settles when it is notified after a collection.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var result = 'pending';
+                (function () {
+                    Atomics.waitAsync(i32, 0, 0, 1000).value
+                        .then(function (value) { result = value; });
+                })();
+            ",
+        )
+        .expect("the waiter script should execute");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    runtime.collect_garbage();
+    runtime
+        .execute(&mut parsed.dom, "Atomics.notify(i32, 0);")
+        .expect("notify should execute");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "result")
+        .expect("reading the result should execute")
+        .value
+        .to_js_string();
+    assert_eq!(value, "ok");
+}
+
+#[test]
+fn atomics_wait_async_times_out_through_the_timer_queue() {
+    // A finite timeout is a timer: the embedding schedules it, and firing it
+    // settles the promise with "timed-out" and no notification.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                var result = 'pending';
+                Atomics.waitAsync(i32, 0, 0, 25).value
+                    .then(function (value) { result = value; });
+            ",
+        )
+        .expect("the waiter script should execute");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    assert_eq!(
+        runtime.take_pending_timer_requests(),
+        vec![crate::TimerRequest::Schedule {
+            id: 1,
+            delay_ms: 25.0
+        }]
+    );
+    runtime
+        .fire_timer(&mut parsed.dom, 1)
+        .expect("the timeout should run");
+    drain_microtasks(&mut runtime, &mut parsed.dom);
+    let value = runtime
+        .execute(&mut parsed.dom, "result")
+        .expect("reading the result should execute")
+        .value
+        .to_js_string();
+    assert_eq!(value, "timed-out");
+}
+
+#[test]
+fn atomics_notify_cancels_the_timeout_of_the_waiter_it_wakes() {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            "var i32 = new Int32Array(new SharedArrayBuffer(8)); \
+             Atomics.waitAsync(i32, 0, 0, 25); Atomics.notify(i32, 0);",
+        )
+        .expect("the waiter script should execute");
+    let requests = runtime.take_pending_timer_requests();
+    assert!(
+        requests.contains(&crate::TimerRequest::Cancel { id: 1 }),
+        "notify should cancel the scheduled timeout, got {requests:?}"
+    );
+}
+
+#[test]
+fn atomics_negative_operands_wrap_exactly_to_the_element_width() {
+    // 25.4.3.17: a negative operand converts to its two's-complement bits, so -5
+    // is 2^64 - 5 before the element keeps its low bytes. That value is not a
+    // double, so the conversion must not round it through floating point.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var i32 = new Int32Array(new SharedArrayBuffer(8));
+                i32[0] = 10;
+                var u32 = new Uint32Array(new SharedArrayBuffer(4));
+                var s8 = new Int8Array(new SharedArrayBuffer(1));
+                var out = [Atomics.add(i32, 0, -5), i32[0],
+                           Atomics.sub(i32, 0, -3), i32[0],
+                           Atomics.add(u32, 0, -1), u32[0],
+                           Atomics.add(s8, 0, -129), s8[0]].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "10,5,5,8,0,4294967295,0,127"
+    );
+}
