@@ -1024,6 +1024,8 @@ pub(crate) enum NativeFunction {
     DataViewGetUint32,
     DataViewGetFloat32,
     DataViewGetFloat64,
+    DataViewGetBigInt64,
+    DataViewGetBigUint64,
     DataViewSetInt8,
     DataViewSetUint8,
     DataViewSetInt16,
@@ -1032,6 +1034,8 @@ pub(crate) enum NativeFunction {
     DataViewSetUint32,
     DataViewSetFloat32,
     DataViewSetFloat64,
+    DataViewSetBigInt64,
+    DataViewSetBigUint64,
     DataViewGetFloat16,
     DataViewSetFloat16,
     /// `DataView.prototype.buffer`, `byteLength` and `byteOffset`: accessors on
@@ -3895,6 +3899,8 @@ impl Realm {
                 ("getFloat32", NativeFunction::DataViewGetFloat32),
                 ("getFloat16", NativeFunction::DataViewGetFloat16),
                 ("getFloat64", NativeFunction::DataViewGetFloat64),
+                ("getBigInt64", NativeFunction::DataViewGetBigInt64),
+                ("getBigUint64", NativeFunction::DataViewGetBigUint64),
                 ("setInt8", NativeFunction::DataViewSetInt8),
                 ("setUint8", NativeFunction::DataViewSetUint8),
                 ("setInt16", NativeFunction::DataViewSetInt16),
@@ -3904,6 +3910,8 @@ impl Realm {
                 ("setFloat16", NativeFunction::DataViewSetFloat16),
                 ("setFloat32", NativeFunction::DataViewSetFloat32),
                 ("setFloat64", NativeFunction::DataViewSetFloat64),
+                ("setBigInt64", NativeFunction::DataViewSetBigInt64),
+                ("setBigUint64", NativeFunction::DataViewSetBigUint64),
             ],
             "DataView",
         );
@@ -4467,9 +4475,9 @@ impl Realm {
             // DataView accessors (ECMA-262 25.2.4): a getter takes the request
             // index, and a setter takes the index and the value.
             "getInt8" | "getUint8" | "getInt16" | "getUint16" | "getInt32" | "getUint32"
-            | "getFloat16" | "getFloat32" | "getFloat64" => 1,
+            | "getFloat16" | "getFloat32" | "getFloat64" | "getBigInt64" | "getBigUint64" => 1,
             "setInt8" | "setUint8" | "setInt16" | "setUint16" | "setInt32" | "setUint32"
-            | "setFloat16" | "setFloat32" | "setFloat64" => 2,
+            | "setFloat16" | "setFloat32" | "setFloat64" | "setBigInt64" | "setBigUint64" => 2,
             // Array, String and Object members whose `length` is one (ECMA-262
             // 23.1.3.1, 22.1.3.1, 20.1.2.x and B.2.2.x).
             "concat" | "unshift" | "join" | "fromEntries" | "__lookupGetter__"

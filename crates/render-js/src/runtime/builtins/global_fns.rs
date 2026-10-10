@@ -211,6 +211,10 @@ impl JsRuntime {
             | NativeFunction::DataViewGetUint32
             | NativeFunction::DataViewGetFloat32
             | NativeFunction::DataViewGetFloat64
+            | NativeFunction::DataViewGetBigInt64
+            | NativeFunction::DataViewGetBigUint64
+            | NativeFunction::DataViewSetBigInt64
+            | NativeFunction::DataViewSetBigUint64
             | NativeFunction::DataViewSetInt8
             | NativeFunction::DataViewSetUint8
             | NativeFunction::DataViewSetInt16

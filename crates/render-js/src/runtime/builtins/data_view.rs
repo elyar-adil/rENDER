@@ -20,6 +20,7 @@
 //! and `TypedArrayKind::store`, which the `DataView` accessors also use.
 
 use super::array::MAX_SAFE_INTEGER;
+use crate::JsBigInt;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
@@ -39,6 +40,10 @@ enum Access {
     Float16,
     Float32,
     Float64,
+    /// `getBigInt64` and `setBigInt64`: eight bytes read as a signed `BigInt`.
+    BigInt64,
+    /// `getBigUint64` and `setBigUint64`: eight bytes read as an unsigned `BigInt`.
+    BigUint64,
 }
 
 impl Access {
@@ -47,8 +52,12 @@ impl Access {
             Self::Int8 | Self::Uint8 => 1,
             Self::Int16 | Self::Uint16 | Self::Float16 => 2,
             Self::Int32 | Self::Uint32 | Self::Float32 => 4,
-            Self::Float64 => 8,
+            Self::Float64 | Self::BigInt64 | Self::BigUint64 => 8,
         }
+    }
+
+    const fn is_bigint(self) -> bool {
+        matches!(self, Self::BigInt64 | Self::BigUint64)
     }
 
     /// The typed-array element type this accessor converts with. `Float16` has
@@ -63,7 +72,7 @@ impl Access {
             Self::Uint32 => TypedArrayKind::Uint32,
             Self::Float32 => TypedArrayKind::Float32,
             Self::Float64 => TypedArrayKind::Float64,
-            Self::Float16 => return None,
+            Self::Float16 | Self::BigInt64 | Self::BigUint64 => return None,
         })
     }
 
@@ -84,6 +93,12 @@ impl Access {
             NativeFunction::DataViewGetFloat64 | NativeFunction::DataViewSetFloat64 => {
                 Self::Float64
             }
+            NativeFunction::DataViewGetBigInt64 | NativeFunction::DataViewSetBigInt64 => {
+                Self::BigInt64
+            }
+            NativeFunction::DataViewGetBigUint64 | NativeFunction::DataViewSetBigUint64 => {
+                Self::BigUint64
+            }
             _ => return None,
         })
     }
@@ -102,7 +117,34 @@ fn is_write(function: NativeFunction) -> bool {
             | NativeFunction::DataViewSetFloat16
             | NativeFunction::DataViewSetFloat32
             | NativeFunction::DataViewSetFloat64
+            | NativeFunction::DataViewSetBigInt64
+            | NativeFunction::DataViewSetBigUint64
     )
+}
+
+/// The eight bytes that store a `BigInt` element: the value modulo 2^64, which
+/// is `ToBigInt64` and `ToBigUint64` (ECMA-262 7.1.15, 7.1.16), reversed for a
+/// big-endian accessor.
+fn encode_bigint_bytes(value: &JsBigInt, big_endian: bool) -> Vec<u8> {
+    let modulo = value
+        .as_uint_n(64)
+        .and_then(|wrapped| wrapped.magnitude_u64())
+        .unwrap_or(0);
+    let mut bytes = modulo.to_le_bytes().to_vec();
+    if big_endian {
+        bytes.reverse();
+    }
+    bytes
+}
+
+/// The `BigInt` an eight-byte element reads as, given in little-endian order.
+fn decode_bigint(access: Access, bytes: &[u8]) -> JsBigInt {
+    let mut raw = [0_u8; 8];
+    raw.copy_from_slice(&bytes[..8]);
+    match access {
+        Access::BigInt64 => JsBigInt::from_i64(i64::from_le_bytes(raw)),
+        _ => JsBigInt::from_u64(u64::from_le_bytes(raw)),
+    }
 }
 
 /// The `width` bytes that store `value` for this accessor, in the requested
@@ -410,13 +452,18 @@ impl JsRuntime {
         let index = self.to_index_value(dom, arguments.first())?;
         if is_write(function) {
             let value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-            let number = self.to_number_value(dom, &value)?;
             // The per-access `littleEndian` argument defaults to false, so an
             // accessor that omits it is big-endian.
             let big_endian = !arguments.get(2).is_some_and(JsValue::is_truthy);
+            let bytes = if access.is_bigint() {
+                let value = self.to_bigint_value(dom, &value)?;
+                encode_bigint_bytes(&value, big_endian)
+            } else {
+                let number = self.to_number_value(dom, &value)?;
+                encode_bytes(access, number, big_endian)
+            };
             buffer.ensure_attached()?;
             self.data_view_bounds(index, access.width(), byte_length)?;
-            let bytes = encode_bytes(access, number, big_endian);
             buffer.write_bytes(byte_offset + index as usize, &bytes);
             return Ok(JsValue::Undefined);
         }
@@ -428,6 +475,9 @@ impl JsRuntime {
         let mut bytes = buffer.read_bytes(byte_offset + index as usize, access.width())?;
         if big_endian {
             bytes.reverse();
+        }
+        if access.is_bigint() {
+            return Ok(JsValue::BigInt(decode_bigint(access, &bytes)));
         }
         Ok(JsValue::Number(decode_number(access, &bytes)))
     }

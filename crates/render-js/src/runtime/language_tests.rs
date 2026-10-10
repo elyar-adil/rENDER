@@ -1837,3 +1837,21 @@ fn array_buffer_is_view_getter_names_and_buffer_constructors() {
         "3,5,2"
     );
 }
+
+#[test]
+fn data_view_bigint_accessors_read_and_write_both_byte_orders() {
+    // ECMA-262 25.2.1.5 and 25.2.1.6: the eight bytes hold the value modulo
+    // 2^64, big-endian unless the accessor is asked for little-endian.
+    assert_eq!(
+        ok(
+            "var v = new DataView(new ArrayBuffer(16)); v.setBigInt64(0, -2n); v.setBigUint64(8, (2n ** 64n) - 1n); [v.getBigInt64(0), v.getBigUint64(8), v.getBigUint64(0), v.getBigInt64(8, true), v.getUint8(7)].join()"
+        ),
+        "-2,18446744073709551615,18446744073709551614,-1,254"
+    );
+    assert_eq!(
+        ok(
+            "var v = new DataView(new ArrayBuffer(8)); var r; try { v.setBigInt64(0, 1); } catch (e) { r = e.name; } [r, DataView.prototype.getBigInt64.length, DataView.prototype.setBigInt64.length].join()"
+        ),
+        "TypeError,1,2"
+    );
+}
