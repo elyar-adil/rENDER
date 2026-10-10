@@ -6824,14 +6824,20 @@ impl Realm {
                     configurable: false,
                 },
             );
-            objects[constructor.0].properties.insert(
-                "name".to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(kind.name().to_owned())),
-            );
-            objects[constructor.0].properties.insert(
-                "length".to_owned(),
-                PropertyDescriptor::builtin(JsValue::Number(1.0)),
-            );
+            // ECMA-262 20.5.6.2.2 and 20.5.6.2.1: a NativeError constructor's
+            // `name` and `length` are non-writable, configurable.
+            for (name, value) in [
+                ("name", JsValue::String(kind.name().to_owned())),
+                ("length", JsValue::Number(1.0)),
+            ] {
+                objects[constructor.0].properties.insert(
+                    name.to_owned(),
+                    PropertyDescriptor {
+                        writable: false,
+                        ..PropertyDescriptor::builtin(value)
+                    },
+                );
+            }
             for (name, value) in [("name", kind.name()), ("message", "")] {
                 objects[prototype.0].properties.insert(
                     name.to_owned(),

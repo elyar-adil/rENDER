@@ -5499,3 +5499,22 @@ fn enumeration_keeps_named_key_order_across_index_deletes() {
         "0,zeta,alpha | 1,2,a"
     );
 }
+
+#[test]
+fn native_error_constructor_name_and_length_are_not_writable() {
+    // ECMA-262 20.5.6.2.1 and 20.5.6.2.2: a NativeError constructor's `name`
+    // and `length` are non-writable, non-enumerable (name) and configurable.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var name = Object.getOwnPropertyDescriptor(TypeError, 'name');
+                var length = Object.getOwnPropertyDescriptor(TypeError, 'length');
+                var out = [name.writable, name.enumerable, name.configurable,
+                           length.writable, length.configurable].join(',');
+            ",
+            "",
+            "out",
+        ),
+        "false,false,true,false,true"
+    );
+}
