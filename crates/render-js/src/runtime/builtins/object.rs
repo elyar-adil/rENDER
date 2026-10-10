@@ -20,13 +20,16 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::array::array_index;
 use crate::runtime::convert::format_number_precision;
 use crate::runtime::convert::required_argument;
+use crate::runtime::convert::uint32_of_number;
 use crate::runtime::eval::PrimitiveHint;
 use crate::runtime::types::ObjectEntryKind;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::same_value;
 use render_dom::Dom;
 
 /// A property key after `ToPropertyKey` (ECMA-262 7.1.19): a string name, or a
@@ -40,7 +43,7 @@ pub(in crate::runtime) enum PropertyName {
 /// A `ToPropertyDescriptor` result (ECMA-262 6.2.6.5). Each field is `None` when
 /// the descriptor object does not have it, so an absent field is told apart
 /// from one that is explicitly `undefined`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PartialDescriptor {
     value: Option<JsValue>,
     writable: Option<bool>,
@@ -116,6 +119,28 @@ fn merge_partial_descriptor(
     }
 }
 
+/// Whether two complete descriptors name the same attributes and value, which
+/// `ValidateAndApplyPropertyDescriptor` accepts even on a non-configurable slot.
+fn same_descriptor(left: &PropertyDescriptor, right: &PropertyDescriptor) -> bool {
+    left.enumerable == right.enumerable
+        && left.configurable == right.configurable
+        && left.getter == right.getter
+        && left.setter == right.setter
+        && left.writable == right.writable
+        && same_value(&left.value, &right.value)
+}
+
+/// The `length` slot of an array as a `u32`, and whether it is writable.
+fn array_length_slot(descriptor: Option<&PropertyDescriptor>) -> (u32, bool) {
+    match descriptor {
+        Some(descriptor) => match descriptor.value {
+            JsValue::Number(length) => (uint32_of_number(length), descriptor.writable),
+            _ => (0, true),
+        },
+        None => (0, true),
+    }
+}
+
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_object_native(
         &mut self,
@@ -140,7 +165,7 @@ impl JsRuntime {
                     .collect::<Vec<_>>();
                 Ok(JsValue::Object(self.create_array_from_values(&symbols)?))
             }
-            NativeFunction::ObjectAssign => self.object_assign(arguments),
+            NativeFunction::ObjectAssign => self.object_assign(dom, arguments),
             NativeFunction::ObjectKeys => {
                 self.object_entries(dom, arguments, ObjectEntryKind::Keys)
             }
@@ -157,19 +182,19 @@ impl JsRuntime {
                 self.object_get_own_property_descriptor(dom, arguments)
             }
             NativeFunction::ObjectGetOwnPropertyDescriptors => {
-                self.object_get_own_property_descriptors(arguments)
+                self.object_get_own_property_descriptors(dom, arguments)
             }
             NativeFunction::ObjectGetOwnPropertyNames => {
-                self.object_get_own_property_names(arguments)
+                self.object_get_own_property_names(dom, arguments)
             }
-            NativeFunction::ObjectGetPrototypeOf => self.object_get_prototype_of(arguments),
+            NativeFunction::ObjectGetPrototypeOf => self.object_get_prototype_of(dom, arguments),
             NativeFunction::ObjectSetPrototypeOf => self.object_set_prototype_of(arguments),
             NativeFunction::ObjectHasOwn => self.object_has_own(dom, arguments),
             NativeFunction::ObjectPrototypeHasOwnProperty => {
                 self.object_prototype_has_own_property(dom, receiver, arguments)
             }
             NativeFunction::ObjectPrototypeIsPrototypeOf => {
-                Ok(self.object_prototype_is_prototype_of(receiver, arguments))
+                self.object_prototype_is_prototype_of(dom, receiver, arguments)
             }
             NativeFunction::SymbolToString => match self.realm.host(receiver) {
                 Some(ObjectHost::SymbolInstance(symbol)) => {
@@ -290,20 +315,30 @@ impl JsRuntime {
                     crate::runtime::convert::number_to_radix_string(value, radix),
                 ))
             }
-            NativeFunction::BoolToString | NativeFunction::BoolValueOf => {
-                match self.realm.host(receiver) {
-                    Some(ObjectHost::BooleanPrimitive(value)) => Ok(JsValue::String(
-                        if value { "true" } else { "false" }.to_owned(),
-                    )),
-                    _ => Err(JsError::type_error("incompatible Boolean method receiver")),
-                }
-            }
+            NativeFunction::BoolToString => match self.realm.host(receiver) {
+                Some(ObjectHost::BooleanPrimitive(value)) => Ok(JsValue::String(
+                    if value { "true" } else { "false" }.to_owned(),
+                )),
+                _ => Err(JsError::type_error("incompatible Boolean method receiver")),
+            },
+            // ECMA-262 20.3.3.3: `valueOf` returns the Boolean itself.
+            NativeFunction::BoolValueOf => match self.realm.host(receiver) {
+                Some(ObjectHost::BooleanPrimitive(value)) => Ok(JsValue::Boolean(value)),
+                _ => Err(JsError::type_error("incompatible Boolean method receiver")),
+            },
             NativeFunction::ObjectPrototypePropertyIsEnumerable => {
                 self.object_prototype_property_is_enumerable(dom, receiver, arguments)
             }
-            NativeFunction::ObjectPrototypeToString => Ok(JsValue::String(
-                self.object_to_string_tag_for_object(receiver),
-            )),
+            NativeFunction::ObjectPrototypeToString => {
+                let tag = self.object_to_string_tag(dom, &JsValue::Object(receiver))?;
+                Ok(JsValue::String(tag))
+            }
+            // ECMA-262 20.1.3.5: `Invoke(this, "toString")`.
+            NativeFunction::ObjectPrototypeToLocaleString => {
+                let method = self.get_member(dom, receiver, "toString")?;
+                let method = Self::require_callable_object(&method, &self.realm)?;
+                self.call_with_this(dom, method, &[], JsValue::Object(receiver))
+            }
             NativeFunction::ObjectPrototypeValueOf => Ok(JsValue::Object(receiver)),
             NativeFunction::ObjectProtoGetter => {
                 // Annex B.2.2.1: a primitive wrapper reports its intrinsic
@@ -315,162 +350,275 @@ impl JsRuntime {
                     .or_else(|| self.realm.object(receiver).and_then(JsObject::prototype))
                     .map_or(JsValue::Undefined, JsValue::Object))
             }
+            // Annex B.2.2.1.2: a non-object value, or a non-object receiver,
+            // leaves the prototype untouched; a refused change throws.
             NativeFunction::ObjectProtoSetter => {
-                let value = required_argument(arguments, 0, "__proto__")?;
-                let prototype = match value {
-                    JsValue::Object(object) => Some(*object),
-                    JsValue::Null => None,
-                    // A primitive that is neither `null` nor an object leaves
-                    // the prototype untouched, per the spec's final step.
+                let prototype = match arguments.first() {
+                    Some(JsValue::Object(object)) => Some(*object),
+                    Some(JsValue::Null) => None,
                     _ => return Ok(JsValue::Undefined),
                 };
-                self.realm.set_prototype(receiver, prototype);
+                if !self.realm.set_prototype(receiver, prototype) {
+                    return Err(JsError::type_error("cannot set prototype"));
+                }
                 Ok(JsValue::Undefined)
             }
             NativeFunction::ObjectDefineGetter => {
-                self.object_define_accessor(receiver, arguments, true)
-            }
-            NativeFunction::ObjectPreventExtensions => {
-                let Some(object) = self.integrity_target(arguments, "preventExtensions")? else {
-                    return Err(JsError::type_error(
-                        "Object.preventExtensions called on null or undefined",
-                    ));
-                };
-                self.realm.prevent_extensions(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectSeal => {
-                let Some(object) = self.integrity_target(arguments, "seal")? else {
-                    return Err(JsError::type_error(
-                        "Object.seal called on null or undefined",
-                    ));
-                };
-                self.realm.seal_object(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectFreeze => {
-                let Some(object) = self.integrity_target(arguments, "freeze")? else {
-                    return Err(JsError::type_error(
-                        "Object.freeze called on null or undefined",
-                    ));
-                };
-                self.realm.freeze_object(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectIsExtensible => {
-                let Some(object) = self.integrity_target(arguments, "isExtensible")? else {
-                    return Err(JsError::type_error(
-                        "Object.isExtensible called on null or undefined",
-                    ));
-                };
-                Ok(JsValue::Boolean(self.realm.is_extensible(object)))
-            }
-            NativeFunction::ObjectIsSealed => {
-                // §20.1.2.13: a non-object target is always sealed.
-                let Some(object) = self.integrity_target(arguments, "isSealed")? else {
-                    return Ok(JsValue::Boolean(true));
-                };
-                Ok(JsValue::Boolean(self.realm.is_sealed(object)))
-            }
-            NativeFunction::ObjectIsFrozen => {
-                // §20.1.2.14: a non-object target is always frozen.
-                let Some(object) = self.integrity_target(arguments, "isFrozen")? else {
-                    return Ok(JsValue::Boolean(true));
-                };
-                Ok(JsValue::Boolean(self.realm.is_frozen(object)))
+                self.object_define_accessor(dom, receiver, arguments, true)
             }
             NativeFunction::ObjectDefineSetter => {
-                self.object_define_accessor(receiver, arguments, false)
+                self.object_define_accessor(dom, receiver, arguments, false)
             }
             NativeFunction::ObjectLookupGetter => {
-                self.object_lookup_accessor(receiver, arguments, true)
+                self.object_lookup_accessor(dom, receiver, arguments, true)
             }
             NativeFunction::ObjectLookupSetter => {
-                self.object_lookup_accessor(receiver, arguments, false)
+                self.object_lookup_accessor(dom, receiver, arguments, false)
             }
+            // §20.1.2.5, 20.1.2.7, 20.1.2.15, 20.1.2.16: a non-object argument
+            // is returned unchanged; the `is*` queries answer for it directly
+            // (§20.1.2.13 and 20.1.2.14 say sealed and frozen, and §20.1.2.11
+            // says not extensible), with no `ToObject`.
+            NativeFunction::ObjectPreventExtensions => match Self::integrity_subject(arguments) {
+                Ok(object) => {
+                    if self.prevent_extensions_value(dom, object)? {
+                        Ok(JsValue::Object(object))
+                    } else {
+                        Err(JsError::type_error("cannot prevent extensions"))
+                    }
+                }
+                Err(value) => Ok(value),
+            },
+            NativeFunction::ObjectSeal => match Self::integrity_subject(arguments) {
+                Ok(object) => {
+                    self.set_integrity_level(dom, object, false)?;
+                    Ok(JsValue::Object(object))
+                }
+                Err(value) => Ok(value),
+            },
+            NativeFunction::ObjectFreeze => match Self::integrity_subject(arguments) {
+                Ok(object) => {
+                    self.set_integrity_level(dom, object, true)?;
+                    Ok(JsValue::Object(object))
+                }
+                Err(value) => Ok(value),
+            },
+            NativeFunction::ObjectIsExtensible => match Self::integrity_subject(arguments) {
+                Ok(object) => Ok(JsValue::Boolean(self.is_extensible_value(dom, object)?)),
+                Err(_) => Ok(JsValue::Boolean(false)),
+            },
+            NativeFunction::ObjectIsSealed => match Self::integrity_subject(arguments) {
+                Ok(object) => Ok(JsValue::Boolean(
+                    self.test_integrity_level(dom, object, false)?,
+                )),
+                Err(_) => Ok(JsValue::Boolean(true)),
+            },
+            NativeFunction::ObjectIsFrozen => match Self::integrity_subject(arguments) {
+                Ok(object) => Ok(JsValue::Boolean(
+                    self.test_integrity_level(dom, object, true)?,
+                )),
+                Err(_) => Ok(JsValue::Boolean(true)),
+            },
             NativeFunction::ErrorPrototypeToString => Ok(self.error_to_string(dom, receiver)),
             other => self.dispatch_math_native(dom, other, receiver, arguments),
         }
     }
 
-    /// Annex-B `__defineGetter__`/`__defineSetter__`: install or extend an
-    /// own accessor descriptor, keeping the opposite slot when present.
+    /// The object an integrity builtin acts on, or the argument itself when it
+    /// is not an object.
+    fn integrity_subject(arguments: &[JsValue]) -> Result<ObjectId, JsValue> {
+        match arguments.first() {
+            Some(JsValue::Object(object)) => Ok(*object),
+            other => Err(other.cloned().unwrap_or(JsValue::Undefined)),
+        }
+    }
+
+    /// `Object.prototype.__defineGetter__` and `__defineSetter__` (Annex B.2.2.2
+    /// and B.2.2.3): the callable check precedes `ToPropertyKey(P)`, and the
+    /// define is a `DefinePropertyOrThrow` of an accessor with only one half.
     pub(in crate::runtime) fn object_define_accessor(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
         getter: bool,
     ) -> Result<JsValue, JsError> {
-        let key = required_argument(arguments, 0, "__defineAccessor__")?.to_js_string();
         let function = Self::require_callable_object(
-            required_argument(arguments, 1, "__defineAccessor__")?,
+            arguments.get(1).unwrap_or(&JsValue::Undefined),
             &self.realm,
         )?;
-        let existing = self.realm.own_property(receiver, &key);
-        let (getter_slot, setter_slot) = match (getter, existing) {
-            (true, Some(existing)) => (Some(function), existing.setter),
-            (false, Some(existing)) => (existing.getter, Some(function)),
-            (true, None) => (Some(function), None),
-            (false, None) => (None, Some(function)),
+        let key = self.to_property_name(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
+        let accessor = AccessorField::Present(Some(function));
+        let partial = if getter {
+            PartialDescriptor {
+                get: accessor,
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..PartialDescriptor::default()
+            }
+        } else {
+            PartialDescriptor {
+                set: accessor,
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..PartialDescriptor::default()
+            }
         };
-        if !self.realm.define_property(
-            receiver,
-            key,
-            PropertyDescriptor {
-                value: JsValue::Undefined,
-                writable: false,
-                getter: getter_slot,
-                setter: setter_slot,
-                enumerable: true,
-                configurable: true,
-            },
-        ) {
-            return Err(JsError::type_error(
-                "cannot redefine non-configurable property",
-            ));
+        self.define_property_or_throw(dom, receiver, &key, partial)?;
+        Ok(JsValue::Undefined)
+    }
+
+    /// `Object.prototype.__lookupGetter__` and `__lookupSetter__` (Annex
+    /// B.2.2.4 and B.2.2.5): the first accessor on the prototype chain for the
+    /// key, or `undefined` when a data property or nothing is found first.
+    pub(in crate::runtime) fn object_lookup_accessor(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+        getter: bool,
+    ) -> Result<JsValue, JsError> {
+        let key = self.to_property_name(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
+        let mut holder = Some(receiver);
+        while let Some(object) = holder {
+            if let Some(descriptor) = self.own_descriptor(dom, object, &key)? {
+                if !descriptor.is_accessor() {
+                    return Ok(JsValue::Undefined);
+                }
+                let slot = if getter {
+                    descriptor.getter
+                } else {
+                    descriptor.setter
+                };
+                return Ok(slot.map_or(JsValue::Undefined, JsValue::Object));
+            }
+            holder = self.prototype_of(dom, object)?;
         }
         Ok(JsValue::Undefined)
     }
 
-    /// Annex-B `__lookupGetter__`/`__lookupSetter__`: own accessor slots
-    /// only, `undefined` when absent.
-    pub(in crate::runtime) fn object_lookup_accessor(
-        &self,
-        receiver: ObjectId,
-        arguments: &[JsValue],
-        getter: bool,
-    ) -> Result<JsValue, JsError> {
-        let key = required_argument(arguments, 0, "__lookupAccessor__")?.to_js_string();
-        let slot = match self.realm.own_property(receiver, &key) {
-            Some(descriptor) if descriptor.is_accessor() => {
-                if getter {
-                    descriptor.getter
-                } else {
-                    descriptor.setter
+    /// ECMA-262 7.3.15 `SetIntegrityLevel`, for `Object.seal` (`frozen` false)
+    /// and `Object.freeze` (`frozen` true).
+    fn set_integrity_level(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        frozen: bool,
+    ) -> Result<(), JsError> {
+        if !self.prevent_extensions_value(dom, object)? {
+            return Err(JsError::type_error("cannot prevent extensions"));
+        }
+        for key in self.own_property_keys(dom, object)? {
+            let partial = if frozen {
+                match self.own_descriptor(dom, object, &key)? {
+                    None => continue,
+                    Some(descriptor) if descriptor.is_accessor() => PartialDescriptor {
+                        configurable: Some(false),
+                        ..PartialDescriptor::default()
+                    },
+                    Some(_) => PartialDescriptor {
+                        configurable: Some(false),
+                        writable: Some(false),
+                        ..PartialDescriptor::default()
+                    },
+                }
+            } else {
+                PartialDescriptor {
+                    configurable: Some(false),
+                    ..PartialDescriptor::default()
+                }
+            };
+            self.define_property_or_throw(dom, object, &key, partial)?;
+        }
+        Ok(())
+    }
+
+    /// ECMA-262 7.3.16 `TestIntegrityLevel`, for `Object.isSealed` and
+    /// `Object.isFrozen`.
+    fn test_integrity_level(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        frozen: bool,
+    ) -> Result<bool, JsError> {
+        if self.is_extensible_value(dom, object)? {
+            return Ok(false);
+        }
+        for key in self.own_property_keys(dom, object)? {
+            let Some(descriptor) = self.own_descriptor(dom, object, &key)? else {
+                continue;
+            };
+            if descriptor.configurable {
+                return Ok(false);
+            }
+            if frozen && !descriptor.is_accessor() && descriptor.writable {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// `[[PreventExtensions]]`, through the proxy trap when there is one.
+    fn prevent_extensions_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<bool, JsError> {
+        match self.realm.host(object) {
+            Some(ObjectHost::Proxy { target, handler }) => {
+                match self.proxy_trap(dom, handler, "preventExtensions")? {
+                    Some(trap) => {
+                        let result = self.call_with_this(
+                            dom,
+                            trap,
+                            &[JsValue::Object(target)],
+                            JsValue::Object(handler),
+                        )?;
+                        Ok(result.is_truthy())
+                    }
+                    None => self.prevent_extensions_value(dom, target),
                 }
             }
-            _ => None,
-        };
-        Ok(slot.map_or(JsValue::Undefined, JsValue::Object))
+            _ => Ok(self.realm.prevent_extensions(object)),
+        }
     }
-    /// Normalized first argument of the object-integrity builtins.
-    ///
-    /// Primitives coerce to their wrapper, mirroring `Object(...)`. Returns
-    /// `None` only for a nullish argument: §20.1.2.{5,7,13,14,15,16} treat a
-    /// non-object target as "always sealed/frozen" for the two `is*` queries
-    /// and as a `ToObject` throw for the four mutating ones, so the caller
-    /// decides. Returning the global object here would report
-    /// `Object.isFrozen(null) === false`, which no engine does.
-    pub(in crate::runtime) fn integrity_target(
-        &mut self,
-        arguments: &[JsValue],
-        name: &str,
-    ) -> Result<Option<ObjectId>, JsError> {
-        let value = required_argument(arguments, 0, name)?;
-        match value {
-            JsValue::Object(object) => Ok(Some(*object)),
-            JsValue::Null | JsValue::Undefined => Ok(None),
-            other => self.to_object(other).map(Some),
+
+    /// `[[IsExtensible]]`, through the proxy trap when there is one.
+    fn is_extensible_value(&mut self, dom: &mut Dom, object: ObjectId) -> Result<bool, JsError> {
+        match self.realm.host(object) {
+            Some(ObjectHost::Proxy { target, handler }) => {
+                match self.proxy_trap(dom, handler, "isExtensible")? {
+                    Some(trap) => {
+                        let result = self.call_with_this(
+                            dom,
+                            trap,
+                            &[JsValue::Object(target)],
+                            JsValue::Object(handler),
+                        )?;
+                        Ok(result.is_truthy())
+                    }
+                    None => self.is_extensible_value(dom, target),
+                }
+            }
+            _ => Ok(self.realm.is_extensible(object)),
+        }
+    }
+
+    /// Whether `object` is an Array exotic object, looking through proxies
+    /// (ECMA-262 7.2.2 `IsArray`).
+    fn is_array_value(&self, object: ObjectId) -> bool {
+        match self.realm.host(object) {
+            Some(ObjectHost::Array) => true,
+            Some(ObjectHost::Proxy { target, .. }) => self.is_array_value(target),
+            _ => false,
+        }
+    }
+
+    /// Whether `object` has a [[Call]], looking through proxies.
+    fn is_callable_value(&self, object: ObjectId) -> bool {
+        match self.realm.host(object) {
+            Some(ObjectHost::Proxy { target, .. }) => self.is_callable_value(target),
+            host => host.is_some_and(|host| host.is_callable()),
         }
     }
 }
@@ -593,107 +741,75 @@ impl JsRuntime {
         }
     }
 
+    /// ECMA-262 20.1.2.1 `Object.assign`: each enumerable own property of each
+    /// source is read with [[Get]] and written with a throwing [[Set]]. Symbol
+    /// keys are copied too, after the string keys.
     pub(in crate::runtime) fn object_assign(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let target_value = required_argument(arguments, 0, "Object.assign")?;
-        // §20.1.2.1 step 1 is `ToObject(Target)`, so a primitive target becomes
-        // its wrapper and the wrapper is what comes back. A nullish target is
-        // deliberately replaced with a fresh object instead of throwing: real
-        // shims pass optional host objects here and expect a usable target.
-        let target = if matches!(target_value, JsValue::Null | JsValue::Undefined) {
-            self.realm.create_ordinary_object()
-        } else {
-            self.to_object(target_value)?
-        };
-        for source in &arguments[1..] {
-            match source {
-                // A symbol or BigInt source wraps to an object with no own
-                // enumerable properties, so there is nothing to copy.
-                JsValue::Symbol(_) | JsValue::BigInt(_) => {}
-                JsValue::Object(source) => {
-                    let properties = self
-                        .realm
-                        .enumerable_own_properties(*source)
-                        .ok_or_else(|| JsError::type_error("Object.assign source is invalid"))?;
-                    for (key, value) in properties {
-                        if !self.realm.set_property(target, key, value) {
-                            return Err(JsError::type_error(
-                                "Object.assign could not write target property",
-                            ));
-                        }
-                    }
+        let target_value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let target = self.to_object(&target_value)?;
+        for source in arguments.iter().skip(1) {
+            if matches!(source, JsValue::Undefined | JsValue::Null) {
+                continue;
+            }
+            let from = self.to_object(source)?;
+            for key in self.own_property_keys(dom, from)? {
+                let Some(descriptor) = self.own_descriptor(dom, from, &key)? else {
+                    continue;
+                };
+                if !descriptor.enumerable {
+                    continue;
                 }
-                JsValue::String(source) => {
-                    for (index, character) in source.chars().enumerate() {
-                        if !self.realm.set_property(
-                            target,
-                            index.to_string(),
-                            JsValue::String(character.to_string()),
-                        ) {
-                            return Err(JsError::type_error(
-                                "Object.assign could not write target property",
-                            ));
-                        }
-                    }
+                let value = self.get_named_or_symbol(dom, from, &key)?;
+                if !self.set_property_checked(dom, target, &key, value)? {
+                    return Err(JsError::type_error(
+                        "Object.assign could not write target property",
+                    ));
                 }
-                JsValue::Undefined | JsValue::Null | JsValue::Boolean(_) | JsValue::Number(_) => {}
             }
         }
         Ok(JsValue::Object(target))
     }
 
+    /// `Object.keys`, `Object.values` and `Object.entries`
+    /// (ECMA-262 7.3.22 `EnumerableOwnProperties`): a nullish argument throws,
+    /// a value is read with [[Get]] only for `values` and `entries`.
     pub(in crate::runtime) fn object_entries(
         &mut self,
         dom: &mut Dom,
         arguments: &[JsValue],
         kind: ObjectEntryKind,
     ) -> Result<JsValue, JsError> {
-        let value = required_argument(arguments, 0, kind.function_name())?;
-        // `EnumerableOwnProperties` (§7.3.20) step 2 is `ToObject`, so a
-        // primitive contributes its own enumerable keys: a String primitive's
-        // indexed characters, nothing for Number/Boolean/Symbol. A nullish
-        // argument is deliberately answered with an empty list rather than a
-        // throw, because page feature-detection relies on that leniency.
-        let properties = if matches!(value, JsValue::Null | JsValue::Undefined) {
-            Vec::new()
-        } else {
-            let object = self.to_object(value)?;
-            if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
-                let keys = self.proxy_own_keys(dom, object)?;
-                let mut properties = Vec::new();
-                for key in keys {
-                    if self
-                        .proxy_get_own_property_descriptor(dom, object, &key)?
-                        .is_some_and(|descriptor| descriptor.enumerable)
-                    {
-                        let value = if kind == ObjectEntryKind::Keys {
-                            JsValue::Undefined
-                        } else {
-                            self.get_member(dom, object, &key)?
-                        };
-                        properties.push((key, value));
-                    }
-                }
-                properties
-            } else {
-                self.realm
-                    .enumerable_own_properties(object)
-                    .ok_or_else(|| JsError::type_error("object is invalid"))?
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let object = self.to_object(&value)?;
+        let pinned = self.transient_roots.len();
+        let mut output = Vec::new();
+        for name in self.own_string_keys(dom, object)? {
+            let key = PropertyName::String(name.clone());
+            let Some(descriptor) = self.own_descriptor(dom, object, &key)? else {
+                continue;
+            };
+            if !descriptor.enumerable {
+                continue;
             }
-        };
-        let mut output = Vec::with_capacity(properties.len());
-        for (key, value) in properties {
             output.push(match kind {
-                ObjectEntryKind::Keys => JsValue::String(key),
-                ObjectEntryKind::Values => value,
+                ObjectEntryKind::Keys => JsValue::String(name),
+                ObjectEntryKind::Values => self.get_member(dom, object, &name)?,
                 ObjectEntryKind::Entries => {
-                    JsValue::Object(self.create_array_from_values(&[JsValue::String(key), value])?)
+                    let value = self.get_member(dom, object, &name)?;
+                    let pair = self.create_array_from_values(&[JsValue::String(name), value])?;
+                    // A later allocation may collect, so the pair stays pinned.
+                    self.transient_roots.push(pair);
+                    JsValue::Object(pair)
                 }
             });
         }
-        Ok(JsValue::Object(self.create_array_from_values(&output)?))
+        let result = self.create_array_from_values(&output)?;
+        self.transient_roots.truncate(pinned);
+        Ok(JsValue::Object(result))
     }
 
     pub(in crate::runtime) fn object_create(
@@ -770,6 +886,7 @@ impl JsRuntime {
         }
     }
 
+    /// ECMA-262 20.1.2.4 `Object.defineProperty`.
     pub(in crate::runtime) fn object_define_property(
         &mut self,
         dom: &mut Dom,
@@ -798,10 +915,12 @@ impl JsRuntime {
             ));
         };
         let partial = self.to_property_descriptor(dom, *descriptor)?;
-        self.apply_property_descriptor(object, &key, partial)?;
+        self.define_property_or_throw(dom, object, &key, partial)?;
         Ok(JsValue::Object(object))
     }
 
+    /// ECMA-262 20.1.2.3 `Object.defineProperties`: every descriptor is read
+    /// before any property is defined.
     pub(in crate::runtime) fn object_define_properties(
         &mut self,
         dom: &mut Dom,
@@ -816,38 +935,16 @@ impl JsRuntime {
         };
         let target = *target;
         // §20.1.2.3 step 2: `ToObject(Properties)`, so undefined and null throw.
-        let descriptors_value = required_argument(arguments, 1, "Object.defineProperties")?;
-        let descriptors = self.to_object(descriptors_value)?;
-        // Steps 3-4: every descriptor is read before any property is defined. The
-        // keys are `OwnPropertyKeys(props)`, strings then symbols; each enumerable
-        // one is re-checked and read with [[Get]] when the loop reaches it.
-        let mut keys = self
-            .realm
-            .own_property_names(descriptors)
-            .unwrap_or_default()
-            .into_iter()
-            .map(PropertyName::String)
-            .collect::<Vec<_>>();
-        keys.extend(
-            self.realm
-                .own_symbols(descriptors)
-                .unwrap_or_default()
-                .into_iter()
-                .map(PropertyName::Symbol),
-        );
-        let mut pending = Vec::with_capacity(keys.len());
-        for key in keys {
-            let enumerable = match &key {
-                PropertyName::String(name) => self
-                    .realm
-                    .own_property(descriptors, name)
-                    .is_some_and(|descriptor| descriptor.enumerable),
-                PropertyName::Symbol(symbol) => self
-                    .realm
-                    .own_symbol_property(descriptors, symbol)
-                    .is_some_and(|descriptor| descriptor.enumerable),
+        let descriptors_value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let descriptors = self.to_object(&descriptors_value)?;
+        // Steps 3-4: the keys are `OwnPropertyKeys(props)`, strings then symbols;
+        // each enumerable one is re-checked and read with [[Get]] when reached.
+        let mut pending = Vec::new();
+        for key in self.own_property_keys(dom, descriptors)? {
+            let Some(descriptor) = self.own_descriptor(dom, descriptors, &key)? else {
+                continue;
             };
-            if !enumerable {
+            if !descriptor.enumerable {
                 continue;
             }
             let JsValue::Object(descriptor) = self.get_named_or_symbol(dom, descriptors, &key)?
@@ -859,7 +956,7 @@ impl JsRuntime {
             pending.push((key, self.to_property_descriptor(dom, descriptor)?));
         }
         for (key, partial) in pending {
-            self.apply_property_descriptor(target, &key, partial)?;
+            self.define_property_or_throw(dom, target, &key, partial)?;
         }
         Ok(JsValue::Object(target))
     }
@@ -921,32 +1018,464 @@ impl JsRuntime {
         }
     }
 
-    /// `DefinePropertyOrThrow`: merge the partial descriptor into the current own
-    /// property, then apply it. The object refusing the change (non-extensible
-    /// target, or a non-configurable property that cannot take it) is a `TypeError`.
-    fn apply_property_descriptor(
+    /// ECMA-262 7.3.8 `DefinePropertyOrThrow`.
+    fn define_property_or_throw(
         &mut self,
+        dom: &mut Dom,
         object: ObjectId,
         key: &PropertyName,
         partial: PartialDescriptor,
     ) -> Result<(), JsError> {
-        let applied = match key {
+        if self.define_own_property(dom, object, key, partial)? {
+            Ok(())
+        } else {
+            Err(JsError::type_error("cannot redefine object property"))
+        }
+    }
+
+    /// ECMA-262 10.1.6 `[[DefineOwnProperty]]`, dispatched on the exotic kind
+    /// of `object`: a proxy runs its `defineProperty` trap, an Array runs
+    /// 10.4.2.1, and anything else is ordinary.
+    fn define_own_property(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &PropertyName,
+        partial: PartialDescriptor,
+    ) -> Result<bool, JsError> {
+        match self.realm.host(object) {
+            Some(ObjectHost::Proxy { .. }) => {
+                return self.proxy_define_own_property(dom, object, key, partial);
+            }
+            Some(ObjectHost::Array) => {
+                if let PropertyName::String(name) = key {
+                    if name == "length" {
+                        return self.array_set_length(dom, object, partial);
+                    }
+                    if let Some(index) = array_index(name) {
+                        return Ok(self.array_define_index(object, name, index, partial));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(self.ordinary_define_own_property(object, key, partial))
+    }
+
+    /// ECMA-262 10.1.6.1 `OrdinaryDefineOwnProperty` with
+    /// `ValidateAndApplyPropertyDescriptor`: the partial descriptor is merged
+    /// with the current property, and the realm refuses an illegal change to a
+    /// non-configurable slot.
+    fn ordinary_define_own_property(
+        &mut self,
+        object: ObjectId,
+        key: &PropertyName,
+        partial: PartialDescriptor,
+    ) -> bool {
+        match key {
             PropertyName::String(name) => {
                 let current = self.realm.own_property(object, name);
                 let merged = merge_partial_descriptor(current.as_ref(), partial);
-                self.realm.define_property(object, name.clone(), merged)
+                if self
+                    .realm
+                    .define_property(object, name.clone(), merged.clone())
+                {
+                    return true;
+                }
+                // A String wrapper's virtual slots refuse every define in the
+                // realm, but a redefinition that changes nothing is still valid.
+                current.is_some_and(|current| same_descriptor(&current, &merged))
             }
             PropertyName::Symbol(symbol) => {
                 let current = self.realm.own_symbol_property(object, symbol);
                 let merged = merge_partial_descriptor(current.as_ref(), partial);
                 self.realm.define_symbol_property(object, symbol, merged)
             }
-        };
-        if applied {
-            Ok(())
-        } else {
-            Err(JsError::type_error("cannot redefine object property"))
         }
+    }
+
+    /// ECMA-262 10.4.2.1 `ArrayDefineOwnProperty` for an array index: an index
+    /// at or past a non-writable `length` is refused, and an accepted index past
+    /// the end grows `length`.
+    fn array_define_index(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        index: u32,
+        partial: PartialDescriptor,
+    ) -> bool {
+        let (old_length, length_writable) =
+            array_length_slot(self.realm.own_property(object, "length").as_ref());
+        if index >= old_length && !length_writable {
+            return false;
+        }
+        let key = PropertyName::String(name.to_owned());
+        if !self.ordinary_define_own_property(object, &key, partial) {
+            return false;
+        }
+        if index >= old_length {
+            self.realm.set_property(
+                object,
+                "length".to_owned(),
+                JsValue::Number(f64::from(index) + 1.0),
+            );
+        }
+        true
+    }
+
+    /// ECMA-262 10.4.2.4 `ArraySetLength`: a shrink deletes the indices at or
+    /// past the new length from the top down, and stops at the first one that
+    /// refuses to go, leaving `length` one past it.
+    fn array_set_length(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        partial: PartialDescriptor,
+    ) -> Result<bool, JsError> {
+        let length_key = PropertyName::String("length".to_owned());
+        let Some(value) = partial.value.clone() else {
+            return Ok(self.ordinary_define_own_property(object, &length_key, partial));
+        };
+        // `ToUint32(Desc.[[Value]])` and then `ToNumber(Desc.[[Value]])`, so an
+        // object's `valueOf` runs twice; the two must agree.
+        let new_length = uint32_of_number(self.to_number_value(dom, &value)?);
+        let number = self.to_number_value(dom, &value)?;
+        if f64::from(new_length) != number {
+            return Err(self.range_error("Invalid array length"));
+        }
+        let (old_length, length_writable) =
+            array_length_slot(self.realm.own_property(object, "length").as_ref());
+        let mut partial = partial;
+        partial.value = Some(JsValue::Number(f64::from(new_length)));
+        if new_length >= old_length {
+            return Ok(self.ordinary_define_own_property(object, &length_key, partial));
+        }
+        if !length_writable {
+            return Ok(false);
+        }
+        // The final writable state applies once the deletions are done, so the
+        // length is kept writable while they run.
+        let requested_writable = partial.writable;
+        partial.writable = Some(true);
+        if !self.ordinary_define_own_property(object, &length_key, partial) {
+            return Ok(false);
+        }
+        let mut doomed = self
+            .realm
+            .own_property_names(object)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| array_index(name))
+            .filter(|index| *index >= new_length)
+            .collect::<Vec<_>>();
+        doomed.sort_unstable_by(|left, right| right.cmp(left));
+        for index in doomed {
+            if !self.realm.delete_property(object, &index.to_string()) {
+                let mut stopped = PartialDescriptor {
+                    value: Some(JsValue::Number(f64::from(index) + 1.0)),
+                    ..PartialDescriptor::default()
+                };
+                if requested_writable == Some(false) {
+                    stopped.writable = Some(false);
+                }
+                self.ordinary_define_own_property(object, &length_key, stopped);
+                return Ok(false);
+            }
+        }
+        if requested_writable == Some(false) {
+            self.ordinary_define_own_property(
+                object,
+                &length_key,
+                PartialDescriptor {
+                    writable: Some(false),
+                    ..PartialDescriptor::default()
+                },
+            );
+        }
+        Ok(true)
+    }
+
+    /// ECMA-262 10.5.5 `[[DefineOwnProperty]]` for a proxy: the `defineProperty`
+    /// trap decides, and without one the define goes to the target.
+    fn proxy_define_own_property(
+        &mut self,
+        dom: &mut Dom,
+        proxy: ObjectId,
+        key: &PropertyName,
+        partial: PartialDescriptor,
+    ) -> Result<bool, JsError> {
+        let (target, handler) = self.proxy_parts(proxy)?;
+        let Some(trap) = self.proxy_trap(dom, handler, "defineProperty")? else {
+            return self.define_own_property(dom, target, key, partial);
+        };
+        let descriptor = self.partial_descriptor_object(partial);
+        let key_value = match key {
+            PropertyName::String(name) => JsValue::String(name.clone()),
+            PropertyName::Symbol(symbol) => JsValue::Symbol(symbol.clone()),
+        };
+        let result = self.call_with_this(
+            dom,
+            trap,
+            &[
+                JsValue::Object(target),
+                key_value,
+                JsValue::Object(descriptor),
+            ],
+            JsValue::Object(handler),
+        )?;
+        Ok(result.is_truthy())
+    }
+
+    /// ECMA-262 6.2.6.4 `FromPropertyDescriptor` for a partial descriptor: only
+    /// the fields it has become properties of the object.
+    fn partial_descriptor_object(&mut self, partial: PartialDescriptor) -> ObjectId {
+        let object = self.realm.create_ordinary_object();
+        if let Some(value) = partial.value {
+            self.realm.set_property(object, "value".to_owned(), value);
+        }
+        if let Some(writable) = partial.writable {
+            self.realm
+                .set_property(object, "writable".to_owned(), JsValue::Boolean(writable));
+        }
+        for (name, field) in [("get", partial.get), ("set", partial.set)] {
+            if let AccessorField::Present(function) = field {
+                let value = function.map_or(JsValue::Undefined, JsValue::Object);
+                self.realm.set_property(object, name.to_owned(), value);
+            }
+        }
+        if let Some(enumerable) = partial.enumerable {
+            self.realm.set_property(
+                object,
+                "enumerable".to_owned(),
+                JsValue::Boolean(enumerable),
+            );
+        }
+        if let Some(configurable) = partial.configurable {
+            self.realm.set_property(
+                object,
+                "configurable".to_owned(),
+                JsValue::Boolean(configurable),
+            );
+        }
+        object
+    }
+
+    /// ECMA-262 10.1.5 `[[GetOwnProperty]]` for either key kind, through the
+    /// proxy `getOwnPropertyDescriptor` trap for string keys.
+    fn own_descriptor(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &PropertyName,
+    ) -> Result<Option<PropertyDescriptor>, JsError> {
+        match key {
+            PropertyName::String(name) => self.proxy_get_own_property_descriptor(dom, object, name),
+            PropertyName::Symbol(symbol) => {
+                let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) else {
+                    return Ok(self.realm.own_symbol_property(object, symbol));
+                };
+                let Some(trap) = self.proxy_trap(dom, handler, "getOwnPropertyDescriptor")? else {
+                    return self.own_descriptor(dom, target, key);
+                };
+                let value = self.call_with_this(
+                    dom,
+                    trap,
+                    &[JsValue::Object(target), JsValue::Symbol(symbol.clone())],
+                    JsValue::Object(handler),
+                )?;
+                if matches!(value, JsValue::Undefined) {
+                    return Ok(None);
+                }
+                self.property_descriptor_from_value(&value).map(Some)
+            }
+        }
+    }
+
+    /// The string keys of `[[OwnPropertyKeys]]`, in order.
+    fn own_string_keys(&mut self, dom: &mut Dom, object: ObjectId) -> Result<Vec<String>, JsError> {
+        Ok(self
+            .own_property_keys(dom, object)?
+            .into_iter()
+            .filter_map(|key| match key {
+                PropertyName::String(name) => Some(name),
+                PropertyName::Symbol(_) => None,
+            })
+            .collect())
+    }
+
+    /// ECMA-262 10.1.11 `[[OwnPropertyKeys]]`: the string keys in order, then
+    /// the symbol keys. A proxy answers through its `ownKeys` trap.
+    fn own_property_keys(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<Vec<PropertyName>, JsError> {
+        if let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) {
+            let Some(trap) = self.proxy_trap(dom, handler, "ownKeys")? else {
+                return self.own_property_keys(dom, target);
+            };
+            let result = self.call_with_this(
+                dom,
+                trap,
+                &[JsValue::Object(target)],
+                JsValue::Object(handler),
+            )?;
+            // CreateListFromArrayLike(trapResult, « String, Symbol »).
+            let mut keys = Vec::new();
+            for value in self.iterate_values(dom, &result)? {
+                keys.push(match value {
+                    JsValue::String(name) => PropertyName::String(name),
+                    JsValue::Symbol(symbol) => PropertyName::Symbol(symbol),
+                    _ => {
+                        return Err(JsError::type_error(
+                            "proxy ownKeys trap returned a non-property key",
+                        ));
+                    }
+                });
+            }
+            return Ok(keys);
+        }
+        let mut keys = self
+            .realm
+            .own_property_names(object)
+            .unwrap_or_default()
+            .into_iter()
+            .map(PropertyName::String)
+            .collect::<Vec<_>>();
+        keys.extend(
+            self.realm
+                .own_symbols(object)
+                .unwrap_or_default()
+                .into_iter()
+                .map(PropertyName::Symbol),
+        );
+        Ok(keys)
+    }
+
+    /// ECMA-262 10.1.1 `[[GetPrototypeOf]]`, through the proxy trap when there
+    /// is one.
+    fn prototype_of(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<Option<ObjectId>, JsError> {
+        if let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) {
+            let Some(trap) = self.proxy_trap(dom, handler, "getPrototypeOf")? else {
+                return self.prototype_of(dom, target);
+            };
+            let result = self.call_with_this(
+                dom,
+                trap,
+                &[JsValue::Object(target)],
+                JsValue::Object(handler),
+            )?;
+            return match result {
+                JsValue::Object(prototype) => Ok(Some(prototype)),
+                JsValue::Null => Ok(None),
+                _ => Err(JsError::type_error(
+                    "getPrototypeOf trap returned neither object nor null",
+                )),
+            };
+        }
+        Ok(self.realm.object(object).and_then(JsObject::prototype))
+    }
+
+    /// ECMA-262 10.1.9.2 `OrdinarySetWithOwnDescriptor` for a receiver that is
+    /// `object` itself: the first own descriptor on the chain decides, an
+    /// accessor runs its setter, and a data write is defined on the receiver.
+    /// Returns `false` where the spec's `[[Set]]` returns `false`.
+    pub(in crate::runtime) fn set_property_checked(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &PropertyName,
+        value: JsValue,
+    ) -> Result<bool, JsError> {
+        if let (PropertyName::String(name), Some(ObjectHost::TypedArray { .. })) =
+            (key, self.realm.host(object))
+        {
+            // Integer-indexed writes keep their buffer semantics in the set path.
+            self.set_member(dom, object, name, value)?;
+            return Ok(true);
+        }
+        let mut inherited = None;
+        let mut holder = Some(object);
+        while let Some(current) = holder {
+            if let (PropertyName::String(name), Some(ObjectHost::Proxy { .. })) =
+                (key, self.realm.host(current))
+            {
+                self.proxy_set(dom, current, name, value)?;
+                return Ok(true);
+            }
+            if let Some(descriptor) = self.own_descriptor(dom, current, key)? {
+                inherited = Some(descriptor);
+                break;
+            }
+            holder = self.prototype_of(dom, current)?;
+        }
+        if let Some(descriptor) = inherited {
+            if descriptor.is_accessor() {
+                return match descriptor.setter {
+                    Some(setter) => {
+                        self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                        Ok(true)
+                    }
+                    None => Ok(false),
+                };
+            }
+            if !descriptor.writable {
+                return Ok(false);
+            }
+        }
+        let partial = match self.own_descriptor(dom, object, key)? {
+            Some(existing) => {
+                if existing.is_accessor() || !existing.writable {
+                    return Ok(false);
+                }
+                PartialDescriptor {
+                    value: Some(value),
+                    ..PartialDescriptor::default()
+                }
+            }
+            None => PartialDescriptor {
+                value: Some(value),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..PartialDescriptor::default()
+            },
+        };
+        self.define_own_property(dom, object, key, partial)
+    }
+
+    /// ECMA-262 6.2.6.4 `FromPropertyDescriptor` for a complete descriptor.
+    fn from_property_descriptor(&mut self, descriptor: &PropertyDescriptor) -> ObjectId {
+        let result = self.realm.create_ordinary_object();
+        if descriptor.is_accessor() {
+            for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
+                let value = slot.map_or(JsValue::Undefined, JsValue::Object);
+                self.realm.set_property(result, name.to_owned(), value);
+            }
+        } else {
+            self.realm
+                .set_property(result, "value".to_owned(), descriptor.value.clone());
+            self.realm.set_property(
+                result,
+                "writable".to_owned(),
+                JsValue::Boolean(descriptor.writable),
+            );
+        }
+        self.realm.set_property(
+            result,
+            "enumerable".to_owned(),
+            JsValue::Boolean(descriptor.enumerable),
+        );
+        self.realm.set_property(
+            result,
+            "configurable".to_owned(),
+            JsValue::Boolean(descriptor.configurable),
+        );
+        result
     }
 
     pub(in crate::runtime) fn object_get_own_property_descriptor(
@@ -964,99 +1493,65 @@ impl JsRuntime {
         )?)?;
         let key_argument = arguments.get(1).unwrap_or(&JsValue::Undefined);
         let key = self.to_property_name(dom, key_argument)?;
-        let descriptor = match &key {
-            PropertyName::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
-            PropertyName::String(name) => self.realm.own_property(object, name),
-        };
-        let Some(descriptor) = descriptor else {
-            return Ok(JsValue::Undefined);
-        };
-        self.ensure_heap_capacity(1)?;
-        let result = self.realm.create_ordinary_object();
-        if descriptor.is_accessor() {
-            for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
-                let value = slot.map_or(JsValue::Undefined, JsValue::Object);
-                self.realm.set_property(result, name.to_owned(), value);
+        match self.own_descriptor(dom, object, &key)? {
+            Some(descriptor) => {
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.from_property_descriptor(&descriptor)))
             }
-        } else {
-            self.realm
-                .set_property(result, "value".to_owned(), descriptor.value);
-            self.realm.set_property(
-                result,
-                "writable".to_owned(),
-                JsValue::Boolean(descriptor.writable),
-            );
+            None => Ok(JsValue::Undefined),
         }
-        self.realm.set_property(
-            result,
-            "enumerable".to_owned(),
-            JsValue::Boolean(descriptor.enumerable),
-        );
-        self.realm.set_property(
-            result,
-            "configurable".to_owned(),
-            JsValue::Boolean(descriptor.configurable),
-        );
-        Ok(JsValue::Object(result))
     }
 
+    /// ECMA-262 20.1.2.8 `Object.getOwnPropertyDescriptors`.
     pub(in crate::runtime) fn object_get_own_property_descriptors(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        // §20.1.2.7: `ToObject` first, so a primitive contributes its own
+        // §20.1.2.8: `ToObject` first, so a primitive contributes its own
         // descriptors (a String primitive's indices and `length`).
-        let value = required_argument(arguments, 0, "Object.getOwnPropertyDescriptors")?;
-        let object = self.to_object(value)?;
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let object = self.to_object(&value)?;
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
-        for key in self.realm.own_property_names(object).unwrap_or_default() {
-            let Some(descriptor) = self.realm.own_property(object, &key) else {
+        let pinned = self.transient_roots.len();
+        self.transient_roots.push(result);
+        for key in self.own_property_keys(dom, object)? {
+            let Some(descriptor) = self.own_descriptor(dom, object, &key)? else {
                 continue;
             };
-            let descriptor_object = self.realm.create_ordinary_object();
-            if descriptor.is_accessor() {
-                for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
-                    let value = slot.map_or(JsValue::Undefined, JsValue::Object);
+            let descriptor_object = self.from_property_descriptor(&descriptor);
+            match key {
+                PropertyName::String(name) => {
                     self.realm
-                        .set_property(descriptor_object, name.to_owned(), value);
+                        .set_property(result, name, JsValue::Object(descriptor_object));
                 }
-            } else {
-                self.realm
-                    .set_property(descriptor_object, "value".to_owned(), descriptor.value);
-                self.realm.set_property(
-                    descriptor_object,
-                    "writable".to_owned(),
-                    JsValue::Boolean(descriptor.writable),
-                );
+                PropertyName::Symbol(symbol) => {
+                    self.realm.define_symbol_property(
+                        result,
+                        &symbol,
+                        PropertyDescriptor::data(JsValue::Object(descriptor_object)),
+                    );
+                }
             }
-            for (name, value) in [
-                ("enumerable", JsValue::Boolean(descriptor.enumerable)),
-                ("configurable", JsValue::Boolean(descriptor.configurable)),
-            ] {
-                self.realm
-                    .set_property(descriptor_object, name.to_owned(), value);
-            }
-            self.realm
-                .set_property(result, key, JsValue::Object(descriptor_object));
         }
+        self.transient_roots.truncate(pinned);
         Ok(JsValue::Object(result))
     }
 
     pub(in crate::runtime) fn object_get_prototype_of(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         // §20.1.2.2: `Object.getPrototypeOf` starts with `ToObject`, so every
         // primitive reports its wrapper's `[[Prototype]]` and only `null` or
         // `undefined` throws. `Object.getPrototypeOf("x") === String.prototype`
         // in every engine, and a 1.3MB production bundle relies on it.
-        let value = required_argument(arguments, 0, "Object.getPrototypeOf")?;
-        let object = self.to_object(value)?;
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let object = self.to_object(&value)?;
         Ok(self
-            .realm
-            .object(object)
-            .and_then(JsObject::prototype)
+            .prototype_of(dom, object)?
             .map_or(JsValue::Null, JsValue::Object))
     }
 
@@ -1085,32 +1580,23 @@ impl JsRuntime {
         }
     }
 
+    /// ECMA-262 20.1.2.10 `Object.getOwnPropertyNames`: string keys only, so a
+    /// proxy answers through its `ownKeys` trap.
     pub(in crate::runtime) fn object_get_own_property_names(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        // §20.1.2.15: `ToObject` first, so a String primitive reports its
+        // §20.1.2.10: `ToObject` first, so a String primitive reports its
         // indexed characters plus `length` like every other engine.
-        let value = required_argument(arguments, 0, "Object.getOwnPropertyNames")?;
-        let object = self.to_object(value)?;
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let object = self.to_object(&value)?;
         let names = self
-            .realm
-            .own_property_names(object)
-            .ok_or_else(|| JsError::type_error("object is invalid"))?
+            .own_string_keys(dom, object)?
             .into_iter()
             .map(JsValue::String)
             .collect::<Vec<_>>();
         Ok(JsValue::Object(self.create_array_from_values(&names)?))
-    }
-
-    /// Whether `object` has an own property under `key`, string or symbol.
-    fn has_own_named(&self, object: ObjectId, key: &PropertyName) -> bool {
-        match key {
-            PropertyName::Symbol(symbol) => {
-                self.realm.own_symbol_property(object, symbol).is_some()
-            }
-            PropertyName::String(name) => self.realm.own_property(object, name).is_some(),
-        }
     }
 
     pub(in crate::runtime) fn object_has_own(
@@ -1120,11 +1606,13 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         // §20.1.2.18: `ToObject` first, so `Object.hasOwn("a", "0")` is true
         // against a String wrapper's indexed characters; then `ToPropertyKey`.
-        let value = required_argument(arguments, 0, "Object.hasOwn")?;
-        let object = self.to_object(value)?;
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let object = self.to_object(&value)?;
         let key_argument = arguments.get(1).unwrap_or(&JsValue::Undefined);
         let key = self.to_property_name(dom, key_argument)?;
-        Ok(JsValue::Boolean(self.has_own_named(object, &key)))
+        Ok(JsValue::Boolean(
+            self.own_descriptor(dom, object, &key)?.is_some(),
+        ))
     }
 
     pub(in crate::runtime) fn object_prototype_has_own_property(
@@ -1136,30 +1624,33 @@ impl JsRuntime {
         // §20.1.3.2: `ToPropertyKey(V)` comes before `ToObject(this)`.
         let key_argument = arguments.first().unwrap_or(&JsValue::Undefined);
         let key = self.to_property_name(dom, key_argument)?;
-        Ok(JsValue::Boolean(self.has_own_named(receiver, &key)))
+        Ok(JsValue::Boolean(
+            self.own_descriptor(dom, receiver, &key)?.is_some(),
+        ))
     }
 
+    /// ECMA-262 20.1.3.3 `Object.prototype.isPrototypeOf`: walks the candidate's
+    /// prototype chain with `[[GetPrototypeOf]]`, so a proxy's trap runs.
     pub(in crate::runtime) fn object_prototype_is_prototype_of(
-        &self,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
-    ) -> JsValue {
-        let Some(&JsValue::Object(mut candidate)) = arguments.first() else {
-            return JsValue::Boolean(false);
+    ) -> Result<JsValue, JsError> {
+        let Some(JsValue::Object(candidate)) = arguments.first() else {
+            return Ok(JsValue::Boolean(false));
         };
-        for _ in 0..self.realm.object_count() {
-            let Some(object) = self.realm.object(candidate) else {
-                return JsValue::Boolean(false);
-            };
-            let Some(prototype) = object.prototype() else {
-                return JsValue::Boolean(false);
-            };
-            if prototype == receiver {
-                return JsValue::Boolean(true);
+        let mut current = *candidate;
+        for _ in 0..=self.realm.object_count() {
+            match self.prototype_of(dom, current)? {
+                None => return Ok(JsValue::Boolean(false)),
+                Some(prototype) if prototype == receiver => {
+                    return Ok(JsValue::Boolean(true));
+                }
+                Some(prototype) => current = prototype,
             }
-            candidate = prototype;
         }
-        JsValue::Boolean(false)
+        Ok(JsValue::Boolean(false))
     }
 
     pub(in crate::runtime) fn object_prototype_property_is_enumerable(
@@ -1171,104 +1662,51 @@ impl JsRuntime {
         // §20.1.3.4: `ToPropertyKey(V)` first, then `ToObject(this)`.
         let key_argument = arguments.first().unwrap_or(&JsValue::Undefined);
         let key = self.to_property_name(dom, key_argument)?;
-        let enumerable = match &key {
-            PropertyName::Symbol(symbol) => self
-                .realm
-                .own_symbol_property(receiver, symbol)
-                .is_some_and(|descriptor| descriptor.enumerable),
-            PropertyName::String(name) => self
-                .realm
-                .own_property(receiver, name)
-                .is_some_and(|descriptor| descriptor.enumerable),
-        };
+        let enumerable = self
+            .own_descriptor(dom, receiver, &key)?
+            .is_some_and(|descriptor| descriptor.enumerable);
         Ok(JsValue::Boolean(enumerable))
     }
 
-    /// `Object.prototype.toString` tag for any value (primitives included).
-    pub(in crate::runtime) fn object_to_string_tag(&self, value: &JsValue) -> String {
-        let builtin = match value {
-            JsValue::Undefined => return "[object Undefined]".to_owned(),
-            JsValue::Null => return "[object Null]".to_owned(),
-            JsValue::Boolean(_) => "Boolean",
-            JsValue::Number(_) => "Number",
-            JsValue::BigInt(_) => "BigInt",
-            JsValue::String(_) => "String",
-            JsValue::Symbol(_) => "Symbol",
-            JsValue::Object(object) => {
-                return self.object_to_string_tag_for_object(*object);
+    /// ECMA-262 20.1.3.6 `Object.prototype.toString`: the `builtinTag` comes
+    /// from the object's internal slots (`Array`, `Function`, `Error`, the
+    /// primitive wrappers, `Date`, `RegExp`), and a string-valued
+    /// `@@toStringTag` read with [[Get]] overrides it. A getter that throws
+    /// propagates.
+    pub(in crate::runtime) fn object_to_string_tag(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<String, JsError> {
+        let object = match value {
+            JsValue::Undefined => return Ok("[object Undefined]".to_owned()),
+            JsValue::Null => return Ok("[object Null]".to_owned()),
+            other => self.to_object(other)?,
+        };
+        let builtin = if self.is_array_value(object) {
+            "Array".to_owned()
+        } else if self.is_callable_value(object) {
+            "Function".to_owned()
+        } else {
+            match self.realm.host(object) {
+                Some(ObjectHost::ErrorInstance) => "Error".to_owned(),
+                Some(ObjectHost::BooleanPrimitive(_)) => "Boolean".to_owned(),
+                Some(ObjectHost::NumberPrimitive(_)) => "Number".to_owned(),
+                Some(ObjectHost::StringPrimitive(_)) => "String".to_owned(),
+                Some(ObjectHost::DateInstance(_)) => "Date".to_owned(),
+                Some(ObjectHost::RegExp(_)) => "RegExp".to_owned(),
+                Some(ObjectHost::TypedArray { kind, .. }) => kind.name().to_owned(),
+                // Hosts whose interface names them through a `@@toStringTag`
+                // that the engine does not install on every prototype.
+                Some(ObjectHost::Document(_)) => "HTMLDocument".to_owned(),
+                Some(ObjectHost::DomException { .. }) => "DOMException".to_owned(),
+                _ => "Object".to_owned(),
             }
         };
-        format!("[object {builtin}]")
-    }
-
-    pub(in crate::runtime) fn object_to_string_tag_for_object(&self, object: ObjectId) -> String {
-        // ECMA-262 Object.prototype.toString step 7: a string-valued
-        // `Symbol.toStringTag` overrides the builtin tag. Real-world
-        // polyfills (core-js) probe this before selecting their fast paths.
-        let to_string_tag = JsSymbol::well_known("@@toStringTag");
-        if let Some(descriptor) = self.realm.get_symbol_descriptor(object, &to_string_tag)
-            && let JsValue::String(tag) = descriptor.value
-        {
-            return format!("[object {tag}]");
-        }
-        // ECMA-262 20.1.3.6 step 5: the builtin tag comes from the internal
-        // slot, so every host the engine models has to name itself. Polyfills
-        // branch on exactly these strings, and a host that falls through to
-        // `"Object"` is indistinguishable from a plain object to them.
-        let host_tag = match self.realm.host(object) {
-            Some(ObjectHost::Array) => "Array",
-            Some(ObjectHost::RegExp(_)) => "RegExp",
-            Some(ObjectHost::StringPrimitive(_)) => "String",
-            Some(ObjectHost::NumberPrimitive(_)) => "Number",
-            Some(ObjectHost::BooleanPrimitive(_)) => "Boolean",
-            Some(ObjectHost::SymbolInstance(_)) => "Symbol",
-            Some(ObjectHost::DateInstance(_)) => "Date",
-            Some(ObjectHost::ErrorConstructor(_) | ObjectHost::ErrorInstance) => "Error",
-            // WebIDL §2.7.2 gives the interface prototype a @@toStringTag of the
-            // interface name, and ECMA-262 `Object.prototype.toString` step 20
-            // reads it through the prototype chain, so the tag above already
-            // answers "DOMException" for an instance. This arm is the fallback
-            // for the case where that tag has been deleted off the prototype
-            // chain - and "Error" is right there, because §3.14.1 gives the
-            // object an [[ErrorData]] slot like any other built-in exception.
-            Some(ObjectHost::DomExceptionConstructor | ObjectHost::DomException { .. }) => {
-                "DOMException"
-            }
-            Some(ObjectHost::Promise(_) | ObjectHost::PromiseSettler { .. }) => "Promise",
-            Some(ObjectHost::Collection { kind, .. } | ObjectHost::CollectionConstructor(kind)) => {
-                kind.tag()
-            }
-            Some(ObjectHost::CollectionIterator { .. } | ObjectHost::IteratorHelper { .. }) => {
-                match self
-                    .realm
-                    .get_symbol_descriptor(object, &JsSymbol::well_known("@@toStringTag"))
-                {
-                    Some(descriptor) => {
-                        return format!("[object {}]", descriptor.value.to_js_string());
-                    }
-                    None => "Object",
-                }
-            }
-            Some(ObjectHost::Document(_)) => "HTMLDocument",
-            Some(ObjectHost::TypedArray { kind, .. }) => kind.name(),
-            Some(
-                ObjectHost::XmlHttpRequest(_)
-                | ObjectHost::AbortController
-                | ObjectHost::AbortSignal
-                | ObjectHost::FormData { .. }
-                | ObjectHost::Response { .. }
-                | ObjectHost::ResponseHeaders { .. }
-                | ObjectHost::Blob { .. }
-                | ObjectHost::UrlInstance(_)
-                | ObjectHost::UrlSearchParams { .. }
-                | ObjectHost::Storage
-                | ObjectHost::IntersectionObserver { .. }
-                | ObjectHost::MutationObserver { .. }
-                | ObjectHost::VideoElement(_),
-            ) => "Object",
-            _ if Self::is_callable_object(object, &self.realm) => "Function",
-            _ => "Object",
-        };
-        format!("[object {host_tag}]")
+        let tag = self.get_symbol_value(dom, object, &JsSymbol::well_known("@@toStringTag"))?;
+        Ok(match tag {
+            JsValue::String(tag) => format!("[object {tag}]"),
+            _ => format!("[object {builtin}]"),
+        })
     }
 }

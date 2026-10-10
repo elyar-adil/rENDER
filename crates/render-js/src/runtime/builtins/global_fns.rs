@@ -312,69 +312,19 @@ impl JsRuntime {
                 };
                 Ok(result)
             }
-            NativeFunction::ObjectDefineGetter => {
-                self.object_define_accessor(receiver, arguments, true)
-            }
-            NativeFunction::ObjectProtoGetter | NativeFunction::ObjectProtoSetter => {
+            NativeFunction::ObjectDefineGetter
+            | NativeFunction::ObjectDefineSetter
+            | NativeFunction::ObjectLookupGetter
+            | NativeFunction::ObjectLookupSetter
+            | NativeFunction::ObjectProtoGetter
+            | NativeFunction::ObjectProtoSetter
+            | NativeFunction::ObjectPreventExtensions
+            | NativeFunction::ObjectSeal
+            | NativeFunction::ObjectFreeze
+            | NativeFunction::ObjectIsExtensible
+            | NativeFunction::ObjectIsSealed
+            | NativeFunction::ObjectIsFrozen => {
                 self.dispatch_object_native(dom, function, receiver, arguments)
-            }
-            NativeFunction::ObjectPreventExtensions => {
-                let Some(object) = self.integrity_target(arguments, "preventExtensions")? else {
-                    return Err(JsError::type_error(
-                        "Object.preventExtensions called on null or undefined",
-                    ));
-                };
-                self.realm.prevent_extensions(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectSeal => {
-                let Some(object) = self.integrity_target(arguments, "seal")? else {
-                    return Err(JsError::type_error(
-                        "Object.seal called on null or undefined",
-                    ));
-                };
-                self.realm.seal_object(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectFreeze => {
-                let Some(object) = self.integrity_target(arguments, "freeze")? else {
-                    return Err(JsError::type_error(
-                        "Object.freeze called on null or undefined",
-                    ));
-                };
-                self.realm.freeze_object(object);
-                Ok(JsValue::Object(object))
-            }
-            NativeFunction::ObjectIsExtensible => {
-                let Some(object) = self.integrity_target(arguments, "isExtensible")? else {
-                    return Err(JsError::type_error(
-                        "Object.isExtensible called on null or undefined",
-                    ));
-                };
-                Ok(JsValue::Boolean(self.realm.is_extensible(object)))
-            }
-            NativeFunction::ObjectIsSealed => {
-                // §20.1.2.13: a non-object target is always sealed.
-                let Some(object) = self.integrity_target(arguments, "isSealed")? else {
-                    return Ok(JsValue::Boolean(true));
-                };
-                Ok(JsValue::Boolean(self.realm.is_sealed(object)))
-            }
-            NativeFunction::ObjectIsFrozen => {
-                // §20.1.2.14: a non-object target is always frozen.
-                let Some(object) = self.integrity_target(arguments, "isFrozen")? else {
-                    return Ok(JsValue::Boolean(true));
-                };
-                Ok(JsValue::Boolean(self.realm.is_frozen(object)))
-            }
-            NativeFunction::ObjectDefineSetter => {
-                self.object_define_accessor(receiver, arguments, false)
-            }
-            NativeFunction::ObjectLookupGetter => {
-                self.object_lookup_accessor(receiver, arguments, true)
-            }
-            NativeFunction::ObjectLookupSetter => {
-                self.object_lookup_accessor(receiver, arguments, false)
             }
             NativeFunction::StrCharAt => self.string_char_at(dom, receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(dom, receiver, arguments),
@@ -1237,6 +1187,12 @@ impl JsRuntime {
             NativeFunction::ObjectPrototypePropertyIsEnumerable => self.dispatch_object_native(
                 dom,
                 NativeFunction::ObjectPrototypePropertyIsEnumerable,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::ObjectPrototypeToLocaleString => self.dispatch_object_native(
+                dom,
+                NativeFunction::ObjectPrototypeToLocaleString,
                 receiver,
                 arguments,
             ),

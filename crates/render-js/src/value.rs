@@ -263,10 +263,12 @@ impl PropertyDescriptor {
     clippy::float_cmp,
     reason = "SameValue compares IEEE values bit-for-bit by definition"
 )]
-fn same_value(left: &JsValue, right: &JsValue) -> bool {
+pub(crate) fn same_value(left: &JsValue, right: &JsValue) -> bool {
     match (left, right) {
+        // ECMA-262 7.2.11 SameValue tells `+0` from `-0`.
         (JsValue::Number(left), JsValue::Number(right)) => {
-            (left.is_nan() && right.is_nan()) || left == right
+            (left.is_nan() && right.is_nan())
+                || (left == right && left.is_sign_negative() == right.is_sign_negative())
         }
         _ => left == right,
     }
@@ -827,6 +829,7 @@ pub(crate) enum NativeFunction {
     ObjectPrototypeIsPrototypeOf,
     ObjectPrototypePropertyIsEnumerable,
     ObjectPrototypeToString,
+    ObjectPrototypeToLocaleString,
     ObjectDefineGetter,
     SymbolDescription,
     SymbolFor,
@@ -1459,16 +1462,6 @@ impl CollectionKind {
 
     pub(crate) const fn is_weak(self) -> bool {
         matches!(self, Self::WeakMap | Self::WeakSet)
-    }
-
-    /// The ECMA-262 20.1.3.6 builtin tag for an instance of this collection.
-    pub(crate) const fn tag(self) -> &'static str {
-        match self {
-            Self::Map => "Map",
-            Self::WeakMap => "WeakMap",
-            Self::Set => "Set",
-            Self::WeakSet => "WeakSet",
-        }
     }
 }
 
@@ -2278,6 +2271,15 @@ impl Realm {
         );
         let object_prototype = Self::install_object(&mut objects, global);
         let function_prototype = Self::install_function(&mut objects, global, object_prototype);
+        // §20.1.1: `Object` is a built-in function, so its [[Prototype]] is
+        // `%Function.prototype%`; the constructor exists only once `install_object` ran.
+        if let Some(JsValue::Object(object_constructor)) = objects[global.0]
+            .properties
+            .get("Object")
+            .map(|descriptor| descriptor.value.clone())
+        {
+            objects[object_constructor.0].prototype = Some(function_prototype);
+        }
         let (element_prototype, dom_prototypes) = Self::install_dom_interfaces(
             &mut objects,
             global,
@@ -3445,6 +3447,24 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 "constructor".to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(constructor)),
+            );
+            // ECMA-262 24.1.3.14, 24.2.3.13, 24.3.3.12, 24.4.3.13: the prototype's
+            // `@@toStringTag` names the collection, and it is what
+            // `Object.prototype.toString` reads.
+            let tag = JsSymbol::well_known("@@toStringTag");
+            objects[prototype.0].symbols.insert(
+                tag.id(),
+                (
+                    tag,
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::String(name.to_owned()),
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                ),
             );
             objects[global.0].properties.insert(
                 name.to_owned(),
@@ -4997,6 +5017,10 @@ impl Realm {
                 NativeFunction::ObjectPrototypePropertyIsEnumerable,
             ),
             ("toString", NativeFunction::ObjectPrototypeToString),
+            (
+                "toLocaleString",
+                NativeFunction::ObjectPrototypeToLocaleString,
+            ),
             ("__defineGetter__", NativeFunction::ObjectDefineGetter),
             ("__defineSetter__", NativeFunction::ObjectDefineSetter),
             ("__lookupGetter__", NativeFunction::ObjectLookupGetter),
@@ -5030,15 +5054,32 @@ impl Realm {
         // (`node.__proto__[SYMBOL] = value`, `{ __proto__: base }`), and no
         // engine leaves it undefined.
         let mut proto_accessor = [None, None];
-        for (slot, function) in proto_accessor.iter_mut().zip([
-            NativeFunction::ObjectProtoGetter,
-            NativeFunction::ObjectProtoSetter,
+        for (slot, (function, name, length)) in proto_accessor.iter_mut().zip([
+            (NativeFunction::ObjectProtoGetter, "get __proto__", 0.0),
+            (NativeFunction::ObjectProtoSetter, "set __proto__", 1.0),
         ]) {
             let accessor = ObjectId(objects.len());
             objects.push(JsObject {
                 host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
+            // ECMA-262 10.2.9 SetFunctionName gives accessors a `get `/`set ` prefix.
+            for (key, value) in [
+                ("length", JsValue::Number(length)),
+                ("name", JsValue::String(name.to_owned())),
+            ] {
+                objects[accessor.0].properties.insert(
+                    key.to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                );
+            }
             *slot = Some(accessor);
         }
         objects[prototype.0].properties.insert(
@@ -6117,6 +6158,9 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(to_string)),
         );
 
+        // §20.5.6.2: every NativeError constructor inherits from `Error`, so its
+        // [[Prototype]] is the `Error` constructor, which `ErrorKind::ALL` lists first.
+        let mut error_constructor = function_prototype;
         for kind in ErrorKind::ALL {
             let prototype = if kind == ErrorKind::Error {
                 error_prototype
@@ -6130,10 +6174,13 @@ impl Realm {
             };
             let constructor = ObjectId(objects.len());
             objects.push(JsObject {
-                prototype: Some(function_prototype),
+                prototype: Some(error_constructor),
                 host: ObjectHost::ErrorConstructor(kind),
                 ..JsObject::default()
             });
+            if kind == ErrorKind::Error {
+                error_constructor = constructor;
+            }
             objects[constructor.0].properties.insert(
                 "prototype".to_owned(),
                 PropertyDescriptor {
@@ -7523,80 +7570,11 @@ impl Realm {
         true
     }
 
-    /// `Object.seal`: no new properties and every own property becomes
-    /// non-configurable.
-    pub(crate) fn seal_object(&mut self, object: ObjectId) -> bool {
-        if !self.prevent_extensions(object) {
-            return false;
-        }
-        let Some(target) = self.objects.get_mut(object.0) else {
-            return false;
-        };
-        for descriptor in target.properties.values_mut() {
-            descriptor.configurable = false;
-        }
-        for (_, descriptor) in target.symbols.values_mut() {
-            descriptor.configurable = false;
-        }
-        true
-    }
-
-    /// `Object.freeze`: seal semantics plus non-writable data values.
-    pub(crate) fn freeze_object(&mut self, object: ObjectId) -> bool {
-        if !self.seal_object(object) {
-            return false;
-        }
-        let Some(target) = self.objects.get_mut(object.0) else {
-            return false;
-        };
-        for descriptor in target.properties.values_mut() {
-            if !descriptor.is_accessor() {
-                descriptor.writable = false;
-            }
-        }
-        for (_, descriptor) in target.symbols.values_mut() {
-            if !descriptor.is_accessor() {
-                descriptor.writable = false;
-            }
-        }
-        true
-    }
-
     #[must_use]
     pub(crate) fn is_extensible(&self, object: ObjectId) -> bool {
         self.objects
             .get(object.0)
             .is_some_and(|target| target.extensible)
-    }
-
-    /// Sealed: not extensible and every own property non-configurable.
-    #[must_use]
-    pub(crate) fn is_sealed(&self, object: ObjectId) -> bool {
-        let Some(target) = self.objects.get(object.0) else {
-            return false;
-        };
-        !target.extensible
-            && target
-                .properties
-                .values()
-                .chain(target.symbols.values().map(|(_, descriptor)| descriptor))
-                .all(|descriptor| !descriptor.configurable)
-    }
-
-    /// Frozen: sealed and every own data property non-writable.
-    #[must_use]
-    pub(crate) fn is_frozen(&self, object: ObjectId) -> bool {
-        if !self.is_sealed(object) {
-            return false;
-        }
-        let Some(target) = self.objects.get(object.0) else {
-            return false;
-        };
-        !target
-            .properties
-            .values()
-            .chain(target.symbols.values().map(|(_, descriptor)| descriptor))
-            .any(|descriptor| !descriptor.is_accessor() && descriptor.writable)
     }
 
     #[must_use]

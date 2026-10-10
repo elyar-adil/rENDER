@@ -57,11 +57,15 @@
       if (entry === null || typeof entry !== 'object') {
         throw new TypeError('Iterator value ' + entry + ' is not an entry object');
       }
-      result[entry[0]] = entry[1];
+      // CreateDataPropertyOrThrow: an inherited setter such as one on
+      // Object.prototype must not run, so the entry is defined, not assigned.
+      defineProperty(result, entry[0], { value: entry[1], writable: true, enumerable: true, configurable: true });
     }
     return result;
   });
   define(Object, 'groupBy', function groupBy(items, callback) {
+    if (items === null || items === undefined) throw new TypeError('Object.groupBy called on null or undefined');
+    if (typeof callback !== 'function') throw new TypeError(String(callback) + ' is not a function');
     var groups = Object.create(null);
     var index = 0;
     for (var item of items) {
