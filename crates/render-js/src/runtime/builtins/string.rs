@@ -281,12 +281,11 @@ impl JsRuntime {
                     && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
                 {
                     // Step 2.d.i passes `this` as the caller gave it, before any
-                    // `ToString`. The engine hands a primitive receiver over as its
-                    // transient wrapper, which converts to the same string.
+                    // `ToString`; `delegate_this` says what that is for each receiver.
                     return self.call_with_this(
                         dom,
                         replacer,
-                        &[JsValue::Object(receiver), replacement],
+                        &[self.delegate_this(receiver), replacement],
                         search,
                     );
                 }
@@ -492,6 +491,7 @@ pub(in crate::runtime) fn expand_units_replacement(
                 index += 2;
             }
             digit if (u16::from(b'1')..=u16::from(b'9')).contains(&digit) => {
+                let reference_start = index;
                 let mut group = usize::from(digit - u16::from(b'1'));
                 index += 2;
                 if let Some(second) = units
@@ -506,6 +506,10 @@ pub(in crate::runtime) fn expand_units_replacement(
                 }
                 if let Some(Some((start, end))) = found.groups.get(group) {
                     output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                } else if group >= found.groups.len() {
+                    // ECMA-262 22.1.3.19.1: a `$n` past the last capture is not a
+                    // reference, so it is copied as written.
+                    output.push_str(&utf16::string_from_utf16(&units[reference_start..index]));
                 }
             }
             unit if unit == u16::from(b'<') && !found.names.is_empty() => {
@@ -632,6 +636,18 @@ impl JsRuntime {
     /// Create a transient wrapper object exposing string prototype members.
     pub(in crate::runtime) fn string_wrapper(&mut self, value: String) -> ObjectId {
         self.realm.string_wrapper(value)
+    }
+
+    /// The `this` value a `@@replace` or `@@split` delegate receives. ECMA-262
+    /// passes `O` as the caller gave it, so a plain object arrives as itself. A
+    /// string receiver arrives here as a wrapper, which cannot be told from a
+    /// `String` object, so it is handed over as its text: the primitive that a
+    /// method call on a string receives.
+    pub(in crate::runtime) fn delegate_this(&self, receiver: ObjectId) -> JsValue {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::StringPrimitive(text)) => JsValue::String(text),
+            _ => JsValue::Object(receiver),
+        }
     }
 
     /// Resolve the string a `%String.prototype%` method operates on:
@@ -1210,7 +1226,7 @@ impl JsRuntime {
             return self.call_with_this(
                 dom,
                 splitter,
-                &[JsValue::Object(receiver), limit],
+                &[self.delegate_this(receiver), limit],
                 separator,
             );
         }
@@ -1368,7 +1384,7 @@ impl JsRuntime {
             return self.call_with_this(
                 dom,
                 replacer,
-                &[JsValue::Object(receiver), replace_value],
+                &[self.delegate_this(receiver), replace_value],
                 search,
             );
         }
@@ -2312,6 +2328,16 @@ mod tests {
     }
 
     #[test]
+    fn a_dollar_reference_past_the_last_capture_is_copied_as_written() {
+        // ECMA-262 22.1.3.19.1: with no captures, `$1` is literal text, and a
+        // two-digit reference is used only when its number is a real group.
+        assert_eq!(run("'abc'.replaceAll('b', '$1')"), "a$1c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$2')"), "a$2c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$1$2')"), "ab$2c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$11')"), "ab1c");
+    }
+
+    #[test]
     fn slice_clamps_infinite_bounds_and_counts_negative_ones_from_the_end() {
         // ECMA-262 22.1.3.24: a negative bound counts from the end, and an infinite
         // one clamps before it is ever an index (this used to slice past the end).
@@ -2347,12 +2373,21 @@ mod tests {
 
     #[test]
     fn replace_all_and_split_hand_their_receiver_to_the_delegate_unconverted() {
-        // A String object is the `this` value the delegate sees, not its text.
+        // A plain object is the `this` value the delegate sees, unconverted, and a
+        // primitive string receiver is the primitive (ECMA-262 22.1.3.20 step 2.d.i).
         assert_eq!(
-            run("var s = new String('Leo'); var seen = null; \
-                 s.replaceAll({ [Symbol.replace]: function(O) { seen = O; return 'r'; } }, 'x'); \
-                 String(seen === s)"),
+            run(
+                "var o = { toString: function() { throw new Error('early'); } }; var seen = null; \
+                 String.prototype.replaceAll.call(o, { [Symbol.replace]: function(O) { seen = O; return 'r'; } }, 'x'); \
+                 String(seen === o)"
+            ),
             "true"
+        );
+        assert_eq!(
+            run(
+                "var seen = null; 'Leo'.replace({ [Symbol.replace]: function(O) { seen = O; return 'r'; } }, 'x'); typeof seen"
+            ),
+            "string"
         );
         // A `@@split` delegate runs before `ToString(this)`, so a throwing `toString`
         // on the receiver is never reached.
