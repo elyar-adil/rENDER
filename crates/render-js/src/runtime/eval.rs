@@ -1674,8 +1674,8 @@ impl JsRuntime {
             } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key_value = self.evaluate(dom, property)?;
-                let key_value = self.to_property_key_value(dom, key_value)?;
                 let receiver = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
+                let key_value = self.to_property_key_value(dom, key_value)?;
                 if let JsValue::Symbol(symbol) = &key_value {
                     return self.get_symbol_value(dom, receiver, symbol);
                 }
@@ -1770,6 +1770,28 @@ impl JsRuntime {
                     self.assign_destructuring_target(dom, target, value.clone())?;
                     return Ok(value);
                 }
+                // ECMA-262 13.15.2: a computed key converts (ToPropertyKey) in
+                // PutValue, which runs after the value expression.
+                match target.as_ref() {
+                    Expr::ComputedMember {
+                        object, property, ..
+                    } => {
+                        let (object, key) = self.computed_member_parts(dom, object, property)?;
+                        let value = self.evaluate(dom, value)?;
+                        let reference = self.property_key_reference(dom, object, key)?;
+                        self.write_assignment_reference(dom, &reference, value.clone())?;
+                        return Ok(value);
+                    }
+                    Expr::SuperComputedMember { property, .. } => {
+                        let key = self.evaluate(dom, property)?;
+                        let value = self.evaluate(dom, value)?;
+                        let key = self.to_property_key_value(dom, key)?.to_js_string();
+                        let reference = AssignmentReference::SuperProperty { property: key };
+                        self.write_assignment_reference(dom, &reference, value.clone())?;
+                        return Ok(value);
+                    }
+                    _ => {}
+                }
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let value = match target.as_ref() {
                     Expr::Identifier(name) if !parenthesized_target => {
@@ -1807,6 +1829,39 @@ impl JsRuntime {
         }
     }
 
+    /// The base object and the unconverted key of `object[property]`. The base
+    /// is checked for `null` and `undefined` here, before any key conversion
+    /// (ECMA-262 `GetValue` and `PutValue` both coerce the base first), so the
+    /// key stays a value and the caller decides when `ToPropertyKey` runs.
+    fn computed_member_parts(
+        &mut self,
+        dom: &mut Dom,
+        object: &Expr,
+        property: &Expr,
+    ) -> Result<(ObjectId, JsValue), JsError> {
+        let evaluated = self.evaluate(dom, object)?;
+        let key_value = self.evaluate(dom, property)?;
+        let object = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
+        Ok((object, key_value))
+    }
+
+    /// The reference for `object[key]` once `key` has been converted with
+    /// `ToPropertyKey`: a symbol names a symbol slot, anything else a string.
+    fn property_key_reference(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: JsValue,
+    ) -> Result<AssignmentReference, JsError> {
+        match self.to_property_key_value(dom, key)? {
+            JsValue::Symbol(symbol) => Ok(AssignmentReference::SymbolProperty { object, symbol }),
+            key => Ok(AssignmentReference::Property {
+                object,
+                property: key.to_js_string(),
+            }),
+        }
+    }
+
     pub(super) fn resolve_assignment_reference(
         &mut self,
         dom: &mut Dom,
@@ -1830,18 +1885,8 @@ impl JsRuntime {
             Expr::ComputedMember {
                 object, property, ..
             } => {
-                let evaluated = self.evaluate(dom, object)?;
-                let key_value = self.evaluate(dom, property)?;
-                let key_value = self.to_property_key_value(dom, key_value)?;
-                let key_text = key_value.to_js_string();
-                let object = self.coerce_member_base(&evaluated, &key_text)?;
-                if let JsValue::Symbol(symbol) = key_value {
-                    return Ok(AssignmentReference::SymbolProperty { object, symbol });
-                }
-                Ok(AssignmentReference::Property {
-                    object,
-                    property: key_text,
-                })
+                let (object, key) = self.computed_member_parts(dom, object, property)?;
+                self.property_key_reference(dom, object, key)
             }
             Expr::PrivateMember { object, name, .. } => {
                 let evaluated = self.evaluate(dom, object)?;
@@ -2786,9 +2831,9 @@ impl JsRuntime {
                     return Ok(None);
                 }
                 let key_value = self.evaluate(dom, property)?;
+                let object = self.coerce_member_base(&receiver, &key_value.to_js_string())?;
                 let key_value = self.to_property_key_value(dom, key_value)?;
                 let key = key_value.to_js_string();
-                let object = self.coerce_member_base(&receiver, &key)?;
                 let callee = if let JsValue::Symbol(symbol) = &key_value {
                     self.get_symbol_value(dom, object, symbol)?
                 } else {

@@ -1783,3 +1783,22 @@ fn object_keys_convert_with_to_property_key() {
         "named"
     );
 }
+
+#[test]
+fn computed_keys_convert_after_the_base_check_and_the_value() {
+    // A null base throws before its key converts (GetValue and PutValue coerce
+    // the base first), and a plain assignment converts its key in PutValue,
+    // after the value expression runs.
+    assert_eq!(
+        ok(
+            "var r = []; var k = { toString() { r.push('key'); return 'k'; } }; try { null[k] += (r.push('rhs'), 1); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var log = []; var base = {}; var k = { toString() { log.push('key'); return 'k'; } }; base[k] = (log.push('rhs'), 1); log.join()"
+        ),
+        "rhs,key"
+    );
+}
