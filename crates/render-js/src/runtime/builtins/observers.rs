@@ -73,6 +73,7 @@ impl JsRuntime {
 impl JsRuntime {
     pub(in crate::runtime) fn intersection_observer_constructor(
         &mut self,
+        dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -111,7 +112,7 @@ impl JsRuntime {
             );
         let thresholds =
             match options.and_then(|object| self.realm.get_property(object, "threshold")) {
-                Some(JsValue::Object(array)) => self.array_elements_for(array)?,
+                Some(JsValue::Object(array)) => self.array_elements_for(dom, array)?,
                 Some(value) if !matches!(value, JsValue::Undefined) => vec![value],
                 _ => vec![JsValue::Number(0.0)],
             };

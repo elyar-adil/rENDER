@@ -5910,3 +5910,145 @@ fn atomics_negative_operands_wrap_exactly_to_the_element_width() {
         "10,5,5,8,0,4294967295,0,127"
     );
 }
+
+/// Run one script in a fresh document and return its completion value.
+fn evaluate_script(source: &str) -> JsValue {
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, source)
+        .expect("the test script should execute")
+        .value
+}
+
+#[test]
+fn reflect_apply_runs_to_length_once_after_the_length_get() {
+    // 7.3.18 LengthOfArrayLike: `Get(obj, "length")` runs first, then ToLength
+    // converts its result through ToPrimitive, so `valueOf` runs exactly once and
+    // before any element is read.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = [];
+                var source = {
+                    get length() {
+                        log.push('get length');
+                        return { valueOf: function () { log.push('valueOf'); return 2; } };
+                    },
+                    0: 'a',
+                    1: 'b'
+                };
+                var count = Reflect.apply(function () { return arguments.length; }, null, source);
+                count === 2 && log.join(',') === 'get length,valueOf';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn parse_int_converts_the_string_before_the_radix_with_to_int32() {
+    // 19.2.5 parseInt: step 1 is ToString(string) and step 3 is ToInt32(radix),
+    // so the string's toString runs first and the radix's valueOf runs once.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = [];
+                var text = { toString: function () { log.push('string'); return 'ff'; } };
+                var radix = { valueOf: function () { log.push('radix'); return 16; } };
+                parseInt(text, radix) === 255 && log.join(',') === 'string,radix';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn parse_int_radix_takes_the_number_hint_so_a_string_value_of_wins() {
+    // ToInt32(radix) is ToNumber(radix), which asks ToPrimitive for the number
+    // hint: valueOf runs first, its string result '16' converts to 16, and the
+    // toString result '2' is never consulted. A Symbol.toPrimitive method receives
+    // the hint 'number'.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var radix = { valueOf: function () { return '16'; }, toString: function () { return '2'; } };
+                var seen = '';
+                var hinted = {};
+                hinted[Symbol.toPrimitive] = function (hint) { seen = hint; return 16; };
+                parseInt('ff', radix) === 255 && parseInt('ff', hinted) === 255 && seen === 'number';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn string_split_limit_runs_to_uint32_before_the_separator_is_converted() {
+    // 22.1.3.23 step 5 is ToUint32(limit) and step 6 is ToString(separator), so
+    // the limit's valueOf runs before the separator's toString. A guard for the
+    // ToUint32 path: a numeric limit converts with the number hint.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = [];
+                var separator = { toString: function () { log.push('separator'); return ','; } };
+                var limit = { valueOf: function () { log.push('limit'); return 1; } };
+                'a,b'.split(separator, limit).join('|') === 'a' && log.join(',') === 'limit,separator';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_element_write_converts_the_value_before_the_index_check() {
+    // 10.4.5.5 [[Set]] reaches 10.4.5.16 TypedArraySetElement, where ToNumber(value)
+    // runs before the index is checked, so an out-of-range write still calls
+    // valueOf, and only an in-range write stores the converted number.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = [];
+                var array = new Int32Array(2);
+                var value = { valueOf: function () { log.push('valueOf'); return 7; } };
+                array[0] = value;
+                array[5] = value;
+                array[0] === 7 && array[5] === undefined && log.join(',') === 'valueOf,valueOf';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn set_timeout_converts_its_delay_with_to_number_after_the_callback_check() {
+    // The delay is a WebIDL `long`, converted with ToNumber, so an object's valueOf
+    // runs once and the timer is still registered.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = [];
+                var id = setTimeout(function () {}, { valueOf: function () { log.push('delay'); return 25; } });
+                typeof id === 'number' && log.join(',') === 'delay';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn class_list_item_converts_its_index_with_to_number() {
+    // `DOMTokenList.item(index)` takes an `unsigned long`, so an object index goes
+    // through ToPrimitive before the token is looked up.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var element = document.createElement('p');
+                element.className = 'alpha beta';
+                element.classList.item({ valueOf: function () { return 1; } }) === 'beta';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}

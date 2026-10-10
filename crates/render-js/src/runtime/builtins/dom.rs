@@ -19,7 +19,6 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::runtime::types::ElementRect;
 use crate::value::DomNodeKind;
 use crate::value::HTML_ELEMENT_INTERFACES;
@@ -988,13 +987,14 @@ impl JsRuntime {
     }
 
     pub(in crate::runtime) fn class_list_item(
-        &self,
-        dom: &Dom,
+        &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let index = to_number(required_argument(arguments, 0, "classList.item")?)?;
+        let index =
+            self.to_number_value(dom, required_argument(arguments, 0, "classList.item")?)?;
         if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
             return Ok(JsValue::Null);
         }

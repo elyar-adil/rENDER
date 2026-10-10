@@ -47,7 +47,6 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
-use crate::runtime::convert::to_number;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PendingFetch;
@@ -89,6 +88,7 @@ impl JsRuntime {
     /// mirroring the `Image` constructor's optional size arguments.
     pub(in crate::runtime) fn video_constructor(
         &mut self,
+        dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -136,7 +136,7 @@ impl JsRuntime {
             if let Some(value) = arguments.get(index)
                 && !matches!(value, JsValue::Undefined)
             {
-                let number = to_number(value)?.max(0.0).floor();
+                let number = self.to_number_value(dom, value)?.max(0.0).floor();
                 self.realm
                     .set_property(instance, name.to_owned(), JsValue::Number(number));
             } else {

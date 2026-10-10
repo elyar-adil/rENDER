@@ -2461,7 +2461,7 @@ impl JsRuntime {
             JsValue::Object(object)
                 if matches!(self.realm.host(*object), Some(ObjectHost::Array)) =>
             {
-                self.array_elements_for(*object)
+                self.array_elements_for(dom, *object)
             }
             JsValue::String(text) => Ok(text
                 .chars()
@@ -2483,12 +2483,12 @@ impl JsRuntime {
                     self.transient_roots.truncate(pinned);
                     return Ok(values);
                 }
-                let array_like = self
-                    .realm
-                    .get_property(*object, "length")
-                    .map(|length| super::builtins::array::to_length(&length))
-                    .transpose()?
-                    .unwrap_or(0.0);
+                // The `length` of a generic array-like can be an object, whose
+                // `valueOf` must run, so ToLength goes through the runtime.
+                let array_like = match self.realm.get_property(*object, "length") {
+                    Some(length) => self.to_length_value(dom, &length)?,
+                    None => 0.0,
+                };
                 if array_like > super::builtins::array::MAX_MATERIALIZED_ELEMENTS as f64 {
                     return Err(JsError::resource(
                         "array-like length exceeds the materialization bound",
@@ -2687,14 +2687,30 @@ impl JsRuntime {
         Ok(super::convert::integer_or_infinity(number))
     }
 
-    /// ECMA-262 `ToLength` for a value that may be an object.
+    /// ECMA-262 `ToLength` for a value that may be an object. A length at or
+    /// below zero is `+0`, which `clamp` alone would leave as `-0`.
     pub(super) fn to_length_value(
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<f64, JsError> {
         let integer = self.to_integer_value(dom, value)?;
-        Ok(integer.clamp(0.0, 9_007_199_254_740_991.0))
+        Ok(if integer <= 0.0 {
+            0.0
+        } else {
+            integer.min(9_007_199_254_740_991.0)
+        })
+    }
+
+    /// ECMA-262 `ToInt32` for a value that may be an object, so an operand
+    /// such as `parseInt`'s radix can carry a `valueOf`.
+    pub(super) fn to_int32_value(
+        &mut self,
+        dom: &mut Dom,
+        value: &JsValue,
+    ) -> Result<i32, JsError> {
+        let number = self.to_number_value(dom, value)?;
+        Ok(super::convert::uint32_of_number(number) as i32)
     }
 
     /// ECMA-262 7.1.19 `ToPropertyKey` for an evaluated key: an object runs
@@ -2759,7 +2775,7 @@ impl JsRuntime {
 
     fn join_array_elements(&mut self, dom: &mut Dom, array: ObjectId) -> Result<String, JsError> {
         let mut parts = Vec::new();
-        for value in self.array_elements_for(array)? {
+        for value in self.array_elements_for(dom, array)? {
             parts.push(match value {
                 JsValue::Null | JsValue::Undefined => String::new(),
                 value => self.to_string_value(dom, &value)?,
@@ -4871,7 +4887,7 @@ impl JsRuntime {
                             buffer.set_bigint_element(kind, start + index, &bigint);
                         }
                     } else {
-                        let number = to_number(&value)?;
+                        let number = self.to_number_value(dom, &value)?;
                         if buffer
                             .view_length(kind.element_size(), start, length)
                             .is_some_and(|current| index < current)
@@ -5178,7 +5194,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
-            Some(ObjectHost::VideoConstructor) => self.video_constructor(constructor, arguments),
+            Some(ObjectHost::VideoConstructor) => {
+                self.video_constructor(dom, constructor, arguments)
+            }
             Some(ObjectHost::XmlHttpRequestConstructor) => {
                 self.xml_http_request_constructor(constructor)
             }
@@ -5205,7 +5223,7 @@ impl JsRuntime {
             Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, constructor, arguments),
             Some(ObjectHost::ProxyConstructor) => self.proxy_constructor(constructor, arguments),
             Some(ObjectHost::IntersectionObserverConstructor) => {
-                self.intersection_observer_constructor(constructor, arguments)
+                self.intersection_observer_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::MutationObserverConstructor) => {
                 self.mutation_observer_constructor(constructor, arguments)
@@ -5452,7 +5470,7 @@ impl JsRuntime {
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             // Legacy web compatibility: `Video()` without `new` constructs,
             // exactly like `Image()`.
-            Some(ObjectHost::VideoConstructor) => self.video_constructor(callee, arguments),
+            Some(ObjectHost::VideoConstructor) => self.video_constructor(dom, callee, arguments),
             Some(ObjectHost::XmlHttpRequestConstructor) => Err(JsError::type_error(
                 "XMLHttpRequest constructor requires 'new'",
             )),

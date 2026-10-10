@@ -43,7 +43,7 @@ impl JsRuntime {
             NativeFunction::JsonStringify => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 let mut stack = BTreeSet::new();
-                match self.json_stringify_value(&value, &mut stack, 0)? {
+                match self.json_stringify_value(dom, &value, &mut stack, 0)? {
                     Some(value) => Ok(JsValue::String(value)),
                     None => Ok(JsValue::Undefined),
                 }
@@ -363,10 +363,11 @@ impl JsRuntime {
     /// form (`undefined`, a symbol, or a function).
     pub(in crate::runtime) fn json_text_of(
         &mut self,
+        dom: &mut Dom,
         value: &JsValue,
     ) -> Result<Option<String>, JsError> {
         let mut stack = BTreeSet::new();
-        self.json_stringify_value(value, &mut stack, 0)
+        self.json_stringify_value(dom, value, &mut stack, 0)
     }
 
     /// `JSON.parse` of text into a value.
@@ -382,6 +383,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn json_stringify_value(
         &mut self,
+        dom: &mut Dom,
         value: &JsValue,
         stack: &mut BTreeSet<ObjectId>,
         depth: usize,
@@ -407,14 +409,14 @@ impl JsRuntime {
                     return Err(JsError::type_error("Converting circular structure to JSON"));
                 }
                 let result = if matches!(self.realm.host(*object), Some(ObjectHost::Array)) {
-                    let values = self.array_elements_for(*object)?;
+                    let values = self.array_elements_for(dom, *object)?;
                     let mut output = String::from("[");
                     for (index, value) in values.iter().enumerate() {
                         if index > 0 {
                             output.push(',');
                         }
                         output.push_str(
-                            self.json_stringify_value(value, stack, depth + 1)?
+                            self.json_stringify_value(dom, value, stack, depth + 1)?
                                 .as_deref()
                                 .unwrap_or("null"),
                         );
@@ -429,7 +431,8 @@ impl JsRuntime {
                         .enumerable_own_properties(*object)
                         .unwrap_or_default()
                     {
-                        let Some(value) = self.json_stringify_value(&value, stack, depth + 1)?
+                        let Some(value) =
+                            self.json_stringify_value(dom, &value, stack, depth + 1)?
                         else {
                             continue;
                         };

@@ -445,8 +445,8 @@ impl JsRuntime {
                 Ok(result)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
-            NativeFunction::HistoryPushState => self.history_state_change(arguments, false),
-            NativeFunction::HistoryReplaceState => self.history_state_change(arguments, true),
+            NativeFunction::HistoryPushState => self.history_state_change(dom, arguments, false),
+            NativeFunction::HistoryReplaceState => self.history_state_change(dom, arguments, true),
             NativeFunction::HistoryBack => {
                 self.pending_history_requests
                     .push(HistoryRequest::Go { delta: -1 });
@@ -547,12 +547,15 @@ impl JsRuntime {
             NativeFunction::GlobalParseInt => {
                 // ECMA-262 7.1.1.1. The radix argument used to be ignored, so
                 // every `parseInt(hex, 16)` in a bundle came back `NaN`.
+                // Step 1 is ToString(string) and step 3 is ToInt32(radix), so the
+                // radix conversion runs after the string's.
                 let text =
                     self.to_string_value(dom, required_argument(arguments, 0, "parseInt")?)?;
+                let radix =
+                    self.to_int32_value(dom, arguments.get(1).unwrap_or(&JsValue::Undefined))?;
                 Ok(JsValue::Number(crate::runtime::convert::parse_int(
-                    &text,
-                    arguments.get(1),
-                )?))
+                    &text, radix,
+                )))
             }
             NativeFunction::GlobalParseFloat => {
                 let text =

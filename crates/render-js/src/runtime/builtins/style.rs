@@ -19,7 +19,6 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_css::stylesheet::parse_declaration_list;
@@ -169,13 +168,13 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn style_item(
         &mut self,
-        dom: &Dom,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_style_declaration(receiver)?;
         let index = match arguments.first() {
-            Some(value) => to_number(value)?,
+            Some(value) => self.to_number_value(dom, value)?,
             None => return Ok(JsValue::String(String::new())),
         };
         let declarations = Self::inline_declarations(dom, node);

@@ -38,7 +38,6 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
-use crate::runtime::convert::to_number;
 use crate::value::{NativeFunction, ObjectHost, TextEncoding};
 use render_dom::Dom;
 
@@ -294,7 +293,7 @@ impl JsRuntime {
         let mut bytes = Vec::new();
         for index in 0..length {
             let item = self.get_member(dom, *object, &index.to_string())?;
-            let number = to_number(&item)?;
+            let number = self.to_number_value(dom, &item)?;
             bytes.push(if number.is_finite() {
                 number.clamp(0.0, 255.0) as u8
             } else {

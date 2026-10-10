@@ -18,11 +18,11 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
-use crate::runtime::convert::to_number;
 use crate::runtime::types::TimerEntry;
 use crate::runtime::types::TimerKind;
 use crate::runtime::types::TimerRequest;
 use crate::value::NativeFunction;
+use render_dom::Dom;
 
 /// Interpret a timer id argument; non-integral or out-of-range values match no
 /// timer, mirroring the platform's lenient `clearTimeout` behavior.
@@ -94,6 +94,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn register_timer(
         &mut self,
+        dom: &mut Dom,
         function: NativeFunction,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -110,7 +111,7 @@ impl JsRuntime {
             Self::require_callable_object(required_argument(arguments, 0, name)?, &self.realm)?;
         let delay = match arguments.get(1) {
             None | Some(JsValue::Undefined) => 0.0,
-            Some(value) => to_number(value)?,
+            Some(value) => self.to_number_value(dom, value)?,
         };
         let extra = arguments.get(2..).unwrap_or_default().to_vec();
         Ok(JsValue::Number(self.register_timer_entry(

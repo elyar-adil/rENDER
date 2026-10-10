@@ -14,7 +14,7 @@ use crate::value::ObjectHost;
 use crate::value::same_value;
 use render_dom::Dom;
 
-use super::array::{MAX_MATERIALIZED_ELEMENTS, to_length};
+use super::array::MAX_MATERIALIZED_ELEMENTS;
 
 /// `SameValue` on property keys: strings by content, symbols by identity.
 fn same_key(left: &PropertyName, right: &PropertyName) -> bool {
@@ -1024,7 +1024,8 @@ impl JsRuntime {
         let JsValue::Object(array) = value else {
             return Err(JsError::type_error("ownKeys trap result is not an object"));
         };
-        let length = to_length(&self.get_member(dom, *array, "length")?)?;
+        let length_value = self.get_member(dom, *array, "length")?;
+        let length = self.to_length_value(dom, &length_value)?;
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(JsError::resource(
                 "ownKeys trap result exceeds the materialization bound",
@@ -1158,7 +1159,7 @@ impl JsRuntime {
             .map_err(|_| JsError::type_error("CreateListFromArrayLike called on a non-object"))?;
         // LengthOfArrayLike: `Get(obj, "length")`, so getters and proxies run.
         let length_value = self.get_member(dom, object, "length")?;
-        let length = to_length(&length_value)?;
+        let length = self.to_length_value(dom, &length_value)?;
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(JsError::resource(
                 "argument list exceeds the materialization bound",

@@ -78,9 +78,11 @@ impl JsRuntime {
                 self.xhr_get_response_header(receiver, arguments)
             }
             NativeFunction::XhrGetAllResponseHeaders => self.xhr_get_all_response_headers(receiver),
-            NativeFunction::XhrAddEventListener => self.xhr_add_event_listener(receiver, arguments),
+            NativeFunction::XhrAddEventListener => {
+                self.xhr_add_event_listener(dom, receiver, arguments)
+            }
             NativeFunction::XhrRemoveEventListener => {
-                self.xhr_remove_event_listener(receiver, arguments)
+                self.xhr_remove_event_listener(dom, receiver, arguments)
             }
             other => self.dispatch_dom_native(dom, other, receiver, arguments),
         }
@@ -848,6 +850,7 @@ impl JsRuntime {
 
     fn xhr_event_callbacks(
         &mut self,
+        dom: &mut Dom,
         listeners: ObjectId,
         event_type: &str,
     ) -> Result<Vec<ObjectId>, JsError> {
@@ -855,7 +858,7 @@ impl JsRuntime {
             return Ok(Vec::new());
         };
         Ok(self
-            .array_elements_for(array)?
+            .array_elements_for(dom, array)?
             .into_iter()
             .filter_map(|value| match value {
                 JsValue::Object(callback) => Some(callback),
@@ -866,6 +869,7 @@ impl JsRuntime {
 
     fn xhr_add_event_listener(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -878,7 +882,7 @@ impl JsRuntime {
             return Ok(JsValue::Undefined);
         }
         let callback = Self::require_callable_object(callback_value, &self.realm)?;
-        let mut callbacks = self.xhr_event_callbacks(listeners, &event_type)?;
+        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &event_type)?;
         if !callbacks.contains(&callback) {
             callbacks.push(callback);
             let values: Vec<_> = callbacks.into_iter().map(JsValue::Object).collect();
@@ -891,6 +895,7 @@ impl JsRuntime {
 
     fn xhr_remove_event_listener(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -899,7 +904,7 @@ impl JsRuntime {
         let Some(JsValue::Object(callback)) = arguments.get(1) else {
             return Ok(JsValue::Undefined);
         };
-        let mut callbacks = self.xhr_event_callbacks(listeners, &event_type)?;
+        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &event_type)?;
         callbacks.retain(|candidate| *candidate != *callback);
         let values: Vec<_> = callbacks.into_iter().map(JsValue::Object).collect();
         let array = self.create_array_from_values(&values)?;
@@ -912,6 +917,7 @@ impl JsRuntime {
     /// as microtasks. Transport failures keep status 0 and fire `error`.
     pub(in crate::runtime) fn complete_xml_http_request(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         outcome: Result<FetchOutcome, String>,
     ) {
@@ -967,13 +973,13 @@ impl JsRuntime {
             ["readystatechange", "load", "loadend"]
         };
         for event_type in events {
-            self.queue_xhr_event(receiver, event_type);
+            self.queue_xhr_event(dom, receiver, event_type);
         }
     }
 
     /// Queue one `on<type>` XHR callback as a microtask bound to the XHR
     /// instance, with a minimal event object as its argument.
-    fn queue_xhr_event(&mut self, receiver: ObjectId, event_type: &str) {
+    fn queue_xhr_event(&mut self, dom: &mut Dom, receiver: ObjectId, event_type: &str) {
         let listeners = self
             .realm
             .get_property(receiver, "__renderXhrListeners")
@@ -982,7 +988,7 @@ impl JsRuntime {
                 _ => None,
             });
         let mut callbacks = listeners
-            .and_then(|list| self.xhr_event_callbacks(list, event_type).ok())
+            .and_then(|list| self.xhr_event_callbacks(dom, list, event_type).ok())
             .unwrap_or_default();
         if let Some(JsValue::Object(handler)) = self
             .realm

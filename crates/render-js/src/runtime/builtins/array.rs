@@ -217,7 +217,12 @@ const FROM_ASYNC_SOURCE: &str = r"(async function (C, asyncItems, mapfn, thisArg
   return built;
 })";
 
-/// `ToLength` (§7.1.15): clamp a length to the 0..=2^53-1 range.
+/// `ToLength` (§7.1.15) over a primitive: clamp a length to the 0..=2^53-1 range.
+///
+/// Its only caller reads an Array's own `length` slot, which is always a Number:
+/// `set_array_length_value` writes `ToUint32` results and no other path stores one.
+/// So the object arm of `ToNumber` is unreachable here. A `length` that can be an
+/// object goes through `JsRuntime::to_length_value` instead.
 pub(in crate::runtime) fn to_length(value: &JsValue) -> Result<f64, JsError> {
     let number = to_number(value)?;
     if number.is_nan() || number <= 0.0 {
@@ -307,6 +312,7 @@ impl JsRuntime {
     /// with a catchable error instead of a multi-gigabyte allocation.
     pub(in crate::runtime) fn array_elements_for(
         &mut self,
+        dom: &mut Dom,
         object: ObjectId,
     ) -> Result<Vec<JsValue>, JsError> {
         if let Some(ObjectHost::TypedArray { .. }) = self.realm.host(object) {
@@ -316,8 +322,9 @@ impl JsRuntime {
                 .into_iter()
                 .collect());
         }
+        // An array-like's `length` can be an object, so ToLength runs its `valueOf`.
         let length = match self.realm.get_property(object, "length") {
-            Some(value) => to_length(&value)?,
+            Some(value) => self.to_length_value(dom, &value)?,
             None => 0.0,
         };
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
@@ -2028,6 +2035,9 @@ impl JsRuntime {
                 _ => None,
             })
             .unwrap_or(JsValue::Undefined);
+        // Every caller passes an Array host, whose `length` slot always holds a
+        // Number (`set_array_length_value` and `array_set_length` write ToUint32
+        // results). So this ToNumber never needs ToPrimitive.
         let number = to_number(&value)?;
         if number.is_nan() || number <= 0.0 {
             return Ok(0);

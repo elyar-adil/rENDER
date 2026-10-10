@@ -910,7 +910,7 @@ impl JsRuntime {
                 let JsValue::Number(index) = co.hidden(&format!("%x{slot}")) else {
                     return Err(JsError::type_error("for-in lost its position"));
                 };
-                let values = self.array_elements_for(list)?;
+                let values = self.array_elements_for(dom, list)?;
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let Some(value) = values.get(index as usize).cloned() else {
                     co.pc = done_pc;

@@ -52,7 +52,7 @@ impl JsRuntime {
                 Ok(JsValue::Undefined)
             }
             NativeFunction::SetTimeout | NativeFunction::SetInterval => {
-                self.register_timer(function, arguments)
+                self.register_timer(dom, function, arguments)
             }
             NativeFunction::CollectionGet => self.collection_get(receiver, arguments),
             NativeFunction::CollectionSet => {

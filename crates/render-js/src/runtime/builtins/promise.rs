@@ -1409,7 +1409,7 @@ impl JsRuntime {
             JsValue::Object(object)
                 if matches!(self.realm.host(*object), Some(ObjectHost::Array)) =>
             {
-                return self.array_elements_for(*object);
+                return self.array_elements_for(dom, *object);
             }
             _ => {}
         }

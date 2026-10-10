@@ -432,6 +432,7 @@ impl JsRuntime {
     /// location and `history.state` change at once; the shell applies the entry.
     pub(crate) fn history_state_change(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
         replace: bool,
     ) -> Result<JsValue, JsError> {
@@ -450,7 +451,7 @@ impl JsRuntime {
             ));
         }
         let state = arguments.first().cloned().unwrap_or(JsValue::Null);
-        let serialized = self.json_text_of(&state)?;
+        let serialized = self.json_text_of(dom, &state)?;
         if let Some(JsValue::Object(history)) = self.realm.global("history") {
             self.realm.set_property(history, "state".to_owned(), state);
         }
@@ -615,7 +616,9 @@ impl JsRuntime {
                     }
                 }
             }
-            Some(ObjectHost::XmlHttpRequest(_)) => self.complete_xml_http_request(target, outcome),
+            Some(ObjectHost::XmlHttpRequest(_)) => {
+                self.complete_xml_http_request(dom, target, outcome);
+            }
             _ => {}
         }
     }

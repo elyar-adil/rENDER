@@ -36,6 +36,12 @@ impl JsValue {
     }
 }
 
+/// ECMA-262 7.1.4 `ToNumber` over a value that is already primitive.
+///
+/// This has no runtime, so it cannot run `ToPrimitive`. Every caller passes a
+/// primitive: either a `ToPrimitive` result, or the output of `ToNumeric` on an
+/// operand. An object must go through `JsRuntime::to_number_value`. The object arm
+/// stays an error so a call site that missed that conversion fails loudly.
 pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
     match value {
         JsValue::Undefined => Ok(f64::NAN),
@@ -126,10 +132,16 @@ pub(super) fn uint32_of_number(number: f64) -> u32 {
     number.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
+/// ECMA-262 7.1.7 `ToUint32` over a primitive. Its callers are the bitwise and
+/// shift operators, which receive `ToNumeric` results, so no object reaches it.
+/// An object operand needs `JsRuntime::to_number_value` first.
 pub(super) fn to_uint32(value: &JsValue) -> Result<u32, JsError> {
     Ok(uint32_of_number(to_number(value)?))
 }
 
+/// ECMA-262 7.1.6 `ToInt32` over a primitive. Its callers are the bitwise
+/// operators (through `ToNumeric`) and the unary `~`. `parseInt` converts its
+/// radix through `JsRuntime::to_int32_value`, since the radix can be an object.
 #[allow(clippy::cast_possible_wrap)]
 pub(super) fn to_int32(value: &JsValue) -> Result<i32, JsError> {
     Ok(to_uint32(value)? as i32)
@@ -257,6 +269,9 @@ pub(super) fn same_value_zero(left: &JsValue, right: &JsValue) -> bool {
     }
 }
 
+/// ECMA-262 7.2.14 `IsLooselyEqual` after the object operands are converted.
+/// `JsRuntime::loose_equal` runs `ToPrimitive` on any object before it calls this,
+/// so the `ToNumber` calls below only ever see primitives.
 pub(super) fn abstract_equal(left: &JsValue, right: &JsValue) -> Result<bool, JsError> {
     if strict_equal(left, right) {
         return Ok(true);
@@ -470,21 +485,21 @@ fn next_double(value: f64) -> f64 {
     f64::from_bits(stepped)
 }
 
-/// ECMA-262 7.1.1.1 `parseInt(string, radix)`. The radix argument was
-/// previously ignored, which made every `parseInt(hex, 16)` in a bundle `NaN`.
-pub(crate) fn parse_int(text: &str, radix: Option<&JsValue>) -> Result<f64, JsError> {
+/// ECMA-262 7.1.1.1 `parseInt(string, radix)`, over a string that is already
+/// `ToString`'d and a radix that is already `ToInt32`'d. The caller converts
+/// both, because each can be an object whose conversion runs user code. The
+/// radix argument was previously ignored, which made every `parseInt(hex, 16)`
+/// in a bundle `NaN`.
+pub(crate) fn parse_int(text: &str, radix: i32) -> f64 {
     let trimmed = text.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
     let (negative, digits_source) = match trimmed.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
     };
     // `R = ToInt32(radix)`, with 0 meaning "infer from the input".
-    let mut radix_value = match radix {
-        None | Some(JsValue::Undefined) => 0u32,
-        Some(value) => to_int32(value)? as u32,
-    };
+    let mut radix_value = radix as u32;
     if !(2..=36).contains(&radix_value) && radix_value != 0 {
-        return Ok(f64::NAN);
+        return f64::NAN;
     }
     let mut body = digits_source;
     if (radix_value == 16 || radix_value == 0)
@@ -505,7 +520,7 @@ pub(crate) fn parse_int(text: &str, radix: Option<&JsValue>) -> Result<f64, JsEr
         .position(|c| digit_value(c as u8).is_none_or(|value| value >= radix_value))
         .unwrap_or(significant.len());
     if end == 0 {
-        return Ok(f64::NAN);
+        return f64::NAN;
     }
     let mut magnitude = 0.0f64;
     for character in significant[..end].chars() {
@@ -514,5 +529,5 @@ pub(crate) fn parse_int(text: &str, radix: Option<&JsValue>) -> Result<f64, JsEr
         // where `u64` would overflow.
         magnitude = magnitude * f64::from(radix_value) + digit;
     }
-    Ok(if negative { -magnitude } else { magnitude })
+    if negative { -magnitude } else { magnitude }
 }
