@@ -2867,3 +2867,17 @@ fn symbol_keyed_get_and_delete_run_the_proxy_traps() {
         "true"
     );
 }
+
+#[test]
+fn template_substitution_ends_at_the_brace_the_tokenizer_finds() {
+    // ECMA-262 12.9.6: a substitution is an expression, so a regex literal, a
+    // string, a comment, an object literal or a nested template inside `${…}`
+    // must not move where the substitution's closing brace is.
+    assert_eq!(ok(r"`[${'a\'b'.replace(/'/g, '!')}]`"), "[a!b]");
+    assert_eq!(ok("`${/}/.source}`"), "}");
+    assert_eq!(ok("`${'}'}`"), "}");
+    assert_eq!(ok("`a${ /* } */ 3 }b`"), "a3b");
+    assert_eq!(ok("`${ {a: 1}.a }`"), "1");
+    assert_eq!(ok("`x${`y${1 + 1}z`}w`"), "xy2zw");
+    assert_eq!(ok("var a = 6; `${a / 2 / 1}`"), "3");
+}

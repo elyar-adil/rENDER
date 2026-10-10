@@ -240,6 +240,17 @@ fn is_js_line_terminator(character: char) -> bool {
 impl Lexer<'_> {
     #[allow(clippy::too_many_lines)]
     fn run(mut self) -> Result<Vec<Token>, JsError> {
+        while let Some((kind, start)) = self.next_token()? {
+            self.push(kind, start)?;
+        }
+        self.push(TokenKind::Eof, self.offset)?;
+        Ok(self.tokens)
+    }
+
+    /// Scan the next token, skipping whitespace and comments first, and return
+    /// its kind with its start offset. `None` once the source is exhausted.
+    #[allow(clippy::too_many_lines)]
+    fn next_token(&mut self) -> Result<Option<(TokenKind, usize)>, JsError> {
         while let Some(character) = self.peek() {
             // ECMA-262 WhiteSpace includes <ZWNBSP> (U+FEFF); source files
             // saved with a UTF-8 byte-order mark must still tokenize.
@@ -416,10 +427,9 @@ impl Lexer<'_> {
                     ));
                 }
             };
-            self.push(kind, start)?;
+            return Ok(Some((kind, start)));
         }
-        self.push(TokenKind::Eof, self.offset)?;
-        Ok(self.tokens)
+        Ok(None)
     }
 
     fn single(&mut self, kind: TokenKind) -> TokenKind {
@@ -1214,47 +1224,42 @@ impl Lexer<'_> {
             .replace('\r', "\n")
     }
 
+    /// Find the `}` that closes a `${` substitution by scanning the expression
+    /// with the ordinary token rules. A character scan cannot tell a regex
+    /// literal such as `/'/g` from a string, so it would lose the brace. The
+    /// expression's tokens are discarded here: the parser reads the returned
+    /// text again. The enclosing token state is restored afterwards.
     fn template_interpolation(&mut self, template_start: usize) -> Result<String, JsError> {
         let expression_start = self.offset;
-        let mut depth = 1_u32;
-        let mut quote = None;
-        while let Some(character) = self.peek() {
-            if let Some(delimiter) = quote {
-                self.advance();
-                if character == '\\' {
-                    if self.peek().is_some() {
-                        self.advance();
-                    }
-                } else if character == delimiter {
-                    quote = None;
+        let outer_tokens = std::mem::take(&mut self.tokens);
+        let outer_braces = std::mem::take(&mut self.brace_stack);
+        let outer_last_block_close = self.last_block_close;
+        let outer_newline = std::mem::take(&mut self.newline);
+        let outer_escaped = std::mem::take(&mut self.escaped_name);
+        let mut depth = 0_u32;
+        let result = loop {
+            match self.next_token() {
+                Ok(Some((TokenKind::LeftBrace, _))) => depth = depth.saturating_add(1),
+                Ok(Some((TokenKind::RightBrace, start))) if depth == 0 => {
+                    break Ok(self.source[expression_start..start].to_owned());
                 }
-                continue;
+                Ok(Some((TokenKind::RightBrace, _))) => depth = depth.saturating_sub(1),
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    break Err(JsError::syntax(
+                        "unterminated template interpolation",
+                        template_start,
+                    ));
+                }
+                Err(error) => break Err(error),
             }
-            match character {
-                '\'' | '"' | '`' => {
-                    quote = Some(character);
-                    self.advance();
-                }
-                '{' => {
-                    depth = depth.saturating_add(1);
-                    self.advance();
-                }
-                '}' => {
-                    depth = depth.saturating_sub(1);
-                    if depth == 0 {
-                        let expression = self.source[expression_start..self.offset].to_owned();
-                        self.advance();
-                        return Ok(expression);
-                    }
-                    self.advance();
-                }
-                _ => self.advance(),
-            }
-        }
-        Err(JsError::syntax(
-            "unterminated template interpolation",
-            template_start,
-        ))
+        };
+        self.tokens = outer_tokens;
+        self.brace_stack = outer_braces;
+        self.last_block_close = outer_last_block_close;
+        self.newline = outer_newline;
+        self.escaped_name = outer_escaped;
+        result
     }
 
     fn line_comment(&mut self) {
