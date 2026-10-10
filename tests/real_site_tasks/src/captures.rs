@@ -27,21 +27,38 @@ pub struct Capture {
     pub base_url: &'static str,
     /// The raw page's `<title>` text.
     pub expected_title: &'static str,
-    /// `a[href]` elements in the raw page. The reduced capture keeps all of them.
+    /// `a[href]` elements in the reduced fixture, counted the way the raw page was.
+    /// This is the count the engine is checked against. It equals
+    /// [`Self::raw_anchors`] unless the reduction dropped links on purpose.
     pub anchors: usize,
+    /// `a[href]` elements in the raw page. Documentation of what was dropped, never
+    /// a check: the engine only ever sees the reduced fixture.
+    pub raw_anchors: usize,
     /// Elements with a `name` among `input`, `textarea`, `select` and `button`.
     pub named_controls: usize,
     /// `input[type=submit]` elements.
     pub submit_inputs: usize,
-    /// `img` elements with a `src`, the image resources a load fetches.
+    /// `img` elements with a `src` that a scripting-enabled browser fetches: every
+    /// `img[src]` outside a `noscript` element, whose content such a browser never
+    /// parses as elements.
     pub images_with_src: usize,
+    /// `img[src]` elements inside `noscript`, which a scripting-enabled browser
+    /// does not fetch.
+    pub noscript_images: usize,
     /// External `<link rel=stylesheet>` elements, whatever their `media`.
     pub stylesheets: usize,
     /// The subset of [`Self::stylesheets`] whose `media` matches a screen. A
     /// `media=print` sheet is discovered and fetched, but does not apply on screen.
     pub screen_stylesheets: usize,
-    /// `script` elements with a `src`.
+    /// `script` elements with a `src` that a module-capable browser runs: every
+    /// `script[src]` except the `nomodule` fallbacks, which such a browser skips.
     pub scripts: usize,
+    /// `script[src][nomodule]` elements, which the classic plan leaves out.
+    pub nomodule_scripts: usize,
+    /// True when the page's visible content is produced by its scripts. Such a
+    /// capture's static markup lays out no text, so layout expectations do not
+    /// apply to it. Its discovery and markup facts still do.
+    pub js_rendered_shell: bool,
     /// `form[role=search]` elements.
     pub search_forms: usize,
     /// `tr.athing` story rows, when the page is a story table.
@@ -94,12 +111,16 @@ pub const HACKER_NEWS_HOME: Capture = Capture {
     base_url: "https://news.ycombinator.com/",
     expected_title: "Hacker News",
     anchors: 230,
+    raw_anchors: 230,
     named_controls: 1,
     submit_inputs: 0,
     images_with_src: 2,
+    noscript_images: 0,
     stylesheets: 1,
     screen_stylesheets: 1,
     scripts: 1,
+    js_rendered_shell: false,
+    nomodule_scripts: 0,
     search_forms: 0,
     story_rows: 30,
     first_story_title: Some("REA Reverse – Engineer Anything"),
@@ -115,17 +136,106 @@ pub const GOOGLE_HOME: Capture = Capture {
     base_url: "https://www.google.com/",
     expected_title: "Google",
     anchors: 15,
+    raw_anchors: 15,
     named_controls: 11,
     submit_inputs: 4,
     images_with_src: 0,
+    noscript_images: 0,
     stylesheets: 2,
     screen_stylesheets: 1,
     scripts: 2,
+    js_rendered_shell: false,
+    nomodule_scripts: 0,
     search_forms: 1,
     story_rows: 0,
     first_story_title: None,
     last_story_title: None,
 };
 
+/// The Yahoo Hong Kong home page: a dense news portal with a header search form,
+/// a category rail, a headline block, weather and sports cards, and a footer.
+/// The reduction keeps every link and every script with a `src`.
+pub const YAHOO_HK_HOME: Capture = Capture {
+    label: "yahoo_hk_home",
+    html_file: "yahoo_hk_home.html",
+    css_file: "yahoo_hk_home.css",
+    base_url: "https://hk.yahoo.com/",
+    expected_title: "Yahoo",
+    anchors: 71,
+    raw_anchors: 71,
+    named_controls: 11,
+    submit_inputs: 0,
+    images_with_src: 34,
+    noscript_images: 0,
+    stylesheets: 1,
+    screen_stylesheets: 1,
+    scripts: 21,
+    js_rendered_shell: false,
+    nomodule_scripts: 1,
+    search_forms: 0,
+    story_rows: 0,
+    first_story_title: None,
+    last_story_title: None,
+};
+
+/// The YouTube home page: a JavaScript-driven application shell. Its static
+/// markup carries the masthead and the guide, and its counts describe that
+/// markup, not the page the application renders after its scripts run.
+pub const YOUTUBE_HOME: Capture = Capture {
+    label: "youtube_home",
+    html_file: "youtube_home.html",
+    css_file: "youtube_home.css",
+    base_url: "https://www.youtube.com/",
+    expected_title: "YouTube",
+    anchors: 14,
+    raw_anchors: 14,
+    named_controls: 1,
+    submit_inputs: 0,
+    images_with_src: 0,
+    noscript_images: 0,
+    stylesheets: 5,
+    screen_stylesheets: 5,
+    scripts: 9,
+    nomodule_scripts: 0,
+    js_rendered_shell: true,
+    search_forms: 0,
+    story_rows: 0,
+    first_story_title: None,
+    last_story_title: None,
+};
+
+/// The Wikipedia main page: an encyclopedia portal with a header search form, a
+/// portal menu, and the featured-content boxes. The reduction drops the
+/// interlanguage menu, the page toolbar, and the skip link, which is why the
+/// reduced link count is smaller than the raw page's.
+pub const WIKIPEDIA_MAIN_PAGE: Capture = Capture {
+    label: "wikipedia_main_page",
+    html_file: "wikipedia_main_page.html",
+    css_file: "wikipedia_main_page.css",
+    base_url: "https://en.wikipedia.org/wiki/Main_Page",
+    expected_title: "Wikipedia, the free encyclopedia",
+    anchors: 243,
+    raw_anchors: 645,
+    named_controls: 4,
+    submit_inputs: 0,
+    images_with_src: 22,
+    noscript_images: 1,
+    stylesheets: 2,
+    screen_stylesheets: 2,
+    scripts: 1,
+    js_rendered_shell: false,
+    nomodule_scripts: 0,
+    search_forms: 0,
+    story_rows: 0,
+    first_story_title: None,
+    last_story_title: None,
+};
+
 /// Every capture the capture tests run over.
-pub const CAPTURES: &[Capture] = &[HACKER_NEWS_HOME, GOOGLE_HOME];
+pub const CAPTURES: &[Capture] = &[
+    HACKER_NEWS_HOME,
+    GOOGLE_HOME,
+    YAHOO_HK_HOME,
+    YOUTUBE_HOME,
+    WIKIPEDIA_MAIN_PAGE,
+];

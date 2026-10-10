@@ -81,6 +81,16 @@ Two rules that the captures already needed:
   form and once in a hidden autocomplete popup, so the contract checks the
   two buttons a user sees, by their labels.
 
+- **A scripting-enabled browser's view of the markup is the reference.**
+  `noscript` content is text to such a browser, so an `img` inside it is not a
+  resource a load fetches, and a `script[nomodule]` is a fallback it does not
+  run. Each capture records these exclusions as their own count, so the
+  expectation is what the page does, and the exclusion is visible.
+- **A JavaScript-rendered shell has no static text to lay out.** The YouTube
+  capture's search field is `hidden` in the static markup, and its skeleton
+  carries no text. Its capture is flagged `js_rendered_shell`, so the layout
+  checks skip it, and its discovery facts still hold.
+
 Run them with `cargo test --manifest-path tests/real_site_tasks/Cargo.toml --test real_site_captures`.
 
 ## The fixtures

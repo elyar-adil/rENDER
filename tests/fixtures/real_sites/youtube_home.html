@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<!--
+  Reduced snapshot of the YouTube home page application shell (https://www.youtube.com/).
+
+  The raw page is a JavaScript-driven application: the server response carries the
+  shell (masthead, guide links, home skeleton) and the data is filled in by script.
+  The DOCTYPE stays on line 1 so the page is in standards mode, as on the real page;
+  the charset declaration follows it on line 2, before this comment, and within the
+  first 1024 bytes. The response is text/html; charset=utf-8.
+
+  Kept verbatim from the raw page: the head (meta, link and icon tags, the four
+  head stylesheets, the eight head scripts, and every inline script under 4096
+  bytes), the ytd-app masthead with its search input, the guide link anchors
+  (slot guide-links-primary and -secondary), the copyright block, and the home
+  skeleton wrapper with one rich-grid item. The watch-page stylesheet link in the
+  body is kept; its skeleton markup is not.
+  Dropped: three inline scripts of 4096 bytes or more (ytBootstrapConfig,
+  ytAtN payload and ytInitialData), 23 of the 24 repeated rich-grid skeleton
+  items, and the watch-page skeleton markup.
+  Stylesheets are served from youtube_home.css: the five sheets in document
+  order, reduced to the rules the kept markup can match (see the notes).
+-->
+<html style="font-size: 62.5%;font-family: Roboto, Arial, sans-serif;" lang="en" darker-dark-theme darker-dark-theme-deprecate system-icons color-version="v2_0" typography typography-spacing>
+<head><script data-id="_gd" nonce="sk82b1uKoeJ-veJw6MHjUw">window.WIZ_global_data = {"AfY8Hf":true,"FL1an":false,"HiPsbb":0,"MUE6Ne":"youtube_web","MuJWjd":false,"TSDtV":"%.@.]","UUFaWc":"%.@.null,1000,2]","cfb2h":"youtube.web-front-end-critical_20261007.08_p0","hsFLT":"%.@.null,10,3]","iCzhFc":false,"nQyAE":{},"oxN3nb":{"1":false,"0":false,"610401301":false,"899588437":false,"772657768":true,"513659523":false,"568333945":true,"651175828":false,"722764542":false,"748402145":false,"748402146":false,"748402147":true,"1602613185":true,"861377723":false,"861377724":false,"869336903":false,"882674507":false,"869336904":true,"869336905":true,"283953155":false,"919444824":true,"928875398":true,"683749201":false},"u4g7r":"%.@.null,1,3]","xnI9P":true,"xwAfE":true,"yFnxrf":2486};</script><meta http-equiv="origin-trial" content="ApvK67ociHgr2egd6c2ZjrfPuRs8BHcvSggogIOPQNH7GJ3cVlyJ1NOq/COCdj0+zxskqHt9HgLLETc8qqD+vwsAAABteyJvcmlnaW4iOiJodHRwczovL3lvdXR1YmUuY29tOjQ0MyIsImZlYXR1cmUiOiJQcml2YWN5U2FuZGJveEFkc0FQSXMiLCJleHBpcnkiOjE2OTUxNjc5OTksImlzU3ViZG9tYWluIjp0cnVlfQ=="/>
+<meta name="apple-itunes-app" content="app-id=544007664, app-argument=https://www.youtube.com/?referring_app=com.apple.mobilesafari-smartbanner, affiliate-data=ct=smart_app_banner_polymer&amp;pt=9008"><script nonce="sk82b1uKoeJ-veJw6MHjUw">var ytcfg={d:function(){return window.yt&&yt.config_||ytcfg.data_||(ytcfg.data_={})},get:function(k,o){return k in ytcfg.d()?ytcfg.d()[k]:o},set:function(){var a=arguments;if(a.length>1)ytcfg.d()[a[0]]=a[1];else{var k;for(k in a[0])ytcfg.d()[k]=a[0][k]}}};
+window.ytcfg.set('EMERGENCY_BASE_URL', '\/error_204?t\x3djserror\x26level\x3dERROR\x26client.name\x3d1\x26client.version\x3d2.20261009.01.00');</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">(function(){window.yterr=window.yterr||true;window.unhandledErrorMessages={};window.unhandledErrorCount=0;
+window.onerror=function(msg,url,line,columnNumber,error){var err;if(error)err=error;else{err=new Error;err.stack="";err.message=msg;err.fileName=url;err.lineNumber=line;if(!isNaN(columnNumber))err["columnNumber"]=columnNumber}var message=String(err.message);if(!err.message||message in window.unhandledErrorMessages||window.unhandledErrorCount>=5)return;window.unhandledErrorCount+=1;window.unhandledErrorMessages[message]=true;var img=new Image;window.emergencyTimeoutImg=img;img.onload=img.onerror=function(){delete window.emergencyTimeoutImg};
+var combinedLineAndColumn=err.lineNumber;if(!isNaN(err["columnNumber"]))combinedLineAndColumn=combinedLineAndColumn+(":"+err["columnNumber"]);var stack=err.stack||"";var values={"msg":message,"type":err.name,"client.params":"unhandled window error","file":err.fileName,"line":combinedLineAndColumn,"stack":stack.substr(0,500)};var thirdPartyScript=!err.fileName||err.fileName==="<anonymous>"||stack.indexOf("extension://")>=0;var replaced=stack.replace(/https:\/\/www.youtube.com\//g,"");if(replaced.match(/https?:\/\/[^/]+\//))thirdPartyScript=
+true;else if(stack.indexOf("trapProp")>=0&&stack.indexOf("trapChain")>=0)thirdPartyScript=true;else if(message.indexOf("redefine non-configurable")>=0)thirdPartyScript=true;var baseUrl=window["ytcfg"].get("EMERGENCY_BASE_URL","https://www.youtube.com/error_204?t=jserror&level=ERROR");var unsupported=message.indexOf("window.customElements is undefined")>=0;if(thirdPartyScript||unsupported)baseUrl=baseUrl.replace("level=ERROR","level=WARNING");var parts=[baseUrl];var key;for(key in values){var value=
+values[key];if(value)parts.push(key+"="+encodeURIComponent(value))}img.src=parts.join("&")};
+(function(){function _getExtendedNativePrototype(tag){var p=this._nativePrototypes[tag];if(!p){p=Object.create(this.getNativePrototype(tag));var p$=Object.getOwnPropertyNames(window["Polymer"].Base);var i=0;var n=void 0;for(;i<p$.length&&(n=p$[i]);i++)if(!window["Polymer"].BaseDescriptors[n])try{p[n]=window["Polymer"].Base[n]}catch(e){throw new Error("Error while copying property: "+n+". Tag is "+tag);}try{Object.defineProperties(p,window["Polymer"].BaseDescriptors)}catch(e){throw new Error("Polymer define property failed for "+
+Object.keys(p));}this._nativePrototypes[tag]=p}return p}function handlePolymerError(msg){window.onerror(msg,window.location.href,0,0,new Error(Array.prototype.join.call(arguments,",")))}var origPolymer=window["Polymer"];var newPolymer=function(config){if(!origPolymer._ytIntercepted&&window["Polymer"].Base){origPolymer._ytIntercepted=true;window["Polymer"].Base._getExtendedNativePrototype=_getExtendedNativePrototype;window["Polymer"].Base._error=handlePolymerError;window["Polymer"].Base._warn=handlePolymerError}return origPolymer.apply(this,
+arguments)};var origDescriptor=Object.getOwnPropertyDescriptor(window,"Polymer");Object.defineProperty(window,"Polymer",{set:function(p){if(origDescriptor&&origDescriptor.set&&origDescriptor.get){origDescriptor.set(p);origPolymer=origDescriptor.get()}else origPolymer=p;if(typeof origPolymer==="function")Object.defineProperty(window,"Polymer",{value:origPolymer,configurable:true,enumerable:true,writable:true})},get:function(){return typeof origPolymer==="function"?newPolymer:origPolymer},configurable:true,
+enumerable:true})})();}).call(this);
+</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">window.Polymer=window.Polymer||{};window.Polymer.legacyOptimizations=true;window.Polymer.setPassiveTouchGestures=true;window.ShadyDOM={force:true,preferPerformance:true,noPatch:true};
+window.polymerSkipLoadingFontRoboto = true;window.ShadyCSS = {disableRuntime: true};</script><link rel="shortcut icon" href="https://www.youtube.com/s/desktop/0a4db377/img/favicon.ico" type="image/x-icon">
+<link rel="icon" href="https://www.youtube.com/s/desktop/0a4db377/img/favicon_32x32.png" sizes="32x32">
+<link rel="icon" href="https://www.youtube.com/s/desktop/0a4db377/img/favicon_48x48.png" sizes="48x48">
+<link rel="icon" href="https://www.youtube.com/s/desktop/0a4db377/img/favicon_96x96.png" sizes="96x96">
+<link rel="icon" href="https://www.youtube.com/s/desktop/0a4db377/img/favicon_144x144.png" sizes="144x144">
+<title>YouTube</title>
+<link rel="canonical" href="https://www.youtube.com/">
+<link rel="alternate" media="handheld" href="https://m.youtube.com/">
+<link rel="alternate" media="only screen and (max-width: 640px)" href="https://m.youtube.com/">
+<meta property="og:image" content="https://www.youtube.com/img/desktop/yt_1200.png">
+<meta property="og:title" content="YouTube">
+<meta property="fb:app_id" content="87741124305">
+<link rel="alternate" href="android-app://com.google.android.youtube/http/www.youtube.com/">
+<link rel="alternate" href="ios-app://544007664/vnd.youtube/www.youtube.com/">
+<meta name="description" content="Enjoy the videos and music you love, upload original content, and share it all with friends, family, and the world on YouTube.">
+<meta name="keywords" content="video, sharing, camera phone, video phone, free, upload"><script nonce="sk82b1uKoeJ-veJw6MHjUw">if ('undefined' == typeof Symbol || 'undefined' == typeof Symbol.iterator) {delete Array.prototype.entries;}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">var ytcsi={gt:function(n){n=(n||"")+"data_";return ytcsi[n]||(ytcsi[n]={tick:{},info:{},gel:{preLoggedGelInfos:[]}})},now:window.performance&&window.performance.timing&&window.performance.now&&window.performance.timing.navigationStart?function(){return window.performance.timing.navigationStart+window.performance.now()}:function(){return(new Date).getTime()},tick:function(l,t,n){var ticks=ytcsi.gt(n).tick;var v=t||ytcsi.now();if(ticks[l]){ticks["_"+l]=ticks["_"+l]||[ticks[l]];ticks["_"+l].push(v)}ticks[l]=
+v},info:function(k,v,n){ytcsi.gt(n).info[k]=v},infoGel:function(p,n){ytcsi.gt(n).gel.preLoggedGelInfos.push(p)},setStart:function(t,n){ytcsi.tick("_start",t,n)}};
+(function(w,d){function isGecko(){if(!w.navigator)return false;try{if(w.navigator.userAgentData&&w.navigator.userAgentData.brands&&w.navigator.userAgentData.brands.length){var brands=w.navigator.userAgentData.brands;var i=0;for(;i<brands.length;i++)if(brands[i]&&brands[i].brand==="Firefox")return true;return false}}catch(e){setTimeout(function(){throw e;})}if(!w.navigator.userAgent)return false;var ua=w.navigator.userAgent;return ua.indexOf("Gecko")>0&&ua.toLowerCase().indexOf("webkit")<0&&ua.indexOf("Edge")<
+0&&ua.indexOf("Trident")<0&&ua.indexOf("MSIE")<0}ytcsi.setStart(w.performance?w.performance.timing.responseStart:null);var isPrerender=(d.visibilityState||d.webkitVisibilityState)=="prerender";var vName=!d.visibilityState&&d.webkitVisibilityState?"webkitvisibilitychange":"visibilitychange";if(isPrerender){var startTick=function(){ytcsi.setStart();d.removeEventListener(vName,startTick)};d.addEventListener(vName,startTick,false)}if(d.addEventListener)d.addEventListener(vName,function(){ytcsi.tick("vc")},
+false);if(isGecko()){var isHidden=(d.visibilityState||d.webkitVisibilityState)=="hidden";if(isHidden)ytcsi.tick("vc")}var slt=function(el,t){setTimeout(function(){var n=ytcsi.now();el.loadTime=n;if(el.slt)el.slt()},t)};w.__ytRIL=function(el){if(!el.getAttribute("data-thumb"))if(w.requestAnimationFrame)w.requestAnimationFrame(function(){slt(el,0)});else slt(el,16)}})(window,document);
+</script><link rel="preload" href="https://i.ytimg.com/generate_204" as="fetch">
+<link rel="preconnect" href="https://i.ytimg.com">
+<link rel="dns-prefetch" href="https://i.ytimg.com">
+<link as="script" rel="preload" href="https://www.youtube.com/s/_/ytmainappweb/_/js/k=ytmainappweb.kevlar_base.en_US.YOQlalfBShg.es5.O/am=AAAAEAAACEBK/d=1/br=1/rs=AGKMywHNztB219TUiyaUIHx8SB3cRF_Ksg/m=kevlar_base_module,kevlar_main_module,kevlar_base_sync_mod_chunk" nonce="sk82b1uKoeJ-veJw6MHjUw"><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/web-animations-next-lite.min.vflset/web-animations-next-lite.min.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/custom-elements-es5-adapter.vflset/custom-elements-es5-adapter.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/webcomponents-sd.vflset/webcomponents-sd.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/intersection-observer.min.vflset/intersection-observer.min.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('lpcs', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('lpcf', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">window.ytAtP = new Promise(res => window.ytAtN = res); window.addEventListener('DOMContentLoaded', () => {window.ytAtN(); delete window.ytAtN;});</script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/scheduler.vflset/scheduler.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/www-i18n-constants-en_US.vflset/www-i18n-constants.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/spf.vflset/spf.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if(window["_spf_state"])window["_spf_state"].config={"assume-all-json-requests-chunked":true};
+//# sourceURL=yt-desktop-spf-config.js</script><script src="https://www.youtube.com/s/desktop/0a4db377/jsbin/network.vflset/network.js" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('csl', null, '');}</script><link rel="stylesheet" href="//fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&amp;family=YouTube+Sans:wght@300..900&amp;display=swap" nonce="7PXyn67IaBeLSaeiI6569g"><script name="www-roboto" nonce="sk82b1uKoeJ-veJw6MHjUw">if (document.fonts && document.fonts.load) {document.fonts.load("400 10pt Roboto", ""); document.fonts.load("500 10pt Roboto", "");}</script><link rel="stylesheet" href="https://www.youtube.com/s/desktop/0a4db377/cssbin/www-main-desktop-home-page-skeleton.css" nonce="7PXyn67IaBeLSaeiI6569g">
+<link rel="stylesheet" href="https://www.youtube.com/s/desktop/0a4db377/cssbin/www-onepick.css" nonce="7PXyn67IaBeLSaeiI6569g">
+<link rel="stylesheet" href="https://www.youtube.com/s/_/ytmainappweb/_/ss/k=ytmainappweb.kevlar_base.Acp-4OKJAFk.L.B1.O/am=AAAAEABgCGBP/d=0/br=1/rs=AGKMywGAkuwHoJoEtYt3OiTErqROWLrH1A" nonce="7PXyn67IaBeLSaeiI6569g"><style class="global_styles" nonce="7PXyn67IaBeLSaeiI6569g">body{padding:0;margin:0;overflow-y:scroll}body.autoscroll{overflow-y:auto}body.no-scroll{overflow:hidden}body.no-y-scroll{overflow-y:hidden}.hidden{display:none}textarea{--paper-input-container-input_-_white-space:pre-wrap}.grecaptcha-badge{visibility:hidden}</style><style class="masthead_shell" nonce="7PXyn67IaBeLSaeiI6569g">ytd-masthead.shell{background-color:#fff!important;position:fixed;top:0;right:0;left:0;display:-ms-flex;display:-webkit-flex;display:-webkit-box;display:-moz-box;display:-ms-flexbox;display:flex;height:56px;-ms-flex-align:center;-webkit-align-items:center;-webkit-box-align:center;-moz-box-align:center;align-items:center}ytd-masthead.shell #menu-icon{margin-left:16px}ytd-app>ytd-masthead.chunked{position:fixed;top:0;width:100%}ytd-masthead.shell.dark,ytd-masthead.shell.theater{background-color:#0f0f0f!important}ytd-masthead.shell.full-window-mode{background-color:#0f0f0f!important;opacity:0;-webkit-transform:translateY(calc(-100% - 5px));transform:translateY(calc(-100% - 5px))}ytd-masthead.shell>:first-child{padding-left:16px}ytd-masthead.shell>:last-child{padding-right:16px}ytd-masthead #masthead-logo{display:-ms-flex;display:-webkit-flex;display:-webkit-box;display:-moz-box;display:-ms-flexbox;display:flex}ytd-masthead #masthead-logo #country-code{margin-right:2px}ytd-masthead.shell #yt-logo-red-svg,ytd-masthead.shell #yt-logo-red-updated-svg,ytd-masthead.shell #yt-logo-svg,ytd-masthead.shell #yt-logo-updated-svg{-webkit-align-self:center;-ms-flex-item-align:center;align-self:center;margin-left:8px;padding:0;color:#000}ytd-masthead.shell #a11y-skip-nav{display:none}ytd-masthead.shell svg{width:40px;height:40px;padding:8px;margin-right:8px;-moz-box-sizing:border-box;box-sizing:border-box;color:#606060;fill:currentColor}ytd-masthead .external-icon{width:24px;height:24px}ytd-masthead .yt-icons-ext{fill:currentColor;color:#606060}ytd-masthead.shell.dark .yt-icons-ext ytd-masthead.shell.theater .yt-icons-ext{fill:#fff}ytd-masthead svg#yt-logo-svg{width:80px}ytd-masthead svg#yt-logo-red-svg{width:106.4px}ytd-masthead svg#yt-logo-updated-svg{width:90px}ytd-masthead svg#yt-logo-red-updated-svg{width:97px}@media (max-width:656px){ytd-masthead.shell>:first-child{padding-left:8px}ytd-masthead.shell>:last-child{padding-right:8px}ytd-masthead.shell svg{margin-right:0}ytd-masthead #masthead-logo{-ms-flex:1 1 0.000000001px;-webkit-flex:1;-webkit-box-flex:1;-moz-box-flex:1;flex:1;-webkit-flex-basis:0.000000001px;-ms-flex-preferred-size:0.000000001px;flex-basis:0.000000001px}ytd-masthead.shell #yt-logo-red-svg,ytd-masthead.shell #yt-logo-svg{margin-left:4px}}@media (min-width:876px){ytd-masthead #masthead-logo{width:129px}}#masthead-skeleton-icons{display:-webkit-box;display:-webkit-flex;display:-moz-box;display:-ms-flexbox;display:flex;-webkit-box-flex:1;-webkit-flex:1;-moz-box-flex:1;-ms-flex:1;flex:1;-webkit-box-orient:horizontal;-webkit-box-direction:normal;-webkit-flex-direction:row;-moz-box-orient:horizontal;-moz-box-direction:normal;-ms-flex-direction:row;flex-direction:row;-webkit-box-pack:end;-webkit-justify-content:flex-end;-moz-box-pack:end;-ms-flex-pack:end;justify-content:flex-end}ytd-masthead.masthead-finish #masthead-skeleton-icons{display:none}.masthead-skeleton-icon{border-radius:50%;height:32px;width:32px;margin:0 8px;background-color:#e3e3e3}ytd-masthead.dark .masthead-skeleton-icon{background-color:#292929}</style><style class="masthead_custom_styles" is="custom-style" id="ext-styles" nonce="7PXyn67IaBeLSaeiI6569g">ytd-masthead .yt-icons-ext{color:var(--yt-sys-color-baseline--text-primary)}ytd-masthead svg#yt-logo-red-svg #youtube-red-paths path,ytd-masthead svg#yt-logo-red-updated-svg #youtube-red-paths path,ytd-masthead svg#yt-logo-svg #youtube-paths path,ytd-masthead svg#yt-logo-updated-svg #youtube-paths path{fill:#282828}ytd-masthead.dark svg#yt-logo-red-svg #youtube-red-paths path,ytd-masthead.dark svg#yt-logo-red-updated-svg #youtube-red-paths path,ytd-masthead.dark svg#yt-logo-svg #youtube-paths path,ytd-masthead.dark svg#yt-logo-updated-svg #youtube-paths path,ytd-masthead.theater svg#yt-logo-red-svg #youtube-red-paths path,ytd-masthead.theater svg#yt-logo-svg #youtube-paths path{fill:#fff}</style><style class="searchbox" nonce="7PXyn67IaBeLSaeiI6569g">#search-input.ytd-searchbox-spt input{-webkit-appearance:none;-webkit-font-smoothing:antialiased;background-color:transparent;border:none;box-shadow:none;color:inherit;font-family:Roboto,Noto,sans-serif;font-size:16px;font-weight:400;line-height:24px;margin-left:4px;max-width:100%;outline:none;text-align:inherit;width:100%;-ms-flex:1 1 0.000000001px;-webkit-flex:1;-webkit-box-flex:1;-moz-box-flex:1;flex:1;-webkit-flex-basis:0.000000001px;-ms-flex-preferred-size:0.000000001px;flex-basis:0.000000001px}#search-container.ytd-searchbox-spt{pointer-events:none;position:absolute;top:0;right:0;bottom:0;left:0}#search-input.ytd-searchbox-spt #search::-webkit-input-placeholder{color:#888}#search-input.ytd-searchbox-spt #search::-moz-input-placeholder{color:#888}#search-input.ytd-searchbox-spt #search:-ms-input-placeholder{color:#888}</style><style class="kevlar_global_styles" nonce="7PXyn67IaBeLSaeiI6569g">html{background-color:#fff!important;-webkit-text-size-adjust:none}html[dark]{background-color:#0f0f0f!important}#logo-red-icon-container.ytd-topbar-logo-renderer{width:86px}</style><meta name="theme-color" content="rgba(255, 255, 255, 0.98)">
+<link rel="search" type="application/opensearchdescription+xml" href="https://www.youtube.com/opensearch?locale=en_US" title="YouTube">
+<link rel="manifest" href="/manifest.webmanifest" crossorigin="use-credentials">
+</head>
+<body dir="ltr"><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('bs', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">ytcfg.set('initialBodyClientWidth', document.body.clientWidth);//# sourceURL=yt-desktop-body-width.js</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('ai', null, '');}</script><iframe name="passive_signin" src="https://accounts.google.com/ServiceLogin?service=youtube&amp;uilel=3&amp;passive=true&amp;continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue%26app%3Ddesktop%26hl%3Den%26next%3D%252Fsignin_passive%26feature%3Dpassive&amp;hl=en" style="display: none">
+</iframe>
+<ytd-app>
+<ytd-masthead id="masthead" logo-type="YOUTUBE_LOGO" slot="masthead" class="shell ">
+<div id="search-container" class="ytd-searchbox-spt" slot="search-container">
+</div>
+<div id="search-input" class="ytd-searchbox-spt" slot="search-input">
+<input id="search" autocapitalize="none" autocomplete="off" autocorrect="off" hidden name="search_query" tabindex="0" type="text" spellcheck="false">
+</div>
+<svg id="menu-icon" class="external-icon" preserveAspectRatio="xMidYMid meet">
+<g id="menu" class="yt-icons-ext" viewBox="0 0 24 24">
+<path d="M21,6H3V5h18V6z M21,11H3v1h18V11z M21,17H3v1h18V17z"/>
+</g>
+</svg>
+<div id="masthead-logo" slot="masthead-logo">
+<a style="display: none;" href="/" title="YouTube">
+<svg xmlns="http://www.w3.org/2000/svg" id="yt-ringo2-svg" width="93" height="20" viewBox="0 0 93 20">
+<g>
+<path d="M14.4848 20C14.4848 20 23.5695 20 25.8229 19.4C27.0917 19.06 28.0459 18.08 28.3808 16.87C29 14.65 29 9.98 29 9.98C29 9.98 29 5.34 28.3808 3.14C28.0459 1.9 27.0917 0.94 25.8229 0.61C23.5695 0 14.4848 0 14.4848 0C14.4848 0 5.42037 0 3.17711 0.61C1.9286 0.94 0.954148 1.9 0.59888 3.14C0 5.34 0 9.98 0 9.98C0 9.98 0 14.65 0.59888 16.87C0.954148 18.08 1.9286 19.06 3.17711 19.4C5.42037 20 14.4848 20 14.4848 20Z" fill="#FF0033"/>
+<path d="M19 10L11.5 5.75V14.25L19 10Z" fill="white"/>
+</g>
+<g id="youtube-paths">
+<path d="M37.1384 18.8999V13.4399L40.6084 2.09994H38.0184L36.6984 7.24994C36.3984 8.42994 36.1284 9.65994 35.9284 10.7999H35.7684C35.6584 9.79994 35.3384 8.48994 35.0184 7.22994L33.7384 2.09994H31.1484L34.5684 13.4399V18.8999H37.1384Z"/>
+<path d="M44.1003 6.29994C41.0703 6.29994 40.0303 8.04994 40.0303 11.8199V13.6099C40.0303 16.9899 40.6803 19.1099 44.0403 19.1099C47.3503 19.1099 48.0603 17.0899 48.0603 13.6099V11.8199C48.0603 8.44994 47.3803 6.29994 44.1003 6.29994ZM45.3903 14.7199C45.3903 16.3599 45.1003 17.3899 44.0503 17.3899C43.0203 17.3899 42.7303 16.3499 42.7303 14.7199V10.6799C42.7303 9.27994 42.9303 8.02994 44.0503 8.02994C45.2303 8.02994 45.3903 9.34994 45.3903 10.6799V14.7199Z"/>
+<path d="M52.2713 19.0899C53.7313 19.0899 54.6413 18.4799 55.3913 17.3799H55.5013L55.6113 18.8999H57.6012V6.53994H54.9613V16.4699C54.6812 16.9599 54.0312 17.3199 53.4212 17.3199C52.6512 17.3199 52.4113 16.7099 52.4113 15.6899V6.53994H49.7812V15.8099C49.7812 17.8199 50.3613 19.0899 52.2713 19.0899Z"/>
+<path d="M62.8261 18.8999V4.14994H65.8661V2.09994H57.1761V4.14994H60.2161V18.8999H62.8261Z"/>
+<path d="M67.8728 19.0899C69.3328 19.0899 70.2428 18.4799 70.9928 17.3799H71.1028L71.2128 18.8999H73.2028V6.53994H70.5628V16.4699C70.2828 16.9599 69.6328 17.3199 69.0228 17.3199C68.2528 17.3199 68.0128 16.7099 68.0128 15.6899V6.53994H65.3828V15.8099C65.3828 17.8199 65.9628 19.0899 67.8728 19.0899Z"/>
+<path d="M80.6744 6.26994C79.3944 6.26994 78.4744 6.82994 77.8644 7.73994H77.7344C77.8144 6.53994 77.8744 5.51994 77.8744 4.70994V1.43994H75.3244L75.3144 12.1799L75.3244 18.8999H77.5444L77.7344 17.6999H77.8044C78.3944 18.5099 79.3044 19.0199 80.5144 19.0199C82.5244 19.0199 83.3844 17.2899 83.3844 13.6099V11.6999C83.3844 8.25994 82.9944 6.26994 80.6744 6.26994ZM80.7644 13.6099C80.7644 15.9099 80.4244 17.2799 79.3544 17.2799C78.8544 17.2799 78.1644 17.0399 77.8544 16.5899V9.23994C78.1244 8.53994 78.7244 8.02994 79.3944 8.02994C80.4744 8.02994 80.7644 9.33994 80.7644 11.7299V13.6099Z"/>
+<path d="M92.6517 11.4999C92.6517 8.51994 92.3517 6.30994 88.9217 6.30994C85.6917 6.30994 84.9717 8.45994 84.9717 11.6199V13.7899C84.9717 16.8699 85.6317 19.1099 88.8417 19.1099C91.3817 19.1099 92.6917 17.8399 92.5417 15.3799L90.2917 15.2599C90.2617 16.7799 89.9117 17.3999 88.9017 17.3999C87.6317 17.3999 87.5717 16.1899 87.5717 14.3899V13.5499H92.6517V11.4999ZM88.8617 7.96994C90.0817 7.96994 90.1717 9.11994 90.1717 11.0699V12.0799H87.5717V11.0699C87.5717 9.13994 87.6517 7.96994 88.8617 7.96994Z"/>
+</g>
+</svg>
+</a>
+<a style="display: none;" href="/" title="YouTube">
+<svg xmlns="http://www.w3.org/2000/svg" id="yt-ringo2-red-svg" class="external-icon" width="101" height="20" viewBox="0 0 101 20">
+<g>
+<path d="M14.4848 20C14.4848 20 23.5695 20 25.8229 19.4C27.0917 19.06 28.0459 18.08 28.3808 16.87C29 14.65 29 9.98 29 9.98C29 9.98 29 5.34 28.3808 3.14C28.0459 1.9 27.0917 0.94 25.8229 0.61C23.5695 0 14.4848 0 14.4848 0C14.4848 0 5.42037 0 3.17711 0.61C1.9286 0.94 0.954148 1.9 0.59888 3.14C0 5.34 0 9.98 0 9.98C0 9.98 0 14.65 0.59888 16.87C0.954148 18.08 1.9286 19.06 3.17711 19.4C5.42037 20 14.4848 20 14.4848 20Z" fill="#FF0033"/>
+<path d="M19 10L11.5 5.75V14.25L19 10Z" fill="white"/>
+</g>
+<g id="youtube-paths">
+<path d="M32.1819 2.10016V18.9002H34.7619V12.9102H35.4519C38.8019 12.9102 40.5619 11.1102 40.5619 7.57016V6.88016C40.5619 3.31016 39.0019 2.10016 35.7219 2.10016H32.1819ZM37.8619 7.63016C37.8619 10.0002 37.1419 11.0802 35.4019 11.0802H34.7619V3.95016H35.4519C37.4219 3.95016 37.8619 4.76016 37.8619 7.13016V7.63016Z"/>
+<path d="M41.982 18.9002H44.532V10.0902C44.952 9.37016 45.992 9.05016 47.302 9.32016L47.462 6.33016C47.292 6.31016 47.142 6.29016 47.002 6.29016C45.802 6.29016 44.832 7.20016 44.342 8.86016H44.162L43.952 6.54016H41.982V18.9002Z"/>
+<path d="M55.7461 11.5002C55.7461 8.52016 55.4461 6.31016 52.0161 6.31016C48.7861 6.31016 48.0661 8.46016 48.0661 11.6202V13.7902C48.0661 16.8702 48.7261 19.1102 51.9361 19.1102C54.4761 19.1102 55.7861 17.8402 55.6361 15.3802L53.3861 15.2602C53.3561 16.7802 53.0061 17.4002 51.9961 17.4002C50.7261 17.4002 50.6661 16.1902 50.6661 14.3902V13.5502H55.7461V11.5002ZM51.9561 7.97016C53.1761 7.97016 53.2661 9.12016 53.2661 11.0702V12.0802H50.6661V11.0702C50.6661 9.14016 50.7461 7.97016 51.9561 7.97016Z"/>
+<path d="M60.1945 18.9002V8.92016C60.5745 8.39016 61.1945 8.07016 61.7945 8.07016C62.5645 8.07016 62.8445 8.61016 62.8445 9.69016V18.9002H65.5045L65.4845 8.93016C65.8545 8.37016 66.4845 8.04016 67.1045 8.04016C67.7745 8.04016 68.1445 8.61016 68.1445 9.69016V18.9002H70.8045V9.49016C70.8045 7.28016 70.0145 6.27016 68.3445 6.27016C67.1845 6.27016 66.1945 6.69016 65.2845 7.67016C64.9045 6.76016 64.1545 6.27016 63.0845 6.27016C61.8745 6.27016 60.7345 6.79016 59.9345 7.76016H59.7845L59.5945 6.54016H57.5445V18.9002H60.1945Z"/>
+<path d="M74.0858 4.97016C74.9858 4.97016 75.4058 4.67016 75.4058 3.43016C75.4058 2.27016 74.9558 1.91016 74.0858 1.91016C73.2058 1.91016 72.7758 2.23016 72.7758 3.43016C72.7758 4.67016 73.1858 4.97016 74.0858 4.97016ZM72.8658 18.9002H75.3958V6.54016H72.8658V18.9002Z"/>
+<path d="M79.9516 19.0902C81.4116 19.0902 82.3216 18.4802 83.0716 17.3802H83.1816L83.2916 18.9002H85.2816V6.54016H82.6416V16.4702C82.3616 16.9602 81.7116 17.3202 81.1016 17.3202C80.3316 17.3202 80.0916 16.7102 80.0916 15.6902V6.54016H77.4616V15.8102C77.4616 17.8202 78.0416 19.0902 79.9516 19.0902Z"/>
+<path d="M90.0031 18.9002V8.92016C90.3831 8.39016 91.0031 8.07016 91.6031 8.07016C92.3731 8.07016 92.6531 8.61016 92.6531 9.69016V18.9002H95.3131L95.2931 8.93016C95.6631 8.37016 96.2931 8.04016 96.9131 8.04016C97.5831 8.04016 97.9531 8.61016 97.9531 9.69016V18.9002H100.613V9.49016C100.613 7.28016 99.8231 6.27016 98.1531 6.27016C96.9931 6.27016 96.0031 6.69016 95.0931 7.67016C94.7131 6.76016 93.9631 6.27016 92.8931 6.27016C91.6831 6.27016 90.5431 6.79016 89.7431 7.76016H89.5931L89.4031 6.54016H87.3531V18.9002H90.0031Z"/>
+</g>
+</svg>
+</a>
+<span id="country-code">
+</span>
+</div>
+<div id="masthead-skeleton-icons" slot="masthead-skeleton">
+<div class="masthead-skeleton-icon">
+</div>
+<div class="masthead-skeleton-icon">
+</div>
+<div class="masthead-skeleton-icon">
+</div>
+</div>
+</ytd-masthead>
+<a slot="guide-links-primary" href="https://www.youtube.com/about/" style="display: none;">About</a>
+<a slot="guide-links-primary" href="https://www.youtube.com/about/press/" style="display: none;">Press</a>
+<a slot="guide-links-primary" href="https://www.youtube.com/about/copyright/" style="display: none;">Copyright</a>
+<a slot="guide-links-primary" href="/t/contact_us/" style="display: none;">Contact us</a>
+<a slot="guide-links-primary" href="https://www.youtube.com/creators/" style="display: none;">Creators</a>
+<a slot="guide-links-primary" href="https://www.youtube.com/ads/" style="display: none;">Advertise</a>
+<a slot="guide-links-primary" href="https://developers.google.com/youtube" style="display: none;">Developers</a>
+<a slot="guide-links-secondary" href="/t/terms" style="display: none;">Terms</a>
+<a slot="guide-links-secondary" href="/t/privacy" style="display: none;">Privacy</a>
+<a slot="guide-links-secondary" href="https://www.youtube.com/about/policies/" style="display: none;">Policy &amp; Safety</a>
+<a slot="guide-links-secondary" href="https://www.youtube.com/howyoutubeworks?utm_campaign=ytgen&amp;utm_source=ythp&amp;utm_medium=LeftNav&amp;utm_content=txt&amp;u=https%3A%2F%2Fwww.youtube.com%2Fhowyoutubeworks%3Futm_source%3Dythp%26utm_medium%3DLeftNav%26utm_campaign%3Dytgen" style="display: none;">How YouTube works</a>
+<a slot="guide-links-secondary" href="/new" style="display: none;">Test new features</a>
+<div id="copyright" slot="copyright" style="display: none;">
+<div dir="ltr" style="display:inline">&copy; 2026 Google LLC</div>
+</div>
+</ytd-app>
+<div id="home-page-skeleton">
+<div id="guide-skeleton">
+</div>
+<div id="home-container-skeleton">
+<div id="home-chips">
+</div>
+<div id="home-container-media">
+<div class="rich-grid-media-skeleton">
+<div class="video-details">
+<div class="rich-thumbnail skeleton-bg-color">
+</div>
+<div class="details">
+<div class="channel-avatar skeleton-bg-color">
+</div>
+<div class="details-text-shell">
+<div class="rich-video-title text-shell skeleton-bg-color">
+</div>
+<div class="rich-video-meta text-shell skeleton-bg-color">
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div>
+</div><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('gcc', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('nc_pj', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('rsbe_dpj', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('js_ld', null, '');}</script><script id="base-js" name="desktop_polymer/desktop_polymer" src="https://www.youtube.com/s/_/ytmainappweb/_/js/k=ytmainappweb.kevlar_base.en_US.YOQlalfBShg.es5.O/am=AAAAEAAACEBK/d=1/br=1/rs=AGKMywHNztB219TUiyaUIHx8SB3cRF_Ksg/m=kevlar_base_module,kevlar_main_module,kevlar_base_sync_mod_chunk" nonce="sk82b1uKoeJ-veJw6MHjUw"></script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('rsef_dpj', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('rsae_dpj', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('js_r', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('ac', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">var onPolymerReady = function(e) {window.removeEventListener('script-load-dpj', onPolymerReady);if (window.ytcsi) {window.ytcsi.tick('apr', null, '');}}; if (window.Polymer && Polymer.RenderStatus) {onPolymerReady();} else {window.addEventListener('script-load-dpj', onPolymerReady);}//# sourceURL=yt-desktop-ready.js</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('pdc', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('pdr', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">(function serverContract() {window['ytPageType'] = "browse";window['ytCommand'] = {"clickTrackingParams":"IhMIz7_mhu6ulwMVM9NyCR2SGh7cMghleHRlcm5hbMoBBI-6SKk=","commandMetadata":{"webCommandMetadata":{"url":"/","webPageType":"WEB_PAGE_TYPE_BROWSE","rootVe":3854,"apiUrl":"/youtubei/v1/browse"}},"browseEndpoint":{"browseId":"FEwhat_to_watch"}};window['ytUrl'] = '\/';var a=window;(function(e){var c=window;c.getInitialCommand=function(){return e};c.loadInitialCommand&&c.loadInitialCommand(c.getInitialCommand())})(a.ytCommand);
+(function(e,c,l,f,g,h,k){var d=window;d.getInitialData=function(){var b=window;b.ytcsi&&b.ytcsi.tick("pr",null,"");b={page:e,endpoint:c,response:l};f&&(b.playerResponse=f);g&&(b.reelWatchSequenceResponse=g);k&&(b.url=k);h&&(b.previousCsn=h);return b};d.loadInitialData&&d.loadInitialData(d.getInitialData())})(a.ytPageType,a.ytCommand,a.ytInitialData,a.ytInitialPlayerResponse,a.ytInitialReelWatchSequenceResponse,a.ytPreviousCsn,a.ytUrl);
+})();</script><link rel="stylesheet" href="https://www.youtube.com/s/desktop/0a4db377/cssbin/www-main-desktop-watch-page-skeleton.css" name="www-main-desktop-watch-page-skeleton" nonce="7PXyn67IaBeLSaeiI6569g"><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {window.ytcsi.tick('gcc', null, '');}</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">ytcfg.set({"CSI_SERVICE_NAME": 'youtube', "TIMING_INFO": {"GetHome_rid": '0x26936b8bd5b16980',}})</script><script nonce="sk82b1uKoeJ-veJw6MHjUw">if (window.ytcsi) {ytcsi.infoGel({serverTimeMs:  141.0 }, '');}</script></body>
+</html>

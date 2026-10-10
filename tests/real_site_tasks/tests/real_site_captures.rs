@@ -5,12 +5,14 @@
 //! matches what the page says, not that a shape rule was broken. Nothing here
 //! needs Internet access: every resource is answered by the harness.
 
-use real_site_tasks::captures::{CAPTURES, Capture, GOOGLE_HOME, HACKER_NEWS_HOME};
+use real_site_tasks::captures::{
+    CAPTURES, Capture, GOOGLE_HOME, HACKER_NEWS_HOME, WIKIPEDIA_MAIN_PAGE, YAHOO_HK_HOME,
+};
 use render_core::document::AuthorStyleSource;
 use render_core::script::ScriptSource;
 use real_site_tasks::fixture::RealSiteFixture;
 use real_site_tasks::harness::Session;
-use real_site_tasks::inspect::{attribute, box_of, document_title, select, subtree_text};
+use real_site_tasks::inspect::{self, attribute, box_of, document_title, select, subtree_text};
 
 /// Load a capture through the normal offline path. The fixture is leaked so the
 /// harness's `'static` requirement holds; a test process loads a handful of
@@ -26,6 +28,11 @@ fn every_capture_keeps_the_facts_measured_from_its_raw_page() {
         let session = load(capture);
         let dom = session.document.dom();
         let label = capture.label;
+        // The reduction may drop links; it may not add any.
+        assert!(
+            capture.anchors <= capture.raw_anchors,
+            "{label}: the reduced fixture has more links than the raw page"
+        );
         assert_eq!(
             document_title(dom).as_deref(),
             Some(capture.expected_title),
@@ -164,4 +171,50 @@ fn google_search_form_keeps_its_query_control_and_buttons_on_screen() {
         ["Google Search", "I'm Feeling Lucky"],
         "the visible submit buttons"
     );
+}
+
+#[test]
+fn every_capture_lays_out_visible_text() {
+    // A capture that lays out no text is an empty page to the user, whatever its
+    // markup says. This is the floor under every other check.
+    for capture in CAPTURES.iter().filter(|capture| !capture.js_rendered_shell) {
+        let session = load(capture);
+        let lines = inspect::lines_in_reading_order(session.document.dom(), session.fragments());
+        assert!(
+            !lines.is_empty(),
+            "{}: no text line was laid out",
+            capture.label
+        );
+    }
+}
+
+#[test]
+fn each_capture_search_input_lays_out_to_a_box() {
+    // The search input each page's own form or header offers. A capture whose
+    // search input has no box is a page the user cannot search. The YouTube shell
+    // is not in this list: its search field is `hidden` in the static markup and
+    // the page reveals it with its scripts.
+    let search_inputs: [(&Capture, &str); 2] = [
+        (&WIKIPEDIA_MAIN_PAGE, "input[name=search]"),
+        (&YAHOO_HK_HOME, "input[name]"),
+    ];
+    for (capture, selector) in search_inputs {
+        let session = load(capture);
+        let dom = session.document.dom();
+        let inputs = select(dom, selector);
+        assert!(
+            !inputs.is_empty(),
+            "{}: no element matches {selector}",
+            capture.label
+        );
+        let laid_out = inputs
+            .iter()
+            .any(|input| box_of(session.fragments(), *input).is_some_and(|boxed| boxed.border.size.width > 0.0));
+        assert!(
+            laid_out,
+            "{}: none of the {} elements matching {selector} lays out to a box",
+            capture.label,
+            inputs.len()
+        );
+    }
 }
