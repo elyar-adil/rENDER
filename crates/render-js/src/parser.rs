@@ -1116,15 +1116,38 @@ impl Parser {
 
     fn statement_list(&mut self, until_right_brace: bool) -> Result<Vec<Statement>, JsError> {
         let mut statements = Vec::new();
+        // Only the top level of a module admits import and export declarations
+        // (ECMA-262 16.2.1.1); a list closed by `}` is a nested statement list.
+        let top_level = !until_right_brace;
         while !self.at(&TokenKind::Eof) && (!until_right_brace || !self.at(&TokenKind::RightBrace))
         {
             self.reserve_statement()?;
-            statements.push(self.statement()?);
+            if top_level && self.at_module_declaration() {
+                statements.push(self.module_declaration()?);
+            } else {
+                statements.push(self.statement()?);
+            }
         }
         if until_right_brace && self.at(&TokenKind::Eof) {
             return Err(self.error("unterminated block statement"));
         }
         Ok(statements)
+    }
+
+    /// True at `import` or `export` that begins a declaration. `import(...)`,
+    /// `import.meta` and similar expressions are not declarations.
+    fn at_import_or_export_keyword(&self) -> bool {
+        matches!(&self.current().kind, TokenKind::Identifier(name) if name == "import" || name == "export")
+            && !matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(TokenKind::Dot | TokenKind::LeftParen)
+            )
+    }
+
+    /// True at a module-level import or export declaration at the top level of a
+    /// module. Scripts keep their existing treatment of these keywords.
+    fn at_module_declaration(&self) -> bool {
+        self.module.is_some() && self.at_import_or_export_keyword()
     }
 
     fn reserve_statement(&mut self) -> Result<(), JsError> {
@@ -1195,14 +1218,13 @@ impl Parser {
         // realm. Static imports/exports are dependency metadata for the
         // browser loader, so consume their declaration here; the surrounding
         // module remains executable without aborting on syntax it cannot bind.
-        if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "import" || name == "export")
-            && !matches!(
-                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-                Some(TokenKind::Dot | TokenKind::LeftParen)
-            )
-        {
+        if self.at_import_or_export_keyword() {
+            // A module's top-level items are parsed by `statement_list`, so a
+            // declaration that reaches this point is nested in a statement.
             if self.module.is_some() {
-                return self.module_declaration();
+                return Err(self.error(
+                    "import and export declarations may only appear at the top level of a module",
+                ));
             }
             self.skip_module_declaration();
             return Ok(Statement::Block(Vec::new()));
