@@ -23,6 +23,7 @@ pub(super) mod dom_exception;
 pub(super) mod encoding;
 pub(super) mod events;
 pub(super) mod fetch;
+pub(super) mod function;
 pub(super) mod global_fns;
 pub(super) mod iterator;
 pub(super) mod json;

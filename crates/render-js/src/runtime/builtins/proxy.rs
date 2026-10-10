@@ -278,7 +278,7 @@ impl JsRuntime {
             NativeFunction::ProxyRevocable => {
                 self.ensure_heap_capacity(2)?;
                 let proxy = self.create_proxy(arguments)?;
-                let revoke = self.proxy_revoker(proxy)?;
+                let revoke = self.proxy_revoker(proxy);
                 let result = self.realm.create_ordinary_object();
                 self.realm
                     .set_property(result, "proxy".to_owned(), JsValue::Object(proxy));
@@ -327,7 +327,7 @@ impl JsRuntime {
 
     /// The revoke function of a `Proxy.revocable` result: a bound native whose
     /// receiver is the proxy, named `""` and of length 0 (ECMA-262 28.2.2.1.1).
-    fn proxy_revoker(&mut self, proxy: ObjectId) -> Result<ObjectId, JsError> {
+    fn proxy_revoker(&mut self, proxy: ObjectId) -> ObjectId {
         let function_prototype = self.realm.function_prototype();
         let revoke = self.realm.create_object(Some(function_prototype));
         *self
@@ -349,7 +349,7 @@ impl JsRuntime {
             .define_property(revoke, "length", attributes(JsValue::Number(0.0)));
         self.realm
             .define_property(revoke, "name", attributes(JsValue::String(String::new())));
-        Ok(revoke)
+        revoke
     }
 
     /// The target and handler of a live proxy. A revoked proxy has no handler,
@@ -1149,23 +1149,19 @@ impl JsRuntime {
     /// `CreateListFromArrayLike` (§7.3.18) restricted to the `length`-indexed
     /// element reading every caller needs for `Reflect.apply` and
     /// `Reflect.construct`.
-    fn create_list_from_array_like(
+    pub(in crate::runtime) fn create_list_from_array_like(
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<Vec<JsValue>, JsError> {
-        let object = Self::require_object(value).map_err(|_| {
-            JsError::type_error("Reflect.construct argumentsList must be an object")
-        })?;
-        let length = self
-            .realm
-            .get_property(object, "length")
-            .map(|value| to_length(&value))
-            .transpose()?
-            .unwrap_or(0.0);
+        let object = Self::require_object(value)
+            .map_err(|_| JsError::type_error("CreateListFromArrayLike called on a non-object"))?;
+        // LengthOfArrayLike: `Get(obj, "length")`, so getters and proxies run.
+        let length_value = self.get_member(dom, object, "length")?;
+        let length = to_length(&length_value)?;
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(JsError::resource(
-                "Reflect.construct argumentsList exceeds the materialization bound",
+                "argument list exceeds the materialization bound",
             ));
         }
         let mut elements = Vec::new();
@@ -1173,7 +1169,7 @@ impl JsRuntime {
         let count = length as usize;
         elements
             .try_reserve_exact(count)
-            .map_err(|_| JsError::resource("Reflect.construct argumentsList allocation refused"))?;
+            .map_err(|_| JsError::resource("argument list allocation refused"))?;
         for index in 0..count {
             elements.push(self.get_member(dom, object, &index.to_string())?);
         }

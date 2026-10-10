@@ -2330,6 +2330,89 @@ fn proxy_on_the_prototype_chain_answers_get_and_in_with_the_child_receiver() {
 }
 
 #[test]
+fn function_prototype_methods_carry_their_spec_length_and_name() {
+    assert_eq!(
+        ok(
+            "[Function.prototype.toString.length, Function.prototype.call.length, Function.prototype.apply.length, Function.prototype.bind.length, Function.prototype.call.name, Function.length, Function.prototype.length].join()"
+        ),
+        "0,1,2,1,call,1,0"
+    );
+    assert_eq!(
+        ok(
+            "var d = Object.getOwnPropertyDescriptor(Function.prototype, 'name'); [d.writable, d.enumerable, d.configurable].join()"
+        ),
+        "false,false,true"
+    );
+}
+
+#[test]
+fn apply_rejects_a_primitive_argument_array_and_reads_array_likes() {
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "thrown(function () { return Function.prototype.apply.call(function () {}, null, 1); })"
+        )),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "Math.max.apply(null, { length: 2, 0: 3, 1: 5 }) + ',' + (function () { return arguments.length; }).apply(null, undefined)"
+        ),
+        "5,0"
+    );
+}
+
+#[test]
+fn bind_computes_length_and_name_from_the_target_own_properties() {
+    assert_eq!(
+        ok(
+            "function f(a, b, c) {} [f.bind(null, 1).length, f.bind(null, 1, 2, 3, 4).length, f.bind().name].join('|')"
+        ),
+        "2|0|bound f"
+    );
+    assert_eq!(
+        ok(
+            "var g = function () {}; Object.defineProperty(g, 'name', { value: 5 }); g.bind().name + '|' + g.bind().length"
+        ),
+        "bound |0"
+    );
+    assert_eq!(
+        ok(
+            "var h = function () {}; Object.defineProperty(h, 'length', { value: Infinity }); String(h.bind(null, 1).length)"
+        ),
+        "Infinity"
+    );
+}
+
+#[test]
+fn has_instance_is_the_intrinsic_that_instanceof_consults() {
+    assert_eq!(
+        ok(
+            "var d = Object.getOwnPropertyDescriptor(Function.prototype, Symbol.hasInstance);\
+            [typeof d.value, d.writable, d.enumerable, d.configurable, d.value.name, d.value.length].join('|')"
+        ),
+        "function|false|false|false|[Symbol.hasInstance]|1"
+    );
+    assert_eq!(
+        ok(
+            "[Function.prototype[Symbol.hasInstance].call(Object, {}), Function.prototype[Symbol.hasInstance].call(1, {}), [] instanceof Array, ({}) instanceof Array].join()"
+        ),
+        "true,false,true,false"
+    );
+    assert_eq!(
+        ok(
+            "var C = { [Symbol.hasInstance](value) { return value === 1; } }; [1 instanceof C, 2 instanceof C].join()"
+        ),
+        "true,false"
+    );
+    assert_eq!(
+        ok(&with_thrown_helper(
+            "thrown(function () { return ({}) instanceof {}; })"
+        )),
+        "TypeError"
+    );
+}
+
+#[test]
 fn symbol_keyed_get_and_delete_run_the_proxy_traps() {
     assert_eq!(
         ok("var s = Symbol('s');\

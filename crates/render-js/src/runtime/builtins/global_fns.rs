@@ -581,6 +581,7 @@ impl JsRuntime {
             | NativeFunction::FunctionToString
             | NativeFunction::FunctionCall
             | NativeFunction::FunctionApply
+            | NativeFunction::FunctionHasInstance
             | NativeFunction::FunctionBind => {
                 unreachable!("Function prototype methods use arbitrary receivers")
             }
