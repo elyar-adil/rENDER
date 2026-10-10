@@ -5821,6 +5821,26 @@ impl JsRuntime {
                 primitive => JsValue::Object(self.to_object(&primitive)?),
             }
         };
+        // The arguments object is allocated before the scope swap, so a failed
+        // allocation leaves the caller's frame untouched. The values it copies
+        // and the receiver are pinned while it may collect garbage.
+        let arguments_object = if create_arguments_binding {
+            let pinned = self.transient_roots.len();
+            self.transient_roots.extend(
+                arguments
+                    .iter()
+                    .chain(std::iter::once(&receiver))
+                    .filter_map(|value| match value {
+                        JsValue::Object(object) => Some(*object),
+                        _ => None,
+                    }),
+            );
+            let created = self.create_array_from_values(arguments);
+            self.transient_roots.truncate(pinned);
+            Some(created?)
+        } else {
+            None
+        };
         let suspended = self.suspend_scopes();
         let previous_environment =
             std::mem::replace(&mut self.environment, function.captured_environment.clone());
@@ -5846,8 +5866,7 @@ impl JsRuntime {
                 },
             );
         }
-        if create_arguments_binding {
-            let arguments_object = self.create_array_from_values(arguments)?;
+        if let Some(arguments_object) = arguments_object {
             call_environment.bindings.insert(
                 "arguments".to_owned(),
                 Binding {
