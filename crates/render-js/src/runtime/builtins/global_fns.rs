@@ -668,6 +668,20 @@ impl JsRuntime {
             NativeFunction::ArrayMap => {
                 self.dispatch_array_native(dom, NativeFunction::ArrayMap, receiver, arguments)
             }
+            NativeFunction::ArrayLastIndexOf
+            | NativeFunction::ArrayFlatMap
+            | NativeFunction::ArrayToLocaleString
+            | NativeFunction::ArrayOf
+            | NativeFunction::ArraySpecies
+            | NativeFunction::ArrayToSorted
+            | NativeFunction::ArrayToReversed
+            | NativeFunction::ArrayToSpliced
+            | NativeFunction::ArrayWith
+            | NativeFunction::ArrayFill
+            | NativeFunction::ArrayCopyWithin
+            | NativeFunction::ArrayFromAsync => {
+                self.dispatch_array_native(dom, function, receiver, arguments)
+            }
             NativeFunction::ArrayPop => {
                 self.dispatch_array_native(dom, NativeFunction::ArrayPop, receiver, arguments)
             }

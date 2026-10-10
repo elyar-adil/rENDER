@@ -770,6 +770,18 @@ pub(crate) enum NativeFunction {
     ArrayEvery,
     ArrayIncludes,
     ArrayReduce,
+    ArrayLastIndexOf,
+    ArrayFlatMap,
+    ArrayToLocaleString,
+    ArrayOf,
+    ArraySpecies,
+    ArrayToSorted,
+    ArrayToReversed,
+    ArrayToSpliced,
+    ArrayWith,
+    ArrayFill,
+    ArrayCopyWithin,
+    ArrayFromAsync,
     FunctionPrototype,
     FunctionToString,
     FunctionCall,
@@ -2990,6 +3002,14 @@ impl Realm {
                 };
             }
         }
+        // `Array.prototype[Symbol.unscopables]` has no prototype at all, which the
+        // loop above would have replaced with `Object.prototype`.
+        let unscopables = JsSymbol::well_known("@@unscopables");
+        if let Some((_, descriptor)) = objects[array_prototype.0].symbols.get(&unscopables.id())
+            && let JsValue::Object(unscopables) = descriptor.value
+        {
+            objects[unscopables.0].prototype = None;
+        }
         Self::install_builtin_metadata(&mut objects);
         Self {
             objects,
@@ -4560,7 +4580,7 @@ impl Realm {
             // Array, String and Object members whose `length` is one (ECMA-262
             // 23.1.3.1, 22.1.3.1, 20.1.2.x and B.2.2.x).
             "concat" | "unshift" | "join" | "fromEntries" | "__lookupGetter__"
-            | "__lookupSetter__" => 1,
+            | "__lookupSetter__" | "toSorted" | "fromAsync" => 1,
             // Math (ECMA-262 21.3.2): two arguments.
             "atan2" | "hypot" | "imul" | "max" | "min" | "pow" => 2,
             "then"
@@ -4581,6 +4601,8 @@ impl Realm {
             | "getOwnPropertyDescriptor"
             | "setPrototypeOf"
             | "copyWithin"
+            | "toSpliced"
+            | "with"
             | "hasOwn"
             | "__defineGetter__"
             | "__defineSetter__"
@@ -7149,6 +7171,108 @@ impl Realm {
         );
     }
 
+    /// `Array.of`, the `Array[Symbol.species]` getter (ECMA-262 23.1.2.5) and
+    /// `Array.prototype[Symbol.unscopables]` (ECMA-262 23.1.3.41), which is a
+    /// null-prototype object naming the methods `with` must not shadow.
+    fn install_array_statics(
+        objects: &mut Vec<JsObject>,
+        array: ObjectId,
+        prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
+        let from = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ArrayFrom),
+            ..JsObject::default()
+        });
+        objects[array.0].properties.insert(
+            "from".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(from)),
+        );
+        let of = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ArrayOf),
+            ..JsObject::default()
+        });
+        objects[array.0].properties.insert(
+            "of".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(of)),
+        );
+        let from_async = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ArrayFromAsync),
+            ..JsObject::default()
+        });
+        objects[array.0].properties.insert(
+            "fromAsync".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(from_async)),
+        );
+        let species_getter = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ArraySpecies),
+            ..JsObject::default()
+        });
+        let species = JsSymbol::well_known("@@species");
+        objects[array.0].symbols.insert(
+            species.id(),
+            (
+                species,
+                PropertyDescriptor {
+                    getter: Some(species_getter),
+                    setter: None,
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        let unscopables = ObjectId(objects.len());
+        objects.push(JsObject::default());
+        for name in [
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
+        ] {
+            objects[unscopables.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::data(JsValue::Boolean(true)),
+            );
+        }
+        let unscopables_symbol = JsSymbol::well_known("@@unscopables");
+        objects[prototype.0].symbols.insert(
+            unscopables_symbol.id(),
+            (
+                unscopables_symbol,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(unscopables),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+    }
+
     fn install_array(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -7187,6 +7311,15 @@ impl Realm {
             ("reduce", NativeFunction::ArrayReduce),
             ("reduceRight", NativeFunction::ArrayReduceRight),
             ("toString", NativeFunction::ArrayPrototypeToString),
+            ("toLocaleString", NativeFunction::ArrayToLocaleString),
+            ("lastIndexOf", NativeFunction::ArrayLastIndexOf),
+            ("flatMap", NativeFunction::ArrayFlatMap),
+            ("fill", NativeFunction::ArrayFill),
+            ("copyWithin", NativeFunction::ArrayCopyWithin),
+            ("toSorted", NativeFunction::ArrayToSorted),
+            ("toReversed", NativeFunction::ArrayToReversed),
+            ("toSpliced", NativeFunction::ArrayToSpliced),
+            ("with", NativeFunction::ArrayWith),
             ("values", NativeFunction::ArrayValues),
             ("keys", NativeFunction::ArrayKeys),
             ("entries", NativeFunction::ArrayEntries),
@@ -7229,16 +7362,7 @@ impl Realm {
             "isArray".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(is_array)),
         );
-        let from = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: Some(function_prototype),
-            host: ObjectHost::NativeFunction(NativeFunction::ArrayFrom),
-            ..JsObject::default()
-        });
-        objects[array.0].properties.insert(
-            "from".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(from)),
-        );
+        Self::install_array_statics(objects, array, prototype, function_prototype);
         objects[array.0].properties.insert(
             "prototype".to_owned(),
             PropertyDescriptor::data(JsValue::Object(prototype)),
@@ -7360,6 +7484,27 @@ impl Realm {
             }
         } else if !target.extensible {
             return false;
+        }
+        // ECMA-262 10.4.2.1: an array index at or past an Array's length grows
+        // the length to cover it, and a read-only length refuses it.
+        let mut grown_length = None;
+        if matches!(target.host, ObjectHost::Array)
+            && let Ok(index) = key.parse::<u32>()
+            && index.to_string() == key
+            && index < u32::MAX
+            && let Some(length) = target.properties.get("length")
+            && let JsValue::Number(current) = length.value
+            && f64::from(index) >= current
+        {
+            if !length.writable {
+                return false;
+            }
+            grown_length = Some(f64::from(index) + 1.0);
+        }
+        if let Some(new_length) = grown_length
+            && let Some(length) = target.properties.get_mut("length")
+        {
+            length.value = JsValue::Number(new_length);
         }
         if !target.properties.contains_key(&key) {
             target.key_order.push(key.clone());
@@ -8060,16 +8205,6 @@ impl Realm {
         target.properties.remove(key);
         target.key_order.retain(|ordered| ordered != key);
         true
-    }
-
-    pub(crate) fn remove_property(&mut self, object: ObjectId, key: &str) -> Option<JsValue> {
-        let target = self.objects.get_mut(object.0)?;
-        if let Some(removed) = target.properties.remove(key) {
-            target.key_order.retain(|ordered| ordered != key);
-            Some(removed.value)
-        } else {
-            None
-        }
     }
 
     /// Define an own writable data property that is neither enumerable nor

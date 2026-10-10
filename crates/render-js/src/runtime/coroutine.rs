@@ -324,6 +324,7 @@ pub(super) fn expr_has_suspend(expression: &Expr) -> bool {
     match expression {
         Expr::Yield { .. } | Expr::Await(_) => true,
         Expr::Literal(_)
+        | Expr::Elision
         | Expr::RegexLiteral { .. }
         | Expr::This
         | Expr::Identifier(_)
@@ -1401,6 +1402,7 @@ impl Compiler {
             }
             Expr::Class { offset, .. } => Err(unsupported("a class heritage", *offset)),
             Expr::Literal(_)
+            | Expr::Elision
             | Expr::RegexLiteral { .. }
             | Expr::This
             | Expr::Identifier(_)

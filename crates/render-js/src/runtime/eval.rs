@@ -1487,6 +1487,9 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match expression {
             Expr::Literal(value) => Ok(value.clone()),
+            // Only an array literal or pattern reads an elision, and it handles
+            // the hole itself; evaluated on its own it is `undefined`.
+            Expr::Elision => Ok(JsValue::Undefined),
             Expr::RegexLiteral { pattern, flags, .. } => {
                 let object = self.construct_regex(pattern, flags)?;
                 Ok(JsValue::Object(object))
@@ -2065,7 +2068,7 @@ impl JsRuntime {
                     for target in targets {
                         match target {
                             // An elision still consumes a value.
-                            Expr::Literal(JsValue::Undefined) => {
+                            Expr::Elision => {
                                 iterator.next(self, dom)?;
                             }
                             // A rest target is the last element and takes what is left.
@@ -3167,16 +3170,28 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_array();
-        let mut values = Vec::with_capacity(elements.len());
+        // One slot per index: an elision leaves its slot empty, so the hole has
+        // no property and reads through the prototype chain like any other.
+        let mut slots: Vec<Option<JsValue>> = Vec::with_capacity(elements.len());
         for expression in elements {
-            self.evaluate_argument(dom, expression, &mut values)?;
+            if matches!(expression, Expr::Elision) {
+                slots.push(None);
+                continue;
+            }
+            let mut produced = Vec::new();
+            self.evaluate_argument(dom, expression, &mut produced)?;
+            slots.extend(produced.into_iter().map(Some));
         }
-        for (index, value) in values.iter().cloned().enumerate() {
-            if !self.realm.set_property(object, index.to_string(), value) {
+        for (index, slot) in slots.iter().enumerate() {
+            if let Some(value) = slot
+                && !self
+                    .realm
+                    .set_property(object, index.to_string(), value.clone())
+            {
                 return Err(JsError::type_error("could not define array element"));
             }
         }
-        let length = u32::try_from(values.len())
+        let length = u32::try_from(slots.len())
             .map_err(|_| JsError::resource("array literal exceeds the supported u32 range"))?;
         if !self.realm.set_property(
             object,
@@ -4896,14 +4911,25 @@ impl JsRuntime {
         let body = parts.pop().unwrap_or_default();
         let parameters = parts.join(",");
         let source = format!("(function anonymous({parameters}\n) {{\n{body}\n}})");
-        let script = crate::CompiledScript::compile(&source, &self.limits)?;
+        self.evaluate_function_source(dom, &source)
+    }
+
+    /// Evaluate `source` in the global scope, which must produce a function
+    /// object. The `Function` constructor and `Array.fromAsync` both build their
+    /// functions this way, so the closure never sees the caller's locals.
+    pub(in crate::runtime) fn evaluate_function_source(
+        &mut self,
+        dom: &mut Dom,
+        source: &str,
+    ) -> Result<JsValue, JsError> {
+        let script = crate::CompiledScript::compile(source, &self.limits)?;
         let environment = std::mem::take(&mut self.environment);
         let result = (|| {
             self.instantiate_statements(&script.statements)?;
             match self.evaluate_statements(dom, &script.statements)? {
                 Completion::Normal(value @ JsValue::Object(_)) => Ok(value),
                 _ => Err(JsError::syntax(
-                    "Function constructor source did not produce a function",
+                    "function source did not produce a function",
                     0,
                 )),
             }
@@ -6004,6 +6030,7 @@ pub(super) fn expr_offset(expression: &Expr) -> Option<usize> {
         | Expr::CompoundAssignment { offset, .. }
         | Expr::LogicalAssignment { offset, .. } => Some(*offset),
         Expr::Literal(_)
+        | Expr::Elision
         | Expr::This
         | Expr::Identifier(_)
         | Expr::Object(_)

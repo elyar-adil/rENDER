@@ -380,6 +380,9 @@ pub(super) enum Statement {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
     Literal(JsValue),
+    /// An elision in an array literal or pattern (`[1, , 2]`): a hole, which
+    /// occupies an index without creating a property.
+    Elision,
     RegexLiteral {
         pattern: String,
         flags: String,
@@ -770,6 +773,7 @@ fn push_expression_parts<'a>(
 ) {
     match expression {
         Expr::Literal(_)
+        | Expr::Elision
         | Expr::RegexLiteral { .. }
         | Expr::This
         | Expr::Identifier(_)
@@ -2782,7 +2786,7 @@ impl Parser {
                     }
                     self.validate_destructuring_target(rest, false)?;
                 }
-                Expr::Literal(JsValue::Undefined) => {}
+                Expr::Elision => {}
                 _ => self.validate_destructuring_target(element, true)?,
             }
         }
@@ -4241,11 +4245,10 @@ impl Parser {
 
     fn array_literal(&mut self) -> Result<Expr, JsError> {
         let mut elements = Vec::new();
-        // Elisions (`[, ,]`) produce holes; the runtime models them as
-        // `undefined` entries.
+        // Elisions (`[, ,]`) produce holes.
         while !self.at(&TokenKind::RightBracket) && !self.at(&TokenKind::Eof) {
             if self.take(&TokenKind::Comma) {
-                elements.push(Expr::Literal(JsValue::Undefined));
+                elements.push(Expr::Elision);
                 continue;
             }
             // An element may be a rest target or an element of an assignment
@@ -4775,7 +4778,11 @@ fn validate_strict_expression(expression: &Expr) -> Result<(), JsError> {
         Expr::Identifier(name) if name != "eval" && is_strict_reserved_word(name) => Err(
             JsError::syntax(format!("{name} is reserved in strict mode"), 0),
         ),
-        Expr::Literal(_) | Expr::RegexLiteral { .. } | Expr::This | Expr::Identifier(_) => Ok(()),
+        Expr::Literal(_)
+        | Expr::Elision
+        | Expr::RegexLiteral { .. }
+        | Expr::This
+        | Expr::Identifier(_) => Ok(()),
         Expr::Sequence(expressions) => expressions.iter().try_for_each(validate_strict_expression),
         Expr::Class {
             name,
@@ -5179,6 +5186,7 @@ fn validate_reserved_expression(
 ) -> Result<(), JsError> {
     match expression {
         Expr::Identifier(name) => check_reserved_identifier(name, context)?,
+        Expr::Elision => {}
         // A function expression's `yield`/`await` restrictions come from its own
         // kind, not the enclosing one. The `name` of a method is a property name
         // and is not checked here.

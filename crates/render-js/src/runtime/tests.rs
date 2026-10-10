@@ -4275,7 +4275,8 @@ fn object_define_property_keeps_symbol_keys_as_symbols() {
             &mut parsed.dom,
             r#"
                 var proto = Array.prototype;
-                var key = Symbol.unscopables;
+                // A fresh symbol: `Array.prototype[Symbol.unscopables]` exists by spec.
+                var key = Symbol('probe');
                 var symbolsBefore = Object.getOwnPropertySymbols(proto).length;
                 void 0 === proto[key] &&
                     Object.defineProperty(proto, key, { configurable: true, value: {} });
