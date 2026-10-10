@@ -316,6 +316,7 @@ impl Compiled {
                 steps: 0,
                 depth: 0,
                 max_depth,
+                backward: false,
             };
             let end = std::cell::Cell::new(None);
             let accepted = matcher.node(&self.root, start, &mut |_matcher, position| {
@@ -352,6 +353,10 @@ struct Matcher<'a> {
     steps: u32,
     depth: u32,
     max_depth: u32,
+    /// Matching right to left, as the body of a lookbehind does (ECMA-262
+    /// 22.2.2.9 `direction`): characters are read before the position, and a
+    /// sequence runs its items from the last.
+    backward: bool,
 }
 
 type Continuation<'k> = dyn FnMut(&mut Matcher<'_>, usize) -> Option<()> + 'k;
@@ -396,7 +401,7 @@ impl Matcher<'_> {
             Node::Empty => next(self, position),
             Node::Literal(_) | Node::AnyChar | Node::Class { .. } => {
                 let length = self.single_length(node, position)?;
-                next(self, position + length)
+                next(self, self.step(position, length))
             }
             Node::AnchorStart => {
                 let at_start = position == 0
@@ -425,7 +430,13 @@ impl Matcher<'_> {
                     None
                 }
             }
-            Node::Sequence(items) => self.sequence(items, position, next),
+            Node::Sequence(items) => {
+                if self.backward {
+                    self.sequence_backward(items, position, next)
+                } else {
+                    self.sequence(items, position, next)
+                }
+            }
             Node::Alternative(branches) => {
                 for branch in branches {
                     if let Some(result) = self.node(branch, position, next) {
@@ -468,7 +479,13 @@ impl Matcher<'_> {
                     let saved = self.captures[index];
                     let matched = self.node(body, position, &mut |matcher, end_position| {
                         let previous = matcher.captures[index];
-                        matcher.captures[index] = Some((position, end_position));
+                        // A backward group ends where it started, so its span
+                        // is always ordered left to right.
+                        matcher.captures[index] = Some(if matcher.backward {
+                            (end_position, position)
+                        } else {
+                            (position, end_position)
+                        });
                         if let Some(result) = next(matcher, end_position) {
                             Some(result)
                         } else {
@@ -483,30 +500,28 @@ impl Matcher<'_> {
                 }
             },
             Node::Lookahead { negated, body } => {
+                let saved = self.captures.clone();
                 let mut probe = Matcher {
                     input: self.input,
                     flags: self.flags,
-                    // The lookahead sees the same captures; restore on failure.
+                    // The lookahead sees the same captures.
                     captures: std::mem::take(&mut self.captures),
                     steps: self.steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
+                    backward: false,
                 };
                 let succeeded = probe
                     .node(body, position, &mut |_matcher, _position| Some(()))
                     .is_some();
                 self.steps = probe.steps;
                 self.captures = probe.captures;
-                if succeeded == *negated {
-                    None
-                } else {
-                    next(self, position)
-                }
+                self.resume_assertion(*negated, succeeded, saved, position, next)
             }
             Node::Lookbehind { negated, body } => {
-                // Try every start at or before `position` for a match of the
-                // body that ends exactly at `position`. Under `u` a start inside
-                // a surrogate pair is not a character boundary.
+                // The body matches right to left from `position`; any way it can
+                // match is a success, and its captures are those of that match.
+                let saved = self.captures.clone();
                 let mut probe = Matcher {
                     input: self.input,
                     flags: self.flags,
@@ -514,30 +529,14 @@ impl Matcher<'_> {
                     steps: self.steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
+                    backward: true,
                 };
-                let mut succeeded = false;
-                for start in (0..=position).rev() {
-                    if self.flags.unicode && is_trail_inside_pair(self.input, start) {
-                        continue;
-                    }
-                    let reached = probe.node(body, start, &mut |_matcher, end| {
-                        if end == position { Some(()) } else { None }
-                    });
-                    if reached.is_some() {
-                        succeeded = true;
-                        break;
-                    }
-                    if probe.steps > MAX_MATCH_STEPS {
-                        break;
-                    }
-                }
+                let succeeded = probe
+                    .node(body, position, &mut |_matcher, _position| Some(()))
+                    .is_some();
                 self.steps = probe.steps;
                 self.captures = probe.captures;
-                if succeeded == *negated {
-                    None
-                } else {
-                    next(self, position)
-                }
+                self.resume_assertion(*negated, succeeded, saved, position, next)
             }
             Node::Backreference(indices) => {
                 let captured = indices
@@ -547,25 +546,33 @@ impl Matcher<'_> {
                     return next(self, position);
                 };
                 let length = end - start;
-                if position + length > self.input.len() {
+                // The input span the reference matches: it ends at `position`
+                // when matching backward, and starts there otherwise.
+                let from = if self.backward {
+                    position.checked_sub(length)?
+                } else {
+                    position
+                };
+                if from + length > self.input.len() {
                     return None;
                 }
                 // Under `u` a back-reference matches whole code points, so it can
                 // neither start nor end inside a surrogate pair of the input.
                 if self.flags.unicode
-                    && (is_trail_inside_pair(self.input, position)
-                        || is_trail_inside_pair(self.input, position + length))
+                    && (is_trail_inside_pair(self.input, from)
+                        || is_trail_inside_pair(self.input, from + length))
                 {
                     return None;
                 }
                 for offset in 0..length {
                     let expected = u32::from(self.input[start + offset]);
-                    let actual = u32::from(self.input[position + offset]);
+                    let actual = u32::from(self.input[from + offset]);
                     if !self.chars_match(expected, actual) {
                         return None;
                     }
                 }
-                next(self, position + length)
+                let after = if self.backward { from } else { from + length };
+                next(self, after)
             }
             Node::Quantifier {
                 min,
@@ -585,10 +592,44 @@ impl Matcher<'_> {
         }
     }
 
+    /// The rest of a lookahead or lookbehind once its body was probed. A negative
+    /// assertion leaves no captures behind, and a continuation that fails hands
+    /// back the captures the assertion started with, so backtracking sees them.
+    fn resume_assertion(
+        &mut self,
+        negated: bool,
+        succeeded: bool,
+        saved: Vec<Option<(usize, usize)>>,
+        position: usize,
+        next: &mut Continuation<'_>,
+    ) -> Option<()> {
+        if negated {
+            self.captures = saved;
+            return if succeeded {
+                None
+            } else {
+                next(self, position)
+            };
+        }
+        if !succeeded {
+            self.captures = saved;
+            return None;
+        }
+        let result = next(self, position);
+        if result.is_none() {
+            self.captures = saved;
+        }
+        result
+    }
+
     /// The length of the single character `node` matches at `position`, if it
     /// matches there.
     fn single_length(&self, node: &Node, position: usize) -> Option<usize> {
-        let (actual, length) = code_point_at(self.input, position, self.flags.unicode)?;
+        let (actual, length) = if self.backward {
+            code_point_before(self.input, position, self.flags.unicode)?
+        } else {
+            code_point_at(self.input, position, self.flags.unicode)?
+        };
         let matched = match node {
             Node::Literal(expected) => self.chars_match(code_value(*expected), actual),
             Node::AnyChar => self.flags.dot_all || !is_line_terminator(actual),
@@ -618,7 +659,7 @@ impl Matcher<'_> {
             let Some(length) = self.single_length(body, last) else {
                 break;
             };
-            ends.push(last + length);
+            ends.push(self.step(last, length));
             self.tick()?;
         }
         let count = ends.len() - 1;
@@ -658,6 +699,31 @@ impl Matcher<'_> {
         })
     }
 
+    /// A sequence matched right to left: its last item is matched first.
+    fn sequence_backward(
+        &mut self,
+        items: &[Node],
+        position: usize,
+        next: &mut Continuation<'_>,
+    ) -> Option<()> {
+        let Some((last, rest)) = items.split_last() else {
+            return next(self, position);
+        };
+        self.node(last, position, &mut |matcher, mid_position| {
+            matcher.sequence_backward(rest, mid_position, next)
+        })
+    }
+
+    /// The position after consuming `length` code units in the matcher's
+    /// direction: forward from `position`, or backward ending at it.
+    fn step(&self, position: usize, length: usize) -> usize {
+        if self.backward {
+            position - length
+        } else {
+            position + length
+        }
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the continuation chain needs the full quantifier state"
@@ -687,9 +753,11 @@ impl Matcher<'_> {
                 saved
             });
             let result = matcher.node(body, position, &mut |inner, advanced| {
-                if advanced == position && min <= count + 1 {
-                    // An empty-body repetition would loop forever.
-                    return next(inner, advanced);
+                // ECMA-262 RepeatMatcher step 2.b: once the minimum is met, an
+                // iteration that consumed nothing fails, which also stops an
+                // empty-body loop. A mandatory iteration may match nothing.
+                if advanced == position && count >= min {
+                    return None;
                 }
                 inner.quantifier(min, max, greedy, body, reset, advanced, count + 1, next)
             });
@@ -767,6 +835,25 @@ fn code_point_at(input: &[u16], position: usize, unicode: bool) -> Option<(u32, 
         && is_trail(trail)
     {
         let value = 0x1_0000 + ((u32::from(unit) - 0xd800) << 10) + (u32::from(trail) - 0xdc00);
+        return Some((value, 2));
+    }
+    Some((u32::from(unit), 1))
+}
+
+/// The code point ending at `position` and its length in code units, read
+/// leftwards for backward matching. Under `u` a trail unit preceded by a lead
+/// unit is one code point.
+fn code_point_before(input: &[u16], position: usize, unicode: bool) -> Option<(u32, usize)> {
+    let index = position.checked_sub(1)?;
+    let unit = *input.get(index)?;
+    if unicode
+        && is_trail(unit)
+        && let Some(lead) = index
+            .checked_sub(1)
+            .and_then(|lead| input.get(lead).copied())
+        && is_lead(lead)
+    {
+        let value = 0x1_0000 + ((u32::from(lead) - 0xd800) << 10) + (u32::from(unit) - 0xdc00);
         return Some((value, 2));
     }
     Some((u32::from(unit), 1))
@@ -2700,6 +2787,46 @@ mod tests {
         assert_eq!(matches(r"[\d-a]", "", "-"), Some((0, 1)));
         assert_eq!(matches(r"\p{L}", "", "p{L}"), Some((0, 4)));
         assert_eq!(matches(r"a{", "", "a{"), Some((0, 2)));
+    }
+
+    #[test]
+    fn optional_empty_iterations_fail_and_assertions_restore_captures() {
+        // RepeatMatcher step 2.b: an optional iteration that matches nothing
+        // fails, so its lookahead capture stays undefined; a mandatory one keeps it.
+        assert_eq!(groups("(?:(?=(abc)))?a", "", "abc"), vec![None::<String>]);
+        assert_eq!(
+            groups("(?:(?=(abc))){1,1}a", "", "abc"),
+            vec![Some("abc".to_owned())]
+        );
+        // A negative lookahead's inner capture is undone when the assertion
+        // fails, so the backreference to it matches nothing.
+        assert_eq!(
+            matches(r"(.*?)a(?!(a+)b\2c)\2(.*)", "", "baaabaac"),
+            Some((0, 8))
+        );
+        assert_eq!(
+            groups(r"(.*?)a(?!(a+)b\2c)\2(.*)", "", "baaabaac"),
+            vec![Some("ba".to_owned()), None, Some("abaac".to_owned())]
+        );
+    }
+
+    #[test]
+    fn lookbehind_matches_right_to_left_so_its_captures_are_greedy_from_the_end() {
+        // ECMA-262 22.2.2.9: the body reads leftwards from the position, so the
+        // rightmost group takes the longest digit run first.
+        assert_eq!(
+            groups(r"(?<=(\d+)(\d+))$", "", "1053"),
+            vec![Some("1".to_owned()), Some("053".to_owned())]
+        );
+        assert_eq!(
+            groups(r"(?<=(b+))c", "", "abbbbbbc"),
+            vec![Some("bbbbbb".to_owned())]
+        );
+        assert_eq!(matches(r"(?<=a)b", "", "ab"), Some((1, 2)));
+        assert_eq!(matches(r"(?<!a)b", "", "ab"), None);
+        assert_eq!(matches(r"(?<!a)b", "", "cb"), Some((1, 2)));
+        // A lookahead inside a lookbehind reads forwards again.
+        assert_eq!(matches(r"(?<=a(?=b))b", "", "ab"), Some((1, 2)));
     }
 
     #[test]
