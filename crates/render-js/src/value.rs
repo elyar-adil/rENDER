@@ -8151,7 +8151,9 @@ impl Realm {
         {
             length.value = JsValue::Number(new_length);
         }
-        if !target.properties.contains_key(&key) {
+        // Integer indices enumerate in ascending order, so only named keys
+        // take a place in the insertion order.
+        if !target.properties.contains_key(&key) && !is_canonical_index(&key) {
             target.key_order.push(key.clone());
         }
         target.properties.insert(key, descriptor);
@@ -8701,18 +8703,13 @@ impl Realm {
 
     pub(crate) fn own_property_names(&self, object: ObjectId) -> Option<Vec<String>> {
         let target = self.objects.get(object.0)?;
-        let is_index = |key: &str| {
-            key.parse::<u32>()
-                .ok()
-                .filter(|index| index.to_string() == key)
-        };
         // Integer indices ascend first; the remaining string keys follow
         // first-insertion order, then any bootstrap keys the order list
         // does not track.
         let mut indices = target
             .properties
             .keys()
-            .filter(|key| is_index(key).is_some())
+            .filter(|key| is_canonical_index(key))
             .cloned()
             .collect::<Vec<_>>();
         if let ObjectHost::StringPrimitive(text) = &target.host {
@@ -8724,18 +8721,18 @@ impl Realm {
                     .filter(|key| !target.properties.contains_key(key)),
             );
         }
-        indices.sort_by_key(|key| is_index(key).unwrap_or(0));
+        indices.sort_by_cached_key(|key| key.parse::<u32>().unwrap_or(0));
         indices.dedup();
         let ordered = target
             .key_order
             .iter()
-            .filter(|key| target.properties.contains_key(*key) && is_index(key).is_none())
+            .filter(|key| target.properties.contains_key(*key) && !is_canonical_index(key))
             .cloned()
             .collect::<Vec<_>>();
         let untracked = target
             .properties
             .keys()
-            .filter(|key| is_index(key).is_none() && !target.key_order.contains(key))
+            .filter(|key| !is_canonical_index(key) && !target.key_order.contains(key))
             .cloned()
             .collect::<Vec<_>>();
         let mut names = indices;
@@ -8804,7 +8801,11 @@ impl Realm {
             return false;
         }
         target.properties.remove(key);
-        target.key_order.retain(|ordered| ordered != key);
+        if !is_canonical_index(key) {
+            // A truncating `length` deletes many index keys in a row, so only
+            // named keys pay for a scan of the insertion order.
+            target.key_order.retain(|ordered| ordered != key);
+        }
         true
     }
 
@@ -8852,7 +8853,9 @@ impl Realm {
             if !target.extensible {
                 return false;
             }
-            target.key_order.push(key.clone());
+            if !is_canonical_index(&key) {
+                target.key_order.push(key.clone());
+            }
             target
                 .properties
                 .insert(key, PropertyDescriptor::data(value));

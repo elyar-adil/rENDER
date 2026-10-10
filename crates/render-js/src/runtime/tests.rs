@@ -5476,3 +5476,26 @@ fn a_caller_scope_survives_a_collection_during_the_call_it_makes() {
         .expect("a call that collects while its caller is suspended executes");
     assert_eq!(outcome.value, JsValue::String("alive:2999".to_owned()));
 }
+
+#[test]
+fn enumeration_keeps_named_key_order_across_index_deletes() {
+    // Index keys enumerate ascending and first; named keys keep their
+    // insertion order even after a `length` truncation deletes many indices
+    // and after a named key in the middle is deleted.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var a = [1, 2, 3];
+                a.zeta = 1;
+                a.alpha = 2;
+                a.length = 1;
+                var o = { b: 1, 2: 0, a: 2, 1: 0 };
+                delete o.b;
+                var out = Object.keys(a).join(',') + ' | ' + Object.keys(o).join(',');
+            ",
+            "",
+            "out",
+        ),
+        "0,zeta,alpha | 1,2,a"
+    );
+}
