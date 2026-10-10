@@ -1758,3 +1758,28 @@ fn array_assignment_pattern_takes_only_what_it_needs_and_closes_the_iterator() {
         "2:4"
     );
 }
+
+#[test]
+fn object_keys_convert_with_to_property_key() {
+    // §7.1.19 ToPropertyKey: an object key runs ToPrimitive (string hint)
+    // first, so a Symbol wrapper addresses the symbol it wraps everywhere a
+    // key is taken: member read and write, `in`, literals and `hasOwnProperty`.
+    assert_eq!(
+        ok(
+            "var s = Object(Symbol()); var obj = {}; obj[s] = 'ok'; [s in obj, obj.hasOwnProperty(s), obj[s], Object.getOwnPropertySymbols(obj).length].join()"
+        ),
+        "true,true,ok,1"
+    );
+    assert_eq!(
+        ok(
+            "var u = Symbol(); var s = Object(u); var obj = {[s]: 1}; [Object.getOwnPropertySymbols(obj)[0] === u, obj[u], u in obj].join()"
+        ),
+        "true,1,true"
+    );
+    assert_eq!(
+        ok(
+            "var k = { toString() { return 'named'; } }; var obj = {}; obj[k] = 1; Object.keys(obj).join()"
+        ),
+        "named"
+    );
+}

@@ -1674,6 +1674,7 @@ impl JsRuntime {
             } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key_value = self.evaluate(dom, property)?;
+                let key_value = self.to_property_key_value(dom, key_value)?;
                 let receiver = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
                 if let JsValue::Symbol(symbol) = &key_value {
                     return self.get_symbol_value(dom, receiver, symbol);
@@ -1831,6 +1832,7 @@ impl JsRuntime {
             } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key_value = self.evaluate(dom, property)?;
+                let key_value = self.to_property_key_value(dom, key_value)?;
                 let key_text = key_value.to_js_string();
                 let object = self.coerce_member_base(&evaluated, &key_text)?;
                 if let JsValue::Symbol(symbol) = key_value {
@@ -1853,7 +1855,8 @@ impl JsRuntime {
                 property: property.clone(),
             }),
             Expr::SuperComputedMember { property, .. } => {
-                let key = self.evaluate(dom, property)?.to_js_string();
+                let key = self.evaluate(dom, property)?;
+                let key = self.to_property_key_value(dom, key)?.to_js_string();
                 Ok(AssignmentReference::SuperProperty { property: key })
             }
             _ => Err(JsError::new(
@@ -1915,7 +1918,8 @@ impl JsRuntime {
                     let name = match key {
                         PropertyKey::Static(name) => name.clone(),
                         PropertyKey::Computed(expression) => {
-                            self.evaluate(dom, expression)?.to_js_string()
+                            let computed = self.evaluate(dom, expression)?;
+                            self.to_property_key_value(dom, computed)?.to_js_string()
                         }
                         PropertyKey::Spread => {
                             unreachable!("the rest element is parsed separately")
@@ -2072,7 +2076,8 @@ impl JsRuntime {
                     let key = match &property.key {
                         PropertyKey::Static(key) => key.clone(),
                         PropertyKey::Computed(expression) => {
-                            self.evaluate(dom, expression)?.to_js_string()
+                            let computed = self.evaluate(dom, expression)?;
+                            self.to_property_key_value(dom, computed)?.to_js_string()
                         }
                         PropertyKey::Spread => unreachable!("spread handled above"),
                         PropertyKey::Private(_) => {
@@ -2527,6 +2532,24 @@ impl JsRuntime {
         Ok(integer.clamp(0.0, 9_007_199_254_740_991.0))
     }
 
+    /// ECMA-262 7.1.19 `ToPropertyKey` for an evaluated key: an object runs
+    /// `ToPrimitive` with the string hint first, so a symbol wrapper addresses
+    /// the symbol it wraps and `[1, 2]` names `"1,2"`. Symbols and strings come
+    /// back unchanged; any other object becomes its primitive's string key.
+    pub(super) fn to_property_key_value(
+        &mut self,
+        dom: &mut Dom,
+        value: JsValue,
+    ) -> Result<JsValue, JsError> {
+        if !matches!(value, JsValue::Object(_)) {
+            return Ok(value);
+        }
+        match self.to_primitive_with_hint(dom, value, PrimitiveHint::String)? {
+            symbol @ JsValue::Symbol(_) => Ok(symbol),
+            primitive => Ok(JsValue::String(primitive.to_js_string())),
+        }
+    }
+
     /// ECMA-262 `ToString` for values that may be objects: run `ToPrimitive`
     /// (string hint) so user-defined `toString`/`valueOf` participate, the
     /// way real-world code and polyfills (`String(obj)`) expect.
@@ -2734,7 +2757,8 @@ impl JsRuntime {
                 (value, receiver)
             }
             Expr::SuperComputedMember { property, .. } => {
-                let key = self.evaluate(dom, property)?.to_js_string();
+                let key = self.evaluate(dom, property)?;
+                let key = self.to_property_key_value(dom, key)?.to_js_string();
                 let value = self.read_super_property(dom, &key)?;
                 let receiver = self.current_this()?;
                 (value, receiver)
@@ -2762,6 +2786,7 @@ impl JsRuntime {
                     return Ok(None);
                 }
                 let key_value = self.evaluate(dom, property)?;
+                let key_value = self.to_property_key_value(dom, key_value)?;
                 let key = key_value.to_js_string();
                 let object = self.coerce_member_base(&receiver, &key)?;
                 let callee = if let JsValue::Symbol(symbol) = &key_value {
@@ -2944,7 +2969,10 @@ impl JsRuntime {
             // result installs a symbol-keyed property instead.
             let key_value = match &property.key {
                 PropertyKey::Static(key) => JsValue::String(key.clone()),
-                PropertyKey::Computed(expression) => self.evaluate(dom, expression)?,
+                PropertyKey::Computed(expression) => {
+                    let computed = self.evaluate(dom, expression)?;
+                    self.to_property_key_value(dom, computed)?
+                }
                 PropertyKey::Spread => unreachable!("spread property handled above"),
                 PropertyKey::Private(_) => {
                     unreachable!("object literals cannot carry private names")
@@ -3354,6 +3382,15 @@ impl JsRuntime {
         key: &JsValue,
         container: &JsValue,
     ) -> Result<bool, JsError> {
+        // ToPropertyKey runs only once the right-hand side is known to be an
+        // object (ECMA-262 13.10.1), so a TypeError comes before any `toString`.
+        let converted;
+        let key = if matches!(container, JsValue::Object(_)) {
+            converted = self.to_property_key_value(dom, key.clone())?;
+            &converted
+        } else {
+            key
+        };
         if let JsValue::Symbol(symbol) = key {
             return match container {
                 JsValue::Object(object) => {
