@@ -964,6 +964,29 @@ impl JsRuntime {
             NativeFunction::DateSetTime => {
                 self.dispatch_date_native(dom, NativeFunction::DateSetTime, receiver, arguments)
             }
+            NativeFunction::DateSetDate
+            | NativeFunction::DateSetFullYear
+            | NativeFunction::DateSetHours
+            | NativeFunction::DateSetMilliseconds
+            | NativeFunction::DateSetMinutes
+            | NativeFunction::DateSetMonth
+            | NativeFunction::DateSetSeconds
+            | NativeFunction::DateSetUTCDate
+            | NativeFunction::DateSetUTCFullYear
+            | NativeFunction::DateSetUTCHours
+            | NativeFunction::DateSetUTCMilliseconds
+            | NativeFunction::DateSetUTCMinutes
+            | NativeFunction::DateSetUTCMonth
+            | NativeFunction::DateSetUTCSeconds
+            | NativeFunction::DateSetYear
+            | NativeFunction::DateGetYear
+            | NativeFunction::DateToTimeString
+            | NativeFunction::DateToLocaleString
+            | NativeFunction::DateToLocaleDateString
+            | NativeFunction::DateToLocaleTimeString
+            | NativeFunction::DateSymbolToPrimitive => {
+                self.dispatch_date_native(dom, function, receiver, arguments)
+            }
             NativeFunction::DateToDateString => self.dispatch_date_native(
                 dom,
                 NativeFunction::DateToDateString,

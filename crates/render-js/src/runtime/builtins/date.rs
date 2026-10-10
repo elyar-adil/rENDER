@@ -18,8 +18,8 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::to_number;
+use crate::runtime::eval::PrimitiveHint;
 use crate::value::ErrorKind;
-use crate::value::JsSymbol;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -49,7 +49,37 @@ impl JsRuntime {
                     Err(JsError::type_error("incompatible Date method receiver"))
                 }
             }
+            NativeFunction::DateSetDate
+            | NativeFunction::DateSetFullYear
+            | NativeFunction::DateSetHours
+            | NativeFunction::DateSetMilliseconds
+            | NativeFunction::DateSetMinutes
+            | NativeFunction::DateSetMonth
+            | NativeFunction::DateSetSeconds
+            | NativeFunction::DateSetUTCDate
+            | NativeFunction::DateSetUTCFullYear
+            | NativeFunction::DateSetUTCHours
+            | NativeFunction::DateSetUTCMilliseconds
+            | NativeFunction::DateSetUTCMinutes
+            | NativeFunction::DateSetUTCMonth
+            | NativeFunction::DateSetUTCSeconds
+            | NativeFunction::DateSetYear => self.date_setter(dom, function, receiver, arguments),
+            NativeFunction::DateSymbolToPrimitive => {
+                let hint = match arguments.first() {
+                    Some(JsValue::String(hint)) => hint.as_str(),
+                    _ => "",
+                };
+                // ECMA-262 21.4.4.45: `string` and `default` try `toString` first,
+                // `number` tries `valueOf` first, and any other hint is a TypeError.
+                let string_first = match hint {
+                    "string" | "default" => true,
+                    "number" => false,
+                    _ => return Err(JsError::type_error("Invalid hint for Date to primitive")),
+                };
+                self.ordinary_date_to_primitive(dom, receiver, string_first)
+            }
             NativeFunction::DateGetFullYear
+            | NativeFunction::DateGetYear
             | NativeFunction::DateGetMonth
             | NativeFunction::DateGetDate
             | NativeFunction::DateGetDay
@@ -79,7 +109,11 @@ impl JsRuntime {
                 Ok(JsValue::String(Self::format_date_iso(ms)))
             }
             NativeFunction::DateToJSON => {
-                let primitive = self.date_to_primitive_number(dom, receiver)?;
+                let primitive = self.to_primitive_with_hint(
+                    dom,
+                    JsValue::Object(receiver),
+                    PrimitiveHint::Number,
+                )?;
                 if let JsValue::Number(number) = primitive
                     && !number.is_finite()
                 {
@@ -94,7 +128,7 @@ impl JsRuntime {
                 }
                 self.call_with_this(dom, method, &[], JsValue::Object(receiver))
             }
-            NativeFunction::DateToDateString => {
+            NativeFunction::DateToDateString | NativeFunction::DateToLocaleDateString => {
                 let ms = self.require_date_value(receiver)?;
                 if !ms.is_finite() {
                     return Ok(JsValue::String("Invalid Date".to_owned()));
@@ -106,6 +140,10 @@ impl JsRuntime {
                     DATE_MONTHS[month as usize],
                     format_date_year(year),
                 )))
+            }
+            NativeFunction::DateToTimeString | NativeFunction::DateToLocaleTimeString => {
+                let ms = self.require_date_value(receiver)?;
+                Ok(JsValue::String(Self::format_date_time_string(ms)))
             }
             NativeFunction::DateParse => {
                 let input = match arguments.first() {
@@ -133,77 +171,41 @@ impl JsRuntime {
             NativeFunction::DateGetValue | NativeFunction::DateValueOf => {
                 Ok(JsValue::Number(self.require_date_value(receiver)?))
             }
-            NativeFunction::DateToString | NativeFunction::DateToGMTString => {
+            NativeFunction::DateToString | NativeFunction::DateToLocaleString => {
                 let ms = self.require_date_value(receiver)?;
-                let text = if function == NativeFunction::DateToString {
-                    Self::format_date_utc(ms)
-                } else {
-                    Self::format_date_to_utc_string(ms)
-                };
-                Ok(JsValue::String(text))
+                Ok(JsValue::String(Self::format_date_utc(ms)))
+            }
+            NativeFunction::DateToGMTString => {
+                let ms = self.require_date_value(receiver)?;
+                Ok(JsValue::String(Self::format_date_to_utc_string(ms)))
             }
             other => self.dispatch_promise_native(dom, other, receiver, arguments),
         }
     }
 
-    /// `ToNumber` for Date arguments: objects run `ToPrimitive` (number hint)
-    /// through the evaluator so user `valueOf`/`toString` and abrupt
-    /// completions behave correctly.
+    /// `ToNumber` for Date arguments, through the full `ToPrimitive` with the
+    /// number hint so a user `Symbol.toPrimitive`, `valueOf` or `toString`, and
+    /// any abrupt completion, behave as the evaluator defines them.
     fn to_date_number(&mut self, dom: &mut Dom, value: &JsValue) -> Result<f64, JsError> {
-        let primitive = match value {
-            JsValue::Object(object) => self.date_to_primitive_number(dom, *object)?,
-            _ => value.clone(),
-        };
+        let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Number)?;
         to_number(&primitive)
     }
 
-    /// ECMA-262 `ToPrimitive(O, hint number)` as needed by `Date.UTC`,
-    /// `Date.prototype.setTime`, and `Date.prototype.toJSON`: an exotic
-    /// `Symbol.toPrimitive` first, then `valueOf`/`toString`, with getters
-    /// invoked and primitive results returned as-is.
-    fn date_to_primitive_number(
+    /// ECMA-262 `OrdinaryToPrimitive`: `toString` then `valueOf` when
+    /// `string_first`, otherwise the reverse. The first method that yields a
+    /// primitive wins, and when neither does the conversion is a `TypeError`.
+    fn ordinary_date_to_primitive(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
+        string_first: bool,
     ) -> Result<JsValue, JsError> {
-        // Primitive wrapper hosts already carry their primitive value.
-        match self.realm.host(object) {
-            Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
-            Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
-            Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
-            _ => {}
-        }
-        let to_primitive = JsSymbol::well_known("@@toPrimitive");
-        if let Some(descriptor) = self.realm.get_symbol_descriptor(object, &to_primitive) {
-            let method = if descriptor.is_accessor() {
-                match descriptor.getter {
-                    Some(getter) => {
-                        self.call_with_this(dom, getter, &[], JsValue::Object(object))?
-                    }
-                    None => JsValue::Undefined,
-                }
-            } else {
-                descriptor.value
-            };
-            match method {
-                JsValue::Undefined | JsValue::Null => {}
-                JsValue::Object(method) if Self::is_callable_object(method, &self.realm) => {
-                    let hint = JsValue::String("number".to_owned());
-                    let result =
-                        self.call_with_this(dom, method, &[hint], JsValue::Object(object))?;
-                    if !matches!(result, JsValue::Object(_)) {
-                        return Ok(result);
-                    }
-                    return Err(JsError::type_error(
-                        "Cannot convert object to primitive value",
-                    ));
-                }
-                _ => {
-                    return Err(JsError::type_error("Symbol.toPrimitive is not a function"));
-                }
-            }
-        }
-        for name in ["valueOf", "toString"] {
+        let names = if string_first {
+            ["toString", "valueOf"]
+        } else {
+            ["valueOf", "toString"]
+        };
+        for name in names {
             let method = self.get_member(dom, object, name)?;
             let JsValue::Object(method) = method else {
                 continue;
@@ -219,6 +221,78 @@ impl JsRuntime {
         Err(JsError::type_error(
             "Cannot convert object to primitive value",
         ))
+    }
+
+    /// ECMA-262 `Date.prototype.set*` (21.4.4.20-28, and the `setUTC*` twins,
+    /// which coincide with the local forms because local time is UTC here) and
+    /// Annex B `setYear`. `thisTimeValue` is checked first. Each argument the
+    /// method reads is then coerced in order, where the first is always read
+    /// (an absent one is `undefined`) and the rest only when present. Only
+    /// after that does an invalid time value matter: `setFullYear` and
+    /// `setYear` take it as `+0`, and the others return NaN.
+    fn date_setter(
+        &mut self,
+        dom: &mut Dom,
+        function: NativeFunction,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let time = self.require_date_value(receiver)?;
+        let (first, count) = Self::date_setter_fields(function);
+        let read = count.min(arguments.len()).max(1);
+        let mut values = [0.0_f64; 4];
+        for (index, slot) in values.iter_mut().enumerate().take(read) {
+            let argument = arguments.get(index).cloned().unwrap_or(JsValue::Undefined);
+            *slot = self.to_date_number(dom, &argument)?;
+        }
+        let base = if !time.is_nan() {
+            time
+        } else if matches!(
+            function,
+            NativeFunction::DateSetFullYear
+                | NativeFunction::DateSetUTCFullYear
+                | NativeFunction::DateSetYear
+        ) {
+            0.0
+        } else {
+            return Ok(JsValue::Number(f64::NAN));
+        };
+        if function == NativeFunction::DateSetYear {
+            values[0] = Self::make_full_year(values[0]);
+        }
+        let (year, month, day, hour, minute, second, millis, _) = Self::date_components(base);
+        let mut fields = [
+            f64::from(year),
+            f64::from(month),
+            f64::from(day),
+            f64::from(hour),
+            f64::from(minute),
+            f64::from(second),
+            f64::from(millis),
+        ];
+        fields[first..first + read].copy_from_slice(&values[..read]);
+        let clipped = Self::time_clip(Self::make_date(
+            Self::make_day(fields[0], fields[1], fields[2]),
+            Self::make_time(fields[3], fields[4], fields[5], fields[6]),
+        ));
+        self.realm.set_host_data_date(receiver, clipped);
+        Ok(JsValue::Number(clipped))
+    }
+
+    /// The first broken-down field a `set*` method replaces (0 is the year,
+    /// 6 the millisecond) and how many arguments it reads.
+    fn date_setter_fields(function: NativeFunction) -> (usize, usize) {
+        match function {
+            NativeFunction::DateSetYear => (0, 1),
+            NativeFunction::DateSetFullYear | NativeFunction::DateSetUTCFullYear => (0, 3),
+            NativeFunction::DateSetMonth | NativeFunction::DateSetUTCMonth => (1, 2),
+            NativeFunction::DateSetDate | NativeFunction::DateSetUTCDate => (2, 1),
+            NativeFunction::DateSetHours | NativeFunction::DateSetUTCHours => (3, 4),
+            NativeFunction::DateSetMinutes | NativeFunction::DateSetUTCMinutes => (4, 3),
+            NativeFunction::DateSetSeconds | NativeFunction::DateSetUTCSeconds => (5, 2),
+            NativeFunction::DateSetMilliseconds | NativeFunction::DateSetUTCMilliseconds => (6, 1),
+            _ => unreachable!("date_setter is only dispatched for the set* methods"),
+        }
     }
 
     /// ECMA-262 `TimeClip`: non-finite and out-of-range values become NaN and
@@ -279,20 +353,30 @@ impl JsRuntime {
         second: f64,
         millis: f64,
     ) -> f64 {
-        let year = if year.is_nan() {
-            f64::NAN
-        } else {
-            let integer = to_integer_or_infinity(year);
-            if (0.0..=99.0).contains(&integer) {
-                1900.0 + integer
-            } else {
-                year
-            }
-        };
         let time = Self::make_time(hour, minute, second, millis);
-        Self::time_clip(Self::make_date(Self::make_day(year, month, date), time))
+        Self::time_clip(Self::make_date(
+            Self::make_day(Self::make_full_year(year), month, date),
+            time,
+        ))
     }
 
+    /// Annex B `MakeFullYear`: an integer part from 0 through 99 reads as the
+    /// year `1900` plus that part, and any other year is kept as given.
+    fn make_full_year(year: f64) -> f64 {
+        if year.is_nan() {
+            return f64::NAN;
+        }
+        let integer = to_integer_or_infinity(year);
+        if (0.0..=99.0).contains(&integer) {
+            1900.0 + integer
+        } else {
+            year
+        }
+    }
+
+    /// ECMA-262 `new Date(value)` with one argument: a Date instance contributes
+    /// its time value directly, anything else takes `ToPrimitive` with no hint,
+    /// and a string parses while every other primitive goes through `ToNumber`.
     pub(in crate::runtime) fn date_from_constructor_arguments(
         &mut self,
         dom: &mut Dom,
@@ -300,14 +384,17 @@ impl JsRuntime {
     ) -> Result<f64, JsError> {
         match arguments {
             [] => Ok(Self::now_ms()),
-            [value] => match value {
-                JsValue::String(text) => Ok(Self::parse_date_string(text).unwrap_or(f64::NAN)),
-                JsValue::Undefined => Ok(f64::NAN),
-                other => {
-                    let number = self.to_date_number(dom, other)?;
-                    Ok(Self::time_clip(number))
+            [value] => {
+                if let JsValue::Object(object) = value
+                    && let Some(ObjectHost::DateInstance(ms)) = self.realm.host(*object)
+                {
+                    return Ok(Self::time_clip(ms));
                 }
-            },
+                match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Default)? {
+                    JsValue::String(text) => Ok(Self::parse_date_string(&text).unwrap_or(f64::NAN)),
+                    primitive => Ok(Self::time_clip(to_number(&primitive)?)),
+                }
+            }
             _ => self.date_from_utc_arguments(dom, arguments),
         }
     }
@@ -328,21 +415,15 @@ impl JsRuntime {
         ))
     }
 
+    /// ECMA-262 21.4.4.41.1 `thisTimeValue`: only an object with a
+    /// `[[DateValue]]` slot qualifies. A primitive receiver arrives boxed, and a
+    /// boxed primitive has no such slot, so it is a `TypeError` like any other.
     pub(in crate::runtime) fn require_date_value(
         &self,
         receiver: ObjectId,
     ) -> Result<f64, JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::DateInstance(ms)) => Ok(ms),
-            // ECMA-262 21.4.4.41.1 `thisTimeValue`: a `Date.prototype` method
-            // reached through `.call(5)` must see a primitive receiver as `NaN`
-            // rather than as a brand error, because the method never had a Date
-            // this-value to begin with.
-            Some(
-                ObjectHost::NumberPrimitive(_)
-                | ObjectHost::StringPrimitive(_)
-                | ObjectHost::BooleanPrimitive(_),
-            ) => Ok(f64::NAN),
             _ => Err(JsError::type_error("incompatible Date method receiver")),
         }
     }
@@ -354,6 +435,8 @@ impl JsRuntime {
         let (year, month, day, hour, minute, second, millis, weekday) = Self::date_components(ms);
         let value = match function {
             NativeFunction::DateGetFullYear | NativeFunction::DateGetUTCFullYear => year,
+            // Annex B.2.3.1 `getYear`: the year less 1900.
+            NativeFunction::DateGetYear => year - 1900,
             NativeFunction::DateGetMonth | NativeFunction::DateGetUTCMonth => month,
             NativeFunction::DateGetDate | NativeFunction::DateGetUTCDate => day,
             NativeFunction::DateGetDay | NativeFunction::DateGetUTCDay => weekday,
@@ -474,6 +557,16 @@ impl JsRuntime {
         let month = DATE_MONTHS[month as usize];
         let year = format_date_year(year);
         format!("{weekday}, {day:02} {month} {year} {hour:02}:{minute:02}:{second:02} GMT")
+    }
+
+    /// ECMA-262 `TimeString` followed by `TimeZoneString`: `00:00:00 GMT+0000`
+    /// (local time is UTC here, so the offset is always zero).
+    pub(in crate::runtime) fn format_date_time_string(ms: f64) -> String {
+        if !ms.is_finite() {
+            return "Invalid Date".to_owned();
+        }
+        let (_, _, _, hour, minute, second, _, _) = Self::date_components(ms);
+        format!("{hour:02}:{minute:02}:{second:02} GMT+0000")
     }
 }
 

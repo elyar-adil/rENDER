@@ -2660,9 +2660,6 @@ impl JsRuntime {
             return Ok(value);
         };
         match self.realm.host(object) {
-            Some(ObjectHost::DateInstance(ms)) if hint != PrimitiveHint::String => {
-                return Ok(JsValue::Number(ms));
-            }
             Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
             Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
             Some(ObjectHost::BigIntPrimitive(value)) => return Ok(JsValue::BigInt(value)),
@@ -5062,10 +5059,13 @@ impl JsRuntime {
                 Ok(JsValue::Object(self.realm.boolean_primitive_wrapper(value)))
             }
             Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
+            // OrdinaryCreateFromConstructor(NewTarget, %Date.prototype%): after the
+            // value is converted, the prototype comes from new.target.
             Some(ObjectHost::DateConstructor) => {
                 let ms = self.date_from_constructor_arguments(dom, arguments)?;
                 self.ensure_heap_capacity(1)?;
-                Ok(JsValue::Object(self.realm.date_wrapper(ms)))
+                let prototype = instance_prototype(self);
+                Ok(JsValue::Object(self.realm.date_wrapper(ms, prototype)))
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
                 self.error_constructor(constructor, kind, arguments)
@@ -5432,6 +5432,21 @@ impl JsRuntime {
             // primitive yields its wrapper, and a nullish receiver throws.
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeValueOf)) => {
                 Ok(JsValue::Object(self.to_object(&receiver)?))
+            }
+            // ECMA-262 21.4.4.45 `Date.prototype[@@toPrimitive]` reads `this` as an
+            // Object, so a primitive receiver is a `TypeError`, not a wrapper.
+            Some(ObjectHost::NativeFunction(NativeFunction::DateSymbolToPrimitive)) => {
+                match receiver {
+                    JsValue::Object(object) => self.call_native(
+                        dom,
+                        NativeFunction::DateSymbolToPrimitive,
+                        object,
+                        arguments,
+                    ),
+                    _ => Err(JsError::type_error(
+                        "Date.prototype[Symbol.toPrimitive] called on a non-object",
+                    )),
+                }
             }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionPrototype)) => {
                 Ok(JsValue::Undefined)

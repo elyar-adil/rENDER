@@ -585,6 +585,8 @@ impl NativeFunction {
                 // Object.prototype methods that begin with ToObject(this).
                 | Self::ObjectPrototypeHasOwnProperty
                 | Self::ObjectPrototypePropertyIsEnumerable
+                // Date.prototype.toJSON begins with ToObject(this) (ECMA-262 21.4.4.37).
+                | Self::DateToJSON
         )
     }
 }
@@ -825,6 +827,27 @@ pub(crate) enum NativeFunction {
     FunctionBind,
     FunctionApply,
     DateSetTime,
+    DateSetDate,
+    DateSetFullYear,
+    DateSetHours,
+    DateSetMilliseconds,
+    DateSetMinutes,
+    DateSetMonth,
+    DateSetSeconds,
+    DateSetUTCDate,
+    DateSetUTCFullYear,
+    DateSetUTCHours,
+    DateSetUTCMilliseconds,
+    DateSetUTCMinutes,
+    DateSetUTCMonth,
+    DateSetUTCSeconds,
+    DateSetYear,
+    DateGetYear,
+    DateToTimeString,
+    DateToLocaleString,
+    DateToLocaleDateString,
+    DateToLocaleTimeString,
+    DateSymbolToPrimitive,
     DateGetFullYear,
     DateGetMonth,
     DateGetDate,
@@ -4766,9 +4789,15 @@ impl Realm {
             | "groupBy"
             | "is" => 2,
             "defineProperty" => 3,
+            // Date setters (ECMA-262 21.4.4.20-28, B.2.3.2) and `toJSON` (21.4.4.37).
+            "setDate" | "setMilliseconds" | "setTime" | "setUTCDate" | "setUTCMilliseconds"
+            | "setYear" | "toJSON" => 1,
+            "setMonth" | "setSeconds" | "setUTCMonth" | "setUTCSeconds" => 2,
+            "setFullYear" | "setMinutes" | "setUTCFullYear" | "setUTCMinutes" => 3,
+            "setHours" | "setUTCHours" => 4,
             "construct" => 2,
-            "toString" | "valueOf" | "toISOString" | "toJSON" | "toUTCString" | "toDateString"
-            | "now" | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
+            "toString" | "valueOf" | "toISOString" | "toUTCString" | "toDateString" | "now"
+            | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
             | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
             | "getMinutes" | "getUTCMinutes" | "getSeconds" | "getUTCSeconds"
             | "getMilliseconds" | "getUTCMilliseconds" | "getTimezoneOffset" | "pop" | "shift"
@@ -5902,6 +5931,7 @@ impl Realm {
     }
 
     /// Install the `Date` constructor, prototype, and `Date.now`.
+    #[allow(clippy::too_many_lines)]
     fn install_date(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -5931,6 +5961,22 @@ impl Realm {
         for (name, function) in [
             ("getTime", NativeFunction::DateGetValue),
             ("setTime", NativeFunction::DateSetTime),
+            ("setDate", NativeFunction::DateSetDate),
+            ("setFullYear", NativeFunction::DateSetFullYear),
+            ("setHours", NativeFunction::DateSetHours),
+            ("setMilliseconds", NativeFunction::DateSetMilliseconds),
+            ("setMinutes", NativeFunction::DateSetMinutes),
+            ("setMonth", NativeFunction::DateSetMonth),
+            ("setSeconds", NativeFunction::DateSetSeconds),
+            ("setUTCDate", NativeFunction::DateSetUTCDate),
+            ("setUTCFullYear", NativeFunction::DateSetUTCFullYear),
+            ("setUTCHours", NativeFunction::DateSetUTCHours),
+            ("setUTCMilliseconds", NativeFunction::DateSetUTCMilliseconds),
+            ("setUTCMinutes", NativeFunction::DateSetUTCMinutes),
+            ("setUTCMonth", NativeFunction::DateSetUTCMonth),
+            ("setUTCSeconds", NativeFunction::DateSetUTCSeconds),
+            ("setYear", NativeFunction::DateSetYear),
+            ("getYear", NativeFunction::DateGetYear),
             ("getFullYear", NativeFunction::DateGetFullYear),
             ("getMonth", NativeFunction::DateGetMonth),
             ("getDate", NativeFunction::DateGetDate),
@@ -5950,7 +5996,10 @@ impl Realm {
             ("getUTCMilliseconds", NativeFunction::DateGetUTCMilliseconds),
             ("valueOf", NativeFunction::DateValueOf),
             ("toString", NativeFunction::DateToString),
-            ("toGMTString", NativeFunction::DateToGMTString),
+            ("toLocaleString", NativeFunction::DateToLocaleString),
+            ("toLocaleDateString", NativeFunction::DateToLocaleDateString),
+            ("toLocaleTimeString", NativeFunction::DateToLocaleTimeString),
+            ("toTimeString", NativeFunction::DateToTimeString),
             ("toUTCString", NativeFunction::DateToGMTString),
             ("toDateString", NativeFunction::DateToDateString),
             ("toISOString", NativeFunction::DateToISOString),
@@ -5964,6 +6013,53 @@ impl Realm {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        // ECMA-262 21.4.4.45: `[Symbol.toPrimitive]` is read-only and configurable,
+        // with length one.
+        let to_primitive = JsSymbol::well_known("@@toPrimitive");
+        let to_primitive_method = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::NativeFunction(NativeFunction::DateSymbolToPrimitive),
+            ..JsObject::default()
+        });
+        Self::install_length(objects, to_primitive_method, 1.0);
+        objects[prototype.0].symbols.insert(
+            to_primitive.id(),
+            (
+                to_primitive,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(to_primitive_method),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        // Annex B.2.3.3: `toGMTString` is the same function object as `toUTCString`.
+        // Its name is set explicitly, because the metadata pass would otherwise take
+        // it from whichever of the two keys sorts first.
+        if let Some(JsValue::Object(utc_string)) = objects[prototype.0]
+            .properties
+            .get("toUTCString")
+            .map(|descriptor| descriptor.value.clone())
+        {
+            objects[utc_string.0].properties.insert(
+                "name".to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String("toUTCString".to_owned()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+            objects[prototype.0].properties.insert(
+                "toGMTString".to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(utc_string)),
             );
         }
         objects[constructor.0].properties.insert(
@@ -8507,9 +8603,11 @@ impl Realm {
     }
 
     /// Create a fresh `Date` instance carrying epoch milliseconds.
-    pub(crate) fn date_wrapper(&mut self, ms: f64) -> ObjectId {
+    /// A new Date instance; `prototype` is the one `new.target` supplies, and
+    /// the realm's `%Date.prototype%` when that is absent.
+    pub(crate) fn date_wrapper(&mut self, ms: f64, prototype: Option<ObjectId>) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.date_prototype),
+            prototype: Some(prototype.unwrap_or(self.date_prototype)),
             host: ObjectHost::DateInstance(ms),
             ..JsObject::default()
         })
