@@ -5362,3 +5362,26 @@ fn object_methods_and_accessors_do_not_bind_their_own_name() {
         "2 2"
     );
 }
+
+#[test]
+fn typed_array_copy_within_revalidates_after_its_arguments_detach_the_buffer() {
+    // ECMA-262 23.2.3.5 step 16: a buffer detached while the arguments are coerced
+    // makes the view out of bounds, and copyWithin throws a TypeError.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var ta = new Uint8Array(new ArrayBuffer(8));
+                try {
+                    ta.copyWithin(0, { valueOf: function () { ta.buffer.transfer(); return 1; } }, 4);
+                    out = 'no throw';
+                } catch (error) {
+                    out = error.name;
+                }
+            ",
+            "",
+            "out",
+        ),
+        "TypeError"
+    );
+}

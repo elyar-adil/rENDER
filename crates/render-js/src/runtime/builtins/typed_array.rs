@@ -1073,15 +1073,22 @@ impl JsRuntime {
         let end = self.relative_position(dom, arguments.get(2), len, len)?;
         let count = (end - from).min(len - to);
         if count > 0.0 {
-            let (to, from, count) = (to as usize, from as usize, count as usize);
-            let mut elements = buffer.elements_value(kind, start, length)?;
-            // The source range is copied out first, so overlapping ranges copy
-            // as if through a temporary.
-            let copied: Vec<JsValue> = elements[from..from + count].to_vec();
-            for (offset, value) in copied.into_iter().enumerate() {
-                elements[to + offset] = value;
+            // The coercions above can run user code that detaches or resizes the
+            // buffer, so the view is validated again and the copy is clamped to its
+            // new length (ECMA-262 23.2.3.5 steps 16.c-e).
+            let (_, _, _, current) = self.typed_array_host(receiver)?;
+            let count = count.min(current as f64 - to).min(current as f64 - from);
+            if count > 0.0 {
+                let (to, from, count) = (to as usize, from as usize, count as usize);
+                let mut elements = buffer.elements_value(kind, start, current)?;
+                // The source range is copied out first, so overlapping ranges copy
+                // as if through a temporary.
+                let copied: Vec<JsValue> = elements[from..from + count].to_vec();
+                for (offset, value) in copied.into_iter().enumerate() {
+                    elements[to + offset] = value;
+                }
+                store_typed_elements(&buffer, kind, start, &elements);
             }
-            store_typed_elements(&buffer, kind, start, &elements);
         }
         Ok(JsValue::Object(receiver))
     }
