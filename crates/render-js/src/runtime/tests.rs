@@ -5213,3 +5213,36 @@ fn array_mutators_read_an_object_length_with_to_number_and_refuse_nullish_receiv
         JsValue::String("a|0|TypeError|1|RangeError".to_owned())
     );
 }
+
+#[test]
+fn array_is_array_throws_for_a_revoked_proxy() {
+    // IsArray (ECMA-262 7.2.2 step 3.a): a revoked proxy has no handler, so it
+    // cannot be inspected, and the check throws rather than answering.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var handle = Proxy.revocable([], {});
+                handle.revoke();
+                try {
+                    Array.isArray(handle.proxy);
+                    out = 'answered';
+                } catch (error) {
+                    out = error.name;
+                }
+            ",
+            "",
+            "out",
+        ),
+        "TypeError"
+    );
+    // A live proxy over an array still answers true.
+    assert_eq!(
+        settle_then_read(
+            "var out = String(Array.isArray(new Proxy([], {})));",
+            "",
+            "out",
+        ),
+        "true"
+    );
+}

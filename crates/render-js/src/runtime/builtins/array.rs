@@ -369,12 +369,16 @@ impl JsRuntime {
     }
 
     /// `IsArray` (§7.2.2): an Array exotic object, or a Proxy whose target is one.
+    /// A revoked proxy has no handler, and `IsArray` on it throws (step 3.a).
     pub(in crate::runtime) fn is_array_value(&self, value: &JsValue) -> Result<bool, JsError> {
         let JsValue::Object(object) = value else {
             return Ok(false);
         };
         match self.realm.host(*object) {
             Some(ObjectHost::Array) => Ok(true),
+            Some(ObjectHost::Proxy { handler: None, .. }) => Err(JsError::type_error(
+                "Array.isArray cannot inspect a revoked proxy",
+            )),
             Some(ObjectHost::Proxy { target, .. }) => {
                 let target = JsValue::Object(target);
                 self.is_array_value(&target)
