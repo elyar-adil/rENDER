@@ -20,11 +20,10 @@ use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::MAX_MATERIALIZED_ELEMENTS;
 use crate::runtime::convert::integer_or_infinity;
-use crate::runtime::convert::required_argument;
-use crate::runtime::convert::slice_range;
 use crate::runtime::convert::uint32_of_number;
 use crate::runtime::eval::PrimitiveHint;
 use crate::utf16;
+use crate::value::HTML_METHODS;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -217,6 +216,11 @@ impl JsRuntime {
                 )]
                 let count = count as usize;
                 let units = utf16::utf16_units(&text);
+                // An empty string repeated any number of times is empty, and
+                // the copy loop below would otherwise spin for the whole count.
+                if units.is_empty() {
+                    return Ok(JsValue::String(String::new()));
+                }
                 let total = units
                     .len()
                     .checked_mul(count)
@@ -243,8 +247,10 @@ impl JsRuntime {
             // order in place.
             NativeFunction::StrLocaleCompare => {
                 let text = self.require_string_receiver(dom, receiver)?;
-                let other =
-                    self.to_string_coerced(dom, required_argument(arguments, 0, "localeCompare")?)?;
+                // Step 3 is `ToString(that)` with no argument present, so a missing
+                // `that` is `undefined`, which converts to "undefined".
+                let that = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                let other = self.to_string_coerced(dom, &that)?;
                 Ok(JsValue::Number(match text.as_str().cmp(other.as_str()) {
                     std::cmp::Ordering::Less => -1.0,
                     std::cmp::Ordering::Equal => 0.0,
@@ -274,11 +280,12 @@ impl JsRuntime {
                 if !matches!(search, JsValue::Undefined | JsValue::Null)
                     && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
                 {
-                    let text = self.require_string_receiver(dom, receiver)?;
+                    // Step 2.d.i passes `this` as the caller gave it, before any
+                    // `ToString`; `delegate_this` says what that is for each receiver.
                     return self.call_with_this(
                         dom,
                         replacer,
-                        &[JsValue::String(text), replacement],
+                        &[self.delegate_this(receiver), replacement],
                         search,
                     );
                 }
@@ -288,37 +295,83 @@ impl JsRuntime {
                 let needle = self.to_string_coerced(dom, &search)?;
                 self.string_replace_all_literal(dom, &text, &needle, &replacement)
             }
-            // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units.
-            // `intStart` is `ToClampedIndex(start, size)` - a negative start
-            // counts from the end - and the run length is clamped to `[0, size]`
-            // rather than resolved from the end, so `substr(0, -1)` is empty
-            // and `substr(-1)` is the last code unit.
+            // ECMA-262 B.2.2.2 - B.2.2.14 `CreateHTML`, the Annex B HTML methods.
+            // The receiver is `RequireObjectCoercible` and `ToString`ed before
+            // the attribute value is converted, which is the order the spec
+            // gives. A `"` in the attribute value becomes `&quot;`, and nothing
+            // else in the receiver or the value is escaped.
+            NativeFunction::StrHtml(index) => {
+                let (_, tag, attribute) = HTML_METHODS[index];
+                let text = self.require_string_receiver(dom, receiver)?;
+                let opening = if attribute.is_empty() {
+                    format!("<{tag}>")
+                } else {
+                    let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                    let value = self.to_string_coerced(dom, &value)?.replace('"', "&quot;");
+                    format!("<{tag} {attribute}=\"{value}\">")
+                };
+                Ok(JsValue::String(format!("{opening}{text}</{tag}>")))
+            }
+            // ECMA-262 22.1.3.10 `String.prototype.isWellFormed` and 22.1.3.32
+            // `String.prototype.toWellFormed` (ES2024). A lone surrogate is the
+            // one thing a well-formed string cannot hold, and this engine keeps
+            // exactly the lone surrogates as placeholders: a valid pair is a
+            // single scalar, so "contains an unpaired surrogate" is "contains a
+            // placeholder". `toWellFormed` replaces each one with U+FFFD.
+            NativeFunction::StrIsWellFormed => {
+                let text = self.require_string_receiver(dom, receiver)?;
+                Ok(JsValue::Boolean(!text.chars().any(utf16::is_placeholder)))
+            }
+            NativeFunction::StrToWellFormed => {
+                let text = self.require_string_receiver(dom, receiver)?;
+                Ok(JsValue::String(
+                    text.chars()
+                        .map(|character| {
+                            if utf16::is_placeholder(character) {
+                                '\u{FFFD}'
+                            } else {
+                                character
+                            }
+                        })
+                        .collect(),
+                ))
+            }
+            // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units, in
+            // the spec's own arithmetic on `ToIntegerOrInfinity` values.
+            //
+            // Steps 5-7 clamp `intStart` into `[0, size]`: a negative start
+            // counts from the end and an infinite one clamps to the nearest
+            // bound. Steps 8-9 clamp `intLength` into `[0, size]`, and step 10
+            // ends the run at `min(intStart + intLength, size)`. Every clamp
+            // happens before any index is formed, so `+Infinity` never reaches
+            // a `usize` conversion: it is `size` by step 7 and the slice below
+            // is always in range.
             NativeFunction::StringSubstr => {
                 let text = self.require_string_receiver(dom, receiver)?;
                 let units = utf16::utf16_units(&text);
-                let size = units.len();
-                let start = slice_range(
-                    size,
-                    self.optional_integer_value(dom, arguments.first())?,
-                    None,
-                    true,
-                )
-                .start;
-                let length = match arguments.get(1) {
-                    None | Some(JsValue::Undefined) => size - start,
-                    Some(value) => {
-                        let requested = self.to_integer_value(dom, value)?;
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "the length is clamped to the string size first"
-                        )]
-                        {
-                            requested.max(0.0).min(size as f64) as usize
-                        }
-                    }
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "a code-unit length is a usize and f64 represents every usize on this target"
+                )]
+                let size = units.len() as f64;
+                let start = self.optional_integer_value(dom, arguments.first())?;
+                let start = if start < 0.0 {
+                    (size + start).max(0.0)
+                } else {
+                    start.min(size)
                 };
-                let end = start.saturating_add(length).min(size);
+                let length = match arguments.get(1) {
+                    None | Some(JsValue::Undefined) => size,
+                    Some(value) => self.to_integer_value(dom, value)?,
+                };
+                let length = length.max(0.0).min(size);
+                let end = (start + length).min(size);
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "start and end are integers clamped into [0, size] above"
+                )]
+                let (start, end) = (start as usize, end as usize);
                 Ok(JsValue::String(utf16::string_from_utf16(
                     &units[start..end],
                 )))
@@ -438,6 +491,7 @@ pub(in crate::runtime) fn expand_units_replacement(
                 index += 2;
             }
             digit if (u16::from(b'1')..=u16::from(b'9')).contains(&digit) => {
+                let reference_start = index;
                 let mut group = usize::from(digit - u16::from(b'1'));
                 index += 2;
                 if let Some(second) = units
@@ -452,6 +506,10 @@ pub(in crate::runtime) fn expand_units_replacement(
                 }
                 if let Some(Some((start, end))) = found.groups.get(group) {
                     output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                } else if group >= found.groups.len() {
+                    // ECMA-262 22.1.3.19.1: a `$n` past the last capture is not a
+                    // reference, so it is copied as written.
+                    output.push_str(&utf16::string_from_utf16(&units[reference_start..index]));
                 }
             }
             unit if unit == u16::from(b'<') && !found.names.is_empty() => {
@@ -580,6 +638,18 @@ impl JsRuntime {
         self.realm.string_wrapper(value)
     }
 
+    /// The `this` value a `@@replace` or `@@split` delegate receives. ECMA-262
+    /// passes `O` as the caller gave it, so a plain object arrives as itself. A
+    /// string receiver arrives here as a wrapper, which cannot be told from a
+    /// `String` object, so it is handed over as its text: the primitive that a
+    /// method call on a string receives.
+    pub(in crate::runtime) fn delegate_this(&self, receiver: ObjectId) -> JsValue {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::StringPrimitive(text)) => JsValue::String(text),
+            _ => JsValue::Object(receiver),
+        }
+    }
+
     /// Resolve the string a `%String.prototype%` method operates on:
     /// `ToString(this)` after `RequireObjectCoercible` (ECMA-262 22.1.3 step 1-2).
     /// A nullish receiver never reaches here, because the native call path
@@ -651,17 +721,13 @@ impl JsRuntime {
         // Step 2/3: `ToObject(template)` then `ToObject(Get(template, "raw"))`.
         // Both throw for `null`/`undefined` and for a missing `raw`, which is
         // what an object that only looks array-like answers.
+        // Every read is a [[Get]], so an accessor `raw` or `length` runs.
         let cooked = self.to_object(template)?;
-        let raw = self
-            .realm
-            .get_property(cooked, "raw")
-            .ok_or_else(|| JsError::type_error("String.raw template has no 'raw' property"))?;
+        let raw = self.get_member(dom, cooked, "raw")?;
         let literals = self.to_object(&raw)?;
         // Step 4: `LengthOfArrayLike`.
-        let length = match self.realm.get_property(literals, "length") {
-            Some(value) => self.to_length_value(dom, &value)?,
-            None => 0.0,
-        };
+        let length = self.get_member(dom, literals, "length")?;
+        let length = self.to_length_value(dom, &length)?;
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(
                 self.range_error("String.raw template literal count exceeds the engine limit")
@@ -676,18 +742,16 @@ impl JsRuntime {
         // Step 5: an empty `raw` contributes nothing at all, not one `undefined`.
         let mut output = String::new();
         for index in 0..count {
-            output.push_str(
-                &self
-                    .get_member(dom, literals, &index.to_string())?
-                    .to_js_string(),
-            );
+            // Steps 8.a-8.c: each literal is read and then converted with `ToString`.
+            let literal = self.get_member(dom, literals, &index.to_string())?;
+            output.push_str(&self.to_string_coerced(dom, &literal)?);
             // Step 8.d: the final literal ends the string; step 8.e splices a
             // substitution only when a later literal still follows.
             if index + 1 == count {
                 break;
             }
             if let Some(substitution) = arguments.get(index + 1) {
-                output.push_str(&substitution.to_js_string());
+                output.push_str(&self.to_string_coerced(dom, substitution)?);
             }
         }
         Ok(JsValue::String(output))
@@ -920,13 +984,39 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
         let units = utf16::utf16_units(&text);
-        let start = self.optional_integer_value(dom, arguments.first())?;
-        let end = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(self.to_integer_value(dom, value)?),
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a code-unit length is a usize and f64 represents every usize on this target"
+        )]
+        let length = units.len() as f64;
+        // Step 6-7: a negative bound counts from the end and clamps at 0; a
+        // positive one clamps at the length. Working in f64 means an infinite
+        // bound is clamped before it is ever an index.
+        let bound = |value: f64| {
+            if value < 0.0 {
+                (length + value).max(0.0)
+            } else {
+                value.min(length)
+            }
         };
-        let range = slice_range(units.len(), start, end, true);
-        Ok(JsValue::String(utf16::string_from_utf16(&units[range])))
+        let start = bound(self.optional_integer_value(dom, arguments.first())?);
+        let end = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => length,
+            Some(value) => bound(self.to_integer_value(dom, value)?),
+        };
+        // Step 8: an empty or reversed range is the empty string.
+        if start >= end {
+            return Ok(JsValue::String(String::new()));
+        }
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "both bounds are clamped into [0, length] above"
+        )]
+        let (start, end) = (start as usize, end as usize);
+        Ok(JsValue::String(utf16::string_from_utf16(
+            &units[start..end],
+        )))
     }
 
     /// ECMA-262 22.1.3.25 `String.prototype.substring`, over code units: both
@@ -941,13 +1031,30 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
         let units = utf16::utf16_units(&text);
-        let start = self.optional_integer_value(dom, arguments.first())?;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "a code-unit length is a usize and f64 represents every usize on this target"
+        )]
+        let length = units.len() as f64;
+        // Steps 4-7: a negative bound is 0 rather than an offset from the end,
+        // which is what distinguishes `substring` from `slice`.
+        let start = self
+            .optional_integer_value(dom, arguments.first())?
+            .max(0.0)
+            .min(length);
         let end = match arguments.get(1) {
-            None | Some(JsValue::Undefined) => None,
-            Some(value) => Some(self.to_integer_value(dom, value)?),
+            None | Some(JsValue::Undefined) => length,
+            Some(value) => self.to_integer_value(dom, value)?.max(0.0).min(length),
         };
-        let range = slice_range(units.len(), start, end, false);
-        Ok(JsValue::String(utf16::string_from_utf16(&units[range])))
+        // Step 8 swaps reversed bounds.
+        let (from, to) = (start.min(end), start.max(end));
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "both bounds are clamped into [0, length] above"
+        )]
+        let (from, to) = (from as usize, to as usize);
+        Ok(JsValue::String(utf16::string_from_utf16(&units[from..to])))
     }
 
     pub(in crate::runtime) fn string_to_case(
@@ -1109,15 +1216,21 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(dom, receiver)?;
         let separator = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let limit = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-        // ECMA-262 22.1.3.23 steps 3-4: a `@@split` method takes over.
+        // ECMA-262 22.1.3.23 steps 2-3: a `@@split` method takes over before
+        // `this` is converted, and it is handed `this` as the caller gave it.
         if !matches!(separator, JsValue::Undefined | JsValue::Null)
             && let Some(splitter) = self.symbol_method_of(dom, &separator, "@@split")?
         {
-            return self.call_with_this(dom, splitter, &[JsValue::String(text), limit], separator);
+            return self.call_with_this(
+                dom,
+                splitter,
+                &[self.delegate_this(receiver), limit],
+                separator,
+            );
         }
+        let text = self.require_string_receiver(dom, receiver)?;
         #[allow(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -1264,17 +1377,18 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let search = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let replace_value = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
-        let text = self.require_string_receiver(dom, receiver)?;
+        // Step 2.c.i hands `this` to the replacer before any `ToString` of it.
         if !matches!(search, JsValue::Undefined | JsValue::Null)
             && let Some(replacer) = self.symbol_method_of(dom, &search, "@@replace")?
         {
             return self.call_with_this(
                 dom,
                 replacer,
-                &[JsValue::String(text), replace_value],
+                &[self.delegate_this(receiver), replace_value],
                 search,
             );
         }
+        let text = self.require_string_receiver(dom, receiver)?;
         let needle = self.to_string_coerced(dom, &search)?;
         let replacer = match &replace_value {
             JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
@@ -1652,14 +1766,12 @@ mod tests {
             run("['c','a','b'].sort(function (x, y) { return x.localeCompare(y); }).join('')"),
             "abc"
         );
-        // A missing argument is a `TypeError`: `localeCompare(that)` is not an
-        // optional argument, and the specification's own step 1 is "Let
-        // comparator be ? Get(@@localeCompare, « this, »); perform ? Call(«
-        // comparator, undefined, « to, this »»)" - a `Call` on a missing argument
-        // throws.
+        // ECMA-262 22.1.3.12 step 3 is `ToString(that)`, so a missing argument is
+        // `undefined`, which converts to "undefined" and does not throw.
+        assert_eq!(caught("'a'.localeCompare()"), "no throw");
         assert_eq!(
-            caught("'a'.localeCompare()"),
-            "TypeError: localeCompare requires at least 1 argument(s)"
+            run("'a'.localeCompare()"),
+            run("'a'.localeCompare(undefined)")
         );
     }
 
@@ -2173,5 +2285,244 @@ mod tests {
         assert!(caught("'a'.indexOf(Symbol())").starts_with("TypeError: "));
         assert!(caught("'a'.concat(Symbol())").starts_with("TypeError: "));
         assert!(caught("String.prototype.replace.call(Symbol())").starts_with("TypeError: "));
+    }
+
+    #[test]
+    fn is_well_formed_reports_an_unpaired_surrogate_and_to_well_formed_replaces_it() {
+        assert_eq!(run("'abc'.isWellFormed()"), "true");
+        assert_eq!(run("'\\uD83D\\uDE00'.isWellFormed()"), "true");
+        assert_eq!(run("'\\uD800'.isWellFormed()"), "false");
+        assert_eq!(run("'a\\uDC00b'.isWellFormed()"), "false");
+        // A pair split across a concatenation is re-joined, so it is well formed.
+        assert_eq!(run("('\\uD83D' + '\\uDE00').isWellFormed()"), "true");
+        // toWellFormed: each lone surrogate becomes U+FFFD, a pair is untouched.
+        assert_eq!(units_of("'a\\uDC00b'.toWellFormed()"), "0061 fffd 0062");
+        assert_eq!(
+            units_of("'\\uD83D\\uDE00\\uD800'.toWellFormed()"),
+            "d83d de00 fffd"
+        );
+        assert_eq!(units_of("'\\uD83D\\uDE00'.toWellFormed()"), "d83d de00");
+        assert_eq!(run("String.prototype.isWellFormed.length"), "0");
+        assert_eq!(run("String.prototype.toWellFormed.length"), "0");
+        // They coerce the receiver, and a nullish receiver is a TypeError.
+        assert_eq!(
+            run("String.prototype.isWellFormed.call({ toString: function() { return 'x'; } })"),
+            "true"
+        );
+        assert!(caught("String.prototype.toWellFormed.call(undefined)").starts_with("TypeError: "));
+        assert!(caught("String.prototype.isWellFormed.call(null)").starts_with("TypeError: "));
+    }
+
+    #[test]
+    fn substring_clamps_negative_bounds_to_zero_and_swaps_reversed_ones() {
+        // Unlike `slice`, a negative bound is 0 and never an offset from the end.
+        assert_eq!(run("'gnulluna'.substring(null, -3)"), "");
+        assert_eq!(run("'abc'.substring(-2, -1)"), "");
+        assert_eq!(run("'abc'.substring(-1, 2)"), "ab");
+        assert_eq!(run("'abc'.substring(2, 0)"), "ab");
+        assert_eq!(run("'abc'.substring(1)"), "bc");
+        assert_eq!(run("'abc'.substring(NaN, Infinity)"), "abc");
+        assert_eq!(run("'abc'.substring(-Infinity, undefined)"), "abc");
+        assert_eq!(run("'abc'.substring(0, -Infinity)"), "");
+        assert_eq!(run("'abc'.substring(1.9, 2.9)"), "b");
+    }
+
+    #[test]
+    fn a_dollar_reference_past_the_last_capture_is_copied_as_written() {
+        // ECMA-262 22.1.3.19.1: with no captures, `$1` is literal text, and a
+        // two-digit reference is used only when its number is a real group.
+        assert_eq!(run("'abc'.replaceAll('b', '$1')"), "a$1c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$2')"), "a$2c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$1$2')"), "ab$2c");
+        assert_eq!(run("'abc'.replace(/(b)/, '$11')"), "ab1c");
+    }
+
+    #[test]
+    fn slice_clamps_infinite_bounds_and_counts_negative_ones_from_the_end() {
+        // ECMA-262 22.1.3.24: a negative bound counts from the end, and an infinite
+        // one clamps before it is ever an index (this used to slice past the end).
+        assert_eq!(run("'abc'.slice(Infinity)"), "");
+        assert_eq!(run("'abc'.slice(-Infinity)"), "abc");
+        assert_eq!(run("'abc'.slice(1, Infinity)"), "bc");
+        assert_eq!(run("'abc'.slice(-2)"), "bc");
+        assert_eq!(run("'abc'.slice(2, 1)"), "");
+        assert_eq!(run("'abc'.slice(-1, -Infinity)"), "");
+        assert_eq!(run("'ab'.slice(Infinity, Infinity)"), "");
+    }
+
+    #[test]
+    fn repeat_of_the_empty_string_is_empty_for_any_count() {
+        // The copy loop would run once per repetition, so an empty receiver must
+        // not reach it.
+        assert_eq!(
+            run("''.repeat(1e15).length === 0 ? 'empty' : 'not'"),
+            "empty"
+        );
+        assert!(caught("''.repeat(-1)").starts_with("RangeError: "));
+    }
+
+    #[test]
+    fn string_raw_reads_raw_through_get_and_converts_with_to_string() {
+        assert_eq!(run("String.raw({ raw: ['a', 'b'] }, 1)"), "a1b");
+        assert!(caught("String.raw({ raw: ['a', 'b'] }, Symbol())").starts_with("TypeError: "));
+        assert!(
+            caught("String.raw({ get raw() { throw new RangeError('raw'); } })")
+                .starts_with("RangeError: ")
+        );
+    }
+
+    #[test]
+    fn replace_all_and_split_hand_their_receiver_to_the_delegate_unconverted() {
+        // A plain object is the `this` value the delegate sees, unconverted, and a
+        // primitive string receiver is the primitive (ECMA-262 22.1.3.20 step 2.d.i).
+        assert_eq!(
+            run(
+                "var o = { toString: function() { throw new Error('early'); } }; var seen = null; \
+                 String.prototype.replaceAll.call(o, { [Symbol.replace]: function(O) { seen = O; return 'r'; } }, 'x'); \
+                 String(seen === o)"
+            ),
+            "true"
+        );
+        assert_eq!(
+            run(
+                "var seen = null; 'Leo'.replace({ [Symbol.replace]: function(O) { seen = O; return 'r'; } }, 'x'); typeof seen"
+            ),
+            "string"
+        );
+        // A `@@split` delegate runs before `ToString(this)`, so a throwing `toString`
+        // on the receiver is never reached.
+        assert_eq!(
+            run(
+                "var s = { toString: function() { throw new Error('early'); } }; \
+                 String.prototype.split.call(s, { [Symbol.split]: function() { return 'ok'; } })"
+            ),
+            "ok"
+        );
+        assert_eq!(run("String.prototype.split.length"), "2");
+    }
+
+    #[test]
+    fn the_string_iterator_is_named_by_its_well_known_symbol_and_has_no_values_alias() {
+        assert_eq!(
+            run("String.prototype[Symbol.iterator].name"),
+            "[Symbol.iterator]"
+        );
+        assert_eq!(run("String(typeof String.prototype.values)"), "undefined");
+    }
+
+    #[test]
+    fn locale_compare_treats_a_missing_argument_as_undefined() {
+        assert_eq!(run("'undefined'.localeCompare()"), "0");
+        assert_eq!(
+            run("'a'.localeCompare() === 'a'.localeCompare(undefined)"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn a_boolean_with_no_argument_is_false_for_string_receivers() {
+        // ECMA-262 20.3.1.1: an absent value is `undefined`, which is falsy, so
+        // both `Boolean()` and `new Boolean` are false.
+        assert_eq!(run("String(Boolean())"), "false");
+        assert_eq!(run("String(new Boolean)"), "false");
+        assert_eq!(
+            run("var b = new Boolean; b.charAt = String.prototype.charAt; \
+                 b.charAt(false) + b.charAt(true) + b.charAt(2)"),
+            "fal"
+        );
+    }
+
+    #[test]
+    fn to_string_reads_accessor_to_primitive_and_to_string_through_get() {
+        // GetMethod(@@toPrimitive) runs the getter: an undefined result means
+        // there is no exotic method, so OrdinaryToPrimitive reads `toString` with
+        // [[Get]] too, and an accessor `toString` is called.
+        assert_eq!(
+            run(
+                "var calls = 0; var o = { get [Symbol.toPrimitive]() { calls++; return undefined; }, \
+                 get toString() { return function() { return 'x'; }; } }; \
+                 String.prototype.trim.call(o) + calls"
+            ),
+            "x1"
+        );
+        // An accessor that yields a method gets the hint as its argument.
+        assert_eq!(
+            run(
+                "String({ get [Symbol.toPrimitive]() { return function(hint) { return 'h:' + hint; }; } })"
+            ),
+            "h:string"
+        );
+    }
+
+    #[test]
+    fn locale_case_methods_are_built_in_functions_that_are_not_constructors() {
+        assert_eq!(run("'bJ'.toLocaleUpperCase()"), "BJ");
+        assert_eq!(run("'BJ'.toLocaleLowerCase()"), "bj");
+        assert_eq!(run("String.prototype.toLocaleUpperCase.call(true)"), "TRUE");
+        assert_eq!(run("String.prototype.toLocaleUpperCase.length"), "0");
+        // A built-in has no `prototype` and no [[Construct]] (ECMA-262 10.3.1).
+        assert_eq!(
+            run("String(String.prototype.toLocaleLowerCase.prototype)"),
+            "undefined"
+        );
+        assert!(caught("new String.prototype.toLocaleUpperCase()").starts_with("TypeError: "));
+        assert!(
+            caught("String.prototype.toLocaleLowerCase.call(undefined)").starts_with("TypeError: ")
+        );
+    }
+
+    #[test]
+    fn annex_b_html_methods_wrap_the_receiver_and_escape_the_attribute() {
+        assert_eq!(run("'x'.bold()"), "<b>x</b>");
+        assert_eq!(run("'x'.anchor('a\"b')"), "<a name=\"a&quot;b\">x</a>");
+        assert_eq!(run("'x'.anchor()"), "<a name=\"undefined\">x</a>");
+        assert_eq!(run("'x'.link('u')"), "<a href=\"u\">x</a>");
+        assert_eq!(run("'x'.fontcolor('red')"), "<font color=\"red\">x</font>");
+        assert_eq!(run("'x'.fontsize(7)"), "<font size=\"7\">x</font>");
+        // A method with no attribute ignores its argument.
+        assert_eq!(run("'x'.bold(1)"), "<b>x</b>");
+        assert_eq!(run("String.prototype.small.call(12)"), "<small>12</small>");
+        assert_eq!(run("String.prototype.anchor.length"), "1");
+        assert_eq!(run("String.prototype.link.length"), "1");
+        assert_eq!(run("String.prototype.sup.length"), "0");
+        assert_eq!(
+            run(
+                "var d = Object.getOwnPropertyDescriptor(String.prototype, 'big'); \
+                 String(d.writable && !d.enumerable && d.configurable)"
+            ),
+            "true"
+        );
+        // RequireObjectCoercible(this) is a TypeError, and the receiver is converted
+        // before the attribute value, as B.2.2.2 steps 2 and 4 order them.
+        assert!(caught("String.prototype.sub.call(undefined)").starts_with("TypeError: "));
+        assert_eq!(
+            run("var log = ''; \
+                 String.prototype.anchor.call({ toString: function() { log += 't'; return 'x'; } }, \
+                   { toString: function() { log += 'v'; return 'y'; } }); log"),
+            "tv"
+        );
+        assert!(
+            caught("'x'.link({ toString: function() { throw new RangeError('no'); } })")
+                .starts_with("RangeError: ")
+        );
+        assert!(caught("new String.prototype.bold()").starts_with("TypeError: "));
+    }
+
+    #[test]
+    fn substr_clamps_infinite_and_fractional_arguments_before_slicing() {
+        // B.2.2.1 steps 5-10: a `+Infinity` start is the end of the string, not an
+        // index, so it answers empty rather than slicing past the end.
+        assert_eq!(run("'abc'.substr(Infinity)"), "");
+        assert_eq!(run("'abc'.substr(Infinity, Infinity)"), "");
+        assert_eq!(run("'ab'.substr(Infinity, 2)"), "");
+        assert_eq!(run("'abc'.substr(-Infinity)"), "abc");
+        assert_eq!(run("'abc'.substr(-Infinity, Infinity)"), "abc");
+        assert_eq!(run("'abc'.substr(1, Infinity)"), "bc");
+        assert_eq!(run("'abc'.substr(-1)"), "c");
+        assert_eq!(run("'abc'.substr(-2, -Infinity)"), "");
+        assert_eq!(run("'abc'.substr(0, -1)"), "");
+        assert_eq!(run("'abc'.substr(NaN, 2)"), "ab");
+        assert_eq!(run("'abc'.substr(1.9, 1.9)"), "b");
+        assert_eq!(run("'abc'.substr(2, undefined)"), "c");
     }
 }

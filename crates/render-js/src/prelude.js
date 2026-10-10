@@ -79,12 +79,6 @@
   // ---------------------------------------------------------------- String
   define(String.prototype, 'trimLeft', String.prototype.trimStart);
   define(String.prototype, 'trimRight', String.prototype.trimEnd);
-  define(String.prototype, 'toLocaleLowerCase', function toLocaleLowerCase() {
-    return String(this).toLowerCase();
-  });
-  define(String.prototype, 'toLocaleUpperCase', function toLocaleUpperCase() {
-    return String(this).toUpperCase();
-  });
 
   // ----------------------------------------------------------------- Error
   define(Error, 'captureStackTrace', function captureStackTrace(target) {
