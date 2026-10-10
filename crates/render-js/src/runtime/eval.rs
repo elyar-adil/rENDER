@@ -4972,6 +4972,7 @@ impl JsRuntime {
                 | ObjectHost::UrlSearchParamsConstructor
                 // ArrayBuffer, DataView and the text codecs are constructors (ECMA-262 25.1.4.1, 25.2.2.1).
                 | ObjectHost::ArrayBufferConstructor
+                | ObjectHost::SharedArrayBufferConstructor
                 | ObjectHost::DataViewConstructor
                 | ObjectHost::TextEncoderConstructor
                 | ObjectHost::TextDecoderConstructor,
@@ -5206,7 +5207,10 @@ impl JsRuntime {
                 self.data_view_constructor(dom, constructor, arguments)
             }
             Some(ObjectHost::ArrayBufferConstructor) => {
-                self.array_buffer_constructor(dom, constructor, arguments)
+                self.array_buffer_constructor(dom, constructor, arguments, false)
+            }
+            Some(ObjectHost::SharedArrayBufferConstructor) => {
+                self.array_buffer_constructor(dom, constructor, arguments, true)
             }
             Some(ObjectHost::ResponseConstructor) => {
                 self.response_constructor(constructor, arguments)
@@ -5484,6 +5488,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::ArrayBufferConstructor) => Err(JsError::type_error(
                 "ArrayBuffer constructor requires 'new'",
+            )),
+            Some(ObjectHost::SharedArrayBufferConstructor) => Err(JsError::type_error(
+                "SharedArrayBuffer constructor requires 'new'",
             )),
             Some(ObjectHost::ResponseConstructor) => {
                 Err(JsError::type_error("Response constructor requires 'new'"))

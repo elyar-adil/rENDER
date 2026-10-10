@@ -231,6 +231,7 @@ pub(super) fn mark_host(
         | ObjectHost::DataViewConstructor
         | ObjectHost::ArrayBufferHost(_)
         | ObjectHost::ArrayBufferConstructor
+        | ObjectHost::SharedArrayBufferConstructor
         | ObjectHost::TextDecoder { .. }
         | ObjectHost::TextEncoderConstructor
         | ObjectHost::TextDecoderConstructor

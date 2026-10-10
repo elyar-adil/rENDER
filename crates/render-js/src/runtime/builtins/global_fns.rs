@@ -239,7 +239,12 @@ impl JsRuntime {
             | NativeFunction::ArrayBufferDetachedGetter
             | NativeFunction::ArrayBufferResize
             | NativeFunction::ArrayBufferTransfer
-            | NativeFunction::ArrayBufferTransferToFixedLength => {
+            | NativeFunction::ArrayBufferTransferToFixedLength
+            | NativeFunction::SharedArrayBufferByteLengthGetter
+            | NativeFunction::SharedArrayBufferGrowableGetter
+            | NativeFunction::SharedArrayBufferMaxByteLengthGetter
+            | NativeFunction::SharedArrayBufferGrow
+            | NativeFunction::SharedArrayBufferSlice => {
                 self.dispatch_encoding_native(dom, function, receiver, arguments)
             }
             NativeFunction::GlobalStructuredClone => {

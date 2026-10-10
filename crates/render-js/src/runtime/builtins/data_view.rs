@@ -256,15 +256,68 @@ fn view_in_bounds(
 }
 
 impl JsRuntime {
-    /// The `ArrayBuffer` store of `receiver`, or a `TypeError` naming the
-    /// accessor that was called on something else.
-    fn array_buffer_host(&self, receiver: ObjectId, member: &str) -> Result<TypedBuffer, JsError> {
+    /// The store of an `ArrayBuffer` (`shared` false) or `SharedArrayBuffer`
+    /// (`shared` true) receiver, or a `TypeError` naming the accessor called on
+    /// anything else, including the other brand.
+    fn buffer_host(
+        &self,
+        receiver: ObjectId,
+        shared: bool,
+        member: &str,
+    ) -> Result<TypedBuffer, JsError> {
         match self.realm.host(receiver) {
-            Some(ObjectHost::ArrayBufferHost(buffer)) => Ok(buffer),
-            _ => Err(JsError::type_error(format!(
-                "ArrayBuffer.prototype.{member} called on an incompatible receiver"
-            ))),
+            Some(ObjectHost::ArrayBufferHost(buffer)) if buffer.is_shared() == shared => Ok(buffer),
+            _ => {
+                let owner = if shared {
+                    "SharedArrayBuffer"
+                } else {
+                    "ArrayBuffer"
+                };
+                Err(JsError::type_error(format!(
+                    "{owner}.prototype.{member} called on an incompatible receiver"
+                )))
+            }
         }
+    }
+
+    /// The store of an `ArrayBuffer` receiver.
+    fn array_buffer_host(&self, receiver: ObjectId, member: &str) -> Result<TypedBuffer, JsError> {
+        self.buffer_host(receiver, false, member)
+    }
+
+    /// The store of a `SharedArrayBuffer` receiver.
+    fn shared_array_buffer_host(
+        &self,
+        receiver: ObjectId,
+        member: &str,
+    ) -> Result<TypedBuffer, JsError> {
+        self.buffer_host(receiver, true, member)
+    }
+
+    /// `SharedArrayBuffer.prototype.grow(newLength)` (ECMA-262 25.2.5.5): only a
+    /// growable buffer has the slot, the length may not shrink, and it may not
+    /// pass `maxByteLength`.
+    fn shared_array_buffer_grow(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let buffer = self.shared_array_buffer_host(receiver, "grow")?;
+        let Some(max) = buffer.max_byte_length() else {
+            return Err(JsError::type_error(
+                "SharedArrayBuffer.prototype.grow called on a fixed-length buffer",
+            ));
+        };
+        let new_length = usize_from(self.to_index_value(dom, arguments.first())?);
+        if new_length > max || new_length > Self::MAX_TYPED_ARRAY_ELEMENTS {
+            return Err(self.range_error("new length is outside the buffer's maxByteLength"));
+        }
+        if new_length < buffer.byte_length() {
+            return Err(self.range_error("a SharedArrayBuffer cannot shrink"));
+        }
+        buffer.resize(new_length);
+        Ok(JsValue::Undefined)
     }
 
     pub(in crate::runtime) fn dispatch_data_view_native(
@@ -275,7 +328,31 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
-            NativeFunction::ArrayBufferSlice => self.array_buffer_slice(dom, receiver, arguments),
+            NativeFunction::ArrayBufferSlice => {
+                self.array_buffer_slice(dom, receiver, arguments, false)
+            }
+            NativeFunction::SharedArrayBufferSlice => {
+                self.array_buffer_slice(dom, receiver, arguments, true)
+            }
+            NativeFunction::SharedArrayBufferByteLengthGetter => {
+                let buffer = self.shared_array_buffer_host(receiver, "byteLength")?;
+                Ok(number_value(buffer.byte_length()))
+            }
+            NativeFunction::SharedArrayBufferGrowableGetter => {
+                let buffer = self.shared_array_buffer_host(receiver, "growable")?;
+                Ok(JsValue::Boolean(buffer.max_byte_length().is_some()))
+            }
+            NativeFunction::SharedArrayBufferMaxByteLengthGetter => {
+                let buffer = self.shared_array_buffer_host(receiver, "maxByteLength")?;
+                Ok(number_value(
+                    buffer
+                        .max_byte_length()
+                        .unwrap_or_else(|| buffer.byte_length()),
+                ))
+            }
+            NativeFunction::SharedArrayBufferGrow => {
+                self.shared_array_buffer_grow(dom, receiver, arguments)
+            }
             NativeFunction::ArrayBufferSpecies => Ok(JsValue::Object(receiver)),
             NativeFunction::ArrayBufferIsView => Ok(JsValue::Boolean(
                 self.is_array_buffer_view(arguments.first()),
@@ -336,14 +413,17 @@ impl JsRuntime {
         Ok(integer)
     }
 
-    /// `new ArrayBuffer(byteLength[, options])`: one byte per slot, so a buffer
-    /// is byte-granular and every view over it is byte-exact. A `maxByteLength`
-    /// option makes the buffer resizable (ECMA-262 25.1.4.1).
+    /// `new ArrayBuffer(byteLength[, options])` (ECMA-262 25.1.4.1), or with
+    /// `shared`, `new SharedArrayBuffer(byteLength[, options])` (ECMA-262
+    /// 25.2.3.1): one byte per slot, so a buffer is byte-granular and every view
+    /// over it is byte-exact. A `maxByteLength` option makes the buffer resizable
+    /// (growable, when shared).
     pub(in crate::runtime) fn array_buffer_constructor(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
+        shared: bool,
     ) -> Result<JsValue, JsError> {
         // §25.1.4.1 steps 2-3: `ToIndex(length)`, then the options.
         let length = usize_from(self.to_index_value(dom, arguments.first())?);
@@ -368,9 +448,10 @@ impl JsRuntime {
             return Err(self.range_error("ArrayBuffer size exceeds the engine bound"));
         }
         let bytes = vec![0; length];
-        let buffer = match max_byte_length {
-            Some(max) => TypedBuffer::new_resizable(bytes, max),
-            None => TypedBuffer::new(bytes),
+        let buffer = match (shared, max_byte_length) {
+            (true, max) => TypedBuffer::new_shared(bytes, max),
+            (false, Some(max)) => TypedBuffer::new_resizable(bytes, max),
+            (false, None) => TypedBuffer::new(bytes),
         };
         let object = self.new_array_buffer(prototype, &buffer)?;
         Ok(JsValue::Object(object))
@@ -450,7 +531,7 @@ impl JsRuntime {
         }
         // The new buffer's object exists before the old one is detached, so an
         // allocation failure leaves the receiver intact.
-        let prototype = self.array_buffer_prototype();
+        let prototype = self.array_buffer_prototype(false);
         self.ensure_heap_capacity(1)?;
         let mut bytes = buffer.bytes();
         bytes.resize(new_length, 0);
@@ -489,14 +570,20 @@ impl JsRuntime {
         if let Some(object) = buffer.object() {
             return Ok(object);
         }
-        let prototype = self.array_buffer_prototype();
+        let prototype = self.array_buffer_prototype(buffer.is_shared());
         self.new_array_buffer(prototype, buffer)
     }
 
-    /// `%ArrayBuffer.prototype%`, read from the global `ArrayBuffer`.
-    fn array_buffer_prototype(&self) -> Option<ObjectId> {
+    /// `%ArrayBuffer.prototype%`, or `%SharedArrayBuffer.prototype%` when `shared`,
+    /// read from the global constructor.
+    fn array_buffer_prototype(&self, shared: bool) -> Option<ObjectId> {
+        let constructor_name = if shared {
+            "SharedArrayBuffer"
+        } else {
+            "ArrayBuffer"
+        };
         self.realm
-            .global("ArrayBuffer")
+            .global(constructor_name)
             .and_then(|value| match value {
                 JsValue::Object(constructor) => self.realm.get_property(constructor, "prototype"),
                 _ => None,
@@ -534,19 +621,8 @@ impl JsRuntime {
     /// The `ArrayBuffer.prototype.byteLength` getter. A detached buffer has no
     /// bytes, so it reports 0.
     fn array_buffer_byte_length(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
-        match self.realm.host(receiver) {
-            Some(ObjectHost::ArrayBufferHost(buffer)) => {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "buffer lengths stay far below any precision boundary"
-                )]
-                let length = buffer.byte_length() as f64;
-                Ok(JsValue::Number(length))
-            }
-            _ => Err(JsError::type_error(
-                "ArrayBuffer.prototype.byteLength called on an incompatible receiver",
-            )),
-        }
+        let buffer = self.array_buffer_host(receiver, "byteLength")?;
+        Ok(number_value(buffer.byte_length()))
     }
 
     /// `ArrayBuffer.prototype.slice(start, end)`, which copies rather than
@@ -557,15 +633,9 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
+        shared: bool,
     ) -> Result<JsValue, JsError> {
-        let buffer = match self.realm.host(receiver) {
-            Some(ObjectHost::ArrayBufferHost(buffer)) => buffer,
-            _ => {
-                return Err(JsError::type_error(
-                    "ArrayBuffer.prototype.slice called on an incompatible receiver",
-                ));
-            }
-        };
+        let buffer = self.buffer_host(receiver, shared, "slice")?;
         // §25.1.6.7 step 4: a detached buffer cannot be sliced.
         buffer.ensure_attached()?;
         let total = buffer.byte_length();
@@ -600,7 +670,12 @@ impl JsRuntime {
         let (start, end) = (start as usize, end as usize);
         let copied = buffer.read_bytes(start.min(end), end - start.min(end))?;
         let prototype = self.realm.get_prototype(receiver);
-        let object = self.new_array_buffer(prototype, &TypedBuffer::new(copied))?;
+        let copy = if shared {
+            TypedBuffer::new_shared(copied, None)
+        } else {
+            TypedBuffer::new(copied)
+        };
+        let object = self.new_array_buffer(prototype, &copy)?;
         Ok(JsValue::Object(object))
     }
 
@@ -1428,6 +1503,46 @@ var d = Object.getOwnPropertyDescriptor(ArrayBuffer, Symbol.species);
  typeof d.get, d.set === undefined, d.get.name, d.get.length].join('|')
             "),
             "true|true|true|function|true|get [Symbol.species]|0"
+        );
+    }
+
+    /// `SharedArrayBuffer` is a separate brand over the same store: it grows but
+    /// never shrinks, its slice is shared, and the `ArrayBuffer` accessors refuse
+    /// it (ECMA-262 25.2.3, 25.2.5). Measured against Node v22.
+    #[test]
+    fn a_shared_buffer_grows_and_keeps_its_brand_apart_from_an_array_buffer() {
+        assert_eq!(
+            run(r"
+(function () {
+var out = [];
+function thrown(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var sab = new SharedArrayBuffer(4);
+out.push(Object.prototype.toString.call(sab), sab.byteLength, sab.growable, sab.maxByteLength);
+var g = new SharedArrayBuffer(2, { maxByteLength: 6 });
+out.push(g.growable, g.maxByteLength, g.byteLength);
+g.grow(5);
+out.push('grow', g.byteLength, g.maxByteLength, Array.from(new Uint8Array(g)).join(','));
+out.push('shrink', thrown(function () { g.grow(3); }));
+out.push('too big', thrown(function () { g.grow(7); }));
+out.push('not growable', thrown(function () { sab.grow(4); }));
+out.push('call', thrown(function () { SharedArrayBuffer(1); }));
+out.push('ab on sab', thrown(function () { ArrayBuffer.prototype.slice.call(sab, 0); }));
+out.push('ab byteLength on sab', thrown(function () { Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'byteLength').get.call(sab); }));
+out.push('sab byteLength on ab', thrown(function () { Object.getOwnPropertyDescriptor(SharedArrayBuffer.prototype, 'byteLength').get.call(new ArrayBuffer(1)); }));
+var sl = g.slice(1, 4);
+out.push('slice', sl.byteLength, sl.growable, Object.prototype.toString.call(sl), Array.from(new Uint8Array(sl)).join(','));
+var dv = new DataView(g, 1);
+out.push('dv', dv.buffer === g, dv.byteLength);
+var ta = new Int16Array(new SharedArrayBuffer(4));
+out.push('ta', ta.length, ta.buffer.constructor === SharedArrayBuffer);
+out.push('species', SharedArrayBuffer[Symbol.species] === SharedArrayBuffer, SharedArrayBuffer.length, SharedArrayBuffer.name);
+out.push('isView', ArrayBuffer.isView(sab));
+out.push('max opt', thrown(function () { new SharedArrayBuffer(5, { maxByteLength: 4 }); }));
+out.push('resizable on sab', String(sab.resizable));
+return out.join(' | ');
+})()
+            "),
+            "[object SharedArrayBuffer] | 4 | false | 4 | true | 6 | 2 | grow | 5 | 6 | 0,0,0,0,0 | shrink | RangeError | too big | RangeError | not growable | TypeError | call | TypeError | ab on sab | TypeError | ab byteLength on sab | TypeError | sab byteLength on ab | TypeError | slice | 3 | false | [object SharedArrayBuffer] | 0,0,0 | dv | true | 4 | ta | 2 | true | species | true | 1 | SharedArrayBuffer | isView | false | max opt | RangeError | resizable on sab | undefined"
         );
     }
 

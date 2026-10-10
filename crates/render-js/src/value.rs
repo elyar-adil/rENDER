@@ -1144,6 +1144,13 @@ pub(crate) enum NativeFunction {
     ArrayBufferResize,
     ArrayBufferTransfer,
     ArrayBufferTransferToFixedLength,
+    /// The `SharedArrayBuffer.prototype` members (ECMA-262 25.2.5): the
+    /// `byteLength`, `growable` and `maxByteLength` accessors, `grow` and `slice`.
+    SharedArrayBufferByteLengthGetter,
+    SharedArrayBufferGrowableGetter,
+    SharedArrayBufferMaxByteLengthGetter,
+    SharedArrayBufferGrow,
+    SharedArrayBufferSlice,
     GlobalStructuredClone,
     VideoPlay,
     VideoPause,
@@ -1381,8 +1388,11 @@ pub(crate) struct BufferStore {
     /// `buffer` getter returns it, so the collector keeps it alive.
     object: Option<ObjectId>,
     /// `[[ArrayBufferMaxByteLength]]` (ECMA-262 25.1.3.1). `Some` makes the
-    /// buffer resizable; `None` is a fixed-length buffer.
+    /// buffer resizable (or, shared, growable); `None` is a fixed-length buffer.
     max_byte_length: Option<usize>,
+    /// Whether this is a `SharedArrayBuffer` (ECMA-262 25.2). It never detaches,
+    /// and its `ArrayBuffer` and `SharedArrayBuffer` brands are kept apart.
+    shared: bool,
 }
 
 impl PartialEq for TypedBuffer {
@@ -1414,6 +1424,21 @@ impl TypedBuffer {
             max_byte_length: Some(max_byte_length),
             ..BufferStore::default()
         })))
+    }
+
+    /// A `SharedArrayBuffer` of `bytes`, growable up to `max_byte_length` when
+    /// that is given.
+    pub(crate) fn new_shared(bytes: Vec<u8>, max_byte_length: Option<usize>) -> Self {
+        Self(std::rc::Rc::new(std::cell::RefCell::new(BufferStore {
+            bytes,
+            max_byte_length,
+            shared: true,
+            ..BufferStore::default()
+        })))
+    }
+
+    pub(crate) fn is_shared(&self) -> bool {
+        self.0.borrow().shared
     }
 
     pub(crate) fn byte_length(&self) -> usize {
@@ -2012,8 +2037,10 @@ pub(crate) enum ObjectHost {
         byte_length: Option<usize>,
     },
     /// An `ArrayBuffer`: the bytes that the typed-array and `DataView` families
-    /// view. Every view reads and writes the same store.
+    /// view. Every view reads and writes the same store. A `SharedArrayBuffer`
+    /// is the same host, told apart by its store.
     ArrayBufferHost(TypedBuffer),
+    SharedArrayBufferConstructor,
     TextDecoder {
         encoding: TextEncoding,
         fatal: bool,
@@ -2133,6 +2160,7 @@ impl ObjectHost {
                 | Self::ErrorConstructor(_)
                 | Self::DomExceptionConstructor
                 | Self::ArrayBufferConstructor
+                | Self::SharedArrayBufferConstructor
                 | Self::DataViewConstructor
                 | Self::TextEncoderConstructor
                 | Self::TextDecoderConstructor
@@ -4100,6 +4128,51 @@ impl Realm {
             objects,
             function_prototype,
             array_buffer_constructor,
+            NativeFunction::ArrayBufferSpecies,
+        );
+        // §25.2: `SharedArrayBuffer`, the same host with its own brand, growable
+        // through `grow`, and its own species getter.
+        let (shared_prototype, shared_constructor) = Self::install_host_interface(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "SharedArrayBuffer",
+            ObjectHost::SharedArrayBufferConstructor,
+            &[],
+            "SharedArrayBuffer",
+        );
+        Self::install_getters(
+            objects,
+            function_prototype,
+            shared_prototype,
+            &[
+                (
+                    "byteLength",
+                    NativeFunction::SharedArrayBufferByteLengthGetter,
+                ),
+                ("growable", NativeFunction::SharedArrayBufferGrowableGetter),
+                (
+                    "maxByteLength",
+                    NativeFunction::SharedArrayBufferMaxByteLengthGetter,
+                ),
+            ],
+        );
+        for (name, function, arity) in [
+            ("grow", NativeFunction::SharedArrayBufferGrow, 1.0),
+            ("slice", NativeFunction::SharedArrayBufferSlice, 2.0),
+        ] {
+            let method = Self::install_native_method(objects, function_prototype, function, arity);
+            objects[shared_prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        Self::install_length(objects, shared_constructor, 1.0);
+        Self::install_species_getter(
+            objects,
+            function_prototype,
+            shared_constructor,
             NativeFunction::ArrayBufferSpecies,
         );
         // §25.1.5.1: `ArrayBuffer.isView` is a static, bound to the constructor
