@@ -16,7 +16,6 @@
 use crate::JsBigInt;
 use crate::JsError;
 use crate::JsErrorKind;
-use crate::JsObject;
 use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
@@ -43,6 +42,7 @@ use crate::runtime::builtins::dom::css_prop_from_member;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
+use crate::runtime::builtins::object::PropertyName;
 use crate::runtime::builtins::string::string_method_native;
 use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
 use crate::runtime::convert::abstract_equal;
@@ -2294,9 +2294,12 @@ impl JsRuntime {
                             self.delete_property_value(dom, object, &property)?,
                         ))
                     }
-                    AssignmentReference::SymbolProperty { object, symbol } => Ok(JsValue::Boolean(
-                        self.realm.delete_symbol_property(object, &symbol),
-                    )),
+                    AssignmentReference::SymbolProperty { object, symbol } => {
+                        let key = PropertyName::Symbol(symbol);
+                        Ok(JsValue::Boolean(
+                            self.delete_property_on(dom, object, &key)?,
+                        ))
+                    }
                     AssignmentReference::Private { .. }
                     | AssignmentReference::SuperProperty { .. } => Err(JsError::new(
                         JsErrorKind::Syntax,
@@ -2500,6 +2503,10 @@ impl JsRuntime {
         object: ObjectId,
         symbol: &JsSymbol,
     ) -> Result<JsValue, JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            let key = PropertyName::Symbol(symbol.clone());
+            return self.proxy_get_property(dom, object, &key, JsValue::Object(object));
+        }
         match self.realm.get_symbol_descriptor(object, symbol) {
             Some(descriptor) if descriptor.is_accessor() => {
                 let Some(getter) = descriptor.getter else {
@@ -2520,6 +2527,12 @@ impl JsRuntime {
         symbol: &JsSymbol,
         value: JsValue,
     ) -> Result<(), JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            // Sloppy-mode assignment: a `false` from the proxy is ignored.
+            let key = PropertyName::Symbol(symbol.clone());
+            self.proxy_set_property(dom, object, &key, value, JsValue::Object(object))?;
+            return Ok(());
+        }
         if let Some(own) = self.realm.own_symbol_property(object, symbol) {
             if own.is_accessor() {
                 if let Some(setter) = own.setter {
@@ -3543,7 +3556,8 @@ impl JsRuntime {
         if let JsValue::Symbol(symbol) = key {
             return match container {
                 JsValue::Object(object) => {
-                    Ok(self.realm.get_symbol_descriptor(*object, symbol).is_some())
+                    let key = PropertyName::Symbol(symbol.clone());
+                    self.has_property_value(dom, *object, &key)
                 }
                 _ => Err(JsError::type_error(
                     "right-hand side of 'in' must be an object",
@@ -3568,7 +3582,8 @@ impl JsRuntime {
                     }
                     return Ok(name == "length");
                 }
-                Ok(false)
+                // Not an own property: a proxy on the prototype chain answers.
+                self.has_property_value(dom, *object, &PropertyName::String(name))
             }
             _ => Err(JsError::type_error(
                 "right-hand side of 'in' must be an object",
@@ -3582,30 +3597,14 @@ impl JsRuntime {
         value: &JsValue,
         constructor: &JsValue,
     ) -> Result<bool, JsError> {
+        // ECMA-262 13.10.2 InstanceofOperator: `GetMethod(C, @@hasInstance)`
+        // wins when present; otherwise `C` must be callable and
+        // `OrdinaryHasInstance` decides.
         let constructor = Self::require_object(constructor)?;
-        if !Self::is_callable_object(constructor, &self.realm) {
-            return Err(JsError::type_error(format!(
-                "right-hand side of instanceof is not callable: host={:?}",
-                self.realm.host(constructor)
-            )));
-        }
-        // `Symbol.hasInstance` overrides the prototype-chain walk.
-        let has_instance_method = self
-            .realm
-            .get_symbol_descriptor(constructor, &JsSymbol::well_known("@@hasInstance"))
-            .and_then(|descriptor| {
-                if descriptor.is_accessor() {
-                    descriptor.getter
-                } else {
-                    match descriptor.value {
-                        JsValue::Object(function) => Some(function),
-                        _ => None,
-                    }
-                }
-            });
-        if let Some(method) =
-            has_instance_method.filter(|method| Self::is_callable_object(*method, &self.realm))
-        {
+        let method =
+            self.get_symbol_value(dom, constructor, &JsSymbol::well_known("@@hasInstance"))?;
+        if !matches!(method, JsValue::Undefined | JsValue::Null) {
+            let method = Self::require_callable_object(&method, &self.realm)?;
             let result = self.call_with_this(
                 dom,
                 method,
@@ -3614,37 +3613,13 @@ impl JsRuntime {
             )?;
             return Ok(result.is_truthy());
         }
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        let Some(prototype) = prototype else {
-            // Transpiled feature probes occasionally use a callable shim with
-            // a primitive prototype.  It cannot match any object, so the
-            // observable result is simply false.
-            return Ok(false);
-        };
-        let JsValue::Object(object) = value else {
-            return Ok(false);
-        };
-        let mut candidate = self.realm.object(*object).and_then(JsObject::prototype);
-        let mut visited = 0_usize;
-        while let Some(current) = candidate {
-            if current == prototype {
-                return Ok(true);
-            }
-            if visited >= self.limits.max_heap_objects {
-                return Err(JsError::resource(
-                    "prototype chain exceeds the heap object limit",
-                ));
-            }
-            visited = visited.saturating_add(1);
-            candidate = self.realm.object(current).and_then(JsObject::prototype);
+        if !Self::is_callable_object(constructor, &self.realm) {
+            return Err(JsError::type_error(format!(
+                "right-hand side of instanceof is not callable: host={:?}",
+                self.realm.host(constructor)
+            )));
         }
-        Ok(false)
+        self.ordinary_has_instance(dom, &JsValue::Object(constructor), value)
     }
 
     pub(super) fn create_binding(
@@ -4061,6 +4036,10 @@ impl JsRuntime {
                 return self.get_value(dom, object, property);
             }
             return Ok(descriptor.value);
+        }
+        // A proxy on the prototype chain answers before any later holder.
+        if let Some(value) = self.proxy_inherited_get(dom, object, property)? {
+            return Ok(value);
         }
         let inherited_origin = self.realm.get_property_with_origin(object, property);
         if object == self.realm.global_object() {
@@ -4978,6 +4957,8 @@ impl JsRuntime {
             // A bound function is constructable exactly when its target is:
             // `IsConstructor` looks through the [[BoundFunction]] wrapper.
             Some(ObjectHost::BoundCallable { target, .. }) => self.is_constructor(target),
+            // A proxy is constructable exactly when its target is (ECMA-262 10.5.13).
+            Some(ObjectHost::Proxy { target, .. }) => self.is_constructor(target),
             _ => false,
         }
     }
@@ -5331,6 +5312,9 @@ impl JsRuntime {
             Some(ObjectHost::BoundCallable { .. }) => {
                 self.construct_bound_callable(dom, constructor, arguments)
             }
+            Some(ObjectHost::Proxy { .. }) => {
+                self.proxy_construct(dom, constructor, arguments, new_target.clone())
+            }
             _ => Err(JsError::type_error("value is not a constructor")),
         }
     }
@@ -5541,6 +5525,13 @@ impl JsRuntime {
                     format!("function {name}() {{ }}")
                 }))
             }
+            // §20.2.3.6 `Function.prototype[@@hasInstance](V)`: `this` is `C`.
+            Some(ObjectHost::NativeFunction(NativeFunction::FunctionHasInstance)) => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                Ok(JsValue::Boolean(
+                    self.ordinary_has_instance(dom, &receiver, &value)?,
+                ))
+            }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionCall)) => {
                 self.function_call(dom, &receiver, arguments)
             }
@@ -5548,14 +5539,16 @@ impl JsRuntime {
                 // apply(thisArg, [args...])
                 let callable = Self::require_callable_object(&receiver, &self.realm)?;
                 let this_argument = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                // §20.2.3.1 step 3: `CreateListFromArrayLike`, which throws for a
+                // primitive argArray; `null` and `undefined` mean no arguments.
                 let call_arguments = match arguments.get(1) {
-                    Some(JsValue::Object(array)) => self.array_elements_for(*array)?,
-                    _ => Vec::new(),
+                    None | Some(JsValue::Undefined | JsValue::Null) => Vec::new(),
+                    Some(list) => self.create_list_from_array_like(dom, list)?,
                 };
                 self.call_with_this(dom, callable, &call_arguments, this_argument)
             }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionBind)) => {
-                self.function_bind(&receiver, arguments)
+                self.function_bind(dom, &receiver, arguments)
             }
             Some(ObjectHost::NativeFunction(NativeFunction::UrlToString)) => {
                 Ok(self.url_to_string(&receiver))
@@ -5629,6 +5622,7 @@ impl JsRuntime {
                 combined.extend_from_slice(arguments);
                 self.call_with_this(dom, target, &combined, receiver)
             }
+            Some(ObjectHost::Proxy { .. }) => self.proxy_call(dom, callee, receiver, arguments),
             Some(ObjectHost::UserFunction(index)) => {
                 if self
                     .functions
@@ -5704,6 +5698,7 @@ impl JsRuntime {
 
     pub(super) fn function_bind(
         &mut self,
+        dom: &mut Dom,
         receiver: &JsValue,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
@@ -5711,24 +5706,45 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         let bound_receiver = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let bound_arguments = arguments.get(1..).unwrap_or_default().to_vec();
+        let bound_count = bound_arguments.len() as f64;
+        // §20.2.3.2 steps 5-6: `length` is the target's own `length` less the
+        // bound count, never below zero. An absent or non-number length is 0,
+        // and ToIntegerOrInfinity keeps an infinite length infinite.
+        let has_length = self
+            .own_descriptor(dom, target, &PropertyName::String("length".to_owned()))?
+            .is_some();
+        let target_length = match has_length
+            .then(|| self.get_member(dom, target, "length"))
+            .transpose()?
+        {
+            Some(JsValue::Number(number)) if !number.is_nan() => number.trunc(),
+            _ => 0.0,
+        };
+        let length = (target_length - bound_count).max(0.0);
+        // §20.2.3.2 steps 7-9: the name is "bound " followed by the target's
+        // name, which counts as "" unless it is a string.
+        let target_name = match self.get_member(dom, target, "name")? {
+            JsValue::String(name) => name,
+            _ => String::new(),
+        };
         let bound = self
             .realm
-            .bound_callable(target, bound_receiver, bound_arguments.clone());
-        // Spec `Function.prototype.bind` metadata: `name` becomes
-        // `"bound " + target.name` and `length` shrinks by the number of
-        // prepended arguments, never below zero.
-        let target_name = self
-            .realm
-            .get_property(target, "name")
-            .map(|value| value.to_js_string())
-            .unwrap_or_default();
-        let target_length = match self.realm.get_property(target, "length") {
-            Some(JsValue::Number(number)) => number.floor().max(0.0) as usize,
-            _ => 0,
+            .bound_callable(target, bound_receiver, bound_arguments);
+        let metadata = |value: JsValue| PropertyDescriptor {
+            value,
+            writable: false,
+            getter: None,
+            setter: None,
+            enumerable: false,
+            configurable: true,
         };
-        let length = target_length.saturating_sub(bound_arguments.len());
         self.realm
-            .install_function_metadata(bound, &format!("bound {target_name}"), length);
+            .define_property(bound, "length", metadata(JsValue::Number(length)));
+        self.realm.define_property(
+            bound,
+            "name",
+            metadata(JsValue::String(format!("bound {target_name}"))),
+        );
         Ok(JsValue::Object(bound))
     }
 
@@ -6010,7 +6026,11 @@ impl JsRuntime {
     }
 
     pub(super) fn is_callable_object(object: ObjectId, realm: &Realm) -> bool {
-        realm.host(object).is_some_and(|host| host.is_callable())
+        match realm.host(object) {
+            // A proxy is callable exactly when its target is (ECMA-262 10.5.12).
+            Some(ObjectHost::Proxy { target, .. }) => Self::is_callable_object(target, realm),
+            host => host.is_some_and(|host| host.is_callable()),
+        }
     }
 
     /// Accept an object receiver for member access, wrapping primitives that

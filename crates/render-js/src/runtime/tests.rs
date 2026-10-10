@@ -2293,7 +2293,11 @@ fn to_primitive_and_has_instance_hooks_participate() {
                 results.push(boxed * 1 === 'prim:default' * 1 || typeof (boxed * 1) === 'number');
                 results.push(`${boxed}` === 'prim:string');
                 classLike = function () {};
-                classLike[Symbol.hasInstance] = function (v) { return v === 'member'; };
+                // `Function.prototype[Symbol.hasInstance]` is non-writable, so a
+                // plain assignment would be ignored; define the own hook instead.
+                Object.defineProperty(classLike, Symbol.hasInstance, {
+                    value: function (v) { return v === 'member'; }
+                });
                 results.push('member' instanceof classLike);
                 results.push(!('other' instanceof classLike));
                 results.join(',');

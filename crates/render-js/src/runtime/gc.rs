@@ -251,7 +251,9 @@ pub(super) fn mark_host(
         ObjectHost::Blob { .. } | ObjectHost::BlobConstructor | ObjectHost::ProxyConstructor => {}
         ObjectHost::Proxy { target, handler } => {
             mark_object(runtime, marked, work, marked_environments, *target);
-            mark_object(runtime, marked, work, marked_environments, *handler);
+            if let Some(handler) = handler {
+                mark_object(runtime, marked, work, marked_environments, *handler);
+            }
         }
         ObjectHost::VideoElement(state) => {
             // Pending `play()` promises stay reachable until the media load

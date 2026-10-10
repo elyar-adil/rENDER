@@ -44,19 +44,19 @@ pub(in crate::runtime) enum PropertyName {
 /// the descriptor object does not have it, so an absent field is told apart
 /// from one that is explicitly `undefined`.
 #[derive(Clone, Default)]
-struct PartialDescriptor {
-    value: Option<JsValue>,
-    writable: Option<bool>,
-    get: AccessorField,
-    set: AccessorField,
-    enumerable: Option<bool>,
-    configurable: Option<bool>,
+pub(in crate::runtime) struct PartialDescriptor {
+    pub(in crate::runtime) value: Option<JsValue>,
+    pub(in crate::runtime) writable: Option<bool>,
+    pub(in crate::runtime) get: AccessorField,
+    pub(in crate::runtime) set: AccessorField,
+    pub(in crate::runtime) enumerable: Option<bool>,
+    pub(in crate::runtime) configurable: Option<bool>,
 }
 
 /// A `get` or `set` field of a `ToPropertyDescriptor` result: absent, or present
 /// with a function or with `undefined`.
 #[derive(Clone, Copy, Default)]
-enum AccessorField {
+pub(in crate::runtime) enum AccessorField {
     #[default]
     Absent,
     Present(Option<ObjectId>),
@@ -188,7 +188,7 @@ impl JsRuntime {
                 self.object_get_own_property_names(dom, arguments)
             }
             NativeFunction::ObjectGetPrototypeOf => self.object_get_prototype_of(dom, arguments),
-            NativeFunction::ObjectSetPrototypeOf => self.object_set_prototype_of(arguments),
+            NativeFunction::ObjectSetPrototypeOf => self.object_set_prototype_of(dom, arguments),
             NativeFunction::ObjectHasOwn => self.object_has_own(dom, arguments),
             NativeFunction::ObjectPrototypeHasOwnProperty => {
                 self.object_prototype_has_own_property(dom, receiver, arguments)
@@ -559,49 +559,27 @@ impl JsRuntime {
     }
 
     /// `[[PreventExtensions]]`, through the proxy trap when there is one.
-    fn prevent_extensions_value(
+    pub(in crate::runtime) fn prevent_extensions_value(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
     ) -> Result<bool, JsError> {
-        match self.realm.host(object) {
-            Some(ObjectHost::Proxy { target, handler }) => {
-                match self.proxy_trap(dom, handler, "preventExtensions")? {
-                    Some(trap) => {
-                        let result = self.call_with_this(
-                            dom,
-                            trap,
-                            &[JsValue::Object(target)],
-                            JsValue::Object(handler),
-                        )?;
-                        Ok(result.is_truthy())
-                    }
-                    None => self.prevent_extensions_value(dom, target),
-                }
-            }
-            _ => Ok(self.realm.prevent_extensions(object)),
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_prevent_extensions(dom, object);
         }
+        Ok(self.realm.prevent_extensions(object))
     }
 
     /// `[[IsExtensible]]`, through the proxy trap when there is one.
-    fn is_extensible_value(&mut self, dom: &mut Dom, object: ObjectId) -> Result<bool, JsError> {
-        match self.realm.host(object) {
-            Some(ObjectHost::Proxy { target, handler }) => {
-                match self.proxy_trap(dom, handler, "isExtensible")? {
-                    Some(trap) => {
-                        let result = self.call_with_this(
-                            dom,
-                            trap,
-                            &[JsValue::Object(target)],
-                            JsValue::Object(handler),
-                        )?;
-                        Ok(result.is_truthy())
-                    }
-                    None => self.is_extensible_value(dom, target),
-                }
-            }
-            _ => Ok(self.realm.is_extensible(object)),
+    pub(in crate::runtime) fn is_extensible_value(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<bool, JsError> {
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_is_extensible(dom, object);
         }
+        Ok(self.realm.is_extensible(object))
     }
 
     /// Whether `object` is an Array exotic object, looking through proxies
@@ -867,10 +845,7 @@ impl JsRuntime {
         object: ObjectId,
         key: &str,
     ) -> Result<bool, JsError> {
-        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
-            return self.proxy_has(dom, object, key);
-        }
-        Ok(self.realm.get_descriptor(object, key).is_some())
+        self.has_property_value(dom, object, &PropertyName::String(key.to_owned()))
     }
 
     /// `[[Get]]` of a field of a descriptor object, for a string or symbol key.
@@ -965,7 +940,7 @@ impl JsRuntime {
     /// the descriptor has it through `HasProperty`, so an inherited field counts
     /// too; its value is read with [[Get]], so an accessor runs. An absent field
     /// stays `None` so the caller can keep the current value.
-    fn to_property_descriptor(
+    pub(in crate::runtime) fn to_property_descriptor(
         &mut self,
         dom: &mut Dom,
         descriptor: ObjectId,
@@ -1063,7 +1038,7 @@ impl JsRuntime {
     /// ECMA-262 10.1.6 `[[DefineOwnProperty]]`, dispatched on the exotic kind
     /// of `object`: a proxy runs its `defineProperty` trap, an Array runs
     /// 10.4.2.1, and anything else is ordinary.
-    fn define_own_property(
+    pub(in crate::runtime) fn define_own_property(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
@@ -1222,40 +1197,12 @@ impl JsRuntime {
         Ok(true)
     }
 
-    /// ECMA-262 10.5.5 `[[DefineOwnProperty]]` for a proxy: the `defineProperty`
-    /// trap decides, and without one the define goes to the target.
-    fn proxy_define_own_property(
-        &mut self,
-        dom: &mut Dom,
-        proxy: ObjectId,
-        key: &PropertyName,
-        partial: PartialDescriptor,
-    ) -> Result<bool, JsError> {
-        let (target, handler) = self.proxy_parts(proxy)?;
-        let Some(trap) = self.proxy_trap(dom, handler, "defineProperty")? else {
-            return self.define_own_property(dom, target, key, partial);
-        };
-        let descriptor = self.partial_descriptor_object(partial);
-        let key_value = match key {
-            PropertyName::String(name) => JsValue::String(name.clone()),
-            PropertyName::Symbol(symbol) => JsValue::Symbol(symbol.clone()),
-        };
-        let result = self.call_with_this(
-            dom,
-            trap,
-            &[
-                JsValue::Object(target),
-                key_value,
-                JsValue::Object(descriptor),
-            ],
-            JsValue::Object(handler),
-        )?;
-        Ok(result.is_truthy())
-    }
-
     /// ECMA-262 6.2.6.4 `FromPropertyDescriptor` for a partial descriptor: only
     /// the fields it has become properties of the object.
-    fn partial_descriptor_object(&mut self, partial: PartialDescriptor) -> ObjectId {
+    pub(in crate::runtime) fn partial_descriptor_object(
+        &mut self,
+        partial: PartialDescriptor,
+    ) -> ObjectId {
         let object = self.realm.create_ordinary_object();
         if let Some(value) = partial.value {
             self.realm.set_property(object, "value".to_owned(), value);
@@ -1289,33 +1236,19 @@ impl JsRuntime {
 
     /// ECMA-262 10.1.5 `[[GetOwnProperty]]` for either key kind, through the
     /// proxy `getOwnPropertyDescriptor` trap for string keys.
-    fn own_descriptor(
+    pub(in crate::runtime) fn own_descriptor(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
         key: &PropertyName,
     ) -> Result<Option<PropertyDescriptor>, JsError> {
-        match key {
-            PropertyName::String(name) => self.proxy_get_own_property_descriptor(dom, object, name),
-            PropertyName::Symbol(symbol) => {
-                let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) else {
-                    return Ok(self.realm.own_symbol_property(object, symbol));
-                };
-                let Some(trap) = self.proxy_trap(dom, handler, "getOwnPropertyDescriptor")? else {
-                    return self.own_descriptor(dom, target, key);
-                };
-                let value = self.call_with_this(
-                    dom,
-                    trap,
-                    &[JsValue::Object(target), JsValue::Symbol(symbol.clone())],
-                    JsValue::Object(handler),
-                )?;
-                if matches!(value, JsValue::Undefined) {
-                    return Ok(None);
-                }
-                self.property_descriptor_from_value(&value).map(Some)
-            }
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_get_own_property(dom, object, key);
         }
+        Ok(match key {
+            PropertyName::String(name) => self.realm.own_property(object, name),
+            PropertyName::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
+        })
     }
 
     /// The string keys of `[[OwnPropertyKeys]]`, in order.
@@ -1332,35 +1265,13 @@ impl JsRuntime {
 
     /// ECMA-262 10.1.11 `[[OwnPropertyKeys]]`: the string keys in order, then
     /// the symbol keys. A proxy answers through its `ownKeys` trap.
-    fn own_property_keys(
+    pub(in crate::runtime) fn own_property_keys(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
     ) -> Result<Vec<PropertyName>, JsError> {
-        if let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) {
-            let Some(trap) = self.proxy_trap(dom, handler, "ownKeys")? else {
-                return self.own_property_keys(dom, target);
-            };
-            let result = self.call_with_this(
-                dom,
-                trap,
-                &[JsValue::Object(target)],
-                JsValue::Object(handler),
-            )?;
-            // CreateListFromArrayLike(trapResult, « String, Symbol »).
-            let mut keys = Vec::new();
-            for value in self.iterate_values(dom, &result)? {
-                keys.push(match value {
-                    JsValue::String(name) => PropertyName::String(name),
-                    JsValue::Symbol(symbol) => PropertyName::Symbol(symbol),
-                    _ => {
-                        return Err(JsError::type_error(
-                            "proxy ownKeys trap returned a non-property key",
-                        ));
-                    }
-                });
-            }
-            return Ok(keys);
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_own_property_keys(dom, object);
         }
         let mut keys = self
             .realm
@@ -1381,28 +1292,13 @@ impl JsRuntime {
 
     /// ECMA-262 10.1.1 `[[GetPrototypeOf]]`, through the proxy trap when there
     /// is one.
-    fn prototype_of(
+    pub(in crate::runtime) fn prototype_of(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
     ) -> Result<Option<ObjectId>, JsError> {
-        if let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) {
-            let Some(trap) = self.proxy_trap(dom, handler, "getPrototypeOf")? else {
-                return self.prototype_of(dom, target);
-            };
-            let result = self.call_with_this(
-                dom,
-                trap,
-                &[JsValue::Object(target)],
-                JsValue::Object(handler),
-            )?;
-            return match result {
-                JsValue::Object(prototype) => Ok(Some(prototype)),
-                JsValue::Null => Ok(None),
-                _ => Err(JsError::type_error(
-                    "getPrototypeOf trap returned neither object nor null",
-                )),
-            };
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            return self.proxy_get_prototype_of(dom, object);
         }
         Ok(self.realm.object(object).and_then(JsObject::prototype))
     }
@@ -1428,11 +1324,9 @@ impl JsRuntime {
         let mut inherited = None;
         let mut holder = Some(object);
         while let Some(current) = holder {
-            if let (PropertyName::String(name), Some(ObjectHost::Proxy { .. })) =
-                (key, self.realm.host(current))
-            {
-                self.proxy_set(dom, current, name, value)?;
-                return Ok(true);
+            if matches!(self.realm.host(current), Some(ObjectHost::Proxy { .. })) {
+                // The proxy's [[Set]] receives the original object as receiver.
+                return self.proxy_set_property(dom, current, key, value, JsValue::Object(object));
             }
             if let Some(descriptor) = self.own_descriptor(dom, current, key)? {
                 inherited = Some(descriptor);
@@ -1476,7 +1370,10 @@ impl JsRuntime {
     }
 
     /// ECMA-262 6.2.6.4 `FromPropertyDescriptor` for a complete descriptor.
-    fn from_property_descriptor(&mut self, descriptor: &PropertyDescriptor) -> ObjectId {
+    pub(in crate::runtime) fn from_property_descriptor(
+        &mut self,
+        descriptor: &PropertyDescriptor,
+    ) -> ObjectId {
         let result = self.realm.create_ordinary_object();
         if descriptor.is_accessor() {
             for (name, slot) in [("get", descriptor.getter), ("set", descriptor.setter)] {
@@ -1584,6 +1481,7 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn object_set_prototype_of(
         &mut self,
+        dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let target = required_argument(arguments, 0, "Object.setPrototypeOf")?.clone();
@@ -1600,7 +1498,7 @@ impl JsRuntime {
         let JsValue::Object(object) = target else {
             return Ok(target);
         };
-        if self.realm.set_prototype(object, prototype) {
+        if self.set_prototype_of_value(dom, object, prototype)? {
             Ok(JsValue::Object(object))
         } else {
             Err(JsError::type_error("cannot set prototype"))

@@ -162,7 +162,9 @@ impl JsRuntime {
             | NativeFunction::ReflectGetPrototypeOf
             | NativeFunction::ReflectSetPrototypeOf
             | NativeFunction::ReflectIsExtensible
-            | NativeFunction::ReflectPreventExtensions => {
+            | NativeFunction::ReflectPreventExtensions
+            | NativeFunction::ProxyRevocable
+            | NativeFunction::ProxyRevoke => {
                 self.dispatch_proxy_native(dom, function, receiver, arguments)
             }
             NativeFunction::StorageGetItem
@@ -579,6 +581,7 @@ impl JsRuntime {
             | NativeFunction::FunctionToString
             | NativeFunction::FunctionCall
             | NativeFunction::FunctionApply
+            | NativeFunction::FunctionHasInstance
             | NativeFunction::FunctionBind => {
                 unreachable!("Function prototype methods use arbitrary receivers")
             }

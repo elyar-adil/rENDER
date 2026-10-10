@@ -824,6 +824,7 @@ pub(crate) enum NativeFunction {
     FunctionCall,
     FunctionBind,
     FunctionApply,
+    FunctionHasInstance,
     DateSetTime,
     DateGetFullYear,
     DateGetMonth,
@@ -1048,6 +1049,8 @@ pub(crate) enum NativeFunction {
     ReflectSetPrototypeOf,
     ReflectIsExtensible,
     ReflectPreventExtensions,
+    ProxyRevocable,
+    ProxyRevoke,
     ResponseText,
     ResponseJson,
     ResponseHeadersGet,
@@ -1953,9 +1956,11 @@ pub(crate) enum ObjectHost {
     },
     BlobConstructor,
     ProxyConstructor,
+    /// A Proxy exotic object. `handler` is `None` once the proxy is revoked;
+    /// `target` stays so the proxy keeps the callability it was created with.
     Proxy {
         target: ObjectId,
-        handler: ObjectId,
+        handler: Option<ObjectId>,
     },
     /// The `Video` (`HTMLVideoElement`) constructor object.
     VideoConstructor,
@@ -6541,6 +6546,23 @@ impl Realm {
         );
     }
 
+    /// The `name` or `length` slot of a built-in function: non-writable,
+    /// non-enumerable and configurable (ECMA-262 10.2.9 and 10.2.10).
+    fn function_metadata_slot(value: JsValue) -> PropertyDescriptor {
+        PropertyDescriptor {
+            value,
+            writable: false,
+            getter: None,
+            setter: None,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Function and its prototype methods install together"
+    )]
     fn install_function(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -6552,15 +6574,20 @@ impl Realm {
             host: ObjectHost::NativeFunction(NativeFunction::FunctionPrototype),
             ..JsObject::default()
         });
+        // ECMA-262 20.2.3: `Function.prototype` is itself a function named "" of length 0.
+        objects[prototype.0].properties.insert(
+            "length".to_owned(),
+            Self::function_metadata_slot(JsValue::Number(0.0)),
+        );
         objects[prototype.0].properties.insert(
             "name".to_owned(),
-            PropertyDescriptor::builtin(JsValue::String(String::new())),
+            Self::function_metadata_slot(JsValue::String(String::new())),
         );
-        for (name, function) in [
-            ("toString", NativeFunction::FunctionToString),
-            ("call", NativeFunction::FunctionCall),
-            ("bind", NativeFunction::FunctionBind),
-            ("apply", NativeFunction::FunctionApply),
+        for (name, function, length) in [
+            ("toString", NativeFunction::FunctionToString, 0.0),
+            ("call", NativeFunction::FunctionCall, 1.0),
+            ("bind", NativeFunction::FunctionBind, 1.0),
+            ("apply", NativeFunction::FunctionApply, 2.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -6568,6 +6595,14 @@ impl Realm {
                 host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                Self::function_metadata_slot(JsValue::Number(length)),
+            );
+            objects[method.0].properties.insert(
+                "name".to_owned(),
+                Self::function_metadata_slot(JsValue::String(name.to_owned())),
+            );
             objects[prototype.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
@@ -6580,6 +6615,37 @@ impl Realm {
                 },
             );
         }
+        // ECMA-262 20.2.3.6 `Function.prototype[@@hasInstance]`: non-writable,
+        // non-enumerable and non-configurable, named "[Symbol.hasInstance]".
+        let has_instance = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::FunctionHasInstance),
+            ..JsObject::default()
+        });
+        objects[has_instance.0].properties.insert(
+            "length".to_owned(),
+            Self::function_metadata_slot(JsValue::Number(1.0)),
+        );
+        objects[has_instance.0].properties.insert(
+            "name".to_owned(),
+            Self::function_metadata_slot(JsValue::String("[Symbol.hasInstance]".to_owned())),
+        );
+        let symbol = JsSymbol::well_known("@@hasInstance");
+        objects[prototype.0].symbols.insert(
+            symbol.id(),
+            (
+                symbol,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::Object(has_instance),
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            ),
+        );
         let function = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(prototype),
@@ -7067,6 +7133,28 @@ impl Realm {
         objects[global.0].properties.insert(
             "Proxy".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(proxy_constructor)),
+        );
+        // `Proxy.revocable` (ECMA-262 28.2.2.1) is a method of the constructor.
+        let revocable = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ProxyRevocable),
+            ..JsObject::default()
+        });
+        objects[revocable.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Number(2.0),
+                writable: false,
+                getter: None,
+                setter: None,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        objects[proxy_constructor.0].properties.insert(
+            "revocable".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(revocable)),
         );
 
         let reflect = ObjectId(objects.len());
@@ -7751,6 +7839,11 @@ impl Realm {
     #[must_use]
     pub(crate) const fn object_prototype(&self) -> ObjectId {
         self.object_prototype
+    }
+
+    /// The realm's `%Function.prototype%`.
+    pub(crate) const fn function_prototype(&self) -> ObjectId {
+        self.function_prototype
     }
 
     /// The realm's `%MediaQueryList.prototype%`, which `matchMedia` stamps onto

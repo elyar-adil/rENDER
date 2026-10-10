@@ -28,6 +28,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::object::{PartialDescriptor, PropertyName};
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
@@ -428,7 +429,13 @@ impl JsRuntime {
         value: JsValue,
     ) -> Result<(), JsError> {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
-            return self.proxy_set(dom, object, key, value);
+            let name = PropertyName::String(key.to_owned());
+            if !self.proxy_set_property(dom, object, &name, value, JsValue::Object(object))? {
+                return Err(JsError::type_error(format!(
+                    "proxy set trap refused property '{key}'"
+                )));
+            }
+            return Ok(());
         }
         if !self.ordinary_set_allowed(object, key) {
             return Err(JsError::type_error(format!(
@@ -534,47 +541,23 @@ impl JsRuntime {
         index: f64,
         value: JsValue,
     ) -> Result<(), JsError> {
-        // A Proxy's `[[DefineOwnProperty]]` is its `defineProperty` trap, which
-        // receives the descriptor this operation would define; without a trap the
-        // define goes to the target.
-        if let Some(ObjectHost::Proxy { target, handler }) = self.realm.host(object) {
-            return match self.get_member(dom, handler, "defineProperty")? {
-                JsValue::Undefined | JsValue::Null => {
-                    self.create_data_property_or_throw(dom, target, index, value)
-                }
-                JsValue::Object(trap) if Self::is_callable_object(trap, &self.realm) => {
-                    let descriptor = self
-                        .realm
-                        .create_object(Some(self.realm.object_prototype()));
-                    for (name, field) in [
-                        ("value", value),
-                        ("writable", JsValue::Boolean(true)),
-                        ("enumerable", JsValue::Boolean(true)),
-                        ("configurable", JsValue::Boolean(true)),
-                    ] {
-                        self.realm.set_property(descriptor, name.to_owned(), field);
-                    }
-                    let accepted = self.call_with_this(
-                        dom,
-                        trap,
-                        &[
-                            JsValue::Object(target),
-                            JsValue::String(index_key(index)),
-                            JsValue::Object(descriptor),
-                        ],
-                        JsValue::Object(handler),
-                    )?;
-                    if accepted.is_truthy() {
-                        Ok(())
-                    } else {
-                        Err(JsError::type_error(
-                            "proxy defineProperty trap refused the property",
-                        ))
-                    }
-                }
-                _ => Err(JsError::type_error(
-                    "proxy defineProperty trap is not callable",
-                )),
+        // CreateDataProperty (ECMA-262 7.3.7): `[[DefineOwnProperty]]` with a
+        // full data descriptor, which a Proxy answers through its trap.
+        if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
+            let key = PropertyName::String(index_key(index));
+            let partial = PartialDescriptor {
+                value: Some(value),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..PartialDescriptor::default()
+            };
+            return if self.define_own_property(dom, object, &key, partial)? {
+                Ok(())
+            } else {
+                Err(JsError::type_error(
+                    "proxy defineProperty trap refused the property",
+                ))
             };
         }
         let key = index_key(index);
