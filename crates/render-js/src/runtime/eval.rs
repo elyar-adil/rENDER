@@ -4692,12 +4692,18 @@ impl JsRuntime {
                 }
                 if let Some(index) = array_index(property) {
                     // ECMA-262 10.1.9.2: an accessor at this index, own or
-                    // inherited, runs its setter instead of storing a value.
-                    if self
+                    // inherited, runs its setter instead of storing a value; one
+                    // without a setter refuses the write.
+                    if let Some(accessor) = self
                         .realm
                         .get_descriptor(object, property)
-                        .is_some_and(|descriptor| descriptor.is_accessor())
+                        .filter(crate::value::PropertyDescriptor::is_accessor)
                     {
+                        if accessor.setter.is_none() {
+                            return Err(JsError::type_error(format!(
+                                "property {property:?} is not writable"
+                            )));
+                        }
                         return self.set_value(dom, object, property, value);
                     }
                     if !self.realm.set_property(object, property.to_owned(), value) {
