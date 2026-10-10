@@ -2385,6 +2385,41 @@ mod tests {
     }
 
     #[test]
+    fn a_boolean_with_no_argument_is_false_for_string_receivers() {
+        // ECMA-262 20.3.1.1: an absent value is `undefined`, which is falsy, so
+        // both `Boolean()` and `new Boolean` are false.
+        assert_eq!(run("String(Boolean())"), "false");
+        assert_eq!(run("String(new Boolean)"), "false");
+        assert_eq!(
+            run("var b = new Boolean; b.charAt = String.prototype.charAt; \
+                 b.charAt(false) + b.charAt(true) + b.charAt(2)"),
+            "fal"
+        );
+    }
+
+    #[test]
+    fn to_string_reads_accessor_to_primitive_and_to_string_through_get() {
+        // GetMethod(@@toPrimitive) runs the getter: an undefined result means
+        // there is no exotic method, so OrdinaryToPrimitive reads `toString` with
+        // [[Get]] too, and an accessor `toString` is called.
+        assert_eq!(
+            run(
+                "var calls = 0; var o = { get [Symbol.toPrimitive]() { calls++; return undefined; }, \
+                 get toString() { return function() { return 'x'; }; } }; \
+                 String.prototype.trim.call(o) + calls"
+            ),
+            "x1"
+        );
+        // An accessor that yields a method gets the hint as its argument.
+        assert_eq!(
+            run(
+                "String({ get [Symbol.toPrimitive]() { return function(hint) { return 'h:' + hint; }; } })"
+            ),
+            "h:string"
+        );
+    }
+
+    #[test]
     fn locale_case_methods_are_built_in_functions_that_are_not_constructors() {
         assert_eq!(run("'bJ'.toLocaleUpperCase()"), "BJ");
         assert_eq!(run("'BJ'.toLocaleLowerCase()"), "bj");

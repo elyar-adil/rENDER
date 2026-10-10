@@ -2683,25 +2683,26 @@ impl JsRuntime {
             _ => {}
         }
         // An exotic `Symbol.toPrimitive` method gets first refusal, called
-        // with the coercion hint; a primitive result short-circuits.
-        let exotic_method = self
+        // with the coercion hint; a primitive result short-circuits. The method
+        // is read with [[Get]]: an accessor is run as its getter, with the object
+        // as receiver, and the getter's result is the method.
+        let exotic_method = match self
             .realm
             .get_symbol_descriptor(object, &JsSymbol::well_known("@@toPrimitive"))
-            .map(|descriptor| {
-                if descriptor.is_accessor() {
-                    descriptor
-                        .getter
-                        .map_or(JsValue::Undefined, JsValue::Object)
-                } else {
-                    descriptor.value
-                }
-            });
+        {
+            None => JsValue::Undefined,
+            Some(descriptor) if descriptor.is_accessor() => match descriptor.getter {
+                Some(getter) => self.call_with_this(dom, getter, &[], JsValue::Object(object))?,
+                None => JsValue::Undefined,
+            },
+            Some(descriptor) => descriptor.value,
+        };
         // ECMA-262 7.1.1 `GetMethod`: `undefined` and `null` mean there is no
         // exotic method, and any other value must be callable or the
         // conversion throws.
         match exotic_method {
-            None | Some(JsValue::Undefined | JsValue::Null) => {}
-            Some(JsValue::Object(method)) if Self::is_callable_object(method, &self.realm) => {
+            JsValue::Undefined | JsValue::Null => {}
+            JsValue::Object(method) if Self::is_callable_object(method, &self.realm) => {
                 let invoked = self.call_with_this(
                     dom,
                     method,
@@ -2715,7 +2716,7 @@ impl JsRuntime {
                     "Cannot convert object to primitive value",
                 ));
             }
-            Some(_) => {
+            _ => {
                 return Err(JsError::type_error("Symbol.toPrimitive is not a function"));
             }
         }
@@ -2727,7 +2728,7 @@ impl JsRuntime {
             ["valueOf", "toString"]
         };
         for method in method_order {
-            let Some(JsValue::Object(callable)) = self.realm.get_property(object, method) else {
+            let JsValue::Object(callable) = self.get_member(dom, object, method)? else {
                 continue;
             };
             if !Self::is_callable_object(callable, &self.realm) {
@@ -5015,7 +5016,8 @@ impl JsRuntime {
                 Ok(JsValue::Object(self.realm.number_primitive_wrapper(number)))
             }
             Some(ObjectHost::BooleanConstructor) => {
-                let value = arguments.first().is_none_or(JsValue::is_truthy);
+                // ECMA-262 20.3.1.1: an absent value is `undefined`, which is falsy.
+                let value = arguments.first().is_some_and(JsValue::is_truthy);
                 self.ensure_heap_capacity(1)?;
                 Ok(JsValue::Object(self.realm.boolean_primitive_wrapper(value)))
             }
@@ -5305,7 +5307,7 @@ impl JsRuntime {
             })),
             Some(ObjectHost::BigIntConstructor) => self.bigint_function(dom, arguments),
             Some(ObjectHost::BooleanConstructor) => Ok(JsValue::Boolean(
-                arguments.first().is_none_or(JsValue::is_truthy),
+                arguments.first().is_some_and(JsValue::is_truthy),
             )),
             // `Date()` called as a function yields the current time string.
             Some(ObjectHost::DateConstructor) => {
