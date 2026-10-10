@@ -1397,6 +1397,8 @@ impl JsRuntime {
             ),
             NativeFunction::PromiseAll
             | NativeFunction::PromiseAllSettled
+            | NativeFunction::PromiseAllKeyed
+            | NativeFunction::PromiseAllSettledKeyed
             | NativeFunction::PromiseAny
             | NativeFunction::PromiseRace
             | NativeFunction::PromiseCombinatorFulfilled

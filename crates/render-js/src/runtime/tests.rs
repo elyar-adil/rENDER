@@ -3429,6 +3429,131 @@ fn a_combinator_adopts_a_thenable_that_is_not_a_promise() {
 }
 
 #[test]
+fn promise_all_keyed_keeps_input_key_order_whatever_order_values_settle_in() {
+    // The result is a null-prototype object whose keys follow the input, even
+    // though the second value settles first.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var resolveFirst, resolveSecond, out = 'pending';
+                var input = {
+                    first: new Promise(function (resolve) { resolveFirst = resolve; }),
+                    second: new Promise(function (resolve) { resolveSecond = resolve; })
+                };
+                Promise.allKeyed(input).then(function (result) {
+                    out = String(Object.getPrototypeOf(result) === null) + ':' +
+                        Object.keys(result).join(',') + ':' + result.first + result.second;
+                });
+                resolveSecond('b');
+                resolveFirst('a');
+            ",
+            "",
+            "out",
+        ),
+        "true:first,second:ab"
+    );
+}
+
+#[test]
+fn promise_all_keyed_reads_only_enumerable_keys_and_resolves_the_empty_input() {
+    // A non-enumerable getter is never called, and no key is copied from it.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending', empty = 'pending';
+                var input = { visible: 1 };
+                Object.defineProperty(input, 'hidden', {
+                    enumerable: false,
+                    configurable: true,
+                    get: function () { throw new Error('non-enumerable getter called'); }
+                });
+                Promise.allKeyed(input).then(function (result) {
+                    out = Object.keys(result).join(',') + '=' + result.visible;
+                });
+                Promise.allKeyed({}).then(function (result) {
+                    empty = String(Object.getPrototypeOf(result) === null) +
+                        Object.keys(result).length;
+                });
+            ",
+            "",
+            "out + '|' + empty",
+        ),
+        "visible=1|true0"
+    );
+}
+
+#[test]
+fn promise_all_settled_keyed_records_each_outcome_by_its_key() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                Promise.allSettledKeyed({
+                    ok: Promise.resolve(1),
+                    bad: Promise.reject(2),
+                    plain: 3
+                }).then(function (result) {
+                    out = result.ok.status + result.ok.value + ',' +
+                        result.bad.status + result.bad.reason + ',' +
+                        result.plain.status + result.plain.value;
+                });
+            ",
+            "",
+            "out",
+        ),
+        "fulfilled1,rejected2,fulfilled3"
+    );
+}
+
+#[test]
+fn promise_all_keyed_rejects_on_a_failed_value_and_on_a_non_object_input() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending', other = 'pending';
+                Promise.allKeyed({ a: 1, b: Promise.reject('no') }).then(
+                    function () { out = 'fulfilled'; },
+                    function (reason) { out = 'rejected:' + reason; }
+                );
+                Promise.allKeyed(5).then(null, function (error) {
+                    other = String(error instanceof TypeError);
+                });
+            ",
+            "",
+            "out + '|' + other",
+        ),
+        "rejected:no|true"
+    );
+}
+
+#[test]
+fn promise_all_keyed_reads_resolve_once_and_rejects_a_non_constructor_receiver_synchronously() {
+    assert_eq!(
+        settle_then_read(
+            r"
+                var reads = 0, out;
+                var original = Promise.resolve;
+                Object.defineProperty(Promise, 'resolve', {
+                    configurable: true,
+                    get: function () { reads += 1; return original; }
+                });
+                Promise.allKeyed({ a: 1, b: 2 });
+                out = 'reads=' + reads;
+                try {
+                    Promise.allKeyed.call(eval, {});
+                    out += ';no throw';
+                } catch (error) {
+                    out += ';' + (error instanceof TypeError ? 'TypeError' : 'other');
+                }
+            ",
+            "",
+            "out",
+        ),
+        "reads=1;TypeError"
+    );
+}
+
+#[test]
 fn promise_all_rejects_with_the_first_reason_and_still_settles_the_rest() {
     // The two halves are what `all` is for: one rejection decides the outcome,
     // and no element is left pending behind it.

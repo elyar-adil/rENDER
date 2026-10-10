@@ -113,6 +113,12 @@ impl JsRuntime {
             NativeFunction::PromiseAllSettled => {
                 self.promise_combinator(dom, Combinator::AllSettled, arguments)
             }
+            NativeFunction::PromiseAllKeyed => {
+                self.promise_keyed_combinator(dom, Combinator::All, receiver, arguments)
+            }
+            NativeFunction::PromiseAllSettledKeyed => {
+                self.promise_keyed_combinator(dom, Combinator::AllSettled, receiver, arguments)
+            }
             NativeFunction::PromiseAny => self.promise_combinator(dom, Combinator::Any, arguments),
             NativeFunction::PromiseRace => {
                 self.promise_combinator(dom, Combinator::Race, arguments)
@@ -160,6 +166,9 @@ mod store {
     pub(super) const SETTLED: &str = "s";
     pub(super) const KIND: &str = "k";
     pub(super) const COUNT: &str = "t";
+    /// Present only on a keyed combinator: maps each element index to the input key
+    /// its result is recorded under.
+    pub(super) const KEYS: &str = "y";
 }
 
 impl JsRuntime {
@@ -245,6 +254,120 @@ impl JsRuntime {
             }
         }
         Ok(result)
+    }
+
+    /// `Promise.allKeyed` and `Promise.allSettledKeyed`.
+    ///
+    /// The keyed forms walk the input's own enumerable string keys instead of an
+    /// iterable. Each value is read with `Get`, passed to the receiver's `resolve`,
+    /// and its `then` is invoked directly, so a value that is not a promise is
+    /// adopted the way `Promise.resolve` adopts it. Only the intrinsic `Promise`
+    /// constructor is accepted as the receiver: a subclass needs its capability
+    /// built by constructing it, which the promise store does not model yet.
+    fn promise_keyed_combinator(
+        &mut self,
+        dom: &mut Dom,
+        combinator: Combinator,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        // NewPromiseCapability(C) throws synchronously for a receiver that cannot
+        // be constructed; everything after it reports through the promise.
+        if !self.is_constructor(receiver) {
+            return Err(JsError::type_error(
+                "Promise combinators require a constructor as their receiver",
+            ));
+        }
+        let is_intrinsic = matches!(
+            self.realm.global("Promise"),
+            Some(JsValue::Object(constructor)) if constructor == receiver
+        );
+        if !is_intrinsic {
+            return Err(JsError::type_error(
+                "keyed Promise combinators on a subclass are not supported",
+            ));
+        }
+        let (capability, result) = self.create_promise()?;
+        // Any failure once the capability exists rejects it, as
+        // IfAbruptRejectPromise does, rather than throwing out of the call.
+        if let Err(error) =
+            self.walk_keyed_combinator(dom, combinator, receiver, capability, arguments)
+        {
+            let reason = self.rejection_reason(&error)?;
+            self.reject_promise(capability, &reason);
+        }
+        Ok(result)
+    }
+
+    fn walk_keyed_combinator(
+        &mut self,
+        dom: &mut Dom,
+        combinator: Combinator,
+        constructor: ObjectId,
+        capability: usize,
+        arguments: &[JsValue],
+    ) -> Result<(), JsError> {
+        // GetPromiseResolve(C) reads `resolve` once for the whole walk, before the
+        // input is checked, so a getter runs exactly once however many keys there are.
+        let resolve = match self.get_member(dom, constructor, "resolve")? {
+            JsValue::Object(function) if Self::is_callable_object(function, &self.realm) => {
+                function
+            }
+            _ => return Err(JsError::type_error("Promise.resolve is not callable")),
+        };
+        let JsValue::Object(input) = arguments.first().cloned().unwrap_or(JsValue::Undefined)
+        else {
+            return Err(JsError::type_error(
+                "Promise combinator input must be an object",
+            ));
+        };
+        let keys = self.proxy_own_keys(dom, input)?;
+        self.ensure_heap_capacity(3)?;
+        let results = self.realm.create_object(None);
+        let slots = self.realm.create_object(None);
+        // A sentinel count of one holds the walk open, so no element can settle
+        // the result before the last key is attached. The walk releases it below.
+        let store = self.new_combinator_store(combinator, capability, results, None, 1);
+        self.realm
+            .set_property(store, store::KEYS.to_owned(), JsValue::Object(slots));
+        let mut index = 0;
+        for key in keys {
+            // EnumerableOwnProperties: the descriptor is read before the value, so
+            // a non-enumerable accessor is never called.
+            let enumerable = self
+                .proxy_get_own_property_descriptor(dom, input, &key)?
+                .is_some_and(|descriptor| descriptor.enumerable);
+            if !enumerable {
+                continue;
+            }
+            let value = self.get_member(dom, input, &key)?;
+            // The key is claimed in the result before its value settles, so the
+            // result keeps the input's key order however the values arrive.
+            self.realm
+                .set_property(slots, index.to_string(), JsValue::String(key.clone()));
+            self.realm.set_property(results, key, JsValue::Undefined);
+            self.increment_combinator(store);
+            let next = self.call_with_this(dom, resolve, &[value], JsValue::Object(constructor))?;
+            let on_fulfilled = self.combinator_handler(store, index, true);
+            let on_rejected = self.combinator_handler(store, index, false);
+            // Invoke(next, "then", ...): a missing or non-callable `then` is a
+            // TypeError, which rejects the result. The array forms instead
+            // fulfil with a non-thenable element.
+            let next_object = self.to_object(&next)?;
+            let then = match self.get_member(dom, next_object, "then")? {
+                JsValue::Object(then) if Self::is_callable_object(then, &self.realm) => then,
+                _ => return Err(JsError::type_error("then is not a function")),
+            };
+            self.call_with_this(dom, then, &[on_fulfilled, on_rejected], next)?;
+            index += 1;
+        }
+        self.decrement_combinator(store);
+        if self.combinator_remaining(store) == 0
+            && let Some(results) = self.combinator_results(store)
+        {
+            self.resolve_combinator(store, &JsValue::Object(results));
+        }
+        Ok(())
     }
 
     /// A member of `value`, but only when it is callable.
@@ -470,9 +593,32 @@ impl JsRuntime {
     /// four combinators differ only in the rule they apply to it.
     fn record_combinator_result(&mut self, store: ObjectId, index: usize, value: JsValue) {
         if let Some(results) = self.combinator_results(store) {
-            self.realm.set_property(results, index.to_string(), value);
+            let slot = self.combinator_slot(store, index);
+            self.realm.set_property(results, slot, value);
         }
         self.decrement_combinator(store);
+    }
+
+    /// The property an element's result is recorded under: its index for the
+    /// array forms, and the input key it was attached under for the keyed forms.
+    fn combinator_slot(&self, store: ObjectId, index: usize) -> String {
+        if let Some(slots) = store_member(&self.realm, store, store::KEYS)
+            && let Some(JsValue::String(key)) = self.realm.get_property(slots, &index.to_string())
+        {
+            return key;
+        }
+        index.to_string()
+    }
+
+    /// Count one more outstanding element before its `then` is invoked, so the
+    /// walk's own sentinel and the elements settle against the same count.
+    fn increment_combinator(&mut self, store: ObjectId) {
+        let remaining = self.combinator_remaining(store);
+        self.realm.set_property(
+            store,
+            store::REMAINING.to_owned(),
+            JsValue::Number((remaining + 1) as f64),
+        );
     }
 
     fn record_combinator_error(&mut self, store: ObjectId, index: usize, reason: JsValue) {

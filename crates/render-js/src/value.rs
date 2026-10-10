@@ -938,6 +938,8 @@ pub(crate) enum NativeFunction {
     TypedArrayToStringTagGetter,
     PromiseAll,
     PromiseAllSettled,
+    PromiseAllKeyed,
+    PromiseAllSettledKeyed,
     PromiseAny,
     PromiseRace,
     /// One element of a combinator settling. Bound with the combinator's store
@@ -6947,6 +6949,56 @@ impl Realm {
         );
     }
 
+    /// The statics on `Promise`: `resolve`, `reject`, and the four combinators, plus
+    /// the two keyed combinators.
+    fn install_promise_statics(objects: &mut Vec<JsObject>, promise: ObjectId) {
+        for (name, function) in [
+            ("resolve", NativeFunction::PromiseResolve),
+            ("reject", NativeFunction::PromiseReject),
+            // The combinators take one argument each, which is what their
+            // `length` reports.
+            ("all", NativeFunction::PromiseAll),
+            ("allSettled", NativeFunction::PromiseAllSettled),
+            ("allKeyed", NativeFunction::PromiseAllKeyed),
+            ("allSettledKeyed", NativeFunction::PromiseAllSettledKeyed),
+            ("any", NativeFunction::PromiseAny),
+            ("race", NativeFunction::PromiseRace),
+        ] {
+            let method = ObjectId(objects.len());
+            let host = match function {
+                // The keyed forms read their receiver as the constructor they build
+                // a result for, so `this` must reach them rather than being bound
+                // to `Promise` as the other statics are.
+                NativeFunction::PromiseAllKeyed | NativeFunction::PromiseAllSettledKeyed => {
+                    ObjectHost::NativeFunction(function)
+                }
+                _ => ObjectHost::BoundFunction {
+                    function,
+                    receiver: promise,
+                },
+            };
+            objects.push(JsObject {
+                host,
+                ..JsObject::default()
+            });
+            objects[promise.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+            // Every static on this constructor takes one argument, and `length`
+            // reports that. Without it a feature-detection bundle reading
+            // `Promise.all.length` sees `undefined`. `length` is read-only (ECMA-262
+            // 10.2.9 SetFunctionLength), unlike the methods around it.
+            objects[method.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor {
+                    writable: false,
+                    ..PropertyDescriptor::builtin(JsValue::Number(1.0))
+                },
+            );
+        }
+    }
+
     fn install_promise(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -6996,36 +7048,7 @@ impl Realm {
                 configurable: false,
             },
         );
-        for (name, function) in [
-            ("resolve", NativeFunction::PromiseResolve),
-            ("reject", NativeFunction::PromiseReject),
-            // The four combinators take one argument each, which is what their
-            // `length` reports.
-            ("all", NativeFunction::PromiseAll),
-            ("allSettled", NativeFunction::PromiseAllSettled),
-            ("any", NativeFunction::PromiseAny),
-            ("race", NativeFunction::PromiseRace),
-        ] {
-            let method = ObjectId(objects.len());
-            objects.push(JsObject {
-                host: ObjectHost::BoundFunction {
-                    function,
-                    receiver: promise,
-                },
-                ..JsObject::default()
-            });
-            objects[promise.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(method)),
-            );
-            // Every static on this constructor takes one argument, and `length`
-            // reports that. Without it a feature-detection bundle reading
-            // `Promise.all.length` sees `undefined`.
-            objects[method.0].properties.insert(
-                "length".to_owned(),
-                PropertyDescriptor::builtin(JsValue::Number(1.0)),
-            );
-        }
+        Self::install_promise_statics(objects, promise);
         Self::install_aggregate_error(objects, global, function_prototype, error_prototype);
         // `Promise.prototype[Symbol.toStringTag] === "Promise"`
         {
