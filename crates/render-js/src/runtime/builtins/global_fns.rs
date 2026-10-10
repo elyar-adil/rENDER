@@ -232,6 +232,7 @@ impl JsRuntime {
             | NativeFunction::DataViewByteOffsetGetter
             | NativeFunction::ArrayBufferSlice
             | NativeFunction::ArrayBufferIsView
+            | NativeFunction::ArrayBufferSpecies
             | NativeFunction::ArrayBufferByteLengthGetter
             | NativeFunction::ArrayBufferResizableGetter
             | NativeFunction::ArrayBufferMaxByteLengthGetter
@@ -1498,6 +1499,7 @@ impl JsRuntime {
             | NativeFunction::TypedArrayToSorted
             | NativeFunction::TypedArrayWith
             | NativeFunction::TypedArrayBufferGetter
+            | NativeFunction::TypedArraySpecies
             | NativeFunction::TypedArrayLengthGetter
             | NativeFunction::TypedArrayByteLengthGetter
             | NativeFunction::TypedArrayByteOffsetGetter

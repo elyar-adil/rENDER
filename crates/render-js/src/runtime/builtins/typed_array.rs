@@ -120,6 +120,7 @@ impl JsRuntime {
                 self.typed_array_from(dom, receiver, kind, arguments)
             }
             NativeFunction::TypedArrayOf => self.typed_array_of(dom, receiver, arguments),
+            NativeFunction::TypedArraySpecies => Ok(JsValue::Object(receiver)),
             NativeFunction::TypedArrayBufferGetter => {
                 let (_, buffer, _, _) = self.typed_array_parts(receiver)?;
                 Ok(JsValue::Object(self.array_buffer_object(&buffer)?))
@@ -913,14 +914,14 @@ impl JsRuntime {
     }
 
     /// `%TypedArray%.prototype.keys()`: an iterator over the indices.
-    /// `%TypedArray%.prototype.keys()` (ECMA-262 23.2.3.19): ValidateTypedArray,
+    /// `%TypedArray%.prototype.keys()` (ECMA-262 23.2.3.19): `ValidateTypedArray`,
     /// then a live iterator.
     fn typed_array_keys(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         self.typed_array_host(receiver)?;
         self.array_view_iterator(receiver, ArrayView::Keys)
     }
 
-    /// `%TypedArray%.prototype.entries()` (ECMA-262 23.2.3.6): ValidateTypedArray,
+    /// `%TypedArray%.prototype.entries()` (ECMA-262 23.2.3.6): `ValidateTypedArray`,
     /// then a live iterator over `[index, value]`.
     fn typed_array_entries(&mut self, receiver: ObjectId) -> Result<JsValue, JsError> {
         self.typed_array_host(receiver)?;

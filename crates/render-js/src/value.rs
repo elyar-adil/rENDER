@@ -1132,6 +1132,9 @@ pub(crate) enum NativeFunction {
     ArrayBufferByteLengthGetter,
     /// `ArrayBuffer.isView(arg)` (ECMA-262 25.1.5.1).
     ArrayBufferIsView,
+    /// `get ArrayBuffer[@@species]` and `get %TypedArray%[@@species]`: `this`.
+    ArrayBufferSpecies,
+    TypedArraySpecies,
     /// The resizable-buffer surface of `ArrayBuffer.prototype` (ECMA-262 25.1.6):
     /// the `resizable`, `maxByteLength` and `detached` accessors, `resize`, and
     /// the two transfer methods.
@@ -3748,6 +3751,13 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        // §23.2.2.4: `get %TypedArray%[@@species]` returns `this`.
+        Self::install_species_getter(
+            objects,
+            function_prototype,
+            intrinsic,
+            NativeFunction::TypedArraySpecies,
+        );
         // §23.2.3: the prototype methods, with their `length`s.
         let methods: &[(&str, NativeFunction, f64)] = &[
             ("at", NativeFunction::TypedArrayAt, 1.0),
@@ -4085,6 +4095,13 @@ impl Realm {
         // `DataView(buffer [, byteOffset [, byteLength]])` both have a `length`
         // of 1.
         Self::install_length(objects, array_buffer_constructor, 1.0);
+        // §25.1.5.3: `get ArrayBuffer[@@species]` returns `this`.
+        Self::install_species_getter(
+            objects,
+            function_prototype,
+            array_buffer_constructor,
+            NativeFunction::ArrayBufferSpecies,
+        );
         // §25.1.5.1: `ArrayBuffer.isView` is a static, bound to the constructor
         // the way `Array.isArray` is.
         let is_view = ObjectId(objects.len());
@@ -4251,6 +4268,38 @@ impl Realm {
             ],
         );
         Self::install_length(objects, data_view_constructor, 1.0);
+    }
+
+    /// Give `constructor` a `get [Symbol.species]` accessor whose getter is
+    /// `getter`, a native that returns `this` (non-enumerable, configurable).
+    fn install_species_getter(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        constructor: ObjectId,
+        getter: NativeFunction,
+    ) {
+        let accessor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(getter),
+            properties: Self::function_metadata("get [Symbol.species]", 0.0),
+            ..JsObject::default()
+        });
+        let species = JsSymbol::well_known("@@species");
+        objects[constructor.0].symbols.insert(
+            species.id(),
+            (
+                species,
+                PropertyDescriptor {
+                    getter: Some(accessor),
+                    setter: None,
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
     }
 
     /// Give a built-in constructor or function its `length` own property

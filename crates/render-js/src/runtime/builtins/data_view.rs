@@ -276,6 +276,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::ArrayBufferSlice => self.array_buffer_slice(dom, receiver, arguments),
+            NativeFunction::ArrayBufferSpecies => Ok(JsValue::Object(receiver)),
             NativeFunction::ArrayBufferIsView => Ok(JsValue::Boolean(
                 self.is_array_buffer_view(arguments.first()),
             )),
@@ -1410,6 +1411,23 @@ return out.join(' | ');
 })()
             "),
             "arr live | 2 | 3 | false | done stays | false |  | keys | 0 | 1 | true | entries | 0:x | true | ta values | 1,2,true | for-of resized | 1,2,0,0,0,0 | fixed keys oob | TypeError | entries len | 0:1 | values oob at creation | TypeError | TypeError | grow visit | 0 | 0 | false | array-like done | true | spread | 0,0,0 | from iterable | 0:5 1:6"
+        );
+    }
+
+    /// `ArrayBuffer[@@species]` and `%TypedArray%[@@species]` are accessors that
+    /// return `this` (ECMA-262 23.2.2.4, 25.1.5.3). Measured against Node v22.
+    #[test]
+    fn the_species_getters_return_their_receiver() {
+        assert_eq!(
+            run(r"
+var TA = Object.getPrototypeOf(Uint8Array);
+var d = Object.getOwnPropertyDescriptor(ArrayBuffer, Symbol.species);
+[ArrayBuffer[Symbol.species] === ArrayBuffer,
+ TA[Symbol.species] === TA,
+ Uint8Array[Symbol.species] === Uint8Array,
+ typeof d.get, d.set === undefined, d.get.name, d.get.length].join('|')
+            "),
+            "true|true|true|function|true|get [Symbol.species]|0"
         );
     }
 
