@@ -1546,6 +1546,58 @@ return out.join(' | ');
         );
     }
 
+    /// `map`, `filter`, `slice` and `subarray` build their results through
+    /// `TypedArraySpeciesCreate` (ECMA-262 23.2.4.1): the species constructor is
+    /// consulted, its result is validated, and a null species falls back to the
+    /// receiver's own kind. Measured against Node v22.
+    #[test]
+    fn typed_array_methods_build_their_results_through_the_species_constructor() {
+        assert_eq!(
+            run(r"
+(function () {
+var out = [];
+function thrown(fn) { try { fn(); return 'none'; } catch (e) { return e.constructor.name; } }
+var ta = new Int16Array([1, 2, 3, 4]);
+out.push(ta.map(function (x) { return x * 2; }).join(','), ta.filter(function (x) { return x % 2; }).join(','), ta.slice(1, 3).join(','), ta.subarray(1).length);
+var a = new Int8Array([1, 2, 3]);
+var c = {};
+c[Symbol.species] = Uint8Array;
+a.constructor = c;
+var m = a.map(function (x) { return x * 10; });
+out.push(m instanceof Uint8Array, m.join(','), a.slice(0, 2) instanceof Uint8Array, a.filter(function () { return true; }).join(','));
+var d = {};
+d[Symbol.species] = function () { return {}; };
+a.constructor = d;
+out.push('not typed', thrown(function () { a.slice(0, 1); }));
+var e = {};
+e[Symbol.species] = function () { return new Uint8Array(1); };
+a.constructor = e;
+out.push('too short', thrown(function () { a.slice(0, 3); }), 'short ok', a.slice(0, 1).length);
+var f = {};
+f[Symbol.species] = Math.max;
+a.constructor = f;
+out.push('not ctor', thrown(function () { a.map(function (x) { return x; }); }));
+var g = {};
+g[Symbol.species] = BigInt64Array;
+a.constructor = g;
+out.push('bigint mix', thrown(function () { a.slice(0, 1); }));
+var h = {};
+h[Symbol.species] = null;
+a.constructor = h;
+out.push('null species', a.slice(0, 2).constructor === Int8Array);
+var s = new Int16Array(new ArrayBuffer(8));
+var k = {};
+k[Symbol.species] = Uint8Array;
+s.constructor = k;
+var sub = s.subarray(1, 4);
+out.push('subarray species', sub instanceof Uint8Array, sub.length, sub.byteOffset, sub.buffer === s.buffer);
+return out.join(' | ');
+})()
+            "),
+            "2,4,6,8 | 1,3 | 2,3 | 3 | true | 10,20,30 | true | 1,2,3 | not typed | TypeError | too short | TypeError | short ok | 1 | not ctor | TypeError | bigint mix | TypeError | null species | true | subarray species | true | 3 | 2 | true"
+        );
+    }
+
     /// `fill` converts its value and range before it writes, and those conversions
     /// can resize the buffer: a fixed-length view that is now out of bounds is a
     /// `TypeError`, and a length-tracking view clamps its end to the new length

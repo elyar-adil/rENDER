@@ -15,6 +15,7 @@
 
 use super::array::callback_this_argument;
 use crate::JsError;
+use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
@@ -613,9 +614,84 @@ impl JsRuntime {
             })
     }
 
+    /// `TypedArraySpeciesCreate(exemplar, argumentList)` (ECMA-262 23.2.4.1): the
+    /// result of `new` on the exemplar's species constructor. That result must be
+    /// a typed array in bounds, of the exemplar's content type, and at least as
+    /// long as a single length argument. The default constructor is the intrinsic
+    /// for `kind`, which is what an absent or null species falls back to.
+    pub(in crate::runtime) fn typed_array_species_create(
+        &mut self,
+        dom: &mut Dom,
+        exemplar: ObjectId,
+        kind: TypedArrayKind,
+        arguments: &[JsValue],
+    ) -> Result<ObjectId, JsError> {
+        // SpeciesConstructor (ECMA-262 7.3.22).
+        let default = self
+            .realm
+            .global(kind.name())
+            .and_then(|value| match value {
+                JsValue::Object(constructor) => Some(constructor),
+                _ => None,
+            });
+        let species = match self.get_member(dom, exemplar, "constructor")? {
+            JsValue::Undefined => default,
+            JsValue::Object(constructor) => {
+                match self.get_symbol_value(dom, constructor, &JsSymbol::well_known("@@species"))? {
+                    JsValue::Undefined | JsValue::Null => default,
+                    JsValue::Object(species) if self.is_constructor(species) => Some(species),
+                    _ => return Err(JsError::type_error("species is not a constructor")),
+                }
+            }
+            _ => return Err(JsError::type_error("constructor is not an object")),
+        };
+        let Some(species) = species else {
+            return Err(JsError::type_error("no default typed-array constructor"));
+        };
+        // TypedArrayCreateFromConstructor (ECMA-262 23.2.4.2).
+        let JsValue::Object(result) = self.construct(dom, species, arguments)? else {
+            return Err(JsError::type_error(
+                "species constructor returned a primitive",
+            ));
+        };
+        let (result_kind, _, _, length) = self.typed_array_host(result)?;
+        if result_kind.is_bigint() != kind.is_bigint() {
+            return Err(JsError::type_error(
+                "cannot mix BigInt and other types in typed array copies",
+            ));
+        }
+        if let [JsValue::Number(requested)] = arguments
+            && (length as f64) < *requested
+        {
+            return Err(JsError::type_error(
+                "species constructor returned a typed array that is too short",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// `Set(target, index, value, true)` on a typed array (ECMA-262 10.4.5.5):
+    /// the value converts to the target's element type, and an index past the
+    /// target's current length is ignored.
+    pub(in crate::runtime) fn typed_array_set_index(
+        &mut self,
+        dom: &mut Dom,
+        target: ObjectId,
+        index: usize,
+        value: &JsValue,
+    ) -> Result<(), JsError> {
+        let (kind, buffer, start, length) = self.typed_array_parts(target)?;
+        let converted = self.typed_element_value(dom, kind, value)?;
+        if length.is_some_and(|length| index < length) {
+            buffer.set_converted_element(kind, start + index, &converted);
+        }
+        Ok(())
+    }
+
     /// `%TypedArray%.prototype.subarray` (ECMA-262 23.2.3.30). An out-of-bounds
     /// receiver has length zero rather than throwing, and a length-tracking
-    /// receiver with no `end` gives a length-tracking result.
+    /// receiver with no `end` gives a length-tracking result. The view comes from
+    /// `TypedArraySpeciesCreate`, over the same buffer.
     pub(in crate::runtime) fn typed_array_subarray(
         &mut self,
         dom: &mut Dom,
@@ -629,18 +705,22 @@ impl JsRuntime {
             Some(ObjectHost::TypedArray { length: None, .. })
         );
         let end_is_absent = matches!(arguments.get(1), None | Some(JsValue::Undefined));
-        let length = (!(tracking && end_is_absent)).then_some(end - begin);
-        self.ensure_heap_capacity(1)?;
-        let prototype = self.typed_array_derived_prototype(receiver);
-        Ok(JsValue::Object(self.realm.typed_array(
-            kind,
-            buffer,
-            start + begin,
-            length,
-            prototype,
-        )))
+        let begin_byte = (start + begin) * kind.element_size();
+        let mut args = vec![
+            JsValue::Object(self.array_buffer_object(&buffer)?),
+            JsValue::Number(begin_byte as f64),
+        ];
+        if !(tracking && end_is_absent) {
+            args.push(JsValue::Number((end - begin) as f64));
+        }
+        Ok(JsValue::Object(
+            self.typed_array_species_create(dom, receiver, kind, &args)?,
+        ))
     }
 
+    /// `%TypedArray%.prototype.slice(start, end)` (ECMA-262 23.2.3.27): the copy
+    /// is made through `TypedArraySpeciesCreate` with the element count, and each
+    /// element is stored through `Set`.
     pub(in crate::runtime) fn typed_array_slice(
         &mut self,
         dom: &mut Dom,
@@ -649,9 +729,14 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, _, _, length) = self.typed_array_host(receiver)?;
         let (begin, end) = self.typed_range(dom, arguments, length)?;
-        let elements = self.typed_array_elements(receiver)?;
-        let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_elements(kind, &elements[begin..end], prototype)
+        let count = end - begin;
+        let result =
+            self.typed_array_species_create(dom, receiver, kind, &[JsValue::Number(count as f64)])?;
+        for offset in 0..count {
+            let value = self.typed_array_get_index(receiver, begin + offset);
+            self.typed_array_set_index(dom, result, offset, &value)?;
+        }
+        Ok(JsValue::Object(result))
     }
 
     /// The half-open element range `[begin, end)` that `subarray` and `slice`
@@ -872,7 +957,19 @@ impl JsRuntime {
         map: bool,
     ) -> Result<JsValue, JsError> {
         let (kind, _, _, length) = self.typed_array_host(receiver)?;
-        let mut output = Vec::new();
+        // `map` creates its result before the visits, and `filter` creates its
+        // result once the kept count is known (ECMA-262 23.2.3.21 and 23.2.3.10).
+        let mapped_result = if map {
+            Some(self.typed_array_species_create(
+                dom,
+                receiver,
+                kind,
+                &[JsValue::Number(length as f64)],
+            )?)
+        } else {
+            None
+        };
+        let mut kept = Vec::new();
         for index in 0..length {
             let element = self.typed_array_get_index(receiver, index);
             let mapped = self.call_with_this(
@@ -885,14 +982,25 @@ impl JsRuntime {
                 ],
                 this_argument.clone(),
             )?;
-            if map {
-                output.push(self.typed_element_value(dom, kind, &mapped)?);
+            if let Some(result) = mapped_result {
+                self.typed_array_set_index(dom, result, index, &mapped)?;
             } else if mapped.is_truthy() {
-                output.push(element);
+                kept.push(element);
             }
         }
-        let prototype = self.typed_array_derived_prototype(receiver);
-        self.create_typed_array_from_elements(kind, &output, prototype)
+        if let Some(result) = mapped_result {
+            return Ok(JsValue::Object(result));
+        }
+        let result = self.typed_array_species_create(
+            dom,
+            receiver,
+            kind,
+            &[JsValue::Number(kept.len() as f64)],
+        )?;
+        for (index, value) in kept.iter().enumerate() {
+            self.typed_array_set_index(dom, result, index, value)?;
+        }
+        Ok(JsValue::Object(result))
     }
 
     pub(in crate::runtime) fn typed_array_join(
