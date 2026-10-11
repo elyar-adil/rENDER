@@ -354,6 +354,7 @@ impl JsRuntime {
                 strict: true,
                 class: Some(class_metadata),
                 kind: FunctionKind::Normal,
+                method: false,
             },
         )?;
         let JsValue::Object(constructor) = constructor else {
@@ -426,6 +427,7 @@ impl JsRuntime {
                     strict: true,
                     class: Some(metadata),
                     kind: FunctionKind::new(element.is_async, element.is_generator),
+                    method: false,
                 },
             )?;
             self.attach_function_source(&method, &element.source);

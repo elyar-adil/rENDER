@@ -717,6 +717,7 @@ impl JsRuntime {
                 strict,
                 class,
                 kind: FunctionKind::new(is_async, false),
+                method: false,
             },
         )
     }
@@ -738,6 +739,32 @@ impl JsRuntime {
                 strict,
                 class: None,
                 kind,
+                method: false,
+            },
+        )
+    }
+
+    /// An object-literal method or accessor (ECMA-262 15.4.4): created like a
+    /// function, but without the own `caller` and `arguments` a plain sloppy
+    /// function carries.
+    pub(super) fn create_method(
+        &mut self,
+        name: Option<&str>,
+        parameters: &[String],
+        body: &[Statement],
+        kind: FunctionKind,
+        strict: bool,
+    ) -> Result<JsValue, JsError> {
+        self.create_function_meta(
+            name,
+            parameters,
+            body,
+            FunctionFlags {
+                arrow: false,
+                strict,
+                class: None,
+                kind,
+                method: true,
             },
         )
     }
@@ -754,6 +781,7 @@ impl JsRuntime {
             strict,
             class,
             kind,
+            method,
         } = flags;
         let class_is_none = class.is_none();
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
@@ -800,7 +828,7 @@ impl JsRuntime {
         // string (anonymous arrows included); `length` counts parameters
         // before the first default initializer, excluding the rest parameter.
         let name = name.unwrap_or("");
-        let sloppy_plain = !arrow && !strict && class_is_none && !kind.is_coroutine();
+        let sloppy_plain = !arrow && !strict && class_is_none && !kind.is_coroutine() && !method;
         let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
@@ -3504,7 +3532,7 @@ impl JsRuntime {
                 // A method or accessor does not bind its own name in its body,
                 // unlike a named function expression (ECMA-262 15.4).
                 let value =
-                    self.create_function(name.as_deref(), parameters, body, *kind, *strict)?;
+                    self.create_method(name.as_deref(), parameters, body, *kind, *strict)?;
                 self.attach_function_source(&value, source);
                 value
             } else {
@@ -6686,12 +6714,17 @@ impl JsRuntime {
                 },
                 context.trim_start_matches('.')
             ))),
-            JsValue::String(text) => Ok(self.string_wrapper(text.clone())),
-            JsValue::Symbol(symbol) => Ok(self.realm.symbol_instance_wrapper(symbol.clone())),
-            JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value, None)),
-            JsValue::BigInt(value) => Ok(self.realm.bigint_primitive_wrapper(value.clone())),
-            JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
+            _ => self.to_object(value),
         }
+    }
+
+    /// The primitive that `object` was boxed from, when `object` is the wrapper of
+    /// the most recent primitive receiver.
+    pub(super) fn boxed_primitive(&self, object: ObjectId) -> Option<JsValue> {
+        self.boxed_receiver
+            .as_ref()
+            .filter(|(boxed, _)| *boxed == object)
+            .map(|(_, primitive)| primitive.clone())
     }
 
     /// ECMA-262 `ToObject` (§7.1.18): every primitive except `null` and
@@ -6732,6 +6765,7 @@ impl JsRuntime {
                 ));
             }
         };
+        self.boxed_receiver = Some((object, value.clone()));
         // Nothing script-visible holds this wrapper yet, so pin it: a later
         // allocation in the same builtin may collect, and a swept slot reads
         // back as a prototype-less tombstone.

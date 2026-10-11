@@ -142,6 +142,9 @@ pub(super) struct FunctionFlags {
     pub(super) strict: bool,
     pub(super) class: Option<Rc<ClassFunction>>,
     pub(super) kind: FunctionKind,
+    /// An object-literal method or accessor. Unlike a plain sloppy function, it has
+    /// no own `caller` or `arguments` (ECMA-262 15.4).
+    pub(super) method: bool,
 }
 
 #[derive(Clone, Debug)]

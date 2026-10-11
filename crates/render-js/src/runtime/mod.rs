@@ -147,6 +147,10 @@ pub struct JsRuntime {
     /// Strictness of the top-level script code that is running, used when no
     /// [`ClassFrame`] is active (ECMA-262 11.2.2 and 16.1.7).
     root_strict: bool,
+    /// The wrapper a primitive receiver was last boxed into, with the primitive it
+    /// came from (ECMA-262 7.1.18 `ToObject`). A builtin that applies `ToString` to
+    /// its `this` reads the primitive, so the prototype's `toString` is not called.
+    boxed_receiver: Option<(ObjectId, JsValue)>,
     /// `new.target` of each active construction, `Undefined` for plain calls.
     new_target_stack: Vec<JsValue>,
     /// Set across the `construct` of a `super()` call; see `dispatch_new_target`.
@@ -289,6 +293,7 @@ impl JsRuntime {
             functions: Vec::new(),
             class_frames: Vec::new(),
             root_strict: false,
+            boxed_receiver: None,
             new_target_stack: Vec::new(),
             super_call_pending: false,
             arrays_joining: Vec::new(),

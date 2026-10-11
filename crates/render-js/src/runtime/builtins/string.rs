@@ -648,11 +648,6 @@ pub(in crate::runtime) fn is_string_native(function: NativeFunction) -> bool {
 }
 
 impl JsRuntime {
-    /// Create a transient wrapper object exposing string prototype members.
-    pub(in crate::runtime) fn string_wrapper(&mut self, value: JsString) -> ObjectId {
-        self.realm.string_wrapper(value)
-    }
-
     /// The `this` value a `@@replace` or `@@split` delegate receives. ECMA-262
     /// passes `O` as the caller gave it, so a plain object arrives as itself. A
     /// string receiver arrives here as a wrapper, which cannot be told from a
@@ -691,9 +686,12 @@ impl JsRuntime {
         value: &JsValue,
     ) -> Result<JsString, JsError> {
         let primitive = match value {
-            JsValue::Object(_) => {
-                self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?
-            }
+            // A primitive receiver boxed for this call converts as the primitive
+            // itself (ECMA-262 22.1.3 `thisStringValue` steps use `ToString(this)`).
+            JsValue::Object(object) => match self.boxed_primitive(*object) {
+                Some(primitive) => primitive,
+                None => self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?,
+            },
             other => other.clone(),
         };
         match primitive {

@@ -3302,3 +3302,27 @@ fn a_script_cannot_declare_a_global_function_the_global_object_refuses() {
         "function"
     );
 }
+
+#[test]
+fn a_primitive_receiver_converts_as_the_primitive_not_through_its_prototype() {
+    // ECMA-262 22.1.3.10: `ToString(this)` of a boolean is its string form; the
+    // prototype's toString, which a user may replace, is not consulted.
+    assert_eq!(
+        ok(
+            "var calls = 0; Boolean.prototype.toString = function () { calls++; return 'x'; };                 var r = String.prototype.isWellFormed.call(true); r + ':' + calls;"
+        ),
+        "true:0"
+    );
+}
+
+#[test]
+fn an_object_literal_method_has_no_own_caller_or_arguments() {
+    // A method definition is not a plain sloppy function, so it carries neither
+    // own property (ECMA-262 15.4); a plain sloppy function keeps them.
+    assert_eq!(
+        ok(
+            "var obj = { method() {} }; obj.method.hasOwnProperty('arguments') + ':' + obj.method.hasOwnProperty('caller') + ' ' + (function plain() {}).hasOwnProperty('arguments');"
+        ),
+        "false:false true"
+    );
+}
