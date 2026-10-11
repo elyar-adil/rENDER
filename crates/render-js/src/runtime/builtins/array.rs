@@ -800,6 +800,19 @@ impl JsRuntime {
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let length = self.length_of_array_like(dom, receiver)?;
+        self.locale_string_of(dom, receiver, length)
+    }
+
+    /// The element walk shared by `Array.prototype.toLocaleString` and
+    /// `%TypedArray%.prototype.toLocaleString` (ECMA-262 23.1.3.32 and 23.2.3.32):
+    /// each present element's `toLocaleString` result, joined by commas. Each
+    /// element is read as the walk reaches it.
+    pub(in crate::runtime) fn locale_string_of(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        length: f64,
+    ) -> Result<JsValue, JsError> {
         if length > MAX_MATERIALIZED_ELEMENTS as f64 {
             return Err(self.range_error("Invalid string length"));
         }

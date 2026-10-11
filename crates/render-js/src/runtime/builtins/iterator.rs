@@ -161,6 +161,11 @@ impl JsRuntime {
             N::IteratorFrom => self.iterator_from(dom, argument(arguments, 0)),
             N::IteratorConcat => self.iterator_concat(dom, arguments),
             N::IteratorPrototypeIterator => Ok(JsValue::Object(receiver)),
+            // `%IteratorPrototype%[@@dispose]`: `return` runs when the iterator has
+            // one (GetMethod, then Call), and the result is undefined.
+            N::IteratorPrototypeDispose => self
+                .call_return_method(dom, receiver)
+                .map(|_| JsValue::Undefined),
             N::IteratorHelperNext => self.iterator_helper_next(dom, receiver),
             N::IteratorHelperReturn => self.iterator_helper_return(dom, receiver),
             N::IteratorWrapNext => self.iterator_wrap_next(dom, receiver),
@@ -253,7 +258,7 @@ impl JsRuntime {
     /// `IteratorClose(record, completion)`. A throw completion is returned
     /// unchanged and the outcome of `return` is discarded. A normal completion
     /// propagates errors from `return` and requires an object result.
-    fn iterator_close<T>(
+    pub(in crate::runtime) fn iterator_close<T>(
         &mut self,
         dom: &mut Dom,
         iterator: ObjectId,

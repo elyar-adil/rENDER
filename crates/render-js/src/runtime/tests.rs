@@ -6028,6 +6028,226 @@ fn typed_array_element_write_converts_the_value_before_the_index_check() {
 }
 
 #[test]
+fn typed_array_canonical_numeric_keys_are_elements_or_nothing() {
+    // 10.4.5: "-0", "1.5" and "-1" are canonical numeric strings that are not valid
+    // indices, so they name no property, and a valid index is not a stored property.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var ta = new Uint8Array(2);
+                ta['-0'] = 9;
+                ta['1.5'] = 9;
+                ta['-1'] = 9;
+                Reflect.has(ta, '-0') === false
+                    && ta.hasOwnProperty('1.5') === false
+                    && Reflect.has(ta, '-1') === false
+                    && Reflect.ownKeys(ta).join(',') === '0,1'
+                    && Reflect.defineProperty(ta, '0', { value: 5, writable: false }) === false
+                    && ta[0] === 0
+                    && Reflect.set(ta, '5', 1) === true
+                    && Reflect.has(ta, '5') === false
+                    && Object.keys(ta).join(',') === '0,1';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_set_checks_the_length_before_reading_the_source() {
+    // 23.2.3.26.2 SetTypedArrayFromArrayLike: an overlong source throws a RangeError
+    // before any element is read.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var reads = 0;
+                var source = { length: 5, get 0() { reads++; return 1; } };
+                var threw = false;
+                try { new Uint8Array(2).set(source); } catch (error) { threw = error instanceof RangeError; }
+                threw && reads === 0;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_to_locale_string_calls_each_elements_to_locale_string() {
+    // 23.2.3.32: the Array walk over the view, invoking each element's toLocaleString.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var calls = [];
+                var original = Number.prototype.toLocaleString;
+                Number.prototype.toLocaleString = function () { calls.push(this); return 'h' + calls.length; };
+                var result = new Uint8Array([42, 0]).toLocaleString();
+                Number.prototype.toLocaleString = original;
+                result === 'h1,h2' && calls.length === 2;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_and_array_buffer_prototypes_come_from_new_target() {
+    // 10.1.14 GetPrototypeFromConstructor: a constructor applied through
+    // Reflect.construct takes the new target's prototype.
+    assert_eq!(
+        evaluate_script(
+            r"
+                Object.getPrototypeOf(Reflect.construct(Uint8Array, [2], Object)) === Object.prototype
+                    && Object.prototype.toString.call(Reflect.construct(ArrayBuffer, [4], Object)) === '[object Object]'
+                    && Object.prototype.toString.call(new ArrayBuffer(4)) === '[object ArrayBuffer]';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn array_buffer_slice_takes_its_result_from_the_species_constructor() {
+    // 25.1.6.7 steps 9-14: the result comes from SpeciesConstructor and may be larger
+    // than the requested length.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var buffer = new ArrayBuffer(8);
+                buffer.constructor = {};
+                buffer.constructor[Symbol.species] = function (n) { return new ArrayBuffer(n + 2); };
+                buffer.slice(0, 4).byteLength === 6;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn new_of_a_non_constructor_operand_throws_a_type_error() {
+    // 13.3.5.1 steps 2-3: an operand that is not a constructor is a TypeError.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var threw = false;
+                var missing;
+                try { new missing(); } catch (error) { threw = error instanceof TypeError; }
+                threw;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn map_brand_checks_refuse_other_collections_and_proxies() {
+    // 24.1.3.7 RequireInternalSlot: a Map method on a WeakMap, a Set's size getter on
+    // a Map, and any method on a proxy of a Map all throw a TypeError.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var threwHas = false;
+                var threwSize = false;
+                var threwProxy = false;
+                try { Map.prototype.has.call(new WeakMap(), {}); } catch (error) { threwHas = error instanceof TypeError; }
+                try { Object.getOwnPropertyDescriptor(Set.prototype, 'size').get.call(new Map()); } catch (error) { threwSize = error instanceof TypeError; }
+                try { Map.prototype.get.call(new Proxy(new Map(), {}), 1); } catch (error) { threwProxy = error instanceof TypeError; }
+                threwHas && threwSize && threwProxy && new Map([[1, 1]]).size === 1;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn weak_collections_hold_unregistered_symbols_but_not_registered_ones() {
+    // 9.13 CanBeHeldWeakly: an object, or a symbol that Symbol.for does not register.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var local = Symbol('local');
+                var weakMap = new WeakMap();
+                weakMap.set(local, 1);
+                var threw = false;
+                try { new WeakSet().add(Symbol.for('registered')); } catch (error) { threw = error instanceof TypeError; }
+                weakMap.get(local) === 1 && threw;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn map_constructor_calls_the_overridden_set_and_closes_on_an_abrupt_entry() {
+    // 24.1.1.2 AddEntriesFromIterable: the adder is read once and called per entry, and
+    // an entry that is not an object closes the iterator.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var closed = 0;
+                var iterable = {};
+                iterable[Symbol.iterator] = function () {
+                    return {
+                        next: function () { return { value: 1, done: false }; },
+                        return: function () { closed++; return {}; }
+                    };
+                };
+                var threw = false;
+                try { new Map(iterable); } catch (error) { threw = error instanceof TypeError; }
+                var original = Map.prototype.set;
+                var calls = 0;
+                Map.prototype.set = function (key, value) { calls++; return original.call(this, key, value); };
+                new Map([[1, 2], [3, 4]]);
+                Map.prototype.set = original;
+                threw && closed === 1 && calls === 2;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn map_upsert_and_group_by_follow_the_keyed_collection_rules() {
+    // Map.prototype.getOrInsert and getOrInsertComputed (the upsert proposal), and
+    // Map.groupBy (24.1.2.1), which groups by SameValueZero with -0 as +0.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var map = new Map();
+                var inserted = map.getOrInsert('a', 1) === 1 && map.getOrInsert('a', 2) === 1;
+                var computed = map.getOrInsertComputed('b', function (key) { return key + '!'; }) === 'b!'
+                    && map.get('b') === 'b!';
+                var groups = Map.groupBy([1, 2, 3], function (value) { return value % 2 ? 'odd' : 'even'; });
+                var zero = Map.groupBy([0, -0], function (value) { return value; });
+                inserted && computed
+                    && groups.get('odd').join(',') === '1,3'
+                    && groups.get('even').join(',') === '2'
+                    && zero.size === 1 && Object.is([...zero.keys()][0], 0)
+                    && Map.groupBy.length === 2;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn iterator_prototype_dispose_calls_return() {
+    // Explicit resource management: %IteratorPrototype%[@@dispose] calls `return` when
+    // the iterator has one, and its result is undefined.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var closed = 0;
+                var iterator = Object.create(Iterator.prototype);
+                iterator.return = function () { closed++; return {}; };
+                var result = iterator[Symbol.dispose]();
+                closed === 1 && result === undefined;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
 fn set_timeout_converts_its_delay_with_to_number_after_the_callback_check() {
     // The delay is a WebIDL `long`, converted with ToNumber, so an object's valueOf
     // runs once and the timer is still registered.

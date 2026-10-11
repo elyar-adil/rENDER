@@ -893,7 +893,8 @@ impl JsRuntime {
         Ok(promise)
     }
 
-    fn pin_value(&mut self, value: &JsValue) {
+    /// Keep an object reachable while a native walk holds it (see `transient_roots`).
+    pub(in crate::runtime) fn pin_value(&mut self, value: &JsValue) {
         if let JsValue::Object(object) = value {
             self.transient_roots.push(*object);
         }
