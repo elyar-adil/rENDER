@@ -5740,21 +5740,26 @@ fn atomics_wait_and_notify_validate_before_they_act() {
 }
 
 #[test]
-fn atomics_wait_reports_not_equal_or_times_out_on_one_agent() {
-    // With no other agent to notify it, a blocking wait can only answer
-    // "not-equal" at once, or "timed-out" for a zero or finite timeout.
+fn atomics_wait_throws_on_a_browser_main_thread_that_cannot_suspend() {
+    // 25.4.3.14 DoWait: a sync wait whose AgentCanSuspend is false throws a
+    // TypeError before the value is compared, whatever the value or timeout. This
+    // host's main thread cannot block (HTML's [[CanBlock]] is false there).
     assert_eq!(
         settle_then_read(
             r"
                 var i32 = new Int32Array(new SharedArrayBuffer(8));
                 i32[0] = 5;
-                var out = [Atomics.wait(i32, 0, 4, 0), Atomics.wait(i32, 0, 5, 0),
-                           Atomics.wait(i32, 0, 5, -1), Atomics.wait(i32, 1, 0, 1)].join(',');
+                var out = [];
+                for (var args of [[4, 0], [5, 0], [5, -1]]) {
+                    try { Atomics.wait(i32, 0, args[0], args[1]); out.push('no'); }
+                    catch (e) { out.push(e.name); }
+                }
+                var result = out.join(',');
             ",
             "",
-            "out",
+            "result",
         ),
-        "not-equal,timed-out,timed-out,timed-out"
+        "TypeError,TypeError,TypeError"
     );
 }
 

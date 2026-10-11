@@ -857,6 +857,14 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
             detail: "module fixture is not a standalone test".to_owned(),
         }];
     }
+    // The host is a browser main thread, which cannot block (AgentCanSuspend is
+    // false), so a test that needs a blocking agent is outside this host's profile.
+    if metadata.flags.iter().any(|flag| flag == "CanBlockIsTrue") {
+        return unsupported(
+            relative_path,
+            "the host main thread cannot block (AgentCanSuspend is false)",
+        );
+    }
     if metadata.flags.iter().any(|flag| flag == "module") {
         return run_module_parse_negative(relative_path, &source, &metadata);
     }
@@ -1468,6 +1476,12 @@ language	88	2	0	1	200
             CompiledScript::compile(&source, &RuntimeLimits::default())
                 .expect("official default harness must compile");
         }
+    }
+
+    #[test]
+    fn classifies_blocking_agent_tests_as_unsupported_on_a_browser_main_thread() {
+        let records = run_manifest_case("built-ins/Atomics/wait/bigint/negative-timeout.js");
+        assert_eq!(records[0].status, Status::Unsupported);
     }
 
     #[test]

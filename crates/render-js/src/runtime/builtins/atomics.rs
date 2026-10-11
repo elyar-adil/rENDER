@@ -20,12 +20,11 @@ use crate::value::{AtomicsOp, NativeFunction, RmwOp, TypedArrayKind, TypedBuffer
 use render_dom::Dom;
 
 /// Whether this agent can suspend in `Atomics.wait` (ECMA-262 25.4.3.1
-/// `AgentCanSuspend`). The engine's one agent can, so a finite blocking wait sleeps
-/// for its timeout and an infinite one is a `TypeError`, since nothing could ever
-/// notify it. A host whose main thread cannot block, such as a browser's, answers
-/// `false`, which makes every blocking `wait` a `TypeError` once its arguments are
-/// checked.
-const AGENT_CAN_SUSPEND: bool = true;
+/// `AgentCanSuspend`, which the host decides). This engine runs on a browser's main
+/// thread, whose agent cannot block (HTML: the main thread's `[[CanBlock]]` is false),
+/// so a blocking `wait` is a `TypeError` once its arguments are checked. The
+/// `CanBlockIsTrue` tests need a blocking agent and are outside this host's profile.
+const AGENT_CAN_SUSPEND: bool = false;
 
 /// The longest delay a `waitAsync` timeout timer carries. A longer timeout fires at
 /// this bound, which is the largest delay the timer queue's `WebIDL` `long` allows.
