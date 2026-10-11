@@ -48,7 +48,7 @@ impl JsRuntime {
                 let node = self.require_node(receiver)?;
                 let name = required_argument(arguments, 0, "setAttribute")?.to_js_string();
                 let value = required_argument(arguments, 1, "setAttribute")?.to_js_string();
-                dom.set_attribute(node, name, value)?;
+                dom.set_attribute(node, name.to_lossy(), value.to_lossy())?;
                 Ok(JsValue::Undefined)
             }
             NativeFunction::SetTimeout | NativeFunction::SetInterval => {

@@ -69,7 +69,7 @@ impl JsRuntime {
                 self.month_day_from_bag(&bag, constrain)
             }
             JsValue::String(text) => {
-                let Some(parsed) = super::parse::parse_month_day(text) else {
+                let Some(parsed) = super::parse::parse_month_day(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid ISO month-day string"));
                 };
                 if parsed
@@ -257,15 +257,14 @@ impl JsRuntime {
             TemporalMethod::ToString => {
                 let date = self.month_day_of(receiver)?;
                 Ok(JsValue::String(
-                    self.month_day_to_string(dom, date, &first)?,
+                    self.month_day_to_string(dom, date, &first)?.into(),
                 ))
             }
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let date = self.month_day_of(receiver)?;
-                Ok(JsValue::String(format!(
-                    "--{:02}-{:02}",
-                    date.month, date.day
-                )))
+                Ok(JsValue::String(
+                    (format!("--{:02}-{:02}", date.month, date.day)).into(),
+                ))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.PlainMonthDay cannot be converted to a primitive; use equals() or toString()",
@@ -298,8 +297,8 @@ impl JsRuntime {
             other => {
                 let date = self.month_day_of(receiver)?;
                 Ok(match other {
-                    TemporalMethod::CalendarId => JsValue::String("iso8601".to_owned()),
-                    TemporalMethod::MonthCode => JsValue::String(month_code(date.month)),
+                    TemporalMethod::CalendarId => JsValue::String(("iso8601".to_owned()).into()),
+                    TemporalMethod::MonthCode => JsValue::String((month_code(date.month)).into()),
                     TemporalMethod::Day => JsValue::Number(f64::from(date.day)),
                     _ => {
                         return Err(JsError::type_error(

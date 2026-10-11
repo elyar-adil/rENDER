@@ -95,8 +95,11 @@ impl JsRuntime {
             .bindings
             .insert("this".to_owned(), initialized(JsValue::Undefined));
         let meta = self.realm.create_ordinary_object();
-        self.realm
-            .set_property(meta, "url".to_owned(), JsValue::String(key.to_owned()));
+        self.realm.set_property(
+            meta,
+            "url".to_owned(),
+            JsValue::String((key.to_owned()).into()),
+        );
         record.bindings.insert(
             IMPORT_META_BINDING.to_owned(),
             initialized(JsValue::Object(meta)),

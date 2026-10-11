@@ -284,7 +284,7 @@ impl JsRuntime {
                     let value = self.evaluate(dom, expression)?;
                     match self.to_property_key_value(dom, value)? {
                         JsValue::Symbol(symbol) => ResolvedKey::Symbol(symbol),
-                        other => ResolvedKey::Named(other.to_js_string()),
+                        other => ResolvedKey::Named((other.to_js_string()).to_key()),
                     }
                 }
                 PropertyKey::Private(private) => ResolvedKey::Private(
@@ -969,7 +969,9 @@ fn element_name(key: &ResolvedKey) -> String {
         ResolvedKey::Named(key) => key.clone(),
         ResolvedKey::Symbol(symbol) => symbol
             .description()
-            .map_or_else(String::new, |description| format!("[{description}]")),
+            .map_or_else(String::new, |description| {
+                format!("[{}]", description.to_key())
+            }),
         ResolvedKey::Private(_, private) => format!("#{private}"),
     }
 }
@@ -980,7 +982,9 @@ fn field_name(key: &ClassFieldKey) -> String {
         ClassFieldKey::Named(key) => key.clone(),
         ClassFieldKey::Symbol(symbol) => symbol
             .description()
-            .map_or_else(String::new, |description| format!("[{description}]")),
+            .map_or_else(String::new, |description| {
+                format!("[{}]", description.to_key())
+            }),
         ClassFieldKey::Private(_, private) => format!("#{private}"),
     }
 }

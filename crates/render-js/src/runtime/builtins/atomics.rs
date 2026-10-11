@@ -322,7 +322,7 @@ impl JsRuntime {
             ));
         }
         std::thread::sleep(Duration::from_millis(timeout as u64));
-        Ok(JsValue::String("timed-out".to_owned()))
+        Ok(JsValue::String(("timed-out".to_owned()).into()))
     }
 
     /// The answer of a wait that does not suspend: the string for `wait`, or a
@@ -333,10 +333,11 @@ impl JsRuntime {
         outcome: &str,
     ) -> Result<JsValue, JsError> {
         if !asynchronous {
-            return Ok(JsValue::String(outcome.to_owned()));
+            return Ok(JsValue::String((outcome.to_owned()).into()));
         }
         self.ensure_heap_capacity(1)?;
-        let result = self.atomics_result_object(false, JsValue::String(outcome.to_owned()));
+        let result =
+            self.atomics_result_object(false, JsValue::String((outcome.to_owned()).into()));
         Ok(JsValue::Object(result))
     }
 
@@ -457,7 +458,7 @@ impl JsRuntime {
         // is the resolution the spec's job performs.
         self.pending_microtasks.push(JsMicrotask::PromiseReaction {
             handler: None,
-            argument: JsValue::String(outcome.to_owned()),
+            argument: JsValue::String((outcome.to_owned()).into()),
             fulfilled: true,
             capability: Some(PromiseCapability::Record {
                 promise: waiter.promise,

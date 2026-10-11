@@ -879,7 +879,7 @@ mod tests {
         let outcome = runtime
             .execute(&mut parsed.dom, source)
             .expect("buffer probe executes");
-        outcome.value.to_js_string()
+        outcome.value.to_js_string().to_lossy()
     }
 
     #[test]
@@ -1151,7 +1151,7 @@ mod tests {
             )
             .expect("the detached views answer");
         assert_eq!(
-            outcome.value.to_js_string(),
+            outcome.value.to_js_string().to_lossy(),
             "0,0,0,0,0,true,TypeError,TypeError,TypeError,TypeError,TypeError,TypeError,true,[object Float64Array]"
         );
     }

@@ -100,12 +100,13 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let node = self.require_style_declaration(receiver)?;
         let requested = required_argument(arguments, 0, "getPropertyValue")?.to_js_string();
-        let requested = requested.trim().to_ascii_lowercase();
+        let requested = requested.to_lossy().trim().to_ascii_lowercase();
         Ok(JsValue::String(
-            Self::inline_declarations(dom, node)
+            (Self::inline_declarations(dom, node)
                 .into_iter()
                 .find(|(name, _, _)| *name == requested)
-                .map_or_else(String::new, |(_, value, _)| value),
+                .map_or_else(String::new, |(_, value, _)| value))
+            .into(),
         ))
     }
 
@@ -118,6 +119,7 @@ impl JsRuntime {
         let node = self.require_style_declaration(receiver)?;
         let name = required_argument(arguments, 0, "setProperty")?
             .to_js_string()
+            .to_lossy()
             .trim()
             .to_ascii_lowercase();
         if !is_valid_property_name(&name) {
@@ -130,14 +132,14 @@ impl JsRuntime {
         let important = arguments
             .get(2)
             .map(JsValue::to_js_string)
-            .is_some_and(|priority| priority.eq_ignore_ascii_case("important"));
-        value = value.trim().into();
+            .is_some_and(|priority| priority.to_lossy().eq_ignore_ascii_case("important"));
+        value = value.to_lossy().trim().into();
         let mut declarations: Vec<(String, String, bool)> = Self::inline_declarations(dom, node)
             .into_iter()
             .filter(|(existing, _, _)| *existing != name)
             .collect();
         if !value.is_empty() {
-            declarations.push((name, value, important));
+            declarations.push((name, (value).to_lossy(), important));
         }
         Self::write_inline_declarations(dom, node, &declarations)?;
         Ok(JsValue::Undefined)
@@ -152,6 +154,7 @@ impl JsRuntime {
         let node = self.require_style_declaration(receiver)?;
         let name = required_argument(arguments, 0, "removeProperty")?
             .to_js_string()
+            .to_lossy()
             .trim()
             .to_ascii_lowercase();
         let previous = Self::inline_declarations(dom, node)
@@ -163,7 +166,7 @@ impl JsRuntime {
             .filter(|(existing, _, _)| *existing != name)
             .collect();
         Self::write_inline_declarations(dom, node, &declarations)?;
-        Ok(JsValue::String(previous))
+        Ok(JsValue::String((previous).into()))
     }
 
     pub(in crate::runtime) fn style_item(
@@ -175,7 +178,7 @@ impl JsRuntime {
         let node = self.require_style_declaration(receiver)?;
         let index = match arguments.first() {
             Some(value) => self.to_number_value(dom, value)?,
-            None => return Ok(JsValue::String(String::new())),
+            None => return Ok(JsValue::String((String::new()).into())),
         };
         let declarations = Self::inline_declarations(dom, node);
         #[allow(
@@ -186,8 +189,8 @@ impl JsRuntime {
         )]
         let position = index as usize;
         Ok(match declarations.get(position) {
-            Some((name, _, _)) => JsValue::String(name.clone()),
-            None => JsValue::String(String::new()),
+            Some((name, _, _)) => JsValue::String((name.clone()).into()),
+            None => JsValue::String((String::new()).into()),
         })
     }
 

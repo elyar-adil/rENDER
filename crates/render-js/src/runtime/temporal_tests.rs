@@ -11,7 +11,7 @@ fn ok(source: &str) -> String {
     let mut runtime = JsRuntime::new(&dom);
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
 }
 
@@ -23,7 +23,7 @@ fn throws(source: &str) -> String {
         format!("var r; try {{ {source}; r = 'no error'; }} catch (e) {{ r = e.name; }} r");
     runtime
         .execute(&mut dom, &wrapped)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
 }
 

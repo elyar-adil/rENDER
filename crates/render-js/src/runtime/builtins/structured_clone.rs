@@ -37,6 +37,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
+use crate::utf16::JsString;
 use crate::value::{NativeFunction, ObjectHost, TypedArrayKind, TypedBuffer};
 use render_dom::Dom;
 
@@ -83,7 +84,7 @@ impl JsRuntime {
                 let Some(compiled) = self.regexes.get(index) else {
                     return Err(self.data_clone_error(value));
                 };
-                let source = compiled.compiled.source().to_owned();
+                let source = compiled.compiled.source();
                 let flags = compiled.compiled.flags().describe().clone();
                 self.clone_regexp(&source, &flags)
             }
@@ -187,7 +188,7 @@ impl JsRuntime {
         Ok(JsValue::Object(object))
     }
 
-    fn clone_regexp(&mut self, source: &str, flags: &str) -> Result<JsValue, JsError> {
+    fn clone_regexp(&mut self, source: &JsString, flags: &str) -> Result<JsValue, JsError> {
         let object = self.construct_regex(source, flags)?;
         Ok(JsValue::Object(object))
     }
@@ -292,9 +293,9 @@ impl JsRuntime {
     /// `DOMException.prototype` off `%Error.prototype%`.
     fn data_clone_error(&mut self, value: &JsValue) -> JsError {
         let description = match value {
-            JsValue::Symbol(symbol) => symbol.to_display(),
+            JsValue::Symbol(symbol) => symbol.to_display().to_lossy(),
             JsValue::Object(_) => "[object Object]".to_owned(),
-            other => other.to_js_string(),
+            other => other.to_js_string().to_lossy(),
         };
         self.dom_exception(
             DomExceptionName::DataClone,
@@ -317,7 +318,7 @@ mod tests {
         let outcome = runtime
             .execute(&mut parsed.dom, source)
             .expect("clone probe executes");
-        outcome.value.to_js_string()
+        outcome.value.to_js_string().to_lossy()
     }
 
     #[test]

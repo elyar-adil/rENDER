@@ -800,7 +800,7 @@ mod tests {
             .expect("reads result")
             .value
             .to_js_string();
-        assert!(out.starts_with("ab"), "{out}");
+        assert!(out.to_lossy().starts_with("ab"), "{out}");
     }
 
     #[test]

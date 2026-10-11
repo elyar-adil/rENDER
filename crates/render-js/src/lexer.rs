@@ -1,5 +1,6 @@
 use super::{JsBigInt, JsError, JsErrorKind, RuntimeLimits};
 use crate::bigint::digit_count_fits;
+use crate::utf16::{JsString, push_code_point};
 
 /// Reserved words in every context (ECMA-262 12.7.2, Table 37 minus the
 /// contextual and strict-only words). Spelled with an escape they are a
@@ -52,7 +53,7 @@ pub(super) enum TokenKind {
     EscapedReserved(String),
     /// `#name`, the private-name form used by class fields and methods.
     PrivateName(String),
-    String(String),
+    String(JsString),
     Number(f64),
     /// A `BigInt` literal: an integer with the `n` suffix (ECMA-262 12.9.6).
     BigInt(JsBigInt),
@@ -159,7 +160,7 @@ pub(super) enum TemplatePart {
     /// source text of the same chunk, which is what a template object's `raw`
     /// property and therefore `String.raw` hand to a tag function.
     Quasi {
-        cooked: String,
+        cooked: JsString,
         raw: String,
     },
     Expression(String),
@@ -1056,11 +1057,13 @@ impl Lexer<'_> {
     fn string(&mut self, quote: char) -> Result<TokenKind, JsError> {
         let start = self.offset;
         self.advance();
-        let mut value = String::new();
+        // The value is a code-unit sequence (ECMA-262 6.1.4), so escapes push
+        // units directly: `\uD83D` is one unit and a lone surrogate survives.
+        let mut value: Vec<u16> = Vec::new();
         while let Some(character) = self.peek() {
             self.advance();
             if character == quote {
-                return Ok(TokenKind::String(value));
+                return Ok(TokenKind::String(JsString::from_unit_vec(value)));
             }
             if character == '\\' {
                 let escaped = self
@@ -1075,40 +1078,38 @@ impl Lexer<'_> {
                         }
                         continue;
                     }
-                    '0' if !self.peek().is_some_and(|value| value.is_ascii_digit()) => {
-                        value.push('\0');
-                        continue;
-                    }
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    'b' => '\u{0008}',
-                    'f' => '\u{000c}',
-                    'v' => '\u{000b}',
-                    '\\' => '\\',
-                    '\'' => '\'',
-                    '"' => '"',
+                    '0' if !self.peek().is_some_and(|value| value.is_ascii_digit()) => 0,
+                    'n' => u32::from('\n'),
+                    'r' => u32::from('\r'),
+                    't' => u32::from('\t'),
+                    'b' => 0x08,
+                    'f' => 0x0c,
+                    'v' => 0x0b,
+                    '\\' => u32::from('\\'),
+                    '\'' => u32::from('\''),
+                    '"' => u32::from('"'),
                     'x' => self.hex_escape(2)?,
                     'u' => self.unicode_escape()?,
                     // A LegacyOctalEscapeSequence or NonOctalDecimalEscapeSequence
                     // (Annex B.1.2), which strict code refuses.
                     digit @ '0'..='9' => {
                         self.legacy_syntax = true;
-                        digit
+                        u32::from(digit)
                     }
-                    other => other,
+                    other => u32::from(other),
                 };
-                value.push(escaped);
+                push_code_point(&mut value, escaped);
             } else if matches!(character, '\n' | '\r') {
                 return Err(JsError::syntax("newline in string literal", self.offset));
             } else {
-                value.push(character);
+                push_code_point(&mut value, u32::from(character));
             }
         }
         Err(JsError::syntax("unterminated string literal", start))
     }
 
-    fn hex_escape(&mut self, digits: usize) -> Result<char, JsError> {
+    /// A `\xHH` escape: a code point below 0x100, always a scalar.
+    fn hex_escape(&mut self, digits: usize) -> Result<u32, JsError> {
         let start = self.offset;
         for _ in 0..digits {
             if !self.peek().is_some_and(|value| value.is_ascii_hexdigit()) {
@@ -1116,12 +1117,15 @@ impl Lexer<'_> {
             }
             self.advance();
         }
-        let value = u32::from_str_radix(&self.source[start..self.offset], 16)
-            .map_err(|_| JsError::syntax("invalid hexadecimal escape", start))?;
-        char::from_u32(value).ok_or_else(|| JsError::syntax("invalid Unicode escape", start))
+        u32::from_str_radix(&self.source[start..self.offset], 16)
+            .map_err(|_| JsError::syntax("invalid hexadecimal escape", start))
     }
 
-    fn unicode_escape(&mut self) -> Result<char, JsError> {
+    /// A `\uXXXX` or `\u{...}` escape as a code point. A surrogate value is
+    /// returned as itself: each escape contributes its own code unit, so
+    /// `😀` is the same two units as the astral scalar, and `\uD83D`
+    /// alone stays a lone unit (ECMA-262 6.1.4, 12.9.4.1).
+    fn unicode_escape(&mut self) -> Result<u32, JsError> {
         if self.peek() == Some('{') {
             let start = self.offset;
             self.advance();
@@ -1135,34 +1139,12 @@ impl Lexer<'_> {
             let value = u32::from_str_radix(&self.source[digits_start..self.offset], 16)
                 .map_err(|_| JsError::syntax("invalid Unicode escape", start))?;
             self.advance();
-            return char::from_u32(value)
-                .ok_or_else(|| JsError::syntax("invalid Unicode escape", start));
-        }
-
-        let start = self.offset;
-        let high = self.hex_escape_value(4)?;
-        if (0xd800..=0xdbff).contains(&high)
-            && self.peek() == Some('\\')
-            && self.peek_second() == Some('u')
-        {
-            // Look ahead at the four hex digits without consuming them, so a
-            // high surrogate that is *not* followed by a trailing one stays a
-            // lone surrogate instead of being replaced. §12.9.4.1 says a
-            // `SurrogatePair` is only formed when a leading surrogate is
-            // followed by `TrailingSurrogate`, and `'\uD83D\uD83D'` is two lone
-            // surrogates of length 2, not one replacement character.
-            let pending = self.offset;
-            self.advance();
-            self.advance();
-            let low = self.hex_escape_value(4)?;
-            if (0xdc00..=0xdfff).contains(&low) {
-                let scalar = 0x1_0000 + ((high - 0xd800) << 10) + (low - 0xdc00);
-                return char::from_u32(scalar)
-                    .ok_or_else(|| JsError::syntax("invalid Unicode surrogate pair", start));
+            if value > 0x10_ffff {
+                return Err(JsError::syntax("invalid Unicode escape", start));
             }
-            self.offset = pending;
+            return Ok(value);
         }
-        Ok(char::from_u32(high).unwrap_or_else(|| surrogate_placeholder(high)))
+        self.hex_escape_value(4)
     }
 
     fn hex_escape_value(&mut self, digits: usize) -> Result<u32, JsError> {
@@ -1181,7 +1163,7 @@ impl Lexer<'_> {
         let start = self.offset;
         self.advance();
         let mut parts = Vec::new();
-        let mut text = String::new();
+        let mut text: Vec<u16> = Vec::new();
         // Byte offset where the current chunk's source text begins, so its raw
         // value can be sliced out verbatim once the chunk's end is reached.
         let mut quasi_start = self.offset;
@@ -1193,7 +1175,7 @@ impl Lexer<'_> {
             match character {
                 '`' => {
                     parts.push(TemplatePart::Quasi {
-                        cooked: text,
+                        cooked: JsString::from_unit_vec(text),
                         raw: self.template_raw_value(quasi_start, self.offset - 1),
                     });
                     return Ok(TokenKind::Template(parts));
@@ -1205,7 +1187,7 @@ impl Lexer<'_> {
                     let raw = self.template_raw_value(quasi_start, self.offset - 1);
                     self.advance();
                     parts.push(TemplatePart::Quasi {
-                        cooked: std::mem::take(&mut text),
+                        cooked: JsString::from_unit_vec(std::mem::take(&mut text)),
                         raw,
                     });
                     parts.push(TemplatePart::Expression(
@@ -1226,26 +1208,26 @@ impl Lexer<'_> {
                             }
                             continue;
                         }
-                        '0' if !self.peek().is_some_and(|value| value.is_ascii_digit()) => '\0',
-                        'n' => '\n',
-                        'r' => '\r',
-                        't' => '\t',
-                        'b' => '\u{0008}',
-                        'f' => '\u{000c}',
-                        'v' => '\u{000b}',
+                        '0' if !self.peek().is_some_and(|value| value.is_ascii_digit()) => 0,
+                        'n' => u32::from('\n'),
+                        'r' => u32::from('\r'),
+                        't' => u32::from('\t'),
+                        'b' => 0x08,
+                        'f' => 0x0c,
+                        'v' => 0x0b,
                         'x' => self.hex_escape(2)?,
                         'u' => self.unicode_escape()?,
                         // Octal and non-octal decimal escapes are refused by an untagged
                         // template in any code (ECMA-262 13.2.8.1, B.1.2).
                         digit @ '0'..='9' => {
                             self.legacy_syntax = true;
-                            digit
+                            u32::from(digit)
                         }
-                        other => other,
+                        other => u32::from(other),
                     };
-                    text.push(escaped);
+                    push_code_point(&mut text, escaped);
                 }
-                other => text.push(other),
+                other => push_code_point(&mut text, u32::from(other)),
             }
         }
     }
@@ -1446,13 +1428,6 @@ fn is_identifier_start(character: char) -> bool {
     unicode_ident::is_xid_start(character) || matches!(character, '_' | '$')
 }
 
-pub(super) fn surrogate_placeholder(value: u32) -> char {
-    // Rust strings contain Unicode scalar values while ECMAScript strings are
-    // UTF-16 code-unit sequences. Reserve a private-use range for unpaired
-    // surrogates so regexes such as /[\uD800-\uDFFF]/ keep their meaning.
-    char::from_u32(0xf_0000 + value.saturating_sub(0xd800)).unwrap_or('\u{fffd}')
-}
-
 fn is_identifier_continue(character: char) -> bool {
     unicode_ident::is_xid_continue(character)
         || matches!(character, '_' | '$' | '\u{200c}' | '\u{200d}')
@@ -1510,7 +1485,7 @@ mod tests {
         assert!(
             tokens
                 .iter()
-                .any(|token| token.kind == TokenKind::String("message".to_owned()))
+                .any(|token| token.kind == TokenKind::String("message".into()))
         );
     }
 

@@ -23,7 +23,8 @@ fn run(modules: &[(&str, &str)], entry: &str) -> Result<String, crate::JsError> 
         .execute(&mut dom, "log.join(',')")
         .expect("read log")
         .value
-        .to_js_string())
+        .to_js_string()
+        .to_lossy())
 }
 
 #[test]

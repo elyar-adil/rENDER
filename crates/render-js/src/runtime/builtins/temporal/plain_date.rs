@@ -15,6 +15,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::utf16::JsString;
 use render_dom::Dom;
 
 /// The date fields a property bag contributes, after each has been read and
@@ -198,7 +199,7 @@ impl JsRuntime {
                 // The string is checked before the options are read, and its
                 // date is always refused when impossible: `overflow` does not
                 // apply to an ISO string.
-                let Some(parsed) = super::parse::parse_date_time(text) else {
+                let Some(parsed) = super::parse::parse_date_time(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid ISO date string"));
                 };
                 if parsed.utc {
@@ -442,11 +443,13 @@ impl JsRuntime {
             }
             TemporalMethod::ToString => {
                 let date = self.date_of(receiver)?;
-                Ok(JsValue::String(self.date_to_string(dom, date, &first)?))
+                Ok(JsValue::String(JsString::from(
+                    self.date_to_string(dom, date, &first)?,
+                )))
             }
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let date = self.date_of(receiver)?;
-                Ok(JsValue::String(date_text(date)))
+                Ok(JsValue::String((date_text(date)).into()))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.PlainDate cannot be converted to a primitive; use compare() or toString()",
@@ -498,11 +501,11 @@ pub(super) fn plain_date_getter_value(
     method: TemporalMethod,
 ) -> Result<JsValue, JsError> {
     Ok(match method {
-        TemporalMethod::CalendarId => JsValue::String("iso8601".to_owned()),
+        TemporalMethod::CalendarId => JsValue::String(("iso8601".to_owned()).into()),
         TemporalMethod::Era | TemporalMethod::EraYear => JsValue::Undefined,
         TemporalMethod::Year => JsValue::Number(f64::from(date.year)),
         TemporalMethod::Month => JsValue::Number(f64::from(date.month)),
-        TemporalMethod::MonthCode => JsValue::String(month_code(date.month)),
+        TemporalMethod::MonthCode => JsValue::String((month_code(date.month)).into()),
         TemporalMethod::Day => JsValue::Number(f64::from(date.day)),
         TemporalMethod::DayOfWeek => JsValue::Number(f64::from(day_of_week(date))),
         TemporalMethod::DayOfYear => JsValue::Number(f64::from(day_of_year(date))),

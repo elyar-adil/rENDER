@@ -91,7 +91,7 @@ impl JsRuntime {
         match primitive {
             JsValue::BigInt(value) => Ok(value.clone()),
             JsValue::Boolean(flag) => Ok(JsBigInt::from_i64(i64::from(*flag))),
-            JsValue::String(text) => match string_to_bigint(text) {
+            JsValue::String(text) => match string_to_bigint(&(text).to_lossy()) {
                 StringToBigInt::Value(value) => Ok(value),
                 StringToBigInt::Invalid => Err(JsError::syntax(
                     format!("Cannot convert {text} to a BigInt"),
@@ -238,7 +238,7 @@ impl JsRuntime {
                     reason = "the range check above bounds the radix to 2..=36"
                 )]
                 let radix = radix as u32;
-                Ok(JsValue::String(value.to_string_radix(radix)))
+                Ok(JsValue::String((value.to_string_radix(radix)).into()))
             }
             _ => unreachable!("dispatch_bigint_native only receives BigInt built-ins"),
         }

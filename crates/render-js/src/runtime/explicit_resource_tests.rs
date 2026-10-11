@@ -20,7 +20,7 @@ fn run(source: &str) -> String {
     let outcome = runtime
         .execute(&mut dom, "log.join(',')")
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"));
-    outcome.value.to_js_string()
+    outcome.value.to_js_string().to_lossy()
 }
 
 fn drain(runtime: &mut JsRuntime, dom: &mut render_dom::Dom) {
@@ -48,7 +48,7 @@ fn ok(source: &str) -> String {
     let mut runtime = JsRuntime::new(&dom);
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
 }
 

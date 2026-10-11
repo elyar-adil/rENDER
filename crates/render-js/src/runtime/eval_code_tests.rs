@@ -9,7 +9,7 @@ fn eval(source: &str) -> Result<String, crate::JsError> {
     let mut runtime = JsRuntime::new(&dom);
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
 }
 
 fn ok(source: &str) -> String {
@@ -462,7 +462,7 @@ fn eval_recursion_is_bounded_by_the_call_depth_limit() {
                     "var r; try { (function f() { eval('f()'); })(); } catch (e) { r = e instanceof RangeError; } r",
                 )
                 .expect("the recursion is caught by the script");
-            assert_eq!(outcome.value.to_js_string(), "true");
+            assert_eq!(outcome.value.to_js_string().to_lossy(), "true");
         })
         .expect("spawn test thread")
         .join()

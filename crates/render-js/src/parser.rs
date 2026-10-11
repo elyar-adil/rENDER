@@ -12,6 +12,7 @@ use crate::JsValue;
 use crate::module::{
     DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, IndirectExport, ModuleInfo,
 };
+use crate::utf16::JsString;
 use crate::value::number_to_string;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -529,7 +530,7 @@ pub(super) enum Expr {
     TaggedTemplate {
         tag: Box<Self>,
         /// The `(cooked, raw)` pairs, always `substitutions + 1` of them.
-        quasis: Vec<(String, String)>,
+        quasis: Vec<(JsString, String)>,
         expressions: Vec<Self>,
         offset: usize,
     },
@@ -1631,7 +1632,7 @@ impl Parser {
             return Err(self.error("expected a module specifier string"));
         };
         self.advance();
-        self.module_info().add_request(&specifier);
+        self.module_info().add_request(&(specifier).to_lossy());
         // Import attributes (`with { type: "json" }`) carry no linking meaning
         // here; consume the block so the declaration ends cleanly.
         if (self.at_contextual("with") || self.at_contextual("assert"))
@@ -1643,15 +1644,19 @@ impl Parser {
             self.advance();
             self.skip_module_declaration();
         }
-        Ok(specifier)
+        Ok(specifier.to_lossy())
     }
 
     /// An `IdentifierName` or string literal in import/export-name position.
     fn module_export_name(&mut self) -> Result<String, JsError> {
         match self.current().kind.clone() {
-            TokenKind::Identifier(name) | TokenKind::String(name) => {
+            TokenKind::Identifier(name) => {
                 self.advance();
                 Ok(name)
+            }
+            TokenKind::String(name) => {
+                self.advance();
+                Ok(name.to_key())
             }
             TokenKind::Default => {
                 self.advance();
@@ -4375,7 +4380,7 @@ impl Parser {
         parts: Vec<TemplatePart>,
         offset: usize,
     ) -> Result<Expr, JsError> {
-        let mut result = Expr::Literal(JsValue::String(String::new()));
+        let mut result = Expr::Literal(JsValue::String((String::new()).into()));
         for part in parts {
             let next = match part {
                 TemplatePart::Quasi { cooked, .. } => Expr::Literal(JsValue::String(cooked)),
@@ -4987,9 +4992,8 @@ impl Parser {
             ));
         }
         match token.kind {
-            TokenKind::Identifier(name)
-            | TokenKind::EscapedReserved(name)
-            | TokenKind::String(name) => Ok(name),
+            TokenKind::String(name) => Ok(name.to_key()),
+            TokenKind::Identifier(name) | TokenKind::EscapedReserved(name) => Ok(name),
             // A numeric name is the ToString of its value: `1e21` is "1e+21".
             TokenKind::Number(value) => Ok(number_to_string(value)),
             // A BigInt name is the ToString of its value, which is decimal.

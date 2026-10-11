@@ -85,15 +85,6 @@ fn x_user_defined(byte: u8) -> char {
     }
 }
 
-/// An ECMAScript string holds UTF-16 code units, and the engine represents an
-/// unpaired surrogate as a private-use placeholder (see
-/// `crate::lexer::surrogate_placeholder`). Encoding one is an error, so it
-/// becomes U+FFFD exactly as a browser's encoder does.
-fn is_unpaired_surrogate(character: char) -> bool {
-    let value = u32::from(character);
-    (0xf_0000..=0xf_07ff).contains(&value)
-}
-
 /// One code point's UTF-8 bytes. A scalar below U+80 is one byte, below U+800
 /// two, below U+10000 three, and the astral planes four.
 fn utf8_bytes(scalar: u32, out: &mut Vec<u8>) {
@@ -119,13 +110,11 @@ fn utf8_bytes(scalar: u32, out: &mut Vec<u8>) {
 
 /// The UTF-8 encoding of a string, with an unpaired surrogate becoming U+FFFD.
 fn encode_utf8(text: &str) -> Vec<u8> {
+    // `text` is host text, so an unpaired surrogate has already become U+FFFD
+    // (WHATWG USVString conversion) and every scalar encodes as itself.
     let mut out = Vec::with_capacity(text.len());
     for character in text.chars() {
-        if is_unpaired_surrogate(character) {
-            utf8_bytes(u32::from(REPLACEMENT), &mut out);
-        } else {
-            utf8_bytes(u32::from(character), &mut out);
-        }
+        utf8_bytes(u32::from(character), &mut out);
     }
     out
 }
@@ -269,7 +258,7 @@ impl JsRuntime {
     /// accepts here.
     fn view_bytes(&mut self, dom: &mut Dom, value: &JsValue) -> Result<Vec<u8>, JsError> {
         let JsValue::Object(object) = value else {
-            return Ok(value.to_js_string().as_bytes().to_vec());
+            return Ok(value.to_js_string().to_lossy().as_bytes().to_vec());
         };
         if let Some(ObjectHost::TypedArray {
             kind,
@@ -343,7 +332,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let label = match arguments.first() {
             None | Some(JsValue::Undefined) => "utf-8".to_owned(),
-            Some(value) => value.to_js_string(),
+            Some(value) => (value.to_js_string()).to_lossy(),
         };
         // Encoding Standard §"TextDecoder": "If encoding is null, then throw a
         // `RangeError`." A Web API specification's `RangeError` is a
@@ -393,7 +382,10 @@ impl JsRuntime {
             };
         }
         for (name, value) in [
-            ("encoding", JsValue::String(encoding.name().to_owned())),
+            (
+                "encoding",
+                JsValue::String((encoding.name().to_owned()).into()),
+            ),
             ("fatal", JsValue::Boolean(fatal)),
         ] {
             self.realm.define_property(
@@ -416,7 +408,7 @@ impl JsRuntime {
     fn text_encoder_encode(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
         let text = arguments
             .first()
-            .map_or_else(String::new, JsValue::to_js_string);
+            .map_or_else(String::new, |value| value.to_js_string().to_lossy());
         let bytes = encode_utf8(&text);
         self.uint8_array_from_bytes(&bytes)
     }
@@ -430,7 +422,7 @@ impl JsRuntime {
     fn text_encoder_encode_into(&mut self, arguments: &[JsValue]) -> Result<JsValue, JsError> {
         let source = arguments
             .first()
-            .map_or_else(String::new, JsValue::to_js_string);
+            .map_or_else(String::new, |value| value.to_js_string().to_lossy());
         let destination = arguments
             .get(1)
             .ok_or_else(|| JsError::type_error("encodeInto requires a destination"))?;
@@ -463,31 +455,18 @@ impl JsRuntime {
         {
             let limit = start + current;
             for character in source.chars() {
-                let scalar = if is_unpaired_surrogate(character) {
-                    u32::from(REPLACEMENT)
-                } else {
-                    u32::from(character)
-                };
                 let mut encoded = Vec::with_capacity(4);
-                utf8_bytes(scalar, &mut encoded);
+                utf8_bytes(u32::from(character), &mut encoded);
                 if start + written + encoded.len() > limit {
                     break;
                 }
                 buffer.write_bytes(start + written, &encoded);
                 written += encoded.len();
-                // `read` is "the number of code units read from source", so it is
-                // counted in the same units `String.prototype.length` reports.
-                // A placeholder stands for exactly *one* surrogate, and
-                // `char::len_utf16` would count the private-use scalar itself as
-                // two - so `encodeInto('\uD83Dx')` reported 2 read for a string
-                // of length 2 where the first code point is one unit wide, and
-                // stopped a unit early. One unit per placeholder is the count
-                // that makes `read` and `length` agree.
-                read += if is_unpaired_surrogate(character) {
-                    1
-                } else {
-                    character.len_utf16()
-                };
+                // `read` is "the number of code units read from source". The
+                // source is already host text, where each unpaired surrogate is
+                // one U+FFFD (one unit), so `len_utf16` counts the same units as
+                // `String.prototype.length` on the original string.
+                read += character.len_utf16();
             }
         }
         self.ensure_heap_capacity(1)?;
@@ -575,7 +554,7 @@ impl JsRuntime {
             *pending = next_pending;
             *seen = bom_seen;
         }
-        Ok(JsValue::String(text))
+        Ok(JsValue::String((text).into()))
     }
 
     /// A `Uint8Array` over `bytes`, using the installed `%Uint8Array.prototype%`
@@ -607,9 +586,8 @@ impl JsRuntime {
 mod tests {
     use super::{
         REPLACEMENT, WINDOWS_1252_HIGH, decode_single_byte, decode_utf8, encode_utf8, get_encoding,
-        is_unpaired_surrogate, utf8_lead,
+        utf8_lead,
     };
-    use crate::lexer::surrogate_placeholder;
     use crate::runtime::JsRuntime;
     use crate::value::TextEncoding;
     use render_html::parse_document;
@@ -624,7 +602,7 @@ mod tests {
         let outcome = runtime
             .execute(&mut parsed.dom, source)
             .expect("encoding probe executes");
-        outcome.value.to_js_string()
+        outcome.value.to_js_string().to_lossy()
     }
 
     #[test]
@@ -985,12 +963,12 @@ mod tests {
         );
     }
 
+    /// U+F0000 is a real private-use scalar. It must encode as itself, not as
+    /// the replacement character that a marker-based alphabet would collide with.
     #[test]
-    fn unpaired_surrogates_are_recognised_by_their_placeholder() {
-        assert!(is_unpaired_surrogate(surrogate_placeholder(0xd800)));
-        assert!(is_unpaired_surrogate(surrogate_placeholder(0xdfff)));
-        assert!(!is_unpaired_surrogate('a'));
-        assert!(!is_unpaired_surrogate(char::from_u32(0x1f600).unwrap()));
+    fn a_private_use_scalar_encodes_as_itself() {
+        assert_eq!(encode_utf8("\u{f0000}"), vec![0xf3, 0xb0, 0x80, 0x80]);
+        assert_eq!(encode_utf8("\u{f07ff}"), vec![0xf3, 0xb0, 0x9f, 0xbf]);
     }
 
     #[test]

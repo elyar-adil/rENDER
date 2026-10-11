@@ -576,8 +576,11 @@ impl JsRuntime {
         self.with_transient_roots(&roots, |runtime| runtime.ensure_heap_capacity(1))?;
         let object = self.realm.create_error(prototype, None);
         if let Some(message) = message {
-            self.realm
-                .define_property(object, "message", data_property(JsValue::String(message)));
+            self.realm.define_property(
+                object,
+                "message",
+                data_property(JsValue::String((message).into())),
+            );
         }
         self.realm
             .define_property(object, "error", data_property(error));
@@ -590,10 +593,10 @@ impl JsRuntime {
     /// The `stack` own property engine-made errors carry: `Name: message`
     /// followed by the current frames.
     fn install_error_stack(&mut self, object: ObjectId, fallback_name: &str) {
-        let name = self
-            .realm
-            .get_property(object, "name")
-            .map_or_else(|| fallback_name.to_owned(), |value| value.to_js_string());
+        let name = self.realm.get_property(object, "name").map_or_else(
+            || fallback_name.to_owned(),
+            |value| (value.to_js_string()).to_lossy(),
+        );
         let header = match self.realm.get_property(object, "message") {
             Some(JsValue::String(text)) if !text.is_empty() => format!("{name}: {text}"),
             _ => name,
@@ -605,7 +608,7 @@ impl JsRuntime {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String(stack),
+                value: JsValue::String((stack).into()),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -620,7 +623,7 @@ impl JsRuntime {
             JsValue::Symbol(_) => Err(JsError::type_error(
                 "Cannot convert a Symbol value to a string",
             )),
-            primitive => Ok(primitive.to_js_string()),
+            primitive => Ok((primitive.to_js_string()).to_lossy()),
         }
     }
 

@@ -33,6 +33,7 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PendingFetch;
+use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -98,9 +99,9 @@ impl JsRuntime {
             JsValue::Object(object) => self
                 .realm
                 .get_property(*object, "url")
-                .map(|value| value.to_js_string())
+                .map(|value| value.to_js_string().to_lossy())
                 .filter(|value| !value.is_empty()),
-            other => Some(other.to_js_string()),
+            other => Some(other.to_js_string().to_lossy()),
         };
         let mut method = "GET".to_owned();
         let mut headers = Vec::new();
@@ -110,7 +111,7 @@ impl JsRuntime {
             if let Some(value) = self.realm.get_property(*init, "method")
                 && !matches!(value, JsValue::Undefined)
             {
-                method = value.to_js_string().to_ascii_uppercase();
+                method = value.to_js_string().to_lossy().to_ascii_uppercase();
             }
             if method.is_empty() || !method.bytes().all(is_http_token_byte) {
                 return Err(JsError::type_error(format!(
@@ -127,7 +128,7 @@ impl JsRuntime {
                     if matches!(value, JsValue::Undefined | JsValue::Null) {
                         continue;
                     }
-                    headers.push((name, value.to_js_string()));
+                    headers.push((name, value.to_js_string().to_lossy()));
                 }
             }
             if let Some(value) = self.realm.get_property(*init, "body")
@@ -172,7 +173,7 @@ impl JsRuntime {
             }
         }
         let Some(url) = requested else {
-            let reason = JsValue::String("fetch requires a string URL".to_owned());
+            let reason = JsValue::String(("fetch requires a string URL".to_owned()).into());
             self.reject_promise(promise, &reason);
             return Ok(value);
         };
@@ -198,7 +199,7 @@ impl JsRuntime {
                         ErrorKind::TypeError,
                         &format!("fetch URL {url:?} is invalid: {message}"),
                     )
-                    .unwrap_or(JsValue::String(message));
+                    .unwrap_or(JsValue::String((message).into()));
                 self.reject_promise(promise, &reason);
             }
         }
@@ -333,7 +334,7 @@ impl JsRuntime {
     fn abort_reason(&mut self) -> JsValue {
         self.construct_dom_exception(DomExceptionName::Abort, "The user aborted a request.")
             .unwrap_or_else(|_| {
-                JsValue::String("AbortError: The user aborted a request.".to_owned())
+                JsValue::String(("AbortError: The user aborted a request.".to_owned()).into())
             })
     }
 
@@ -360,7 +361,9 @@ impl JsRuntime {
         let name = if function == NativeFunction::FormDataEntries {
             String::new()
         } else {
-            required_argument(arguments, 0, "FormData method")?.to_js_string()
+            required_argument(arguments, 0, "FormData method")?
+                .to_js_string()
+                .to_lossy()
         };
         let value = if matches!(
             function,
@@ -375,20 +378,22 @@ impl JsRuntime {
         };
         match function {
             NativeFunction::FormDataAppend => {
-                entries.push((name, value.expect("append value")));
+                entries.push((name, (value.expect("append value")).to_lossy()));
                 Ok(JsValue::Undefined)
             }
             NativeFunction::FormDataSet => {
                 let first = entries.iter().position(|(key, _)| key == &name);
                 entries.retain(|(key, _)| key != &name);
                 let index = first.unwrap_or(entries.len()).min(entries.len());
-                entries.insert(index, (name, value.expect("set value")));
+                entries.insert(index, (name, (value.expect("set value")).to_lossy()));
                 Ok(JsValue::Undefined)
             }
             NativeFunction::FormDataGet => Ok(entries
                 .iter()
                 .find(|(key, _)| key == &name)
-                .map_or(JsValue::Null, |(_, value)| JsValue::String(value.clone()))),
+                .map_or(JsValue::Null, |(_, value)| {
+                    JsValue::String((value.clone()).into())
+                })),
             NativeFunction::FormDataHas => Ok(JsValue::Boolean(
                 entries.iter().any(|(key, _)| key == &name),
             )),
@@ -401,8 +406,8 @@ impl JsRuntime {
                 let mut rows = Vec::with_capacity(pairs.len());
                 for (key, value) in pairs {
                     let pair = self.create_array_from_values(&[
-                        JsValue::String(key),
-                        JsValue::String(value),
+                        JsValue::String((key).into()),
+                        JsValue::String((value).into()),
                     ])?;
                     rows.push(JsValue::Object(pair));
                 }
@@ -420,7 +425,7 @@ impl JsRuntime {
 
     fn request_body(&self, value: &JsValue, headers: &mut Vec<(String, String)>) -> String {
         let JsValue::Object(object) = value else {
-            return value.to_js_string();
+            return (value.to_js_string()).to_lossy();
         };
         let entries = match self.realm.host(*object) {
             Some(ObjectHost::FormData { entries }) => entries,
@@ -442,7 +447,7 @@ impl JsRuntime {
                     )
                     .finish();
             }
-            _ => return value.to_js_string(),
+            _ => return value.to_js_string().to_lossy(),
         };
         let boundary = "----render-browser-form-boundary";
         if !headers
@@ -506,7 +511,7 @@ impl JsRuntime {
         let prototype = self.constructor_prototype(constructor)?;
         let body = match arguments.first() {
             None | Some(JsValue::Undefined | JsValue::Null) => String::new(),
-            Some(value) => value.to_js_string(),
+            Some(value) => (value.to_js_string()).to_lossy(),
         };
         self.ensure_heap_capacity(3)?;
         let response = self.realm.create_object(Some(prototype));
@@ -525,11 +530,11 @@ impl JsRuntime {
     ) {
         for (name, value) in [
             ("status", JsValue::Number(f64::from(status))),
-            ("statusText", JsValue::String(status_text.clone())),
+            ("statusText", JsValue::String((status_text.clone()).into())),
             ("ok", JsValue::Boolean((200..300).contains(&status))),
-            ("type", JsValue::String("basic".to_owned())),
+            ("type", JsValue::String(("basic".to_owned()).into())),
             ("bodyUsed", JsValue::Boolean(false)),
-            ("url", JsValue::String(String::new())),
+            ("url", JsValue::String((String::new()).into())),
         ] {
             self.realm.set_property(response, name.to_owned(), value);
         }
@@ -569,7 +574,7 @@ impl JsRuntime {
         // The body is already available, so the promise settles immediately;
         // reaction callbacks still run at the microtask checkpoint.
         let (promise, value) = self.create_promise()?;
-        self.resolve_promise(promise, &JsValue::String(body));
+        self.resolve_promise(promise, &JsValue::String((body).into()));
         Ok(value)
     }
 
@@ -579,11 +584,12 @@ impl JsRuntime {
             _ => return Err(JsError::type_error("incompatible Response method receiver")),
         };
         let (promise, value) = self.create_promise()?;
-        match JsonParser::new(&body).parse() {
+        let input = JsString::from(body.as_str());
+        match JsonParser::new(input.units()).parse() {
             Ok(node) => match self.json_node_to_value(node) {
                 Ok(parsed) => self.resolve_promise(promise, &parsed),
                 Err(error) => {
-                    let reason = JsValue::String(error.to_string());
+                    let reason = JsValue::String((error.to_string()).into());
                     self.reject_promise(promise, &reason);
                 }
             },
@@ -593,7 +599,7 @@ impl JsRuntime {
                         ErrorKind::SyntaxError,
                         &format!("Failed to parse response body as JSON: {message}"),
                     )
-                    .unwrap_or(JsValue::String(message));
+                    .unwrap_or(JsValue::String((message).into()));
                 self.reject_promise(promise, &reason);
             }
         }
@@ -614,7 +620,11 @@ impl JsRuntime {
             Some(ObjectHost::Response { headers, .. }) => headers.clone(),
             _ => return Ok(JsValue::Null),
         };
-        Ok(find_header(&headers, &name).map_or(JsValue::Null, JsValue::String))
+        Ok(
+            find_header(&headers, &name.to_lossy()).map_or(JsValue::Null, |value| {
+                JsValue::String(JsString::from(value))
+            }),
+        )
     }
 
     /// `new XMLHttpRequest()`: an instance in the UNSENT state.
@@ -633,11 +643,11 @@ impl JsRuntime {
         for (name, value) in [
             ("readyState", JsValue::Number(0.0)),
             ("status", JsValue::Number(0.0)),
-            ("statusText", JsValue::String(String::new())),
-            ("responseType", JsValue::String(String::new())),
-            ("response", JsValue::String(String::new())),
-            ("responseText", JsValue::String(String::new())),
-            ("responseURL", JsValue::String(String::new())),
+            ("statusText", JsValue::String((String::new()).into())),
+            ("responseType", JsValue::String((String::new()).into())),
+            ("response", JsValue::String((String::new()).into())),
+            ("responseText", JsValue::String((String::new()).into())),
+            ("responseURL", JsValue::String((String::new()).into())),
             ("withCredentials", JsValue::Boolean(false)),
             ("onreadystatechange", JsValue::Undefined),
             ("onload", JsValue::Undefined),
@@ -652,7 +662,7 @@ impl JsRuntime {
     fn xhr_open(&mut self, receiver: ObjectId, arguments: &[JsValue]) -> Result<JsValue, JsError> {
         let method = required_argument(arguments, 0, "open")?.to_js_string();
         let requested = required_argument(arguments, 1, "open")?.to_js_string();
-        if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+        if method.is_empty() || !method.to_lossy().bytes().all(is_http_token_byte) {
             return Err(JsError::type_error(format!(
                 "XMLHttpRequest.open requires a valid HTTP method, got {method:?}"
             )));
@@ -663,15 +673,17 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => true,
             Some(value) => value.is_truthy(),
         };
-        let resolved = self.resolve_fetch_url(&requested).map_err(|message| {
-            JsError::type_error(format!(
-                "XMLHttpRequest.open URL {requested:?} is invalid: {message}"
-            ))
-        })?;
+        let resolved = self
+            .resolve_fetch_url(&(requested).to_lossy())
+            .map_err(|message| {
+                JsError::type_error(format!(
+                    "XMLHttpRequest.open URL {requested:?} is invalid: {message}"
+                ))
+            })?;
         match self.realm.host_mut(receiver) {
             Some(ObjectHost::XmlHttpRequest(state)) => {
                 *state = XmlHttpRequestState {
-                    method: method.to_ascii_uppercase(),
+                    method: method.to_lossy().to_ascii_uppercase(),
                     url: resolved.to_string(),
                     headers: Vec::new(),
                     async_request,
@@ -688,10 +700,10 @@ impl JsRuntime {
         for (name, value) in [
             ("readyState", JsValue::Number(1.0)),
             ("status", JsValue::Number(0.0)),
-            ("statusText", JsValue::String(String::new())),
-            ("response", JsValue::String(String::new())),
-            ("responseText", JsValue::String(String::new())),
-            ("responseURL", JsValue::String(String::new())),
+            ("statusText", JsValue::String((String::new()).into())),
+            ("response", JsValue::String((String::new()).into())),
+            ("responseText", JsValue::String((String::new()).into())),
+            ("responseURL", JsValue::String((String::new()).into())),
         ] {
             self.realm.set_property(receiver, name.to_owned(), value);
         }
@@ -705,14 +717,14 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let name = required_argument(arguments, 0, "setRequestHeader")?.to_js_string();
         let value = required_argument(arguments, 1, "setRequestHeader")?.to_js_string();
-        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
+        if name.is_empty() || !name.to_lossy().bytes().all(is_http_token_byte) {
             return Err(JsError::type_error(format!(
                 "setRequestHeader requires a valid header name, got {name:?}"
             )));
         }
         match self.realm.host_mut(receiver) {
             Some(ObjectHost::XmlHttpRequest(state)) if !state.method.is_empty() && !state.sent => {
-                state.headers.push((name, value));
+                state.headers.push(((name).to_lossy(), (value).to_lossy()));
             }
             Some(ObjectHost::XmlHttpRequest(_)) => {
                 return Err(JsError::type_error(
@@ -791,7 +803,11 @@ impl JsRuntime {
                 ));
             }
         };
-        Ok(find_header(&headers, &name).map_or(JsValue::Null, JsValue::String))
+        Ok(
+            find_header(&headers, &name.to_lossy()).map_or(JsValue::Null, |value| {
+                JsValue::String(JsString::from(value))
+            }),
+        )
     }
 
     fn xhr_get_all_response_headers(&self, receiver: ObjectId) -> Result<JsValue, JsError> {
@@ -814,7 +830,7 @@ impl JsRuntime {
             result.push_str(&value);
             result.push_str("\r\n");
         }
-        Ok(JsValue::String(result))
+        Ok(JsValue::String((result).into()))
     }
 
     fn xhr_listeners(&mut self, receiver: ObjectId) -> Result<ObjectId, JsError> {
@@ -882,13 +898,13 @@ impl JsRuntime {
             return Ok(JsValue::Undefined);
         }
         let callback = Self::require_callable_object(callback_value, &self.realm)?;
-        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &event_type)?;
+        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &(event_type).to_key())?;
         if !callbacks.contains(&callback) {
             callbacks.push(callback);
             let values: Vec<_> = callbacks.into_iter().map(JsValue::Object).collect();
             let array = self.create_array_from_values(&values)?;
             self.realm
-                .set_property(listeners, event_type, JsValue::Object(array));
+                .set_property(listeners, (event_type).to_key(), JsValue::Object(array));
         }
         Ok(JsValue::Undefined)
     }
@@ -904,12 +920,12 @@ impl JsRuntime {
         let Some(JsValue::Object(callback)) = arguments.get(1) else {
             return Ok(JsValue::Undefined);
         };
-        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &event_type)?;
+        let mut callbacks = self.xhr_event_callbacks(dom, listeners, &(event_type).to_key())?;
         callbacks.retain(|candidate| *candidate != *callback);
         let values: Vec<_> = callbacks.into_iter().map(JsValue::Object).collect();
         let array = self.create_array_from_values(&values)?;
         self.realm
-            .set_property(listeners, event_type, JsValue::Object(array));
+            .set_property(listeners, (event_type).to_key(), JsValue::Object(array));
         Ok(JsValue::Undefined)
     }
 
@@ -949,20 +965,21 @@ impl JsRuntime {
             .map(|value| value.to_js_string())
             .unwrap_or_default();
         let response_value = if status != 0 && response_type == "json" {
-            match JsonParser::new(&body).parse() {
+            let input = JsString::from(body.as_str());
+            match JsonParser::new(input.units()).parse() {
                 Ok(node) => self.json_node_to_value(node).unwrap_or(JsValue::Null),
                 Err(_) => JsValue::Null,
             }
         } else {
-            JsValue::String(body.clone())
+            JsValue::String((body.clone()).into())
         };
         for (name, value) in [
             ("readyState", JsValue::Number(4.0)),
             ("status", JsValue::Number(f64::from(status))),
-            ("statusText", JsValue::String(status_text)),
-            ("responseText", JsValue::String(body.clone())),
+            ("statusText", JsValue::String((status_text).into())),
+            ("responseText", JsValue::String((body.clone()).into())),
             ("response", response_value),
-            ("responseURL", JsValue::String(request_url)),
+            ("responseURL", JsValue::String((request_url).into())),
         ] {
             self.realm.set_property(receiver, name.to_owned(), value);
         }
@@ -1008,7 +1025,7 @@ impl JsRuntime {
         }
         let event = self.realm.create_ordinary_object();
         for (name, value) in [
-            ("type", JsValue::String(event_type.to_owned())),
+            ("type", JsValue::String((event_type.to_owned()).into())),
             ("target", JsValue::Object(receiver)),
             ("currentTarget", JsValue::Object(receiver)),
         ] {
@@ -1123,7 +1140,7 @@ mod tests {
             .value;
         assert_eq!(
             observed,
-            JsValue::String("duplicate-blocked|true|17|true|https://example.test/data".to_owned())
+            JsValue::String("duplicate-blocked|true|17|true|https://example.test/data".into())
         );
     }
 
@@ -1144,7 +1161,7 @@ mod tests {
         ",
             )
             .expect("FormData request should execute");
-        assert_eq!(result.value, JsValue::String("456:true:aid".to_owned()));
+        assert_eq!(result.value, JsValue::String("456:true:aid".into()));
         let requests = runtime.take_pending_fetch_requests();
         assert_eq!(requests.len(), 1);
         let request = &requests[0];
@@ -1191,7 +1208,7 @@ mod tests {
             .expect("abort result should be readable");
         assert_eq!(
             result.value,
-            JsValue::String("AbortError:true:cancelled by caller".to_owned())
+            JsValue::String("AbortError:true:cancelled by caller".into())
         );
     }
 }

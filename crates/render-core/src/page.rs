@@ -624,9 +624,9 @@ impl Page {
             return;
         };
         let title = match value {
-            JsValue::String(text) => text,
+            JsValue::String(text) => text.to_lossy(),
             JsValue::Null | JsValue::Undefined => String::new(),
-            other => other.to_js_string(),
+            other => other.to_js_string().to_lossy(),
         };
         if self.script_title_override.as_deref() == Some(title.as_str()) {
             return;
@@ -962,7 +962,7 @@ impl Page {
         let mut event = PageDomEvent::new(target, "keydown").cancelable(true);
         event
             .properties
-            .push(("key".to_owned(), JsValue::String(key.to_owned())));
+            .push(("key".to_owned(), JsValue::String(key.into())));
         self.queue_dom_event(event)
     }
 
@@ -2561,7 +2561,7 @@ fn page_url_is_visible_to_scripts_in_the_persistent_realm() {
             .as_ref()
             .expect("script result")
             .value,
-        crate::js::JsValue::String("www.baidu.com/s?wd=rust#result".to_owned())
+        crate::js::JsValue::String("www.baidu.com/s?wd=rust#result".into())
     );
 }
 
@@ -2607,6 +2607,6 @@ fn page_settle_fetch_completes_script_promise_chains() {
         .expect("result turn");
     assert_eq!(
         turn.executions[0].result.as_ref().expect("result").value,
-        crate::js::JsValue::String("zdy".to_owned())
+        crate::js::JsValue::String("zdy".into())
     );
 }

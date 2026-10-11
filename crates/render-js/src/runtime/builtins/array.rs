@@ -34,7 +34,7 @@ use crate::runtime::convert::same_value_zero;
 use crate::runtime::convert::strict_equal;
 use crate::runtime::convert::to_number;
 use crate::runtime::convert::uint32_of_number;
-use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::ArrayView;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -403,7 +403,7 @@ impl JsRuntime {
     fn length_of_array_like(&mut self, dom: &mut Dom, object: ObjectId) -> Result<f64, JsError> {
         if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(object) {
             #[allow(clippy::cast_precision_loss)]
-            return Ok(utf16::utf16_length(&text) as f64);
+            return Ok(text.len() as f64);
         }
         let length = self.get_member(dom, object, "length")?;
         self.to_length_value(dom, &length)
@@ -424,7 +424,7 @@ impl JsRuntime {
             }) => buffer
                 .view_length(kind.element_size(), start, length)
                 .is_some_and(|current| index < current as f64),
-            Some(ObjectHost::StringPrimitive(text)) => index < utf16::utf16_length(&text) as f64,
+            Some(ObjectHost::StringPrimitive(text)) => index < text.len() as f64,
             _ => self.realm.get_property(object, &index_key(index)).is_some(),
         })
     }
@@ -484,7 +484,7 @@ impl JsRuntime {
             Some(ObjectHost::TypedArray { .. }) => return true,
             Some(ObjectHost::StringPrimitive(text)) => {
                 if let Ok(index) = key.parse::<usize>()
-                    && index < utf16::utf16_length(&text)
+                    && index < text.len()
                 {
                     return false;
                 }
@@ -728,11 +728,11 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let length = self.length_of_array_like(dom, receiver)?;
         let separator = match arguments.first() {
-            None | Some(JsValue::Undefined) => ",".to_owned(),
+            None | Some(JsValue::Undefined) => JsString::from(","),
             Some(value) => self.to_string_value(dom, value)?,
         };
         if self.arrays_joining.contains(&receiver) {
-            return Ok(JsValue::String(String::new()));
+            return Ok(JsValue::String(JsString::empty()));
         }
         // The joined string is at least `length - 1` characters long; a
         // hostile length must yield a catchable error, not an unbounded
@@ -751,23 +751,25 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
         length: f64,
-        separator: &str,
-    ) -> Result<String, JsError> {
-        let mut output = String::new();
+        separator: &JsString,
+    ) -> Result<JsString, JsError> {
+        // Built on code units, so a lone surrogate element or separator is
+        // carried through the join unchanged.
+        let mut output: Vec<u16> = Vec::new();
         let mut index = 0.0;
         while index < length {
             if index > 0.0 {
-                output.push_str(separator);
+                output.extend_from_slice(separator.units());
             }
             match self.get_index(dom, receiver, index)? {
                 JsValue::Undefined | JsValue::Null => {}
                 // ToString, not the primitive shortcut: a nested array or
                 // any object element runs its own `toString`.
-                value => output.push_str(&self.to_string_value(dom, &value)?),
+                value => output.extend_from_slice(self.to_string_value(dom, &value)?.units()),
             }
             index += 1.0;
         }
-        Ok(output)
+        Ok(JsString::from_unit_vec(output))
     }
 
     /// `Array.prototype.toString` (§23.1.3.36): `join` when it is callable,
@@ -815,11 +817,11 @@ impl JsRuntime {
                     return Err(JsError::type_error("toLocaleString is not a function"));
                 };
                 let text = self.call_with_this(dom, method, &[], element)?;
-                output.push_str(&self.to_string_value(dom, &text)?);
+                output.push_str(&(self.to_string_value(dom, &text)?).to_lossy());
             }
             index += 1.0;
         }
-        Ok(JsValue::String(output))
+        Ok(JsValue::String((output).into()))
     }
 
     /// `Array.prototype.keys/values/entries` and the `TypedArray` counterparts: a
@@ -1490,8 +1492,8 @@ impl JsRuntime {
             let number = self.to_number_value(dom, &result)?;
             return Ok(if number.is_nan() { 0.0 } else { number });
         }
-        let left = utf16::utf16_units(&self.to_string_value(dom, left)?);
-        let right = utf16::utf16_units(&self.to_string_value(dom, right)?);
+        let left = self.to_string_value(dom, left)?.units().to_vec();
+        let right = self.to_string_value(dom, right)?.units().to_vec();
         Ok(match left.cmp(&right) {
             std::cmp::Ordering::Less => -1.0,
             std::cmp::Ordering::Equal => 0.0,
@@ -2030,7 +2032,7 @@ impl JsRuntime {
                 Some(ObjectHost::StringPrimitive(text)) =>
                 {
                     #[allow(clippy::cast_precision_loss)]
-                    Some(JsValue::Number(utf16::utf16_length(&text) as f64))
+                    Some(JsValue::Number(text.len() as f64))
                 }
                 _ => None,
             })
@@ -2109,7 +2111,7 @@ mod tests {
         let mut parsed = parse_document("<!doctype html><p></p>");
         let mut runtime = JsRuntime::new(&parsed.dom);
         match runtime.execute(&mut parsed.dom, source) {
-            Ok(outcome) => outcome.value.to_js_string(),
+            Ok(outcome) => outcome.value.to_js_string().to_lossy(),
             Err(error) => format!("<threw {}>", error.message()),
         }
     }
@@ -2415,7 +2417,7 @@ mod tests {
 
     fn run_in(runtime: &mut JsRuntime, dom: &mut render_dom::Dom, source: &str) -> String {
         match runtime.execute(dom, source) {
-            Ok(outcome) => outcome.value.to_js_string(),
+            Ok(outcome) => outcome.value.to_js_string().to_lossy(),
             Err(error) => format!("<threw {}>", error.message()),
         }
     }

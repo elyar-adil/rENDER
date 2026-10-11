@@ -134,7 +134,7 @@ impl JsRuntime {
                 Ok(IsoDateTime { date, time })
             }
             JsValue::String(text) => {
-                let Some(parsed) = super::parse::parse_date_time(text) else {
+                let Some(parsed) = super::parse::parse_date_time(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid ISO date-time string"));
                 };
                 if parsed.utc {
@@ -360,7 +360,7 @@ impl JsRuntime {
             JsValue::Undefined => {
                 return Err(JsError::type_error("round requires an options argument"));
             }
-            JsValue::String(text) => match Unit::parse(text) {
+            JsValue::String(text) => match Unit::parse(&(text).to_lossy()) {
                 Some(unit) => (1, RoundingMode::HalfExpand, Some(unit)),
                 None => return Err(self.range_error("invalid smallestUnit")),
             },
@@ -462,16 +462,19 @@ impl JsRuntime {
             TemporalMethod::ToString => {
                 let datetime = self.datetime_of(receiver)?;
                 Ok(JsValue::String(
-                    self.datetime_to_string(dom, datetime, &first)?,
+                    self.datetime_to_string(dom, datetime, &first)?.into(),
                 ))
             }
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let datetime = self.datetime_of(receiver)?;
-                Ok(JsValue::String(format!(
-                    "{}T{}",
-                    date_text(datetime.date),
-                    time_text(datetime.time, super::format::Precision::Auto)
-                )))
+                Ok(JsValue::String(
+                    (format!(
+                        "{}T{}",
+                        date_text(datetime.date),
+                        time_text(datetime.time, super::format::Precision::Auto)
+                    ))
+                    .into(),
+                ))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.PlainDateTime cannot be converted to a primitive; use compare() or toString()",

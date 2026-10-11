@@ -11,7 +11,7 @@ fn eval(source: &str) -> Result<String, crate::JsError> {
     let mut runtime = JsRuntime::new(&dom);
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
 }
 
 fn ok(source: &str) -> String {

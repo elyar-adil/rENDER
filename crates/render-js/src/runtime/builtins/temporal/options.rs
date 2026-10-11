@@ -34,7 +34,7 @@ impl JsRuntime {
             JsValue::Symbol(_) => Err(JsError::type_error(
                 "Cannot convert a Symbol value to a string",
             )),
-            primitive => Ok(primitive.to_js_string()),
+            primitive => Ok((primitive.to_js_string()).to_lossy()),
         }
     }
 
@@ -237,13 +237,13 @@ impl JsRuntime {
                 "calendar must be a string or a Temporal object",
             )),
             JsValue::String(text) => {
-                let named = if text.eq_ignore_ascii_case("iso8601") {
+                let named = if text.to_lossy().eq_ignore_ascii_case("iso8601") {
                     None
                 } else {
-                    super::parse::parse_date_time(text).map(|parsed| parsed.calendar)
+                    super::parse::parse_date_time(&(text).to_lossy()).map(|parsed| parsed.calendar)
                 };
                 match named {
-                    None if text.eq_ignore_ascii_case("iso8601") => Ok(()),
+                    None if text.to_lossy().eq_ignore_ascii_case("iso8601") => Ok(()),
                     Some(None) => Ok(()),
                     Some(Some(calendar)) if calendar.eq_ignore_ascii_case("iso8601") => Ok(()),
                     _ => Err(self.range_error("unsupported calendar; only iso8601 is available")),

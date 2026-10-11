@@ -20,7 +20,7 @@ fn ok(source: &str) -> String {
     let (mut dom, mut runtime) = runtime_with_dom();
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
 }
 
@@ -49,6 +49,7 @@ fn run_async(source: &str) -> String {
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
         .value
         .to_js_string()
+        .to_lossy()
 }
 
 fn drain(runtime: &mut JsRuntime, dom: &mut render_dom::Dom) {
@@ -471,7 +472,8 @@ fn run_module(source: &str) -> Result<String, crate::JsError> {
     Ok(runtime
         .execute(&mut dom, "log.join(',')")?
         .value
-        .to_js_string())
+        .to_js_string()
+        .to_lossy())
 }
 
 #[test]

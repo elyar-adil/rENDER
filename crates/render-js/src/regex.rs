@@ -33,7 +33,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use crate::utf16;
+use crate::utf16::JsString;
 
 /// Why a pattern could not be compiled.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,8 +156,8 @@ impl Flags {
 
 #[derive(Clone, Debug)]
 enum ClassItem {
-    Char(char),
-    Range(char, char),
+    Char(u32),
+    Range(u32, u32),
     Digit(bool),
     Word(bool),
     Space(bool),
@@ -178,7 +178,7 @@ enum ClassItem {
 enum Node {
     Empty,
     /// A pattern character: a code unit without `u`, a code point with it.
-    Literal(char),
+    Literal(u32),
     AnyChar,
     Class {
         negated: bool,
@@ -272,8 +272,8 @@ impl Compiled {
     }
 
     #[must_use]
-    pub fn source(&self) -> &str {
-        &self.source
+    pub fn source(&self) -> JsString {
+        JsString::from_key(&self.source)
     }
 
     /// Find the leftmost match starting at or after `from`, both in code units
@@ -631,7 +631,7 @@ impl Matcher<'_> {
             code_point_at(self.input, position, self.flags.unicode)?
         };
         let matched = match node {
-            Node::Literal(expected) => self.chars_match(code_value(*expected), actual),
+            Node::Literal(expected) => self.chars_match(*expected, actual),
             Node::AnyChar => self.flags.dot_all || !is_line_terminator(actual),
             Node::Class { negated, items } => class_contains(items, actual, self.flags) != *negated,
             _ => false,
@@ -794,21 +794,6 @@ impl Matcher<'_> {
     }
 }
 
-/// The code unit or code point a pattern character stands for.
-fn code_value(character: char) -> u32 {
-    utf16::placeholder_unit(character).map_or(u32::from(character), u32::from)
-}
-
-/// The pattern character for a code point or code unit, where a surrogate is
-/// the placeholder that stands for one unpaired surrogate.
-fn value_char(value: u32) -> Option<char> {
-    if (0xd800..=0xdfff).contains(&value) {
-        Some(crate::lexer::surrogate_placeholder(value))
-    } else {
-        char::from_u32(value)
-    }
-}
-
 fn is_lead(unit: u16) -> bool {
     (0xd800..=0xdbff).contains(&unit)
 }
@@ -945,8 +930,8 @@ fn class_contains(items: &[ClassItem], value: u32, flags: Flags) -> bool {
 
 fn item_matches(item: &ClassItem, value: u32, flags: Flags) -> bool {
     match item {
-        ClassItem::Char(expected) => code_value(*expected) == value,
-        ClassItem::Range(start, end) => code_value(*start) <= value && value <= code_value(*end),
+        ClassItem::Char(expected) => *expected == value,
+        ClassItem::Range(start, end) => *start <= value && value <= *end,
         ClassItem::Digit(positive) => {
             (u32::from('0')..=u32::from('9')).contains(&value) == *positive
         }
@@ -982,21 +967,21 @@ fn shorthand_item(character: char) -> ClassItem {
 /// parser will, without building anything. Escapes and character classes are
 /// skipped so a `(` inside them is not mistaken for a group. Returns the named
 /// groups and the number of capturing groups.
-fn scan_group_names(characters: &[char]) -> (Vec<(String, usize)>, usize) {
+fn scan_group_names(characters: &[u32]) -> (Vec<(String, usize)>, usize) {
     let mut names = Vec::new();
     let mut count = 0usize;
     let mut cursor = 0usize;
     let mut in_class = false;
     while cursor < characters.len() {
-        match characters[cursor] {
-            '\\' => cursor += 1,
-            '[' => in_class = true,
-            ']' => in_class = false,
-            '(' if !in_class => {
-                if characters.get(cursor + 1) != Some(&'?') {
+        match char_at(characters, cursor) {
+            Some('\\') => cursor += 1,
+            Some('[') => in_class = true,
+            Some(']') => in_class = false,
+            Some('(') if !in_class => {
+                if char_at(characters, cursor + 1) != Some('?') {
                     count += 1;
-                } else if characters.get(cursor + 2) == Some(&'<')
-                    && !matches!(characters.get(cursor + 3), Some('=' | '!'))
+                } else if char_at(characters, cursor + 2) == Some('<')
+                    && !matches!(char_at(characters, cursor + 3), Some('=' | '!'))
                 {
                     count += 1;
                     if let Some((name, _)) = read_group_name(characters, cursor + 3) {
@@ -1011,36 +996,41 @@ fn scan_group_names(characters: &[char]) -> (Vec<(String, usize)>, usize) {
     (names, count)
 }
 
+/// The character a code value spells, or `None` for a surrogate (which is no
+/// syntax character and no identifier character).
+fn char_at(characters: &[u32], index: usize) -> Option<char> {
+    characters.get(index).and_then(|&code| char::from_u32(code))
+}
+
 /// Read a `GroupName` whose `<` is already consumed, from `cursor` through its
 /// closing `>`. Returns the decoded name and the cursor after the `>`. A `\u`
 /// escape is decoded, and each character must be an identifier start (first)
 /// or identifier part (later).
-fn read_group_name(characters: &[char], mut cursor: usize) -> Option<(String, usize)> {
+fn read_group_name(characters: &[u32], mut cursor: usize) -> Option<(String, usize)> {
     let mut name = String::new();
     loop {
-        let character = *characters.get(cursor)?;
-        if character == '>' {
+        let code = *characters.get(cursor)?;
+        if code == u32::from('>') {
             break;
         }
-        let (value, next) = if character == '\\' {
-            if characters.get(cursor + 1) != Some(&'u') {
+        let (value, next) = if code == u32::from('\\') {
+            if char_at(characters, cursor + 1) != Some('u') {
                 return None;
             }
             unicode_escape_value(characters, cursor + 2)?
-        } else if let (Some(lead), Some(trail)) = (
-            utf16::placeholder_unit(character),
-            characters
+        } else if (0xd800..=0xdbff).contains(&code)
+            && characters
                 .get(cursor + 1)
-                .and_then(|next| utf16::placeholder_unit(*next)),
-        ) && is_lead(lead)
-            && is_trail(trail)
+                .is_some_and(|trail| (0xdc00..=0xdfff).contains(trail))
         {
-            // A literal surrogate pair, read as two characters without `u`.
-            let value = 0x1_0000 + ((u32::from(lead) - 0xd800) << 10) + (u32::from(trail) - 0xdc00);
+            // A literal surrogate pair, read as two code units without `u`.
+            let trail = characters[cursor + 1];
+            let value = 0x1_0000 + ((code - 0xd800) << 10) + (trail - 0xdc00);
             (value, cursor + 2)
         } else {
-            (code_value(character), cursor + 1)
+            (code, cursor + 1)
         };
+        // A lone surrogate is no code point, so it cannot start or continue a name.
         let decoded = char::from_u32(value)?;
         let valid = if name.is_empty() {
             is_identifier_start(decoded)
@@ -1062,10 +1052,17 @@ fn read_group_name(characters: &[char], mut cursor: usize) -> Option<(String, us
 /// The code point of a `\u` escape whose `u` is already consumed: `{X…}`, or
 /// four hex digits joined with a following `\uXXXX` trail surrogate. Returns the
 /// code point and the cursor after the escape.
-fn unicode_escape_value(characters: &[char], cursor: usize) -> Option<(u32, usize)> {
-    if characters.get(cursor) == Some(&'{') {
-        let close = cursor + 1 + characters[cursor + 1..].iter().position(|c| *c == '}')?;
-        let digits: String = characters[cursor + 1..close].iter().collect();
+fn unicode_escape_value(characters: &[u32], cursor: usize) -> Option<(u32, usize)> {
+    if char_at(characters, cursor) == Some('{') {
+        let close = cursor
+            + 1
+            + characters[cursor + 1..]
+                .iter()
+                .position(|&c| c == u32::from('}'))?;
+        let digits: String = characters[cursor + 1..close]
+            .iter()
+            .map(|&code| char::from_u32(code))
+            .collect::<Option<String>>()?;
         if digits.is_empty() || !digits.chars().all(|digit| digit.is_ascii_hexdigit()) {
             return None;
         }
@@ -1074,8 +1071,8 @@ fn unicode_escape_value(characters: &[char], cursor: usize) -> Option<(u32, usiz
     }
     let lead = hex_value(characters, cursor, 4)?;
     if (0xd800..=0xdbff).contains(&lead)
-        && characters.get(cursor + 4) == Some(&'\\')
-        && characters.get(cursor + 5) == Some(&'u')
+        && char_at(characters, cursor + 4) == Some('\\')
+        && char_at(characters, cursor + 5) == Some('u')
         && let Some(trail) = hex_value(characters, cursor + 6, 4)
         && (0xdc00..=0xdfff).contains(&trail)
     {
@@ -1086,12 +1083,13 @@ fn unicode_escape_value(characters: &[char], cursor: usize) -> Option<(u32, usiz
 }
 
 /// `digits` hexadecimal digits starting at `cursor`, if all of them are present.
-fn hex_value(characters: &[char], cursor: usize, digits: usize) -> Option<u32> {
-    let text: String = characters.get(cursor..cursor + digits)?.iter().collect();
-    if !text.chars().all(|digit| digit.is_ascii_hexdigit()) {
-        return None;
+fn hex_value(characters: &[u32], cursor: usize, digits: usize) -> Option<u32> {
+    let mut value = 0_u32;
+    for offset in 0..digits {
+        let digit = char_at(characters, cursor + offset)?.to_digit(16)?;
+        value = value * 16 + digit;
     }
-    u32::from_str_radix(&text, 16).ok()
+    Some(value)
 }
 
 fn is_identifier_start(character: char) -> bool {
@@ -1116,8 +1114,8 @@ fn in_different_branches(left: &[(usize, usize)], right: &[(usize, usize)]) -> b
 
 /// The pattern as the characters the parser reads: code points with the `u`
 /// flag, code units without it (a surrogate unit is a placeholder character).
-fn pattern_characters(pattern: &str, unicode: bool) -> Vec<char> {
-    let units = utf16::utf16_units(pattern);
+fn pattern_characters(pattern: &JsString, unicode: bool) -> Vec<u32> {
+    let units = pattern.units();
     let mut characters = Vec::with_capacity(units.len());
     let mut index = 0;
     while index < units.len() {
@@ -1128,10 +1126,12 @@ fn pattern_characters(pattern: &str, unicode: bool) -> Vec<char> {
             && is_trail(trail)
         {
             let value = 0x1_0000 + ((u32::from(unit) - 0xd800) << 10) + (u32::from(trail) - 0xdc00);
-            characters.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+            characters.push(value);
             index += 2;
         } else {
-            characters.push(value_char(u32::from(unit)).unwrap_or('\u{fffd}'));
+            // A lone surrogate keeps its own code value: the alphabet is code
+            // values, so no real character can stand in for it.
+            characters.push(u32::from(unit));
             index += 1;
         }
     }
@@ -1140,7 +1140,7 @@ fn pattern_characters(pattern: &str, unicode: bool) -> Vec<char> {
 
 /// ECMA-262 §22.2.3 `ClassRanges` atom: one character, or a class escape.
 enum ClassAtom {
-    Char(char),
+    Char(u32),
     Item(ClassItem),
 }
 
@@ -1180,7 +1180,7 @@ const STRING_PROPERTIES: [&str; 7] = [
 #[derive(Clone, Debug, Default)]
 struct ClassValue {
     items: Vec<ClassItem>,
-    strings: BTreeSet<Vec<char>>,
+    strings: BTreeSet<Vec<u32>>,
     may_contain_strings: bool,
     /// A property of strings whose strings this engine has no data for. It is
     /// an early error inside a negated class, and otherwise fails when the
@@ -1206,7 +1206,7 @@ impl ClassValue {
 
     /// One `\q{…}` alternative: a single character is a code point, and any
     /// other alternative, the empty one included, is a string.
-    fn add_alternative(&mut self, text: Vec<char>) {
+    fn add_alternative(&mut self, text: Vec<u32>) {
         match text.first() {
             Some(&only) if text.len() == 1 => self.items.push(ClassItem::Char(only)),
             _ => {
@@ -1283,7 +1283,7 @@ impl ClassValue {
 
 /// A `v`-mode union member or operand: one character, or a set.
 enum SetMember {
-    Char(char),
+    Char(u32),
     Set(ClassValue),
 }
 
@@ -1316,7 +1316,7 @@ fn class_value_node(value: ClassValue) -> Node {
             items: value.items,
         };
     }
-    let mut strings: Vec<Vec<char>> = value.strings.into_iter().collect();
+    let mut strings: Vec<Vec<u32>> = value.strings.into_iter().collect();
     strings.sort_by_key(|text| std::cmp::Reverse(text.len()));
     let mut branches: Vec<Node> = strings
         .into_iter()
@@ -1339,7 +1339,7 @@ fn class_value_node(value: ClassValue) -> Node {
 fn keycap_sequences() -> ClassValue {
     let mut value = ClassValue::default();
     for base in "#*0123456789".chars() {
-        value.add_alternative(vec![base, '\u{fe0f}', '\u{20e3}']);
+        value.add_alternative(vec![u32::from(base), 0xfe0f, 0x20e3]);
     }
     value
 }
@@ -1354,7 +1354,7 @@ type NamedGroup = (String, usize, Vec<(usize, usize)>);
 ///
 /// Returns [`RegexSyntaxError`] for malformed patterns and for constructs the
 /// engine deliberately does not support.
-pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
+pub fn compile(pattern: &JsString, flags: &str) -> Result<Compiled, RegexSyntaxError> {
     let parsed_flags = Flags::parse(flags)?;
     let characters = pattern_characters(pattern, parsed_flags.unicode);
     let (names, total_groups) = scan_group_names(&characters);
@@ -1393,7 +1393,7 @@ pub fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError>
         group_count: parser.group_count,
         group_names: names,
         flags: parsed_flags,
-        source: pattern.to_owned(),
+        source: pattern.to_key(),
     })
 }
 
@@ -1415,7 +1415,7 @@ pub fn advance_index(input: &[u16], index: usize, unicode: bool) -> usize {
 ///
 /// Returns the syntax error for a pattern or flag list ECMAScript rejects.
 pub fn validate(pattern: &str, flags: &str) -> Result<(), RegexSyntaxError> {
-    match compile(pattern, flags) {
+    match compile(&JsString::from(pattern), flags) {
         Ok(_) => Ok(()),
         Err(error) if error.unsupported => Ok(()),
         Err(error) => Err(error),
@@ -1423,7 +1423,7 @@ pub fn validate(pattern: &str, flags: &str) -> Result<(), RegexSyntaxError> {
 }
 
 struct PatternParser<'a> {
-    characters: &'a [char],
+    characters: &'a [u32],
     cursor: usize,
     group_count: usize,
     /// Capturing groups in the whole pattern, found before parsing so a decimal
@@ -1452,18 +1452,29 @@ fn is_identity_escapable(character: char, in_class: bool) -> bool {
 }
 
 impl PatternParser<'_> {
-    fn peek(&self) -> Option<char> {
+    /// The code value at the cursor: a code unit without `u`, a code point with it.
+    fn peek(&self) -> Option<u32> {
         self.characters.get(self.cursor).copied()
     }
 
-    fn bump(&mut self) -> Option<char> {
-        let character = self.peek()?;
+    /// The character at the cursor, for syntax tests. A surrogate is no syntax
+    /// character, so it reads as `None` here and as its own code value in `peek`.
+    fn peek_char(&self) -> Option<char> {
+        self.peek().and_then(char::from_u32)
+    }
+
+    fn bump(&mut self) -> Option<u32> {
+        let code = self.peek()?;
         self.cursor += 1;
-        Some(character)
+        Some(code)
+    }
+
+    fn bump_char(&mut self) -> Option<char> {
+        self.bump().and_then(char::from_u32)
     }
 
     fn eat(&mut self, expected: char) -> bool {
-        if self.peek() == Some(expected) {
+        if self.peek_char() == Some(expected) {
             self.cursor += 1;
             true
         } else {
@@ -1480,7 +1491,7 @@ impl PatternParser<'_> {
             let branch = self.sequence(top_level)?;
             self.path.pop();
             branches.push(branch);
-            if self.peek() != Some('|') {
+            if self.peek_char() != Some('|') {
                 break;
             }
             self.cursor += 1;
@@ -1494,8 +1505,8 @@ impl PatternParser<'_> {
 
     fn sequence(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
         let mut items = Vec::new();
-        while let Some(character) = self.peek() {
-            if character == '|' || character == ')' {
+        while let Some(code) = self.peek() {
+            if matches!(char::from_u32(code), Some('|' | ')')) {
                 break;
             }
             let groups_before = self.group_count;
@@ -1517,7 +1528,7 @@ impl PatternParser<'_> {
         atom: Node,
         reset: Option<(usize, usize)>,
     ) -> Result<Node, RegexSyntaxError> {
-        let (min, max) = match self.peek() {
+        let (min, max) = match self.peek_char() {
             Some('*') => {
                 self.cursor += 1;
                 (0, None)
@@ -1591,7 +1602,7 @@ impl PatternParser<'_> {
     /// A decimal count. A count beyond `u64` saturates: no input is that long.
     fn digits(&mut self) -> Option<u64> {
         let start = self.cursor;
-        while self.peek().is_some_and(|value| value.is_ascii_digit()) {
+        while self.peek_char().is_some_and(|value| value.is_ascii_digit()) {
             self.cursor += 1;
         }
         if self.cursor == start {
@@ -1601,9 +1612,11 @@ impl PatternParser<'_> {
             self.characters[start..self.cursor]
                 .iter()
                 .fold(0u64, |count, digit| {
-                    count
-                        .saturating_mul(10)
-                        .saturating_add(u64::from(digit.to_digit(10).unwrap_or_default()))
+                    count.saturating_mul(10).saturating_add(u64::from(
+                        char::from_u32(*digit)
+                            .and_then(|digit| digit.to_digit(10))
+                            .unwrap_or_default(),
+                    ))
                 }),
         )
     }
@@ -1611,38 +1624,38 @@ impl PatternParser<'_> {
     fn atom(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
         // Annex B: a braced quantifier with nothing before it is an early error,
         // while a `{` that cannot be a quantifier is an ordinary character.
-        if self.peek() == Some('{') && self.try_bounds()?.is_some() {
+        if self.peek_char() == Some('{') && self.try_bounds()?.is_some() {
             return Err(RegexSyntaxError::new(
                 "quantifier has nothing to repeat".to_owned(),
             ));
         }
-        let Some(character) = self.bump() else {
+        let Some(code) = self.bump() else {
             return Err(RegexSyntaxError::new(
                 "unexpected end of pattern".to_owned(),
             ));
         };
-        match character {
-            '^' => Ok(Node::AnchorStart),
-            '$' => Ok(Node::AnchorEnd),
-            '.' => Ok(Node::AnyChar),
-            '[' => self.class(),
-            '(' => self.group(top_level),
-            '\\' => self.escape(),
-            '*' | '+' | '?' => Err(RegexSyntaxError::new(
+        match char::from_u32(code) {
+            Some('^') => Ok(Node::AnchorStart),
+            Some('$') => Ok(Node::AnchorEnd),
+            Some('.') => Ok(Node::AnyChar),
+            Some('[') => self.class(),
+            Some('(') => self.group(top_level),
+            Some('\\') => self.escape(),
+            Some('*' | '+' | '?') => Err(RegexSyntaxError::new(
                 "quantifier has nothing to repeat".to_owned(),
             )),
             // A lone bracket is a character only without `u`.
-            '{' | '}' | ']' if self.unicode => Err(RegexSyntaxError::new(
+            Some('{' | '}' | ']') if self.unicode => Err(RegexSyntaxError::new(
                 "lone quantifier bracket with the u flag".to_owned(),
             )),
-            other => Ok(Node::Literal(other)),
+            _ => Ok(Node::Literal(code)),
         }
     }
 
     fn group(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
         let mut index = None;
         if self.eat('?') {
-            match self.bump() {
+            match self.bump_char() {
                 Some(':') => {}
                 Some('=') => {
                     let body = self.alternative(false)?;
@@ -1665,8 +1678,8 @@ impl PatternParser<'_> {
                     });
                 }
                 Some('<') => {
-                    if matches!(self.peek(), Some('=' | '!')) {
-                        let negated = self.bump() == Some('!');
+                    if matches!(self.peek_char(), Some('=' | '!')) {
+                        let negated = self.bump_char() == Some('!');
                         let body = self.alternative(false)?;
                         if !self.eat(')') {
                             return Err(RegexSyntaxError::new(
@@ -1718,14 +1731,14 @@ impl PatternParser<'_> {
     /// error.
     fn modifier_group(&mut self, top_level: bool) -> Result<Node, RegexSyntaxError> {
         let mut add = String::new();
-        while let Some(letter @ ('i' | 'm' | 's')) = self.peek() {
+        while let Some(letter @ ('i' | 'm' | 's')) = self.peek_char() {
             self.cursor += 1;
             add.push(letter);
         }
         let mut remove = String::new();
         let has_remove = self.eat('-');
         if has_remove {
-            while let Some(letter @ ('i' | 'm' | 's')) = self.peek() {
+            while let Some(letter @ ('i' | 'm' | 's')) = self.peek_char() {
                 self.cursor += 1;
                 remove.push(letter);
             }
@@ -1775,34 +1788,34 @@ impl PatternParser<'_> {
         let negated = self.eat('^');
         let mut items = Vec::new();
         let mut closed = false;
-        while let Some(character) = self.bump() {
-            if character == ']' {
+        while let Some(code) = self.bump() {
+            if code == u32::from(']') {
                 closed = true;
                 break;
             }
-            let low = if character == '\\' {
+            let low = if code == u32::from('\\') {
                 self.class_escape()?
             } else {
-                ClassAtom::Char(character)
+                ClassAtom::Char(code)
             };
-            let is_range = self.peek() == Some('-')
+            let is_range = self.peek_char() == Some('-')
                 && self
                     .characters
                     .get(self.cursor + 1)
-                    .is_some_and(|next| *next != ']');
+                    .is_some_and(|next| *next != u32::from(']'));
             if !is_range {
                 items.push(low.into_item());
                 continue;
             }
             self.cursor += 1;
             let high = match self.bump() {
-                Some('\\') => self.class_escape()?,
-                Some(character) => ClassAtom::Char(character),
+                Some(code) if code == u32::from('\\') => self.class_escape()?,
+                Some(code) => ClassAtom::Char(code),
                 None => break,
             };
             match (low, high) {
                 (ClassAtom::Char(low), ClassAtom::Char(high)) => {
-                    if code_value(high) < code_value(low) {
+                    if high < low {
                         return Err(RegexSyntaxError::new("class range out of order".to_owned()));
                     }
                     items.push(ClassItem::Range(low, high));
@@ -1815,7 +1828,7 @@ impl PatternParser<'_> {
                     }
                     // Annex B: the `-` is an ordinary character.
                     items.push(low.into_item());
-                    items.push(ClassItem::Char('-'));
+                    items.push(ClassItem::Char(u32::from('-')));
                     items.push(high.into_item());
                 }
             }
@@ -1829,11 +1842,14 @@ impl PatternParser<'_> {
     }
 
     fn escape(&mut self) -> Result<Node, RegexSyntaxError> {
-        let Some(character) = self.bump() else {
+        let Some(code) = self.bump() else {
             return Err(RegexSyntaxError::new(
                 "pattern ends with a lone backslash".to_owned(),
             ));
         };
+        // A surrogate is no letter, so it reads as the replacement character here
+        // and falls through to the identity arm, which keeps `code`.
+        let character = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
         match character {
             'b' => Ok(Node::WordBoundary(true)),
             'B' => Ok(Node::WordBoundary(false)),
@@ -1851,7 +1867,7 @@ impl PatternParser<'_> {
             }
             '1'..='9' => self.decimal_escape(character),
             '0' => {
-                if self.unicode && self.peek().is_some_and(|value| value.is_ascii_digit()) {
+                if self.unicode && self.peek_char().is_some_and(|value| value.is_ascii_digit()) {
                     return Err(RegexSyntaxError::new(
                         "decimal digit after \\0 with the u flag".to_owned(),
                     ));
@@ -1880,7 +1896,7 @@ impl PatternParser<'_> {
                 }
                 Ok(Node::Backreference(indices))
             }
-            other => Ok(Node::Literal(self.escape_char(other, false)?)),
+            _ => Ok(Node::Literal(self.escape_char(code, false)?)),
         }
     }
 
@@ -1891,7 +1907,7 @@ impl PatternParser<'_> {
         let first = first_character.to_digit(10).unwrap_or_default();
         let after_first = self.cursor;
         let mut number = first as usize;
-        while let Some(digit) = self.peek().and_then(|value| value.to_digit(10)) {
+        while let Some(digit) = self.peek_char().and_then(|value| value.to_digit(10)) {
             number = number.saturating_mul(10).saturating_add(digit as usize);
             self.cursor += 1;
         }
@@ -1905,7 +1921,7 @@ impl PatternParser<'_> {
         }
         self.cursor = after_first;
         if first >= 8 {
-            Ok(Node::Literal(first_character))
+            Ok(Node::Literal(u32::from(first_character)))
         } else {
             Ok(Node::Literal(self.octal_escape(first)))
         }
@@ -1913,32 +1929,35 @@ impl PatternParser<'_> {
 
     /// Annex B `LegacyOctalEscapeSequence` whose first digit `first` (0 to 7) is
     /// already consumed. `\0` not followed by an octal digit is NUL.
-    fn octal_escape(&mut self, first: u32) -> char {
-        if first == 0 && !self.peek().is_some_and(|value| value.is_digit(8)) {
-            return '\0';
+    fn octal_escape(&mut self, first: u32) -> u32 {
+        if first == 0 && !self.peek_char().is_some_and(|value| value.is_digit(8)) {
+            return 0;
         }
         // Up to two more digits after 0 to 3, and one more after 4 to 7.
         let extra = if first <= 3 { 2 } else { 1 };
         let mut value = first;
         for _ in 0..extra {
-            let Some(digit) = self.peek().and_then(|character| character.to_digit(8)) else {
+            let Some(digit) = self.peek_char().and_then(|character| character.to_digit(8)) else {
                 break;
             };
             value = value * 8 + digit;
             self.cursor += 1;
         }
-        char::from_u32(value).unwrap_or('\0')
+        value
     }
 
     fn class_escape(&mut self) -> Result<ClassAtom, RegexSyntaxError> {
-        let Some(character) = self.bump() else {
+        let Some(code) = self.bump() else {
             return Err(RegexSyntaxError::new(
                 "class ends with a lone backslash".to_owned(),
             ));
         };
+        // A surrogate reads as the replacement character, which no letter arm
+        // matches, so it reaches the identity arm with its own `code`.
+        let character = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
         Ok(match character {
             'd' | 'D' | 's' | 'S' | 'w' | 'W' => ClassAtom::Item(shorthand_item(character)),
-            'b' => ClassAtom::Char('\u{0008}'),
+            'b' => ClassAtom::Char(0x08),
             'B' if self.unicode => {
                 return Err(RegexSyntaxError::new(
                     "\\B is not allowed in a class with the u flag".to_owned(),
@@ -1951,12 +1970,12 @@ impl PatternParser<'_> {
             '0'..='7' => {
                 let first = character.to_digit(8).unwrap_or_default();
                 if self.unicode {
-                    if first != 0 || self.peek().is_some_and(|value| value.is_ascii_digit()) {
+                    if first != 0 || self.peek_char().is_some_and(|value| value.is_ascii_digit()) {
                         return Err(RegexSyntaxError::new(
                             "octal escape in a class with the u flag".to_owned(),
                         ));
                     }
-                    ClassAtom::Char('\0')
+                    ClassAtom::Char(0)
                 } else {
                     ClassAtom::Char(self.octal_escape(first))
                 }
@@ -1969,13 +1988,13 @@ impl PatternParser<'_> {
             // Annex B ClassControlLetter: `\c` followed by a digit or `_` in a class.
             'c' if !self.unicode
                 && self
-                    .peek()
+                    .peek_char()
                     .is_some_and(|value| value.is_ascii_digit() || value == '_') =>
             {
-                let letter = self.bump().unwrap_or('_');
-                ClassAtom::Char(char::from(letter as u8 % 32))
+                let letter = self.bump_char().unwrap_or('_');
+                ClassAtom::Char(u32::from(letter as u8 % 32))
             }
-            other => ClassAtom::Char(self.escape_char(other, true)?),
+            _ => ClassAtom::Char(self.escape_char(code, true)?),
         })
     }
 
@@ -1995,7 +2014,7 @@ impl PatternParser<'_> {
         }
         let mut name = String::new();
         loop {
-            match self.bump() {
+            match self.bump_char() {
                 Some('}') => return Ok(name),
                 Some(character) => name.push(character),
                 None => return Err(RegexSyntaxError::new("invalid property escape".to_owned())),
@@ -2067,7 +2086,7 @@ impl PatternParser<'_> {
             let operand = match member {
                 // A character followed by a single `-` opens a range.
                 SetMember::Char(low)
-                    if self.peek() == Some('-') && self.peek_at(1) != Some('-') =>
+                    if self.peek_char() == Some('-') && self.peek_char_at(1) != Some('-') =>
                 {
                     self.cursor += 1;
                     let high = self.class_set_character()?;
@@ -2101,7 +2120,7 @@ impl PatternParser<'_> {
         let mut operands = vec![first.into_value()];
         while self.starts_with(operator) {
             self.cursor += 2;
-            if self.peek() == operator.chars().next() {
+            if self.peek_char() == operator.chars().next() {
                 return Err(RegexSyntaxError::new(
                     "invalid set operator in a class".to_owned(),
                 ));
@@ -2123,7 +2142,7 @@ impl PatternParser<'_> {
     /// One union member or operand: a character, a nested class, a class string
     /// disjunction, or a class escape.
     fn class_set_member(&mut self) -> Result<SetMember, RegexSyntaxError> {
-        Ok(match (self.peek(), self.peek_at(1)) {
+        Ok(match (self.peek_char(), self.peek_char_at(1)) {
             (Some('['), _) => {
                 self.cursor += 1;
                 SetMember::Set(self.bracketed_class()?)
@@ -2156,7 +2175,7 @@ impl PatternParser<'_> {
         let mut value = ClassValue::default();
         let mut alternative = Vec::new();
         loop {
-            match self.peek() {
+            match self.peek_char() {
                 Some(separator @ ('}' | '|')) => {
                     self.cursor += 1;
                     value.add_alternative(std::mem::take(&mut alternative));
@@ -2164,8 +2183,8 @@ impl PatternParser<'_> {
                         return Ok(value);
                     }
                 }
-                Some(_) => alternative.push(self.class_set_character()?),
-                None => {
+                _ if self.peek().is_some() => alternative.push(self.class_set_character()?),
+                _ => {
                     return Err(RegexSyntaxError::new(
                         "unterminated class string disjunction".to_owned(),
                     ));
@@ -2176,24 +2195,30 @@ impl PatternParser<'_> {
 
     /// One `ClassSetCharacter`: a character that is not a syntax character and
     /// does not begin a doubled punctuator, or an escape naming one.
-    fn class_set_character(&mut self) -> Result<char, RegexSyntaxError> {
-        let Some(character) = self.bump() else {
+    fn class_set_character(&mut self) -> Result<u32, RegexSyntaxError> {
+        let Some(code) = self.bump() else {
             return Err(RegexSyntaxError::new(
                 "unterminated character class".to_owned(),
             ));
         };
+        // A surrogate is no syntax character and no punctuator, so it reads as
+        // the replacement character here and stays `code` when returned.
+        let character = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
         if character == '\\' {
             let Some(escaped) = self.bump() else {
                 return Err(RegexSyntaxError::new(
                     "class ends with a lone backslash".to_owned(),
                 ));
             };
-            return match escaped {
-                'b' => Ok('\u{0008}'),
+            let escaped_char = char::from_u32(escaped).unwrap_or(char::REPLACEMENT_CHARACTER);
+            return match escaped_char {
+                'b' => Ok(0x08),
                 // `\0` is a CharacterEscape unless a decimal digit follows it.
-                '0' if !self.peek().is_some_and(|next| next.is_ascii_digit()) => Ok('\0'),
-                reserved if CLASS_SET_RESERVED_PUNCTUATORS.contains(reserved) => Ok(reserved),
-                other => self.escape_char(other, true),
+                '0' if !self.peek_char().is_some_and(|next| next.is_ascii_digit()) => Ok(0),
+                reserved if CLASS_SET_RESERVED_PUNCTUATORS.contains(reserved) => {
+                    Ok(u32::from(reserved))
+                }
+                _ => self.escape_char(escaped, true),
             };
         }
         if CLASS_SET_SYNTAX_CHARACTERS.contains(character) {
@@ -2201,7 +2226,7 @@ impl PatternParser<'_> {
                 "{character:?} must be escaped in a class with the v flag"
             )));
         }
-        let doubled = self.peek().is_some_and(|next| {
+        let doubled = self.peek_char().is_some_and(|next| {
             CLASS_SET_DOUBLE_PUNCTUATORS.iter().any(|pair| {
                 let mut pair = pair.chars();
                 pair.next() == Some(character) && pair.next() == Some(next)
@@ -2212,41 +2237,50 @@ impl PatternParser<'_> {
                 "doubled punctuator in a class with the v flag".to_owned(),
             ));
         }
-        Ok(character)
+        Ok(code)
     }
 
     /// Whether the input at the cursor starts with `text`.
     fn starts_with(&self, text: &str) -> bool {
         text.chars()
             .enumerate()
-            .all(|(offset, expected)| self.peek_at(offset) == Some(expected))
+            .all(|(offset, expected)| self.peek_char_at(offset) == Some(expected))
     }
 
-    /// The character `offset` places after the cursor.
-    fn peek_at(&self, offset: usize) -> Option<char> {
+    /// The code value `offset` places after the cursor.
+    fn peek_at(&self, offset: usize) -> Option<u32> {
         self.characters.get(self.cursor + offset).copied()
+    }
+
+    /// The character `offset` places after the cursor, if it is a scalar.
+    fn peek_char_at(&self, offset: usize) -> Option<char> {
+        self.peek_at(offset).and_then(char::from_u32)
     }
 
     /// Whether the cursor is at the `]` that closes a class (or at the end).
     fn at_class_end(&self) -> bool {
-        matches!(self.peek(), None | Some(']'))
+        self.peek().is_none() || self.peek_char() == Some(']')
     }
 
     /// The character that an escape other than the class, decimal and `\k`
     /// forms stands for. `character` is already consumed. Under `u` an identity
     /// escape must name a syntax character.
-    fn escape_char(&mut self, character: char, in_class: bool) -> Result<char, RegexSyntaxError> {
+    /// `CharacterEscape` (ECMA-262 §22.2.1) for the escape letter `code`, which
+    /// is already consumed. Returns the code value the escape stands for. A
+    /// letter with no escape meaning is an identity escape, which is `code`.
+    fn escape_char(&mut self, code: u32, in_class: bool) -> Result<u32, RegexSyntaxError> {
+        let character = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
         match character {
-            'f' => Ok('\u{000c}'),
-            'n' => Ok('\n'),
-            'r' => Ok('\r'),
-            't' => Ok('\t'),
-            'v' => Ok('\u{000b}'),
+            'f' => Ok(0x0c),
+            'n' => Ok(0x0a),
+            'r' => Ok(0x0d),
+            't' => Ok(0x09),
+            'v' => Ok(0x0b),
             // §22.2.1 ControlEscape: `\cA` is U+0001 … `\cZ` is U+001A.
-            'c' => match self.peek() {
+            'c' => match self.peek_char() {
                 Some(letter) if letter.is_ascii_alphabetic() => {
                     self.cursor += 1;
-                    Ok(char::from(letter as u8 % 32))
+                    Ok(u32::from(letter as u8 % 32))
                 }
                 _ if self.unicode => Err(RegexSyntaxError::new(
                     "invalid control escape with the u flag".to_owned(),
@@ -2254,18 +2288,18 @@ impl PatternParser<'_> {
                 _ => {
                     // Annex B: the backslash is a character, and `c` is read again.
                     self.cursor -= 1;
-                    Ok('\\')
+                    Ok(u32::from('\\'))
                 }
             },
             'x' => match hex_value(self.characters, self.cursor, 2) {
                 Some(value) => {
                     self.cursor += 2;
-                    Ok(value_char(value).unwrap_or('\u{fffd}'))
+                    Ok(value)
                 }
                 None if self.unicode => Err(RegexSyntaxError::new(
                     "invalid \\x escape in pattern".to_owned(),
                 )),
-                None => Ok('x'),
+                None => Ok(u32::from('x')),
             },
             'u' => {
                 if self.unicode {
@@ -2276,25 +2310,25 @@ impl PatternParser<'_> {
                         ));
                     };
                     self.cursor = next;
-                    Ok(value_char(value).unwrap_or('\u{fffd}'))
+                    Ok(value)
                 } else {
                     match hex_value(self.characters, self.cursor, 4) {
                         Some(value) => {
                             self.cursor += 4;
-                            Ok(value_char(value).unwrap_or('\u{fffd}'))
+                            Ok(value)
                         }
                         // Annex B: `\u` without four hex digits is the letter.
-                        None => Ok('u'),
+                        None => Ok(u32::from('u')),
                     }
                 }
             }
-            other => {
-                if self.unicode && !is_identity_escapable(other, in_class) {
+            _ => {
+                if self.unicode && !is_identity_escapable(character, in_class) {
                     Err(RegexSyntaxError::new(
                         "invalid identity escape with the u flag".to_owned(),
                     ))
                 } else {
-                    Ok(other)
+                    Ok(code)
                 }
             }
         }
@@ -2461,7 +2495,27 @@ mod property {
 
 #[cfg(test)]
 mod tests {
-    use super::{Compiled, Flags, compile, validate};
+    use super::{Compiled, Flags, RegexSyntaxError, validate};
+    use crate::utf16::JsString;
+
+    /// A pattern written as Rust text: the tests spell patterns as `&str`, and
+    /// the engine takes the code units of the pattern.
+    fn compile(pattern: &str, flags: &str) -> Result<Compiled, RegexSyntaxError> {
+        super::compile(&JsString::from(pattern), flags)
+    }
+
+    /// The pattern alphabet is code values, so U+F0000 (a real private-use
+    /// character, the pair `D B80 DC00`) and a lone `\uD800` are different
+    /// characters. The old surrogate marker made them the same one.
+    #[test]
+    fn a_private_use_character_and_a_lone_surrogate_do_not_collide() {
+        let private_use = compile("\u{f0000}", "u").expect("compiles");
+        assert_eq!(private_use.find(&[0xd800_u16], 0), None);
+        assert!(private_use.find(&[0xdb80_u16, 0xdc00], 0).is_some());
+        let lone = compile("\\uD800", "").expect("compiles");
+        assert!(lone.find(&[0xd800_u16], 0).is_some());
+        assert_eq!(lone.find(&[0xdb80_u16, 0xdc00], 0), None);
+    }
 
     fn units(input: &str) -> Vec<u16> {
         input.encode_utf16().collect()

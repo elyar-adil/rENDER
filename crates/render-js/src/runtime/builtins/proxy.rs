@@ -28,7 +28,7 @@ fn same_key(left: &PropertyName, right: &PropertyName) -> bool {
 /// The key as a JavaScript value, which is what a trap receives.
 fn key_value(key: &PropertyName) -> JsValue {
     match key {
-        PropertyName::String(name) => JsValue::String(name.clone()),
+        PropertyName::String(name) => JsValue::String((name.clone()).into()),
         PropertyName::Symbol(symbol) => JsValue::Symbol(symbol.clone()),
     }
 }
@@ -347,8 +347,11 @@ impl JsRuntime {
         };
         self.realm
             .define_property(revoke, "length", attributes(JsValue::Number(0.0)));
-        self.realm
-            .define_property(revoke, "name", attributes(JsValue::String(String::new())));
+        self.realm.define_property(
+            revoke,
+            "name",
+            attributes(JsValue::String((String::new()).into())),
+        );
         revoke
     }
 
@@ -1036,7 +1039,7 @@ impl JsRuntime {
         let count = length as usize;
         for index in 0..count {
             let key = match self.get_member(dom, *array, &index.to_string())? {
-                JsValue::String(name) => PropertyName::String(name),
+                JsValue::String(name) => PropertyName::String((name).to_key()),
                 JsValue::Symbol(symbol) => PropertyName::Symbol(symbol),
                 _ => {
                     return Err(JsError::type_error(

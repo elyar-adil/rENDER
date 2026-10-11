@@ -145,7 +145,7 @@ fn event_target_registers_removes_and_cancels_listeners() {
                 "#,
         )
         .expect("EventTarget methods should dispatch a cancelable event");
-    assert_eq!(outcome.value, JsValue::String("1:false:true".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("1:false:true".into()));
 }
 
 #[test]
@@ -190,7 +190,7 @@ fn object_reflection_and_assignment_cover_common_runtime_usage() {
                 "#,
             )
             .expect("Object builtins should execute");
-    assert_eq!(outcome.value, JsValue::String("ba21true1".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("ba21true1".into()));
 }
 
 #[test]
@@ -290,7 +290,7 @@ fn array_constructor_and_length_follow_common_ecmascript_semantics() {
         .expect("Array constructor and length semantics should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("0:2:true:x:0,1,2,3:4:true".to_owned())
+        JsValue::String("0:2:true:x:0,1,2,3:4:true".into())
     );
 }
 
@@ -316,7 +316,7 @@ fn primitive_prototypes_and_native_function_call_are_wired() {
         .expect("primitive methods and native call inheritance should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("0.000|1|1.20|true|true|ok|1".to_owned())
+        JsValue::String("0.000|1|1.20|true|true|ok|1".into())
     );
 }
 
@@ -349,7 +349,7 @@ fn dom_interfaces_and_keyed_collections_cover_site_bootstrap_usage() {
         .expect("DOM constructors and keyed collections should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("function|true|true|3|1|true|6|false|1|2|ok".to_owned())
+        JsValue::String("function|true|true|3|1|true|6|false|1|2|ok".into())
     );
 }
 
@@ -386,7 +386,7 @@ fn browser_constructor_aliases_and_screen_metrics_are_available() {
         .expect("browser globals should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("function|function|function|true|1024|768|24|true|true".to_owned())
+        JsValue::String("function|function|function|true|1024|768|24|true|true".into())
     );
 }
 
@@ -397,11 +397,11 @@ fn base64_globals_support_media_bootstrap_decoding() {
     let outcome = runtime
         .execute(&mut parsed.dom, r#"btoa("render");"#)
         .expect("btoa should execute");
-    assert_eq!(outcome.value, JsValue::String("cmVuZGVy".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("cmVuZGVy".into()));
     let round_trip = runtime
         .execute(&mut parsed.dom, r#"atob("cmVuZGVy");"#)
         .expect("atob should execute");
-    assert_eq!(round_trip.value, JsValue::String("render".to_owned()));
+    assert_eq!(round_trip.value, JsValue::String("render".into()));
 }
 
 #[test]
@@ -417,7 +417,7 @@ fn template_literals_and_surrogate_pairs_execute() {
                 "#,
         )
         .expect("template interpolation should execute");
-    assert_eq!(outcome.value, JsValue::String("QQ-3-😀".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("QQ-3-😀".into()));
 }
 
 #[test]
@@ -437,7 +437,7 @@ fn array_length_reads_use_to_length_for_generic_array_methods() {
                 "#,
             )
             .expect("generic array methods should normalize length");
-    assert_eq!(outcome.value, JsValue::String("a|object|e|3".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("a|object|e|3".into()));
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn for_in_enumerates_prototypes_and_delete_honors_descriptors() {
             .expect("for-in and delete should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("fixed,own,inherited,true,false,undefined,4".to_owned())
+        JsValue::String("fixed,own,inherited,true,false,undefined,4".into())
     );
 }
 
@@ -510,7 +510,7 @@ fn property_helper_primordials_can_be_uncurried() {
         .expect("propertyHelper primordial operations should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("a;b;c:visible,hidden:32".to_owned())
+        JsValue::String("a;b;c:visible,hidden:32".into())
     );
 }
 
@@ -530,7 +530,7 @@ fn user_functions_expose_arguments_and_string_conversion() {
                 "#,
         )
         .expect("ordinary functions should expose arguments");
-    assert_eq!(outcome.value, JsValue::String("2:42:function".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("2:42:function".into()));
 }
 
 #[test]
@@ -554,9 +554,7 @@ fn native_error_constructors_share_the_error_prototype_contract() {
 
     assert_eq!(
         outcome.value,
-        JsValue::String(
-            "function:true:true:true:TypeError:bad input:TypeError: bad input".to_owned()
-        )
+        JsValue::String("function:true:true:true:TypeError:bad input:TypeError: bad input".into())
     );
 }
 
@@ -603,7 +601,7 @@ fn bitwise_operators_follow_ecmascript_precedence_and_int32_semantics() {
 
     assert_eq!(
         outcome.value,
-        JsValue::String("7:3:-2147483648:-1:4294967295:0:0:-1".to_owned())
+        JsValue::String("7:3:-2147483648:-1:4294967295:0:0:-1".into())
     );
 }
 
@@ -626,7 +624,7 @@ fn bitwise_compound_assignment_evaluates_member_reference_once() {
         )
         .expect("compound bitwise assignment should preserve a single reference evaluation");
 
-    assert_eq!(outcome.value, JsValue::String("10:3".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("10:3".into()));
 }
 
 #[test]
@@ -657,13 +655,13 @@ fn document_ready_state_follows_the_host_and_starts_loading() {
     let mut runtime = JsRuntime::new(&parsed.dom);
     runtime
         .execute(&mut parsed.dom, "document.readyState")
-        .map(|outcome| assert_eq!(outcome.value, JsValue::String("loading".to_owned())))
+        .map(|outcome| assert_eq!(outcome.value, JsValue::String("loading".into())))
         .expect("a new document is loading");
 
     runtime.set_document_ready_state(crate::DocumentReadyState::Interactive);
     runtime
         .execute(&mut parsed.dom, "document.readyState")
-        .map(|outcome| assert_eq!(outcome.value, JsValue::String("interactive".to_owned())))
+        .map(|outcome| assert_eq!(outcome.value, JsValue::String("interactive".into())))
         .expect("the host moves the document on");
     assert_eq!(
         runtime.document_ready_state(),
@@ -865,7 +863,7 @@ fn inner_html_round_trips_and_setter_replaces_children() {
         .expect("innerHTML accessors should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("<p>old</p>|<b>new</b> text &amp; more<!-- c -->|1".to_owned()),
+        JsValue::String("<p>old</p>|<b>new</b> text &amp; more<!-- c -->|1".into()),
         "children counts only the element child; text and comment are preserved"
     );
 }
@@ -921,7 +919,7 @@ fn style_declaration_reads_writes_and_clears_inline_declarations() {
         JsValue::String(
             "red:red:2:color:color: red; background-color: blue !important;::\
                  background-color: blue !important;"
-                .to_owned()
+                .into()
         ),
         "unexpected inline style state"
     );
@@ -972,10 +970,7 @@ fn get_rect_bounds_reports_installed_geometry() {
                 "#,
         )
         .expect("geometry-backed rect should read back");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("8,16,100,20,108,36".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("8,16,100,20,108,36".into()));
 }
 
 #[test]
@@ -1025,7 +1020,7 @@ fn regex_literals_support_exec_groups_and_flags() {
         .expect("regex literal should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("item-42|item|42|0|item-42 rest|true".to_owned())
+        JsValue::String("item-42|item|42|0|item-42 rest|true".into())
     );
 }
 
@@ -1050,7 +1045,7 @@ fn regex_global_test_and_sticky_track_last_index() {
         .expect("regex flag tests should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,false,true,false,0".to_owned())
+        JsValue::String("true,true,true,false,true,false,0".into())
     );
 }
 
@@ -1075,7 +1070,7 @@ fn string_methods_cover_indexing_slicing_and_case() {
         .expect("string methods should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("o|72|7|1|HELLO|world|bc|def|cd|abcdefghi".to_owned())
+        JsValue::String("o|72|7|1|HELLO|world|bc|def|cd|abcdefghi".into())
     );
 }
 
@@ -1097,7 +1092,7 @@ fn string_replace_expands_groups_and_honors_global() {
         .expect("string replace should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("b_a-c|a+b+c|23/08/2026".to_owned())
+        JsValue::String("b_a-c|a+b+c|23/08/2026".into())
     );
 }
 
@@ -1122,7 +1117,7 @@ fn string_split_match_search_interoperate_with_regex() {
         .expect("regex-aware string methods should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("4|one/two/three|2:12.34|9|-1".to_owned())
+        JsValue::String("4|one/two/three|2:12.34|9|-1".into())
     );
 }
 
@@ -1144,10 +1139,7 @@ fn json_and_date_builtins_cover_real_world_bootstrap_scripts() {
             .expect("JSON and Date builtins should execute");
     assert_eq!(
             outcome.value,
-            JsValue::String(
-                "{\"name\":\"rENDER\",\"items\":[1,true,null]}|1787488496789|2026|7|23|12|2026-08-23T12:34:56.789Z|1787443200000"
-                    .to_owned()
-            )
+            JsValue::String("{\"name\":\"rENDER\",\"items\":[1,true,null]}|1787488496789|2026|7|23|12|2026-08-23T12:34:56.789Z|1787443200000".into())
         );
 }
 
@@ -1164,10 +1156,7 @@ fn global_this_is_available_to_feature_detection() {
                 "#,
         )
         .expect("globalThis feature detection should execute");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("object|true|true".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("object|true|true".into()));
 }
 
 #[test]
@@ -1180,7 +1169,7 @@ fn typeof_missing_bindings_short_circuits_optional_globals() {
                 r#"[typeof define, ("function" == typeof define && define.amd) ? "yes" : "no"].join("|")"#,
             )
             .expect("optional global feature detection should execute");
-    assert_eq!(outcome.value, JsValue::String("undefined|no".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("undefined|no".into()));
 }
 
 #[test]
@@ -1210,7 +1199,7 @@ fn modern_binding_spread_computed_and_string_builtins_execute() {
         .expect("modern syntax and string constructors should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("AB|😀|1|2|3|4|5|7|9|8|side7tail9".to_owned())
+        JsValue::String("AB|😀|1|2|3|4|5|7|9|8|side7tail9".into())
     );
 }
 
@@ -1262,7 +1251,7 @@ fn intersection_observer_reports_viewport_entries_and_drives_src_mutation() {
         Some("loaded.png")
     );
     let outcome = runtime.execute(&mut parsed.dom, "observed").unwrap();
-    assert_eq!(outcome.value, JsValue::String("true:1:30".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("true:1:30".into()));
 }
 
 #[test]
@@ -1283,10 +1272,7 @@ fn caught_native_errors_materialize_as_standard_error_instances() {
             "#,
         )
         .expect("catch executes");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("true:true:string".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("true:true:string".into()));
 }
 
 #[test]
@@ -1310,6 +1296,7 @@ fn error_stack_names_active_frames_and_matches_header() {
     let JsValue::String(stack) = outcome.value else {
         panic!("stack should be a string");
     };
+    let stack = stack.to_lossy();
     let (flag, text) = stack.split_once(':').expect("flag:stack");
     assert_eq!(flag, "true");
     assert!(text.contains("TypeError: boom"), "stack: {text}");
@@ -1386,7 +1373,7 @@ fn accessor_properties_invoke_getters_and_setters_through_the_chain() {
         .expect("accessor chain executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("42:s:21".to_owned()),
+        JsValue::String("42:s:21".into()),
         "setter fires on the receiver, getter multiplies stored"
     );
 }
@@ -1409,7 +1396,7 @@ fn object_get_own_property_descriptor_reports_accessors() {
     // Spec: attributes omitted from the descriptor default to false.
     assert_eq!(
         outcome.value,
-        JsValue::String("function,true,false,true,false".to_owned())
+        JsValue::String("function,true,false,true,false".into())
     );
 }
 
@@ -1447,10 +1434,7 @@ fn object_literal_accessors_and_define_getter_family_agree() {
             ",
         )
         .expect("accessor literal executes");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("true,true:function".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("true,true:function".into()));
 }
 
 #[test]
@@ -1479,7 +1463,7 @@ fn object_integrity_levels_freeze_seal_and_extension_guards() {
         .expect("integrity builtins execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true,true".into())
     );
 }
 
@@ -1519,7 +1503,7 @@ fn to_object_boxes_primitives_into_distinct_wrappers() {
     assert_eq!(
         outcome.value,
         JsValue::String(
-            "true,true,true,true,true,true,true,true,true,true,true,true,true,true".to_owned()
+            "true,true,true,true,true,true,true,true,true,true,true,true,true,true".into()
         )
     );
 }
@@ -1562,10 +1546,7 @@ fn to_object_on_nullish_throws_while_strings_expose_exotic_own_keys() {
         .expect("String exotic probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String(
-            "true,true,false,0,1,length,0,1,a,false,true,false,2,false,false,false,true,true,a,b,0,1,tag,length,true,true,a2x"
-                .to_owned()
-        )
+        JsValue::String("true,true,false,0,1,length,0,1,a,false,true,false,2,false,false,false,true,true,a,b,0,1,tag,length,true,true,a2x".into())
     );
 }
 
@@ -1626,10 +1607,7 @@ fn object_statics_and_reflect_share_one_to_object() {
         .expect("Object/Reflect probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String(
-            "true,true,true,true,true,0,1,length,true,true,true,true,true,true,true,true,true,true,true,true/2/a,true,true,true,true,true,true,true,true"
-                .to_owned()
-        )
+        JsValue::String("true,true,true,true,true,0,1,length,true,true,true,true,true,true,true,true,true,true,true,true/2/a,true,true,true,true,true,true,true,true".into())
     );
 }
 
@@ -1673,10 +1651,7 @@ fn proto_accessor_and_object_literal_proto_set_the_prototype() {
         .expect("__proto__ probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String(
-            "true,false,true,true,true,true,true,true,1,2,true,true,undefined,true,,__proto__,__proto__,__proto__,__proto__"
-                .to_owned()
-        )
+        JsValue::String("true,false,true,true,true,true,true,true,1,2,true,true,undefined,true,,__proto__,__proto__,__proto__,__proto__".into())
     );
 }
 
@@ -1762,7 +1737,7 @@ fn function_prototype_call_and_apply_thread_the_receiver() {
         JsValue::String(
             "true,false,false,true,true,2,AB,1.5,5,p-q,ABC,{\"a\":1},AB,2,4,6,1,3,12,\
              true,true,1,2,4,2,4,9,11,2,true,5,42,true,2,true,8,function,true"
-                .to_owned()
+                .into()
         )
     );
 }
@@ -1823,7 +1798,7 @@ fn number_to_string_honours_a_radix_and_parse_int_reads_one() {
             "ff,11111111,73,-ff,0.1,1.1,0,1e+21,0.00011001,10,10,1010,\
              true,true,true,NaN/-Infinity,255,31,31,5,-42,1295,NaN,NaN,0,\
              10000000000000000,2147483647"
-                .to_owned()
+                .into()
         )
     );
 }
@@ -1853,7 +1828,7 @@ fn date_prototype_methods_reject_a_receiver_without_a_time_value() {
         .expect("Date receiver probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,7".to_owned())
+        JsValue::String("true,true,true,true,true,true,7".into())
     );
 }
 
@@ -1889,7 +1864,7 @@ fn date_setters_coerce_arguments_in_order_before_the_nan_check() {
         .expect("Date setter coercion probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,h m,month,true,0".to_owned())
+        JsValue::String("true,h m,month,true,0".into())
     );
 }
 
@@ -1923,7 +1898,7 @@ fn date_setters_compute_fields_and_clip_like_the_spec() {
         .expect("Date setter arithmetic probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,true,true,true,true,NaN,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,true,true,true,true,NaN,true".into())
     );
 }
 
@@ -1948,7 +1923,7 @@ fn date_setter_lengths_and_names_follow_the_spec() {
         .expect("Date length probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("1,3,4,1,3,2,2,1,1,1,3,4,1,3,2,2,1,1,0".to_owned())
+        JsValue::String("1,3,4,1,3,2,2,1,1,1,3,4,1,3,2,2,1,1,0".into())
     );
 }
 
@@ -1984,7 +1959,7 @@ fn date_symbol_to_primitive_orders_methods_by_hint() {
         .expect("Date @@toPrimitive probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,true,true,true".into())
     );
 }
 
@@ -2017,7 +1992,7 @@ fn date_annex_b_year_accessors_and_gmt_alias() {
         JsValue::String(
             "70,true,true,true,true,true,toUTCString,00:00:00 GMT+0000,\
              00:00:00 GMT+0000,Thu Jan 01 1970,true"
-                .to_owned()
+                .into()
         )
     );
 }
@@ -2040,7 +2015,7 @@ fn date_constructor_reads_a_date_argument_without_valueof() {
             ",
         )
         .expect("Date constructor argument probe executes");
-    assert_eq!(outcome.value, JsValue::String("5,true,default".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("5,true,default".into()));
 }
 
 #[test]
@@ -2074,7 +2049,7 @@ fn date_instances_take_new_target_prototype_and_to_json_brand_checks_its_receive
         .expect("Date subclass and toJSON probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,true".into())
     );
 }
 
@@ -2150,7 +2125,7 @@ fn string_raw_reads_a_template_object_and_tags_name_their_hosts() {
 [object Symbol],[object Number],[object String],[object Boolean],\
 [object Array],[object Object],[object Object],[object Function],\
 [object Function],[object Promise]"
-                .to_owned()
+                .into()
         )
     );
 }
@@ -2164,7 +2139,7 @@ fn a_boxed_wrapper_is_pinned_while_only_the_interpreter_frame_holds_it() {
     // reference as a root. Without the pin the slot is rewritten to a
     // prototype-less tombstone and the builtin keeps reading a dead object.
     let wrapper = runtime
-        .to_object(&JsValue::String("ab".to_owned()))
+        .to_object(&JsValue::String("ab".into()))
         .expect("ToObject boxes a string");
     runtime.collect_garbage();
     let realm = runtime.realm();
@@ -2185,7 +2160,7 @@ fn a_boxed_wrapper_is_pinned_while_only_the_interpreter_frame_holds_it() {
     );
     assert_eq!(
         realm.own_property(wrapper, "1").map(|entry| entry.value),
-        Some(JsValue::String("b".to_owned()))
+        Some(JsValue::String("b".into()))
     );
 }
 
@@ -2225,7 +2200,7 @@ fn boxed_wrappers_survive_repeated_collections_during_a_builtin() {
         .expect("collection probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("-1,true,0,1,length,b".to_owned())
+        JsValue::String("-1,true,0,1,length,b".into())
     );
 }
 
@@ -2260,7 +2235,7 @@ fn string_prototype_symbol_iterator_yields_an_iterator_object() {
         .expect("String iterator probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,a,false,xy,a-b,true".to_owned())
+        JsValue::String("true,true,true,a,false,xy,a-b,true".into())
     );
 }
 
@@ -2305,8 +2280,7 @@ fn web_storage_areas_answer_the_storage_interface() {
     assert_eq!(
         outcome.value,
         JsValue::String(
-            "true,0,null,2,dark,7,dark,theme,count,theme/count,,2,1,,1,0,1,zero,1,1,here"
-                .to_owned()
+            "true,0,null,2,dark,7,dark,theme,count,theme/count,,2,1,,1,0,1,zero,1,1,here".into()
         )
     );
 }
@@ -2332,7 +2306,7 @@ fn local_storage_is_seeded_and_its_changes_are_reported_to_the_host() {
             ",
         )
         .expect("storage probe executes");
-    assert_eq!(outcome.value, JsValue::String("dark".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("dark".into()));
     assert_eq!(
         runtime.local_storage_entries(),
         vec![
@@ -2366,7 +2340,7 @@ fn own_string_keys_enumerate_in_insertion_order() {
         .expect("ordering probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("second,first,third:second,first,third".to_owned())
+        JsValue::String("second,first,third:second,first,third".into())
     );
 }
 
@@ -2395,7 +2369,7 @@ fn symbols_are_real_primitives_with_spec_identity() {
         .expect("symbol probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,true".into())
     );
 }
 
@@ -2416,7 +2390,7 @@ fn new_symbol_throws_and_well_knowns_are_symbol_values() {
             ",
         )
         .expect("well-known probe executes");
-    assert_eq!(outcome.value, JsValue::String("true,true,true".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("true,true,true".into()));
 }
 
 #[test]
@@ -2448,7 +2422,7 @@ fn symbol_keyed_properties_round_trip_through_brackets_and_introspection() {
         .expect("symbol property probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true,true,true".into())
     );
 }
 
@@ -2495,7 +2469,7 @@ fn for_of_and_spread_drive_map_set_and_custom_iterators() {
         .expect("iterator probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true".into())
     );
 }
 
@@ -2527,7 +2501,7 @@ fn to_primitive_and_has_instance_hooks_participate() {
         .expect("hook probe executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("true,true,true,true,true".to_owned())
+        JsValue::String("true,true,true,true,true".into())
     );
 }
 
@@ -2568,10 +2542,7 @@ fn promise_prototype_is_real_and_overridable() {
     let outcome = runtime
         .execute(&mut parsed.dom, "results.join(',') + ':' + (calls === 13)")
         .expect("results read executes");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("true,true,true:true".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("true,true,true:true".into()));
 }
 
 #[test]
@@ -2591,7 +2562,7 @@ fn fetch_queues_exactly_one_pending_request_with_method_headers_and_body() {
             "#,
         )
         .expect("fetch call should execute");
-    assert_eq!(outcome.value, JsValue::String("function".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("function".into()));
 
     let mut requests = runtime.take_pending_fetch_requests();
     assert_eq!(requests.len(), 1);
@@ -2635,15 +2606,13 @@ fn blob_constructor_exposes_bounded_bytes_and_async_read_methods() {
     let outcome = runtime
         .execute(&mut parsed.dom, "summary")
         .expect("summary should be readable");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("11:text/plain:world".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("11:text/plain:world".into()));
     let url = runtime
         .execute(&mut parsed.dom, "objectUrl")
         .expect("object URL should be readable")
         .value
-        .to_js_string();
+        .to_js_string()
+        .to_lossy();
     assert!(url.starts_with("data:text/plain;base64,"));
 }
 
@@ -2701,7 +2670,7 @@ fn settle_fetch_ok_resolves_response_text_through_microtasks() {
         .expect("result read executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("200:true:OK:text/plain;hello fetch".to_owned())
+        JsValue::String("200:true:OK:text/plain;hello fetch".into())
     );
     // Settled ids leave no bookkeeping behind.
     assert!(runtime.take_pending_fetch_requests().is_empty());
@@ -2749,7 +2718,7 @@ fn settle_fetch_error_rejects_and_catch_receives_the_reason() {
         .expect("reason read executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("host name lookup failed".to_owned())
+        JsValue::String("host name lookup failed".into())
     );
 }
 
@@ -2818,7 +2787,7 @@ fn xhr_queues_request_and_completes_with_events_status_and_response_text() {
     // readystatechange, load, then loadend, all observing the settled state.
     assert_eq!(
         outcome.value,
-        JsValue::String("rs200:welcomeloadtrueload|end#abc#4,200,OK".to_owned())
+        JsValue::String("rs200:welcomeloadtrueload|end#abc#4,200,OK".into())
     );
 }
 
@@ -2848,7 +2817,7 @@ fn xhr_transport_failure_fires_error_with_status_zero() {
     let outcome = runtime
         .execute(&mut parsed.dom, "log + '#' + xhr.status")
         .expect("XHR log read executes");
-    assert_eq!(outcome.value, JsValue::String("rs0error#0".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("rs0error#0".into()));
 }
 
 #[test]
@@ -2872,7 +2841,7 @@ fn xhr_synchronous_send_throws_and_queues_nothing() {
             "#,
         )
         .expect("sync XHR probe should execute");
-    assert_eq!(outcome.value, JsValue::String("TypeError".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("TypeError".into()));
     assert!(runtime.take_pending_fetch_requests().is_empty());
 }
 
@@ -2909,7 +2878,7 @@ fn response_json_parses_the_body_into_a_readable_object() {
             "parsed.user + ':' + parsed.count + ':' + parsed.nested.ok",
         )
         .expect("parsed read executes");
-    assert_eq!(outcome.value, JsValue::String("zdy:2:true".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("zdy:2:true".into()));
 }
 
 #[test]
@@ -2932,7 +2901,7 @@ fn response_constructor_text_settles_without_a_transfer() {
     let outcome = runtime
         .execute(&mut parsed.dom, "parts.join('#')")
         .expect("parts read executes");
-    assert_eq!(outcome.value, JsValue::String("200,true#ready".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("200,true#ready".into()));
 }
 
 #[test]
@@ -2954,7 +2923,7 @@ fn dataset_setter_writes_through_to_the_data_attribute_and_reads_back() {
         .expect("dataset member write should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("https://sentry.test/42|https://sentry.test/42".to_owned())
+        JsValue::String("https://sentry.test/42|https://sentry.test/42".into())
     );
 }
 
@@ -2981,10 +2950,7 @@ fn dataset_reads_delete_and_missing_members_follow_the_camel_case_mapping() {
         .expect("dataset member reads should execute");
     // Spec: Array.prototype.join renders undefined members as empty
     // strings, so the missing/deleted reads join as "".
-    assert_eq!(
-        outcome.value,
-        JsValue::String("first|7| / |false|7".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("first|7| / |false|7".into()));
 }
 
 #[test]
@@ -3020,7 +2986,7 @@ fn user_functions_expose_name_and_length_own_properties() {
             // `length` counts parameters before the first default and
             // excludes the rest parameter. A function or arrow assigned to a
             // variable takes that name (NamedEvaluation, ECMA-262 8.4.5).
-            "declared|2|anonymous|2|arrow|1|0|string|true|true|0|declared".to_owned()
+            "declared|2|anonymous|2|arrow|1|0|string|true|true|0|declared".into()
         )
     );
 }
@@ -3044,7 +3010,7 @@ fn default_and_rest_parameters_bind_arguments_and_apply_defaults() {
     // omitted or explicitly `undefined` argument evaluates the default.
     assert_eq!(
         outcome.value,
-        JsValue::String("1|2|object / 7|5|object / 7|5|object".to_owned())
+        JsValue::String("1|2|object / 7|5|object / 7|5|object".into())
     );
 }
 
@@ -3066,10 +3032,7 @@ fn default_parameters_evaluate_when_arguments_are_undefined() {
         .expect("default parameters should execute");
     // `b`'s initializer sees the earlier `a` binding; supplying `c`
     // suppresses its initializer, so `calls` only increments once.
-    assert_eq!(
-        outcome.value,
-        JsValue::String("1|2|10 / 1|5|7 / 1".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("1|2|10 / 1|5|7 / 1".into()));
 }
 
 #[test]
@@ -3089,7 +3052,7 @@ fn default_parameters_distinguish_undefined_from_null() {
         .expect("undefined-vs-null default probe should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("default / null / default / 0".to_owned())
+        JsValue::String("default / null / default / 0".into())
     );
 }
 
@@ -3111,7 +3074,7 @@ fn throwing_default_parameters_propagate_before_the_body_runs() {
                 "#,
         )
         .expect("throwing default parameter probe should execute");
-    assert_eq!(outcome.value, JsValue::String("boom / 0".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("boom / 0".into()));
 }
 
 #[test]
@@ -3136,7 +3099,7 @@ fn default_parameters_see_later_parameters_in_the_temporal_dead_zone() {
     // back to an outer binding of the same name.
     assert_eq!(
         outcome.value,
-        JsValue::String("first|second / ReferenceError".to_owned())
+        JsValue::String("first|second / ReferenceError".into())
     );
 }
 
@@ -3179,7 +3142,7 @@ fn parameter_defaults_do_not_change_function_length() {
         )
         .expect("function length probe should execute");
     // `length` counts parameters before the first default and excludes rest.
-    assert_eq!(outcome.value, JsValue::String("1|0|0".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("1|0|0".into()));
 }
 
 #[test]
@@ -3195,7 +3158,7 @@ fn destructuring_arrow_parameter_defaults_apply_to_the_whole_pattern() {
                 "#,
         )
         .expect("destructuring arrow default probe should execute");
-    assert_eq!(outcome.value, JsValue::String("7|3".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("7|3".into()));
 }
 
 /// Evaluate `source` and read one expression out of the resulting scope.
@@ -3210,6 +3173,7 @@ fn eval_read(source: &str, read: &str) -> String {
         .expect("reading the destructured bindings should execute")
         .value
         .to_js_string()
+        .to_lossy()
 }
 
 #[test]
@@ -3556,6 +3520,7 @@ fn settle_then_read(set_up: &str, after_first_drain: &str, read: &str) -> String
         .expect("reading the combinator result should execute")
         .value
         .to_js_string()
+        .to_lossy()
 }
 
 #[test]
@@ -4073,7 +4038,7 @@ fn arrow_default_parameters_see_the_lexical_this() {
                 "#,
         )
         .expect("arrow default `this` probe should execute");
-    assert_eq!(outcome.value, JsValue::String("10|4".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("10|4".into()));
 }
 
 #[test]
@@ -4094,7 +4059,7 @@ fn derived_constructor_parameters_apply_defaults_before_super() {
                 "#,
         )
         .expect("derived constructor default probe should execute");
-    assert_eq!(outcome.value, JsValue::String("10|6".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("10|6".into()));
 }
 
 #[test]
@@ -4114,7 +4079,7 @@ fn bound_functions_take_the_bound_name_and_shrunk_length() {
         .expect("bound function metadata probe should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("bound target|2|bound target|3".to_owned())
+        JsValue::String("bound target|2|bound target|3".into())
     );
 }
 
@@ -4157,8 +4122,7 @@ fn uncaught_script_errors_dispatch_a_window_error_event() {
     assert_eq!(
         outcome.value,
         JsValue::String(
-            "1|error|boom is not defined|https://example.test/app.js|1:1|real-error|true"
-                .to_owned()
+            "1|error|boom is not defined|https://example.test/app.js|1:1|real-error|true".into()
         )
     );
 }
@@ -4197,7 +4161,7 @@ fn uncaught_microtask_errors_dispatch_a_window_error_event() {
         .expect("failure probe should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("microtask boom:typed".to_owned())
+        JsValue::String("microtask boom:typed".into())
     );
 }
 
@@ -4220,7 +4184,7 @@ fn document_cookie_round_trips_and_deletes() {
         .expect("cookie round trip executes");
     assert_eq!(
         outcome.value,
-        JsValue::String("a=1; b=hello world | b=hello world".to_owned())
+        JsValue::String("a=1; b=hello world | b=hello world".into())
     );
 }
 
@@ -4344,7 +4308,7 @@ fn iterator_helpers_map_filter_take_and_terminals() {
     assert_eq!(
         outcome.value,
         JsValue::String(
-            "2,4,6|2,4|1,2|2,3|16|1,2,3,4|5|true|true|1+2|3+4|5|1-2|2-3|1,10,2,20|7,8".to_owned()
+            "2,4,6|2,4|1,2|2,3|16|1,2,3,4|5|true|true|1+2|3+4|5|1-2|2-3|1,10,2,20|7,8".into()
         )
     );
 }
@@ -4358,6 +4322,7 @@ fn iterator_script_value(script: &str) -> String {
         .expect("the iterator script should execute")
         .value
         .to_js_string()
+        .to_lossy()
 }
 
 #[test]
@@ -4591,10 +4556,7 @@ fn classes_can_extend_iterator_and_use_helpers() {
             "#,
         )
         .expect("Iterator subclass executes");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("4,3,2,1|false|true".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("4,3,2,1|false|true".into()));
 }
 
 #[test]
@@ -4706,7 +4668,7 @@ fn iterator_subclass_super_still_constructs_through_new_target_scope_fix() {
             "#,
         )
         .expect("Iterator subclass super() should keep constructing");
-    assert_eq!(outcome.value, JsValue::String("4,2,0".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("4,2,0".into()));
 }
 
 #[test]
@@ -4880,10 +4842,7 @@ fn document_create_comment_produces_a_comment_node() {
         "#,
         )
         .expect("createComment runs");
-    assert_eq!(
-        outcome.value,
-        JsValue::String("8:feature-detect".to_owned())
-    );
+    assert_eq!(outcome.value, JsValue::String("8:feature-detect".into()));
 }
 
 #[test]
@@ -4919,7 +4878,7 @@ fn push_and_replace_state_move_the_location_and_queue_history_requests() {
         .map(|outcome| {
             assert_eq!(
                 outcome.value,
-                JsValue::String("https://example.test/app/two".to_owned())
+                JsValue::String("https://example.test/app/two".into())
             );
         })
         .expect("the location reports the replaced URL");
@@ -4944,7 +4903,7 @@ fn history_refuses_another_origin_and_file_documents_may_move_between_files() {
     let JsValue::String(message) = outcome.value else {
         panic!("the script reports the refusal as a string");
     };
-    assert!(message.contains("SecurityError"), "{message}");
+    assert!(message.to_lossy().contains("SecurityError"), "{message}");
     assert!(runtime.take_pending_history_requests().is_empty());
 
     let mut parsed = parse_document("<!doctype html><p></p>");
@@ -5014,7 +4973,7 @@ fn a_same_document_traversal_fires_popstate_with_the_state_and_keeps_the_script(
         .map(|outcome| {
             assert_eq!(
                 outcome.value,
-                JsValue::String("https://example.test/app/one pop:1:1:yes".to_owned())
+                JsValue::String("https://example.test/app/one pop:1:1:yes".into())
             );
         })
         .expect("the location and handler see the traversal");
@@ -5066,7 +5025,7 @@ fn define_property_converts_object_keys_and_reads_descriptor_fields_through_get(
         .expect("object keys and descriptor getters should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("true|from getter|true".to_owned())
+        JsValue::String("true|from getter|true".into())
     );
 }
 
@@ -5089,7 +5048,7 @@ fn define_properties_reads_symbol_keyed_descriptors_and_inherited_fields() {
             "#,
         )
         .expect("symbol-keyed descriptors should execute");
-    assert_eq!(outcome.value, JsValue::String("5|9".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("5|9".into()));
 }
 
 #[test]
@@ -5210,7 +5169,7 @@ fn array_mutators_read_an_object_length_with_to_number_and_refuse_nullish_receiv
         .expect("array mutators should execute");
     assert_eq!(
         outcome.value,
-        JsValue::String("a|0|TypeError|1|RangeError".to_owned())
+        JsValue::String("a|0|TypeError|1|RangeError".into())
     );
 }
 
@@ -5256,6 +5215,7 @@ fn regexp_check(source: &str) -> String {
         .expect("the RegExp check script should execute")
         .value
         .to_js_string()
+        .to_lossy()
 }
 
 #[test]
@@ -5410,7 +5370,7 @@ fn array_from_keeps_its_iterator_alive_across_collections() {
             ",
         )
         .expect("Array.from over an array executes");
-    assert_eq!(outcome.value, JsValue::String("3000,4498500".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("3000,4498500".into()));
 }
 
 #[test]
@@ -5443,7 +5403,7 @@ fn typed_array_from_an_iterable_keeps_its_iterator_alive_across_collections() {
             ",
         )
         .expect("typed array over an iterable executes");
-    assert_eq!(outcome.value, JsValue::String("3000,2999".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("3000,2999".into()));
 }
 
 #[test]
@@ -5474,7 +5434,7 @@ fn a_caller_scope_survives_a_collection_during_the_call_it_makes() {
             ",
         )
         .expect("a call that collects while its caller is suspended executes");
-    assert_eq!(outcome.value, JsValue::String("alive:2999".to_owned()));
+    assert_eq!(outcome.value, JsValue::String("alive:2999".into()));
 }
 
 #[test]
@@ -5833,7 +5793,8 @@ fn atomics_wait_async_keeps_its_promise_alive_until_it_is_notified() {
         .execute(&mut parsed.dom, "result")
         .expect("reading the result should execute")
         .value
-        .to_js_string();
+        .to_js_string()
+        .to_lossy();
     assert_eq!(value, "ok");
 }
 
@@ -5870,7 +5831,8 @@ fn atomics_wait_async_times_out_through_the_timer_queue() {
         .execute(&mut parsed.dom, "result")
         .expect("reading the result should execute")
         .value
-        .to_js_string();
+        .to_js_string()
+        .to_lossy();
     assert_eq!(value, "timed-out");
 }
 

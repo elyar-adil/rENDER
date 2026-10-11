@@ -19,6 +19,7 @@ use crate::ObjectId;
 use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::{JsSymbol, NativeFunction, ObjectHost, RegExpAccessor};
 use render_dom::Dom;
 
@@ -153,7 +154,7 @@ impl JsRuntime {
         flags: &str,
     ) -> Result<ObjectId, JsError> {
         let source = match pattern {
-            JsValue::Undefined => String::new(),
+            JsValue::Undefined => JsString::empty(),
             value => self.to_string_value(dom, value)?,
         };
         self.construct_regex(&source, flags)
@@ -280,10 +281,10 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(rx)?;
-        let input = utf16::utf16_units(text);
+        let input = text.units().to_vec();
         match self.regexp_builtin_match(dom, rx, index, &input)? {
             Some(found) => {
                 let has_indices = self.regexes[index].compiled.flags().has_indices;
@@ -300,7 +301,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
         input: &[u16],
     ) -> Result<Exec, JsError> {
         let exec = self.get_member(dom, rx, "exec")?;
@@ -346,7 +347,7 @@ impl JsRuntime {
         &mut self,
         rx: ObjectId,
         input: &[u16],
-        text: &str,
+        text: &JsString,
         found: &MatchRanges,
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(rx)?;
@@ -359,12 +360,12 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
     ) -> Result<JsValue, JsError> {
         let flags = self.regexp_flags(dom, rx)?;
         let (global, full_unicode) = global_and_unicode(&flags);
         if !global {
-            let input = utf16::utf16_units(text);
+            let input = text.units().to_vec();
             return match self.regexp_exec_step(dom, rx, text, &input)? {
                 Exec::None => Ok(JsValue::Null),
                 Exec::Native(found) => self.exec_result_value(rx, &input, text, &found),
@@ -372,14 +373,14 @@ impl JsRuntime {
             };
         }
         self.set_strict(dom, rx, "lastIndex", JsValue::Number(0.0))?;
-        let input = utf16::utf16_units(text);
+        let input = text.units().to_vec();
         let mut collected = Vec::new();
         loop {
             match self.regexp_exec_step(dom, rx, text, &input)? {
                 Exec::None => break,
                 Exec::Native(found) => {
                     let empty = found.start == found.end;
-                    collected.push(JsValue::String(utf16::string_from_utf16(
+                    collected.push(JsValue::String(utf16::JsString::from_units(
                         &input[found.start..found.end],
                     )));
                     if empty {
@@ -422,14 +423,14 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
     ) -> Result<JsValue, JsError> {
         let constructor = self.regexp_species_constructor(dom, rx)?;
         let flags = self.regexp_flags(dom, rx)?;
         let matcher = self.construct_dispatch(
             dom,
             constructor,
-            &[JsValue::Object(rx), JsValue::String(flags.clone())],
+            &[JsValue::Object(rx), JsValue::String((flags.clone()).into())],
         )?;
         let JsValue::Object(matcher) = matcher else {
             return Err(JsError::type_error(
@@ -467,7 +468,7 @@ impl JsRuntime {
         if done {
             return self.iterator_step_result(JsValue::Undefined, true);
         }
-        let units = utf16::utf16_units(&input);
+        let units = input.units().to_vec();
         let outcome = self.regexp_exec_step(dom, matcher, &input, &units)?;
         let value = match outcome {
             Exec::None => {
@@ -521,10 +522,10 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
         replace_value: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let input = utf16::utf16_units(text);
+        let input = text.units().to_vec();
         let replacer = match replace_value {
             JsValue::Object(callable) if Self::is_callable_object(*callable, &self.realm) => {
                 Some(*callable)
@@ -535,7 +536,7 @@ impl JsRuntime {
             Vec::new()
         } else {
             let template = self.to_string_coerced(dom, replace_value)?;
-            utf16::utf16_units(&template)
+            template.units().to_vec()
         };
         let flags = self.regexp_flags(dom, rx)?;
         let (global, full_unicode) = global_and_unicode(&flags);
@@ -587,7 +588,7 @@ impl JsRuntime {
             };
             let replacement = if let Some(callable) = replacer {
                 let mut arguments = Vec::with_capacity(parts.captures.len() + 4);
-                arguments.push(JsValue::String(utf16::string_from_utf16(&parts.matched)));
+                arguments.push(JsValue::String(utf16::JsString::from_units(&parts.matched)));
                 arguments.extend(parts.captures.iter().cloned());
                 #[allow(
                     clippy::cast_precision_loss,
@@ -600,7 +601,7 @@ impl JsRuntime {
                 }
                 let produced = self.call(dom, callable, &arguments)?;
                 let produced = self.to_string_value(dom, &produced)?;
-                utf16::utf16_units(&produced)
+                produced.units().to_vec()
             } else {
                 let named = match &parts.groups {
                     JsValue::Undefined => JsValue::Undefined,
@@ -629,7 +630,7 @@ impl JsRuntime {
         if next_source < input.len() {
             accumulated.extend_from_slice(&input[next_source..]);
         }
-        Ok(JsValue::String(utf16::string_from_utf16(&accumulated)))
+        Ok(JsValue::String(utf16::JsString::from_units(&accumulated)))
     }
 
     /// The `@@replace` fields of a span the built-in matcher found.
@@ -645,7 +646,7 @@ impl JsRuntime {
             .iter()
             .map(|span| match span {
                 Some((start, end)) => {
-                    JsValue::String(utf16::string_from_utf16(&input[*start..*end]))
+                    JsValue::String(utf16::JsString::from_units(&input[*start..*end]))
                 }
                 None => JsValue::Undefined,
             })
@@ -700,7 +701,7 @@ impl JsRuntime {
         }
         let groups = self.get_member(dom, result, "groups")?;
         Ok(MatchParts {
-            matched: utf16::utf16_units(&matched),
+            matched: matched.units().to_vec(),
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -774,7 +775,7 @@ impl JsRuntime {
                     let length = 1 + digit_count;
                     if (1..=capture_count).contains(&reference) {
                         if let JsValue::String(capture) = &captures[reference - 1] {
-                            output.extend(utf16::utf16_units(capture));
+                            output.extend(capture.units().to_vec());
                         }
                     } else {
                         let end = (index + length).min(template.len());
@@ -788,11 +789,11 @@ impl JsRuntime {
                         .position(|unit| *unit == u16::from(b'>'));
                     if let (JsValue::Object(object), Some(close)) = (named, close) {
                         let name =
-                            utf16::string_from_utf16(&template[index + 2..index + 2 + close]);
-                        let capture = self.get_member(dom, *object, &name)?;
+                            utf16::JsString::from_units(&template[index + 2..index + 2 + close]);
+                        let capture = self.get_member(dom, *object, &(name).to_key())?;
                         if !matches!(capture, JsValue::Undefined) {
                             let text = self.to_string_value(dom, &capture)?;
-                            output.extend(utf16::utf16_units(&text));
+                            output.extend(text.units().to_vec());
                         }
                         index += close + 3;
                     } else {
@@ -821,10 +822,10 @@ impl JsRuntime {
         if self.is_intrinsic_regexp_getter(rx, "flags", RegExpAccessor::Flags)
             && let JsValue::String(text) = self.regexp_flags_from_getters(dom, rx)?
         {
-            return Ok(text);
+            return Ok(text.to_lossy());
         }
         let value = self.get_member(dom, rx, "flags")?;
-        self.to_string_coerced(dom, &value)
+        Ok(self.to_string_coerced(dom, &value)?.to_lossy())
     }
 
     /// `RegExp.prototype[@@search]` (§22.2.6.11).
@@ -832,13 +833,13 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
     ) -> Result<JsValue, JsError> {
         let previous = self.get_member(dom, rx, "lastIndex")?;
         if !is_positive_zero(&previous) {
             self.set_strict(dom, rx, "lastIndex", JsValue::Number(0.0))?;
         }
-        let input = utf16::utf16_units(text);
+        let input = text.units().to_vec();
         let outcome = self.regexp_exec_step(dom, rx, text, &input)?;
         let current = self.get_member(dom, rx, "lastIndex")?;
         if !same_value(&current, &previous) {
@@ -863,7 +864,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         rx: ObjectId,
-        text: &str,
+        text: &JsString,
         limit: &JsValue,
     ) -> Result<JsValue, JsError> {
         let constructor = self.regexp_species_constructor(dom, rx)?;
@@ -877,7 +878,7 @@ impl JsRuntime {
         let splitter = self.construct_dispatch(
             dom,
             constructor,
-            &[JsValue::Object(rx), JsValue::String(new_flags)],
+            &[JsValue::Object(rx), JsValue::String((new_flags).into())],
         )?;
         let JsValue::Object(splitter) = splitter else {
             return Err(JsError::type_error(
@@ -888,7 +889,7 @@ impl JsRuntime {
             JsValue::Undefined => u32::MAX,
             value => crate::runtime::convert::uint32_of_number(self.to_number_value(dom, value)?),
         };
-        let input = utf16::utf16_units(text);
+        let input = text.units().to_vec();
         let mut pieces: Vec<JsValue> = Vec::new();
         if limit == 0 {
             return Ok(JsValue::Object(self.create_array_from_values(&pieces)?));
@@ -919,7 +920,7 @@ impl JsRuntime {
                                 .iter()
                                 .map(|span| match span {
                                     Some((start, end)) => JsValue::String(
-                                        utf16::string_from_utf16(&input[*start..*end]),
+                                        utf16::JsString::from_units(&input[*start..*end]),
                                     ),
                                     None => JsValue::Undefined,
                                 })
@@ -947,7 +948,7 @@ impl JsRuntime {
                         q = advance_string_index(&input, q as f64, unicode_matching) as usize;
                         continue;
                     }
-                    pieces.push(JsValue::String(utf16::string_from_utf16(&input[p..q])));
+                    pieces.push(JsValue::String(utf16::JsString::from_units(&input[p..q])));
                     if pieces.len() == limit {
                         return Ok(JsValue::Object(self.create_array_from_values(&pieces)?));
                     }
@@ -962,7 +963,9 @@ impl JsRuntime {
                 }
             }
         }
-        pieces.push(JsValue::String(utf16::string_from_utf16(&input[p..size])));
+        pieces.push(JsValue::String(utf16::JsString::from_units(
+            &input[p..size],
+        )));
         Ok(JsValue::Object(self.create_array_from_values(&pieces)?))
     }
 }
@@ -996,7 +999,7 @@ mod tests {
         let mut parsed = parse_document("<!doctype html><p></p>");
         let mut runtime = JsRuntime::new(&parsed.dom);
         match runtime.execute(&mut parsed.dom, source) {
-            Ok(outcome) => outcome.value.to_js_string(),
+            Ok(outcome) => outcome.value.to_js_string().to_lossy(),
             Err(error) => format!("<threw {}>", error.message()),
         }
     }

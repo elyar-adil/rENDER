@@ -11,7 +11,7 @@ fn main() {
     for source in cases.lines().filter(|line| !line.trim().is_empty()) {
         let result = runtime.execute(&mut dom, source).map_or_else(
             |error| format!("ERR {error}"),
-            |outcome| outcome.value.to_js_string(),
+            |outcome| outcome.value.to_js_string().to_lossy(),
         );
         println!("{source:110} => {result}");
     }

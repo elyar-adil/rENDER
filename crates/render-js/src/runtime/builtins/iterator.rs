@@ -703,7 +703,7 @@ impl JsRuntime {
             None | Some(JsValue::Undefined) => ",".to_owned(),
             Some(value) => {
                 let text = self.to_string_value(dom, value);
-                self.close_on_error(dom, receiver, text)?
+                (self.close_on_error(dom, receiver, text)?).to_lossy()
             }
         };
         let record = self.iterator_direct(dom, receiver)?;
@@ -714,7 +714,7 @@ impl JsRuntime {
                 JsValue::Undefined | JsValue::Null => String::new(),
                 value => {
                     let text = self.to_string_value(dom, &value);
-                    self.close_on_error(dom, record.iterator, text)?
+                    (self.close_on_error(dom, record.iterator, text)?).to_lossy()
                 }
             };
             if !first {
@@ -723,7 +723,7 @@ impl JsRuntime {
             first = false;
             joined.push_str(&element);
         }
-        Ok(JsValue::String(joined))
+        Ok(JsValue::String((joined).into()))
     }
 
     fn iterator_chunks(
@@ -913,7 +913,7 @@ impl JsRuntime {
                     continue;
                 }
                 match self.get_iterator_flattenable(dom, &value, false) {
-                    Ok(record) => inputs.push((record, JsValue::String(key))),
+                    Ok(record) => inputs.push((record, JsValue::String((key).into()))),
                     Err(error) => return Err(self.close_zip_inputs(dom, None, &inputs, error)),
                 }
             }
@@ -995,7 +995,7 @@ impl JsRuntime {
             let mut padding = Vec::with_capacity(inputs.len());
             for (_, key) in inputs {
                 let key = key.to_js_string();
-                padding.push(self.get_member(dom, *option, &key)?);
+                padding.push(self.get_member(dom, *option, &(key).to_key())?);
             }
             return Ok(padding);
         }
@@ -1103,7 +1103,7 @@ impl JsRuntime {
             self.realm.set_prototype(object, None);
             for (index, result) in results.into_iter().enumerate() {
                 let key = state.buffer[index * ZIP_STRIDE + 3].to_js_string();
-                self.realm.set_property(object, key, result);
+                self.realm.set_property(object, (key).to_key(), result);
             }
             JsValue::Object(object)
         } else {

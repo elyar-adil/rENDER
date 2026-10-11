@@ -57,7 +57,8 @@ pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
         JsValue::Boolean(value) => Ok(u8::from(*value).into()),
         JsValue::Number(value) => Ok(*value),
         JsValue::String(value) => {
-            let value = value.trim();
+            let text = value.to_lossy();
+            let value = text.trim();
             if value.is_empty() {
                 Ok(0.0)
             } else {
@@ -209,10 +210,10 @@ fn less_than(left: &JsValue, right: &JsValue) -> Result<Option<bool>, JsError> {
         (JsValue::String(left), JsValue::String(right)) => Some(left < right),
         (JsValue::BigInt(left), JsValue::BigInt(right)) => Some(left < right),
         (JsValue::BigInt(left), JsValue::String(right)) => {
-            bigint_from_text(right).map(|right| *left < right)
+            bigint_from_text(&(right).to_lossy()).map(|right| *left < right)
         }
         (JsValue::String(left), JsValue::BigInt(right)) => {
-            bigint_from_text(left).map(|left| left < *right)
+            bigint_from_text(&(left).to_lossy()).map(|left| left < *right)
         }
         // A BigInt against a Number compares mathematical values exactly.
         (JsValue::BigInt(left), other) => left
@@ -293,7 +294,7 @@ pub(super) fn abstract_equal(left: &JsValue, right: &JsValue) -> Result<bool, Js
         }
         (JsValue::BigInt(left), JsValue::String(right))
         | (JsValue::String(right), JsValue::BigInt(left)) => {
-            Ok(bigint_from_text(right).is_some_and(|right| right == *left))
+            Ok(bigint_from_text(&(right).to_lossy()).is_some_and(|right| right == *left))
         }
         (JsValue::Boolean(_), _) => abstract_equal(&JsValue::Number(to_number(left)?), right),
         (_, JsValue::Boolean(_)) => abstract_equal(left, &JsValue::Number(to_number(right)?)),
