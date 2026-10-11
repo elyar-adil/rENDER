@@ -21,7 +21,7 @@ use std::collections::BTreeSet;
 /// is bound or referenced. An escaped spelling decodes to the same name, which
 /// the spec also refuses (ECMA-262 12.7.2).
 const ALWAYS_RESERVED_NAMES: &[&str] = &[
-    "class", "debugger", "enum", "export", "extends", "super", "with",
+    "class", "debugger", "enum", "export", "extends", "import", "super", "with",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1261,15 +1261,15 @@ impl Parser {
         // browser loader, so consume their declaration here; the surrounding
         // module remains executable without aborting on syntax it cannot bind.
         if self.at_import_or_export_keyword() {
-            // A module's top-level items are parsed by `statement_list`, so a
-            // declaration that reaches this point is nested in a statement.
+            // Import and export declarations are module-only (ECMA-262 16.2.1.1, 16.2.3.1).
+            // A module's top-level items are parsed by `statement_list`, so one that
+            // reaches this point is nested in a statement, or sits in a script.
             if self.module.is_some() {
                 return Err(self.error(
                     "import and export declarations may only appear at the top level of a module",
                 ));
             }
-            self.skip_module_declaration();
-            return Ok(Statement::Block(Vec::new()));
+            return Err(self.error("import and export declarations are only allowed in a module"));
         }
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "class") {
             self.advance();
@@ -1391,8 +1391,13 @@ impl Parser {
             return self.try_statement();
         }
         if self.take(&TokenKind::Throw) {
-            if self.at(&TokenKind::Semicolon) || self.at(&TokenKind::RightBrace) {
-                return Err(self.error("throw requires an expression"));
+            // `throw [no LineTerminator here] Expression` (ECMA-262 14.14.1): a line break
+            // after `throw` ends the statement, which then has no expression.
+            if self.at(&TokenKind::Semicolon)
+                || self.at(&TokenKind::RightBrace)
+                || self.current().after_newline
+            {
+                return Err(self.error("throw requires an expression on the same line"));
             }
             let value = self.expression()?;
             self.end_statement()?;
@@ -6009,6 +6014,24 @@ mod tests {
     }
 
     #[test]
+    fn throw_requires_its_expression_on_the_same_line() {
+        assert!(!script_is_syntax_error("throw 1;"));
+        assert!(script_is_syntax_error("throw\n1;"));
+    }
+
+    #[test]
+    fn import_and_export_declarations_are_refused_in_a_script() {
+        assert!(script_is_syntax_error("export default null;"));
+        assert!(script_is_syntax_error("import v from './x.js';"));
+        assert!(script_is_syntax_error(
+            "import defer * as ns from './x.js';"
+        ));
+        assert!(script_is_syntax_error("{ import v from './x.js'; }"));
+        assert!(!script_is_syntax_error("var f = import('./x.js');"));
+        assert!(!module_is_syntax_error("export default 1;"));
+    }
+
+    #[test]
     fn legacy_octal_numbers_are_early_errors_in_strict_code() {
         assert!(!script_is_syntax_error(
             "010; 08; 08.5; 0.5; 0; 1_0; 0.0_1;"
@@ -6079,5 +6102,21 @@ mod tests {
         assert!(!script_is_syntax_error("`${'\\07'}`;"));
         assert!(script_is_syntax_error("'use strict'; `${'\\07'}`;"));
         assert!(script_is_syntax_error("'use strict'; `${010}`;"));
+    }
+
+    #[test]
+    fn a_line_terminator_ends_a_single_line_comment() {
+        assert!(script_is_syntax_error("// comment\rthis is code"));
+        assert!(script_is_syntax_error("// comment\u{2028}this is code"));
+        assert!(!script_is_syntax_error("// comment\r\nvar x = 1;"));
+    }
+
+    #[test]
+    fn import_is_a_reserved_word_as_a_binding_or_a_bare_name() {
+        assert!(script_is_syntax_error("var import = 1;"));
+        assert!(script_is_syntax_error("var o = { import };"));
+        assert!(script_is_syntax_error("import;"));
+        assert!(!script_is_syntax_error("var o = { import: 1 };"));
+        assert!(!script_is_syntax_error("var o = {}; o.import = 1;"));
     }
 }

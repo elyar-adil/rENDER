@@ -1300,10 +1300,15 @@ impl Lexer<'_> {
         result
     }
 
+    /// A single-line comment ends before any `LineTerminator`, which includes a
+    /// carriage return and the Unicode line and paragraph separators (ECMA-262 12.4).
     fn line_comment(&mut self) {
         self.advance();
         self.advance();
-        while self.peek().is_some_and(|value| value != '\n') {
+        while self
+            .peek()
+            .is_some_and(|value| !is_js_line_terminator(value))
+        {
             self.advance();
         }
     }
