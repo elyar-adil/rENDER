@@ -32,6 +32,7 @@ use crate::parser::ObjectProperty;
 use crate::parser::PARAMETER_DEFAULT_MARKER;
 use crate::parser::PARAMETER_REST_MARKER;
 use crate::parser::PropertyKey;
+use crate::parser::SourceSpan;
 use crate::parser::Statement;
 use crate::parser::UnaryOp;
 use crate::parser::VariableKind;
@@ -498,10 +499,11 @@ impl JsRuntime {
                     body,
                     kind,
                     strict,
+                    source,
                     ..
                 } => {
                     var_names.insert(name.clone());
-                    functions.push((name, parameters, body, *kind, *strict));
+                    functions.push((name, parameters, body, *kind, *strict, source));
                 }
                 Statement::Class { name, .. } => {
                     // A class declaration is a mutable `let`-style binding; only
@@ -535,8 +537,9 @@ impl JsRuntime {
         for name in var_names {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
-        for (name, parameters, body, kind, strict) in functions {
+        for (name, parameters, body, kind, strict, source) in functions {
             let value = self.create_function(Some(name), parameters, body, kind, strict)?;
+            self.attach_function_source(&value, source);
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -590,6 +593,7 @@ impl JsRuntime {
                     body,
                     kind,
                     strict,
+                    source,
                     ..
                 } => {
                     // Sloppy code may repeat a block-level function declaration
@@ -605,7 +609,7 @@ impl JsRuntime {
                         ));
                     }
                     function_names.insert(name.clone());
-                    functions.push((name, parameters, body, *kind, *strict));
+                    functions.push((name, parameters, body, *kind, *strict, source));
                 }
                 Statement::Class { name, .. }
                     if declarations
@@ -623,11 +627,26 @@ impl JsRuntime {
         for (name, kind) in declarations {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
-        for (name, parameters, body, kind, strict) in functions {
+        for (name, parameters, body, kind, strict, source) in functions {
             let value = self.create_function(Some(name), parameters, body, kind, strict)?;
+            self.attach_function_source(&value, source);
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
+    }
+
+    /// Records the source text of a function object created from `value`, so
+    /// `Function.prototype.toString` can return it (ECMA-262 20.2.3.5).
+    pub(super) fn attach_function_source(&mut self, value: &JsValue, source: &SourceSpan) {
+        let JsValue::Object(object) = value else {
+            return;
+        };
+        if let Some(ObjectHost::UserFunction(index) | ObjectHost::ArrowFunction(index)) =
+            self.realm.host(*object)
+            && let Some(function) = self.functions.get_mut(index)
+        {
+            function.source = Some(source.clone());
+        }
     }
 
     pub(super) fn create_user_function(
@@ -702,6 +721,7 @@ impl JsRuntime {
             class,
             kind,
         } = flags;
+        let class_is_none = class.is_none();
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
         let (body, defaults, patterns) = Self::extract_parameter_markers(body);
@@ -740,16 +760,38 @@ impl JsRuntime {
             rest,
             kind,
             this_context,
+            source: None,
         });
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
         // before the first default initializer, excluding the rest parameter.
         let name = name.unwrap_or("");
+        let sloppy_plain = !arrow && !strict && class_is_none && !kind.is_coroutine();
         let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
             self.realm.user_function(function_index, name, length, kind)
         };
+        // A sloppy ordinary function carries its own `caller` and `arguments`
+        // (both null, non-writable and non-configurable), so reading them does
+        // not reach the poisoned accessors that `Function.prototype` inherits
+        // (ECMA-262 10.2.4 applies to strict functions only).
+        if sloppy_plain {
+            for key in ["caller", "arguments"] {
+                self.realm.define_property(
+                    function,
+                    key,
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Null,
+                        writable: false,
+                        enumerable: false,
+                        configurable: false,
+                    },
+                );
+            }
+        }
         Ok(JsValue::Object(function))
     }
 
@@ -921,10 +963,12 @@ impl JsRuntime {
                 name,
                 super_class,
                 elements,
+                source,
                 ..
             } => {
                 let value =
                     self.evaluate_class(dom, Some(name), super_class.as_deref(), elements)?;
+                self.attach_function_source(&value, source);
                 self.initialize_binding(dom, name, value.clone(), VariableKind::Let)?;
                 Ok(Completion::Normal(value))
             }
@@ -964,10 +1008,12 @@ impl JsRuntime {
                             },
                         ) =>
                     {
-                        JsError::thrown_with_message(
-                            value,
-                            self.error_to_string(dom, object).to_js_string().to_lossy(),
-                        )
+                        match self.error_to_string(dom, object) {
+                            Ok(text) => {
+                                JsError::thrown_with_message(value, text.to_js_string().to_lossy())
+                            }
+                            Err(_) => JsError::thrown(value),
+                        }
                     }
                     value => match object_message {
                         Some(message) => JsError::thrown_with_message(value, message.to_lossy()),
@@ -1635,23 +1681,44 @@ impl JsRuntime {
                 body,
                 kind,
                 strict,
+                source,
                 ..
             } => {
-                self.evaluate_function_expression(name.as_deref(), parameters, body, *kind, *strict)
+                let value = self.evaluate_function_expression(
+                    name.as_deref(),
+                    parameters,
+                    body,
+                    *kind,
+                    *strict,
+                )?;
+                self.attach_function_source(&value, source);
+                Ok(value)
             }
             Expr::Arrow {
                 parameters,
                 body,
                 is_async,
                 strict,
+                source,
                 ..
-            } => self.create_arrow_function(None, parameters, body, *is_async, *strict),
+            } => {
+                let value =
+                    self.create_arrow_function(None, parameters, body, *is_async, *strict)?;
+                self.attach_function_source(&value, source);
+                Ok(value)
+            }
             Expr::Class {
                 name,
                 super_class,
                 elements,
+                source,
                 ..
-            } => self.evaluate_class(dom, name.as_deref(), super_class.as_deref(), elements),
+            } => {
+                let value =
+                    self.evaluate_class(dom, name.as_deref(), super_class.as_deref(), elements)?;
+                self.attach_function_source(&value, source);
+                Ok(value)
+            }
             Expr::SuperMember { property, .. } => self.read_super_property(dom, property),
             Expr::SuperComputedMember { property, .. } => {
                 // `this` is checked before the key expression runs (§13.3.7.1).
@@ -2841,6 +2908,12 @@ impl JsRuntime {
         value: &JsValue,
     ) -> Result<JsString, JsError> {
         let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?;
+        // ECMA-262 7.1.17 ToString: a Symbol has no string conversion.
+        if matches!(primitive, JsValue::Symbol(_)) {
+            return Err(JsError::type_error(
+                "Cannot convert a Symbol value to a string",
+            ));
+        }
         // The trace is for objects only, so a primitive does not pay for an
         // environment lookup on every conversion.
         if let JsValue::Object(object) = value
@@ -2897,11 +2970,10 @@ impl JsRuntime {
         let JsValue::Object(object) = value else {
             return Ok(value);
         };
+        // String, Number, BigInt and Boolean wrappers take the ordinary path
+        // (ECMA-262 7.1.1.1 OrdinaryToPrimitive), so a user `valueOf` or
+        // `toString` on the wrapper is consulted, as the spec requires.
         match self.realm.host(object) {
-            Some(ObjectHost::StringPrimitive(text)) => return Ok(JsValue::String(text)),
-            Some(ObjectHost::NumberPrimitive(number)) => return Ok(JsValue::Number(number)),
-            Some(ObjectHost::BigIntPrimitive(value)) => return Ok(JsValue::BigInt(value)),
-            Some(ObjectHost::BooleanPrimitive(value)) => return Ok(JsValue::Boolean(value)),
             // §20.4.3 `Symbol.prototype[@@toPrimitive]` returns the symbol itself,
             // so a symbol wrapper converts to the symbol (and not its description).
             Some(ObjectHost::SymbolInstance(symbol)) => return Ok(JsValue::Symbol(symbol)),
@@ -3188,21 +3260,42 @@ impl JsRuntime {
                 body,
                 kind,
                 strict,
+                source,
                 ..
-            } => self.create_function(Some(name), parameters, body, *kind, *strict),
+            } => {
+                let value = self.create_function(Some(name), parameters, body, *kind, *strict)?;
+                self.attach_function_source(&value, source);
+                Ok(value)
+            }
             Expr::Arrow {
                 parameters,
                 body,
                 is_async,
                 strict,
+                source,
                 ..
-            } => self.create_arrow_function(Some(name), parameters, body, *is_async, *strict),
+            } => {
+                let value =
+                    self.create_arrow_function(Some(name), parameters, body, *is_async, *strict)?;
+                self.attach_function_source(&value, source);
+                Ok(value)
+            }
             Expr::Class {
                 name: None,
                 super_class,
                 elements,
+                source,
                 ..
-            } => self.evaluate_anonymous_class_named(dom, name, super_class.as_deref(), elements),
+            } => {
+                let value = self.evaluate_anonymous_class_named(
+                    dom,
+                    name,
+                    super_class.as_deref(),
+                    elements,
+                )?;
+                self.attach_function_source(&value, source);
+                Ok(value)
+            }
             _ => self.evaluate(dom, expression),
         }
     }
@@ -3325,12 +3418,16 @@ impl JsRuntime {
                 body,
                 kind,
                 strict,
+                source,
                 ..
             } = &property.value
             {
                 // A method or accessor does not bind its own name in its body,
                 // unlike a named function expression (ECMA-262 15.4).
-                self.create_function(name.as_deref(), parameters, body, *kind, *strict)?
+                let value =
+                    self.create_function(name.as_deref(), parameters, body, *kind, *strict)?;
+                self.attach_function_source(&value, source);
+                value
             } else {
                 self.evaluate(dom, &property.value)?
             };
@@ -5022,7 +5119,12 @@ impl JsRuntime {
         match self.realm.host(object) {
             Some(ObjectHost::Array) => {
                 if property == "length" {
-                    return self.set_array_length_value(dom, object, &value);
+                    // A refused ArraySetLength is `[[Set]]` returning false: a
+                    // `TypeError` in strict code, and silent otherwise.
+                    if !self.set_array_length_value(dom, object, &value)? && self.code_is_strict() {
+                        return Err(JsError::type_error("cannot assign to array length"));
+                    }
+                    return Ok(());
                 }
                 if let Some(index) = array_index(property) {
                     // ECMA-262 10.1.9.2: an accessor at this index, own or
@@ -5354,13 +5456,18 @@ impl JsRuntime {
                     self.realm.string_wrapper(JsString::from(text)),
                 ))
             }
+            // ECMA-262 21.1.1.1: an absent value is +0, while an explicit
+            // `undefined` converts to NaN; the prototype comes from new.target.
             Some(ObjectHost::NumberConstructor) => {
                 let number = match arguments.first() {
-                    None | Some(JsValue::Undefined) => 0.0,
+                    None => 0.0,
                     Some(value) => self.number_conversion(dom, value)?,
                 };
                 self.ensure_heap_capacity(1)?;
-                Ok(JsValue::Object(self.realm.number_primitive_wrapper(number)))
+                let prototype = instance_prototype(self);
+                Ok(JsValue::Object(
+                    self.realm.number_primitive_wrapper(number, prototype),
+                ))
             }
             Some(ObjectHost::BooleanConstructor) => {
                 // ECMA-262 20.3.1.1: an absent value is `undefined`, which is falsy.
@@ -5378,7 +5485,7 @@ impl JsRuntime {
                 Ok(JsValue::Object(self.realm.date_wrapper(ms, prototype)))
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
-                self.error_constructor(constructor, kind, arguments)
+                self.error_constructor(dom, constructor, &new_target, kind, arguments)
             }
             Some(ObjectHost::DomExceptionConstructor) => {
                 self.dom_exception_constructor(constructor, arguments)
@@ -5641,12 +5748,15 @@ impl JsRuntime {
             Some(ObjectHost::ObjectConstructor) => self.object_constructor(arguments),
             Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
             Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
+            // ECMA-262 22.1.1.1 step 2.a: `String(symbol)` without `new` is the
+            // symbol's descriptive string, not a ToString (which would throw).
             Some(ObjectHost::StringConstructor) => Ok(JsValue::String(match arguments.first() {
                 None => (String::new()).into(),
+                Some(JsValue::Symbol(symbol)) => symbol.to_display(),
                 Some(value) => self.to_string_value(dom, value)?,
             })),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
-                None | Some(JsValue::Undefined) => 0.0,
+                None => 0.0,
                 Some(value) => self.number_conversion(dom, value)?,
             })),
             Some(ObjectHost::BigIntConstructor) => self.bigint_function(dom, arguments),
@@ -5737,7 +5847,7 @@ impl JsRuntime {
                 self.url_search_params_constructor(callee, arguments)
             }
             Some(ObjectHost::ErrorConstructor(kind)) => {
-                self.error_constructor(callee, kind, arguments)
+                self.error_constructor(dom, callee, &JsValue::Undefined, kind, arguments)
             }
             Some(ObjectHost::SuppressedErrorConstructor) => {
                 self.suppressed_error_constructor(dom, &JsValue::Object(callee), arguments)
@@ -5801,21 +5911,47 @@ impl JsRuntime {
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionPrototype)) => {
                 Ok(JsValue::Undefined)
             }
+            // ECMA-262 20.2.3.5: a function written in source answers the text it
+            // was parsed from. A built-in or bound function answers the
+            // implementation-defined NativeFunction form, whose name must be a
+            // PropertyName, so a name that is not one is left out.
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionToString)) => {
                 let function = Self::require_callable_object(&receiver, &self.realm)?;
+                let source = match self.realm.host(function) {
+                    Some(ObjectHost::UserFunction(index) | ObjectHost::ArrowFunction(index)) => {
+                        self.functions
+                            .get(index)
+                            .and_then(|function| function.source.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(source) = source {
+                    return Ok(JsValue::String(source.as_str().into()));
+                }
                 let name = self
                     .realm
                     .get_property(function, "name")
                     .map_or_else(String::new, |value| (value.to_js_string()).to_lossy());
-                let native = !matches!(
-                    self.realm.host(function),
-                    Some(ObjectHost::UserFunction(_) | ObjectHost::ArrowFunction(_))
-                );
-                Ok(JsValue::String(if native {
-                    (format!("function {name}() {{ [native code] }}")).into()
-                } else {
-                    (format!("function {name}() {{ }}")).into()
-                }))
+                let is_identifier = |text: &str| {
+                    let mut characters = text.chars();
+                    characters
+                        .next()
+                        .is_some_and(|first| first == '_' || first == '$' || first.is_alphabetic())
+                        && characters.all(|character| {
+                            character == '_' || character == '$' || character.is_alphanumeric()
+                        })
+                };
+                let is_computed = |text: &str| text.starts_with('[') && text.ends_with(']');
+                let accessor = name
+                    .strip_prefix("get ")
+                    .or_else(|| name.strip_prefix("set "));
+                let named = is_identifier(&name)
+                    || is_computed(&name)
+                    || accessor.is_some_and(|rest| is_identifier(rest) || is_computed(rest));
+                let native_name = if named { name } else { String::new() };
+                Ok(JsValue::String(
+                    (format!("function {native_name}() {{ [native code] }}")).into(),
+                ))
             }
             // §20.2.3.6 `Function.prototype[@@hasInstance](V)`: `this` is `C`.
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionHasInstance)) => {
@@ -5900,6 +6036,18 @@ impl JsRuntime {
                 _ if crate::runtime::builtins::iterator::reads_receiver_unchanged(function) => Err(
                     JsError::type_error("iterator method called on a non-object receiver"),
                 ),
+                _ if crate::runtime::builtins::object::requires_object_receiver(function) => {
+                    Err(JsError::type_error(
+                        "Error.prototype.toString requires that 'this' be an Object",
+                    ))
+                }
+                JsValue::Null | JsValue::Undefined
+                    if crate::runtime::builtins::array::is_array_prototype_method(function) =>
+                {
+                    Err(JsError::type_error(
+                        "Array.prototype method called on null or undefined",
+                    ))
+                }
                 JsValue::Null | JsValue::Undefined => {
                     let global = self.realm.global_object();
                     self.call_native(dom, function, global, arguments)
@@ -6410,7 +6558,7 @@ impl JsRuntime {
             ))),
             JsValue::String(text) => Ok(self.string_wrapper(text.clone())),
             JsValue::Symbol(symbol) => Ok(self.realm.symbol_instance_wrapper(symbol.clone())),
-            JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value)),
+            JsValue::Number(value) => Ok(self.realm.number_primitive_wrapper(*value, None)),
             JsValue::BigInt(value) => Ok(self.realm.bigint_primitive_wrapper(value.clone())),
             JsValue::Boolean(value) => Ok(self.realm.boolean_primitive_wrapper(*value)),
         }
@@ -6434,7 +6582,7 @@ impl JsRuntime {
             }
             JsValue::Number(number) => {
                 self.ensure_heap_capacity(1)?;
-                self.realm.number_primitive_wrapper(*number)
+                self.realm.number_primitive_wrapper(*number, None)
             }
             JsValue::BigInt(number) => {
                 self.ensure_heap_capacity(1)?;

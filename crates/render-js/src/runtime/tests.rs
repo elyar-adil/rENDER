@@ -2385,7 +2385,7 @@ fn new_symbol_throws_and_well_knowns_are_symbol_values() {
                 try { new Symbol('x'); results.push('no-throw'); }
                 catch (e) { results.push(e instanceof TypeError); }
                 results.push(typeof Symbol.iterator === 'symbol');
-                results.push(Symbol.toStringTag.toString() === 'Symbol(@@toStringTag)');
+                results.push(Symbol.toStringTag.toString() === 'Symbol(Symbol.toStringTag)');
                 results.join(',');
             ",
         )

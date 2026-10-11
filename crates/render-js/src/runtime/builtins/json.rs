@@ -13,17 +13,19 @@
     clippy::wrong_self_convention
 )]
 
+use std::ops::Range;
+
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
-use crate::runtime::convert::required_argument;
+use crate::runtime::builtins::object::{PartialDescriptor, PropertyName};
 use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::number_to_string;
+use crate::value::same_value;
 use render_dom::Dom;
-use std::collections::BTreeSet;
-use std::fmt::Write as _;
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_json_native(
@@ -34,36 +36,40 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         match function {
-            NativeFunction::JsonParse => {
-                let input = required_argument(arguments, 0, "JSON.parse")?.to_js_string();
-                let node = JsonParser::new(input.units())
-                    .parse()
-                    .map_err(|message| JsError::syntax(message, 0))?;
-                self.json_node_to_value(node)
-            }
-            NativeFunction::JsonStringify => {
-                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-                let mut stack = BTreeSet::new();
-                match self.json_stringify_value(dom, &value, &mut stack, 0)? {
-                    Some(value) => Ok(JsValue::String((value).into())),
-                    None => Ok(JsValue::Undefined),
-                }
-            }
+            NativeFunction::JsonParse => self.json_parse(dom, arguments),
+            NativeFunction::JsonStringify => self.json_stringify(dom, arguments),
+            NativeFunction::JsonRawJson => self.json_raw_json(dom, arguments),
+            // ECMA-262 JSON.isRawJSON: true exactly for the objects JSON.rawJSON made.
+            NativeFunction::JsonIsRawJson => Ok(JsValue::Boolean(matches!(
+                arguments.first(),
+                Some(JsValue::Object(object))
+                    if matches!(self.realm.host(*object), Some(ObjectHost::RawJson))
+            ))),
             other => self.dispatch_date_native(dom, other, receiver, arguments),
         }
     }
 }
 
+/// One parsed JSON value. A primitive keeps the code-unit range of its source
+/// text, which the reviver's `context.source` reports.
 #[derive(Debug)]
 pub(in crate::runtime) enum JsonNode {
-    Null,
-    Bool(bool),
-    Number(f64),
-    String(JsString),
+    Primitive(JsValue, Range<usize>),
     Array(Vec<JsonNode>),
     /// The members in source order. A name is code units, so a lone surrogate
     /// in a name survives into the property key.
     Object(Vec<(JsString, JsonNode)>),
+}
+
+/// The JSON Parse Record of json-parse-with-source: the value a parse created,
+/// the source of a primitive, and the records of the elements or members beneath
+/// it. The reviver walk compares `value` with the holder's current value, so a
+/// record only describes a value the reviver has not changed.
+pub(in crate::runtime) struct JsonRecord {
+    value: JsValue,
+    source: Option<Range<usize>>,
+    elements: Vec<JsonRecord>,
+    entries: Vec<(String, JsonRecord)>,
 }
 
 /// What a non-ASCII code unit reads as in the byte checks below. It is not a
@@ -105,20 +111,25 @@ impl<'a> JsonParser<'a> {
             return Err("JSON nesting depth exceeded".to_owned());
         }
         self.whitespace();
+        let start = self.position;
+        let primitive = |value: JsValue, end: usize| JsonNode::Primitive(value, start..end);
         match self.peek() {
             Some(b'n') => {
                 self.literal(b"null")?;
-                Ok(JsonNode::Null)
+                Ok(primitive(JsValue::Null, self.position))
             }
             Some(b't') => {
                 self.literal(b"true")?;
-                Ok(JsonNode::Bool(true))
+                Ok(primitive(JsValue::Boolean(true), self.position))
             }
             Some(b'f') => {
                 self.literal(b"false")?;
-                Ok(JsonNode::Bool(false))
+                Ok(primitive(JsValue::Boolean(false), self.position))
             }
-            Some(b'"') => Ok(JsonNode::String(self.string()?)),
+            Some(b'"') => {
+                let text = self.string()?;
+                Ok(primitive(JsValue::String(text), self.position))
+            }
             Some(b'[') => self.array(depth),
             Some(b'{') => self.object(depth),
             Some(b'-' | b'0'..=b'9') => self.number(),
@@ -177,7 +188,7 @@ impl<'a> JsonParser<'a> {
 
     pub(in crate::runtime) fn number(&mut self) -> Result<JsonNode, String> {
         let start = self.position;
-        if self.consume(b'-') {}
+        self.consume(b'-');
         match self.peek() {
             Some(b'0') => {
                 self.position += 1;
@@ -212,6 +223,8 @@ impl<'a> JsonParser<'a> {
             }
         }
         // Every unit of a number is ASCII, so each one reads as its character.
+        // An out-of-range literal such as `1e400` is an ordinary Number value
+        // (ECMA-262 7.1.4.1.1 rounds it to infinity), not a parse error.
         let text: String = self.input[start..self.position]
             .iter()
             .map(|&unit| u8::try_from(unit).map_or('?', char::from))
@@ -219,10 +232,10 @@ impl<'a> JsonParser<'a> {
         let value = text
             .parse::<f64>()
             .map_err(|_| "invalid JSON number".to_owned())?;
-        if !value.is_finite() {
-            return Err(self.error("JSON number is not finite"));
-        }
-        Ok(JsonNode::Number(value))
+        Ok(JsonNode::Primitive(
+            JsValue::Number(value),
+            start..self.position,
+        ))
     }
 
     pub(in crate::runtime) fn string(&mut self) -> Result<JsString, String> {
@@ -320,74 +333,377 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-/// `QuoteJSONString` (ECMA-262 25.5.2.3 in ES2019 and later). Every code unit is
-/// read in order, so a lone surrogate is written as its `\uXXXX` escape rather
-/// than as the replacement character.
-pub(in crate::runtime) fn json_quote(value: &JsString) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
-    output.push('"');
-    for unit in char::decode_utf16(value.units().iter().copied()) {
-        match unit {
-            Ok(character) => match character {
-                '"' => output.push_str("\\\""),
-                '\\' => output.push_str("\\\\"),
-                '\u{0008}' => output.push_str("\\b"),
-                '\u{000c}' => output.push_str("\\f"),
-                '\n' => output.push_str("\\n"),
-                '\r' => output.push_str("\\r"),
-                '\t' => output.push_str("\\t"),
-                character if character < '\u{0020}' => {
-                    let _ = write!(output, "\\u{:04x}", character as u32);
-                }
-                character => output.push(character),
-            },
-            Err(error) => {
-                let _ = write!(output, "\\u{:04x}", error.unpaired_surrogate());
-            }
+/// The code units of `text`, for output that is ASCII.
+fn units_of(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+/// `QuoteJSONString` (ECMA-262 25.5.2.3). The text is read in code units, so
+/// a matched surrogate pair is copied and a lone surrogate is written as its
+/// `\uXXXX` escape, which keeps the output well-formed.
+pub(in crate::runtime) fn json_quote(value: &JsString) -> Vec<u16> {
+    let units = value.units();
+    let mut output = Vec::with_capacity(units.len() + 2);
+    output.push(u16::from(b'"'));
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        let escape = match unit {
+            0x22 => Some(r#"\""#),
+            0x5C => Some(r"\\"),
+            0x08 => Some(r"\b"),
+            0x0C => Some(r"\f"),
+            0x0A => Some(r"\n"),
+            0x0D => Some(r"\r"),
+            0x09 => Some(r"\t"),
+            _ => None,
+        };
+        if let Some(escape) = escape {
+            output.extend(units_of(escape));
+        } else if (0xD800..=0xDBFF).contains(&unit)
+            && units
+                .get(index + 1)
+                .is_some_and(|next| (0xDC00..=0xDFFF).contains(next))
+        {
+            output.push(unit);
+            output.push(units[index + 1]);
+            index += 1;
+        } else if unit < 0x20 || (0xD800..=0xDFFF).contains(&unit) {
+            output.extend(units_of(&format!("\\u{unit:04x}")));
+        } else {
+            output.push(unit);
         }
+        index += 1;
     }
-    output.push('"');
+    output.push(u16::from(b'"'));
+    output
+}
+
+/// The state of one `JSON.stringify` call (ECMA-262 25.5.2.1 steps 1 to 7).
+#[derive(Default)]
+struct JsonWriter {
+    replacer: Option<ObjectId>,
+    property_list: Option<Vec<String>>,
+    gap: Vec<u16>,
+    indent: Vec<u16>,
+    stack: Vec<ObjectId>,
+}
+
+/// Joins serialized members between `open` and `close` (ECMA-262 25.5.2.5 and
+/// 25.5.2.2 final steps). `indent` is the indentation of the members, and
+/// `stepback` the indentation of the closing bracket.
+fn json_wrap(
+    members: Vec<Vec<u16>>,
+    open: u8,
+    close: u8,
+    writer: &JsonWriter,
+    stepback: &[u16],
+) -> Vec<u16> {
+    let (comma, newline) = (u16::from(b','), u16::from(b'\n'));
+    let mut output = vec![u16::from(open)];
+    if members.is_empty() {
+        output.push(u16::from(close));
+        return output;
+    }
+    if writer.gap.is_empty() {
+        for (index, member) in members.into_iter().enumerate() {
+            if index > 0 {
+                output.push(comma);
+            }
+            output.extend(member);
+        }
+    } else {
+        output.push(newline);
+        for (index, member) in members.into_iter().enumerate() {
+            if index > 0 {
+                output.push(comma);
+                output.push(newline);
+            }
+            output.extend_from_slice(&writer.indent);
+            output.extend(member);
+        }
+        output.push(newline);
+        output.extend_from_slice(stepback);
+    }
+    output.push(u16::from(close));
     output
 }
 
 impl JsRuntime {
+    /// ECMA-262 25.5.1 `JSON.parse`: `ToString(text)`, the parse, and then the
+    /// reviver walk (25.5.1.1 `InternalizeJSONProperty`) when a callable reviver
+    /// is given. The reviver is looked up once, after the text parses.
+    fn json_parse(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let text_value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let text = self.to_string_value(dom, &text_value)?;
+        let node = JsonParser::new(text.units())
+            .parse()
+            .map_err(|message| JsError::syntax(message, 0))?;
+        let reviver = match arguments.get(1) {
+            Some(JsValue::Object(object))
+                if JsRuntime::is_callable_object(*object, &self.realm) =>
+            {
+                Some(*object)
+            }
+            _ => None,
+        };
+        let Some(reviver) = reviver else {
+            return self.json_node_to_value(node);
+        };
+        let (value, record) = self.json_build(node, true)?;
+        self.ensure_heap_capacity(1)?;
+        let root = self.realm.create_ordinary_object();
+        self.realm.set_property(root, String::new(), value);
+        self.json_internalize(dom, root, "", reviver, record.as_ref(), &text)
+    }
+
+    /// ECMA-262 25.5.1.1 `InternalizeJSONProperty`, with the `context` argument of
+    /// json-parse-with-source. `context.source` is present only for a primitive
+    /// the reviver has not replaced, and the records of an array or object
+    /// apply only while the holder still holds that same object.
+    fn json_internalize(
+        &mut self,
+        dom: &mut Dom,
+        holder: ObjectId,
+        name: &str,
+        reviver: ObjectId,
+        record: Option<&JsonRecord>,
+        text: &JsString,
+    ) -> Result<JsValue, JsError> {
+        let value = self.get_member(dom, holder, name)?;
+        self.ensure_heap_capacity(1)?;
+        let context = self.realm.create_ordinary_object();
+        let record = record.filter(|record| same_value(&record.value, &value));
+        if let Some(range) = record.and_then(|record| record.source.clone()) {
+            let source = text.units()[range].to_vec();
+            self.realm.set_property(
+                context,
+                "source".to_owned(),
+                JsValue::String(JsString::from_unit_vec(source)),
+            );
+        }
+        if let JsValue::Object(object) = value {
+            if self.is_array_value(&value)? {
+                let length = self.get_member(dom, object, "length")?;
+                let length = self.to_length_value(dom, &length)?;
+                let mut index = 0.0;
+                while index < length {
+                    let key = number_to_string(index);
+                    let child = record.and_then(|record| record.elements.get(index as usize));
+                    self.json_revive_member(dom, object, key, reviver, child, text)?;
+                    index += 1.0;
+                }
+            } else {
+                for key in self.json_enumerable_keys(dom, object)? {
+                    let child = record.and_then(|record| {
+                        record
+                            .entries
+                            .iter()
+                            .rev()
+                            .find(|(name, _)| *name == key)
+                            .map(|(_, child)| child)
+                    });
+                    self.json_revive_member(dom, object, key, reviver, child, text)?;
+                }
+            }
+        }
+        let arguments = [
+            JsValue::String(JsString::from_key(name)),
+            value,
+            JsValue::Object(context),
+        ];
+        self.call_with_this(dom, reviver, &arguments, JsValue::Object(holder))
+    }
+
+    /// One member step of `InternalizeJSONProperty`: revive it, then delete it
+    /// when the reviver returned `undefined`, and otherwise define the result
+    /// as a data property (`CreateDataProperty`, whose result is not checked).
+    fn json_revive_member(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: String,
+        reviver: ObjectId,
+        record: Option<&JsonRecord>,
+        text: &JsString,
+    ) -> Result<(), JsError> {
+        let element = self.json_internalize(dom, object, &key, reviver, record, text)?;
+        if matches!(element, JsValue::Undefined) {
+            self.delete_property_on(dom, object, &PropertyName::String(key))?;
+        } else {
+            let partial = PartialDescriptor {
+                value: Some(element),
+                writable: Some(true),
+                enumerable: Some(true),
+                configurable: Some(true),
+                ..PartialDescriptor::default()
+            };
+            self.define_own_property(dom, object, &PropertyName::String(key), partial)?;
+        }
+        Ok(())
+    }
+
+    /// The string keys that `EnumerableOwnProperties` (ECMA-262 7.3.23) reports:
+    /// the enumerable own string keys, in `[[OwnPropertyKeys]]` order.
+    fn json_enumerable_keys(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<Vec<String>, JsError> {
+        let mut keys = Vec::new();
+        for key in self.own_property_keys(dom, object)? {
+            let PropertyName::String(name) = &key else {
+                continue;
+            };
+            if self
+                .own_descriptor(dom, object, &key)?
+                .is_some_and(|descriptor| descriptor.enumerable)
+            {
+                keys.push(name.clone());
+            }
+        }
+        Ok(keys)
+    }
+
+    /// ECMA-262 25.5.1 steps 3 to 4 for `JSON.parse` without a reviver: build
+    /// the value of a parsed node.
     pub(in crate::runtime) fn json_node_to_value(
         &mut self,
         node: JsonNode,
     ) -> Result<JsValue, JsError> {
+        Ok(self.json_build(node, false)?.0)
+    }
+
+    /// Builds the value of a parsed node, and its parse record when `keep` is
+    /// set. A record is only needed by a reviver, so it is not built otherwise.
+    fn json_build(
+        &mut self,
+        node: JsonNode,
+        keep: bool,
+    ) -> Result<(JsValue, Option<JsonRecord>), JsError> {
         match node {
-            JsonNode::Null => Ok(JsValue::Null),
-            JsonNode::Bool(value) => Ok(JsValue::Boolean(value)),
-            JsonNode::Number(value) => Ok(JsValue::Number(value)),
-            JsonNode::String(value) => Ok(JsValue::String(value)),
-            JsonNode::Array(values) => {
-                self.ensure_heap_capacity(1)?;
-                let array = self.realm.create_array();
-                for (index, value) in values.into_iter().enumerate() {
-                    let value = self.json_node_to_value(value)?;
-                    self.realm.set_property(array, index.to_string(), value);
-                }
-                let length = self.realm.own_property_names(array).map_or(0, |names| {
-                    names
-                        .iter()
-                        .filter_map(|name| name.parse::<usize>().ok())
-                        .max()
-                        .map_or(0, |n| n + 1)
+            JsonNode::Primitive(value, source) => {
+                let record = keep.then(|| JsonRecord {
+                    value: value.clone(),
+                    source: Some(source),
+                    elements: Vec::new(),
+                    entries: Vec::new(),
                 });
-                self.realm
-                    .set_property(array, "length".to_owned(), JsValue::Number(length as f64));
-                Ok(JsValue::Object(array))
+                Ok((value, record))
             }
-            JsonNode::Object(properties) => {
+            JsonNode::Array(nodes) => {
+                let mut values = Vec::with_capacity(nodes.len());
+                let mut elements = Vec::new();
+                for node in nodes {
+                    let (value, record) = self.json_build(node, keep)?;
+                    values.push(value);
+                    elements.extend(record);
+                }
+                let value = JsValue::Object(self.create_array_from_values(&values)?);
+                let record = keep.then(|| JsonRecord {
+                    value: value.clone(),
+                    source: None,
+                    elements,
+                    entries: Vec::new(),
+                });
+                Ok((value, record))
+            }
+            JsonNode::Object(members) => {
                 self.ensure_heap_capacity(1)?;
                 let object = self.realm.create_ordinary_object();
-                for (name, value) in properties {
-                    let value = self.json_node_to_value(value)?;
-                    self.realm.set_property(object, name.to_key(), value);
+                let mut entries = Vec::new();
+                for (name, node) in members {
+                    let (value, record) = self.json_build(node, keep)?;
+                    let key = name.to_key();
+                    self.realm.set_property(object, key.clone(), value);
+                    entries.extend(record.map(|record| (key, record)));
                 }
-                Ok(JsValue::Object(object))
+                let value = JsValue::Object(object);
+                let record = keep.then(|| JsonRecord {
+                    value: value.clone(),
+                    source: None,
+                    elements: Vec::new(),
+                    entries,
+                });
+                Ok((value, record))
             }
         }
+    }
+
+    /// ECMA-262 25.5.2 `JSON.stringify(value, replacer, space)`.
+    fn json_stringify(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let replacer = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let mut writer = JsonWriter::default();
+        if let JsValue::Object(replacer_object) = replacer {
+            if JsRuntime::is_callable_object(replacer_object, &self.realm) {
+                writer.replacer = Some(replacer_object);
+            } else if self.is_array_value(&replacer)? {
+                writer.property_list = Some(self.json_property_list(dom, replacer_object)?);
+            }
+        }
+        let mut space = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
+        if let JsValue::Object(space_object) = space {
+            match self.realm.host(space_object) {
+                Some(ObjectHost::NumberPrimitive(_)) => {
+                    space = JsValue::Number(self.to_number_value(dom, &space)?);
+                }
+                Some(ObjectHost::StringPrimitive(_)) => {
+                    space = JsValue::String(self.to_string_value(dom, &space)?);
+                }
+                _ => {}
+            }
+        }
+        writer.gap = match &space {
+            JsValue::Number(_) => {
+                let count = self.to_integer_value(dom, &space)?.clamp(0.0, 10.0) as usize;
+                vec![u16::from(b' '); count]
+            }
+            JsValue::String(text) => text.units().iter().take(10).copied().collect(),
+            _ => Vec::new(),
+        };
+        Ok(match self.json_serialize_root(dom, &mut writer, value)? {
+            Some(text) => JsValue::String(JsString::from_unit_vec(text)),
+            None => JsValue::Undefined,
+        })
+    }
+
+    /// The `PropertyList` of a `JSON.stringify` array replacer (ECMA-262 25.5.2.1
+    /// step 4.b): string and number elements, and String and Number wrapper
+    /// elements, converted to keys with duplicates removed.
+    fn json_property_list(
+        &mut self,
+        dom: &mut Dom,
+        replacer: ObjectId,
+    ) -> Result<Vec<String>, JsError> {
+        let length = self.get_member(dom, replacer, "length")?;
+        let length = self.to_length_value(dom, &length)?;
+        let mut list: Vec<String> = Vec::new();
+        let mut index = 0.0;
+        while index < length {
+            let element = self.get_member(dom, replacer, &number_to_string(index))?;
+            let item = match &element {
+                JsValue::String(text) => Some(text.clone()),
+                JsValue::Number(_) => Some(self.to_string_value(dom, &element)?),
+                JsValue::Object(object)
+                    if matches!(
+                        self.realm.host(*object),
+                        Some(ObjectHost::StringPrimitive(_) | ObjectHost::NumberPrimitive(_))
+                    ) =>
+                {
+                    Some(self.to_string_value(dom, &element)?)
+                }
+                _ => None,
+            };
+            if let Some(item) = item {
+                let key = item.to_key();
+                if !list.contains(&key) {
+                    list.push(key);
+                }
+            }
+            index += 1.0;
+        }
+        Ok(list)
     }
 
     /// `JSON.stringify` of one value as text, or `None` when it has no JSON
@@ -397,8 +713,10 @@ impl JsRuntime {
         dom: &mut Dom,
         value: &JsValue,
     ) -> Result<Option<String>, JsError> {
-        let mut stack = BTreeSet::new();
-        self.json_stringify_value(dom, value, &mut stack, 0)
+        let mut writer = JsonWriter::default();
+        Ok(self
+            .json_serialize_root(dom, &mut writer, value.clone())?
+            .map(|units| String::from_utf16_lossy(&units)))
     }
 
     /// `JSON.parse` of text into a value.
@@ -413,75 +731,202 @@ impl JsRuntime {
         self.json_node_to_value(node)
     }
 
-    pub(in crate::runtime) fn json_stringify_value(
+    /// ECMA-262 25.5.2.1 steps 5 to 8: the wrapper holding `value` under the
+    /// empty key, then `SerializeJSONProperty` on it.
+    fn json_serialize_root(
+        &mut self,
+        dom: &mut Dom,
+        writer: &mut JsonWriter,
+        value: JsValue,
+    ) -> Result<Option<Vec<u16>>, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let wrapper = self.realm.create_ordinary_object();
+        self.realm.set_property(wrapper, String::new(), value);
+        self.json_serialize_property(dom, writer, wrapper, "")
+    }
+
+    /// ECMA-262 25.5.2.2 `SerializeJSONProperty`.
+    fn json_serialize_property(
+        &mut self,
+        dom: &mut Dom,
+        writer: &mut JsonWriter,
+        holder: ObjectId,
+        key: &str,
+    ) -> Result<Option<Vec<u16>>, JsError> {
+        let mut value = self.get_member(dom, holder, key)?;
+        if matches!(value, JsValue::Object(_) | JsValue::BigInt(_)) {
+            let to_json = self.json_get_from_value(dom, &value, "toJSON")?;
+            if let JsValue::Object(function) = to_json
+                && JsRuntime::is_callable_object(function, &self.realm)
+            {
+                let arguments = [JsValue::String(JsString::from_key(key))];
+                value = self.call_with_this(dom, function, &arguments, value.clone())?;
+            }
+        }
+        if let Some(replacer) = writer.replacer {
+            let arguments = [JsValue::String(JsString::from_key(key)), value];
+            value = self.call_with_this(dom, replacer, &arguments, JsValue::Object(holder))?;
+        }
+        if let JsValue::Object(object) = value {
+            // A `JSON.rawJSON` object is written as its own text.
+            if matches!(self.realm.host(object), Some(ObjectHost::RawJson)) {
+                let raw = self.get_member(dom, object, "rawJSON")?;
+                return Ok(Some(self.to_string_value(dom, &raw)?.units().to_vec()));
+            }
+            value = match self.realm.host(object) {
+                Some(ObjectHost::NumberPrimitive(_)) => {
+                    JsValue::Number(self.to_number_value(dom, &value)?)
+                }
+                Some(ObjectHost::StringPrimitive(_)) => {
+                    JsValue::String(self.to_string_value(dom, &value)?)
+                }
+                Some(ObjectHost::BooleanPrimitive(boolean)) => JsValue::Boolean(boolean),
+                Some(ObjectHost::BigIntPrimitive(bigint)) => JsValue::BigInt(bigint),
+                _ => value,
+            };
+        }
+        match value {
+            JsValue::Null => Ok(Some(units_of("null"))),
+            JsValue::Boolean(true) => Ok(Some(units_of("true"))),
+            JsValue::Boolean(false) => Ok(Some(units_of("false"))),
+            JsValue::String(text) => Ok(Some(json_quote(&text))),
+            JsValue::Number(number) if number.is_finite() => {
+                Ok(Some(units_of(&number_to_string(number))))
+            }
+            JsValue::Number(_) => Ok(Some(units_of("null"))),
+            // ECMA-262 25.5.2.2 step 10: a BigInt has no JSON form.
+            JsValue::BigInt(_) => Err(JsError::type_error("Do not know how to serialize a BigInt")),
+            JsValue::Object(object) if !JsRuntime::is_callable_object(object, &self.realm) => {
+                if self.is_array_value(&JsValue::Object(object))? {
+                    self.json_serialize_array(dom, writer, object).map(Some)
+                } else {
+                    self.json_serialize_object(dom, writer, object).map(Some)
+                }
+            }
+            // `undefined`, a symbol, and a callable have no JSON form.
+            _ => Ok(None),
+        }
+    }
+
+    /// `GetV(value, key)` (ECMA-262 7.3.3): an object reads with [[Get]], and a
+    /// primitive reads through its wrapper's prototype chain, with the primitive
+    /// itself as the receiver of an accessor.
+    fn json_get_from_value(
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
-        stack: &mut BTreeSet<ObjectId>,
-        depth: usize,
-    ) -> Result<Option<String>, JsError> {
-        if depth > 128 {
-            return Err(JsError::resource("JSON nesting depth exceeded"));
-        }
-        Ok(match value {
-            JsValue::Undefined | JsValue::Symbol(_) => None,
-            JsValue::Null => Some("null".to_owned()),
-            JsValue::Boolean(value) => Some(value.to_string()),
-            JsValue::Number(value) if value.is_finite() => {
-                Some(crate::value::number_to_string(*value))
-            }
-            JsValue::Number(_) => Some("null".to_owned()),
-            // ECMA-262 25.5.2.2 SerializeJSONProperty: a BigInt has no JSON form.
-            JsValue::BigInt(_) => {
-                return Err(JsError::type_error("Do not know how to serialize a BigInt"));
-            }
-            JsValue::String(value) => Some(json_quote(value)),
-            JsValue::Object(object) => {
-                if !stack.insert(*object) {
-                    return Err(JsError::type_error("Converting circular structure to JSON"));
+        key: &str,
+    ) -> Result<JsValue, JsError> {
+        match value {
+            JsValue::Object(object) => self.get_member(dom, *object, key),
+            primitive => {
+                let wrapper = self.to_object(primitive)?;
+                match self.realm.get_descriptor(wrapper, key) {
+                    Some(descriptor) if descriptor.is_accessor() => match descriptor.getter {
+                        Some(getter) => self.call_with_this(dom, getter, &[], primitive.clone()),
+                        None => Ok(JsValue::Undefined),
+                    },
+                    Some(descriptor) => Ok(descriptor.value),
+                    None => Ok(JsValue::Undefined),
                 }
-                let result = if matches!(self.realm.host(*object), Some(ObjectHost::Array)) {
-                    let values = self.array_elements_for(dom, *object)?;
-                    let mut output = String::from("[");
-                    for (index, value) in values.iter().enumerate() {
-                        if index > 0 {
-                            output.push(',');
-                        }
-                        output.push_str(
-                            self.json_stringify_value(dom, value, stack, depth + 1)?
-                                .as_deref()
-                                .unwrap_or("null"),
-                        );
-                    }
-                    output.push(']');
-                    output
-                } else {
-                    let mut output = String::from("{");
-                    let mut first = true;
-                    for (name, value) in self
-                        .realm
-                        .enumerable_own_properties(*object)
-                        .unwrap_or_default()
-                    {
-                        let Some(value) =
-                            self.json_stringify_value(dom, &value, stack, depth + 1)?
-                        else {
-                            continue;
-                        };
-                        if !first {
-                            output.push(',');
-                        }
-                        first = false;
-                        output.push_str(&json_quote(&JsString::from_key(&name)));
-                        output.push(':');
-                        output.push_str(&value);
-                    }
-                    output.push('}');
-                    output
-                };
-                stack.remove(object);
-                Some(result)
             }
-        })
+        }
+    }
+
+    /// ECMA-262 25.5.2.6 `SerializeJSONObject`.
+    fn json_serialize_object(
+        &mut self,
+        dom: &mut Dom,
+        writer: &mut JsonWriter,
+        object: ObjectId,
+    ) -> Result<Vec<u16>, JsError> {
+        if writer.stack.contains(&object) {
+            return Err(JsError::type_error("Converting circular structure to JSON"));
+        }
+        writer.stack.push(object);
+        let stepback = writer.indent.clone();
+        writer.indent.extend_from_slice(&writer.gap);
+        let keys = match writer.property_list.clone() {
+            Some(list) => list,
+            None => self.json_enumerable_keys(dom, object)?,
+        };
+        let mut members = Vec::new();
+        for key in keys {
+            if let Some(text) = self.json_serialize_property(dom, writer, object, &key)? {
+                let mut member = json_quote(&JsString::from_key(&key));
+                member.push(u16::from(b':'));
+                if !writer.gap.is_empty() {
+                    member.push(u16::from(b' '));
+                }
+                member.extend(text);
+                members.push(member);
+            }
+        }
+        let output = json_wrap(members, b'{', b'}', writer, &stepback);
+        writer.stack.pop();
+        writer.indent = stepback;
+        Ok(output)
+    }
+
+    /// ECMA-262 25.5.2.7 `SerializeJSONArray`.
+    fn json_serialize_array(
+        &mut self,
+        dom: &mut Dom,
+        writer: &mut JsonWriter,
+        array: ObjectId,
+    ) -> Result<Vec<u16>, JsError> {
+        if writer.stack.contains(&array) {
+            return Err(JsError::type_error("Converting circular structure to JSON"));
+        }
+        writer.stack.push(array);
+        let stepback = writer.indent.clone();
+        writer.indent.extend_from_slice(&writer.gap);
+        let length = self.get_member(dom, array, "length")?;
+        let length = self.to_length_value(dom, &length)?;
+        let mut elements = Vec::new();
+        let mut index = 0.0;
+        while index < length {
+            let key = number_to_string(index);
+            let text = self
+                .json_serialize_property(dom, writer, array, &key)?
+                .unwrap_or_else(|| units_of("null"));
+            elements.push(text);
+            index += 1.0;
+        }
+        let output = json_wrap(elements, b'[', b']', writer, &stepback);
+        writer.stack.pop();
+        writer.indent = stepback;
+        Ok(output)
+    }
+
+    /// `JSON.rawJSON(text)` (json-parse-with-source): the text must be one JSON
+    /// primitive without surrounding white space. The result is a frozen object
+    /// with a null prototype and a `rawJSON` property.
+    fn json_raw_json(&mut self, dom: &mut Dom, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        let text_value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let text = self.to_string_value(dom, &text_value)?;
+        let units = text.units();
+        let is_white_space = |unit: Option<&u16>| matches!(unit, Some(0x09 | 0x0A | 0x0D | 0x20));
+        if units.is_empty() || is_white_space(units.first()) || is_white_space(units.last()) {
+            return Err(JsError::syntax(
+                "JSON.rawJSON cannot be created from text with surrounding white space",
+                0,
+            ));
+        }
+        let node = JsonParser::new(units)
+            .parse()
+            .map_err(|message| JsError::syntax(message, 0))?;
+        if matches!(node, JsonNode::Array(_) | JsonNode::Object(_)) {
+            return Err(JsError::syntax(
+                "JSON.rawJSON accepts only a JSON primitive",
+                0,
+            ));
+        }
+        self.ensure_heap_capacity(1)?;
+        let object = self.realm.allocate_host(None, ObjectHost::RawJson);
+        self.realm
+            .set_property(object, "rawJSON".to_owned(), JsValue::String(text));
+        self.set_integrity_level(dom, object, true)?;
+        Ok(JsValue::Object(object))
     }
 }

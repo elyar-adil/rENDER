@@ -221,6 +221,7 @@ pub(super) fn mark_host(
         | ObjectHost::ArrayConstructor
         | ObjectHost::StringPrimitive(_)
         | ObjectHost::NumberPrimitive(_)
+        | ObjectHost::RawJson
         | ObjectHost::BigIntPrimitive(_)
         | ObjectHost::BooleanPrimitive(_)
         | ObjectHost::DateInstance(_)

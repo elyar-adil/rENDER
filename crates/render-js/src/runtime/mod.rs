@@ -414,9 +414,8 @@ impl JsRuntime {
         let Some(JsValue::Object(constructor)) = self.realm.global(kind.name()) else {
             return Err(JsError::resource(message.to_owned()));
         };
-        let argument = JsValue::String((message.to_owned()).into());
-        match self.error_constructor(constructor, kind, &[argument]) {
-            Ok(instance) => Ok(instance),
+        match self.error_instance_for(constructor, Some(message)) {
+            Ok(instance) => Ok(JsValue::Object(instance)),
             Err(_) => Err(JsError::resource(message.to_owned())),
         }
     }
@@ -1109,13 +1108,12 @@ impl JsRuntime {
 
     /// A native error instance of the global constructor `name`, thrown as a
     /// script exception. Without that constructor a `TypeError` stands in.
-    fn native_error(&mut self, name: &str, kind: ErrorKind, message: &str) -> JsError {
-        let value = JsValue::String(JsString::from(message));
+    fn native_error(&mut self, name: &str, _kind: ErrorKind, message: &str) -> JsError {
         match self.realm.global(name) {
             Some(JsValue::Object(constructor)) => {
-                match self.error_constructor(constructor, kind, &[value]) {
-                    Ok(JsValue::Object(instance)) => JsError::thrown(JsValue::Object(instance)),
-                    _ => JsError::type_error(message),
+                match self.error_instance_for(constructor, Some(message)) {
+                    Ok(instance) => JsError::thrown(JsValue::Object(instance)),
+                    Err(_) => JsError::type_error(message),
                 }
             }
             _ => JsError::type_error(message),

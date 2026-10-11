@@ -28,10 +28,12 @@ impl JsRuntime {
         let JsValue::Object(object) = value else {
             return Ok(false);
         };
-        // A primitive `prototype` answers `false`, the lenient reading that
-        // transpiled feature probes rely on (a callable shim cannot match).
+        // ECMA-262 7.3.21 OrdinaryHasInstance steps 4-5: a non-object `prototype`
+        // is a TypeError, and it is read only after the value was found to be an object.
         let JsValue::Object(prototype) = self.get_member(dom, *constructor, "prototype")? else {
-            return Ok(false);
+            return Err(JsError::type_error(
+                "Function has non-object prototype in instanceof check",
+            ));
         };
         let mut candidate = self.prototype_of(dom, *object)?;
         let mut visited = 0_usize;

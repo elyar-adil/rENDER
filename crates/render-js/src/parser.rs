@@ -16,6 +16,7 @@ use crate::utf16::JsString;
 use crate::value::number_to_string;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Words that are reserved in every context but are not keyword tokens. The
 /// lexer hands them out as identifiers, so the parser refuses them where a name
@@ -188,6 +189,8 @@ pub(super) struct ClassElement {
     pub body: Vec<Statement>,
     pub initializer: Option<Expr>,
     pub offset: usize,
+    /// The method's source text, from its first token after `static`.
+    pub source: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -305,6 +308,7 @@ pub(super) enum Statement {
         /// binding (ECMA-262 B.3.2.3). Evaluating the declaration then copies its
         /// block binding's value to the variable environment.
         annex_b_var: bool,
+        source: SourceSpan,
     },
     /// `class Name extends Base { ... }`, a lexical binding like `let`.
     Class {
@@ -312,6 +316,7 @@ pub(super) enum Statement {
         super_class: Option<Box<Expr>>,
         elements: Vec<ClassElement>,
         offset: usize,
+        source: SourceSpan,
     },
     Return(Option<Expr>),
     Throw(Expr),
@@ -409,6 +414,22 @@ pub(super) enum Statement {
     },
 }
 
+/// The source text of a function or class: the slice `start..end` of the whole
+/// script or eval text it was parsed from (ECMA-262 20.2.3.5 `Function.prototype.toString`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SourceSpan {
+    pub(super) text: Arc<str>,
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
+impl SourceSpan {
+    /// The spanned text, or nothing when the offsets do not describe a slice.
+    pub(super) fn as_str(&self) -> &str {
+        self.text.get(self.start..self.end).unwrap_or("")
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Expr {
     Literal(JsValue),
@@ -429,6 +450,7 @@ pub(super) enum Expr {
         offset: usize,
         kind: FunctionKind,
         strict: bool,
+        source: SourceSpan,
     },
     Arrow {
         parameters: Vec<String>,
@@ -436,6 +458,7 @@ pub(super) enum Expr {
         offset: usize,
         is_async: bool,
         strict: bool,
+        source: SourceSpan,
     },
     /// `yield`, `yield value`, `yield* iterable`.
     Yield {
@@ -451,6 +474,7 @@ pub(super) enum Expr {
         super_class: Option<Box<Expr>>,
         elements: Vec<ClassElement>,
         offset: usize,
+        source: SourceSpan,
     },
     /// `super.name` inside a method: a property reference with the current
     /// receiver as its get/set receiver.
@@ -576,19 +600,21 @@ pub(super) enum Expr {
 }
 
 pub(super) fn parse(
+    source: Arc<str>,
     tokens: Vec<Token>,
     limits: &RuntimeLimits,
 ) -> Result<(Vec<Statement>, bool), JsError> {
-    Parser::new(tokens, limits).program()
+    Parser::new(source, tokens, limits).program()
 }
 
 /// Parse a module body: `import`/`export` become tables in the returned
 /// [`ModuleInfo`] and the declarations they wrap stay in the statement list.
 pub(super) fn parse_module(
+    source: Arc<str>,
     tokens: Vec<Token>,
     limits: &RuntimeLimits,
 ) -> Result<(Vec<Statement>, ModuleInfo), JsError> {
-    let mut parser = Parser::new(tokens, limits);
+    let mut parser = Parser::new(source, tokens, limits);
     parser.module = Some(ModuleInfo::default());
     // Top-level `await` is part of the module grammar (ECMA-262 §16.2).
     parser.in_async = true;
@@ -631,11 +657,12 @@ pub(super) struct EvalContext {
 /// the statements and whether the eval code is strict: strict when the caller
 /// is, or when its own directive prologue says so.
 pub(super) fn parse_eval(
+    source: Arc<str>,
     tokens: Vec<Token>,
     limits: &RuntimeLimits,
     context: &EvalContext,
 ) -> Result<(Vec<Statement>, bool), JsError> {
-    let mut parser = Parser::new(tokens, limits);
+    let mut parser = Parser::new(source, tokens, limits);
     parser.new_target_allowed = context.new_target;
     parser.super_property_allowed = context.super_property;
     parser.super_call_allowed = context.super_call;
@@ -1145,8 +1172,9 @@ fn push_pattern_parts<'a>(pattern: &'a BindingPattern, expressions: &mut Vec<&'a
 }
 
 impl Parser {
-    fn new(tokens: Vec<Token>, limits: &RuntimeLimits) -> Self {
+    fn new(source: Arc<str>, tokens: Vec<Token>, limits: &RuntimeLimits) -> Self {
         Self {
+            source,
             tokens,
             cursor: 0,
             previous_offset: 0,
@@ -1179,6 +1207,9 @@ impl Parser {
     reason = "each flag is an independent grammar context (no_in, async, generator, parameters, strict, ...)"
 )]
 struct Parser {
+    /// The whole text being parsed. A function or class keeps the slice of it
+    /// that it spans, for `Function.prototype.toString`.
+    source: Arc<str>,
     previous_offset: usize,
     tokens: Vec<Token>,
     cursor: usize,
@@ -1366,9 +1397,10 @@ impl Parser {
             validate_declaration_conflicts(&statements, false, self.strict)?;
             return Ok(Statement::Block(statements));
         }
+        let start = self.current().offset;
         if self.take(&TokenKind::Function) {
             let is_generator = self.take(&TokenKind::Star);
-            return self.function_declaration(FunctionKind::new(false, is_generator));
+            return self.function_declaration(FunctionKind::new(false, is_generator), start);
         }
         // Module declarations are intentionally lowered into the shared page
         // realm. Static imports/exports are dependency metadata for the
@@ -1386,6 +1418,7 @@ impl Parser {
             return Err(self.error("import and export declarations are only allowed in a module"));
         }
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "class") {
+            let start = self.current().offset;
             self.advance();
             let TokenKind::Identifier(name) = self.current().kind.clone() else {
                 return Err(self.error("class declaration requires a name"));
@@ -1398,6 +1431,7 @@ impl Parser {
                 name,
                 super_class,
                 elements,
+                source: self.source_span(start),
             });
         }
         // An escaped `async` is an identifier, never the modifier (ECMA-262 12.7.2).
@@ -1410,10 +1444,11 @@ impl Parser {
                 Some(TokenKind::Function)
             )
         {
+            let start = self.current().offset;
             self.advance();
             self.advance();
             let is_generator = self.take(&TokenKind::Star);
-            return self.function_declaration(FunctionKind::new(true, is_generator));
+            return self.function_declaration(FunctionKind::new(true, is_generator), start);
         }
         if self.take(&TokenKind::If) {
             return self.if_statement();
@@ -1925,11 +1960,12 @@ impl Parser {
                 matches!(next.kind, TokenKind::Function) && !next.after_newline
             });
         if is_async || self.at(&TokenKind::Function) {
+            let start = self.current().offset;
             if is_async {
                 self.advance();
             }
             self.advance();
-            let value = self.function_expression(is_async)?;
+            let value = self.function_expression(is_async, start)?;
             self.module_info()
                 .local_exports
                 .push(("default".to_owned(), DEFAULT_BINDING.to_owned()));
@@ -2224,7 +2260,11 @@ impl Parser {
         declarations.push((BindingTarget::Pattern(pattern), Some(initializer)));
     }
 
-    fn function_declaration(&mut self, kind: FunctionKind) -> Result<Statement, JsError> {
+    fn function_declaration(
+        &mut self,
+        kind: FunctionKind,
+        start: usize,
+    ) -> Result<Statement, JsError> {
         let TokenKind::Identifier(name) = self.advance().kind else {
             return Err(self.error("expected a function name"));
         };
@@ -2244,6 +2284,7 @@ impl Parser {
             kind,
             strict,
             annex_b_var: false,
+            source: self.source_span(start),
         })
     }
 
@@ -3205,6 +3246,7 @@ impl Parser {
             body,
             is_async: is_async_arrow,
             strict,
+            source: self.source_span(self.tokens[checkpoint].offset),
         }))
     }
 
@@ -3869,7 +3911,7 @@ impl Parser {
                 if name == "async" && !escaped && self.at(&TokenKind::Function) =>
             {
                 self.advance();
-                self.function_expression(true)
+                self.function_expression(true, token.offset)
             }
             TokenKind::Identifier(name) if name == "class" => {
                 // An anonymous class may be followed by `extends`; only a
@@ -3889,6 +3931,7 @@ impl Parser {
                     name,
                     super_class,
                     elements,
+                    source: self.source_span(token.offset),
                 })
             }
             TokenKind::Identifier(name)
@@ -4069,7 +4112,7 @@ impl Parser {
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
             TokenKind::Null => Ok(Expr::Literal(JsValue::Null)),
-            TokenKind::Function => self.function_expression(false),
+            TokenKind::Function => self.function_expression(false, token.offset),
             TokenKind::LeftBrace => self.object_literal(),
             TokenKind::LeftBracket => self.array_literal(),
             TokenKind::LeftParen => {
@@ -4256,9 +4299,12 @@ impl Parser {
                     body,
                     initializer: None,
                     offset: static_start,
+                    source: self.source_span(static_start),
                 });
             }
         }
+        // A method's text starts after `static` (ECMA-262 15.7.14 ClassElement).
+        let member_start = self.current().offset;
         // `get *x` is not an accessor: the `*` cannot follow the word `get`, so
         // `get` is the element's name, and `get` then `*x` on the same line is a
         // syntax error. On a new line the `*` starts a generator element.
@@ -4335,6 +4381,7 @@ impl Parser {
                 body,
                 initializer: None,
                 offset,
+                source: self.source_span(member_start),
             });
         }
         if matches!(kind, ClassElementKind::Get | ClassElementKind::Set) {
@@ -4359,6 +4406,7 @@ impl Parser {
             body: Vec::new(),
             initializer,
             offset,
+            source: self.source_span(member_start),
         })
     }
 
@@ -4438,7 +4486,8 @@ impl Parser {
     fn template_expression(&mut self, source: &str, offset: usize) -> Result<Expr, JsError> {
         let limits = RuntimeLimits::default();
         let tokens = tokenize(source, &limits)?;
-        let mut parser = Parser::new(tokens, &limits);
+        // The substitution's own text is the source its functions are sliced from.
+        let mut parser = Parser::new(Arc::from(source), tokens, &limits);
         // The substitution is part of the enclosing function, class and module,
         // so it sees the same `await`/`yield`, private names and `import.meta`.
         parser.in_async = self.in_async;
@@ -4465,7 +4514,7 @@ impl Parser {
         Ok(expression)
     }
 
-    fn function_expression(&mut self, is_async: bool) -> Result<Expr, JsError> {
+    fn function_expression(&mut self, is_async: bool, start: usize) -> Result<Expr, JsError> {
         let is_generator = self.take(&TokenKind::Star);
         let kind = FunctionKind::new(is_async, is_generator);
         let name = if let TokenKind::Identifier(name) = &self.current().kind {
@@ -4498,6 +4547,7 @@ impl Parser {
             parameters,
             body,
             kind,
+            source: self.source_span(start),
             strict,
         })
     }
@@ -4603,6 +4653,14 @@ impl Parser {
         self.static_block = previous_static_block;
         self.static_block_await = previous_static_await;
         let (parameters, body, strict) = result?;
+        // ECMA-262 15.2.1.1 and 15.4.1.1: a duplicate parameter name is an early
+        // error unless the function is sloppy, not a method, and has a simple
+        // parameter list. Sloppy duplicates bind left to right, so the last wins.
+        if (strict || super_property || !is_simple_parameter_list(&parameters))
+            && has_duplicate_parameter(&parameters)
+        {
+            return Err(self.error("duplicate parameter name is not allowed in this function"));
+        }
         validate_declaration_conflicts(&body, true, self.strict)?;
         validate_parameters_against_body(&parameters, &body)?;
         // Parameters of strict code are checked as strict code, including an
@@ -4631,16 +4689,12 @@ impl Parser {
         let mut parameters = Vec::new();
         let mut markers: Vec<Statement> = Vec::new();
         let mut patterns = Vec::new();
-        let mut bound = BTreeSet::new();
         if !self.at(&TokenKind::RightParen) {
             loop {
                 if self.take(&TokenKind::Ellipsis) {
                     let TokenKind::Identifier(parameter) = self.advance().kind else {
                         return Err(self.error("expected a rest parameter name"));
                     };
-                    if !bound.insert(parameter.clone()) {
-                        return Err(self.error("duplicate function parameters are not supported"));
-                    }
                     parameters.push(format!("{PARAMETER_REST_MARKER}{parameter}"));
                     break;
                 }
@@ -4670,9 +4724,6 @@ impl Parser {
                     });
                 }
                 for parameter in bound_names {
-                    if !bound.insert(parameter.clone()) {
-                        return Err(self.error("duplicate function parameters are not supported"));
-                    }
                     parameters.push(if has_default {
                         format!("{PARAMETER_DEFAULT_MARKER}{parameter}")
                     } else {
@@ -4682,6 +4733,20 @@ impl Parser {
                 if !self.take(&TokenKind::Comma) || self.at(&TokenKind::RightParen) {
                     break;
                 }
+            }
+        }
+        // A non-simple list (defaults, rest, or patterns) never allows a duplicate,
+        // and its pattern names count too (ECMA-262 15.2.1.1).
+        if !is_simple_parameter_list(&parameters) {
+            let mut names: Vec<String> = parameters
+                .iter()
+                .map(|parameter| parameter_binding_name(parameter).to_owned())
+                .collect();
+            for (_, _, pattern) in &patterns {
+                collect_binding_names(pattern, &mut names);
+            }
+            if has_duplicate_parameter(&names) {
+                return Err(self.error("duplicate parameter name is not allowed in this function"));
             }
         }
         self.require(&TokenKind::RightParen, "expected ')' after parameters")?;
@@ -4746,6 +4811,8 @@ impl Parser {
     /// an accessor, a `PropertyName : AssignmentExpression` pair, or a shorthand
     /// `IdentifierReference`.
     fn object_member(&mut self) -> Result<ObjectProperty, JsError> {
+        // A method's text starts at its first modifier or name (ECMA-262 15.4).
+        let start = self.current().offset;
         if self.take(&TokenKind::Ellipsis) {
             self.pattern_candidate = true;
             return Ok(ObjectProperty {
@@ -4778,7 +4845,7 @@ impl Parser {
         let is_generator = self.take(&TokenKind::Star);
         if is_async || is_generator {
             let key = self.property_key()?;
-            return self.object_method(key, FunctionKind::new(is_async, is_generator));
+            return self.object_method(key, FunctionKind::new(is_async, is_generator), start);
         }
         // `get` and `set` are accessor keywords only when a property name
         // follows; `{ get }`, `{ get: 1 }`, `{ get() {} }` and `{ get = 1 }`
@@ -4835,6 +4902,7 @@ impl Parser {
                     body,
                     kind: FunctionKind::Normal,
                     strict,
+                    source: self.source_span(start),
                 },
                 accessor: Some(accessor),
                 shorthand: false,
@@ -4851,7 +4919,7 @@ impl Parser {
         };
         let key = self.property_key()?;
         if self.at(&TokenKind::LeftParen) {
-            return self.object_method(key, FunctionKind::Normal);
+            return self.object_method(key, FunctionKind::Normal, start);
         }
         if self.take(&TokenKind::Colon) {
             self.pattern_candidate = true;
@@ -4914,6 +4982,7 @@ impl Parser {
         &mut self,
         key: PropertyKey,
         kind: FunctionKind,
+        start: usize,
     ) -> Result<ObjectProperty, JsError> {
         let name = static_key_name(&key);
         let (parameters, body, strict) = self.method_tail(kind, false)?;
@@ -4926,6 +4995,7 @@ impl Parser {
                 body,
                 kind,
                 strict,
+                source: self.source_span(start),
             },
             accessor: None,
             shorthand: false,
@@ -5090,6 +5160,22 @@ impl Parser {
     /// for a node constructed after parsing its tokens.
     fn previous_offset(&self) -> usize {
         self.previous_offset
+    }
+
+    /// The source text from `start` to the end of the last consumed token. Both
+    /// `advance` and `take` move the cursor past the token they consume, so that
+    /// token is the one before the cursor, whatever path consumed it.
+    fn source_span(&self, start: usize) -> SourceSpan {
+        let end = self
+            .cursor
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map_or(start, |token| token.end);
+        SourceSpan {
+            text: Arc::clone(&self.source),
+            start,
+            end,
+        }
     }
 
     fn current(&self) -> &Token {
@@ -5611,6 +5697,14 @@ fn is_simple_target(expression: &Expr) -> bool {
 /// Whether a parameter list is a `SimpleParameterList` (ECMA-262 15.1.1): plain
 /// names only, with no default, rest, or destructuring parameter. Destructuring
 /// parameters are recorded under the `\0`-prefixed temporaries of the lowering.
+/// Whether two parameters bind the same name.
+fn has_duplicate_parameter(parameters: &[String]) -> bool {
+    let mut seen = BTreeSet::new();
+    parameters
+        .iter()
+        .any(|parameter| !seen.insert(parameter_binding_name(parameter)))
+}
+
 fn is_simple_parameter_list(parameters: &[String]) -> bool {
     parameters.iter().all(|parameter| {
         !parameter.starts_with(PARAMETER_DEFAULT_MARKER)
@@ -6385,6 +6479,7 @@ mod tests {
     use super::{Expr, Statement, parse};
     use crate::RuntimeLimits;
     use crate::lexer::tokenize;
+    use std::sync::Arc;
 
     #[test]
     fn parses_function_control_flow_and_return() {
@@ -6393,7 +6488,7 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default())
+        let statements = parse(Arc::from(""), tokens, &RuntimeLimits::default())
             .expect("source should parse")
             .0;
         assert!(
@@ -6408,7 +6503,7 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default())
+        let statements = parse(Arc::from(""), tokens, &RuntimeLimits::default())
             .expect("source should parse")
             .0;
         assert!(matches!(statements.first(), Some(Statement::For { .. })));
@@ -6425,7 +6520,7 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default())
+        let statements = parse(Arc::from(""), tokens, &RuntimeLimits::default())
             .expect("source should parse")
             .0;
         assert!(matches!(
@@ -6450,7 +6545,8 @@ mod tests {
     fn strict_reserved_word_is_an_early_error() {
         let tokens = tokenize("\"use strict\"; var public = 1;", &RuntimeLimits::default())
             .expect("source should tokenize");
-        let error = parse(tokens, &RuntimeLimits::default()).expect_err("strict error expected");
+        let error = parse(Arc::from(""), tokens, &RuntimeLimits::default())
+            .expect_err("strict error expected");
         assert_eq!(error.kind(), super::JsErrorKind::Syntax);
     }
 
@@ -6458,7 +6554,7 @@ mod tests {
     fn parses_unicode_escaped_variable_name() {
         let tokens = tokenize(r"let \u0061 = 1;", &RuntimeLimits::default())
             .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default())
+        let statements = parse(Arc::from(""), tokens, &RuntimeLimits::default())
             .expect("source should parse")
             .0;
         assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
@@ -6469,7 +6565,9 @@ mod tests {
     fn script_is_syntax_error(source: &str) -> bool {
         let limits = RuntimeLimits::default();
         tokenize(source, &limits)
-            .and_then(|tokens| parse(tokens, &limits).map(|(statements, _)| statements))
+            .and_then(|tokens| {
+                parse(Arc::from(""), tokens, &limits).map(|(statements, _)| statements)
+            })
             .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
     }
 
@@ -6477,7 +6575,7 @@ mod tests {
     fn module_is_syntax_error(source: &str) -> bool {
         let limits = RuntimeLimits::default();
         tokenize(source, &limits)
-            .and_then(|tokens| super::parse_module(tokens, &limits))
+            .and_then(|tokens| super::parse_module(Arc::from(""), tokens, &limits))
             .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
     }
 

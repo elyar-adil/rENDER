@@ -131,6 +131,9 @@ impl JsRuntime {
                 let host = self.host_functions[index];
                 host(self, dom, arguments)
             }
+            NativeFunction::ThrowTypeError => Err(JsError::type_error(
+                "'caller', 'callee', and 'arguments' properties may not be accessed on strict mode functions or the arguments objects for calls to them",
+            )),
             NativeFunction::DomExceptionNameGetter
             | NativeFunction::DomExceptionMessageGetter
             | NativeFunction::DomExceptionCodeGetter => {
@@ -1038,6 +1041,9 @@ impl JsRuntime {
             NativeFunction::DateValueOf => {
                 self.dispatch_date_native(dom, NativeFunction::DateValueOf, receiver, arguments)
             }
+            NativeFunction::ErrorIsError => {
+                self.dispatch_object_native(dom, NativeFunction::ErrorIsError, receiver, arguments)
+            }
             NativeFunction::ErrorPrototypeToString => self.dispatch_object_native(
                 dom,
                 NativeFunction::ErrorPrototypeToString,
@@ -1104,8 +1110,10 @@ impl JsRuntime {
             NativeFunction::JsonParse => {
                 self.dispatch_json_native(dom, NativeFunction::JsonParse, receiver, arguments)
             }
-            NativeFunction::JsonStringify => {
-                self.dispatch_json_native(dom, NativeFunction::JsonStringify, receiver, arguments)
+            NativeFunction::JsonStringify
+            | NativeFunction::JsonRawJson
+            | NativeFunction::JsonIsRawJson => {
+                self.dispatch_json_native(dom, function, receiver, arguments)
             }
             NativeFunction::Matches => {
                 self.dispatch_dom_native(dom, NativeFunction::Matches, receiver, arguments)
@@ -1167,8 +1175,10 @@ impl JsRuntime {
             NativeFunction::NamedMapItem => {
                 self.dispatch_dom_native(dom, NativeFunction::NamedMapItem, receiver, arguments)
             }
-            NativeFunction::NumToFixed => {
-                self.dispatch_object_native(dom, NativeFunction::NumToFixed, receiver, arguments)
+            NativeFunction::NumToExponential
+            | NativeFunction::NumToFixed
+            | NativeFunction::NumToLocaleString => {
+                self.dispatch_object_native(dom, function, receiver, arguments)
             }
             NativeFunction::NumToPrecision => self.dispatch_object_native(
                 dom,

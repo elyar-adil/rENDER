@@ -21,6 +21,7 @@ pub mod video;
 
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 pub use bigint::JsBigInt;
 pub use runtime::{
@@ -250,7 +251,7 @@ impl CompiledScript {
     /// never ignored or deferred until execution.
     pub fn compile(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
         let tokens = lexer::tokenize(source, limits)?;
-        let (statements, strict) = parser::parse(tokens, limits)?;
+        let (statements, strict) = parser::parse(Arc::from(source), tokens, limits)?;
         Ok(Self {
             source: source.to_owned(),
             statements,
@@ -267,7 +268,7 @@ impl CompiledScript {
     /// Returns a typed syntax or resource-limit error.
     pub fn compile_module(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
         let tokens = lexer::tokenize(source, limits)?;
-        let (statements, module) = parser::parse_module(tokens, limits)?;
+        let (statements, module) = parser::parse_module(Arc::from(source), tokens, limits)?;
         Ok(Self {
             source: source.to_owned(),
             statements,

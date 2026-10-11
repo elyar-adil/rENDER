@@ -223,6 +223,54 @@ const FROM_ASYNC_SOURCE: &str = r"(async function (C, asyncItems, mapfn, thisArg
 /// `set_array_length_value` writes `ToUint32` results and no other path stores one.
 /// So the object arm of `ToNumber` is unreachable here. A `length` that can be an
 /// object goes through `JsRuntime::to_length_value` instead.
+/// The `Array.prototype` methods whose first step is `ToObject(this value)`
+/// (ECMA-262 23.1.3): a nullish receiver is a `TypeError`. Statics such as
+/// `Array.from` ignore `this` and are not in this set.
+pub(in crate::runtime) fn is_array_prototype_method(function: NativeFunction) -> bool {
+    use NativeFunction as N;
+    matches!(
+        function,
+        N::ArrayPush
+            | N::ArrayPop
+            | N::ArrayJoin
+            | N::ArrayIndexOf
+            | N::ArraySlice
+            | N::ArrayValues
+            | N::ArrayKeys
+            | N::ArrayEntries
+            | N::ArraySplice
+            | N::ArrayReverse
+            | N::ArraySort
+            | N::ArrayConcat
+            | N::ArrayShift
+            | N::ArrayUnshift
+            | N::ArrayForEach
+            | N::ArrayMap
+            | N::ArrayFilter
+            | N::ArraySome
+            | N::ArrayFind
+            | N::ArrayFindIndex
+            | N::ArrayFindLast
+            | N::ArrayFindLastIndex
+            | N::ArrayAt
+            | N::ArrayFlat
+            | N::ArrayReduceRight
+            | N::ArrayEvery
+            | N::ArrayIncludes
+            | N::ArrayReduce
+            | N::ArrayLastIndexOf
+            | N::ArrayFlatMap
+            | N::ArrayToLocaleString
+            | N::ArrayToSorted
+            | N::ArrayToReversed
+            | N::ArrayToSpliced
+            | N::ArrayWith
+            | N::ArrayFill
+            | N::ArrayCopyWithin
+            | N::ArrayPrototypeToString
+    )
+}
+
 pub(in crate::runtime) fn to_length(value: &JsValue) -> Result<f64, JsError> {
     let number = to_number(value)?;
     if number.is_nan() || number <= 0.0 {
@@ -546,7 +594,10 @@ impl JsRuntime {
         length: f64,
     ) -> Result<(), JsError> {
         if matches!(self.realm.host(object), Some(ObjectHost::Array)) {
-            return self.set_array_length_value(dom, object, &JsValue::Number(length));
+            if !self.set_array_length_value(dom, object, &JsValue::Number(length))? {
+                return Err(JsError::type_error("could not shrink array length"));
+            }
+            return Ok(());
         }
         self.set_key_or_throw(dom, object, "length", JsValue::Number(length))
     }
@@ -2056,12 +2107,17 @@ impl JsRuntime {
         Ok(number.trunc() as u32)
     }
 
+    /// ECMA-262 10.4.2.4 `ArraySetLength`, returning the `[[DefineOwnProperty]]`
+    /// result: `false` when the length is read-only, or when an element at or
+    /// past the new length cannot be deleted. The caller decides whether a
+    /// refusal throws, which depends on strictness at a write and is always a
+    /// `TypeError` for a built-in.
     pub(in crate::runtime) fn set_array_length_value(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
         value: &JsValue,
-    ) -> Result<(), JsError> {
+    ) -> Result<bool, JsError> {
         // ECMA-262 10.4.2.4 ArraySetLength: `newLen = ToUint32(value)` and then
         // `numberLen = ToNumber(value)`, so an object's `valueOf` runs twice.
         // A mismatch between the two is a RangeError.
@@ -2072,17 +2128,34 @@ impl JsRuntime {
         }
         let length = uint32_length;
         let old_length = self.array_length(object)?;
+        if !self.array_length_writable(object) {
+            // A read-only `length` refuses the write even when the value is unchanged:
+            // `[[Set]]` (ECMA-262 10.1.9.2 step 2.a) returns false for a non-writable
+            // data property before any `[[DefineOwnProperty]]` is attempted.
+            return Ok(false);
+        }
         if length < old_length {
-            for name in self.realm.own_property_names(object).unwrap_or_default() {
-                if let Some(index) = array_index(&name)
-                    && index >= length
-                    && !self.realm.delete_property(object, &name)
-                {
-                    return Err(JsError::type_error("could not shrink array length"));
+            // Elements are deleted from the highest index down (step 17.b), and
+            // the first one that refuses stops the shrink: the length settles
+            // just above it and the update is reported as refused.
+            let mut indices: Vec<u32> = self
+                .realm
+                .own_property_names(object)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| array_index(name))
+                .filter(|index| *index >= length)
+                .collect();
+            indices.sort_unstable_by(|left, right| right.cmp(left));
+            for index in indices {
+                if !self.realm.delete_property(object, &index.to_string()) {
+                    self.set_array_length(object, index + 1)?;
+                    return Ok(false);
                 }
             }
         }
-        self.set_array_length(object, length)
+        self.set_array_length(object, length)?;
+        Ok(true)
     }
 
     pub(in crate::runtime) fn set_array_length(

@@ -65,29 +65,32 @@ impl JsSymbol {
     }
 
     /// The well-known symbol whose registry key is `name` ("@@iterator",
-    /// "@@toStringTag", ...). Descriptions mirror the registry keys, except the
-    /// explicit-resource-management pair, which carries the specification's
-    /// `Symbol.dispose` and `Symbol.asyncDispose` names because `toString()` shows them.
+    /// "@@toStringTag", ...). ECMA-262 6.1.5.1 gives each one the description
+    /// `Symbol.<name>` (for example `Symbol.iterator`), which is what
+    /// `description`, `toString()` and the names of functions derived from the
+    /// symbol show; the registry key itself is never observable.
     #[must_use]
     pub(crate) fn well_known(name: &str) -> Self {
-        match name {
-            "@@iterator" => Self::new(1, Some(JsString::from("@@iterator"))),
-            "@@asyncIterator" => Self::new(2, Some(JsString::from("@@asyncIterator"))),
-            "@@toStringTag" => Self::new(3, Some(JsString::from("@@toStringTag"))),
-            "@@toPrimitive" => Self::new(4, Some(JsString::from("@@toPrimitive"))),
-            "@@hasInstance" => Self::new(5, Some(JsString::from("@@hasInstance"))),
-            "@@species" => Self::new(6, Some(JsString::from("@@species"))),
-            "@@isConcatSpreadable" => Self::new(7, Some(JsString::from("@@isConcatSpreadable"))),
-            "@@unscopables" => Self::new(8, Some(JsString::from("@@unscopables"))),
-            "@@match" => Self::new(9, Some(JsString::from("@@match"))),
-            "@@matchAll" => Self::new(10, Some(JsString::from("@@matchAll"))),
-            "@@replace" => Self::new(11, Some(JsString::from("@@replace"))),
-            "@@search" => Self::new(12, Some(JsString::from("@@search"))),
-            "@@split" => Self::new(13, Some(JsString::from("@@split"))),
-            "@@dispose" => Self::new(14, Some(JsString::from("Symbol.dispose"))),
-            "@@asyncDispose" => Self::new(15, Some(JsString::from("Symbol.asyncDispose"))),
-            _ => Self::new(0, None),
-        }
+        let id = match name {
+            "@@iterator" => 1,
+            "@@asyncIterator" => 2,
+            "@@toStringTag" => 3,
+            "@@toPrimitive" => 4,
+            "@@hasInstance" => 5,
+            "@@species" => 6,
+            "@@isConcatSpreadable" => 7,
+            "@@unscopables" => 8,
+            "@@match" => 9,
+            "@@matchAll" => 10,
+            "@@replace" => 11,
+            "@@search" => 12,
+            "@@split" => 13,
+            "@@dispose" => 14,
+            "@@asyncDispose" => 15,
+            _ => return Self::new(0, None),
+        };
+        let description = format!("Symbol.{}", name.trim_start_matches("@@"));
+        Self::new(id, Some(JsString::from(description)))
     }
 
     #[must_use]
@@ -681,7 +684,9 @@ pub(crate) enum NativeFunction {
     BigIntAsUintN,
     BigIntToString,
     BigIntValueOf,
+    NumToExponential,
     NumToFixed,
+    NumToLocaleString,
     NumToPrecision,
     NumToString,
     NumValueOf,
@@ -859,6 +864,9 @@ pub(crate) enum NativeFunction {
     ArrayFromAsync,
     FunctionPrototype,
     FunctionToString,
+    /// `%ThrowTypeError%` (ECMA-262 10.2.4.1): the accessor that `caller` and
+    /// `arguments` on `Function.prototype` use.
+    ThrowTypeError,
     FunctionCall,
     FunctionBind,
     FunctionApply,
@@ -962,6 +970,7 @@ pub(crate) enum NativeFunction {
     DateGetValue,
     DateValueOf,
     DateToString,
+    ErrorIsError,
     ErrorPrototypeToString,
     /// The `name`, `message` and `code` accessors of `DOMException.prototype`.
     /// One native per member because `WebIDL` attributes are separate accessors,
@@ -981,7 +990,9 @@ pub(crate) enum NativeFunction {
     MediaQueryListRemoveEventListener,
     MediaQueryListAddListener,
     MediaQueryListRemoveListener,
+    JsonIsRawJson,
     JsonParse,
+    JsonRawJson,
     JsonStringify,
     PerformanceNow,
     PerformanceGetEntries,
@@ -1967,6 +1978,8 @@ pub(crate) enum ObjectHost {
     ArrayConstructor,
     StringPrimitive(JsString),
     NumberPrimitive(f64),
+    /// `JSON.rawJSON` output: the `[[IsRawJSON]]` slot (json-parse-with-source).
+    RawJson,
     BooleanPrimitive(bool),
     DateInstance(f64),
     NamedNodeMap(NodeId),
@@ -6248,7 +6261,7 @@ impl Realm {
             ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
             ("EPSILON", f64::EPSILON),
             ("MAX_VALUE", f64::MAX),
-            ("MIN_VALUE", f64::MIN_POSITIVE),
+            ("MIN_VALUE", f64::from_bits(1)),
             ("POSITIVE_INFINITY", f64::INFINITY),
             ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
             ("NaN", f64::NAN),
@@ -6276,6 +6289,7 @@ impl Realm {
                 host: ObjectHost::NativeFunction(NativeFunction::NumberOp(function)),
                 ..JsObject::default()
             });
+            Self::install_length(objects, method, 1.0);
             objects[constructor.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
@@ -6292,23 +6306,28 @@ impl Realm {
                 configurable: true,
             },
         );
-        // Number primitive wrapper prototype.
+        // ECMA-262 21.1.3: `Number.prototype` is itself a Number object whose
+        // [[NumberData]] is +0.
         let num_proto = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
+            host: ObjectHost::NumberPrimitive(0.0),
             ..JsObject::default()
         });
-        for (name, function) in [
-            ("toFixed", NativeFunction::NumToFixed),
-            ("toPrecision", NativeFunction::NumToPrecision),
-            ("toString", NativeFunction::NumToString),
-            ("valueOf", NativeFunction::NumValueOf),
+        for (name, function, length) in [
+            ("toExponential", NativeFunction::NumToExponential, 1.0),
+            ("toFixed", NativeFunction::NumToFixed, 1.0),
+            ("toLocaleString", NativeFunction::NumToLocaleString, 0.0),
+            ("toPrecision", NativeFunction::NumToPrecision, 1.0),
+            ("toString", NativeFunction::NumToString, 1.0),
+            ("valueOf", NativeFunction::NumValueOf, 0.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
                 host: ObjectHost::NativeFunction(function),
                 ..JsObject::default()
             });
+            Self::install_length(objects, method, length);
             objects[num_proto.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
@@ -6927,6 +6946,18 @@ impl Realm {
             });
             if kind == ErrorKind::Error {
                 error_constructor = constructor;
+                // `Error.isError` (test262 feature `Error.isError`): length 1.
+                let method = ObjectId(objects.len());
+                objects.push(JsObject {
+                    prototype: Some(function_prototype),
+                    host: ObjectHost::NativeFunction(NativeFunction::ErrorIsError),
+                    ..JsObject::default()
+                });
+                Self::install_length(objects, method, 1.0);
+                objects[constructor.0].properties.insert(
+                    "isError".to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(method)),
+                );
             }
             objects[constructor.0].properties.insert(
                 "prototype".to_owned(),
@@ -7210,6 +7241,46 @@ impl Realm {
                 },
             ),
         );
+        // ECMA-262 10.2.4 AddRestrictedFunctionProperties: `Function.prototype`
+        // has `caller` and `arguments` accessors that both read `%ThrowTypeError%`.
+        // That function is length 0 and named "", both non-configurable, and it
+        // is not extensible.
+        let thrower = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::ThrowTypeError),
+            extensible: false,
+            ..JsObject::default()
+        });
+        for (name, value) in [
+            ("length", JsValue::Number(0.0)),
+            ("name", JsValue::String(JsString::from(""))),
+        ] {
+            objects[thrower.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value,
+                    writable: false,
+                    enumerable: false,
+                    configurable: false,
+                },
+            );
+        }
+        for name in ["caller", "arguments"] {
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: Some(thrower),
+                    setter: Some(thrower),
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
         let function = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(prototype),
@@ -7241,6 +7312,10 @@ impl Realm {
         prototype
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Math's functions and constants install together"
+    )]
     fn install_math(objects: &mut Vec<JsObject>, global: ObjectId, object_prototype: ObjectId) {
         let math = ObjectId(objects.len());
         objects.push(JsObject {
@@ -7323,6 +7398,22 @@ impl Realm {
                 },
             );
         }
+        // ECMA-262 21.3.1: `Math[@@toStringTag]` is "Math".
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[math.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(("Math").into()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
         objects[global.0].properties.insert(
             "Math".to_owned(),
             PropertyDescriptor {
@@ -7347,9 +7438,12 @@ impl Realm {
             prototype: Some(object_prototype),
             ..JsObject::default()
         });
-        for (name, function) in [
-            ("parse", NativeFunction::JsonParse),
-            ("stringify", NativeFunction::JsonStringify),
+        // ECMA-262 25.5 and json-parse-with-source: each method's `length`.
+        for (name, function, length) in [
+            ("parse", NativeFunction::JsonParse, 2.0),
+            ("stringify", NativeFunction::JsonStringify, 3.0),
+            ("rawJSON", NativeFunction::JsonRawJson, 1.0),
+            ("isRawJSON", NativeFunction::JsonIsRawJson, 1.0),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -7360,11 +7454,28 @@ impl Realm {
                 },
                 ..JsObject::default()
             });
+            Self::install_length(objects, method, length);
             objects[json.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        // ECMA-262 25.5.3: `JSON[@@toStringTag]` is "JSON".
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[json.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(("JSON").into()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
         objects[global.0].properties.insert(
             "JSON".to_owned(),
             PropertyDescriptor {
@@ -8392,17 +8503,35 @@ impl Realm {
         );
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Array and its prototype methods install together"
+    )]
     fn install_array(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
     ) -> ObjectId {
+        // ECMA-262 23.1.3: `Array.prototype` is itself an Array exotic object
+        // whose `length` is +0.
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
+            host: ObjectHost::Array,
             ..JsObject::default()
         });
+        objects[prototype.0].properties.insert(
+            "length".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Number(0.0),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         for (name, function) in [
             ("push", NativeFunction::ArrayPush),
             ("pop", NativeFunction::ArrayPop),
@@ -9411,9 +9540,13 @@ impl Realm {
     }
 
     /// Create a transient number wrapper exposing Number.prototype members.
-    pub(crate) fn number_primitive_wrapper(&mut self, value: f64) -> ObjectId {
+    pub(crate) fn number_primitive_wrapper(
+        &mut self,
+        value: f64,
+        prototype: Option<ObjectId>,
+    ) -> ObjectId {
         self.allocate(JsObject {
-            prototype: Some(self.number_primitive_prototype),
+            prototype: Some(prototype.unwrap_or(self.number_primitive_prototype)),
             host: ObjectHost::NumberPrimitive(value),
             ..JsObject::default()
         })

@@ -338,7 +338,8 @@ impl JsRuntime {
         let tokens =
             lexer::tokenize(source, &self.limits).map_err(|error| without_offset(&error))?;
         let (mut statements, strict) =
-            parse_eval(tokens, &self.limits, context).map_err(|error| without_offset(&error))?;
+            parse_eval(std::sync::Arc::from(source), tokens, &self.limits, context)
+                .map_err(|error| without_offset(&error))?;
         if direct {
             if strict == self.code_is_strict() {
                 return self.evaluate_eval_code(dom, &mut statements, strict);
@@ -529,6 +530,7 @@ impl JsRuntime {
                 body,
                 kind,
                 strict: function_strict,
+                source,
                 ..
             }) = function_declaration(&statements[index])
             else {
@@ -541,6 +543,7 @@ impl JsRuntime {
                 *kind,
                 *function_strict,
             )?;
+            self.attach_function_source(&function, source);
             match var_scope {
                 None => self.create_global_function_binding(name, function)?,
                 Some(depth) => {

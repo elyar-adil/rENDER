@@ -428,6 +428,7 @@ impl JsRuntime {
                     kind: FunctionKind::new(element.is_async, element.is_generator),
                 },
             )?;
+            self.attach_function_source(&method, &element.source);
             let JsValue::Object(method) = method else {
                 continue;
             };

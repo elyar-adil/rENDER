@@ -2995,3 +2995,288 @@ fn a_var_deleted_during_its_own_initializer_is_created_again() {
         "true"
     );
 }
+
+#[test]
+fn number_prototype_is_a_number_object_with_zero_value() {
+    // ECMA-262 21.1.3: `Number.prototype` has [[NumberData]] +0, so its methods
+    // accept it as a receiver, and `Object.prototype.toString` names it Number.
+    assert_eq!(
+        ok(
+            "[Number.prototype.toString(2), Number.prototype.valueOf(), Object.prototype.toString.call(Number.prototype)].join()"
+        ),
+        "0,0,[object Number]"
+    );
+    assert_eq!(ok("Number.prototype.toString.call(5)"), "5");
+}
+
+#[test]
+fn string_to_number_admits_only_the_numeric_grammar() {
+    // ECMA-262 7.1.4.1.1: `Infinity` is case-sensitive, and Rust's `inf`, `nan`
+    // and underscore spellings are not numeric literals.
+    assert_eq!(
+        ok(
+            "[Number('INFINITY'), Number('infinity'), Number('nan'), Number('1_000'), Number('-Infinity'), Number(' +.5 '), Number('0x1F'), Number('-0x10'), Number('5.'), Number('\\u00851')].join()"
+        ),
+        "NaN,NaN,NaN,NaN,-Infinity,0.5,31,NaN,5,NaN"
+    );
+    // `Number(undefined)` is NaN, while an absent argument is +0.
+    assert_eq!(
+        ok("[Number(undefined), Number(), new Number(undefined) + ''].join()"),
+        "NaN,0,NaN"
+    );
+    assert_eq!(ok("Number.MIN_VALUE / 2"), "0");
+}
+
+#[test]
+fn number_formatting_rounds_ties_up_on_the_exact_value() {
+    // ECMA-262 21.1.3.2, 21.1.3.3 and 21.1.3.5 pick the larger candidate on a tie.
+    assert_eq!(
+        ok(
+            "[(2.5).toFixed(0), (-2.5).toFixed(0), (0.5).toFixed(0), (1.25).toExponential(1), (9.99).toExponential(1), (1.5).toPrecision(1), (1.005).toFixed(2)].join()"
+        ),
+        "3,-3,1,1.3e+0,1.0e+1,2,1.00"
+    );
+    assert_eq!(
+        ok(
+            "[(0).toExponential(), (123456).toExponential(), (-1.5e-7).toExponential(3), (0.000001234).toPrecision(2), (1e-7).toPrecision(2), (123.456).toPrecision(4), (1e21).toFixed(2)].join()"
+        ),
+        "0e+0,1.23456e+5,-1.500e-7,0.0000012,1.0e-7,123.5,1e+21"
+    );
+    assert_eq!(ok("(12345.6789).toExponential(0)"), "1e+4");
+    assert_eq!(
+        ok(
+            "var r = []; try { (1).toExponential(101); } catch (e) { r.push(e.name); } try { (1).toPrecision(0); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "RangeError,RangeError"
+    );
+}
+
+#[test]
+fn json_stringify_applies_replacer_space_tojson_and_raw_json() {
+    // ECMA-262 25.5.2: the array replacer selects and orders keys, a function
+    // replacer transforms, `space` indents, and wrappers unwrap.
+    assert_eq!(
+        ok("JSON.stringify({a: 1, b: 2, c: 3}, ['b', 'a'])"),
+        r#"{"b":2,"a":1}"#
+    );
+    assert_eq!(
+        ok("JSON.stringify({a: 1, b: 2}, function (k, v) { return k === 'a' ? undefined : v; })"),
+        r#"{"b":2}"#
+    );
+    assert_eq!(
+        ok("JSON.stringify({a: [1]}, null, 2)"),
+        "{\n  \"a\": [\n    1\n  ]\n}"
+    );
+    assert_eq!(
+        ok("JSON.stringify([new Number(8.5), new String('s'), new Boolean(false)])"),
+        r#"[8.5,"s",false]"#
+    );
+    assert_eq!(
+        ok("JSON.stringify({toJSON(k) { return 'K' + k; }})"),
+        r#""K""#
+    );
+    assert_eq!(ok("JSON.stringify('\\ud800\\u0001')"), r#""\ud800\u0001""#);
+    // json-parse-with-source: `rawJSON` text is emitted unchanged.
+    assert_eq!(
+        ok("JSON.stringify({x: JSON.rawJSON('1e1000')})"),
+        r#"{"x":1e1000}"#
+    );
+    assert_eq!(
+        ok("[JSON.isRawJSON(JSON.rawJSON('1')), JSON.isRawJSON({rawJSON: '1'})].join()"),
+        "true,false"
+    );
+    assert_eq!(
+        ok("var r; try { JSON.stringify({x: 1n}); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn json_parse_reviver_sees_source_text_and_deletes_undefined() {
+    // ECMA-262 25.5.1.1 InternalizeJSONProperty, with the json-parse-with-source
+    // `context.source` for an unmodified primitive.
+    assert_eq!(
+        ok("JSON.parse('[1]', function (k, v, c) { return k === '0' ? c.source + '!' : v; })[0]"),
+        "1!"
+    );
+    assert_eq!(
+        ok("JSON.parse('[1,2,3]', function (k, v) { return k === '1' ? undefined : v; }).length"),
+        "3"
+    );
+    assert_eq!(ok("JSON.parse('1e400')"), "Infinity");
+    assert_eq!(
+        ok("JSON.parse({ toString() { return '\"s\"'; }, valueOf() { return '1'; } })"),
+        "s"
+    );
+    assert_eq!(
+        ok("[JSON.parse.length, JSON.stringify.length, JSON.rawJSON.length].join()"),
+        "2,3,1"
+    );
+}
+
+#[test]
+fn array_prototype_is_an_array_and_refuses_nullish_receivers() {
+    // ECMA-262 23.1.3: `Array.prototype` is an Array exotic object of length 0,
+    // and its methods apply ToObject to `this`, which throws for null or undefined.
+    assert_eq!(
+        ok("[Array.isArray(Array.prototype), Array.prototype.length].join()"),
+        "true,0"
+    );
+    assert_eq!(
+        ok(
+            "var r = []; try { Array.prototype.fill.call(null, 0); } catch (e) { r.push(e.name); } try { Array.prototype.lastIndexOf.call(undefined, 1); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError,TypeError"
+    );
+    // ArraySetLength refuses a shrink past a non-configurable element: sloppy
+    // code ignores the refusal, and strict code throws.
+    assert_eq!(
+        ok(
+            "var a = [1, 2, 3]; Object.defineProperty(a, 1, {configurable: false}); a.length = 0; a.length"
+        ),
+        "2"
+    );
+    assert_eq!(
+        ok(
+            "'use strict'; var a = [1, 2, 3]; Object.defineProperty(a, 1, {configurable: false}); var r; try { a.length = 0; r = 'no'; } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn array_methods_that_set_length_throw_on_a_read_only_length() {
+    // ECMA-262 10.1.9.2 step 2.a: `[[Set]]` on a non-writable data property returns
+    // false before any [[DefineOwnProperty]], so even an unchanged length throws
+    // for a built-in that writes it (strict `Set(O, "length", 0, true)`).
+    assert_eq!(
+        ok(
+            "var r = []; var a = []; Object.defineProperty(a, 'length', {writable: false}); try { a.push(1); } catch (e) { r.push(e.name); } try { a.pop(); } catch (e) { r.push(e.name); } r.join()"
+        ),
+        "TypeError,TypeError"
+    );
+}
+
+#[test]
+fn error_constructor_installs_cause_and_to_string_is_spec_shaped() {
+    // ECMA-262 20.5.1.1 and 20.5.8.1 InstallErrorCause: `cause` is copied only when
+    // `options` has it, and the message is converted with ToString first.
+    assert_eq!(ok("new Error('m', {cause: 3}).cause"), "3");
+    assert_eq!(
+        ok("Object.prototype.hasOwnProperty.call(new Error('m', {}), 'cause')"),
+        "false"
+    );
+    assert_eq!(
+        ok("Error.isError(new TypeError()) + ',' + Error.isError({})"),
+        "true,false"
+    );
+    // ECMA-262 20.5.3.4: a primitive receiver throws, and the name and message
+    // come from [[Get]] with the Error.prototype defaults.
+    assert_eq!(
+        ok(
+            "var r = []; try { Error.prototype.toString.call(undefined); } catch (e) { r.push(e.name); } r.push(Error.prototype.toString.call({name: undefined, message: 'M'})); r.push(Error.prototype.toString.call({name: '', message: 'M'})); r.join('|')"
+        ),
+        "TypeError|Error: M|M"
+    );
+    assert_eq!(
+        ok("var r; try { new Error(Symbol()); } catch (e) { r = e.name; } r"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn sloppy_duplicate_parameters_bind_last_and_strict_ones_are_refused() {
+    // ECMA-262 15.2.1.1: duplicates are allowed only in sloppy functions with a
+    // simple parameter list and not in a method, and the last duplicate binds.
+    assert_eq!(ok("(function (a, a) { return a; })(1, 2)"), "2");
+    assert_eq!(ok("new Function('a', 'a', 'return a')(1, 5)"), "5");
+    assert!(eval("(function (a, a) { 'use strict'; })").is_err());
+    assert!(eval("({ m(a, a) {} })").is_err());
+    assert!(eval("(function (a, {a}) {})").is_err());
+    assert!(eval("(function (a, ...a) {})").is_err());
+}
+
+#[test]
+fn function_prototype_poisons_caller_and_arguments() {
+    // ECMA-262 10.2.4 AddRestrictedFunctionProperties: both accessors read the same
+    // non-extensible %ThrowTypeError%, which throws.
+    assert_eq!(
+        ok(
+            "var d = Object.getOwnPropertyDescriptor(Function.prototype, 'caller'); [d.get === d.set, d.get === Object.getOwnPropertyDescriptor(Function.prototype, 'arguments').get, Object.isExtensible(d.get), d.enumerable, d.configurable].join()"
+        ),
+        "true,true,false,false,true"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { (function () { 'use strict'; return function () {}; })().caller; } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn ordinary_has_instance_requires_an_object_prototype() {
+    // ECMA-262 7.3.21 OrdinaryHasInstance step 5: a non-object `prototype` throws
+    // once the value is an object.
+    assert_eq!(
+        ok(
+            "var F = function () {}; F.prototype = 1; var r; try { ({}) instanceof F; r = 'no'; } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(ok("Object.prototype.toString.call(Math)"), "[object Math]");
+}
+
+#[test]
+fn well_known_symbols_describe_themselves_by_their_spec_names() {
+    // ECMA-262 6.1.5.1: each well-known symbol's description is `Symbol.<name>`.
+    assert_eq!(
+        ok("Symbol.asyncIterator.toString() + ' ' + Symbol.iterator.description"),
+        "Symbol(Symbol.asyncIterator) Symbol.iterator"
+    );
+}
+
+#[test]
+fn function_to_string_returns_the_source_text_of_each_function_form() {
+    // ECMA-262 20.2.3.5: a function written in source answers the text it was
+    // parsed from, comments included and `static` excluded from a method.
+    assert_eq!(
+        ok("(function /* a */ f /* b */ ( ) { }).toString()"),
+        "function /* a */ f /* b */ ( ) { }"
+    );
+    assert_eq!(
+        ok(
+            "Object.getOwnPropertyDescriptor({ get /* a */ x() { return 1; } }, 'x').get.toString()"
+        ),
+        "get /* a */ x() { return 1; }"
+    );
+    assert_eq!(
+        ok("class /* a */ A /* b */ { m() { } }; A.prototype.m.toString()"),
+        "m() { }"
+    );
+    assert_eq!(
+        ok("(class A { static /* a */ m() {} }).m.toString()"),
+        "m() {}"
+    );
+    assert_eq!(
+        ok("(async /* a */ ( /* b */ a) => a).toString()"),
+        "async /* a */ ( /* b */ a) => a"
+    );
+    assert_eq!(
+        ok("(function* g(a, b) { yield a; }).toString()"),
+        "function* g(a, b) { yield a; }"
+    );
+    // A built-in answers the NativeFunction form, and a bound function has no name.
+    assert_eq!(
+        ok("Math.max.toString()"),
+        "function max() { [native code] }"
+    );
+    assert_eq!(
+        ok("(function () {}).bind(null).toString()"),
+        "function () { [native code] }"
+    );
+    assert_eq!(
+        ok("new Function('a', 'b', 'return a + b').toString()"),
+        "function anonymous(a,b\n) {\nreturn a + b\n}"
+    );
+}

@@ -169,6 +169,9 @@ pub(super) enum TemplatePart {
 pub(super) struct Token {
     pub kind: TokenKind,
     pub offset: usize,
+    /// The byte offset just past the token's last character, which is what a
+    /// function's source text ends at (`Function.prototype.toString`).
+    pub end: usize,
     /// Whether a line terminator (or a comment containing one) precedes this
     /// token. Restricted productions such as `return` need this for correct
     /// automatic semicolon insertion.
@@ -1320,6 +1323,7 @@ impl Lexer<'_> {
         self.tokens.push(Token {
             kind,
             offset,
+            end: self.offset,
             after_newline: std::mem::take(&mut self.newline),
             escaped: std::mem::take(&mut self.escaped_name),
             legacy_syntax: std::mem::take(&mut self.legacy_syntax),

@@ -17,6 +17,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::parser::Expr;
 use crate::parser::FunctionKind;
+use crate::parser::SourceSpan;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::runtime::builtins::promise::PromiseState;
@@ -155,6 +156,9 @@ pub(super) struct UserFunction {
     /// The function context an arrow inherits from the code it was created in.
     /// Other functions derive theirs from their own metadata at each call.
     pub(super) this_context: ThisContext,
+    /// The function's own source text, which `Function.prototype.toString`
+    /// returns. `None` for a function the parser did not spell out.
+    pub(super) source: Option<SourceSpan>,
 }
 
 /// The function context that `this` and the other per-function bindings come

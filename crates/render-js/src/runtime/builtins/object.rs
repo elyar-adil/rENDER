@@ -21,7 +21,6 @@ use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
-use crate::runtime::convert::format_number_precision;
 use crate::runtime::convert::required_argument;
 use crate::runtime::convert::uint32_of_number;
 use crate::runtime::eval::PrimitiveHint;
@@ -142,7 +141,25 @@ fn array_length_slot(descriptor: Option<&PropertyDescriptor>) -> (u32, bool) {
     }
 }
 
+/// Built-ins whose `this` must already be an Object: a primitive or a nullish
+/// receiver is a `TypeError`, where other built-ins would wrap or coerce it.
+pub(in crate::runtime) fn requires_object_receiver(function: NativeFunction) -> bool {
+    matches!(function, NativeFunction::ErrorPrototypeToString)
+}
+
 impl JsRuntime {
+    /// ECMA-262 21.1.3 `thisNumberValue`. A primitive receiver arrives boxed as
+    /// a Number wrapper, and `Number.prototype` is itself a Number object whose
+    /// value is +0, so both pass; any other receiver is a `TypeError`.
+    fn this_number_value(&self, receiver: ObjectId) -> Result<f64, JsError> {
+        match self.realm.host(receiver) {
+            Some(ObjectHost::NumberPrimitive(value)) => Ok(value),
+            _ => Err(JsError::type_error(
+                "Number.prototype method requires that 'this' be a Number",
+            )),
+        }
+    }
+
     pub(in crate::runtime) fn dispatch_object_native(
         &mut self,
         dom: &mut Dom,
@@ -219,64 +236,86 @@ impl JsRuntime {
                     "Symbol.prototype.valueOf requires that 'this' be a Symbol",
                 )),
             },
-            // ECMA-262 6.1.6.1.9: `Number.prototype.valueOf` returns the
-            // receiver's number, not the wrapper, so `Object(1).valueOf() === 1`
-            // and `typeof` is `"number"` exactly as in every engine. The
-            // String counterpart already unwraps.
-            NativeFunction::NumValueOf => match self.realm.host(receiver) {
-                Some(ObjectHost::NumberPrimitive(value)) => Ok(JsValue::Number(value)),
-                _ => Err(JsError::type_error(
-                    "Number.prototype.valueOf requires that 'this' be a Number",
-                )),
-            },
+            // ECMA-262 21.1.3.7: `Number.prototype.valueOf` returns the
+            // receiver's number, not the wrapper, so `Object(1).valueOf() === 1`.
+            NativeFunction::NumValueOf => self.this_number_value(receiver).map(JsValue::Number),
+            // ECMA-262 21.1.3.3 `toFixed`: `thisNumberValue` comes first, then
+            // ToIntegerOrInfinity(fractionDigits), then the range check; a
+            // non-finite number or one of 1e21 or more prints as `ToString` does.
             NativeFunction::NumToFixed => {
-                // ECMA-262 21.1.3.3: the digits argument is converted first and
-                // must lie in 0..=100; a non-finite number or one of 1e21 or more
-                // prints as `ToString` does.
+                let value = self.this_number_value(receiver)?;
                 let digits =
                     self.to_integer_value(dom, arguments.first().unwrap_or(&JsValue::Undefined))?;
-                if !(0.0..=100.0).contains(&digits) {
+                if !digits.is_finite() || !(0.0..=100.0).contains(&digits) {
                     return Err(
                         self.range_error("toFixed() digits argument must be between 0 and 100")
                     );
+                }
+                if !value.is_finite() || value.abs() >= 1e21 {
+                    return Ok(JsValue::String(
+                        crate::value::number_to_string(value).into(),
+                    ));
                 }
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
                     reason = "digits was just checked to lie in 0..=100"
                 )]
-                let digits = digits as usize;
-                match self.realm.host(receiver) {
-                    Some(ObjectHost::NumberPrimitive(value)) => {
-                        if !value.is_finite() || value.abs() >= 1e21 {
-                            Ok(JsValue::String(
-                                (crate::value::number_to_string(value)).into(),
-                            ))
-                        } else {
-                            Ok(JsValue::String((format!("{value:.digits$}")).into()))
-                        }
-                    }
-                    _ => Err(JsError::type_error("incompatible Number method receiver")),
-                }
+                Ok(JsValue::String(
+                    crate::runtime::convert::format_fixed(value, digits as usize).into(),
+                ))
             }
-            NativeFunction::NumToPrecision => {
-                let value = match self.realm.host(receiver) {
-                    Some(ObjectHost::NumberPrimitive(value)) => value,
-                    _ => {
-                        return Err(JsError::type_error("incompatible Number method receiver"));
-                    }
-                };
-                let Some(argument) = arguments.first() else {
+            // ECMA-262 21.1.3.2 `toExponential`: the fraction-digits argument is
+            // converted before the non-finite early return, and an absent or
+            // undefined argument selects the shortest representation.
+            NativeFunction::NumToExponential => {
+                let value = self.this_number_value(receiver)?;
+                let argument = arguments.first().unwrap_or(&JsValue::Undefined);
+                let digits = self.to_integer_value(dom, argument)?;
+                if !value.is_finite() {
                     return Ok(JsValue::String(
-                        (crate::value::number_to_string(value)).into(),
-                    ));
-                };
-                if matches!(argument, JsValue::Undefined) {
-                    return Ok(JsValue::String(
-                        (crate::value::number_to_string(value)).into(),
+                        crate::value::number_to_string(value).into(),
                     ));
                 }
+                if !(0.0..=100.0).contains(&digits) {
+                    return Err(
+                        self.range_error("toExponential() argument must be between 0 and 100")
+                    );
+                }
+                let fraction_digits = match argument {
+                    JsValue::Undefined => None,
+                    _ =>
+                    {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "digits was just checked to lie in 0..=100"
+                        )]
+                        Some(digits as usize)
+                    }
+                };
+                Ok(JsValue::String(
+                    crate::runtime::convert::format_exponential(value, fraction_digits).into(),
+                ))
+            }
+            // ECMA-262 21.1.3.5 `toPrecision`: an undefined precision is `ToString`;
+            // otherwise ToIntegerOrInfinity runs before the non-finite early return.
+            NativeFunction::NumToPrecision => {
+                let value = self.this_number_value(receiver)?;
+                let Some(argument) = arguments
+                    .first()
+                    .filter(|value| !matches!(value, JsValue::Undefined))
+                else {
+                    return Ok(JsValue::String(
+                        crate::value::number_to_string(value).into(),
+                    ));
+                };
                 let precision = self.to_integer_value(dom, argument)?;
+                if !value.is_finite() {
+                    return Ok(JsValue::String(
+                        crate::value::number_to_string(value).into(),
+                    ));
+                }
                 if !(1.0..=100.0).contains(&precision) {
                     return Err(
                         self.range_error("toPrecision() argument must be between 1 and 100")
@@ -287,22 +326,22 @@ impl JsRuntime {
                     clippy::cast_sign_loss,
                     reason = "toPrecision precision is validated in the 1..=100 range"
                 )]
-                let precision = precision as usize;
                 Ok(JsValue::String(
-                    (format_number_precision(value, precision)).into(),
+                    crate::runtime::convert::format_precision(value, precision as usize).into(),
                 ))
             }
-            // ECMA-262 21.1.3.9: an absent or `undefined` radix means 10, and
-            // anything outside 2..=36 is a `RangeError`. Bundled base64 and
-            // colour helpers depend on `(0xff).toString(16)`, which previously
-            // returned the decimal form.
+            // ECMA-262 21.1.3.4 `toLocaleString`: without locale data the
+            // implementation-defined form is `Number::toString`.
+            NativeFunction::NumToLocaleString => {
+                let value = self.this_number_value(receiver)?;
+                Ok(JsValue::String(
+                    crate::value::number_to_string(value).into(),
+                ))
+            }
+            // ECMA-262 21.1.3.6: an absent or `undefined` radix means 10, and
+            // anything outside 2..=36 is a `RangeError`.
             NativeFunction::NumToString => {
-                let value = match self.realm.host(receiver) {
-                    Some(ObjectHost::NumberPrimitive(value)) => value,
-                    _ => {
-                        return Err(JsError::type_error("incompatible Number method receiver"));
-                    }
-                };
+                let value = self.this_number_value(receiver)?;
                 let radix = match arguments.first() {
                     None | Some(JsValue::Undefined) => 10u32,
                     Some(argument) => {
@@ -428,7 +467,8 @@ impl JsRuntime {
                 )),
                 Err(_) => Ok(JsValue::Boolean(true)),
             },
-            NativeFunction::ErrorPrototypeToString => Ok(self.error_to_string(dom, receiver)),
+            NativeFunction::ErrorPrototypeToString => self.error_to_string(dom, receiver),
+            NativeFunction::ErrorIsError => Ok(Self::error_is_error(arguments, &self.realm)),
             other => self.dispatch_math_native(dom, other, receiver, arguments),
         }
     }
@@ -508,7 +548,7 @@ impl JsRuntime {
 
     /// ECMA-262 7.3.15 `SetIntegrityLevel`, for `Object.seal` (`frozen` false)
     /// and `Object.freeze` (`frozen` true).
-    fn set_integrity_level(
+    pub(in crate::runtime) fn set_integrity_level(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,
@@ -630,14 +670,21 @@ impl JsRuntime {
         Ok(JsValue::Object(self.realm.create_ordinary_object()))
     }
 
+    /// ECMA-262 20.5.1.1 `Error(message, options)`, shared by `Error` and the
+    /// `NativeError` constructors. The instance's prototype comes from `new.target`
+    /// (`OrdinaryCreateFromConstructor`), falling back to this constructor's own
+    /// prototype. `message` is converted with `ToString`, and then `InstallErrorCause`
+    /// (20.5.8.1) reads `cause` from `options` when it is present.
     pub(in crate::runtime) fn error_constructor(
         &mut self,
+        dom: &mut Dom,
         constructor: ObjectId,
+        new_target: &JsValue,
         _kind: ErrorKind,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         self.ensure_heap_capacity(1)?;
-        let prototype = self
+        let fallback = self
             .realm
             .get_property(constructor, "prototype")
             .and_then(|value| match value {
@@ -645,26 +692,53 @@ impl JsRuntime {
                 _ => None,
             })
             .ok_or_else(|| JsError::type_error("Error constructor prototype is not an object"))?;
-        let message = arguments
-            .first()
-            .and_then(|value| (!matches!(value, JsValue::Undefined)).then(|| value.to_js_string()));
-        let object = self
-            .realm
-            .create_error(prototype, message.clone().map(|message| message.to_lossy()));
-        // `Error.prototype.stack`: engine-captured at construction, shaped
-        // like a real engine ("TypeError: msg" header + `    at` frames).
-        let stack = {
-            let name = self
-                .realm
-                .get_property(object, "name")
-                .unwrap_or_else(|| JsValue::String(("Error".to_owned()).into()))
-                .to_js_string();
-            let header = match &message {
-                Some(text) if !text.is_empty() => format!("{name}: {text}"),
-                _ => (name).to_key(),
-            };
-            format!("{header}{}", self.stack_frame_lines())
+        let prototype = match new_target {
+            JsValue::Object(target) => match self.get_member(dom, *target, "prototype")? {
+                JsValue::Object(prototype) => prototype,
+                _ => fallback,
+            },
+            _ => fallback,
         };
+        let message = match arguments.first() {
+            None | Some(JsValue::Undefined) => None,
+            Some(value) => Some(self.to_string_value(dom, value)?.to_lossy()),
+        };
+        self.ensure_heap_capacity(1)?;
+        let object = self.realm.create_error(prototype, message.clone());
+        if let Some(&JsValue::Object(options)) = arguments.get(1)
+            && self.has_property_value(dom, options, &PropertyName::String("cause".to_owned()))?
+        {
+            let cause = self.get_member(dom, options, "cause")?;
+            self.realm.define_property(
+                object,
+                "cause",
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: cause,
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            );
+        }
+        self.attach_error_stack(object, message.as_deref());
+        Ok(JsValue::Object(object))
+    }
+
+    /// The own `stack` property of a new error: the engine-captured header
+    /// ("Name: message") followed by the call-site lines, like a real engine.
+    fn attach_error_stack(&mut self, object: ObjectId, message: Option<&str>) {
+        let name = self
+            .realm
+            .get_property(object, "name")
+            .unwrap_or_else(|| JsValue::String(("Error".to_owned()).into()))
+            .to_js_string();
+        let header = match message {
+            Some(text) if !text.is_empty() => format!("{name}: {text}"),
+            _ => (name).to_key(),
+        };
+        let stack = format!("{header}{}", self.stack_frame_lines());
         self.realm.define_property(
             object,
             "stack",
@@ -677,56 +751,74 @@ impl JsRuntime {
                 configurable: true,
             },
         );
-        Ok(JsValue::Object(object))
     }
 
-    /// ECMA-262 §20.1.3.1 `Error.prototype.toString`, read through `Get` so an
-    /// accessor counts.
-    ///
-    /// `Get`, not the descriptor's value slot: `DOMException.prototype`'s `name`
-    /// and `message` are `WebIDL` §2.5.2 readonly attributes, which are accessors
-    /// reading internal slots, so a read that skipped the accessor would see the
-    /// accessor's unused value slot and answer `undefined` for a perfectly good
-    /// exception. The same is true of a user-written `class MyError extends Error
-    /// { get name() { return "My"; } }`, which this now also honours.
+    /// An error instance of `constructor` (its own `prototype`) for an error the
+    /// engine throws itself, with no `new`, no `cause` and no script call.
+    pub(in crate::runtime) fn error_instance_for(
+        &mut self,
+        constructor: ObjectId,
+        message: Option<&str>,
+    ) -> Result<ObjectId, JsError> {
+        self.ensure_heap_capacity(1)?;
+        let prototype = self
+            .realm
+            .get_property(constructor, "prototype")
+            .and_then(|value| match value {
+                JsValue::Object(prototype) => Some(prototype),
+                _ => None,
+            })
+            .ok_or_else(|| JsError::type_error("Error constructor prototype is not an object"))?;
+        let object = self
+            .realm
+            .create_error(prototype, message.map(str::to_owned));
+        self.attach_error_stack(object, message);
+        Ok(object)
+    }
+
+    /// `Error.isError(argument)` (the Error.isError proposal, test262 feature
+    /// `Error.isError`): true exactly for an object with an `[[ErrorData]]` slot.
+    fn error_is_error(arguments: &[JsValue], realm: &crate::value::Realm) -> JsValue {
+        JsValue::Boolean(matches!(
+            arguments.first(),
+            Some(JsValue::Object(object)) if matches!(realm.host(*object), Some(ObjectHost::ErrorInstance))
+        ))
+    }
+
+    /// ECMA-262 20.5.3.4 `Error.prototype.toString`. The receiver is an Object
+    /// (the caller enforces that), and `name` and `message` are read with [[Get]],
+    /// so a throwing getter or `ToString` propagates.
     pub(in crate::runtime) fn error_to_string(
         &mut self,
         dom: &mut Dom,
         receiver: ObjectId,
-    ) -> JsValue {
-        let name = self.error_string_member(dom, receiver, "name", "Error");
-        let message = self.error_string_member(dom, receiver, "message", "");
-        let result = match (name.is_empty(), message.is_empty()) {
-            (true, _) => message,
-            (_, true) => name,
-            (false, false) => format!("{name}: {message}"),
-        };
-        JsValue::String((result).into())
+    ) -> Result<JsValue, JsError> {
+        let name = self.error_string_member(dom, receiver, "name", "Error")?;
+        let message = self.error_string_member(dom, receiver, "message", "")?;
+        if name.is_empty() {
+            return Ok(JsValue::String(message));
+        }
+        if message.is_empty() {
+            return Ok(JsValue::String(name));
+        }
+        let mut units = name.units().to_vec();
+        units.extend(": ".encode_utf16());
+        units.extend_from_slice(message.units());
+        Ok(JsValue::String(JsString::from_unit_vec(units)))
     }
 
     /// One `Get(this, name)` of `Error.prototype.toString`, with the
-    /// `Error.prototype` default the specification gives for a missing member.
+    /// `Error.prototype` default the specification gives for `undefined`.
     fn error_string_member(
         &mut self,
         dom: &mut Dom,
         receiver: ObjectId,
         key: &str,
         fallback: &str,
-    ) -> String {
-        let value = self
-            .realm
-            .get_descriptor(receiver, key)
-            .map(|descriptor| {
-                if descriptor.is_accessor() {
-                    self.get_value(dom, receiver, key)
-                } else {
-                    Ok(descriptor.value)
-                }
-            })
-            .unwrap_or(Ok(JsValue::Undefined));
-        match value {
-            Ok(JsValue::Undefined) | Err(_) => fallback.to_owned(),
-            Ok(value) => (value.to_js_string()).to_lossy(),
+    ) -> Result<JsString, JsError> {
+        match self.get_member(dom, receiver, key)? {
+            JsValue::Undefined => Ok(JsString::from(fallback)),
+            value => self.to_string_value(dom, &value),
         }
     }
 

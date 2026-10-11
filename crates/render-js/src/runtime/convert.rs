@@ -21,6 +21,7 @@ use crate::JsValue;
 use crate::parser::BinaryOp;
 use crate::runtime::builtins::bigint::StringToBigInt;
 use crate::runtime::builtins::bigint::string_to_bigint;
+use crate::runtime::builtins::string::is_js_whitespace;
 
 impl JsValue {
     pub(super) fn is_truthy(&self) -> bool {
@@ -56,72 +57,280 @@ pub(super) fn to_number(value: &JsValue) -> Result<f64, JsError> {
         )),
         JsValue::Boolean(value) => Ok(u8::from(*value).into()),
         JsValue::Number(value) => Ok(*value),
-        JsValue::String(value) => {
-            let text = value.to_lossy();
-            let value = text.trim();
-            if value.is_empty() {
-                Ok(0.0)
-            } else {
-                let radix_value = [
-                    ("0x", 16),
-                    ("0X", 16),
-                    ("0b", 2),
-                    ("0B", 2),
-                    ("0o", 8),
-                    ("0O", 8),
-                ]
-                .into_iter()
-                .find_map(|(prefix, radix)| {
-                    value.strip_prefix(prefix).map(|digits| {
-                        u64::from_str_radix(digits, radix).map_or(f64::NAN, |number| number as f64)
-                    })
-                });
-                Ok(radix_value.unwrap_or_else(|| value.parse().unwrap_or(f64::NAN)))
-            }
-        }
+        JsValue::String(value) => Ok(string_to_number(&value.to_lossy())),
         JsValue::Object(_) => Err(JsError::type_error(
             "object-to-primitive numeric conversion is not implemented",
         )),
     }
 }
 
-pub(super) fn format_number_precision(value: f64, precision: usize) -> String {
-    if !value.is_finite() {
-        return crate::value::number_to_string(value);
+/// ECMA-262 7.1.4.1.1 `StringToNumber`. The text is trimmed of JavaScript
+/// white space and must match `StringNumericLiteral`: the empty string is `0`;
+/// an unsigned `0x`/`0o`/`0b` prefix introduces an integer in that radix; and
+/// otherwise an optional sign precedes `Infinity` (case-sensitive) or a
+/// decimal literal. Anything else is `NaN`. Rust's `f64` parser also accepts
+/// `inf`, `nan` and other spellings outside this grammar, so the decimal form
+/// is checked against the grammar before parsing.
+pub(crate) fn string_to_number(text: &str) -> f64 {
+    let text = text.trim_matches(is_js_whitespace);
+    if text.is_empty() {
+        return 0.0;
     }
-    if value == 0.0 {
-        return if precision == 1 {
-            "0".to_owned()
-        } else {
-            format!("0.{:0<width$}", "", width = precision - 1)
-        };
+    let radix = match text.get(..2) {
+        Some("0x" | "0X") => Some(16),
+        Some("0o" | "0O") => Some(8),
+        Some("0b" | "0B") => Some(2),
+        _ => None,
+    };
+    if let Some(radix) = radix {
+        return radix_integer_value(&text[2..], radix);
     }
-
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "finite binary64 base-10 exponents fit comfortably in i32"
-    )]
-    let exponent = value.abs().log10().floor() as i32;
-    if exponent < -6 || exponent >= precision as i32 {
-        let mut formatted = format!("{:.*e}", precision - 1, value);
-        if let Some(marker) = formatted.find('e') {
-            let raw_exponent = formatted[marker + 1..].parse::<i32>().unwrap_or(exponent);
-            formatted.truncate(marker + 1);
-            if raw_exponent >= 0 {
-                formatted.push('+');
-            }
-            formatted.push_str(&raw_exponent.to_string());
-        }
-        formatted
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let magnitude = if unsigned == "Infinity" {
+        f64::INFINITY
+    } else if is_decimal_literal(unsigned) {
+        unsigned.parse::<f64>().unwrap_or(f64::NAN)
     } else {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "precision is at most 100 and exponent selects fixed notation"
-        )]
-        let decimals = (precision as i32 - exponent - 1) as usize;
-        format!("{value:.decimals$}")
+        f64::NAN
+    };
+    if negative { -magnitude } else { magnitude }
+}
+
+/// The value of `digits` read in `radix`, rounded once to the nearest double.
+/// Empty text or a digit outside the radix is `NaN`.
+fn radix_integer_value(digits: &str, radix: u32) -> f64 {
+    if digits.is_empty() || !digits.chars().all(|digit| digit.is_digit(radix)) {
+        return f64::NAN;
     }
+    match u128::from_str_radix(digits, radix) {
+        Ok(number) => number as f64,
+        Err(_) => digits.chars().fold(0.0, |value, digit| {
+            value * f64::from(radix) + f64::from(digit.to_digit(radix).unwrap_or(0))
+        }),
+    }
+}
+
+/// `StrUnsignedDecimalLiteral` without `Infinity`: digits with an optional
+/// fraction (`1`, `1.`, `.5`, `1.5`) and an optional exponent (`e`/`E`, an
+/// optional sign, then at least one digit). At least one mantissa digit is
+/// required.
+fn is_decimal_literal(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let digits_from = |index: &mut usize| {
+        let start = *index;
+        while *index < bytes.len() && bytes[*index].is_ascii_digit() {
+            *index += 1;
+        }
+        *index - start
+    };
+    let mut mantissa_digits = digits_from(&mut index);
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        mantissa_digits += digits_from(&mut index);
+    }
+    if mantissa_digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        if digits_from(&mut index) == 0 {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+/// Decimal digit strings for the `Number.prototype` formatting methods
+/// (ECMA-262 21.1.3.2 `toExponential`, 21.1.3.3 `toFixed`, 21.1.3.5
+/// `toPrecision`). Every rounding here is taken on the exact binary value of the
+/// double, and a tie rounds up to the larger candidate, as those steps require.
+/// Rust's own `{:.N}` formatting rounds ties to even, so it is not used for the
+/// rounding decision.
+///
+/// The exact expansion of a finite double has at most 1074 fractional digits
+/// and 767 significant digits, so 1100 places of Rust's exact formatting carry
+/// every digit that can take part in a rounding decision.
+const EXACT_PLACES: usize = 1100;
+
+/// The significant digits of a finite, positive double in scientific form, as
+/// `(digits, exponent)` where `value` is `d.ddd` times `10^exponent`. The
+/// digits carry no leading zero, and the exponent is the power of its first.
+fn scientific_digits(text: &str) -> (Vec<u8>, i32) {
+    let (mantissa, exponent) = text.split_once('e').unwrap_or((text, "0"));
+    let digits = mantissa
+        .bytes()
+        .filter(u8::is_ascii_digit)
+        .map(|byte| byte - b'0')
+        .collect();
+    (digits, exponent.parse().unwrap_or(0))
+}
+
+/// Adds one to a base-10 digit string, prepending a leading `1` on carry.
+fn increment_decimal(digits: &mut Vec<u8>) {
+    for digit in digits.iter_mut().rev() {
+        if *digit == 9 {
+            *digit = 0;
+        } else {
+            *digit += 1;
+            return;
+        }
+    }
+    digits.insert(0, 1);
+}
+
+/// The `count` leading significant digits of a finite, positive double, rounded
+/// half up, with the exponent of the first. Rounding up over a run of nines
+/// carries into a new leading digit, which moves the exponent by one.
+fn significant_digits(value: f64, count: usize) -> (Vec<u8>, i32) {
+    let places = EXACT_PLACES;
+    let exact = format!("{value:.places$e}");
+    let (mut digits, mut exponent) = scientific_digits(&exact);
+    let round_up = digits.get(count).is_some_and(|digit| *digit >= 5);
+    digits.resize(count, 0);
+    if round_up {
+        increment_decimal(&mut digits);
+        if digits.len() > count {
+            digits.truncate(count);
+            exponent += 1;
+        }
+    }
+    (digits, exponent)
+}
+
+/// The digits of the shortest decimal that round-trips to a finite, positive
+/// double, as `Number::toString` chooses them (ECMA-262 6.1.6.1.20).
+fn shortest_significant_digits(value: f64) -> (Vec<u8>, i32) {
+    scientific_digits(&format!("{value:e}"))
+}
+
+/// `Number.prototype.toExponential` for a finite double with `fraction_digits`
+/// digits after the point, or with the shortest round-trip digits when that
+/// argument is absent (ECMA-262 21.1.3.2 steps 9 to 14).
+pub(super) fn format_exponential(value: f64, fraction_digits: Option<usize>) -> String {
+    let negative = value < 0.0;
+    let magnitude = value.abs();
+    let (digits, exponent) = if magnitude == 0.0 {
+        (vec![0; fraction_digits.map_or(1, |digits| digits + 1)], 0)
+    } else if let Some(digits) = fraction_digits {
+        significant_digits(magnitude, digits + 1)
+    } else {
+        shortest_significant_digits(magnitude)
+    };
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    text.push(char::from(b'0' + digits[0]));
+    if digits.len() > 1 {
+        text.push('.');
+        text.extend(digits[1..].iter().map(|digit| char::from(b'0' + digit)));
+    }
+    push_exponent(&mut text, exponent);
+    text
+}
+
+/// `Number.prototype.toPrecision` for a finite double and a precision in
+/// `1..=100` (ECMA-262 21.1.3.5 steps 9 to 13).
+pub(super) fn format_precision(value: f64, precision: usize) -> String {
+    let negative = value < 0.0;
+    let magnitude = value.abs();
+    let (digits, exponent) = if magnitude == 0.0 {
+        (vec![0; precision], 0)
+    } else {
+        significant_digits(magnitude, precision)
+    };
+    let digit_text: String = digits
+        .iter()
+        .map(|digit| char::from(b'0' + digit))
+        .collect();
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    let exponent_form = exponent < -6 || exponent >= precision as i32;
+    if exponent_form {
+        text.push_str(&digit_text[..1]);
+        if precision != 1 {
+            text.push('.');
+            text.push_str(&digit_text[1..]);
+        }
+        push_exponent(&mut text, exponent);
+    } else if exponent >= 0 {
+        let point = exponent as usize + 1;
+        text.push_str(&digit_text[..point]);
+        if point < precision {
+            text.push('.');
+            text.push_str(&digit_text[point..]);
+        }
+    } else {
+        text.push_str("0.");
+        text.extend(std::iter::repeat_n(
+            '0',
+            exponent.unsigned_abs() as usize - 1,
+        ));
+        text.push_str(&digit_text);
+    }
+    text
+}
+
+/// `Number.prototype.toFixed` for a finite double with magnitude below 10^21
+/// and `fraction_digits` in `0..=100` (ECMA-262 21.1.3.3 steps 8 to 11): the
+/// integer `n` nearest `x * 10^f`, with a tie taking the larger `n`.
+pub(super) fn format_fixed(value: f64, fraction_digits: usize) -> String {
+    let negative = value < 0.0;
+    let exact = format!("{:.EXACT_PLACES$}", value.abs());
+    let (integer, fraction) = exact.split_once('.').unwrap_or((&exact, ""));
+    let mut digits: Vec<u8> = integer
+        .bytes()
+        .map(|byte| byte - b'0')
+        .chain(
+            fraction
+                .bytes()
+                .chain(std::iter::repeat(b'0'))
+                .take(fraction_digits)
+                .map(|byte| byte - b'0'),
+        )
+        .collect();
+    let round_up = fraction
+        .as_bytes()
+        .get(fraction_digits)
+        .is_some_and(|byte| *byte >= b'5');
+    if round_up {
+        increment_decimal(&mut digits);
+    }
+    let integer_length = digits.len() - fraction_digits;
+    let mut text = String::new();
+    if negative {
+        text.push('-');
+    }
+    text.extend(
+        digits[..integer_length]
+            .iter()
+            .map(|digit| char::from(b'0' + digit)),
+    );
+    if fraction_digits > 0 {
+        text.push('.');
+        text.extend(
+            digits[integer_length..]
+                .iter()
+                .map(|digit| char::from(b'0' + digit)),
+        );
+    }
+    text
+}
+
+/// Appends the `e+N` or `e-N` suffix of an exponential form.
+fn push_exponent(text: &mut String, exponent: i32) {
+    text.push('e');
+    text.push(if exponent < 0 { '-' } else { '+' });
+    text.push_str(&exponent.unsigned_abs().to_string());
 }
 
 /// ECMA-262 §7.1.7 `ToUint32` on an already-numeric value.
