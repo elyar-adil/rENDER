@@ -3059,27 +3059,68 @@ impl Parser {
         })
     }
 
-    fn logical_or(&mut self) -> Result<Expr, JsError> {
-        self.binary_level(
-            Self::logical_and,
-            &[(&TokenKind::OrOr, BinaryOp::LogicalOr)],
-        )
+    /// `ShortCircuitExpression` (ECMA-262 13.13): a `||` chain or a `??` chain. A
+    /// `CoalesceExpression`'s operands are `BitwiseORExpression`s, so `??` cannot be
+    /// combined with an unparenthesized `&&` or `||` (an early error). The first
+    /// operand is therefore parsed at the bitwise level, and the chain that
+    /// follows is decided by the operator that comes next.
+    fn nullish(&mut self) -> Result<Expr, JsError> {
+        let first = self.bitwise_or()?;
+        if self.at(&TokenKind::QuestionQuestion) {
+            let mut expression = first;
+            while self.take(&TokenKind::QuestionQuestion) {
+                let right = self.bitwise_or()?;
+                expression = Expr::Binary {
+                    offset: self.previous_offset(),
+                    operator: BinaryOp::Nullish,
+                    left: Box::new(expression),
+                    right: Box::new(right),
+                };
+            }
+            if self.at(&TokenKind::AndAnd) || self.at(&TokenKind::OrOr) {
+                return Err(self.error("?? cannot be combined with && or || without parentheses"));
+            }
+            return Ok(expression);
+        }
+        let expression = self.logical_and_rest(first)?;
+        let expression = self.logical_or_rest(expression)?;
+        if self.at(&TokenKind::QuestionQuestion) {
+            return Err(self.error("?? cannot be combined with && or || without parentheses"));
+        }
+        Ok(expression)
     }
 
-    /// `??` binds tighter than `||` in this parser's table; the spec forbids
-    /// mixing them unparenthesized, which this engine accepts.
-    fn nullish(&mut self) -> Result<Expr, JsError> {
-        self.binary_level(
-            Self::logical_or,
-            &[(&TokenKind::QuestionQuestion, BinaryOp::Nullish)],
-        )
+    /// The `&&` operators after an already parsed left operand (ECMA-262 13.13).
+    fn logical_and_rest(&mut self, mut expression: Expr) -> Result<Expr, JsError> {
+        while self.take(&TokenKind::AndAnd) {
+            let right = self.bitwise_or()?;
+            expression = Expr::Binary {
+                offset: self.previous_offset(),
+                operator: BinaryOp::LogicalAnd,
+                left: Box::new(expression),
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
+    }
+
+    /// The `||` operators after an already parsed left operand (ECMA-262 13.13).
+    fn logical_or_rest(&mut self, mut expression: Expr) -> Result<Expr, JsError> {
+        while self.take(&TokenKind::OrOr) {
+            let right = self.logical_and()?;
+            expression = Expr::Binary {
+                offset: self.previous_offset(),
+                operator: BinaryOp::LogicalOr,
+                left: Box::new(expression),
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
     }
 
     fn logical_and(&mut self) -> Result<Expr, JsError> {
-        self.binary_level(
-            Self::bitwise_or,
-            &[(&TokenKind::AndAnd, BinaryOp::LogicalAnd)],
-        )
+        let first = self.bitwise_or()?;
+        self.logical_and_rest(first)
     }
 
     fn bitwise_or(&mut self) -> Result<Expr, JsError> {
@@ -3162,10 +3203,19 @@ impl Parser {
     }
 
     fn exponent(&mut self) -> Result<Expr, JsError> {
+        // The base of `**` is an UpdateExpression, so a unary operator or `await` in
+        // front of it must be parenthesized (ECMA-262 13.6.1).
+        let unary_base = self.at_unary_operator();
         let left = self.unary()?;
-        if !self.take(&TokenKind::StarStar) {
+        if !self.at(&TokenKind::StarStar) {
             return Ok(left);
         }
+        if unary_base {
+            return Err(
+                self.error("a unary expression cannot be the base of ** without parentheses")
+            );
+        }
+        self.advance();
         Ok(Expr::Binary {
             offset: self.previous_offset(),
             operator: BinaryOp::Exponentiate,
@@ -3193,25 +3243,27 @@ impl Parser {
         Ok(expression)
     }
 
+    /// Whether the token at the cursor starts a unary expression that is not an
+    /// update expression: a prefix operator other than `++`/`--`, or `await`
+    /// in async code.
+    fn at_unary_operator(&self) -> bool {
+        matches!(
+            self.current().kind,
+            TokenKind::Bang
+                | TokenKind::Delete
+                | TokenKind::Typeof
+                | TokenKind::Void
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Tilde
+        ) || (self.in_async
+            && !self.current().escaped
+            && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await"))
+    }
+
     fn unary(&mut self) -> Result<Expr, JsError> {
-        if let TokenKind::PrivateName(name) = self.current().kind.clone()
-            && matches!(
-                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
-                Some(TokenKind::In)
-            )
-        {
-            let offset = self.current().offset;
-            self.private_reference(&name, offset)?;
-            self.advance();
-            self.advance();
-            let object = self.unary()?;
-            return Ok(Expr::PrivateIn {
-                name,
-                object: Box::new(object),
-                offset,
-            });
-        }
         if self.in_async
+            && !self.current().escaped
             && matches!(&self.current().kind, TokenKind::Identifier(name) if name == "await")
         {
             // `await` has unary-expression precedence (ECMA-262 §15.8).
@@ -6102,6 +6154,39 @@ mod tests {
         assert!(!script_is_syntax_error("`${'\\07'}`;"));
         assert!(script_is_syntax_error("'use strict'; `${'\\07'}`;"));
         assert!(script_is_syntax_error("'use strict'; `${010}`;"));
+    }
+
+    #[test]
+    fn coalesce_cannot_be_combined_with_logical_operators_without_parentheses() {
+        assert!(!script_is_syntax_error(
+            "a ?? b ?? c; (a || b) ?? c; a ?? (b && c); a ?? b | c; a || b && c;"
+        ));
+        assert!(script_is_syntax_error("0 && 0 ?? true;"));
+        assert!(script_is_syntax_error("0 || 0 ?? true;"));
+        assert!(script_is_syntax_error("0 ?? 0 && true;"));
+        assert!(script_is_syntax_error("0 ?? 0 || true;"));
+        assert!(script_is_syntax_error("a ?? b || c;"));
+    }
+
+    #[test]
+    fn unary_base_of_exponentiation_must_be_parenthesized() {
+        assert!(!script_is_syntax_error(
+            "(-3) ** 2; 2 ** -3; ++x ** 2; x ** 2 ** 3; (typeof 1) ** 2;"
+        ));
+        assert!(script_is_syntax_error("-3 ** 2;"));
+        assert!(script_is_syntax_error("+1 ** 2;"));
+        assert!(script_is_syntax_error("!1 ** 2;"));
+        assert!(script_is_syntax_error("~3 ** 2;"));
+        assert!(script_is_syntax_error("typeof 1 ** 2;"));
+        assert!(script_is_syntax_error("void 1 ** 2;"));
+        assert!(script_is_syntax_error("delete o.p ** 2;"));
+        assert!(script_is_syntax_error("2 ** -1 ** 2;"));
+        assert!(script_is_syntax_error(
+            "async function f() { await 1 ** 2; }"
+        ));
+        assert!(!script_is_syntax_error(
+            "async function f() { (await 1) ** 2; }"
+        ));
     }
 
     #[test]
