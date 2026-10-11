@@ -10,7 +10,8 @@ use super::lexer::{TemplatePart, Token, TokenKind, tokenize};
 use super::{JsError, JsErrorKind, RuntimeLimits};
 use crate::JsValue;
 use crate::module::{
-    DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, IndirectExport, ModuleInfo,
+    DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, ImportPhase, IndirectExport,
+    ModuleInfo,
 };
 use crate::utf16::JsString;
 use crate::value::number_to_string;
@@ -1641,12 +1642,20 @@ impl Parser {
             && !self.current().escaped
     }
 
+    /// A module specifier, recorded as an ordinary request.
     fn module_specifier(&mut self) -> Result<String, JsError> {
+        let specifier = self.module_specifier_unrecorded()?;
+        self.module_info()
+            .add_request(&specifier, ImportPhase::Evaluation);
+        Ok(specifier)
+    }
+
+    /// A module specifier that the caller records with its own phase.
+    fn module_specifier_unrecorded(&mut self) -> Result<String, JsError> {
         let TokenKind::String(specifier) = self.current().kind.clone() else {
             return Err(self.error("expected a module specifier string"));
         };
         self.advance();
-        self.module_info().add_request(&(specifier).to_lossy());
         // Import attributes (`with { type: "json" }`) carry no linking meaning
         // here; consume the block so the declaration ends cleanly.
         if (self.at_contextual("with") || self.at_contextual("assert"))
@@ -1656,27 +1665,27 @@ impl Parser {
             )
         {
             self.advance();
-            self.skip_module_declaration();
+            self.import_attributes()?;
         }
         Ok(specifier.to_lossy())
     }
 
-    /// An `IdentifierName` or string literal in import/export-name position.
+    /// An `IdentifierName` or string literal in import/export-name position. A
+    /// string name must be well-formed Unicode (ECMA-262 16.2.3.1).
     fn module_export_name(&mut self) -> Result<String, JsError> {
         match self.current().kind.clone() {
-            TokenKind::Identifier(name) => {
-                self.advance();
-                Ok(name)
-            }
             TokenKind::String(name) => {
+                if !name.is_well_formed() {
+                    return Err(self.error("module export name is not well-formed Unicode"));
+                }
                 self.advance();
                 Ok(name.to_key())
             }
-            TokenKind::Default => {
-                self.advance();
-                Ok("default".to_owned())
+            TokenKind::Number(_) | TokenKind::BigInt(_) => {
+                Err(self.error("expected an import or export name"))
             }
-            _ => Err(self.error("expected an import or export name")),
+            // Any reserved word is an IdentifierName here, so `as import` is valid.
+            _ => self.property_name(),
         }
     }
 
@@ -1686,6 +1695,42 @@ impl Parser {
         }
         self.advance();
         self.module_specifier()
+    }
+
+    /// `from` and a specifier that the import declaration records with its phase.
+    fn expect_from_unrecorded(&mut self) -> Result<String, JsError> {
+        if !self.at_contextual("from") {
+            return Err(self.error("expected 'from' in module declaration"));
+        }
+        self.advance();
+        self.module_specifier_unrecorded()
+    }
+
+    /// The token kind `offset` places after the cursor.
+    fn peek_kind(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.cursor + offset)
+            .map(|token| &token.kind)
+    }
+
+    /// The phase of the import declaration at the cursor, consuming its keyword.
+    /// `import defer * as ns from` is a deferred namespace import, and `import source
+    /// x from` a source-phase one. Anything else, including `import defer from`
+    /// with a binding named `defer`, is an ordinary import.
+    fn import_phase(&mut self) -> ImportPhase {
+        if self.at_contextual("defer") && matches!(self.peek_kind(1), Some(TokenKind::Star)) {
+            self.advance();
+            return ImportPhase::Defer;
+        }
+        if self.at_contextual("source")
+            && matches!(self.peek_kind(1), Some(TokenKind::Identifier(_)))
+            && matches!(self.peek_kind(2), Some(TokenKind::Identifier(word)) if word == "from")
+            && matches!(self.peek_kind(3), Some(TokenKind::String(_)))
+        {
+            self.advance();
+            return ImportPhase::Source;
+        }
+        ImportPhase::Evaluation
     }
 
     /// `await` cannot name a binding or label in async code and `yield` cannot
@@ -1727,14 +1772,15 @@ impl Parser {
             self.end_statement()?;
             return Ok(());
         }
+        let phase = self.import_phase();
         // (imported, local) pairs, resolved against the specifier afterwards.
         let mut entries: Vec<(ImportName, String)> = Vec::new();
         if matches!(&self.current().kind, TokenKind::Identifier(_)) {
             let local = self.local_identifier()?;
             entries.push((ImportName::Named("default".to_owned()), local));
             if !self.take(&TokenKind::Comma) {
-                let request = self.expect_from()?;
-                self.finish_import(&request, entries)?;
+                let request = self.expect_from_unrecorded()?;
+                self.finish_import(&request, phase, entries)?;
                 return Ok(());
             }
         }
@@ -1763,22 +1809,25 @@ impl Parser {
         } else {
             return Err(self.error("malformed import declaration"));
         }
-        let request = self.expect_from()?;
-        self.finish_import(&request, entries)?;
+        let request = self.expect_from_unrecorded()?;
+        self.finish_import(&request, phase, entries)?;
         Ok(())
     }
 
     fn finish_import(
         &mut self,
         request: &str,
+        phase: ImportPhase,
         entries: Vec<(ImportName, String)>,
     ) -> Result<(), JsError> {
         self.end_statement()?;
+        self.module_info().add_request(request, phase);
         for (imported, local) in entries {
             self.module_info().imports.push(ImportEntry {
                 request: request.to_owned(),
                 imported,
                 local,
+                phase,
             });
         }
         Ok(())
@@ -1929,15 +1978,30 @@ impl Parser {
                 self.advance();
             }
             self.advance();
-            let value = self.function_expression(is_async)?;
+            // An anonymous default function is a hoisted declaration (ECMA-262
+            // 16.2.3.7), so importers can call it before the module body runs.
+            let Expr::Function {
+                parameters,
+                body,
+                offset,
+                kind,
+                strict,
+                ..
+            } = self.function_expression(is_async)?
+            else {
+                return Err(self.error("expected an anonymous default function"));
+            };
             self.module_info()
                 .local_exports
                 .push(("default".to_owned(), DEFAULT_BINDING.to_owned()));
-            return Ok(Statement::Variable {
-                kind: VariableKind::Const,
+            return Ok(Statement::Function {
                 name: DEFAULT_BINDING.to_owned(),
-                value: Some(value),
-                offset: self.previous_offset(),
+                parameters,
+                body,
+                offset,
+                kind,
+                strict,
+                annex_b_var: false,
             });
         }
         // Anonymous class declarations and every other expression are evaluated in
@@ -1955,31 +2019,46 @@ impl Parser {
         })
     }
 
-    fn skip_module_declaration(&mut self) {
-        let mut parens = 0_u32;
-        let mut brackets = 0_u32;
-        let mut braces = 0_u32;
-        while !self.at(&TokenKind::Eof) {
-            match self.current().kind {
-                TokenKind::LeftParen => parens = parens.saturating_add(1),
-                TokenKind::RightParen => parens = parens.saturating_sub(1),
-                TokenKind::LeftBracket => brackets = brackets.saturating_add(1),
-                TokenKind::RightBracket => brackets = brackets.saturating_sub(1),
-                TokenKind::LeftBrace => braces = braces.saturating_add(1),
-                TokenKind::RightBrace => {
-                    if braces == 0 && parens == 0 && brackets == 0 {
-                        break;
-                    }
-                    braces = braces.saturating_sub(1);
-                }
-                TokenKind::Semicolon if parens == 0 && brackets == 0 && braces == 0 => {
+    /// The `{ key: "value", ... }` of import attributes (ECMA-262 16.2.2.1). A key is
+    /// an `IdentifierName` or a string, a value is a string literal, and a key may
+    /// appear once: a repeated key is an early error.
+    fn import_attributes(&mut self) -> Result<(), JsError> {
+        self.require(
+            &TokenKind::LeftBrace,
+            "expected '{' after import attributes",
+        )?;
+        let mut keys: Vec<String> = Vec::new();
+        while !self.at(&TokenKind::RightBrace) {
+            let key = match self.current().kind.clone() {
+                TokenKind::String(key) => {
                     self.advance();
-                    break;
+                    key.to_key()
                 }
-                _ => {}
+                TokenKind::Number(_) | TokenKind::BigInt(_) => {
+                    return Err(self.error("expected an import attribute key"));
+                }
+                _ => self.property_name()?,
+            };
+            self.require(
+                &TokenKind::Colon,
+                "expected ':' after an import attribute key",
+            )?;
+            if !matches!(self.current().kind, TokenKind::String(_)) {
+                return Err(self.error("an import attribute value must be a string literal"));
             }
             self.advance();
+            if keys.contains(&key) {
+                return Err(self.error("duplicate import attribute key"));
+            }
+            keys.push(key);
+            if !self.take(&TokenKind::Comma) {
+                break;
+            }
         }
+        self.require(
+            &TokenKind::RightBrace,
+            "expected '}' after import attributes",
+        )
     }
 
     /// Consume an identifier in `break`/`continue` label position. A line

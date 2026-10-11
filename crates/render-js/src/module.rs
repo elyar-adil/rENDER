@@ -13,12 +13,22 @@ pub(crate) enum ImportName {
     Namespace,
 }
 
+/// The phase an import is made in: an ordinary import, a deferred one
+/// (`import defer * as ns`), or a source-phase one (`import source x`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportPhase {
+    Evaluation,
+    Defer,
+    Source,
+}
+
 /// One local binding introduced by an `import` declaration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImportEntry {
     pub(crate) request: String,
     pub(crate) imported: ImportName,
     pub(crate) local: String,
+    pub(crate) phase: ImportPhase,
 }
 
 /// `export { a as b } from "m"` and `export * as b from "m"`.
@@ -34,6 +44,9 @@ pub(crate) struct IndirectExport {
 pub(crate) struct ModuleInfo {
     /// Module specifiers in source order, without duplicates.
     pub(crate) requests: Vec<String>,
+    /// Each distinct `(specifier, phase)` request in source order: the order in
+    /// which module evaluation visits a module's dependencies.
+    pub(crate) request_phases: Vec<(String, ImportPhase)>,
     pub(crate) imports: Vec<ImportEntry>,
     /// `(exported name, local binding name)`.
     pub(crate) local_exports: Vec<(String, String)>,
@@ -43,9 +56,18 @@ pub(crate) struct ModuleInfo {
 }
 
 impl ModuleInfo {
-    pub(crate) fn add_request(&mut self, specifier: &str) {
+    /// Record a request for `specifier` made in `phase`. A module is requested
+    /// once however many phases name it, but each phase is its own request.
+    pub(crate) fn add_request(&mut self, specifier: &str, phase: ImportPhase) {
         if !self.requests.iter().any(|existing| existing == specifier) {
             self.requests.push(specifier.to_owned());
+        }
+        if !self
+            .request_phases
+            .iter()
+            .any(|(existing, existing_phase)| existing == specifier && *existing_phase == phase)
+        {
+            self.request_phases.push((specifier.to_owned(), phase));
         }
     }
 }

@@ -330,6 +330,34 @@ impl JsRuntime {
         Ok(result)
     }
 
+    /// Run the body of an asynchronous module (ECMA-262 16.2.1.5.3.2 AsyncBlockStart):
+    /// the body starts now in the module's environment, and its completion
+    /// settles `promise`.
+    pub(super) fn start_module_coroutine(
+        &mut self,
+        dom: &mut Dom,
+        code: std::rc::Rc<super::coroutine::CoroutineCode>,
+        environment: Environment,
+        promise: usize,
+        label: &str,
+    ) {
+        let id = self.coroutines.len();
+        self.coroutines.push(Some(Coroutine {
+            code,
+            pc: 0,
+            state: CoState::Start,
+            environment: vec![environment.clone()],
+            call_environment: environment,
+            class_frame: ClassFrame::default(),
+            handlers: Vec::new(),
+            loops: Vec::new(),
+            promise: Some(promise),
+            label: label.to_owned(),
+            after_await: None,
+        }));
+        self.async_continue(dom, id, Resume::Next(JsValue::Undefined));
+    }
+
     // -------------------------------------------------------------- generators
 
     /// `%GeneratorPrototype%.next/return/throw`.

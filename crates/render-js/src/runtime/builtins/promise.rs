@@ -261,7 +261,7 @@ impl JsRuntime {
     }
 
     /// `PerformPromiseThen(promise, onFulfilled, onRejected, resultCapability)`.
-    fn perform_then(
+    pub(in crate::runtime) fn perform_then(
         &mut self,
         promise: usize,
         on_fulfilled: Option<ObjectId>,

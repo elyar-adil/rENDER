@@ -207,6 +207,9 @@ pub(super) fn mark_host(
         | ObjectHost::NativeFunction(_)
         | ObjectHost::Generator(_)
         | ObjectHost::AsyncResume { .. }
+        | ObjectHost::ModuleNamespace(_)
+        | ObjectHost::AsyncModuleStep { .. }
+        | ObjectHost::ModuleNamespaceOf { .. }
         | ObjectHost::AsyncGenerator(_)
         | ObjectHost::AsyncFromSyncValue { .. }
         | ObjectHost::PromiseConstructor
@@ -286,6 +289,9 @@ pub(super) fn mark_host(
         }
         ObjectHost::DisposeAwaitResume { stack, .. } => {
             mark_object(runtime, marked, work, marked_environments, *stack);
+        }
+        ObjectHost::DynamicImportLinked { object, .. } => {
+            mark_object(runtime, marked, work, marked_environments, *object);
         }
         ObjectHost::Proxy { target, handler } => {
             mark_object(runtime, marked, work, marked_environments, *target);
@@ -589,6 +595,24 @@ impl JsRuntime {
                 &mut marked_environments,
                 &record.environment,
             );
+            if let Some(namespace) = record.namespace {
+                mark_object(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    namespace,
+                );
+            }
+            if let Some(promise) = record.top_level_capability {
+                mark_promise(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    promise,
+                );
+            }
         }
         // A suspended generator or async function is kept alive by its saved
         // scope chain, which also holds the hidden bindings that stand in for

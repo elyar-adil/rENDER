@@ -266,3 +266,124 @@ fn export_of_an_imported_binding_is_an_indirect_export() {
     .expect("runs");
     assert_eq!(log, "1,2");
 }
+
+/// A loader over an in-memory map: the specifier is the module key.
+#[derive(Debug)]
+struct MapLoader(Vec<(&'static str, &'static str)>);
+
+impl crate::ModuleLoader for MapLoader {
+    fn load(
+        &mut self,
+        _referrer: &str,
+        specifier: &str,
+        _attributes: &[(String, String)],
+    ) -> Result<(String, CompiledScript), crate::JsError> {
+        let (_, source) = self
+            .0
+            .iter()
+            .find(|(key, _)| *key == specifier)
+            .ok_or_else(|| crate::JsError::type_error(format!("no module {specifier}")))?;
+        let script = CompiledScript::compile_module(source, &RuntimeLimits::default())?;
+        Ok((specifier.to_owned(), script))
+    }
+}
+
+/// Run `entry` as module `main.js` with `modules` loadable through the loader,
+/// drain the job queue, and return `log` joined by commas.
+fn run_with_loader(
+    modules: &[(&'static str, &'static str)],
+    entry: &str,
+) -> Result<String, crate::JsError> {
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime.execute(&mut dom, "var log = [];").expect("log");
+    runtime.set_module_loader(Box::new(MapLoader(modules.to_vec())));
+    let script = CompiledScript::compile_module(entry, &RuntimeLimits::default())?;
+    runtime.load_module("main.js", &script)?;
+    runtime.evaluate_module(&mut dom, "main.js")?;
+    while let pending = runtime.take_pending_microtasks()
+        && !pending.is_empty()
+    {
+        for microtask in pending {
+            runtime.invoke_microtask(&mut dom, microtask)?;
+        }
+    }
+    Ok(runtime
+        .execute(&mut dom, "log.join(',')")
+        .expect("read log")
+        .value
+        .to_js_string()
+        .to_lossy())
+}
+
+#[test]
+fn dynamic_import_resolves_to_the_namespace_after_evaluation() {
+    let log = run_with_loader(
+        &[("lib.js", "export const value = 42; log.push('lib');")],
+        "import('lib.js').then(ns => log.push('ns', ns.value));",
+    )
+    .expect("runs");
+    assert_eq!(log, "lib,ns,42");
+}
+
+#[test]
+fn dynamic_import_of_a_missing_module_rejects() {
+    let log = run_with_loader(
+        &[],
+        "import('missing.js').then(() => log.push('resolved'), error => log.push(error.name));",
+    )
+    .expect("runs");
+    assert_eq!(log, "TypeError");
+}
+
+#[test]
+fn import_defer_evaluates_its_module_on_the_first_property_read() {
+    let log = run_with_loader(
+        &[("dep.js", "log.push('dep'); export const value = 1;")],
+        "import defer * as ns from 'dep.js'; log.push('imported'); log.push(ns.value);",
+    )
+    .expect("runs");
+    assert_eq!(log, "imported,dep,1");
+}
+
+#[test]
+fn a_namespace_refuses_writes_and_deletes_of_its_exports() {
+    let log = run(
+        &[
+            ("m.js", "export var a = 1;"),
+            (
+                "main.js",
+                "import * as ns from 'm.js'; var out = []; \
+                 try { ns.a = 2; out.push('written'); } catch (error) { out.push(error.name); } \
+                 try { delete ns.a; out.push('deleted'); } catch (error) { out.push(error.name); } \
+                 log.push(out.join('|'), Reflect.set(ns, 'a', 1), ns.a, delete ns.absent);",
+            ),
+        ],
+        "main.js",
+    )
+    .expect("runs");
+    assert_eq!(log, "TypeError|TypeError,false,1,true");
+}
+
+#[test]
+fn top_level_await_completes_a_module_before_its_importers_run() {
+    let log = run_with_loader(
+        &[
+            ("a.js", "log.push('a1'); await null; log.push('a2');"),
+            ("b.js", "import 'a.js'; log.push('b');"),
+        ],
+        "import 'b.js'; log.push('main');",
+    )
+    .expect("runs");
+    assert_eq!(log, "a1,a2,b,main");
+}
+
+#[test]
+fn a_repeated_import_attribute_key_is_an_early_error() {
+    let error = CompiledScript::compile_module(
+        "import x from 'x.js' with { type: 'json', type: 'json' };",
+        &RuntimeLimits::default(),
+    )
+    .expect_err("duplicate attribute keys must not compile");
+    assert_eq!(error.kind(), crate::JsErrorKind::Syntax);
+}

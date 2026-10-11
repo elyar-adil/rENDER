@@ -536,7 +536,13 @@ impl JsRuntime {
             self.create_binding(&name, VariableKind::Var, true, JsValue::Undefined)?;
         }
         for (name, parameters, body, kind, strict) in functions {
-            let value = self.create_function(Some(name), parameters, body, kind, strict)?;
+            let value = self.create_function(
+                Some(binding_function_name(name)),
+                parameters,
+                body,
+                kind,
+                strict,
+            )?;
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -624,7 +630,13 @@ impl JsRuntime {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
         for (name, parameters, body, kind, strict) in functions {
-            let value = self.create_function(Some(name), parameters, body, kind, strict)?;
+            let value = self.create_function(
+                Some(binding_function_name(name)),
+                parameters,
+                body,
+                kind,
+                strict,
+            )?;
             self.initialize_declared_binding(name, value, VariableKind::Var)?;
         }
         Ok(())
@@ -2365,6 +2377,17 @@ impl JsRuntime {
         }
     }
 
+    /// The result of `delete` on a property reference: a failed delete in strict
+    /// mode code is a `TypeError` (ECMA-262 13.5.1.2 step 5.c).
+    fn refuse_failed_delete(&self, deleted: bool) -> Result<JsValue, JsError> {
+        if !deleted && self.code_is_strict() {
+            return Err(JsError::type_error(
+                "cannot delete a non-configurable property in strict code",
+            ));
+        }
+        Ok(JsValue::Boolean(deleted))
+    }
+
     pub(super) fn evaluate_delete(
         &mut self,
         dom: &mut Dom,
@@ -2380,15 +2403,14 @@ impl JsRuntime {
                                 dom, node, &property,
                             )?));
                         }
-                        Ok(JsValue::Boolean(
-                            self.delete_property_value(dom, object, &property)?,
-                        ))
+                        self.ensure_deferred_namespace(dom, object, Some(&property))?;
+                        let deleted = self.delete_property_value(dom, object, &property)?;
+                        self.refuse_failed_delete(deleted)
                     }
                     AssignmentReference::SymbolProperty { object, symbol } => {
                         let key = PropertyName::Symbol(symbol);
-                        Ok(JsValue::Boolean(
-                            self.delete_property_on(dom, object, &key)?,
-                        ))
+                        let deleted = self.delete_property_on(dom, object, &key)?;
+                        self.refuse_failed_delete(deleted)
                     }
                     AssignmentReference::Private { .. }
                     | AssignmentReference::SuperProperty { .. } => Err(JsError::new(
@@ -2650,16 +2672,20 @@ impl JsRuntime {
             self.proxy_set_property(dom, object, &key, value, JsValue::Object(object))?;
             return Ok(());
         }
+        // A write that is refused fails in strict code and is ignored otherwise (PutValue, ECMA-262 6.2.5.6).
+        let strict = self.code_is_strict();
         if let Some(own) = self.realm.own_symbol_property(object, symbol) {
             if own.is_accessor() {
-                if let Some(setter) = own.setter {
-                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
-                }
-                return Ok(());
+                return match own.setter {
+                    Some(setter) => {
+                        self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                        Ok(())
+                    }
+                    None => Self::failed_set(strict, "symbol property"),
+                };
             }
-            // A non-writable data property ignores the write, as for string keys.
             if !own.writable {
-                return Ok(());
+                return Self::failed_set(strict, "symbol property");
             }
             self.realm
                 .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
@@ -2667,16 +2693,23 @@ impl JsRuntime {
         }
         if let Some(descriptor) = self.realm.get_symbol_descriptor(object, symbol) {
             if descriptor.is_accessor() {
-                if let Some(setter) = descriptor.setter {
-                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
-                }
-                return Ok(());
+                return match descriptor.setter {
+                    Some(setter) => {
+                        self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                        Ok(())
+                    }
+                    None => Self::failed_set(strict, "symbol property"),
+                };
             }
             // An inherited non-writable data property blocks creating an own one
             // (ECMA-262 10.1.9.2 OrdinarySetWithOwnDescriptor).
             if !descriptor.writable {
-                return Ok(());
+                return Self::failed_set(strict, "symbol property");
             }
+        }
+        // A non-extensible object takes no new own property.
+        if !self.realm.is_extensible(object) {
+            return Self::failed_set(strict, "symbol property");
         }
         self.realm
             .define_symbol_property(object, symbol, PropertyDescriptor::data(value));
@@ -2694,26 +2727,44 @@ impl JsRuntime {
         key: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
+        // A failed [[Set]] (an accessor without a setter, or a refused write)
+        // throws only in strict mode code (PutValue, ECMA-262 6.2.5.6).
+        let strict = self.code_is_strict();
         if let Some(own) = self.realm.own_property(object, key) {
             if own.is_accessor() {
-                if let Some(setter) = own.setter {
-                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
-                }
-                return Ok(());
+                return match own.setter {
+                    Some(setter) => {
+                        self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                        Ok(())
+                    }
+                    None => Self::failed_set(strict, key),
+                };
             }
-            // Sloppy-mode [[Set]]: a non-writable data property silently
-            // ignores the write (strict mode would throw).
-            self.realm.set_property(object, key.to_owned(), value);
+            if !self.realm.set_property(object, key.to_owned(), value) {
+                return Self::failed_set(strict, key);
+            }
             return Ok(());
         }
         let inherited = self.realm.get_descriptor(object, key);
         if let Some(descriptor) = inherited.filter(crate::value::PropertyDescriptor::is_accessor) {
-            if let Some(setter) = descriptor.setter {
-                self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
-            }
-            return Ok(());
+            return match descriptor.setter {
+                Some(setter) => {
+                    self.call_with_this(dom, setter, &[value], JsValue::Object(object))?;
+                    Ok(())
+                }
+                None => Self::failed_set(strict, key),
+            };
         }
         if !self.realm.set_property(object, key.to_owned(), value) {
+            return Self::failed_set(strict, key);
+        }
+        Ok(())
+    }
+
+    /// The outcome of a refused [[Set]] of `key`: a `TypeError` in strict mode
+    /// code, and otherwise nothing, since the write is silently ignored.
+    fn failed_set(strict: bool, key: &str) -> Result<(), JsError> {
+        if strict {
             return Err(JsError::type_error(format!(
                 "property {key:?} is not writable"
             )));
@@ -3048,8 +3099,10 @@ impl JsRuntime {
             }
             Expr::SuperComputedMember { property, .. } => {
                 let key = self.evaluate(dom, property)?;
-                let key = self.to_property_key_value(dom, key)?.to_js_string();
-                let value = self.read_super_property(dom, &(key).to_key())?;
+                let value = match self.to_property_key_value(dom, key)? {
+                    JsValue::Symbol(symbol) => self.read_super_symbol(dom, &symbol)?,
+                    key => self.read_super_property(dom, &(key.to_js_string()).to_key())?,
+                };
                 let receiver = self.current_this()?;
                 (value, receiver)
             }
@@ -3181,6 +3234,7 @@ impl JsRuntime {
         expression: &Expr,
         name: &str,
     ) -> Result<JsValue, JsError> {
+        let name = binding_function_name(name);
         match expression {
             Expr::Function {
                 name: None,
@@ -3739,6 +3793,7 @@ impl JsRuntime {
         let name = key.to_js_string();
         match container {
             JsValue::Object(object) => {
+                self.ensure_deferred_namespace(dom, *object, Some(&name.to_lossy()))?;
                 if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) {
                     return self.proxy_has(dom, *object, &(name).to_key());
                 }
@@ -4264,6 +4319,18 @@ impl JsRuntime {
         property: &str,
     ) -> Result<JsValue, JsError> {
         self.consume_step()?;
+        self.ensure_deferred_namespace(dom, object, Some(property))?;
+        if self.realm.has_deferred_namespace()
+            && self.realm.own_property(object, property).is_none()
+        {
+            self.ensure_deferred_read(dom, self.realm.get_prototype(object), property)?;
+        }
+        // A namespace export reads its binding, which throws while the binding is uninitialized (ECMA-262 10.4.6.8).
+        if let Some(local) = self.realm.uninitialized_namespace_binding(object, property) {
+            return Err(JsError::reference(format!(
+                "cannot access {local} before initialization"
+            )));
+        }
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_get(dom, object, property);
         }
@@ -5971,6 +6038,23 @@ impl JsRuntime {
                 self.call_promise_settler(dom, promise, fulfilled, pair, &value)?;
                 Ok(JsValue::Undefined)
             }
+            Some(ObjectHost::AsyncModuleStep { module, rejected }) => {
+                let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                self.async_module_step(dom, &module, rejected, &value);
+                Ok(JsValue::Undefined)
+            }
+            Some(ObjectHost::DynamicImportLinked {
+                module,
+                promise,
+                object,
+                phase,
+            }) => {
+                self.continue_dynamic_import(dom, &module, promise, object, phase)?;
+                Ok(JsValue::Undefined)
+            }
+            Some(ObjectHost::ModuleNamespaceOf { module, deferred }) => self
+                .module_namespace(&module, deferred)
+                .map(JsValue::Object),
             _ => Err(JsError::type_error(format!(
                 "value is not callable (callee host {:?})",
                 self.realm.host(callee)
@@ -6539,5 +6623,15 @@ fn own_loop_completion(labels: &[String], completion: Completion) -> Completion 
         Completion::Continue(Some(label)) if labels.contains(&label) => Completion::Continue(None),
         Completion::Break(Some(label)) if labels.contains(&label) => Completion::Break(None),
         other => other,
+    }
+}
+
+/// The name a function or class takes from the binding `name` it is bound to.
+/// The hidden binding of an anonymous default export is `"default"` (ECMA-262 16.2.3.7).
+fn binding_function_name(name: &str) -> &str {
+    if name == crate::module::DEFAULT_BINDING {
+        "default"
+    } else {
+        name
     }
 }

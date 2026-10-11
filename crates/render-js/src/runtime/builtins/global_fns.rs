@@ -17,6 +17,7 @@ use crate::HistoryRequest;
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
+use crate::module::ImportPhase;
 use crate::runtime::JsRuntime;
 use crate::runtime::async_iteration::AsyncFromSyncMethod;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
@@ -442,13 +443,13 @@ impl JsRuntime {
                 self.perform_eval(dom, argument, false, false)
             }
             NativeFunction::GlobalImport => {
-                // Module graph fetching belongs to the browser coordinator.
-                // Keep dynamic import thenable so feature detection and
-                // optional chunks do not turn into a fatal ReferenceError.
-                let (promise, result) = self.create_promise()?;
-                let namespace = self.realm.create_ordinary_object();
-                self.resolve_promise(promise, &JsValue::Object(namespace));
-                Ok(result)
+                self.dynamic_import(dom, arguments, ImportPhase::Evaluation)
+            }
+            NativeFunction::GlobalImportDefer => {
+                self.dynamic_import(dom, arguments, ImportPhase::Defer)
+            }
+            NativeFunction::GlobalImportSource => {
+                self.dynamic_import(dom, arguments, ImportPhase::Source)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),
             NativeFunction::HistoryPushState => self.history_state_change(dom, arguments, false),

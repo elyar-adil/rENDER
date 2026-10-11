@@ -25,7 +25,8 @@ use std::fmt;
 pub use bigint::JsBigInt;
 pub use runtime::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
-    JsMicrotask, JsRuntime, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    JsMicrotask, JsRuntime, ModuleLoader, NavigationRequest, PendingFetch, TimerEntry, TimerKind,
+    TimerRequest,
 };
 pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm};
 
@@ -171,7 +172,9 @@ impl JsError {
         Self::new(JsErrorKind::Reference, message, None)
     }
 
-    pub(crate) fn type_error(message: impl Into<String>) -> Self {
+    /// A `TypeError` raised by the host, such as a module loader that cannot
+    /// fetch a module it was asked for.
+    pub fn type_error(message: impl Into<String>) -> Self {
         Self::new(JsErrorKind::Type, message, None)
     }
 
@@ -266,7 +269,7 @@ impl CompiledScript {
     ///
     /// Returns a typed syntax or resource-limit error.
     pub fn compile_module(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
-        let tokens = lexer::tokenize(source, limits)?;
+        let tokens = lexer::tokenize_module(source, limits)?;
         let (statements, module) = parser::parse_module(tokens, limits)?;
         Ok(Self {
             source: source.to_owned(),
