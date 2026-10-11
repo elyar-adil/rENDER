@@ -20,6 +20,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::ElementRect;
 use crate::runtime::types::JsMicrotask;
+use crate::utf16::JsString;
 use crate::value::MutationWatch;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -108,7 +109,7 @@ impl JsRuntime {
             .and_then(|object| self.realm.get_property(object, "rootMargin"))
             .map_or_else(
                 || "0px 0px 0px 0px".to_owned(),
-                |value| value.to_js_string(),
+                |value| (value.to_js_string()).to_lossy(),
             );
         let thresholds =
             match options.and_then(|object| self.realm.get_property(object, "threshold")) {
@@ -119,7 +120,7 @@ impl JsRuntime {
         let thresholds = self.create_array_from_values(&thresholds)?;
         for (name, value) in [
             ("root", root),
-            ("rootMargin", JsValue::String(root_margin)),
+            ("rootMargin", JsValue::String((root_margin).into())),
             ("thresholds", JsValue::Object(thresholds)),
         ] {
             self.realm.set_property(observer, name.to_owned(), value);
@@ -420,7 +421,7 @@ impl JsRuntime {
         self.realm.set_property(
             object,
             "type".to_owned(),
-            JsValue::String(type_name.to_owned()),
+            JsValue::String((type_name.to_owned()).into()),
         );
         let wrapper = self.wrap_node(dom, target)?;
         self.realm
@@ -428,7 +429,7 @@ impl JsRuntime {
         self.realm.set_property(
             object,
             "attributeName".to_owned(),
-            attribute_name.map_or(JsValue::Null, JsValue::String),
+            attribute_name.map_or(JsValue::Null, |name| JsValue::String(JsString::from(name))),
         );
         for (name, nodes) in [("addedNodes", added), ("removedNodes", removed)] {
             let values = nodes
@@ -527,7 +528,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let media = required_argument(arguments, 0, "matchMedia")?.to_js_string();
-        let matches = self.media_query_matches(&media);
+        let matches = self.media_query_matches(&(media).to_lossy());
         let prototype = self.realm.media_query_list_prototype();
         self.ensure_heap_capacity(1)?;
         let list = self.realm.create_object(Some(prototype));
@@ -535,7 +536,7 @@ impl JsRuntime {
             .realm
             .host_mut(list)
             .expect("a freshly created object has host storage") = ObjectHost::MediaQueryList {
-            media,
+            media: media.to_lossy(),
             matches,
             listeners: Vec::new(),
         };
@@ -564,7 +565,7 @@ impl JsRuntime {
         Ok(if want_matches {
             JsValue::Boolean(matches)
         } else {
-            JsValue::String(media)
+            JsValue::String((media).into())
         })
     }
 
@@ -693,8 +694,8 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         let event = self.realm.create_object(prototype);
         for (name, value) in [
-            ("type", JsValue::String("change".to_owned())),
-            ("media", JsValue::String(media.to_owned())),
+            ("type", JsValue::String(("change".to_owned()).into())),
+            ("media", JsValue::String((media.to_owned()).into())),
             ("matches", JsValue::Boolean(matches)),
         ] {
             self.realm.set_property(event, name.to_owned(), value);
@@ -903,6 +904,7 @@ mod tests {
             .expect("script should execute")
             .value
             .to_js_string()
+            .to_lossy()
     }
 
     /// The initial value comes from the cascade's own media-query evaluator, so
@@ -938,7 +940,7 @@ mod tests {
         // Media Queries 4 §2.1.1's "unknown means false" fallback is what makes
         // it answer `false` rather than throwing.
         assert_eq!(
-            outcome.value.to_js_string(),
+            outcome.value.to_js_string().to_lossy(),
             "true,false,true,true,true,false"
         );
     }
@@ -1026,7 +1028,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "mql.matches")
                 .expect("matches readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "false",
             "a 400px viewport must not satisfy a 900px min-width"
         );
@@ -1038,7 +1041,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "log.length")
                 .expect("log readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "0"
         );
 
@@ -1051,7 +1055,8 @@ function,function,function"
             .execute(&mut parsed.dom, "log.join(';')")
             .expect("log readable")
             .value
-            .to_js_string();
+            .to_js_string()
+            .to_lossy();
         assert_eq!(
             log, "change|true|(min-width: 900px)|true|true",
             "the event must carry the new matches, this must be the list, and \
@@ -1065,7 +1070,8 @@ function,function,function"
             .execute(&mut parsed.dom, "log.join(';')")
             .expect("log readable")
             .value
-            .to_js_string();
+            .to_js_string()
+            .to_lossy();
         assert_eq!(
             log,
             "change|true|(min-width: 900px)|true|true;\
@@ -1093,7 +1099,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "mql.matches")
                 .expect("matches readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "true"
         );
         // Publish without draining: the notification is queued, not run, and the
@@ -1104,7 +1111,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "mql.matches")
                 .expect("matches readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "false"
         );
     }
@@ -1136,7 +1144,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "order.join(',')")
                 .expect("order readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "onchange,addListener,listener"
         );
 
@@ -1164,7 +1173,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "hits")
                 .expect("hits readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "0"
         );
     }
@@ -1194,7 +1204,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "other")
                 .expect("other readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "10"
         );
     }
@@ -1225,7 +1236,8 @@ function,function,function"
                 .execute(&mut parsed.dom, "fired + ':' + mql.matches")
                 .expect("fired readable")
                 .value
-                .to_js_string(),
+                .to_js_string()
+                .to_lossy(),
             "0:false"
         );
     }
@@ -1265,6 +1277,6 @@ function,function,function"
         let result = runtime
             .execute(&mut parsed.dom, "seen.join(',')")
             .expect("observer result should be readable");
-        assert_eq!(result.value, JsValue::String("LINK".to_owned()));
+        assert_eq!(result.value, JsValue::String("LINK".into()));
     }
 }

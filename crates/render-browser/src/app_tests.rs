@@ -1600,7 +1600,7 @@ fn committed_page_target_is_visible_as_script_location() {
             .as_ref()
             .expect("script should execute")
             .value,
-        render_core::js::JsValue::String("https://example.test/app/index.html?q=1#view".to_owned())
+        render_core::js::JsValue::String("https://example.test/app/index.html?q=1#view".into())
     );
 }
 

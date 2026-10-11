@@ -21,7 +21,6 @@ use crate::runtime::convert::required_argument;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
-use std::fmt::Write as _;
 use url::Url;
 
 impl JsRuntime {
@@ -73,10 +72,9 @@ impl JsRuntime {
         } else {
             &content_type
         };
-        Ok(JsValue::String(format!(
-            "data:{mime};base64,{}",
-            base64_encode(&bytes)
-        )))
+        Ok(JsValue::String(
+            (format!("data:{mime};base64,{}", base64_encode(&bytes))).into(),
+        ))
     }
 }
 
@@ -117,11 +115,11 @@ impl JsRuntime {
             },
             _ => None,
         });
-        let parsed = Url::parse(&input)
+        let parsed = Url::parse(&(input).to_lossy())
             .or_else(|_| {
                 base.as_ref()
                     .ok_or(url::ParseError::EmptyHost)
-                    .and_then(|base| base.join(&input))
+                    .and_then(|base| base.join(&(input).to_lossy()))
             })
             .map_err(|_| JsError::type_error("Invalid URL"))?;
         let prototype = self
@@ -157,7 +155,7 @@ impl JsRuntime {
         }
         for (name, value) in crate::value::location_components(&parsed) {
             self.realm
-                .set_property(instance, name.to_owned(), JsValue::String(value));
+                .set_property(instance, name.to_owned(), JsValue::String((value).into()));
         }
         self.realm
             .set_property(instance, "searchParams".to_owned(), JsValue::Object(params));
@@ -175,6 +173,7 @@ impl JsRuntime {
             .map(JsValue::to_js_string)
             .unwrap_or_default();
         let pairs = input
+            .to_lossy()
             .trim_start_matches('?')
             .split('&')
             .filter(|part| !part.is_empty())
@@ -204,7 +203,7 @@ impl JsRuntime {
     pub(in crate::runtime) fn url_to_string(&self, receiver: &JsValue) -> JsValue {
         match receiver {
             JsValue::Object(object) => match self.realm.host(*object) {
-                Some(ObjectHost::UrlInstance(url)) => JsValue::String(url.to_string()),
+                Some(ObjectHost::UrlInstance(url)) => JsValue::String(url.to_string().into()),
                 _ => JsValue::String(receiver.to_js_string()),
             },
             _ => JsValue::String(receiver.to_js_string()),
@@ -224,19 +223,23 @@ impl JsRuntime {
         let Some(ObjectHost::UrlSearchParams { mut pairs, owner }) = self.realm.host(object) else {
             return JsValue::Undefined;
         };
+        // WHATWG URL takes name and value as USVString, so a lone surrogate
+        // becomes U+FFFD before it is stored.
         let key = arguments
             .first()
-            .map(JsValue::to_js_string)
+            .map(|value| value.to_js_string().to_lossy())
             .unwrap_or_default();
         let value = arguments
             .get(1)
-            .map(JsValue::to_js_string)
+            .map(|value| value.to_js_string().to_lossy())
             .unwrap_or_default();
         let result = match function {
             NativeFunction::UrlSearchParamsGet => pairs
                 .iter()
                 .find(|(name, _)| name == &key)
-                .map_or(JsValue::Null, |(_, value)| JsValue::String(value.clone())),
+                .map_or(JsValue::Null, |(_, value)| {
+                    JsValue::String(value.as_str().into())
+                }),
             NativeFunction::UrlSearchParamsHas => {
                 JsValue::Boolean(pairs.iter().any(|(name, _)| name == &key))
             }
@@ -245,18 +248,19 @@ impl JsRuntime {
                     .iter()
                     .map(|(name, value)| format!("{name}={value}"))
                     .collect::<Vec<_>>()
-                    .join("&"),
+                    .join("&")
+                    .into(),
             ),
             NativeFunction::UrlSearchParamsSet => {
                 if let Some((_, existing)) = pairs.iter_mut().find(|(name, _)| name == &key) {
-                    *existing = value;
+                    existing.clone_from(&value);
                 } else {
-                    pairs.push((key, value));
+                    pairs.push((key.clone(), value.clone()));
                 }
                 JsValue::Object(object)
             }
             NativeFunction::UrlSearchParamsAppend => {
-                pairs.push((key, value));
+                pairs.push((key.clone(), value.clone()));
                 JsValue::Object(object)
             }
             NativeFunction::UrlSearchParamsForEach => {
@@ -266,8 +270,8 @@ impl JsRuntime {
                             dom,
                             *callback,
                             &[
-                                JsValue::String(value.clone()),
-                                JsValue::String(name.clone()),
+                                JsValue::String(value.as_str().into()),
+                                JsValue::String(name.as_str().into()),
                             ],
                             JsValue::Object(object),
                         );
@@ -299,56 +303,18 @@ impl JsRuntime {
                 if let Some(host) = self.realm.host_mut(owner) {
                     *host = ObjectHost::UrlInstance(url.clone());
                 }
-                self.realm
-                    .set_property(owner, "href".to_owned(), JsValue::String(url.to_string()));
+                self.realm.set_property(
+                    owner,
+                    "href".to_owned(),
+                    JsValue::String((url.to_string()).into()),
+                );
                 self.realm.set_property(
                     owner,
                     "search".to_owned(),
-                    JsValue::String(format!("?{query}")),
+                    JsValue::String((format!("?{query}")).into()),
                 );
             }
         }
         result
-    }
-
-    /// Percent-encode per RFC 3986; `keep_uri` preserves reserved characters.
-    pub(in crate::runtime) fn percent_encode(text: &str, keep_uri: bool) -> String {
-        let mut output = String::with_capacity(text.len());
-        for byte in text.bytes() {
-            let keep = byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-                )
-                || (keep_uri
-                    && matches!(
-                        byte,
-                        b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
-                    ));
-            if keep {
-                output.push(byte as char);
-            } else {
-                let _ = write!(output, "%{byte:02X}");
-            }
-        }
-        output
-    }
-
-    /// Decode `%XX` sequences; returns `None` on malformed input.
-    pub(in crate::runtime) fn percent_decode(text: &str) -> Option<String> {
-        let bytes: Vec<u8> = text.bytes().collect();
-        let mut decoded = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'%' && index + 2 < bytes.len() {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-                decoded.push(u8::from_str_radix(hex, 16).ok()?);
-                index += 3;
-            } else {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
-        }
-        String::from_utf8(decoded).ok()
     }
 }

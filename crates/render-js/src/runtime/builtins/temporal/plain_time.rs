@@ -10,6 +10,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::utf16::JsString;
 use render_dom::Dom;
 
 /// The time fields a property bag may name, in the order they are read.
@@ -130,7 +131,7 @@ impl JsRuntime {
             }
             JsValue::String(text) => {
                 let constrain = self.overflow_option(dom, options)?;
-                let Some(parsed) = super::parse::parse_time_string(text) else {
+                let Some(parsed) = super::parse::parse_time_string(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid ISO time string"));
                 };
                 if parsed.utc {
@@ -279,7 +280,7 @@ impl JsRuntime {
             JsValue::Undefined => {
                 return Err(JsError::type_error("round requires an options argument"));
             }
-            JsValue::String(text) => match Unit::parse(text) {
+            JsValue::String(text) => match Unit::parse(&(text).to_lossy()) {
                 Some(unit) => (1, RoundingMode::HalfExpand, Some(unit)),
                 None => return Err(self.range_error("invalid smallestUnit")),
             },
@@ -369,16 +370,16 @@ impl JsRuntime {
             }
             TemporalMethod::ToString => {
                 let time = self.time_of(receiver)?;
-                Ok(JsValue::String(self.time_to_string(dom, time, &first)?))
+                Ok(JsValue::String(JsString::from(
+                    self.time_to_string(dom, time, &first)?,
+                )))
             }
             // `toJSON` and `toLocaleString` take no options, so none are read.
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let time = self.time_of(receiver)?;
-                Ok(JsValue::String(self.time_to_string(
-                    dom,
-                    time,
-                    &JsValue::Undefined,
-                )?))
+                Ok(JsValue::String(
+                    self.time_to_string(dom, time, &JsValue::Undefined)?.into(),
+                ))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.PlainTime cannot be converted to a primitive; use compare() or toString()",

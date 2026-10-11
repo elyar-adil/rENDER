@@ -23,6 +23,7 @@ use crate::runtime::convert::integer_or_infinity;
 use crate::runtime::convert::uint32_of_number;
 use crate::runtime::eval::PrimitiveHint;
 use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::HTML_METHODS;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -76,7 +77,7 @@ impl JsRuntime {
                 if !position.is_finite() || position < 0.0 {
                     return Ok(JsValue::Undefined);
                 }
-                let units = utf16::utf16_units(&text);
+                let units = text.units().to_vec();
                 #[allow(
                     clippy::cast_possible_truncation,
                     clippy::cast_sign_loss,
@@ -101,7 +102,7 @@ impl JsRuntime {
                     clippy::cast_precision_loss,
                     reason = "a code-unit length is a usize and f64 represents every usize on this target"
                 )]
-                let length = utf16::utf16_length(&text) as f64;
+                let length = text.len() as f64;
                 let relative = self.optional_integer_value(dom, arguments.first())?;
                 let index = if relative >= 0.0 {
                     relative
@@ -117,8 +118,8 @@ impl JsRuntime {
                     reason = "the bounds check above bounds the index by the code-unit length"
                 )]
                 let index = index as usize;
-                Ok(JsValue::String(utf16::string_from_unit(
-                    utf16::utf16_units(&text)[index],
+                Ok(JsValue::String(utf16::JsString::from_unit(
+                    text.units().to_vec()[index],
                 )))
             }
             // ECMA-262 22.1.3.17 `padStart` and 22.1.3.18 `padEnd`, which is
@@ -157,7 +158,7 @@ impl JsRuntime {
                     reason = "the cap above bounds the target to the materialization limit"
                 )]
                 let target = target as usize;
-                let current = utf16::utf16_length(&text);
+                let current = text.len();
                 if current >= target {
                     return Ok(JsValue::String(text));
                 }
@@ -165,7 +166,7 @@ impl JsRuntime {
                     Some(JsValue::Undefined) | None => vec![0x20],
                     Some(value) => {
                         let filler_text = self.to_string_coerced(dom, value)?;
-                        utf16::utf16_units(&filler_text)
+                        filler_text.units().to_vec()
                     }
                 };
                 // Step 3 of `StringPad`: an empty filler pads by nothing at all.
@@ -184,16 +185,16 @@ impl JsRuntime {
                         padding.push(*unit);
                     }
                 }
-                let padding = utf16::string_from_utf16(&padding);
-                let mut units = utf16::utf16_units(&text);
+                let padding = utf16::JsString::from_units(&padding);
+                let mut units = text.units().to_vec();
                 if function == NativeFunction::StrPadStart {
-                    let mut padded = utf16::utf16_units(&padding);
+                    let mut padded = padding.units().to_vec();
                     padded.append(&mut units);
                     units = padded;
                 } else {
-                    units.extend(utf16::utf16_units(&padding));
+                    units.extend(padding.units().to_vec());
                 }
-                Ok(JsValue::String(utf16::string_from_utf16(&units)))
+                Ok(JsValue::String(utf16::JsString::from_units(&units)))
             }
             NativeFunction::StrTrimStart => self.string_trim_end(dom, receiver, true),
             NativeFunction::StrTrimEnd => self.string_trim_end(dom, receiver, false),
@@ -215,11 +216,11 @@ impl JsRuntime {
                     reason = "the range check above bounds the count to a non-negative integer"
                 )]
                 let count = count as usize;
-                let units = utf16::utf16_units(&text);
+                let units = text.units().to_vec();
                 // An empty string repeated any number of times is empty, and
                 // the copy loop below would otherwise spin for the whole count.
                 if units.is_empty() {
-                    return Ok(JsValue::String(String::new()));
+                    return Ok(JsValue::String((String::new()).into()));
                 }
                 let total = units
                     .len()
@@ -234,7 +235,7 @@ impl JsRuntime {
                 for _ in 0..count {
                     repeated.extend_from_slice(&units);
                 }
-                Ok(JsValue::String(utf16::string_from_utf16(&repeated)))
+                Ok(JsValue::String(utf16::JsString::from_units(&repeated)))
             }
             // ECMA-262 22.1.3.17 `String.prototype.localeCompare`. The
             // specification makes the collation implementation-defined ("an
@@ -251,7 +252,7 @@ impl JsRuntime {
                 // `that` is `undefined`, which converts to "undefined".
                 let that = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 let other = self.to_string_coerced(dom, &that)?;
-                Ok(JsValue::Number(match text.as_str().cmp(other.as_str()) {
+                Ok(JsValue::Number(match text.units().cmp(other.units()) {
                     std::cmp::Ordering::Less => -1.0,
                     std::cmp::Ordering::Equal => 0.0,
                     std::cmp::Ordering::Greater => 1.0,
@@ -271,7 +272,7 @@ impl JsRuntime {
                         return Err(JsError::type_error("RegExp flags are not coercible"));
                     }
                     let flags = self.to_string_value(dom, &flags)?;
-                    if !flags.contains('g') {
+                    if !flags.to_lossy().contains('g') {
                         return Err(JsError::type_error(
                             "String.prototype.replaceAll must be called with a global RegExp",
                         ));
@@ -303,38 +304,47 @@ impl JsRuntime {
             NativeFunction::StrHtml(index) => {
                 let (_, tag, attribute) = HTML_METHODS[index];
                 let text = self.require_string_receiver(dom, receiver)?;
-                let opening = if attribute.is_empty() {
-                    format!("<{tag}>")
+                let mut output: Vec<u16> = Vec::new();
+                if attribute.is_empty() {
+                    output.extend(format!("<{tag}>").encode_utf16());
                 } else {
                     let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-                    let value = self.to_string_coerced(dom, &value)?.replace('"', "&quot;");
-                    format!("<{tag} {attribute}=\"{value}\">")
-                };
-                Ok(JsValue::String(format!("{opening}{text}</{tag}>")))
+                    let value = self.to_string_coerced(dom, &value)?;
+                    output.extend(format!("<{tag} {attribute}=\"").encode_utf16());
+                    for unit in value.units() {
+                        if *unit == u16::from(b'"') {
+                            output.extend("&quot;".encode_utf16());
+                        } else {
+                            output.push(*unit);
+                        }
+                    }
+                    output.extend("\">".encode_utf16());
+                }
+                output.extend_from_slice(text.units());
+                output.extend(format!("</{tag}>").encode_utf16());
+                Ok(JsValue::String(JsString::from_unit_vec(output)))
             }
             // ECMA-262 22.1.3.10 `String.prototype.isWellFormed` and 22.1.3.32
             // `String.prototype.toWellFormed` (ES2024). A lone surrogate is the
             // one thing a well-formed string cannot hold, and this engine keeps
-            // exactly the lone surrogates as placeholders: a valid pair is a
-            // single scalar, so "contains an unpaired surrogate" is "contains a
-            // placeholder". `toWellFormed` replaces each one with U+FFFD.
+            // the lone surrogates a well-formed string cannot contain. A valid
+            // pair is one scalar, so the check is on the decoded units.
+            // `toWellFormed` replaces each unpaired surrogate with U+FFFD.
             NativeFunction::StrIsWellFormed => {
                 let text = self.require_string_receiver(dom, receiver)?;
-                Ok(JsValue::Boolean(!text.chars().any(utf16::is_placeholder)))
+                Ok(JsValue::Boolean(text.is_well_formed()))
             }
             NativeFunction::StrToWellFormed => {
                 let text = self.require_string_receiver(dom, receiver)?;
-                Ok(JsValue::String(
-                    text.chars()
-                        .map(|character| {
-                            if utf16::is_placeholder(character) {
-                                '\u{FFFD}'
-                            } else {
-                                character
-                            }
-                        })
-                        .collect(),
-                ))
+                // Each unpaired surrogate becomes U+FFFD; paired units stay.
+                let units: Vec<u16> = char::decode_utf16(text.units().iter().copied())
+                    .flat_map(|unit| {
+                        let character = unit.unwrap_or(char::REPLACEMENT_CHARACTER);
+                        let mut encoded = [0_u16; 2];
+                        character.encode_utf16(&mut encoded).to_vec()
+                    })
+                    .collect();
+                Ok(JsValue::String(JsString::from_unit_vec(units)))
             }
             // ECMA-262 B.2.2.1 `String.prototype.substr`, over code units, in
             // the spec's own arithmetic on `ToIntegerOrInfinity` values.
@@ -348,7 +358,7 @@ impl JsRuntime {
             // is always in range.
             NativeFunction::StringSubstr => {
                 let text = self.require_string_receiver(dom, receiver)?;
-                let units = utf16::utf16_units(&text);
+                let units = text.units().to_vec();
                 #[allow(
                     clippy::cast_precision_loss,
                     reason = "a code-unit length is a usize and f64 represents every usize on this target"
@@ -372,7 +382,7 @@ impl JsRuntime {
                     reason = "start and end are integers clamped into [0, size] above"
                 )]
                 let (start, end) = (start as usize, end as usize);
-                Ok(JsValue::String(utf16::string_from_utf16(
+                Ok(JsValue::String(utf16::JsString::from_units(
                     &units[start..end],
                 )))
             }
@@ -413,8 +423,8 @@ pub(in crate::runtime) fn valid_position(position: f64, length: usize) -> Option
 /// even though the specification defines the first *in terms of* the second.
 pub(in crate::runtime) fn char_at_value(units: &[u16], position: f64) -> JsValue {
     match valid_position(position, units.len()) {
-        Some(position) => JsValue::String(utf16::string_from_unit(units[position])),
-        None => JsValue::String(String::new()),
+        Some(position) => JsValue::String(utf16::JsString::from_unit(units[position])),
+        None => JsValue::String((String::new()).into()),
     }
 }
 
@@ -429,19 +439,23 @@ pub(in crate::runtime) fn char_at_value(units: &[u16], position: f64) -> JsValue
 /// `0xDE00`. `str::split` on the engine's own `String` cannot express that,
 /// because the trailing half of a pair is not a separate value there - the
 /// engine represents the whole pair as one scalar.
-pub(in crate::runtime) fn split_by_units(text: &str, separator: &str, limit: usize) -> Vec<String> {
-    let units = utf16::utf16_units(text);
-    let needle = utf16::utf16_units(separator);
+pub(in crate::runtime) fn split_by_units(
+    text: &JsString,
+    separator: &JsString,
+    limit: usize,
+) -> Vec<JsString> {
+    let units = text.units().to_vec();
+    let needle = separator.units().to_vec();
     let mut pieces = Vec::new();
     let mut cursor = 0usize;
     while pieces.len() < limit {
         let found = (cursor..=units.len().saturating_sub(needle.len()))
             .find(|start| units[*start..].starts_with(&needle));
         let Some(found) = found else {
-            pieces.push(utf16::string_from_utf16(&units[cursor..]));
+            pieces.push(utf16::JsString::from_units(&units[cursor..]));
             break;
         };
-        pieces.push(utf16::string_from_utf16(&units[cursor..found]));
+        pieces.push(utf16::JsString::from_units(&units[cursor..found]));
         cursor = found + needle.len();
     }
     pieces
@@ -456,38 +470,37 @@ pub(in crate::runtime) fn split_by_units(text: &str, separator: &str, limit: usi
 /// which a surrogate pair can split, so replacing the trailing half of a pair
 /// with a backtick expansion yields the lone high surrogate.
 pub(in crate::runtime) fn expand_units_replacement(
-    replacement: &str,
+    replacement: &[u16],
     input: &[u16],
     found: &crate::regex::MatchRanges,
-) -> String {
-    let mut output = String::new();
-    let units: Vec<u16> = replacement.encode_utf16().collect();
+) -> Vec<u16> {
+    let mut output: Vec<u16> = Vec::new();
+    let units = replacement;
+    let dollar = u16::from(b'$');
     let mut index = 0usize;
     while index < units.len() {
         let unit = units[index];
-        if unit != u16::from(b'$') || index + 1 >= units.len() {
-            output.push_str(&utf16::string_from_unit(unit));
+        if unit != dollar || index + 1 >= units.len() {
+            output.push(unit);
             index += 1;
             continue;
         }
         let next = units[index + 1];
         match next {
-            unit if unit == u16::from(b'$') => {
-                output.push('$');
+            unit if unit == dollar => {
+                output.push(dollar);
                 index += 2;
             }
             unit if unit == u16::from(b'&') => {
-                output.push_str(&utf16::string_from_utf16(&input[found.start..found.end]));
+                output.extend_from_slice(&input[found.start..found.end]);
                 index += 2;
             }
             unit if unit == u16::from(b'`') => {
-                output.push_str(&utf16::string_from_utf16(&input[..found.start]));
+                output.extend_from_slice(&input[..found.start]);
                 index += 2;
             }
             unit if unit == u16::from(b'\'') => {
-                output.push_str(&utf16::string_from_utf16(
-                    &input[found.end.min(input.len())..],
-                ));
+                output.extend_from_slice(&input[found.end.min(input.len())..]);
                 index += 2;
             }
             digit if (u16::from(b'1')..=u16::from(b'9')).contains(&digit) => {
@@ -505,32 +518,34 @@ pub(in crate::runtime) fn expand_units_replacement(
                     }
                 }
                 if let Some(Some((start, end))) = found.groups.get(group) {
-                    output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                    output.extend_from_slice(&input[*start..*end]);
                 } else if group >= found.groups.len() {
                     // ECMA-262 22.1.3.19.1: a `$n` past the last capture is not a
                     // reference, so it is copied as written.
-                    output.push_str(&utf16::string_from_utf16(&units[reference_start..index]));
+                    output.extend_from_slice(&units[reference_start..index]);
                 }
             }
             unit if unit == u16::from(b'<') && !found.names.is_empty() => {
                 let rest = &units[index + 2..];
                 if let Some(close) = rest.iter().position(|unit| *unit == u16::from(b'>')) {
-                    let name = utf16::string_from_utf16(&rest[..close]);
-                    if let Some((_, group)) =
-                        found.names.iter().find(|(candidate, _)| *candidate == name)
+                    let name = &rest[..close];
+                    if let Some((_, group)) = found
+                        .names
+                        .iter()
+                        .find(|(candidate, _)| utf16::JsString::from_key(candidate).units() == name)
                         && let Some(Some((start, end))) = found.groups.get(group - 1)
                     {
-                        output.push_str(&utf16::string_from_utf16(&input[*start..*end]));
+                        output.extend_from_slice(&input[*start..*end]);
                     }
                     index += close + 3;
                 } else {
-                    output.push_str("$<");
+                    output.extend_from_slice(&[u16::from(b'$'), u16::from(b'<')]);
                     index += 2;
                 }
             }
             other => {
-                output.push('$');
-                output.push_str(&utf16::string_from_unit(other));
+                output.push(dollar);
+                output.push(other);
                 index += 2;
             }
         }
@@ -634,7 +649,7 @@ pub(in crate::runtime) fn is_string_native(function: NativeFunction) -> bool {
 
 impl JsRuntime {
     /// Create a transient wrapper object exposing string prototype members.
-    pub(in crate::runtime) fn string_wrapper(&mut self, value: String) -> ObjectId {
+    pub(in crate::runtime) fn string_wrapper(&mut self, value: JsString) -> ObjectId {
         self.realm.string_wrapper(value)
     }
 
@@ -660,7 +675,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         receiver: ObjectId,
-    ) -> Result<String, JsError> {
+    ) -> Result<JsString, JsError> {
         if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(receiver) {
             return Ok(text);
         }
@@ -674,7 +689,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
-    ) -> Result<String, JsError> {
+    ) -> Result<JsString, JsError> {
         let primitive = match value {
             JsValue::Object(_) => {
                 self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?
@@ -694,7 +709,7 @@ impl JsRuntime {
     pub(in crate::runtime) fn require_string_object(
         &self,
         receiver: ObjectId,
-    ) -> Result<String, JsError> {
+    ) -> Result<JsString, JsError> {
         match self.realm.host(receiver) {
             Some(ObjectHost::StringPrimitive(text)) => Ok(text.clone()),
             other => Err(JsError::type_error(format!(
@@ -740,21 +755,21 @@ impl JsRuntime {
         )]
         let count = length as usize;
         // Step 5: an empty `raw` contributes nothing at all, not one `undefined`.
-        let mut output = String::new();
+        let mut output: Vec<u16> = Vec::new();
         for index in 0..count {
             // Steps 8.a-8.c: each literal is read and then converted with `ToString`.
             let literal = self.get_member(dom, literals, &index.to_string())?;
-            output.push_str(&self.to_string_coerced(dom, &literal)?);
+            output.extend_from_slice(self.to_string_coerced(dom, &literal)?.units());
             // Step 8.d: the final literal ends the string; step 8.e splices a
             // substitution only when a later literal still follows.
             if index + 1 == count {
                 break;
             }
             if let Some(substitution) = arguments.get(index + 1) {
-                output.push_str(&self.to_string_coerced(dom, substitution)?);
+                output.extend_from_slice(self.to_string_coerced(dom, substitution)?.units());
             }
         }
-        Ok(JsValue::String(output))
+        Ok(JsValue::String(JsString::from_unit_vec(output)))
     }
 
     /// ECMA-262 22.1.3.2 `String.prototype.charAt`, over code units.
@@ -766,7 +781,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
         let position = self.optional_integer_value(dom, arguments.first())?;
-        Ok(char_at_value(&utf16::utf16_units(&text), position))
+        Ok(char_at_value(text.units(), position))
     }
 
     /// ECMA-262 22.1.3.3 `String.prototype.charCodeAt`: "the numeric value of
@@ -783,7 +798,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
         let position = self.optional_integer_value(dom, arguments.first())?;
-        let units = utf16::utf16_units(&text);
+        let units = text.units().to_vec();
         let Some(position) = valid_position(position, units.len()) else {
             return Ok(JsValue::Number(f64::NAN));
         };
@@ -815,7 +830,7 @@ impl JsRuntime {
         // substring result goes through, which is what makes
         // `String.fromCharCode(0xD83D, 0xDE00).length === 2` agree with
         // `'\u{1F600}'.length`: both are the length of the code-unit sequence.
-        Ok(JsValue::String(utf16::string_from_utf16(&units)))
+        Ok(JsValue::String(utf16::JsString::from_units(&units)))
     }
 
     pub(in crate::runtime) fn string_from_code_point(
@@ -823,7 +838,7 @@ impl JsRuntime {
         dom: &mut Dom,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let mut text = String::with_capacity(arguments.len());
+        let mut units: Vec<u16> = Vec::with_capacity(arguments.len());
         for value in arguments {
             let number = self.to_number_value(dom, value)?;
             if !number.is_finite()
@@ -838,21 +853,12 @@ impl JsRuntime {
                 reason = "the preceding range and integer checks guarantee a code point input"
             )]
             let code = number as u32;
-            // A surrogate is a code point the specification accepts (§22.1.2.2
-            // only bounds the value to 0..=0x10FFFF), so it becomes the
-            // placeholder for one unpaired code unit rather than a range error.
-            if let Ok(unit) = u16::try_from(code)
-                && (0xD800..=0xDFFF).contains(&unit)
-            {
-                text.push_str(&utf16::string_from_unit(unit));
-                continue;
-            }
-            let Some(character) = char::from_u32(code) else {
-                return Err(self.range_error("invalid code point"));
-            };
-            text.push(character);
+            // ECMA-262 22.1.2.2 accepts a surrogate value too, and it is kept as
+            // the one code unit it names, so `fromCodePoint(0xD800).charCodeAt(0)`
+            // is 0xD800.
+            utf16::push_code_point(&mut units, code);
         }
-        Ok(JsValue::String(text))
+        Ok(JsValue::String(JsString::from_unit_vec(units)))
     }
 
     /// ECMA-262 22.1.3.9 `indexOf` and 22.1.3.11 `lastIndexOf`, which are
@@ -873,8 +879,8 @@ impl JsRuntime {
         let text = self.require_string_receiver(dom, receiver)?;
         let search = arguments.first().unwrap_or(&JsValue::Undefined);
         let needle = self.to_string_coerced(dom, search)?;
-        let units = utf16::utf16_units(&text);
-        let needle = utf16::utf16_units(&needle);
+        let units = text.units().to_vec();
+        let needle = needle.units().to_vec();
         let length = units.len();
         let start = if from_end {
             // §22.1.3.12 steps 3-4: `ToNumber(position)`, where NaN means +∞, so
@@ -929,8 +935,8 @@ impl JsRuntime {
         }
         let needle = self.to_string_coerced(dom, search)?;
         let position = self.optional_integer_value(dom, arguments.get(1))?;
-        let units = utf16::utf16_units(&text);
-        let needle = utf16::utf16_units(&needle);
+        let units = text.units().to_vec();
+        let needle = needle.units().to_vec();
         let start = clamp_position(position, units.len());
         let found = needle.len() <= units.len()
             && (start..=units.len() - needle.len())
@@ -956,8 +962,8 @@ impl JsRuntime {
             ));
         }
         let needle = self.to_string_coerced(dom, search)?;
-        let units = utf16::utf16_units(&text);
-        let needle = utf16::utf16_units(&needle);
+        let units = text.units().to_vec();
+        let needle = needle.units().to_vec();
         let length = units.len();
         let matched = if starts {
             // §22.1.3.24 steps 6-9: `ToIntegerOrInfinity(position)`, absent is 0.
@@ -983,7 +989,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
-        let units = utf16::utf16_units(&text);
+        let units = text.units().to_vec();
         #[allow(
             clippy::cast_precision_loss,
             reason = "a code-unit length is a usize and f64 represents every usize on this target"
@@ -1006,7 +1012,7 @@ impl JsRuntime {
         };
         // Step 8: an empty or reversed range is the empty string.
         if start >= end {
-            return Ok(JsValue::String(String::new()));
+            return Ok(JsValue::String((String::new()).into()));
         }
         #[allow(
             clippy::cast_possible_truncation,
@@ -1014,7 +1020,7 @@ impl JsRuntime {
             reason = "both bounds are clamped into [0, length] above"
         )]
         let (start, end) = (start as usize, end as usize);
-        Ok(JsValue::String(utf16::string_from_utf16(
+        Ok(JsValue::String(utf16::JsString::from_units(
             &units[start..end],
         )))
     }
@@ -1030,7 +1036,7 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
-        let units = utf16::utf16_units(&text);
+        let units = text.units().to_vec();
         #[allow(
             clippy::cast_precision_loss,
             reason = "a code-unit length is a usize and f64 represents every usize on this target"
@@ -1054,7 +1060,30 @@ impl JsRuntime {
             reason = "both bounds are clamped into [0, length] above"
         )]
         let (from, to) = (from as usize, to as usize);
-        Ok(JsValue::String(utf16::string_from_utf16(&units[from..to])))
+        Ok(JsValue::String(utf16::JsString::from_units(
+            &units[from..to],
+        )))
+    }
+
+    /// Map each run of well-formed text with `convert`, passing unpaired
+    /// surrogates through unchanged. The run boundary is the lone unit, so a
+    /// context-sensitive mapping (final sigma) sees the same text it would
+    /// see in a string that has no surrogate at all.
+    fn map_well_formed_runs(units: &[u16], convert: impl Fn(&str) -> String) -> Vec<u16> {
+        let mut output: Vec<u16> = Vec::with_capacity(units.len());
+        let mut run = String::new();
+        for unit in char::decode_utf16(units.iter().copied()) {
+            match unit {
+                Ok(character) => run.push(character),
+                Err(error) => {
+                    output.extend(convert(&run).encode_utf16());
+                    run.clear();
+                    output.push(error.unpaired_surrogate());
+                }
+            }
+        }
+        output.extend(convert(&run).encode_utf16());
+        output
     }
 
     pub(in crate::runtime) fn string_to_case(
@@ -1064,11 +1093,12 @@ impl JsRuntime {
         upper: bool,
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
-        Ok(JsValue::String(if upper {
-            text.to_uppercase()
+        let units = if upper {
+            Self::map_well_formed_runs(text.units(), str::to_uppercase)
         } else {
-            text.to_lowercase()
-        }))
+            Self::map_well_formed_runs(text.units(), str::to_lowercase)
+        };
+        Ok(JsValue::String(JsString::from_unit_vec(units)))
     }
 
     /// ECMA-262 22.1.3.30 `String.prototype.trim`: `TrimString` over the
@@ -1079,26 +1109,44 @@ impl JsRuntime {
         dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
-        let text = self.require_string_receiver(dom, receiver)?;
-        Ok(JsValue::String(
-            text.trim_matches(is_js_whitespace).to_owned(),
-        ))
+        self.string_trim_ends(dom, receiver, true, true)
     }
 
     /// ECMA-262 22.1.3.31 `trimStart` and 22.1.3.32 `trimEnd`, which are `trim`
-    /// restricted to one end.
+    /// restricted to one end. Whitespace code points are all in the BMP, so the
+    /// check runs on single code units and never splits a pair.
     pub(in crate::runtime) fn string_trim_end(
         &mut self,
         dom: &mut Dom,
         receiver: ObjectId,
         start: bool,
     ) -> Result<JsValue, JsError> {
+        self.string_trim_ends(dom, receiver, start, !start)
+    }
+
+    fn string_trim_ends(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        trim_start: bool,
+        trim_end: bool,
+    ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
-        Ok(JsValue::String(if start {
-            text.trim_start_matches(is_js_whitespace).to_owned()
-        } else {
-            text.trim_end_matches(is_js_whitespace).to_owned()
-        }))
+        let units = text.units();
+        let is_space = |unit: &u16| char::from_u32(u32::from(*unit)).is_some_and(is_js_whitespace);
+        let mut from = 0;
+        let mut to = units.len();
+        if trim_start {
+            while from < to && is_space(&units[from]) {
+                from += 1;
+            }
+        }
+        if trim_end {
+            while to > from && is_space(&units[to - 1]) {
+                to -= 1;
+            }
+        }
+        Ok(JsValue::String(JsString::from_units(&units[from..to])))
     }
 
     /// `replaceAll` with a **string** search value: every non-overlapping
@@ -1115,12 +1163,12 @@ impl JsRuntime {
     pub(in crate::runtime) fn string_replace_all_literal(
         &mut self,
         dom: &mut Dom,
-        text: &str,
-        needle: &str,
+        text: &JsString,
+        needle: &JsString,
         replacement: &JsValue,
     ) -> Result<JsValue, JsError> {
-        let units = utf16::utf16_units(text);
-        let pattern = utf16::utf16_units(needle);
+        let units = text.units().to_vec();
+        let pattern = needle.units().to_vec();
         // The output is accumulated as code units rather than as text, because a
         // substitution can put a lone surrogate next to one the copy left
         // behind, and only re-decoding at the end knows whether the two halves
@@ -1141,7 +1189,7 @@ impl JsRuntime {
                     && Self::is_callable_object(*callable, &self.realm)
                 {
                     let matched_text =
-                        utf16::string_from_utf16(&units[cursor..cursor + pattern.len()]);
+                        utf16::JsString::from_units(&units[cursor..cursor + pattern.len()]);
                     #[allow(
                         clippy::cast_precision_loss,
                         reason = "string offsets stay far below any precision boundary"
@@ -1152,16 +1200,16 @@ impl JsRuntime {
                         &[
                             JsValue::String(matched_text),
                             JsValue::Number(cursor as f64),
-                            JsValue::String(text.to_owned()),
+                            JsValue::String(text.clone()),
                         ],
                     )?;
-                    output.extend(utf16::utf16_units(&produced.to_js_string()));
+                    output.extend(produced.to_js_string().units().to_vec());
                 } else {
-                    output.extend(utf16::utf16_units(&expand_units_replacement(
-                        &replacement_template,
+                    output.extend(expand_units_replacement(
+                        replacement_template.units(),
                         &units,
                         &found,
-                    )));
+                    ));
                 }
                 cursor += pattern.len().max(1);
                 continue;
@@ -1173,11 +1221,11 @@ impl JsRuntime {
                 // `"ab".replaceAll("", "-")` is `"-a-b-"`, and an implementation
                 // that emits the unit first gets `"a-b--"` or `"-ab"`, which are
                 // the two wrong answers a `split`/`join` produces.
-                output.extend(utf16::utf16_units(&expand_units_replacement(
-                    &replacement_template,
+                output.extend(expand_units_replacement(
+                    replacement_template.units(),
                     &units,
                     &found,
-                )));
+                ));
                 if cursor < units.len() {
                     output.push(units[cursor]);
                 }
@@ -1189,7 +1237,7 @@ impl JsRuntime {
             }
             cursor += 1;
         }
-        Ok(JsValue::String(utf16::string_from_utf16(&output)))
+        Ok(JsValue::String(utf16::JsString::from_units(&output)))
     }
 
     /// §22.1.3.3 `String.prototype.concat`, which is a code-unit
@@ -1201,12 +1249,15 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let mut units = utf16::utf16_units(&self.require_string_receiver(dom, receiver)?);
+        let mut units = self
+            .require_string_receiver(dom, receiver)?
+            .units()
+            .to_vec();
         for argument in arguments {
             let text = self.to_string_coerced(dom, argument)?;
-            units.extend(utf16::utf16_units(&text));
+            units.extend(text.units().to_vec());
         }
-        Ok(JsValue::String(utf16::string_from_utf16(&units)))
+        Ok(JsValue::String(utf16::JsString::from_units(&units)))
     }
 
     /// Split by a literal separator or a regular expression.
@@ -1257,10 +1308,11 @@ impl JsRuntime {
             // String values for each code unit", so `'\u{1F600}'.split('')` has
             // two elements. This is the same code-unit notion `length` reports,
             // so `split('')`, `length` and `charAt` agree.
-            Some(separator) if separator.is_empty() => utf16::utf16_units(&text)
+            Some(separator) if separator.is_empty() => text
+                .units()
                 .iter()
                 .take(limit)
-                .map(|unit| utf16::string_from_unit(*unit))
+                .map(|unit| utf16::JsString::from_unit(*unit))
                 .collect(),
             // A non-empty separator is matched as a substring of the code-unit
             // sequence, so `'\u{1F600}a'.split('\uDE00')` splits inside the pair,
@@ -1308,7 +1360,7 @@ impl JsRuntime {
                     return Err(JsError::type_error("RegExp flags are not coercible"));
                 }
                 let flags = self.to_string_value(dom, &flags)?;
-                if !flags.contains('g') {
+                if !flags.to_lossy().contains('g') {
                     return Err(JsError::type_error(
                         "String.prototype.matchAll called with a non-global RegExp argument",
                     ));
@@ -1358,9 +1410,12 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let text = self.require_string_receiver(dom, receiver)?;
         self.ensure_heap_capacity(1)?;
+        // Each element is one code point, a surrogate pair or a lone unit, and
+        // is kept as code units so a lone surrogate reaches the loop intact.
         let values = text
-            .chars()
-            .map(|character| JsValue::String(character.to_string()))
+            .code_point_strings()
+            .into_iter()
+            .map(JsValue::String)
             .collect::<Vec<_>>();
         Ok(JsValue::Object(self.realm.collection_iterator(values)))
     }
@@ -1400,10 +1455,10 @@ impl JsRuntime {
             Vec::new()
         } else {
             let template = self.to_string_coerced(dom, &replace_value)?;
-            utf16::utf16_units(&template)
+            template.units().to_vec()
         };
-        let units = utf16::utf16_units(&text);
-        let pattern = utf16::utf16_units(&needle);
+        let units = text.units().to_vec();
+        let pattern = needle.units().to_vec();
         let Some(position) = Self::find_units(&units, &pattern, 0) else {
             return Ok(JsValue::String(text));
         };
@@ -1420,7 +1475,7 @@ impl JsRuntime {
                 ];
                 let produced = self.call(dom, callable, &arguments)?;
                 let produced = self.to_string_value(dom, &produced)?;
-                utf16::utf16_units(&produced)
+                produced.units().to_vec()
             }
             None => self.get_substitution(
                 dom,
@@ -1435,7 +1490,7 @@ impl JsRuntime {
         let mut output = units[..position].to_vec();
         output.extend(replacement);
         output.extend_from_slice(&units[position + pattern.len()..]);
-        Ok(JsValue::String(utf16::string_from_utf16(&output)))
+        Ok(JsValue::String(utf16::JsString::from_units(&output)))
     }
 
     /// The first index at or after `from` where `pattern` occurs in `units`.
@@ -1460,7 +1515,7 @@ mod tests {
         let mut parsed = parse_document("<!doctype html><p></p>");
         let mut runtime = JsRuntime::new(&parsed.dom);
         match runtime.execute(&mut parsed.dom, source) {
-            Ok(outcome) => outcome.value.to_js_string(),
+            Ok(outcome) => outcome.value.to_js_string().to_lossy(),
             Err(error) => format!("<threw {}>", error.message()),
         }
     }
@@ -1480,12 +1535,10 @@ mod tests {
     /// The code-unit sequence of a string-valued expression, as lowercase hex
     /// separated by spaces.
     ///
-    /// A lone surrogate is invisible in a Rust `String` - the engine holds it as
-    /// a private-use placeholder - so comparing a returned string against a Rust
-    /// literal would silently pass or fail on the wrong thing. Reading the units
-    /// back through the engine's own `charCodeAt` is what makes a
-    /// half-a-pair result observable at all, and it is also the only way to
-    /// state the expectation without depending on the internal placeholder.
+    /// A lone surrogate has no Rust `String` form (its host text is U+FFFD), so
+    /// comparing a returned string against a Rust literal would silently pass or
+    /// fail on the wrong thing. Reading the units back through the engine's own
+    /// `charCodeAt` is what makes a half-a-pair result observable at all.
     fn units_of(expression: &str) -> String {
         run(&format!(
             "var s = {expression}; var out = []; \
@@ -1955,8 +2008,8 @@ mod tests {
     ///
     /// This is the case a code-point model cannot represent at all: it has no
     /// value for half a character, so it must either answer the whole emoji or
-    /// lose the character. The engine's placeholder representation keeps it,
-    /// which is what makes `charCodeAt`, `indexOf` and `codePointAt` agree that
+    /// lose the character. The code-unit representation keeps it, which is what
+    /// makes `charCodeAt`, `indexOf` and `codePointAt` agree that
     /// unit 0 is `0xD83D` and not a pair.
     #[test]
     fn a_lone_surrogate_is_one_addressable_unit() {
@@ -2017,9 +2070,9 @@ mod tests {
     }
 
     /// Concatenation is a code-unit concatenation, so two halves either side of
-    /// a join become one pair. The engine holds a lone surrogate as a
-    /// private-use placeholder, so this is where a plain text concatenation
-    /// would visibly disagree with the specified answer.
+    /// a join become one pair. A text concatenation would lose a lone surrogate
+    /// to U+FFFD, so this is where it would visibly disagree with the specified
+    /// answer.
     #[test]
     fn concatenation_re_joins_a_pair_split_across_the_operator() {
         let lone = "String.fromCharCode(0xD83D)";
@@ -2122,10 +2175,11 @@ mod tests {
         assert_eq!(run("'\\u{1f600}'.replaceAll('\\u{1f600}', 'X')"), "X");
         assert_eq!(length_of("'\\u{1f600}'.replaceAll('\\u{1f600}', 'X')"), "1");
         // The reported offset is a code-unit offset: the trailing half of the
-        // pair sits at unit 2 of `"a\u{1F600}"`, not unit 1.
+        // pair sits at unit 2 of `"a\u{1F600}"`, not unit 1. The lone leading
+        // half that stays behind is host text's U+FFFD.
         assert_eq!(
             run("'a\\u{1f600}'.replaceAll('\\uDE00', function (m, o) { return o; })"),
-            "a\u{f003d}2"
+            "a\u{fffd}2"
         );
         assert_eq!(
             run(

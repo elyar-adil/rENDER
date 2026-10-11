@@ -261,7 +261,7 @@ fn run_scripts(dom: &mut render_core::dom::Dom, scripts: &[PendingScript]) {
         .map_or_else(
             |error| format!("probe failed: {error}"),
             |outcome| match outcome.value {
-                render_core::js::JsValue::String(missing) => missing,
+                render_core::js::JsValue::String(missing) => missing.to_lossy(),
                 other => format!("probe produced {other:?}"),
             },
         );

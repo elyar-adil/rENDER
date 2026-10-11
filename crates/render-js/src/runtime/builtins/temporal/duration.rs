@@ -309,7 +309,7 @@ impl JsRuntime {
                 Ok(DurationRecord::from_array(values))
             }
             JsValue::String(text) => {
-                let Some(parsed) = parse_duration(text) else {
+                let Some(parsed) = parse_duration(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid duration string"));
                 };
                 self.duration_from_string(&parsed)
@@ -418,7 +418,7 @@ impl JsRuntime {
             // A relativeTo string may carry an offset or `Z`: its local date is
             // the one used, and the offset and any zone name do not change it.
             JsValue::String(text) => {
-                let Some(parsed) = super::parse::parse_date_time(text) else {
+                let Some(parsed) = super::parse::parse_date_time(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid relativeTo string"));
                 };
                 if parsed
@@ -692,7 +692,7 @@ impl JsRuntime {
                 return Err(JsError::type_error("round requires an options argument"));
             }
             JsValue::String(text) => {
-                let Some(smallest) = Unit::parse(text) else {
+                let Some(smallest) = Unit::parse(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid smallestUnit"));
                 };
                 (None, None, 1, RoundingMode::HalfExpand, Some(smallest))
@@ -746,7 +746,7 @@ impl JsRuntime {
             JsValue::Undefined => {
                 return Err(JsError::type_error("total requires an argument"));
             }
-            JsValue::String(text) => (Unit::parse(text), None),
+            JsValue::String(text) => (Unit::parse(&(text).to_lossy()), None),
             other => {
                 let options = Self::options_object(other)?;
                 let relative_to = self.relative_to_option(dom, options)?;
@@ -986,13 +986,13 @@ impl JsRuntime {
             TemporalMethod::ToString => {
                 let record = self.duration_of(receiver)?;
                 let text = self.duration_to_string(dom, record, &first)?;
-                Ok(JsValue::String(text))
+                Ok(JsValue::String((text).into()))
             }
             // `toJSON` and `toLocaleString` take no options, so none are read.
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let record = self.duration_of(receiver)?;
                 let text = self.duration_to_string(dom, record, &JsValue::Undefined)?;
-                Ok(JsValue::String(text))
+                Ok(JsValue::String((text).into()))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.Duration cannot be converted to a primitive; use compare() or toString()",

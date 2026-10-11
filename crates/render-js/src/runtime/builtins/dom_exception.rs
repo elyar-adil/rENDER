@@ -23,6 +23,7 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::PropertyDescriptor;
@@ -108,10 +109,10 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let message = arguments
             .first()
-            .map_or_else(String::new, JsValue::to_js_string);
+            .map_or_else(JsString::empty, JsValue::to_js_string);
         let name = match arguments.get(1) {
             Some(value) => value.to_js_string(),
-            None => "Error".to_owned(),
+            None => JsString::from("Error"),
         };
         let Some(prototype) = self
             .realm
@@ -155,10 +156,10 @@ impl JsRuntime {
             ));
         };
         Ok(match function {
-            NativeFunction::DomExceptionNameGetter => JsValue::String(name),
-            NativeFunction::DomExceptionMessageGetter => JsValue::String(message),
+            NativeFunction::DomExceptionNameGetter => JsValue::String(name.clone()),
+            NativeFunction::DomExceptionMessageGetter => JsValue::String(message.clone()),
             NativeFunction::DomExceptionCodeGetter => {
-                JsValue::Number(f64::from(dom_exception_code(&name)))
+                JsValue::Number(f64::from(dom_exception_code(&name.to_lossy())))
             }
             _ => {
                 return Err(JsError::type_error(
@@ -197,8 +198,8 @@ impl JsRuntime {
                 .map_err(|_| JsError::resource(message.to_owned()));
         };
         let arguments = [
-            JsValue::String(message.to_owned()),
-            JsValue::String(name.as_str().to_owned()),
+            JsValue::String((message.to_owned()).into()),
+            JsValue::String((name.as_str().to_owned()).into()),
         ];
         self.dom_exception_constructor(constructor, &arguments)
     }
@@ -216,7 +217,9 @@ impl JsRuntime {
             // No realm to construct in. A string is the weakest answer that
             // still carries the name, because a bare `JsError` string loses
             // `e.name` and that is the member the whole migration is about.
-            Err(_) => JsError::thrown(JsValue::String(format!("{}: {message}", name.as_str()))),
+            Err(_) => JsError::thrown(JsValue::String(
+                (format!("{}: {message}", name.as_str())).into(),
+            )),
         }
     }
 
@@ -230,16 +233,17 @@ impl JsRuntime {
         let header = match self.realm.host(object) {
             Some(ObjectHost::DomException { name, message }) => {
                 if message.is_empty() {
-                    name
+                    name.to_lossy()
                 } else {
-                    format!("{name}: {message}")
+                    format!("{}: {}", name.to_lossy(), message.to_lossy())
                 }
             }
-            _ => self
+            _ => (self
                 .realm
                 .get_property(object, "name")
-                .unwrap_or_else(|| JsValue::String("Error".to_owned()))
-                .to_js_string(),
+                .unwrap_or_else(|| JsValue::String(("Error".to_owned()).into()))
+                .to_js_string())
+            .to_lossy(),
         };
         let stack = format!("{header}{}", self.stack_frame_lines());
         self.realm.define_property(
@@ -248,7 +252,7 @@ impl JsRuntime {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String(stack),
+                value: JsValue::String((stack).into()),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -269,7 +273,7 @@ mod tests {
         let mut parsed = parse_document("<!doctype html><p></p>");
         let mut runtime = JsRuntime::new(&parsed.dom);
         match runtime.execute(&mut parsed.dom, source) {
-            Ok(outcome) => outcome.value.to_js_string(),
+            Ok(outcome) => outcome.value.to_js_string().to_lossy(),
             Err(error) => format!("<threw {}>", error.message()),
         }
     }
@@ -571,7 +575,7 @@ InvalidCharacterError/5 DataCloneError/25 RangeError/0 TypeError/0"
             ",
             )
             .expect("play() should execute");
-        assert_eq!(outcome.value, JsValue::String("pending".to_owned()));
+        assert_eq!(outcome.value, JsValue::String("pending".into()));
         for _ in 0..8 {
             let tasks = runtime.take_pending_microtasks();
             if tasks.is_empty() {
@@ -586,6 +590,9 @@ InvalidCharacterError/5 DataCloneError/25 RangeError/0 TypeError/0"
         let result = runtime
             .execute(&mut parsed.dom, "reason")
             .expect("the reason should be readable");
-        assert_eq!(result.value.to_js_string(), "NotSupportedError/true/true");
+        assert_eq!(
+            result.value.to_js_string().to_lossy(),
+            "NotSupportedError/true/true"
+        );
     }
 }

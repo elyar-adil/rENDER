@@ -133,9 +133,9 @@ const WALK: &str = r#"
 })()
 "#;
 
-fn as_text(value: &JsValue) -> &str {
+fn as_text(value: &JsValue) -> String {
     match value {
-        JsValue::String(text) => text,
+        JsValue::String(text) => text.to_lossy(),
         other => panic!("walk should return a string, got {other:?}"),
     }
 }

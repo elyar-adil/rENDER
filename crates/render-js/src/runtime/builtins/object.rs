@@ -26,6 +26,7 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::convert::uint32_of_number;
 use crate::runtime::eval::PrimitiveHint;
 use crate::runtime::types::ObjectEntryKind;
+use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -248,9 +249,11 @@ impl JsRuntime {
                 match self.realm.host(receiver) {
                     Some(ObjectHost::NumberPrimitive(value)) => {
                         if !value.is_finite() || value.abs() >= 1e21 {
-                            Ok(JsValue::String(crate::value::number_to_string(value)))
+                            Ok(JsValue::String(
+                                (crate::value::number_to_string(value)).into(),
+                            ))
                         } else {
-                            Ok(JsValue::String(format!("{value:.digits$}")))
+                            Ok(JsValue::String((format!("{value:.digits$}")).into()))
                         }
                     }
                     _ => Err(JsError::type_error("incompatible Number method receiver")),
@@ -264,10 +267,14 @@ impl JsRuntime {
                     }
                 };
                 let Some(argument) = arguments.first() else {
-                    return Ok(JsValue::String(crate::value::number_to_string(value)));
+                    return Ok(JsValue::String(
+                        (crate::value::number_to_string(value)).into(),
+                    ));
                 };
                 if matches!(argument, JsValue::Undefined) {
-                    return Ok(JsValue::String(crate::value::number_to_string(value)));
+                    return Ok(JsValue::String(
+                        (crate::value::number_to_string(value)).into(),
+                    ));
                 }
                 let precision = self.to_integer_value(dom, argument)?;
                 if !(1.0..=100.0).contains(&precision) {
@@ -281,7 +288,9 @@ impl JsRuntime {
                     reason = "toPrecision precision is validated in the 1..=100 range"
                 )]
                 let precision = precision as usize;
-                Ok(JsValue::String(format_number_precision(value, precision)))
+                Ok(JsValue::String(
+                    (format_number_precision(value, precision)).into(),
+                ))
             }
             // ECMA-262 21.1.3.9: an absent or `undefined` radix means 10, and
             // anything outside 2..=36 is a `RangeError`. Bundled base64 and
@@ -312,12 +321,12 @@ impl JsRuntime {
                     }
                 };
                 Ok(JsValue::String(
-                    crate::runtime::convert::number_to_radix_string(value, radix),
+                    (crate::runtime::convert::number_to_radix_string(value, radix)).into(),
                 ))
             }
             NativeFunction::BoolToString => match self.realm.host(receiver) {
                 Some(ObjectHost::BooleanPrimitive(value)) => Ok(JsValue::String(
-                    if value { "true" } else { "false" }.to_owned(),
+                    (if value { "true" } else { "false" }.to_owned()).into(),
                 )),
                 _ => Err(JsError::type_error("incompatible Boolean method receiver")),
             },
@@ -331,7 +340,7 @@ impl JsRuntime {
             }
             NativeFunction::ObjectPrototypeToString => {
                 let tag = self.object_to_string_tag(dom, &JsValue::Object(receiver))?;
-                Ok(JsValue::String(tag))
+                Ok(JsValue::String((tag).into()))
             }
             // ECMA-262 20.1.3.5: `Invoke(this, "toString")`.
             NativeFunction::ObjectPrototypeToLocaleString => {
@@ -639,18 +648,20 @@ impl JsRuntime {
         let message = arguments
             .first()
             .and_then(|value| (!matches!(value, JsValue::Undefined)).then(|| value.to_js_string()));
-        let object = self.realm.create_error(prototype, message.clone());
+        let object = self
+            .realm
+            .create_error(prototype, message.clone().map(|message| message.to_lossy()));
         // `Error.prototype.stack`: engine-captured at construction, shaped
         // like a real engine ("TypeError: msg" header + `    at` frames).
         let stack = {
             let name = self
                 .realm
                 .get_property(object, "name")
-                .unwrap_or_else(|| JsValue::String("Error".to_owned()))
+                .unwrap_or_else(|| JsValue::String(("Error".to_owned()).into()))
                 .to_js_string();
             let header = match &message {
                 Some(text) if !text.is_empty() => format!("{name}: {text}"),
-                _ => name,
+                _ => (name).to_key(),
             };
             format!("{header}{}", self.stack_frame_lines())
         };
@@ -660,7 +671,7 @@ impl JsRuntime {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String(stack),
+                value: JsValue::String((stack).into()),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -690,7 +701,7 @@ impl JsRuntime {
             (_, true) => name,
             (false, false) => format!("{name}: {message}"),
         };
-        JsValue::String(result)
+        JsValue::String((result).into())
     }
 
     /// One `Get(this, name)` of `Error.prototype.toString`, with the
@@ -715,7 +726,7 @@ impl JsRuntime {
             .unwrap_or(Ok(JsValue::Undefined));
         match value {
             Ok(JsValue::Undefined) | Err(_) => fallback.to_owned(),
-            Ok(value) => value.to_js_string(),
+            Ok(value) => (value.to_js_string()).to_lossy(),
         }
     }
 
@@ -774,11 +785,12 @@ impl JsRuntime {
                 continue;
             }
             output.push(match kind {
-                ObjectEntryKind::Keys => JsValue::String(name),
+                ObjectEntryKind::Keys => JsValue::String((name).into()),
                 ObjectEntryKind::Values => self.get_member(dom, object, &name)?,
                 ObjectEntryKind::Entries => {
                     let value = self.get_member(dom, object, &name)?;
-                    let pair = self.create_array_from_values(&[JsValue::String(name), value])?;
+                    let pair =
+                        self.create_array_from_values(&[JsValue::String((name).into()), value])?;
                     // A later allocation may collect, so the pair stays pinned.
                     self.transient_roots.push(pair);
                     JsValue::Object(pair)
@@ -830,10 +842,10 @@ impl JsRuntime {
             JsValue::Object(_) => {
                 match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)? {
                     JsValue::Symbol(symbol) => Ok(PropertyName::Symbol(symbol)),
-                    primitive => Ok(PropertyName::String(primitive.to_js_string())),
+                    primitive => Ok(PropertyName::String((primitive.to_js_string()).to_key())),
                 }
             }
-            other => Ok(PropertyName::String(other.to_js_string())),
+            other => Ok(PropertyName::String((other.to_js_string()).to_key())),
         }
     }
 
@@ -1519,7 +1531,7 @@ impl JsRuntime {
         let names = self
             .own_string_keys(dom, object)?
             .into_iter()
-            .map(JsValue::String)
+            .map(|key| JsValue::String(JsString::from_key(&key)))
             .collect::<Vec<_>>();
         Ok(JsValue::Object(self.create_array_from_values(&names)?))
     }

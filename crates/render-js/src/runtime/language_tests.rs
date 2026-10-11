@@ -9,7 +9,7 @@ fn eval(source: &str) -> Result<String, crate::JsError> {
     let mut runtime = JsRuntime::new(&dom);
     runtime
         .execute(&mut dom, source)
-        .map(|outcome| outcome.value.to_js_string())
+        .map(|outcome| outcome.value.to_js_string().to_lossy())
 }
 
 fn ok(source: &str) -> String {
@@ -1851,7 +1851,7 @@ fn a_unicode_back_reference_matches_whole_code_points() {
     );
     assert_eq!(
         ok(r#"String(/foo(.+)bar\1/u.exec("foo\uD834bar\uD834"))"#),
-        "foo\u{f0034}bar\u{f0034},\u{f0034}"
+        "foo\u{fffd}bar\u{fffd},\u{fffd}"
     );
     assert_eq!(
         ok(r#"String(/^(.+)\1$/u.exec("\uDC00foobar\uD834\uDC00foobar\uD834"))"#),

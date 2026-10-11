@@ -50,6 +50,7 @@ use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::types::FetchOutcome;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PendingFetch;
+use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::VideoElementState;
@@ -108,7 +109,7 @@ impl JsRuntime {
             .expect("newly created Video has host storage") =
             ObjectHost::VideoElement(VideoElementState::default());
         for (name, value) in [
-            ("src", JsValue::String(String::new())),
+            ("src", JsValue::String((String::new()).into())),
             ("videoWidth", JsValue::Number(0.0)),
             ("videoHeight", JsValue::Number(0.0)),
             ("currentTime", JsValue::Number(0.0)),
@@ -318,7 +319,7 @@ impl JsRuntime {
             .first()
             .map(JsValue::to_js_string)
             .unwrap_or_default();
-        let requested = requested.trim().to_ascii_lowercase();
+        let requested = requested.to_lossy().trim().to_ascii_lowercase();
         let answer = if requested.is_empty() {
             ""
         } else {
@@ -335,7 +336,7 @@ impl JsRuntime {
                 _ => "",
             }
         };
-        Ok(JsValue::String(answer.to_owned()))
+        Ok(JsValue::String(JsString::from(answer)))
     }
 
     /// Queue one media transfer for `receiver` and record it as the
@@ -704,7 +705,7 @@ impl JsRuntime {
         }
         let event = self.realm.create_ordinary_object();
         for (name, value) in [
-            ("type", JsValue::String(event_type.to_owned())),
+            ("type", JsValue::String((event_type.to_owned()).into())),
             ("target", JsValue::Object(receiver)),
             ("currentTarget", JsValue::Object(receiver)),
         ] {
@@ -749,7 +750,7 @@ impl JsRuntime {
 
     fn string_property(&self, receiver: ObjectId, name: &str) -> String {
         match self.realm.get_property(receiver, name) {
-            Some(value) => value.to_js_string(),
+            Some(value) => (value.to_js_string()).to_lossy(),
             None => String::new(),
         }
     }
@@ -769,7 +770,7 @@ impl JsRuntime {
     /// not answer `e instanceof DOMException` for any of them.
     fn media_rejection(&mut self, name: DomExceptionName, message: &str) -> JsValue {
         self.construct_dom_exception(name, message)
-            .unwrap_or_else(|_| JsValue::String(format!("{}: {message}", name.as_str())))
+            .unwrap_or_else(|_| JsValue::String((format!("{}: {message}", name.as_str())).into()))
     }
 }
 
@@ -846,7 +847,7 @@ mod tests {
 
         fn string(&mut self, source: &str) -> String {
             match self.execute(source) {
-                JsValue::String(text) => text,
+                JsValue::String(text) => text.to_lossy(),
                 other => panic!("script returned {other:?}, expected a string"),
             }
         }
@@ -854,7 +855,7 @@ mod tests {
         /// Evaluate a primitive-valued expression and render it as a string.
         fn scalar(&mut self, source: &str) -> String {
             match self.execute(&format!("String({source})")) {
-                JsValue::String(text) => text,
+                JsValue::String(text) => text.to_lossy(),
                 other => panic!("script returned {other:?}, expected a string"),
             }
         }

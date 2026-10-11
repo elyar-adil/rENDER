@@ -1004,7 +1004,7 @@ fn run_async_variant(
         Err(error) => return fail(format!("print log expression: {}", error.message())),
     };
     let printed = match runtime.execute_compiled(&mut document.dom, &log) {
-        Ok(outcome) => outcome.value.to_js_string(),
+        Ok(outcome) => outcome.value.to_js_string().to_lossy(),
         Err(error) => return fail(format!("print log failed: {}", error.message())),
     };
     let lines: Vec<&str> = printed.lines().collect();

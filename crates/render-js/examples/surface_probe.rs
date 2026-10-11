@@ -247,7 +247,7 @@ fn main() {
         );
         let result = runtime.execute(&mut dom, &source).map_or_else(
             |error| format!("ERR {error}"),
-            |outcome| outcome.value.to_js_string(),
+            |outcome| outcome.value.to_js_string().to_lossy(),
         );
         if result == "undefined" || result.starts_with("throws") || result.starts_with("ERR") {
             missing.push(format!("{name} -> {result}"));

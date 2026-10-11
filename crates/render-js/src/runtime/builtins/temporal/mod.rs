@@ -415,7 +415,7 @@ impl Realm {
             holder,
             &symbol,
             PropertyDescriptor {
-                value: JsValue::String(tag.to_owned()),
+                value: JsValue::String((tag.to_owned()).into()),
                 writable: false,
                 getter: None,
                 setter: None,

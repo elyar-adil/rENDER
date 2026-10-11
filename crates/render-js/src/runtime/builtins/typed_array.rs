@@ -20,6 +20,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
+use crate::utf16::JsString;
 use crate::value::ArrayView;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -348,8 +349,8 @@ impl JsRuntime {
             // converted like any other element (23.2.2.1 steps 5 and 6).
             JsValue::String(text) => {
                 let mut converted = Vec::new();
-                for character in text.chars() {
-                    let character = JsValue::String(character.to_string());
+                for character in text.code_point_strings() {
+                    let character = JsValue::String(character);
                     converted.push(self.typed_element_value(dom, kind, &character)?);
                 }
                 converted
@@ -573,8 +574,8 @@ impl JsRuntime {
             // element type like any other value.
             JsValue::String(text) => {
                 let mut values = Vec::new();
-                for character in text.chars() {
-                    let character = JsValue::String(character.to_string());
+                for character in text.code_point_strings() {
+                    let character = JsValue::String(character);
                     values.push(self.typed_element_value(dom, kind, &character)?);
                 }
                 values
@@ -1010,15 +1011,20 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
         let separator = match arguments.first() {
-            None | Some(JsValue::Undefined) => ",".to_owned(),
+            None | Some(JsValue::Undefined) => JsString::from(","),
             Some(value) => value.to_js_string(),
         };
         let elements = buffer.elements_value(kind, start, length)?;
-        let parts = elements
-            .iter()
-            .map(JsValue::to_js_string)
-            .collect::<Vec<_>>();
-        Ok(JsValue::String(parts.join(&separator)))
+        // ECMA-262 23.2.3.19: each element is ToString'd and the parts are joined
+        // by the separator's code units.
+        let mut joined = JsString::empty();
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                joined = joined.concat(&separator);
+            }
+            joined = joined.concat(&element.to_js_string());
+        }
+        Ok(JsValue::String(joined))
     }
 
     /// `%TypedArray%.prototype.keys()`: an iterator over the indices.
@@ -1361,7 +1367,7 @@ impl JsRuntime {
     /// and `undefined` for anything else (ECMA-262 23.2.3.32).
     fn typed_array_to_string_tag(&self, receiver: ObjectId) -> JsValue {
         match self.typed_array_parts(receiver) {
-            Ok((kind, _, _, _)) => JsValue::String(kind.name().to_owned()),
+            Ok((kind, _, _, _)) => JsValue::String((kind.name().to_owned()).into()),
             Err(_) => JsValue::Undefined,
         }
     }

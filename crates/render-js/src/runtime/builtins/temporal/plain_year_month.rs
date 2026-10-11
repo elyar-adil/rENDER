@@ -70,7 +70,7 @@ impl JsRuntime {
                 self.year_month_from_bag(&bag, constrain)
             }
             JsValue::String(text) => {
-                let Some(parsed) = super::parse::parse_year_month(text) else {
+                let Some(parsed) = super::parse::parse_year_month(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid ISO year-month string"));
                 };
                 if parsed.utc {
@@ -348,16 +348,14 @@ impl JsRuntime {
             TemporalMethod::ToString => {
                 let date = self.year_month_of(receiver)?;
                 Ok(JsValue::String(
-                    self.year_month_to_string(dom, date, &first)?,
+                    self.year_month_to_string(dom, date, &first)?.into(),
                 ))
             }
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let date = self.year_month_of(receiver)?;
-                Ok(JsValue::String(format!(
-                    "{}-{:02}",
-                    year_text(date.year),
-                    date.month
-                )))
+                Ok(JsValue::String(
+                    (format!("{}-{:02}", year_text(date.year), date.month)).into(),
+                ))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.PlainYearMonth cannot be converted to a primitive; use compare() or toString()",
@@ -391,11 +389,11 @@ impl JsRuntime {
 /// The `PlainYearMonth` getters, derived from the year and month.
 fn plain_year_month_getter(date: IsoDate, method: TemporalMethod) -> Result<JsValue, JsError> {
     Ok(match method {
-        TemporalMethod::CalendarId => JsValue::String("iso8601".to_owned()),
+        TemporalMethod::CalendarId => JsValue::String(("iso8601".to_owned()).into()),
         TemporalMethod::Era | TemporalMethod::EraYear => JsValue::Undefined,
         TemporalMethod::Year => JsValue::Number(f64::from(date.year)),
         TemporalMethod::Month => JsValue::Number(f64::from(date.month)),
-        TemporalMethod::MonthCode => JsValue::String(month_code(date.month)),
+        TemporalMethod::MonthCode => JsValue::String((month_code(date.month)).into()),
         TemporalMethod::DaysInYear => JsValue::Number(f64::from(days_in_year(date.year))),
         TemporalMethod::DaysInMonth => {
             JsValue::Number(f64::from(days_in_month(date.year, date.month)))

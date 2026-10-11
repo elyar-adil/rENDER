@@ -223,7 +223,7 @@ impl Coroutine {
                 },
                 JsValue::Undefined,
                 label.map_or(JsValue::Undefined, |label| {
-                    JsValue::String(label.to_string())
+                    JsValue::String((label.to_string()).into())
                 }),
             ),
         };
@@ -244,7 +244,7 @@ impl Coroutine {
             Pending::Return(value)
         } else if kind == PENDING_BREAK || kind == PENDING_CONTINUE {
             let label = match self.hidden(&format!("%l{slot}")) {
-                JsValue::String(label) => Some(Rc::from(label.as_str())),
+                JsValue::String(label) => Some(Rc::from(label.to_lossy().as_str())),
                 _ => None,
             };
             Pending::Jump {
@@ -436,7 +436,7 @@ impl JsRuntime {
     /// The value a script sees for `error`: the thrown value, or an Error object.
     pub(super) fn error_value(&mut self, error: &JsError) -> JsValue {
         self.error_to_thrown_value(error)
-            .unwrap_or_else(|_| JsValue::String(error.message().to_owned()))
+            .unwrap_or_else(|_| JsValue::String((error.message().to_owned()).into()))
     }
 
     fn reject_with_error(&mut self, promise: usize, error: &JsError) {
@@ -899,7 +899,10 @@ impl JsRuntime {
                         })?,
                     _ => Vec::new(),
                 };
-                let names: Vec<JsValue> = names.into_iter().map(JsValue::String).collect();
+                let names: Vec<JsValue> = names
+                    .into_iter()
+                    .map(|key| JsValue::String(crate::utf16::JsString::from_key(&key)))
+                    .collect();
                 let list = self.create_array_from_values(&names)?;
                 if binding.kind == VariableKind::Var {
                     self.create_binding(

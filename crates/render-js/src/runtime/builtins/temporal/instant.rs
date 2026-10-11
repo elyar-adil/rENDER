@@ -100,7 +100,7 @@ impl JsRuntime {
                 let text = self.to_string_checked(dom, item)?;
                 self.instant_from_text(&text)
             }
-            JsValue::String(text) => self.instant_from_text(text),
+            JsValue::String(text) => self.instant_from_text(&(text).to_lossy()),
             _ => Err(JsError::type_error(
                 "expected a Temporal.Instant or an ISO string",
             )),
@@ -228,7 +228,7 @@ impl JsRuntime {
                 return Err(JsError::type_error("round requires an options argument"));
             }
             JsValue::String(text) => {
-                let Some(unit) = Unit::parse(text) else {
+                let Some(unit) = Unit::parse(&(text).to_lossy()) else {
                     return Err(self.range_error("invalid smallestUnit"));
                 };
                 (1, RoundingMode::HalfExpand, Some(unit))
@@ -355,13 +355,13 @@ impl JsRuntime {
             TemporalMethod::ToString => {
                 let nanos = self.instant_of(receiver)?;
                 let text = self.instant_to_string(dom, nanos, &first)?;
-                Ok(JsValue::String(text))
+                Ok(JsValue::String((text).into()))
             }
             // `toJSON` and `toLocaleString` take no options, so none are read.
             TemporalMethod::ToJSON | TemporalMethod::ToLocaleString => {
                 let nanos = self.instant_of(receiver)?;
                 let text = self.instant_to_string(dom, nanos, &JsValue::Undefined)?;
-                Ok(JsValue::String(text))
+                Ok(JsValue::String((text).into()))
             }
             TemporalMethod::ValueOf => Err(JsError::type_error(
                 "Temporal.Instant cannot be converted to a primitive; use compare() or toString()",

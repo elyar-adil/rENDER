@@ -22,6 +22,7 @@ use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
 use crate::runtime::types::RegexRecord;
 use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::ObjectHost;
 use crate::value::{NativeFunction, RegExpAccessor};
 use render_dom::Dom;
@@ -62,10 +63,10 @@ impl JsRuntime {
     /// Compile `pattern` with `flags` and allocate a `RegExp` instance.
     pub(in crate::runtime) fn construct_regex(
         &mut self,
-        pattern: &str,
+        pattern: &JsString,
         flags: &str,
     ) -> Result<ObjectId, JsError> {
-        let key = (pattern.to_owned(), flags.to_owned());
+        let key = (pattern.to_key(), flags.to_owned());
         let compiled = if let Some(compiled) = self.regex_cache.get(&key) {
             std::rc::Rc::clone(compiled)
         } else {
@@ -129,8 +130,8 @@ impl JsRuntime {
         let (source, flag_value) = match (record, &pattern) {
             (Some(index), _) => {
                 let compiled = &self.regexes[index].compiled;
-                let original = JsValue::String(compiled.flags().describe());
-                let source = JsValue::String(compiled.source().to_owned());
+                let original = JsValue::String((compiled.flags().describe()).into());
+                let source = JsValue::String(compiled.source());
                 let flag_value = if matches!(flags, JsValue::Undefined) {
                     original
                 } else {
@@ -150,12 +151,12 @@ impl JsRuntime {
             _ => (pattern.clone(), flags.clone()),
         };
         let source = match source {
-            JsValue::Undefined => String::new(),
+            JsValue::Undefined => JsString::empty(),
             value => self.to_string_coerced(dom, &value)?,
         };
         let flags_text = match flag_value {
             JsValue::Undefined => String::new(),
-            value => self.to_string_coerced(dom, &value)?,
+            value => self.to_string_coerced(dom, &value)?.to_lossy(),
         };
         let object = self.construct_regex(&source, &flags_text)?;
         Ok(JsValue::Object(object))
@@ -180,7 +181,7 @@ impl JsRuntime {
             let value = match accessor {
                 RegExpAccessor::Source => {
                     return Ok(JsValue::String(escaped_source(
-                        self.regexes[index].compiled.source(),
+                        &self.regexes[index].compiled.source(),
                     )));
                 }
                 RegExpAccessor::Flags => unreachable!("handled above"),
@@ -203,7 +204,7 @@ impl JsRuntime {
             ));
         }
         Ok(match accessor {
-            RegExpAccessor::Source => JsValue::String("(?:)".to_owned()),
+            RegExpAccessor::Source => JsValue::String(("(?:)".to_owned()).into()),
             _ => JsValue::Undefined,
         })
     }
@@ -236,7 +237,7 @@ impl JsRuntime {
                 text.push(letter);
             }
         }
-        Ok(JsValue::String(text))
+        Ok(JsValue::String((text).into()))
     }
 
     /// The flag `accessor` reads from `receiver`'s record, when `Get(receiver,
@@ -308,18 +309,18 @@ impl JsRuntime {
     pub(in crate::runtime) fn regex_result(
         &mut self,
         input: &[u16],
-        text: &str,
+        text: &JsString,
         found: &MatchRanges,
         has_indices: bool,
     ) -> Result<JsValue, JsError> {
         let mut values = Vec::with_capacity(found.groups.len() + 1);
-        values.push(JsValue::String(utf16::string_from_utf16(
+        values.push(JsValue::String(utf16::JsString::from_units(
             &input[found.start..found.end],
         )));
         for group in &found.groups {
             values.push(match group {
                 Some((start, end)) => {
-                    JsValue::String(utf16::string_from_utf16(&input[*start..*end]))
+                    JsValue::String(utf16::JsString::from_units(&input[*start..*end]))
                 }
                 None => JsValue::Undefined,
             });
@@ -331,7 +332,7 @@ impl JsRuntime {
             JsValue::Number(found.start as f64),
         );
         self.realm
-            .set_property(array, "input".to_owned(), JsValue::String(text.to_owned()));
+            .set_property(array, "input".to_owned(), JsValue::String(text.clone()));
         let groups = if found.names.is_empty() {
             JsValue::Undefined
         } else {
@@ -413,7 +414,7 @@ impl JsRuntime {
         for (name, index) in found.names.iter() {
             let value = match found.groups.get(index - 1) {
                 Some(Some((start, end))) => {
-                    JsValue::String(utf16::string_from_utf16(&input[*start..*end]))
+                    JsValue::String(utf16::JsString::from_units(&input[*start..*end]))
                 }
                 _ => JsValue::Undefined,
             };
@@ -455,7 +456,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let argument = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let text = self.to_string_value(dom, &argument)?;
-        let input = utf16::utf16_units(&text);
+        let input = text.units().to_vec();
         Ok(JsValue::Boolean(!matches!(
             self.regexp_exec_step(dom, receiver, &text, &input)?,
             crate::runtime::builtins::regexp_symbols::Exec::None
@@ -467,9 +468,11 @@ impl JsRuntime {
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
-        let source = escaped_source(self.regexes[index].compiled.source());
+        let source = escaped_source(&self.regexes[index].compiled.source());
         let flags = self.regexes[index].compiled.flags().describe();
-        Ok(JsValue::String(format!("/{source}/{flags}")))
+        Ok(JsValue::String(JsString::from(format!(
+            "/{source}/{flags}"
+        ))))
     }
 
     /// `RegExp.escape(string)`: the source text that matches `string` literally.
@@ -482,7 +485,7 @@ impl JsRuntime {
         let JsValue::String(text) = arguments.first().cloned().unwrap_or(JsValue::Undefined) else {
             return Err(JsError::type_error("RegExp.escape requires a string"));
         };
-        let units = utf16::utf16_units(&text);
+        let units = text.units().to_vec();
         let mut output = String::with_capacity(text.len() * 2);
         let mut index = 0usize;
         while index < units.len() {
@@ -501,52 +504,64 @@ impl JsRuntime {
             escape_regexp_code_point(code, first, &mut output);
             index += length;
         }
-        Ok(JsValue::String(output))
+        Ok(JsValue::String((output).into()))
     }
 }
 
 /// `EscapeRegExpPattern` (ECMA-262 22.2.6.13.1) behind the `source` getter: the
 /// empty pattern reads `(?:)`, an unescaped `/` outside a class is escaped, and
 /// a line terminator is written as its escape so the source stays one line.
-fn escaped_source(source: &str) -> String {
+fn escaped_source(source: &JsString) -> JsString {
+    const BACKSLASH: u16 = 0x5C;
+    const SLASH: u16 = 0x2F;
+    const LEFT_BRACKET: u16 = 0x5B;
+    const RIGHT_BRACKET: u16 = 0x5D;
+    const LF: u16 = 0x0A;
+    const CR: u16 = 0x0D;
+    const LINE_SEPARATOR: u16 = 0x2028;
+    const PARAGRAPH_SEPARATOR: u16 = 0x2029;
+
     if source.is_empty() {
-        return "(?:)".to_owned();
+        return JsString::from("(?:)");
     }
-    let mut output = String::with_capacity(source.len());
+    // Every rewritten unit is one code unit, so the walk is over units and a
+    // lone surrogate passes through untouched.
+    let mut output: Vec<u16> = Vec::with_capacity(source.len());
     let mut in_class = false;
-    let mut characters = source.chars();
-    while let Some(character) = characters.next() {
-        match character {
-            '\\' => {
-                output.push('\\');
-                // A backslash escapes the next character, which is copied
-                // as written; a line terminator after it is written escaped.
-                match characters.next() {
-                    Some('\n') => output.push('n'),
-                    Some('\r') => output.push('r'),
-                    Some('\u{2028}') => output.push_str("u2028"),
-                    Some('\u{2029}') => output.push_str("u2029"),
-                    Some(next) => output.push(next),
-                    None => {}
+    let mut units = source.units().iter().copied();
+    while let Some(unit) = units.next() {
+        match unit {
+            BACKSLASH => {
+                output.push(unit);
+                // A backslash escapes the next unit, which is copied as written;
+                // a line terminator after it is written escaped.
+                if let Some(next) = units.next() {
+                    match next {
+                        LF => output.extend("n".encode_utf16()),
+                        CR => output.extend("r".encode_utf16()),
+                        LINE_SEPARATOR => output.extend("u2028".encode_utf16()),
+                        PARAGRAPH_SEPARATOR => output.extend("u2029".encode_utf16()),
+                        other => output.push(other),
+                    }
                 }
             }
-            '[' => {
+            LEFT_BRACKET => {
                 in_class = true;
-                output.push(character);
+                output.push(unit);
             }
-            ']' => {
+            RIGHT_BRACKET => {
                 in_class = false;
-                output.push(character);
+                output.push(unit);
             }
-            '/' if !in_class => output.push_str("\\/"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\u{2028}' => output.push_str("\\u2028"),
-            '\u{2029}' => output.push_str("\\u2029"),
+            SLASH if !in_class => output.extend("\\/".encode_utf16()),
+            LF => output.extend("\\n".encode_utf16()),
+            CR => output.extend("\\r".encode_utf16()),
+            LINE_SEPARATOR => output.extend("\\u2028".encode_utf16()),
+            PARAGRAPH_SEPARATOR => output.extend("\\u2029".encode_utf16()),
             other => output.push(other),
         }
     }
-    output
+    JsString::from_unit_vec(output)
 }
 
 /// `EncodeForRegExpEscape` (RegExp.escape proposal) for one code point, appended

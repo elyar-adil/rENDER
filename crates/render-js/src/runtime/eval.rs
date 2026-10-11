@@ -66,6 +66,7 @@ use crate::runtime::types::NavigationRequest;
 use crate::runtime::types::ThisContext;
 use crate::runtime::types::UserFunction;
 use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -161,8 +162,9 @@ impl ArrayDestructuring {
         // replacing `Array.prototype[@@iterator]` is observable (ECMA-262 8.6.2).
         if let JsValue::String(text) = value {
             let values = text
-                .chars()
-                .map(|character| JsValue::String(character.to_string()))
+                .code_point_strings()
+                .into_iter()
+                .map(JsValue::String)
                 .collect();
             return Ok(Self::over(values));
         }
@@ -331,8 +333,10 @@ fn property_key_function_name(key: &JsValue) -> String {
     match key {
         JsValue::Symbol(symbol) => symbol
             .description()
-            .map_or_else(String::new, |description| format!("[{description}]")),
-        other => other.to_js_string(),
+            .map_or_else(String::new, |description| {
+                format!("[{}]", description.to_key())
+            }),
+        other => other.to_js_string().to_key(),
     }
 }
 
@@ -357,7 +361,7 @@ fn describe_source(value: &JsValue) -> String {
         JsValue::BigInt(value) => format!("bigint {}", value.to_string_radix(10)),
         JsValue::Boolean(value) => format!("boolean {value}"),
         JsValue::Symbol(_) => "symbol".to_owned(),
-        JsValue::String(text) => text.clone(),
+        JsValue::String(text) => (text.clone()).to_lossy(),
     }
 }
 
@@ -962,11 +966,11 @@ impl JsRuntime {
                     {
                         JsError::thrown_with_message(
                             value,
-                            self.error_to_string(dom, object).to_js_string(),
+                            self.error_to_string(dom, object).to_js_string().to_lossy(),
                         )
                     }
                     value => match object_message {
-                        Some(message) => JsError::thrown_with_message(value, message),
+                        Some(message) => JsError::thrown_with_message(value, message.to_lossy()),
                         None => JsError::thrown(value),
                     },
                 };
@@ -1298,7 +1302,7 @@ impl JsRuntime {
                 environment.borrow_mut().bindings.insert(
                     name.to_owned(),
                     Binding {
-                        value: JsValue::String(property.clone()),
+                        value: JsValue::String((property.clone()).into()),
                         mutable: !kind.is_immutable(),
                         initialized: true,
                         kind,
@@ -1308,7 +1312,7 @@ impl JsRuntime {
                 Some(environment)
             };
             if kind == VariableKind::Var {
-                self.assign_binding(dom, name, JsValue::String(property))?;
+                self.assign_binding(dom, name, JsValue::String((property).into()))?;
             }
             let completion = self.evaluate_statement(dom, body);
             if iteration_environment.is_some() {
@@ -1349,7 +1353,11 @@ impl JsRuntime {
         for property in names {
             self.consume_step()?;
             let reference = self.resolve_assignment_reference(dom, target)?;
-            self.write_assignment_reference(dom, &reference, JsValue::String(property.clone()))?;
+            self.write_assignment_reference(
+                dom,
+                &reference,
+                JsValue::String((property.clone()).into()),
+            )?;
             match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                 Completion::Normal(next) => value = next,
                 Completion::Continue(None) => {}
@@ -1616,7 +1624,7 @@ impl JsRuntime {
             // the hole itself; evaluated on its own it is `undefined`.
             Expr::Elision => Ok(JsValue::Undefined),
             Expr::RegexLiteral { pattern, flags, .. } => {
-                let object = self.construct_regex(pattern, flags)?;
+                let object = self.construct_regex(&JsString::from(pattern.as_str()), flags)?;
                 Ok(JsValue::Object(object))
             }
             Expr::This => self.current_this(),
@@ -1650,7 +1658,7 @@ impl JsRuntime {
                 self.current_this()?;
                 let key = self.evaluate(dom, property)?;
                 let key = self.to_property_key_value(dom, key)?.to_js_string();
-                self.read_super_property(dom, &key)
+                self.read_super_property(dom, &(key).to_key())
             }
             Expr::SuperCall { arguments, .. } => {
                 let class = self.class_frame().ok_or_else(|| {
@@ -1748,7 +1756,7 @@ impl JsRuntime {
                 };
                 let scope = self.resolve_name(dom, name)?;
                 if scope.is_none() && !self.global_name_exists(name) {
-                    return Ok(JsValue::String("undefined".to_owned()));
+                    return Ok(JsValue::String(("undefined".to_owned()).into()));
                 }
                 let value = self.read_resolved_binding(dom, scope, name)?;
                 self.evaluate_unary(dom, UnaryOp::Typeof, &value)
@@ -1809,13 +1817,14 @@ impl JsRuntime {
             } => {
                 let evaluated = self.evaluate(dom, object)?;
                 let key_value = self.evaluate(dom, property)?;
-                let receiver = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
+                let receiver =
+                    self.coerce_member_base(&evaluated, &(key_value.to_js_string()).to_key())?;
                 let key_value = self.to_property_key_value(dom, key_value)?;
                 if let JsValue::Symbol(symbol) = &key_value {
                     return self.get_symbol_value(dom, receiver, symbol);
                 }
                 let key = key_value.to_js_string();
-                self.get_member(dom, receiver, &key)
+                self.get_member(dom, receiver, &(key).to_key())
             }
             Expr::New {
                 constructor,
@@ -1923,7 +1932,9 @@ impl JsRuntime {
                         let key = self.evaluate(dom, property)?;
                         let value = self.evaluate(dom, value)?;
                         let key = self.to_property_key_value(dom, key)?.to_js_string();
-                        let reference = AssignmentReference::SuperProperty { property: key };
+                        let reference = AssignmentReference::SuperProperty {
+                            property: (key).to_key(),
+                        };
                         self.write_assignment_reference(dom, &reference, value.clone())?;
                         return Ok(value);
                     }
@@ -1978,7 +1989,7 @@ impl JsRuntime {
     ) -> Result<(ObjectId, JsValue), JsError> {
         let evaluated = self.evaluate(dom, object)?;
         let key_value = self.evaluate(dom, property)?;
-        let object = self.coerce_member_base(&evaluated, &key_value.to_js_string())?;
+        let object = self.coerce_member_base(&evaluated, &(key_value.to_js_string()).to_key())?;
         Ok((object, key_value))
     }
 
@@ -1994,7 +2005,7 @@ impl JsRuntime {
             JsValue::Symbol(symbol) => Ok(AssignmentReference::SymbolProperty { object, symbol }),
             key => Ok(AssignmentReference::Property {
                 object,
-                property: key.to_js_string(),
+                property: (key.to_js_string()).to_key(),
             }),
         }
     }
@@ -2039,7 +2050,9 @@ impl JsRuntime {
             Expr::SuperComputedMember { property, .. } => {
                 let key = self.evaluate(dom, property)?;
                 let key = self.to_property_key_value(dom, key)?.to_js_string();
-                Ok(AssignmentReference::SuperProperty { property: key })
+                Ok(AssignmentReference::SuperProperty {
+                    property: (key).to_key(),
+                })
             }
             _ => Err(JsError::new(
                 JsErrorKind::Syntax,
@@ -2101,7 +2114,7 @@ impl JsRuntime {
                         PropertyKey::Static(name) => name.clone(),
                         PropertyKey::Computed(expression) => {
                             let computed = self.evaluate(dom, expression)?;
-                            self.to_property_key_value(dom, computed)?.to_js_string()
+                            (self.to_property_key_value(dom, computed)?.to_js_string()).to_key()
                         }
                         PropertyKey::Spread => {
                             unreachable!("the rest element is parsed separately")
@@ -2264,7 +2277,7 @@ impl JsRuntime {
                         PropertyKey::Static(key) => key.clone(),
                         PropertyKey::Computed(expression) => {
                             let computed = self.evaluate(dom, expression)?;
-                            self.to_property_key_value(dom, computed)?.to_js_string()
+                            (self.to_property_key_value(dom, computed)?.to_js_string()).to_key()
                         }
                         PropertyKey::Spread => unreachable!("spread handled above"),
                         PropertyKey::Private(_) => {
@@ -2532,8 +2545,9 @@ impl JsRuntime {
                 self.array_elements_for(dom, *object)
             }
             JsValue::String(text) => Ok(text
-                .chars()
-                .map(|character| JsValue::String(character.to_string()))
+                .code_point_strings()
+                .into_iter()
+                .map(JsValue::String)
                 .collect()),
             JsValue::Object(object) => {
                 if let Some((iterator, next)) = self.get_iterator(dom, value)? {
@@ -2806,7 +2820,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
-    ) -> Result<String, JsError> {
+    ) -> Result<JsString, JsError> {
         let primitive = self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::String)?;
         // The trace is for objects only, so a primitive does not pay for an
         // environment lookup on every conversion.
@@ -2831,7 +2845,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
-    ) -> Result<String, JsError> {
+    ) -> Result<JsString, JsError> {
         match value {
             JsValue::Symbol(_) => Err(JsError::type_error(
                 "Cannot convert a Symbol value to a string",
@@ -2841,15 +2855,18 @@ impl JsRuntime {
         }
     }
 
-    fn join_array_elements(&mut self, dom: &mut Dom, array: ObjectId) -> Result<String, JsError> {
-        let mut parts = Vec::new();
-        for value in self.array_elements_for(dom, array)? {
-            parts.push(match value {
-                JsValue::Null | JsValue::Undefined => String::new(),
-                value => self.to_string_value(dom, &value)?,
-            });
+    fn join_array_elements(&mut self, dom: &mut Dom, array: ObjectId) -> Result<JsString, JsError> {
+        // Joined on code units, so a lone surrogate element survives the join.
+        let mut units: Vec<u16> = Vec::new();
+        for (index, value) in self.array_elements_for(dom, array)?.into_iter().enumerate() {
+            if index > 0 {
+                units.push(u16::from(b','));
+            }
+            if !matches!(value, JsValue::Null | JsValue::Undefined) {
+                units.extend_from_slice(self.to_string_value(dom, &value)?.units());
+            }
         }
-        Ok(parts.join(","))
+        Ok(JsString::from_unit_vec(units))
     }
 
     pub(super) fn to_primitive_with_hint(
@@ -2874,7 +2891,7 @@ impl JsRuntime {
                 // cycle and contributes nothing (ECMA-262 leaves this to the
                 // host; every engine returns the empty string).
                 if self.arrays_joining.contains(&object) {
-                    return Ok(JsValue::String(String::new()));
+                    return Ok(JsValue::String((String::new()).into()));
                 }
                 self.arrays_joining.push(object);
                 let text = self.join_array_elements(dom, object);
@@ -2907,7 +2924,7 @@ impl JsRuntime {
                 let invoked = self.call_with_this(
                     dom,
                     method,
-                    &[JsValue::String(hint.name().to_owned())],
+                    &[JsValue::String((hint.name().to_owned()).into())],
                     JsValue::Object(object),
                 )?;
                 if !matches!(invoked, JsValue::Object(_)) {
@@ -2950,7 +2967,7 @@ impl JsRuntime {
                 "Cannot convert object to primitive value",
             ));
         }
-        Ok(JsValue::String("[object Object]".to_owned()))
+        Ok(JsValue::String(("[object Object]".to_owned()).into()))
     }
 
     pub(super) fn evaluate_call(
@@ -3013,7 +3030,7 @@ impl JsRuntime {
             Expr::SuperComputedMember { property, .. } => {
                 let key = self.evaluate(dom, property)?;
                 let key = self.to_property_key_value(dom, key)?.to_js_string();
-                let value = self.read_super_property(dom, &key)?;
+                let value = self.read_super_property(dom, &(key).to_key())?;
                 let receiver = self.current_this()?;
                 (value, receiver)
             }
@@ -3040,13 +3057,14 @@ impl JsRuntime {
                     return Ok(None);
                 }
                 let key_value = self.evaluate(dom, property)?;
-                let object = self.coerce_member_base(&receiver, &key_value.to_js_string())?;
+                let object =
+                    self.coerce_member_base(&receiver, &(key_value.to_js_string()).to_key())?;
                 let key_value = self.to_property_key_value(dom, key_value)?;
                 let key = key_value.to_js_string();
                 let callee = if let JsValue::Symbol(symbol) = &key_value {
                     self.get_symbol_value(dom, object, symbol)?
                 } else {
-                    self.get_member(dom, object, &key)?
+                    self.get_member(dom, object, &(key).to_key())?
                 };
                 (callee, receiver)
             }
@@ -3107,13 +3125,16 @@ impl JsRuntime {
     /// property holds the unprocessed texts. The indices are ordinary data
     /// properties; only `raw` is non-enumerable, so a tag function can walk the
     /// strings with `for`/`map` exactly as it walks a real array.
-    fn create_template_object(&mut self, quasis: &[(String, String)]) -> Result<ObjectId, JsError> {
+    fn create_template_object(
+        &mut self,
+        quasis: &[(JsString, String)],
+    ) -> Result<ObjectId, JsError> {
         self.ensure_heap_capacity(2)?;
         let mut cooked = Vec::with_capacity(quasis.len());
         let mut raw = Vec::with_capacity(quasis.len());
         for (cooked_value, raw_value) in quasis {
             cooked.push(JsValue::String(cooked_value.clone()));
-            raw.push(JsValue::String(raw_value.clone()));
+            raw.push(JsValue::String(JsString::from(raw_value.as_str())));
         }
         let raw_object = self.create_array_from_values(&raw)?;
         let template = self.create_array_from_values(&cooked)?;
@@ -3216,11 +3237,12 @@ impl JsRuntime {
                         }
                     }
                     JsValue::String(text) => {
-                        for (index, character) in text.chars().enumerate() {
+                        for (index, character) in text.code_point_strings().into_iter().enumerate()
+                        {
                             if !self.realm.set_property(
                                 object,
                                 index.to_string(),
-                                JsValue::String(character.to_string()),
+                                JsValue::String(character),
                             ) {
                                 return Err(JsError::type_error(
                                     "could not define spread string property",
@@ -3238,7 +3260,7 @@ impl JsRuntime {
             // The key expression evaluates exactly once (spec); a symbol
             // result installs a symbol-keyed property instead.
             let key_value = match &property.key {
-                PropertyKey::Static(key) => JsValue::String(key.clone()),
+                PropertyKey::Static(key) => JsValue::String((key.clone()).into()),
                 PropertyKey::Computed(expression) => {
                     let computed = self.evaluate(dom, expression)?;
                     self.to_property_key_value(dom, computed)?
@@ -3310,7 +3332,7 @@ impl JsRuntime {
                 };
                 let existing = match &symbol_key {
                     Some(symbol) => self.realm.own_symbol_property(object, symbol),
-                    None => self.realm.own_property(object, &key),
+                    None => self.realm.own_property(object, &(key).to_key()),
                 };
                 let (getter, setter) = match (accessor, existing) {
                     (ObjectAccessorKind::Getter, Some(existing)) => {
@@ -3334,7 +3356,7 @@ impl JsRuntime {
                     Some(symbol) => self
                         .realm
                         .define_symbol_property(object, symbol, descriptor),
-                    None => self.realm.define_property(object, key, descriptor),
+                    None => self.realm.define_property(object, key.to_key(), descriptor),
                 };
                 if !defined {
                     return Err(JsError::type_error("could not define object accessor"));
@@ -3358,7 +3380,7 @@ impl JsRuntime {
                 }
                 continue;
             }
-            if !self.realm.set_property(object, key, value) {
+            if !self.realm.set_property(object, (key).to_key(), value) {
                 return Err(JsError::type_error("could not define object property"));
             }
         }
@@ -3461,7 +3483,7 @@ impl JsRuntime {
         match operator {
             UnaryOp::Not => Ok(JsValue::Boolean(!value.is_truthy())),
             UnaryOp::Typeof => Ok(JsValue::String(
-                match value {
+                (match value {
                     JsValue::Undefined => "undefined",
                     JsValue::Object(object) if Self::is_callable_object(*object, &self.realm) => {
                         "function"
@@ -3473,7 +3495,8 @@ impl JsRuntime {
                     JsValue::String(_) => "string",
                     JsValue::Symbol(_) => "symbol",
                 }
-                .to_owned(),
+                .to_owned())
+                .into(),
             )),
             // Unary `+` is `ToNumber`, which throws for a BigInt; `-` and `~`
             // are `ToNumeric` and keep a BigInt operand a BigInt.
@@ -3556,9 +3579,9 @@ impl JsRuntime {
             BinaryOp::LogicalAnd | BinaryOp::LogicalOr | BinaryOp::Nullish => return Ok(right),
             BinaryOp::TemplateConcat => {
                 let text = self.template_substitution_text(dom, &right)?;
-                let mut units = utf16::utf16_units(&left.to_js_string());
-                units.extend(utf16::utf16_units(&text));
-                return Ok(JsValue::String(utf16::string_from_utf16(&units)));
+                let mut units = left.to_js_string().units().to_vec();
+                units.extend(text.units().to_vec());
+                return Ok(JsValue::String(utf16::JsString::from_units(&units)));
             }
             BinaryOp::Less | BinaryOp::LessEqual | BinaryOp::Greater | BinaryOp::GreaterEqual => {
                 let left = self.to_primitive_with_hint(dom, left, PrimitiveHint::Number)?;
@@ -3579,17 +3602,15 @@ impl JsRuntime {
                     ));
                 }
                 // `+` on strings is §13.15.2 `StringAdd`, which concatenates
-                // two code-unit sequences. The engine holds a lone surrogate
-                // as a private-use placeholder, so a plain `format!` would
-                // keep two halves of a pair as two separate placeholders and
-                // `'\uD83D' + '\uDE00'` would not equal `'\u{1F600}'`.
-                // Decoding through the code units re-joins them, which is
-                // what makes `charAt(0) + charAt(1)` and
+                // two code-unit sequences. Joining the units (rather than
+                // rendering both sides as text) keeps a lone surrogate on each
+                // side, so `'\uD83D' + '\uDE00'` equals `'\u{1F600}'`, and
+                // `charAt(0) + charAt(1)` and
                 // `String.fromCharCode(0xD83D) + String.fromCharCode(0xDE00)`
                 // both answer the original pair.
-                let mut units = utf16::utf16_units(&left.to_js_string());
-                units.extend(utf16::utf16_units(&right.to_js_string()));
-                return Ok(JsValue::String(utf16::string_from_utf16(&units)));
+                let mut units = left.to_js_string().units().to_vec();
+                units.extend(right.to_js_string().units().to_vec());
+                return Ok(JsValue::String(utf16::JsString::from_units(&units)));
             }
             (left, right)
         } else {
@@ -3700,22 +3721,22 @@ impl JsRuntime {
         match container {
             JsValue::Object(object) => {
                 if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) {
-                    return self.proxy_has(dom, *object, &name);
+                    return self.proxy_has(dom, *object, &(name).to_key());
                 }
-                if self.realm.get_property(*object, &name).is_some() {
+                if self.realm.get_property(*object, &(name).to_key()).is_some() {
                     return Ok(true);
                 }
                 if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(*object) {
                     // A String exotic object's indexed properties are numbered
                     // in code units, so `2 in '\u{1F600}'` is false and
                     // `1 in '\u{1F600}'` is true.
-                    if let Ok(index) = name.parse::<usize>() {
-                        return Ok(index < utf16::utf16_length(&text));
+                    if let Ok(index) = name.to_lossy().parse::<usize>() {
+                        return Ok(index < text.len());
                     }
                     return Ok(name == "length");
                 }
                 // Not an own property: a proxy on the prototype chain answers.
-                self.has_property_value(dom, *object, &PropertyName::String(name))
+                self.has_property_value(dom, *object, &PropertyName::String((name).to_key()))
             }
             _ => Err(JsError::type_error(
                 "right-hand side of 'in' must be an object",
@@ -3987,7 +4008,7 @@ impl JsRuntime {
     ) -> Result<bool, JsError> {
         if !self.property_in(
             dom,
-            &JsValue::String(name.to_owned()),
+            &JsValue::String((name.to_owned()).into()),
             &JsValue::Object(object),
         )? {
             return Ok(false);
@@ -4012,7 +4033,7 @@ impl JsRuntime {
     ) -> Result<(), JsError> {
         let _still_exists = self.property_in(
             dom,
-            &JsValue::String(name.to_owned()),
+            &JsValue::String((name.to_owned()).into()),
             &JsValue::Object(object),
         )?;
         self.set_member(dom, object, name, value)
@@ -4034,7 +4055,7 @@ impl JsRuntime {
             // 9.1.1.2.6): a property that has gone reads as `undefined`.
             if !self.property_in(
                 dom,
-                &JsValue::String(name.to_owned()),
+                &JsValue::String((name.to_owned()).into()),
                 &JsValue::Object(object),
             )? {
                 return Ok(JsValue::Undefined);
@@ -4246,12 +4267,12 @@ impl JsRuntime {
                         Some(other) => other.name().to_owned(),
                         None => String::new(),
                     };
-                    return Ok(JsValue::String(name));
+                    return Ok(JsValue::String((name).into()));
                 }
                 "nodeValue" | "data" => {
                     return Ok(match dom.node(node_id).map(render_dom::Node::kind) {
                         Some(NodeKind::Text(data) | NodeKind::Comment(data)) => {
-                            JsValue::String(data.clone())
+                            JsValue::String((data.clone()).into())
                         }
                         _ => JsValue::Null,
                     });
@@ -4307,10 +4328,12 @@ impl JsRuntime {
                     return Ok(JsValue::Object(self.create_array_from_values(&values)?));
                 }
                 "readyState" => {
-                    return Ok(JsValue::String(self.ready_state.as_str().to_owned()));
+                    return Ok(JsValue::String(
+                        (self.ready_state.as_str().to_owned()).into(),
+                    ));
                 }
                 "cookie" => {
-                    return Ok(JsValue::String(self.js_cookie_jar_serialize()));
+                    return Ok(JsValue::String((self.js_cookie_jar_serialize()).into()));
                 }
                 // The embedding window is the realm's global object.
                 "defaultView" | "parentWindow" => {
@@ -4331,11 +4354,15 @@ impl JsRuntime {
                 "size" => {
                     return Ok(JsValue::Number(bytes.len() as f64));
                 }
-                "type" => return Ok(JsValue::String(content_type.clone())),
+                "type" => return Ok(JsValue::String((content_type.clone()).into())),
                 _ => {}
             },
             Some(ObjectHost::Node(node)) => match property {
-                "textContent" => return self.text_content(dom, node).map(JsValue::String),
+                "textContent" => {
+                    return self
+                        .text_content(dom, node)
+                        .map(|text| JsValue::String(JsString::from(text)));
+                }
                 "clientWidth" | "offsetWidth" | "scrollWidth" => {
                     let width = self
                         .element_geometry
@@ -4372,11 +4399,11 @@ impl JsRuntime {
                     } else {
                         serialize_html_node(dom, node)
                     };
-                    return Ok(JsValue::String(html));
+                    return Ok(JsValue::String((html).into()));
                 }
                 "className" => {
                     return Ok(JsValue::String(
-                        dom.attribute(node, "class")?.unwrap_or_default().to_owned(),
+                        (dom.attribute(node, "class")?.unwrap_or_default().to_owned()).into(),
                     ));
                 }
                 "parentNode" | "parentElement" => {
@@ -4444,9 +4471,10 @@ impl JsRuntime {
                         return Ok(JsValue::Boolean(dom.attribute(node, attribute)?.is_some()));
                     }
                     return Ok(JsValue::String(
-                        dom.attribute(node, attribute)?
+                        (dom.attribute(node, attribute)?
                             .unwrap_or_default()
-                            .to_owned(),
+                            .to_owned())
+                        .into(),
                     ));
                 }
                 _ => {}
@@ -4491,9 +4519,9 @@ impl JsRuntime {
                     None => String::new(),
                 };
                 match property {
-                    "name" | "nodeName" => return Ok(JsValue::String(name.clone())),
+                    "name" | "nodeName" => return Ok(JsValue::String((name.clone()).into())),
                     "value" | "nodeValue" | "textContent" => {
-                        return Ok(JsValue::String(value));
+                        return Ok(JsValue::String((value).into()));
                     }
                     "specified" => return Ok(JsValue::Boolean(true)),
                     _ => {}
@@ -4510,7 +4538,7 @@ impl JsRuntime {
                 }
                 "value" => {
                     return Ok(JsValue::String(
-                        Self::class_list_tokens(dom, node)?.join(" "),
+                        (Self::class_list_tokens(dom, node)?.join(" ")).into(),
                     ));
                 }
                 _ => {}
@@ -4521,7 +4549,7 @@ impl JsRuntime {
                 // prototype-chain lookup; everything else falls through.
                 if let Some(value) = JsRuntime::dataset_member_attribute_value(dom, node, property)?
                 {
-                    return Ok(JsValue::String(value));
+                    return Ok(JsValue::String((value).into()));
                 }
             }
             Some(ObjectHost::CssStyleDeclaration(node)) => {
@@ -4538,7 +4566,7 @@ impl JsRuntime {
                         })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    return Ok(JsValue::String(text));
+                    return Ok(JsValue::String((text).into()));
                 }
                 if property == "length" || property.parse::<usize>().is_ok() {
                     let declarations = Self::inline_declarations(dom, node);
@@ -4552,7 +4580,7 @@ impl JsRuntime {
                     }
                     if let Ok(index) = property.parse::<usize>() {
                         return Ok(match declarations.get(index) {
-                            Some((name, _, _)) => JsValue::String(name.clone()),
+                            Some((name, _, _)) => JsValue::String((name.clone()).into()),
                             None => JsValue::Undefined,
                         });
                     }
@@ -4563,10 +4591,11 @@ impl JsRuntime {
                     let css_name = css_prop_from_member(property);
                     if is_valid_property_name(&css_name) {
                         return Ok(JsValue::String(
-                            Self::inline_declarations(dom, node)
+                            (Self::inline_declarations(dom, node)
                                 .into_iter()
                                 .find(|(name, _, _)| *name == css_name)
-                                .map_or_else(String::new, |(_, value, _)| value),
+                                .map_or_else(String::new, |(_, value, _)| value))
+                            .into(),
                         ));
                     }
                 }
@@ -4623,23 +4652,22 @@ impl JsRuntime {
                 }
             }
             Some(ObjectHost::StringPrimitive(text)) => {
-                let characters: Vec<char> = text.chars().collect();
+                // A String wrapper's indexed properties and `length` are code-unit
+                // views of the hosted value (ECMA-262 10.4.3.5).
                 match property {
                     "length" => {
                         #[allow(
                             clippy::cast_precision_loss,
                             reason = "string lengths stay far below any precision boundary"
                         )]
-                        let length = characters.len() as f64;
+                        let length = text.len() as f64;
                         return Ok(JsValue::Number(length));
                     }
                     _ => {
                         if let Ok(index) = property.parse::<usize>() {
-                            return Ok(characters
-                                .get(index)
-                                .map_or(JsValue::Undefined, |character| {
-                                    JsValue::String(character.to_string())
-                                }));
+                            return Ok(text.unit_at(index).map_or(JsValue::Undefined, |unit| {
+                                JsValue::String(JsString::from_unit(unit))
+                            }));
                         }
                     }
                 }
@@ -4833,7 +4861,7 @@ impl JsRuntime {
             Some(JsValue::Object(hook)) if reacts => hook,
             _ => return self.set_member_native(dom, object, property, value),
         };
-        let property_name = JsValue::String(property.to_owned());
+        let property_name = JsValue::String((property.to_owned()).into());
         let after = self.call(dom, hook, &[JsValue::Object(object), property_name])?;
         self.set_member_native(dom, object, property, value)?;
         if let JsValue::Object(after) = after {
@@ -4864,13 +4892,13 @@ impl JsRuntime {
         // `document.cookie = "name=value"`: store in the JS-visible jar.
         if property == "cookie" && matches!(self.realm.host(object), Some(ObjectHost::Document(_)))
         {
-            self.js_cookie_store(&value.to_js_string());
+            self.js_cookie_store(&(value.to_js_string()).to_lossy());
             return Ok(());
         }
         if let Some(base) = location_base {
             if property == "href" {
                 let target = value.to_js_string();
-                let resolved = base.join(&target).map_err(|error| {
+                let resolved = base.join(&(target).to_lossy()).map_err(|error| {
                     JsError::dom(format!("invalid navigation URL {target:?}: {error}"))
                 })?;
                 self.pending_navigations.push(NavigationRequest {
@@ -4884,14 +4912,14 @@ impl JsRuntime {
             )));
         }
         if let (Some(ObjectHost::Node(node)), "textContent") = (self.realm.host(object), property) {
-            return self.set_text_content(dom, node, value.to_js_string());
+            return self.set_text_content(dom, node, (value.to_js_string()).to_lossy());
         }
         if let (Some(ObjectHost::Node(node)), "innerHTML" | "outerHTML") =
             (self.realm.host(object), property)
         {
             let source = match &value {
                 JsValue::Null | JsValue::Undefined => String::new(),
-                other => other.to_js_string(),
+                other => (other.to_js_string()).to_lossy(),
             };
             if property == "innerHTML" {
                 return self.set_inner_html(dom, node, &source);
@@ -4901,7 +4929,7 @@ impl JsRuntime {
         if let Some(ObjectHost::CssStyleDeclaration(node)) = self.realm.host(object) {
             if property == "cssText" {
                 let source = value.to_js_string();
-                let declarations = parse_declaration_list(&source)
+                let declarations = parse_declaration_list(&(source).to_lossy())
                     .0
                     .into_iter()
                     .map(|declaration| {
@@ -4926,7 +4954,7 @@ impl JsRuntime {
                             .filter(|(name, _, _)| *name != css_name)
                             .collect();
                     let css_value = value.to_js_string();
-                    let css_value = css_value.trim().to_owned();
+                    let css_value = css_value.to_lossy().trim().to_owned();
                     if !css_value.is_empty() {
                         declarations.push((css_name.clone(), css_value, false));
                     }
@@ -5008,7 +5036,11 @@ impl JsRuntime {
             }
             Some(ObjectHost::Node(node)) => {
                 if property == "className" {
-                    return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
+                    return Ok(dom.set_attribute(
+                        node,
+                        "class",
+                        value.to_js_string().to_lossy(),
+                    )?);
                 }
                 if property.starts_with("on") && property.len() > 2 {
                     let event_type = property[2..].to_ascii_lowercase();
@@ -5032,11 +5064,15 @@ impl JsRuntime {
                     if node_boolean_property(property) && !value.is_truthy() {
                         return Ok(dom.remove_attribute(node, attribute)?);
                     }
-                    return Ok(dom.set_attribute(node, attribute, value.to_js_string())?);
+                    return Ok(dom.set_attribute(
+                        node,
+                        attribute,
+                        value.to_js_string().to_lossy(),
+                    )?);
                 }
             }
             Some(ObjectHost::ClassList(node)) if property == "value" => {
-                return Ok(dom.set_attribute(node, "class", value.to_js_string())?);
+                return Ok(dom.set_attribute(node, "class", value.to_js_string().to_lossy())?);
             }
             Some(ObjectHost::DataSet(node)) => {
                 // DOMStringMap writes go straight to the element's `data-*`
@@ -5051,7 +5087,7 @@ impl JsRuntime {
                     return Ok(());
                 }
                 if let Ok(index) = property.parse::<usize>()
-                    && index < utf16::utf16_length(&text)
+                    && index < text.len()
                 {
                     return Ok(());
                 }
@@ -5175,7 +5211,11 @@ impl JsRuntime {
             parts.push(self.to_string_value(dom, argument)?);
         }
         let body = parts.pop().unwrap_or_default();
-        let parameters = parts.join(",");
+        let parameters = parts
+            .iter()
+            .map(JsString::to_lossy)
+            .collect::<Vec<_>>()
+            .join(",");
         let source = format!("(function anonymous({parameters}\n) {{\n{body}\n}})");
         self.evaluate_function_source(dom, &source)
     }
@@ -5251,10 +5291,12 @@ impl JsRuntime {
             Some(ObjectHost::StringConstructor) => {
                 let text = match arguments.first() {
                     None => String::new(),
-                    Some(value) => self.to_string_value(dom, value)?,
+                    Some(value) => (self.to_string_value(dom, value)?).to_lossy(),
                 };
                 self.ensure_heap_capacity(1)?;
-                Ok(JsValue::Object(self.realm.string_wrapper(text)))
+                Ok(JsValue::Object(
+                    self.realm.string_wrapper(JsString::from(text)),
+                ))
             }
             Some(ObjectHost::NumberConstructor) => {
                 let number = match arguments.first() {
@@ -5544,7 +5586,7 @@ impl JsRuntime {
             Some(ObjectHost::ArrayConstructor) => self.array_constructor(arguments),
             Some(ObjectHost::FunctionConstructor) => self.function_constructor(dom, arguments),
             Some(ObjectHost::StringConstructor) => Ok(JsValue::String(match arguments.first() {
-                None => String::new(),
+                None => (String::new()).into(),
                 Some(value) => self.to_string_value(dom, value)?,
             })),
             Some(ObjectHost::NumberConstructor) => Ok(JsValue::Number(match arguments.first() {
@@ -5556,9 +5598,9 @@ impl JsRuntime {
                 arguments.first().is_some_and(JsValue::is_truthy),
             )),
             // `Date()` called as a function yields the current time string.
-            Some(ObjectHost::DateConstructor) => {
-                Ok(JsValue::String(Self::format_date_utc(Self::now_ms())))
-            }
+            Some(ObjectHost::DateConstructor) => Ok(JsValue::String(
+                (Self::format_date_utc(Self::now_ms())).into(),
+            )),
             Some(ObjectHost::SymbolInstance(_)) => {
                 Err(JsError::type_error("Symbol wrapper is not callable"))
             }
@@ -5676,7 +5718,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeToString)) => {
                 // `toString.call(primitive)` never materializes an object.
-                Ok(JsValue::String(self.object_to_string_tag(dom, &receiver)?))
+                Ok(JsValue::String(JsString::from(
+                    self.object_to_string_tag(dom, &receiver)?,
+                )))
             }
             // §20.1.3.7 `Object.prototype.valueOf` is `ToObject(this)`: a
             // primitive yields its wrapper, and a nullish receiver throws.
@@ -5706,15 +5750,15 @@ impl JsRuntime {
                 let name = self
                     .realm
                     .get_property(function, "name")
-                    .map_or_else(String::new, |value| value.to_js_string());
+                    .map_or_else(String::new, |value| (value.to_js_string()).to_lossy());
                 let native = !matches!(
                     self.realm.host(function),
                     Some(ObjectHost::UserFunction(_) | ObjectHost::ArrowFunction(_))
                 );
                 Ok(JsValue::String(if native {
-                    format!("function {name}() {{ [native code] }}")
+                    (format!("function {name}() {{ [native code] }}")).into()
                 } else {
-                    format!("function {name}() {{ }}")
+                    (format!("function {name}() {{ }}")).into()
                 }))
             }
             // §20.2.3.6 `Function.prototype[@@hasInstance](V)`: `this` is `C`.
@@ -5925,7 +5969,7 @@ impl JsRuntime {
         // name, which counts as "" unless it is a string.
         let target_name = match self.get_member(dom, target, "name")? {
             JsValue::String(name) => name,
-            _ => String::new(),
+            _ => JsString::empty(),
         };
         let bound = self
             .realm
@@ -5943,7 +5987,7 @@ impl JsRuntime {
         self.realm.define_property(
             bound,
             "name",
-            metadata(JsValue::String(format!("bound {target_name}"))),
+            metadata(JsValue::String((format!("bound {target_name}")).into())),
         );
         Ok(JsValue::Object(bound))
     }

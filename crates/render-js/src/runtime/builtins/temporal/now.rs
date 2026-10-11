@@ -42,7 +42,7 @@ impl JsRuntime {
             TemporalMethod::NowInstant => {
                 self.temporal_instance(TemporalKind::Instant, TemporalValue::Instant(nanos))
             }
-            TemporalMethod::NowTimeZoneId => Ok(JsValue::String("UTC".to_owned())),
+            TemporalMethod::NowTimeZoneId => Ok(JsValue::String(("UTC".to_owned()).into())),
             TemporalMethod::NowPlainDateIso => {
                 self.check_utc_argument(dom, &zone)?;
                 let date = datetime_from_epoch_nanos(nanos).date;

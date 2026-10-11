@@ -13,7 +13,7 @@ fn run(source: &str) -> Result<String, crate::JsError> {
     drain(&mut runtime, &mut dom);
     let outcome = runtime.execute(&mut dom, "log.join(',')")?;
     assert!(runtime.prelude_error().is_none());
-    Ok(outcome.value.to_js_string())
+    Ok(outcome.value.to_js_string().to_lossy())
 }
 
 fn drain(runtime: &mut JsRuntime, dom: &mut render_dom::Dom) {
@@ -413,7 +413,10 @@ fn suspended_coroutines_survive_garbage_collection() {
             "var r = it.next(); log.push(r.value.x, r.value.held.tag, it.next().value.x); log.join(',')",
         )
         .expect("resume");
-    assert_eq!(outcome.value.to_js_string(), "async-local,2,2,kept,3");
+    assert_eq!(
+        outcome.value.to_js_string().to_lossy(),
+        "async-local,2,2,kept,3"
+    );
 }
 
 #[test]

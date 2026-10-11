@@ -31,6 +31,7 @@ use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::PromiseRecord;
 use crate::runtime::types::RegexRecord;
 use crate::runtime::types::UserFunction;
+use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -380,19 +381,22 @@ impl JsRuntime {
 
     /// Allocate a fresh unique symbol; runtime symbols start above the
     /// well-known id range so identity never collides with bootstrap.
-    pub(super) fn create_symbol(&mut self, description: Option<String>) -> JsSymbol {
+    pub(super) fn create_symbol(&mut self, description: Option<JsString>) -> JsSymbol {
         self.next_symbol_id += 1;
         JsSymbol::new(self.next_symbol_id, description)
     }
 
     /// `Symbol.for(key)`: return the registered symbol or register a new one.
-    pub(super) fn symbol_for(&mut self, key: String) -> JsSymbol {
-        if let Some(id) = self.global_symbol_registry.get(&key) {
+    pub(super) fn symbol_for(&mut self, key: JsString) -> JsSymbol {
+        // The registry is keyed by the property-key form, so two strings share a
+        // symbol exactly when they have the same code units.
+        let registry_key = key.to_key();
+        if let Some(id) = self.global_symbol_registry.get(&registry_key) {
             return JsSymbol::new(*id, Some(key));
         }
         self.next_symbol_id += 1;
         let id = self.next_symbol_id;
-        self.global_symbol_registry.insert(key.clone(), id);
+        self.global_symbol_registry.insert(registry_key, id);
         JsSymbol::new(id, Some(key))
     }
 
@@ -406,7 +410,7 @@ impl JsRuntime {
         let Some(JsValue::Object(constructor)) = self.realm.global(kind.name()) else {
             return Err(JsError::resource(message.to_owned()));
         };
-        let argument = JsValue::String(message.to_owned());
+        let argument = JsValue::String((message.to_owned()).into());
         match self.error_constructor(constructor, kind, &[argument]) {
             Ok(instance) => Ok(instance),
             Err(_) => Err(JsError::resource(message.to_owned())),
@@ -450,7 +454,7 @@ impl JsRuntime {
         let url = match arguments.get(2) {
             None | Some(JsValue::Undefined) => current.clone(),
             Some(value) => current
-                .join(&value.to_js_string())
+                .join(&(value.to_js_string()).to_lossy())
                 .map_err(|error| JsError::dom(format!("invalid history URL: {error}")))?,
         };
         if !same_history_origin(&url, &current) {
@@ -612,14 +616,14 @@ impl JsRuntime {
                             let reason = error
                                 .thrown_value()
                                 .cloned()
-                                .unwrap_or_else(|| JsValue::String(error.to_string()));
+                                .unwrap_or_else(|| JsValue::String((error.to_string()).into()));
                             self.reject_promise(promise_index, &reason);
                         }
                     },
                     Err(message) => {
                         let reason = self
                             .construct_standard_error(ErrorKind::TypeError, &message)
-                            .unwrap_or_else(|_| JsValue::String(message.clone()));
+                            .unwrap_or_else(|_| JsValue::String((message.clone()).into()));
                         self.reject_promise(promise_index, &reason);
                     }
                 }
@@ -827,19 +831,22 @@ impl JsRuntime {
                 .get_property(*instance, "message")
                 .map(|value| value.to_js_string())
                 .filter(|message| !message.is_empty())
-                .unwrap_or_else(|| error.message().to_owned()),
-            _ => error.message().to_owned(),
+                .unwrap_or_else(|| (error.message().to_owned()).into()),
+            _ => JsString::from(error.message()),
         };
         let event = self.realm.create_object(prototype);
         for (name, value) in [
-            ("type", JsValue::String("error".to_owned())),
+            ("type", JsValue::String(("error".to_owned()).into())),
             ("bubbles", JsValue::Boolean(false)),
             ("cancelable", JsValue::Boolean(true)),
             ("defaultPrevented", JsValue::Boolean(false)),
             ("target", JsValue::Null),
             ("currentTarget", JsValue::Null),
             ("message", JsValue::String(message)),
-            ("filename", JsValue::String(self.document_url_string())),
+            (
+                "filename",
+                JsValue::String((self.document_url_string()).into()),
+            ),
             (
                 "lineno",
                 JsValue::Number(error.position().map_or(0.0, |(line, _)| line as f64)),
@@ -1049,7 +1056,7 @@ impl JsRuntime {
         let target = required_argument(arguments, 0, if replace { "replace" } else { "assign" })?
             .to_js_string();
         let resolved = base
-            .join(&target)
+            .join(&(target).to_lossy())
             .map_err(|error| JsError::dom(format!("invalid navigation URL {target:?}: {error}")))?;
         self.pending_navigations.push(NavigationRequest {
             url: resolved.to_string(),
@@ -1074,10 +1081,21 @@ impl JsRuntime {
 
     /// Surface a throw-ready `RangeError` instance with the given message.
     fn range_error(&mut self, message: &str) -> JsError {
-        let value = JsValue::String(message.to_owned());
-        match self.realm.global("RangeError") {
+        self.native_error("RangeError", ErrorKind::RangeError, message)
+    }
+
+    /// A `URIError` thrown from the engine (ECMA-262 19.2.6).
+    pub(super) fn uri_error(&mut self, message: &str) -> JsError {
+        self.native_error("URIError", ErrorKind::UriError, message)
+    }
+
+    /// A native error instance of the global constructor `name`, thrown as a
+    /// script exception. Without that constructor a `TypeError` stands in.
+    fn native_error(&mut self, name: &str, kind: ErrorKind, message: &str) -> JsError {
+        let value = JsValue::String(JsString::from(message));
+        match self.realm.global(name) {
             Some(JsValue::Object(constructor)) => {
-                match self.error_constructor(constructor, ErrorKind::RangeError, &[value]) {
+                match self.error_constructor(constructor, kind, &[value]) {
                     Ok(JsValue::Object(instance)) => JsError::thrown(JsValue::Object(instance)),
                     _ => JsError::type_error(message),
                 }

@@ -33,7 +33,7 @@ impl JsRuntime {
             .unwrap_or_default()
             .into_iter()
             .filter_map(|key| match self.realm.own_property(storage, &key)?.value {
-                JsValue::String(value) => Some((key, value)),
+                JsValue::String(value) => Some((key, value.to_lossy())),
                 _ => None,
             })
             .collect()
@@ -49,8 +49,11 @@ impl JsRuntime {
             self.realm.delete_property(storage, &key);
         }
         for (key, value) in entries {
-            self.realm
-                .set_property(storage, key.clone(), JsValue::String(value.clone()));
+            self.realm.set_property(
+                storage,
+                key.clone(),
+                JsValue::String((value.clone()).into()),
+            );
         }
     }
 
@@ -74,7 +77,7 @@ impl JsRuntime {
                 // `getItem` answers `null` for a missing key.
                 Ok(self
                     .realm
-                    .own_property(receiver, &key)
+                    .own_property(receiver, &(key).to_key())
                     .map_or(JsValue::Null, |descriptor| descriptor.value))
             }
             NativeFunction::StorageSetItem => {
@@ -82,7 +85,7 @@ impl JsRuntime {
                 let value = required_argument(arguments, 1, "setItem")?.to_js_string();
                 if !self
                     .realm
-                    .set_property(receiver, key, JsValue::String(value))
+                    .set_property(receiver, (key).to_key(), JsValue::String(value))
                 {
                     return Err(JsError::type_error("could not store the value"));
                 }
@@ -90,7 +93,7 @@ impl JsRuntime {
             }
             NativeFunction::StorageRemoveItem => {
                 let key = required_argument(arguments, 0, "removeItem")?.to_js_string();
-                self.realm.delete_property(receiver, &key);
+                self.realm.delete_property(receiver, &(key).to_key());
                 Ok(JsValue::Undefined)
             }
             NativeFunction::StorageClear => {
@@ -120,7 +123,7 @@ impl JsRuntime {
                     .own_property_names(receiver)
                     .and_then(|keys| keys.get(index).cloned())
                     .unwrap_or_default();
-                Ok(JsValue::String(key))
+                Ok(JsValue::String((key).into()))
             }
             other => Err(JsError::type_error(format!(
                 "unsupported storage native {other:?}"

@@ -11,7 +11,7 @@ use url::Url;
 use crate::bigint::JsBigInt;
 use crate::parser::FunctionKind;
 use crate::runtime::builtins::temporal::{TemporalKind, TemporalMethod, TemporalValue};
-use crate::utf16;
+use crate::utf16::JsString;
 
 /// Stable identity for an object allocated in a [`Realm`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,7 +41,7 @@ pub enum JsValue {
     Number(f64),
     /// The `BigInt` primitive (ECMA-262 6.1.6.2): an exact integer.
     BigInt(JsBigInt),
-    String(String),
+    String(JsString),
     Symbol(JsSymbol),
     Object(ObjectId),
 }
@@ -52,7 +52,7 @@ pub enum JsValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct JsSymbol {
     id: u64,
-    description: Option<String>,
+    description: Option<JsString>,
 }
 
 /// Symbol ids below this constant are reserved for the well-known symbols
@@ -60,7 +60,7 @@ pub struct JsSymbol {
 pub(crate) const FIRST_DYNAMIC_SYMBOL_ID: u64 = 1_000;
 
 impl JsSymbol {
-    pub(crate) const fn new(id: u64, description: Option<String>) -> Self {
+    pub(crate) const fn new(id: u64, description: Option<JsString>) -> Self {
         Self { id, description }
     }
 
@@ -71,21 +71,21 @@ impl JsSymbol {
     #[must_use]
     pub(crate) fn well_known(name: &str) -> Self {
         match name {
-            "@@iterator" => Self::new(1, Some("@@iterator".to_owned())),
-            "@@asyncIterator" => Self::new(2, Some("@@asyncIterator".to_owned())),
-            "@@toStringTag" => Self::new(3, Some("@@toStringTag".to_owned())),
-            "@@toPrimitive" => Self::new(4, Some("@@toPrimitive".to_owned())),
-            "@@hasInstance" => Self::new(5, Some("@@hasInstance".to_owned())),
-            "@@species" => Self::new(6, Some("@@species".to_owned())),
-            "@@isConcatSpreadable" => Self::new(7, Some("@@isConcatSpreadable".to_owned())),
-            "@@unscopables" => Self::new(8, Some("@@unscopables".to_owned())),
-            "@@match" => Self::new(9, Some("@@match".to_owned())),
-            "@@matchAll" => Self::new(10, Some("@@matchAll".to_owned())),
-            "@@replace" => Self::new(11, Some("@@replace".to_owned())),
-            "@@search" => Self::new(12, Some("@@search".to_owned())),
-            "@@split" => Self::new(13, Some("@@split".to_owned())),
-            "@@dispose" => Self::new(14, Some("Symbol.dispose".to_owned())),
-            "@@asyncDispose" => Self::new(15, Some("Symbol.asyncDispose".to_owned())),
+            "@@iterator" => Self::new(1, Some(JsString::from("@@iterator"))),
+            "@@asyncIterator" => Self::new(2, Some(JsString::from("@@asyncIterator"))),
+            "@@toStringTag" => Self::new(3, Some(JsString::from("@@toStringTag"))),
+            "@@toPrimitive" => Self::new(4, Some(JsString::from("@@toPrimitive"))),
+            "@@hasInstance" => Self::new(5, Some(JsString::from("@@hasInstance"))),
+            "@@species" => Self::new(6, Some(JsString::from("@@species"))),
+            "@@isConcatSpreadable" => Self::new(7, Some(JsString::from("@@isConcatSpreadable"))),
+            "@@unscopables" => Self::new(8, Some(JsString::from("@@unscopables"))),
+            "@@match" => Self::new(9, Some(JsString::from("@@match"))),
+            "@@matchAll" => Self::new(10, Some(JsString::from("@@matchAll"))),
+            "@@replace" => Self::new(11, Some(JsString::from("@@replace"))),
+            "@@search" => Self::new(12, Some(JsString::from("@@search"))),
+            "@@split" => Self::new(13, Some(JsString::from("@@split"))),
+            "@@dispose" => Self::new(14, Some(JsString::from("Symbol.dispose"))),
+            "@@asyncDispose" => Self::new(15, Some(JsString::from("Symbol.asyncDispose"))),
             _ => Self::new(0, None),
         }
     }
@@ -96,33 +96,37 @@ impl JsSymbol {
     }
 
     #[must_use]
-    pub fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    pub fn description(&self) -> Option<&JsString> {
+        self.description.as_ref()
     }
 
-    /// The canonical string form (`Symbol(description)` / `Symbol()`).
+    /// The canonical string form (`Symbol(description)` / `Symbol()`), as code
+    /// units so a lone surrogate in the description survives.
     #[must_use]
-    pub fn to_display(&self) -> String {
+    pub fn to_display(&self) -> JsString {
         match &self.description {
-            Some(description) => format!("Symbol({description})"),
-            None => "Symbol()".to_owned(),
+            Some(description) => JsString::from("Symbol(")
+                .concat(description)
+                .concat(&JsString::from(")")),
+            None => JsString::from("Symbol()"),
         }
     }
 }
 
 impl JsValue {
-    /// Apply the string conversion needed by the initial DOM bindings.
+    /// The string conversion of a primitive (ECMA-262 `ToString` for the
+    /// non-object cases), as a code-unit string.
     #[must_use]
-    pub fn to_js_string(&self) -> String {
+    pub fn to_js_string(&self) -> JsString {
         match self {
-            Self::Undefined => "undefined".to_owned(),
-            Self::Null => "null".to_owned(),
-            Self::Boolean(value) => value.to_string(),
-            Self::Number(value) => number_to_string(*value),
-            Self::BigInt(value) => value.to_string_radix(10),
             Self::String(value) => value.clone(),
+            Self::Undefined => JsString::from("undefined"),
+            Self::Null => JsString::from("null"),
+            Self::Boolean(value) => JsString::from(value.to_string()),
+            Self::Number(value) => JsString::from(number_to_string(*value)),
+            Self::BigInt(value) => JsString::from(value.to_string_radix(10)),
             Self::Symbol(symbol) => symbol.to_display(),
-            Self::Object(_) => "[object Object]".to_owned(),
+            Self::Object(_) => JsString::from("[object Object]"),
         }
     }
 }
@@ -328,14 +332,14 @@ fn is_canonical_index(key: &str) -> bool {
 /// enumerable:true, configurable:false; `length` is writable:false,
 /// enumerable:false, configurable:false. Ordinary properties are unaffected, so
 /// this is only consulted for keys the object does not already carry.
-fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
+fn string_exotic_property(text: &JsString, key: &str) -> Option<PropertyDescriptor> {
     if key == "length" {
         #[allow(
             clippy::cast_precision_loss,
             reason = "string lengths stay far below any precision boundary"
         )]
         return Some(PropertyDescriptor {
-            value: JsValue::Number(utf16::utf16_length(text) as f64),
+            value: JsValue::Number(text.len() as f64),
             writable: false,
             getter: None,
             setter: None,
@@ -347,14 +351,9 @@ fn string_exotic_property(text: &str, key: &str) -> Option<PropertyDescriptor> {
     if index.to_string() != key {
         return None;
     }
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "the canonical index form bounds the value at u32::MAX"
-    )]
-    let unit = utf16::utf16_units(text).get(index as usize).copied()?;
+    let unit = text.unit_at(usize::try_from(index).ok()?)?;
     Some(PropertyDescriptor {
-        value: JsValue::String(utf16::string_from_unit(unit)),
+        value: JsValue::String(JsString::from_units([unit])),
         writable: false,
         getter: None,
         setter: None,
@@ -1966,7 +1965,7 @@ pub(crate) enum ObjectHost {
     SymbolInstance(JsSymbol),
     BigIntPrimitive(JsBigInt),
     ArrayConstructor,
-    StringPrimitive(String),
+    StringPrimitive(JsString),
     NumberPrimitive(f64),
     BooleanPrimitive(bool),
     DateInstance(f64),
@@ -2021,8 +2020,8 @@ pub(crate) enum ObjectHost {
     /// `DOMException` whose name is not in that table reports `0`, and storing a
     /// third field would let the two disagree.
     DomException {
-        name: String,
-        message: String,
+        name: JsString,
+        message: JsString,
     },
     /// One `MediaQueryList` (CSSOM View). `media` is the query as
     /// `matchMedia` was given it and `matches` is its **last evaluated**
@@ -2098,7 +2097,7 @@ pub(crate) enum ObjectHost {
     /// that `matchAll` cloned, stepped by `next()` over `input`.
     RegExpStringIterator {
         matcher: ObjectId,
-        input: String,
+        input: JsString,
         global: bool,
         unicode: bool,
         done: bool,
@@ -2810,7 +2809,7 @@ impl Realm {
         });
         objects[import_meta.0].properties.insert(
             "url".to_owned(),
-            PropertyDescriptor::builtin(JsValue::String(document_url.to_string())),
+            PropertyDescriptor::builtin(JsValue::String((document_url.to_string()).into())),
         );
         objects[dynamic_import.0].properties.insert(
             "meta".to_owned(),
@@ -3274,7 +3273,7 @@ impl Realm {
             media_query_list_tag.id(),
             (
                 media_query_list_tag,
-                PropertyDescriptor::builtin(JsValue::String("MediaQueryList".to_owned())),
+                PropertyDescriptor::builtin(JsValue::String(("MediaQueryList".to_owned()).into())),
             ),
         );
         // The interface object exists even though the interface has no
@@ -3674,7 +3673,7 @@ impl Realm {
             },
         );
         for (key, value) in [
-            ("name", JsValue::String(name.to_owned())),
+            ("name", JsValue::String((name.to_owned()).into())),
             ("length", JsValue::Number(0.0)),
         ] {
             objects[constructor.0].properties.insert(
@@ -3701,7 +3700,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String(name.to_owned()),
+                    value: JsValue::String((name.to_owned()).into()),
                     writable: false,
                     enumerable: false,
                     configurable: true,
@@ -3851,7 +3850,7 @@ impl Realm {
                     PropertyDescriptor {
                         getter: None,
                         setter: None,
-                        value: JsValue::String(name.to_owned()),
+                        value: JsValue::String((name.to_owned()).into()),
                         writable: false,
                         enumerable: false,
                         configurable: true,
@@ -3915,7 +3914,7 @@ impl Realm {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String("TypedArray".to_owned()),
+                value: JsValue::String(("TypedArray".to_owned()).into()),
                 writable: false,
                 enumerable: false,
                 configurable: true,
@@ -4154,7 +4153,7 @@ impl Realm {
             (
                 tag,
                 PropertyDescriptor {
-                    value: JsValue::String("Atomics".to_owned()),
+                    value: JsValue::String(("Atomics".to_owned()).into()),
                     writable: false,
                     getter: None,
                     setter: None,
@@ -4224,7 +4223,7 @@ impl Realm {
             symbol.id(),
             (
                 symbol,
-                PropertyDescriptor::builtin(JsValue::String(tag.to_owned())),
+                PropertyDescriptor::builtin(JsValue::String((tag.to_owned()).into())),
             ),
         );
         let constructor = ObjectId(objects.len());
@@ -4441,7 +4440,7 @@ impl Realm {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String("utf-8".to_owned()),
+                value: JsValue::String(("utf-8".to_owned()).into()),
                 writable: false,
                 enumerable: true,
                 configurable: true,
@@ -4665,7 +4664,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String("AsyncGenerator".to_owned()),
+                    value: JsValue::String(("AsyncGenerator".to_owned()).into()),
                     writable: false,
                     enumerable: false,
                     configurable: true,
@@ -4717,7 +4716,10 @@ impl Realm {
             tag.id(),
             (
                 tag,
-                link(JsValue::String("AsyncGeneratorFunction".to_owned()), false),
+                link(
+                    JsValue::String(("AsyncGeneratorFunction".to_owned()).into()),
+                    false,
+                ),
             ),
         );
         (generator, from_sync, generator_function)
@@ -4807,7 +4809,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String("Generator".to_owned()),
+                    value: JsValue::String(("Generator".to_owned()).into()),
                     writable: false,
                     enumerable: false,
                     configurable: true,
@@ -5045,7 +5047,7 @@ impl Realm {
                     continue;
                 };
                 if names[target.0].is_none()
-                    && let Some(description) = symbol.description()
+                    && let Some(description) = symbol.description().map(JsString::to_key)
                 {
                     // A well-known symbol is named by its specification name, which the
                     // engine stores as `@@iterator` and reports as `[Symbol.iterator]`.
@@ -5083,7 +5085,7 @@ impl Realm {
                     PropertyDescriptor {
                         getter: None,
                         setter: None,
-                        value: JsValue::String(name.clone()),
+                        value: JsValue::String(JsString::from_key(&name)),
                         writable: false,
                         enumerable: false,
                         configurable: true,
@@ -5385,7 +5387,7 @@ impl Realm {
             tag.id(),
             (
                 tag,
-                PropertyDescriptor::builtin(JsValue::String("Storage".to_owned())),
+                PropertyDescriptor::builtin(JsValue::String(("Storage".to_owned()).into())),
             ),
         );
         prototype
@@ -5464,7 +5466,7 @@ impl Realm {
         for (name, value) in location_components(url) {
             objects[location.0].properties.insert(
                 name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(value)),
+                PropertyDescriptor::builtin(JsValue::String((value).into())),
             );
         }
         for owner in [global, document] {
@@ -5516,7 +5518,7 @@ impl Realm {
         ] {
             objects[navigator.0].properties.insert(
                 name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(value.to_owned())),
+                PropertyDescriptor::builtin(JsValue::String((value.to_owned()).into())),
             );
         }
         for (name, value) in [("cookieEnabled", true), ("onLine", true)] {
@@ -5716,7 +5718,7 @@ impl Realm {
             // ECMA-262 10.2.9 SetFunctionName gives accessors a `get `/`set ` prefix.
             for (key, value) in [
                 ("length", JsValue::Number(length)),
-                ("name", JsValue::String(name.to_owned())),
+                ("name", JsValue::String((name.to_owned()).into())),
             ] {
                 objects[accessor.0].properties.insert(
                     key.to_owned(),
@@ -6015,7 +6017,7 @@ impl Realm {
             ("length".to_owned(), read_only(JsValue::Number(length))),
             (
                 "name".to_owned(),
-                read_only(JsValue::String(name.to_owned())),
+                read_only(JsValue::String(JsString::from_key(name))),
             ),
         ])
     }
@@ -6051,7 +6053,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String("RegExp String Iterator".to_owned()),
+                    value: JsValue::String(("RegExp String Iterator".to_owned()).into()),
                     writable: false,
                     enumerable: false,
                     configurable: true,
@@ -6513,7 +6515,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String("toUTCString".to_owned()),
+                    value: JsValue::String(("toUTCString".to_owned()).into()),
                     writable: false,
                     enumerable: false,
                     configurable: true,
@@ -6643,7 +6645,7 @@ impl Realm {
                 tag.id(),
                 (
                     tag,
-                    PropertyDescriptor::builtin(JsValue::String("Symbol".to_owned())),
+                    PropertyDescriptor::builtin(JsValue::String(("Symbol".to_owned()).into())),
                 ),
             );
         }
@@ -6735,7 +6737,7 @@ impl Realm {
                     PropertyDescriptor {
                         getter: None,
                         setter: None,
-                        value: JsValue::String("BigInt".to_owned()),
+                        value: JsValue::String(("BigInt".to_owned()).into()),
                         writable: false,
                         enumerable: false,
                         configurable: true,
@@ -6940,7 +6942,7 @@ impl Realm {
             // ECMA-262 20.5.6.2.2 and 20.5.6.2.1: a NativeError constructor's
             // `name` and `length` are non-writable, configurable.
             for (name, value) in [
-                ("name", JsValue::String(kind.name().to_owned())),
+                ("name", JsValue::String((kind.name().to_owned()).into())),
                 ("length", JsValue::Number(1.0)),
             ] {
                 objects[constructor.0].properties.insert(
@@ -6954,7 +6956,7 @@ impl Realm {
             for (name, value) in [("name", kind.name()), ("message", "")] {
                 objects[prototype.0].properties.insert(
                     name.to_owned(),
-                    PropertyDescriptor::builtin(JsValue::String(value.to_owned())),
+                    PropertyDescriptor::builtin(JsValue::String((value.to_owned()).into())),
                 );
             }
             objects[prototype.0].properties.insert(
@@ -7022,7 +7024,7 @@ impl Realm {
             to_string_tag.id(),
             (
                 to_string_tag,
-                PropertyDescriptor::builtin(JsValue::String("DOMException".to_owned())),
+                PropertyDescriptor::builtin(JsValue::String(("DOMException".to_owned()).into())),
             ),
         );
         // WebIDL §2.5.2: a `readonly attribute` is an accessor on the prototype
@@ -7141,7 +7143,7 @@ impl Realm {
         );
         objects[prototype.0].properties.insert(
             "name".to_owned(),
-            Self::function_metadata_slot(JsValue::String(String::new())),
+            Self::function_metadata_slot(JsValue::String((String::new()).into())),
         );
         for (name, function, length) in [
             ("toString", NativeFunction::FunctionToString, 0.0),
@@ -7161,7 +7163,7 @@ impl Realm {
             );
             objects[method.0].properties.insert(
                 "name".to_owned(),
-                Self::function_metadata_slot(JsValue::String(name.to_owned())),
+                Self::function_metadata_slot(JsValue::String((name.to_owned()).into())),
             );
             objects[prototype.0].properties.insert(
                 name.to_owned(),
@@ -7189,7 +7191,9 @@ impl Realm {
         );
         objects[has_instance.0].properties.insert(
             "name".to_owned(),
-            Self::function_metadata_slot(JsValue::String("[Symbol.hasInstance]".to_owned())),
+            Self::function_metadata_slot(JsValue::String(
+                ("[Symbol.hasInstance]".to_owned()).into(),
+            )),
         );
         let symbol = JsSymbol::well_known("@@hasInstance");
         objects[prototype.0].symbols.insert(
@@ -7954,7 +7958,9 @@ impl Realm {
                     // ECMA-262 27.2.5.5: the tag is read-only, unlike the methods.
                     PropertyDescriptor {
                         writable: false,
-                        ..PropertyDescriptor::builtin(JsValue::String("Promise".to_owned()))
+                        ..PropertyDescriptor::builtin(JsValue::String(
+                            ("Promise".to_owned()).into(),
+                        ))
                     },
                 ),
             );
@@ -8011,7 +8017,7 @@ impl Realm {
         );
         objects[constructor.0].properties.insert(
             "name".to_owned(),
-            PropertyDescriptor::builtin(JsValue::String("AggregateError".to_owned())),
+            PropertyDescriptor::builtin(JsValue::String(("AggregateError".to_owned()).into())),
         );
         objects[constructor.0].properties.insert(
             "length".to_owned(),
@@ -8023,7 +8029,7 @@ impl Realm {
                 PropertyDescriptor {
                     getter: None,
                     setter: None,
-                    value: JsValue::String(value.to_owned()),
+                    value: JsValue::String((value.to_owned()).into()),
                     writable: true,
                     enumerable: false,
                     configurable: true,
@@ -8091,7 +8097,7 @@ impl Realm {
         for (name, value) in [("name", "SuppressedError"), ("message", "")] {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(value.to_owned())),
+                PropertyDescriptor::builtin(JsValue::String((value.to_owned()).into())),
             );
         }
         objects[prototype.0].properties.insert(
@@ -8165,7 +8171,7 @@ impl Realm {
                 tag,
                 PropertyDescriptor {
                     writable: false,
-                    ..PropertyDescriptor::builtin(JsValue::String(name.to_owned()))
+                    ..PropertyDescriptor::builtin(JsValue::String((name.to_owned()).into()))
                 },
             ),
         );
@@ -8541,7 +8547,7 @@ impl Realm {
         if let Some(message) = message {
             self.objects[error.0].properties.insert(
                 "message".to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(message)),
+                PropertyDescriptor::builtin(JsValue::String((message).into())),
             );
         }
         error
@@ -8882,7 +8888,7 @@ impl Realm {
         for (name, value) in location_components(&url) {
             object.properties.insert(
                 name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::String(value)),
+                PropertyDescriptor::builtin(JsValue::String((value).into())),
             );
         }
         if let ObjectHost::Location(current) = &mut object.host {
@@ -9188,7 +9194,7 @@ impl Realm {
             // ECMA-262 §10.4.3: a String exotic object lists its characters as
             // ascending integer indices ahead of the ordinary string keys.
             indices.extend(
-                (0..utf16::utf16_length(text))
+                (0..text.len())
                     .map(|index| index.to_string())
                     .filter(|key| !target.properties.contains_key(key)),
             );
@@ -9234,7 +9240,7 @@ impl Realm {
             // A String exotic object only contributes its enumerable indexed
             // characters here; `length` is not enumerable.
             if first && let ObjectHost::StringPrimitive(text) = &current.host {
-                for index in 0..utf16::utf16_length(text) {
+                for index in 0..text.len() {
                     let key = index.to_string();
                     if !current.properties.contains_key(&key) && seen.insert(key.clone()) {
                         names.push(key);
@@ -9396,7 +9402,7 @@ impl Realm {
     }
 
     /// Create a fresh transient wrapper exposing string prototype members.
-    pub(crate) fn string_wrapper(&mut self, value: String) -> ObjectId {
+    pub(crate) fn string_wrapper(&mut self, value: JsString) -> ObjectId {
         self.allocate(JsObject {
             prototype: Some(self.string_prototype),
             host: ObjectHost::StringPrimitive(value),
@@ -9603,7 +9609,7 @@ impl Realm {
         )]
         let length = length as f64;
         for (property, value) in [
-            ("name", JsValue::String(name.to_owned())),
+            ("name", JsValue::String(JsString::from_key(name))),
             ("length", JsValue::Number(length)),
         ] {
             self.objects[object.0].properties.insert(
@@ -9851,7 +9857,7 @@ impl Realm {
     pub(crate) fn regexp_string_iterator(
         &mut self,
         matcher: ObjectId,
-        input: String,
+        input: JsString,
         global: bool,
         unicode: bool,
     ) -> ObjectId {

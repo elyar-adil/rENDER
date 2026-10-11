@@ -59,7 +59,7 @@ impl JsRuntime {
                 _ => None,
             })
             .filter(|value| !matches!(value, JsValue::Undefined))
-            .map_or_else(String::new, |value| value.to_js_string())
+            .map_or_else(String::new, |value| (value.to_js_string()).to_lossy())
             .to_ascii_lowercase();
         let prototype = self
             .realm
@@ -86,7 +86,7 @@ impl JsRuntime {
         bytes: &mut Vec<u8>,
     ) -> Result<(), JsError> {
         match value {
-            JsValue::String(text) => bytes.extend_from_slice(text.as_bytes()),
+            JsValue::String(text) => bytes.extend_from_slice(text.to_lossy().as_bytes()),
             JsValue::Object(object) => match self.realm.host(*object) {
                 Some(ObjectHost::Blob { bytes: part, .. }) => bytes.extend_from_slice(&part),
                 Some(ObjectHost::TypedArray {
@@ -108,11 +108,11 @@ impl JsRuntime {
                             });
                         }
                     } else {
-                        bytes.extend_from_slice(value.to_js_string().as_bytes());
+                        bytes.extend_from_slice(value.to_js_string().to_lossy().as_bytes());
                     }
                 }
             },
-            _ => bytes.extend_from_slice(value.to_js_string().as_bytes()),
+            _ => bytes.extend_from_slice(value.to_js_string().to_lossy().as_bytes()),
         }
         Ok(())
     }
@@ -134,7 +134,7 @@ impl JsRuntime {
         let (promise, value) = self.create_promise()?;
         self.resolve_promise(
             promise,
-            &JsValue::String(String::from_utf8_lossy(&bytes).into_owned()),
+            &JsValue::String((String::from_utf8_lossy(&bytes).into_owned()).into()),
         );
         Ok(value)
     }
@@ -182,6 +182,7 @@ impl JsRuntime {
             .get(2)
             .map(JsValue::to_js_string)
             .unwrap_or_default()
+            .to_lossy()
             .to_ascii_lowercase();
         self.ensure_heap_capacity(1)?;
         let prototype = self.realm.get_prototype(receiver);
@@ -200,7 +201,11 @@ fn blob_index(value: Option<&JsValue>, len: i64, default: i64) -> i64 {
     let Some(value) = value else { return default };
     let number = match value {
         JsValue::Number(number) => *number,
-        _ => value.to_js_string().parse::<f64>().unwrap_or(0.0),
+        _ => value
+            .to_js_string()
+            .to_lossy()
+            .parse::<f64>()
+            .unwrap_or(0.0),
     };
     if !number.is_finite() {
         return if number.is_sign_negative() { 0 } else { len };

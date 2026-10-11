@@ -124,7 +124,7 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         let event = self.realm.create_object(prototype);
         for (name, value) in [
-            ("type", JsValue::String(event_type.to_owned())),
+            ("type", JsValue::String((event_type.to_owned()).into())),
             ("bubbles", JsValue::Boolean(bubbles)),
             ("cancelable", JsValue::Boolean(cancelable)),
             ("composed", JsValue::Boolean(composed)),
@@ -161,7 +161,7 @@ impl JsRuntime {
                 .is_some_and(|value| value.is_truthy())
         };
         let event = self.create_event_object(
-            &event_type,
+            &(event_type).to_key(),
             flag(self, "bubbles"),
             flag(self, "cancelable"),
             flag(self, "composed"),
@@ -244,7 +244,7 @@ impl JsRuntime {
             .event_listeners
             .entry(target)
             .or_default()
-            .entry(event_type)
+            .entry((event_type).to_key())
             .or_default();
         Self::insert_listener(listeners, listener);
         Ok(JsValue::Undefined)
@@ -263,7 +263,7 @@ impl JsRuntime {
         if let Some(listeners) = self
             .event_listeners
             .get_mut(&target)
-            .and_then(|listeners| listeners.get_mut(&event_type))
+            .and_then(|listeners| listeners.get_mut(&event_type.to_key()))
         {
             listeners.retain(|candidate| {
                 !(candidate.callback == listener.callback && candidate.capture == listener.capture)
@@ -291,7 +291,7 @@ impl JsRuntime {
             .get_property(event, "bubbles")
             .is_some_and(|value| value.is_truthy());
         let not_canceled =
-            self.dispatch_prepared_event(dom, target, event, &event_type, bubbles)?;
+            self.dispatch_prepared_event(dom, target, event, &(event_type).to_key(), bubbles)?;
         Ok(JsValue::Boolean(not_canceled))
     }
 
@@ -309,7 +309,10 @@ impl JsRuntime {
         let Some(listener) = self.listener_from_arguments(arguments, "addEventListener")? else {
             return Ok(JsValue::Undefined);
         };
-        let listeners = self.window_event_handlers.entry(event_type).or_default();
+        let listeners = self
+            .window_event_handlers
+            .entry((event_type).to_key())
+            .or_default();
         Self::insert_listener(listeners, listener);
         Ok(JsValue::Undefined)
     }
@@ -328,7 +331,7 @@ impl JsRuntime {
         let Some(listener) = self.listener_from_arguments(arguments, "removeEventListener")? else {
             return Ok(JsValue::Undefined);
         };
-        if let Some(listeners) = self.window_event_handlers.get_mut(&event_type) {
+        if let Some(listeners) = self.window_event_handlers.get_mut(&event_type.to_key()) {
             listeners.retain(|candidate| {
                 !(candidate.callback == listener.callback && candidate.capture == listener.capture)
             });

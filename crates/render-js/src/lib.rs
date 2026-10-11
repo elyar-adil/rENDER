@@ -189,7 +189,7 @@ impl JsError {
     pub(crate) fn thrown(value: JsValue) -> Self {
         Self {
             kind: JsErrorKind::Throw,
-            message: value.to_js_string(),
+            message: (value.to_js_string()).to_lossy(),
             offset: None,
             position: None,
             thrown: Some(value),
@@ -465,9 +465,7 @@ mod tests {
 
         assert_eq!(
             runtime.realm().global("result"),
-            Some(super::JsValue::String(
-                "listenerpropertyclickgoapp".to_owned(),
-            ))
+            Some(super::JsValue::String("listenerpropertyclickgoapp".into()))
         );
     }
 

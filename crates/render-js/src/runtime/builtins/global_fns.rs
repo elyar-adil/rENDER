@@ -28,10 +28,10 @@ use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::MAX_BUFFERED_CONSOLE_MESSAGES;
 use crate::runtime::types::TimerKind;
 use crate::utf16;
+use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
-use std::fmt::Write as _;
 
 impl JsRuntime {
     fn base64_encode(bytes: &[u8]) -> String {
@@ -271,7 +271,7 @@ impl JsRuntime {
             NativeFunction::RemoveEventListener => self.remove_event_listener(receiver, arguments),
             NativeFunction::DispatchEvent => self.dispatch_event(dom, receiver, arguments),
             NativeFunction::LocationToString => match self.realm.host(receiver) {
-                Some(ObjectHost::Location(url)) => Ok(JsValue::String(url.to_string())),
+                Some(ObjectHost::Location(url)) => Ok(JsValue::String((url.to_string()).into())),
                 _ => Err(JsError::type_error("incompatible Location method receiver")),
             },
             NativeFunction::LocationAssign | NativeFunction::LocationReplace => {
@@ -305,7 +305,7 @@ impl JsRuntime {
             NativeFunction::SymbolDescription => match self.realm.host(receiver) {
                 Some(ObjectHost::SymbolInstance(symbol)) => Ok(symbol
                     .description()
-                    .map_or(JsValue::Undefined, |text| JsValue::String(text.to_owned()))),
+                    .map_or(JsValue::Undefined, |text| JsValue::String(text.clone()))),
                 _ => Err(JsError::type_error(
                     "Symbol.prototype.description requires that 'this' be a Symbol",
                 )),
@@ -326,7 +326,7 @@ impl JsRuntime {
                         .global_symbol_registry
                         .iter()
                         .find(|(_, id)| **id == symbol.id())
-                        .map(|(key, _)| JsValue::String(key.clone()))
+                        .map(|(key, _)| JsValue::String(JsString::from_key(key)))
                         .unwrap_or(JsValue::Undefined),
                     _ => JsValue::Undefined,
                 };
@@ -401,18 +401,20 @@ impl JsRuntime {
                 // yields code points - but the index it reports has to be a
                 // position in the string, so it is the code-unit offset of
                 // each code point rather than a running counter.
-                for (offset, character) in text.chars().scan(0usize, |offset, character| {
-                    let start = *offset;
-                    *offset += character.len_utf16();
-                    Some((start, character))
-                }) {
+                for (offset, character) in
+                    text.to_lossy().chars().scan(0usize, |offset, character| {
+                        let start = *offset;
+                        *offset += character.len_utf16();
+                        Some((start, character))
+                    })
+                {
                     #[allow(clippy::cast_precision_loss)]
                     let index = JsValue::Number(offset as f64);
                     self.call(
                         dom,
                         callback,
                         &[
-                            JsValue::String(character.to_string()),
+                            JsValue::String((character.to_string()).into()),
                             index,
                             JsValue::Object(receiver),
                         ],
@@ -420,9 +422,9 @@ impl JsRuntime {
                 }
                 Ok(JsValue::Undefined)
             }
-            NativeFunction::StrPush => Ok(JsValue::Number(utf16::utf16_length(
-                &self.require_string_receiver(dom, receiver)?,
-            ) as f64)),
+            NativeFunction::StrPush => Ok(JsValue::Number(
+                self.require_string_receiver(dom, receiver)?.len() as f64,
+            )),
             NativeFunction::StrIterator => self.string_iterator(dom, receiver),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
@@ -483,42 +485,27 @@ impl JsRuntime {
             NativeFunction::CssSupports => css_supports(arguments),
             NativeFunction::GlobalEscape => {
                 let text = required_argument(arguments, 0, "escape")?.to_js_string();
-                let mut output = String::with_capacity(text.len());
-                for character in text.chars() {
-                    let code = character as u32;
-                    if code < 0x80
-                        && (character.is_ascii_alphanumeric()
-                            || matches!(
-                                character,
-                                '@' | '*' | '_' | '+' | '-' | '.' | '/' | '(' | ')'
-                            ))
-                    {
-                        output.push(character);
-                    } else if code < 0x100 {
-                        let _ = write!(output, "%{code:02X}");
-                    } else {
-                        let _ = write!(output, "%u{code:04X}");
-                    }
-                }
-                Ok(JsValue::String(output))
+                Ok(JsValue::String(js_escape(text.units())))
             }
             NativeFunction::GlobalUnescape => {
                 let text = required_argument(arguments, 0, "unescape")?.to_js_string();
-                match Self::percent_decode(&text) {
-                    Some(decoded) => Ok(JsValue::String(decoded)),
-                    None => Ok(JsValue::String(text)),
-                }
+                Ok(JsValue::String(js_unescape(text.units())))
             }
             NativeFunction::GlobalAtob => {
                 let text = required_argument(arguments, 0, "atob")?.to_js_string();
-                self.base64_decode(&text).map(JsValue::String)
+                self.base64_decode(&text.to_lossy())
+                    .map(|decoded| JsValue::String(JsString::from(decoded)))
             }
             NativeFunction::GlobalRandomBytes => {
                 // The prelude's `crypto.getRandomValues` and `randomUUID` draw
                 // from the operating system's generator through this, and
                 // take it off the global object before any page script runs.
                 let count = required_argument(arguments, 0, "random bytes")?.to_js_string();
-                let count = count.parse::<usize>().ok().filter(|count| *count <= 65_536);
+                let count = count
+                    .to_lossy()
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|count| *count <= 65_536);
                 let Some(count) = count else {
                     return Err(self.range_error(
                         "byte length exceeds the 65536 bytes of entropy available per call",
@@ -538,15 +525,19 @@ impl JsRuntime {
                 // Infra §"base64 encode": "If the code point value of any
                 // character in data is greater than 255, then throw an
                 // `InvalidCharacterError` `DOMException`."
-                if text.chars().any(|character| character as u32 > 0xff) {
+                // A unit above 0xFF is outside Latin-1, and so is a lone surrogate.
+                let Some(bytes) = text
+                    .units()
+                    .iter()
+                    .map(|&unit| u8::try_from(unit).ok())
+                    .collect::<Option<Vec<u8>>>()
+                else {
                     return Err(self.dom_exception(
                         DomExceptionName::InvalidCharacter,
                         "The string to be encoded contains characters outside of the Latin1 range",
                     ));
-                }
-                Ok(JsValue::String(Self::base64_encode(
-                    &text.bytes().collect::<Vec<_>>(),
-                )))
+                };
+                Ok(JsValue::String(JsString::from(Self::base64_encode(&bytes))))
             }
             NativeFunction::GlobalParseInt => {
                 // ECMA-262 7.1.1.1. The radix argument used to be ignored, so
@@ -558,12 +549,14 @@ impl JsRuntime {
                 let radix =
                     self.to_int32_value(dom, arguments.get(1).unwrap_or(&JsValue::Undefined))?;
                 Ok(JsValue::Number(crate::runtime::convert::parse_int(
-                    &text, radix,
+                    &(text).to_lossy(),
+                    radix,
                 )))
             }
             NativeFunction::GlobalParseFloat => {
-                let text =
-                    self.to_string_value(dom, required_argument(arguments, 0, "parseFloat")?)?;
+                let text = self
+                    .to_string_value(dom, required_argument(arguments, 0, "parseFloat")?)?
+                    .to_lossy();
                 let trimmed = text.trim_start();
                 let end = trimmed
                     .find(|c: char| {
@@ -585,15 +578,23 @@ impl JsRuntime {
             )),
             NativeFunction::GlobalEncodeURI | NativeFunction::GlobalEncodeURIComponent => {
                 let text = required_argument(arguments, 0, "encodeURI")?.to_js_string();
-                let component = function == NativeFunction::GlobalEncodeURIComponent;
-                Ok(JsValue::String(Self::percent_encode(&text, !component)))
+                // encodeURI keeps the reserved set and `#` as they are.
+                let extra: &[u8] = if function == NativeFunction::GlobalEncodeURI {
+                    b";/?:@&=+$,#"
+                } else {
+                    b""
+                };
+                self.uri_encode(&text, extra).map(JsValue::String)
             }
             NativeFunction::GlobalDecodeURI | NativeFunction::GlobalDecodeURIComponent => {
                 let text = required_argument(arguments, 0, "decodeURI")?.to_js_string();
-                match Self::percent_decode(&text) {
-                    Some(decoded) => Ok(JsValue::String(decoded)),
-                    None => Err(JsError::dom("malformed URI sequence")),
-                }
+                // decodeURI leaves an escaped reserved character and `#` as escapes.
+                let preserved: &[u8] = if function == NativeFunction::GlobalDecodeURI {
+                    b";/?:@&=+$,#"
+                } else {
+                    b""
+                };
+                self.uri_decode(&text, preserved).map(JsValue::String)
             }
             NativeFunction::PerformanceNow => Ok(JsValue::Number(Self::monotonic_now_ms())),
             NativeFunction::PerformanceGetEntries | NativeFunction::PerformanceGetEntriesByType => {
@@ -1609,18 +1610,180 @@ impl JsRuntime {
 /// The answers come from `render-css`, which is the crate that already decides
 /// whether a declaration survives a style rule, so one parser and one
 /// evaluator answer both the stylesheet question and the script question.
+/// The characters `encodeURI` and `encodeURIComponent` leave alone besides
+/// ASCII letters and digits (ECMA-262 19.2.6.4, the `unreservedURISet` marks).
+const URI_UNRESERVED_MARKS: &[u8] = b"-_.!~*'()";
+/// The uppercase hexadecimal digits an escape is written with.
+const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// The value of one hexadecimal digit code unit.
+fn hex_nibble(unit: u16) -> Option<u8> {
+    u8::try_from(unit)
+        .ok()
+        .and_then(|byte| char::from(byte).to_digit(16))
+        .and_then(|digit| u8::try_from(digit).ok())
+}
+
+/// The octet two hexadecimal digits at `start` spell, or `None`.
+fn hex_byte(units: &[u16], start: usize) -> Option<u8> {
+    let high = hex_nibble(*units.get(start)?)?;
+    let low = hex_nibble(*units.get(start + 1)?)?;
+    Some(high * 16 + low)
+}
+
+/// Append `%XX` for one octet, in uppercase hexadecimal.
+fn push_percent_octet(output: &mut Vec<u16>, octet: u8) {
+    output.push(u16::from(b'%'));
+    output.push(u16::from(UPPER_HEX[usize::from(octet >> 4)]));
+    output.push(u16::from(UPPER_HEX[usize::from(octet & 0x0F)]));
+}
+
+/// ECMA-262 B.2.1.1 `escape(string)`, over code units: a unit outside the
+/// unescaped set becomes `%XX` below 256 and `%uXXXX` above it.
+fn js_escape(units: &[u16]) -> JsString {
+    let mut output: Vec<u16> = Vec::with_capacity(units.len());
+    for &unit in units {
+        if u8::try_from(unit)
+            .is_ok_and(|byte| byte.is_ascii_alphanumeric() || b"@*_+-./".contains(&byte))
+        {
+            output.push(unit);
+        } else if let Ok(octet) = u8::try_from(unit) {
+            push_percent_octet(&mut output, octet);
+        } else {
+            output.extend([u16::from(b'%'), u16::from(b'u')]);
+            for shift in [12_u32, 8, 4, 0] {
+                let nibble = (unit >> shift) & 0x0F;
+                output.push(u16::from(UPPER_HEX[usize::from(nibble)]));
+            }
+        }
+    }
+    JsString::from_unit_vec(output)
+}
+
+/// ECMA-262 B.2.1.2 `unescape(string)`, over code units. A malformed escape is
+/// copied through, and so is every unit that is not part of one.
+fn js_unescape(units: &[u16]) -> JsString {
+    let percent = u16::from(b'%');
+    let mut output: Vec<u16> = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        let unit = units[index];
+        if unit == percent {
+            if units.get(index + 1) == Some(&u16::from(b'u'))
+                && let (Some(high), Some(low)) =
+                    (hex_byte(units, index + 2), hex_byte(units, index + 4))
+            {
+                output.push(u16::from(high) << 8 | u16::from(low));
+                index += 6;
+                continue;
+            }
+            if let Some(octet) = hex_byte(units, index + 1) {
+                output.push(u16::from(octet));
+                index += 3;
+                continue;
+            }
+        }
+        output.push(unit);
+        index += 1;
+    }
+    JsString::from_unit_vec(output)
+}
+
+impl JsRuntime {
+    /// ECMA-262 19.2.6.5 `Encode(string, extraUnescaped)` over code units. A
+    /// lone surrogate has no UTF-8 form, so it is a `URIError`.
+    fn uri_encode(&mut self, text: &JsString, extra_unescaped: &[u8]) -> Result<JsString, JsError> {
+        let units = text.units();
+        let mut output: Vec<u16> = Vec::with_capacity(units.len());
+        let mut index = 0;
+        while index < units.len() {
+            let unit = units[index];
+            if u8::try_from(unit).is_ok_and(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || URI_UNRESERVED_MARKS.contains(&byte)
+                    || extra_unescaped.contains(&byte)
+            }) {
+                output.push(unit);
+                index += 1;
+                continue;
+            }
+            let Some(character) = char::from_u32(utf16::code_point_at(units, index)) else {
+                return Err(self.uri_error("URI malformed"));
+            };
+            index += character.len_utf16();
+            let mut encoded = [0_u8; 4];
+            for octet in character.encode_utf8(&mut encoded).bytes() {
+                push_percent_octet(&mut output, octet);
+            }
+        }
+        Ok(JsString::from_unit_vec(output))
+    }
+
+    /// ECMA-262 19.2.6.6 `Decode(string, preserveEscapeSet)` over code units. A
+    /// unit that is not `%` is copied as it is, so a lone surrogate survives.
+    fn uri_decode(&mut self, text: &JsString, preserved: &[u8]) -> Result<JsString, JsError> {
+        let units = text.units();
+        let mut output: Vec<u16> = Vec::with_capacity(units.len());
+        let mut index = 0;
+        while index < units.len() {
+            if units[index] != u16::from(b'%') {
+                output.push(units[index]);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            let Some(first) = hex_byte(units, index + 1) else {
+                return Err(self.uri_error("URI malformed"));
+            };
+            index += 3;
+            if first < 0x80 {
+                if preserved.contains(&first) {
+                    output.extend_from_slice(&units[start..index]);
+                } else {
+                    output.push(u16::from(first));
+                }
+                continue;
+            }
+            // The leading one bits count the octets of the sequence, which is
+            // two to four; a continuation octet follows as `%XX` each.
+            let count = first.leading_ones() as usize;
+            if !(2..=4).contains(&count) {
+                return Err(self.uri_error("URI malformed"));
+            }
+            let mut octets = vec![first];
+            for _ in 1..count {
+                if units.get(index) != Some(&u16::from(b'%')) {
+                    return Err(self.uri_error("URI malformed"));
+                }
+                let Some(octet) = hex_byte(units, index + 1) else {
+                    return Err(self.uri_error("URI malformed"));
+                };
+                octets.push(octet);
+                index += 3;
+            }
+            // Only a valid UTF-8 sequence names a code point; an encoded
+            // surrogate, an overlong form and a value above U+10FFFF are not one.
+            let Ok(decoded) = std::str::from_utf8(&octets) else {
+                return Err(self.uri_error("URI malformed"));
+            };
+            output.extend(decoded.encode_utf16());
+        }
+        Ok(JsString::from_unit_vec(output))
+    }
+}
+
 fn css_supports(arguments: &[JsValue]) -> Result<JsValue, JsError> {
     let first = required_argument(arguments, 0, "CSS.supports")?;
     if let Some(second) = arguments.get(1) {
         return Ok(JsValue::Boolean(
             render_css::supports::supports_declaration(
-                &first.to_js_string(),
-                &second.to_js_string(),
+                &first.to_js_string().to_lossy(),
+                &second.to_js_string().to_lossy(),
             ),
         ));
     }
     Ok(JsValue::Boolean(
-        render_css::supports::supports_condition_text(&first.to_js_string()),
+        render_css::supports::supports_condition_text(&(first.to_js_string()).to_lossy()),
     ))
 }
 
@@ -1642,7 +1805,7 @@ impl JsRuntime {
         };
         let text = arguments
             .iter()
-            .map(JsValue::to_js_string)
+            .map(|value| value.to_js_string().to_lossy())
             .collect::<Vec<_>>()
             .join(" ");
         if self.console_messages.len() >= MAX_BUFFERED_CONSOLE_MESSAGES {
@@ -1661,11 +1824,12 @@ mod tests {
     fn supports(arguments: &[&str]) -> String {
         let values: Vec<JsValue> = arguments
             .iter()
-            .map(|argument| JsValue::String((*argument).to_owned()))
+            .map(|argument| JsValue::String((*argument).into()))
             .collect();
         css_supports(&values)
             .expect("CSS.supports should answer")
             .to_js_string()
+            .to_lossy()
     }
 
     /// `CSS.supports` was a hardcoded `true`, which is the failure

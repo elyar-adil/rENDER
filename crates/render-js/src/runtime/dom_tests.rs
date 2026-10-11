@@ -21,7 +21,8 @@ fn eval(source: &str) -> String {
         .execute(&mut dom, source)
         .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
         .value
-        .to_js_string();
+        .to_js_string()
+        .to_lossy();
     assert!(runtime.prelude_error().is_none());
     value
 }
@@ -334,7 +335,8 @@ fn messaging_primitives_deliver_asynchronously() {
         .execute(&mut dom, "log.join(',')")
         .expect("log")
         .value
-        .to_js_string();
+        .to_js_string()
+        .to_lossy();
     assert_eq!(log, "sync-done,port2:1,window:hi:true,b:bc");
 }
 

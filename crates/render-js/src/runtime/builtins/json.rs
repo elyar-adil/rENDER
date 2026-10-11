@@ -18,6 +18,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
+use crate::utf16::JsString;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -35,7 +36,7 @@ impl JsRuntime {
         match function {
             NativeFunction::JsonParse => {
                 let input = required_argument(arguments, 0, "JSON.parse")?.to_js_string();
-                let node = JsonParser::new(&input)
+                let node = JsonParser::new(input.units())
                     .parse()
                     .map_err(|message| JsError::syntax(message, 0))?;
                 self.json_node_to_value(node)
@@ -44,7 +45,7 @@ impl JsRuntime {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);
                 let mut stack = BTreeSet::new();
                 match self.json_stringify_value(dom, &value, &mut stack, 0)? {
-                    Some(value) => Ok(JsValue::String(value)),
+                    Some(value) => Ok(JsValue::String((value).into())),
                     None => Ok(JsValue::Undefined),
                 }
             }
@@ -58,22 +59,36 @@ pub(in crate::runtime) enum JsonNode {
     Null,
     Bool(bool),
     Number(f64),
-    String(String),
+    String(JsString),
     Array(Vec<JsonNode>),
-    Object(Vec<(String, JsonNode)>),
+    /// The members in source order. A name is code units, so a lone surrogate
+    /// in a name survives into the property key.
+    Object(Vec<(JsString, JsonNode)>),
 }
 
+/// What a non-ASCII code unit reads as in the byte checks below. It is not a
+/// JSON structural byte, so every structural test treats it as "something else".
+const NOT_ASCII: u8 = 0xFF;
+
+/// The value of one hexadecimal digit code unit.
+fn hex_digit(unit: u16) -> Option<u16> {
+    u8::try_from(unit)
+        .ok()
+        .and_then(|byte| char::from(byte).to_digit(16))
+        .and_then(|digit| u16::try_from(digit).ok())
+}
+
+/// The JSON text parser (ECMA-262 25.5.1.1). It reads code units: the text is a
+/// string value, and a `\uD800` escape or a lone surrogate in a string is one
+/// code unit that must reach the value unchanged.
 pub(in crate::runtime) struct JsonParser<'a> {
-    pub(in crate::runtime) input: &'a [u8],
+    pub(in crate::runtime) input: &'a [u16],
     pub(in crate::runtime) position: usize,
 }
 
 impl<'a> JsonParser<'a> {
-    pub(in crate::runtime) fn new(input: &'a str) -> Self {
-        Self {
-            input: input.as_bytes(),
-            position: 0,
-        }
+    pub(in crate::runtime) fn new(input: &'a [u16]) -> Self {
+        Self { input, position: 0 }
     }
 
     pub(in crate::runtime) fn parse(mut self) -> Result<JsonNode, String> {
@@ -196,8 +211,11 @@ impl<'a> JsonParser<'a> {
                 return Err(self.error("invalid JSON exponent"));
             }
         }
-        let text = std::str::from_utf8(&self.input[start..self.position])
-            .map_err(|_| "invalid JSON number".to_owned())?;
+        // Every unit of a number is ASCII, so each one reads as its character.
+        let text: String = self.input[start..self.position]
+            .iter()
+            .map(|&unit| u8::try_from(unit).map_or('?', char::from))
+            .collect();
         let value = text
             .parse::<f64>()
             .map_err(|_| "invalid JSON number".to_owned())?;
@@ -207,67 +225,70 @@ impl<'a> JsonParser<'a> {
         Ok(JsonNode::Number(value))
     }
 
-    pub(in crate::runtime) fn string(&mut self) -> Result<String, String> {
+    pub(in crate::runtime) fn string(&mut self) -> Result<JsString, String> {
         if !self.consume(b'"') {
             return Err(self.error("expected JSON string"));
         }
-        let mut output = String::new();
-        while let Some(byte) = self.peek() {
+        let mut output: Vec<u16> = Vec::new();
+        while let Some(unit) = self.input.get(self.position).copied() {
             self.position += 1;
-            match byte {
-                b'"' => return Ok(output),
-                b'\\' => {
+            match unit {
+                // The closing quote.
+                0x22 => return Ok(JsString::from_unit_vec(output)),
+                0x5C => {
                     let escape = self
-                        .peek()
+                        .input
+                        .get(self.position)
+                        .copied()
                         .ok_or_else(|| self.error("unterminated JSON escape"))?;
                     self.position += 1;
-                    match escape {
-                        b'"' | b'\\' | b'/' => output.push(escape as char),
-                        b'b' => output.push('\u{0008}'),
-                        b'f' => output.push('\u{000c}'),
-                        b'n' => output.push('\n'),
-                        b'r' => output.push('\r'),
-                        b't' => output.push('\t'),
-                        b'u' => {
-                            let end = self
-                                .position
-                                .checked_add(4)
-                                .ok_or_else(|| self.error("invalid unicode escape"))?;
-                            let digits = self
-                                .input
-                                .get(self.position..end)
-                                .ok_or_else(|| self.error("invalid unicode escape"))?;
-                            let hex = std::str::from_utf8(digits)
-                                .map_err(|_| self.error("invalid unicode escape"))?;
-                            let value = u16::from_str_radix(hex, 16)
-                                .map_err(|_| self.error("invalid unicode escape"))?;
-                            output.push(char::from_u32(u32::from(value)).unwrap_or('\u{fffd}'));
-                            self.position = end;
-                        }
+                    output.push(match escape {
+                        // `"`, `\`, `/`
+                        0x22 | 0x5C | 0x2F => escape,
+                        // `b`, `f`, `n`, `r`, `t`
+                        0x62 => 0x08,
+                        0x66 => 0x0C,
+                        0x6E => 0x0A,
+                        0x72 => 0x0D,
+                        0x74 => 0x09,
+                        // `u`: exactly four hexadecimal digits, one code unit.
+                        0x75 => self.hex_escape()?,
                         _ => return Err(self.error("invalid JSON escape")),
-                    }
+                    });
                 }
-                0..=0x1f => return Err(self.error("control character in JSON string")),
-                _ => {
-                    let start = self.position - 1;
-                    while self
-                        .peek()
-                        .is_some_and(|next| !matches!(next, b'"' | b'\\' | 0..=0x1f))
-                    {
-                        self.position += 1;
-                    }
-                    let text = std::str::from_utf8(&self.input[start..self.position])
-                        .map_err(|_| self.error("invalid UTF-8 in JSON string"))?;
-                    output.push_str(text);
-                }
+                0x00..=0x1F => return Err(self.error("control character in JSON string")),
+                other => output.push(other),
             }
         }
         Err(self.error("unterminated JSON string"))
     }
 
+    /// The four hexadecimal digits after `\u`, as one code unit.
+    fn hex_escape(&mut self) -> Result<u16, String> {
+        let mut value: u16 = 0;
+        for _ in 0..4 {
+            let digit = self
+                .input
+                .get(self.position)
+                .copied()
+                .and_then(hex_digit)
+                .ok_or_else(|| self.error("invalid unicode escape"))?;
+            value = value * 16 + digit;
+            self.position += 1;
+        }
+        Ok(value)
+    }
+
     pub(in crate::runtime) fn literal(&mut self, literal: &[u8]) -> Result<(), String> {
-        if self.input.get(self.position..self.position + literal.len()) == Some(literal) {
-            self.position += literal.len();
+        let end = self.position + literal.len();
+        let found = self.input.get(self.position..end).is_some_and(|units| {
+            units
+                .iter()
+                .copied()
+                .eq(literal.iter().map(|&byte| u16::from(byte)))
+        });
+        if found {
+            self.position = end;
             Ok(())
         } else {
             Err(self.error("invalid JSON literal"))
@@ -290,29 +311,39 @@ impl<'a> JsonParser<'a> {
         }
     }
     pub(in crate::runtime) fn peek(&self) -> Option<u8> {
-        self.input.get(self.position).copied()
+        self.input
+            .get(self.position)
+            .map(|&unit| u8::try_from(unit).unwrap_or(NOT_ASCII))
     }
     pub(in crate::runtime) fn error(&self, message: &str) -> String {
-        format!("{message} at byte {}", self.position)
+        format!("{message} at code unit {}", self.position)
     }
 }
 
-pub(in crate::runtime) fn json_quote(value: &str) -> String {
+/// `QuoteJSONString` (ECMA-262 25.5.2.3 in ES2019 and later). Every code unit is
+/// read in order, so a lone surrogate is written as its `\uXXXX` escape rather
+/// than as the replacement character.
+pub(in crate::runtime) fn json_quote(value: &JsString) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{0008}' => output.push_str("\\b"),
-            '\u{000c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            character if character < '\u{0020}' => {
-                let _ = write!(output, "\\u{:04x}", character as u32);
+    for unit in char::decode_utf16(value.units().iter().copied()) {
+        match unit {
+            Ok(character) => match character {
+                '"' => output.push_str("\\\""),
+                '\\' => output.push_str("\\\\"),
+                '\u{0008}' => output.push_str("\\b"),
+                '\u{000c}' => output.push_str("\\f"),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                character if character < '\u{0020}' => {
+                    let _ = write!(output, "\\u{:04x}", character as u32);
+                }
+                character => output.push(character),
+            },
+            Err(error) => {
+                let _ = write!(output, "\\u{:04x}", error.unpaired_surrogate());
             }
-            character => output.push(character),
         }
     }
     output.push('"');
@@ -352,7 +383,7 @@ impl JsRuntime {
                 let object = self.realm.create_ordinary_object();
                 for (name, value) in properties {
                     let value = self.json_node_to_value(value)?;
-                    self.realm.set_property(object, name, value);
+                    self.realm.set_property(object, name.to_key(), value);
                 }
                 Ok(JsValue::Object(object))
             }
@@ -375,7 +406,8 @@ impl JsRuntime {
         &mut self,
         text: &str,
     ) -> Result<JsValue, JsError> {
-        let node = JsonParser::new(text)
+        let input = JsString::from(text);
+        let node = JsonParser::new(input.units())
             .parse()
             .map_err(|message| JsError::syntax(message, 0))?;
         self.json_node_to_value(node)
@@ -440,7 +472,7 @@ impl JsRuntime {
                             output.push(',');
                         }
                         first = false;
-                        output.push_str(&json_quote(&name));
+                        output.push_str(&json_quote(&JsString::from_key(&name)));
                         output.push(':');
                         output.push_str(&value);
                     }

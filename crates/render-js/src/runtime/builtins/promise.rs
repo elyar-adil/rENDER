@@ -22,6 +22,7 @@ use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PromiseCapability;
 use crate::runtime::types::PromiseReaction;
 use crate::runtime::types::PromiseRecord;
+use crate::utf16::JsString;
 use crate::value::JsSymbol;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
@@ -963,7 +964,7 @@ impl JsRuntime {
         for key in keys {
             let enumerable = match &key {
                 JsValue::String(name) => self
-                    .proxy_get_own_property_descriptor(dom, input, name)?
+                    .proxy_get_own_property_descriptor(dom, input, &(name).to_key())?
                     .is_some_and(|descriptor| descriptor.enumerable),
                 JsValue::Symbol(symbol) => self
                     .realm
@@ -975,7 +976,7 @@ impl JsRuntime {
                 continue;
             }
             let value = match &key {
-                JsValue::String(name) => self.get_member(dom, input, name)?,
+                JsValue::String(name) => self.get_member(dom, input, &(name).to_key())?,
                 JsValue::Symbol(symbol) => self.get_symbol_value(dom, input, symbol)?,
                 _ => JsValue::Undefined,
             };
@@ -1000,7 +1001,10 @@ impl JsRuntime {
         object: ObjectId,
     ) -> Result<Vec<JsValue>, JsError> {
         let names = self.proxy_own_keys(dom, object)?;
-        let mut keys: Vec<JsValue> = names.into_iter().map(JsValue::String).collect();
+        let mut keys: Vec<JsValue> = names
+            .into_iter()
+            .map(|key| JsValue::String(JsString::from_key(&key)))
+            .collect();
         if !matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             keys.extend(
                 self.realm
@@ -1065,7 +1069,7 @@ impl JsRuntime {
                 }
                 key
             }
-            None => JsValue::String(index.to_string()),
+            None => JsValue::String((index.to_string()).into()),
         };
         self.realm.set_property(
             store,
@@ -1310,7 +1314,7 @@ impl JsRuntime {
         {
             return key;
         }
-        JsValue::String(index.to_string())
+        JsValue::String((index.to_string()).into())
     }
 
     fn set_combinator_entry(&mut self, object: ObjectId, key: &JsValue, value: JsValue) {
@@ -1330,7 +1334,8 @@ impl JsRuntime {
                 );
             }
             JsValue::String(name) => {
-                self.realm.set_property(object, name.clone(), value);
+                self.realm
+                    .set_property(object, (name.clone()).to_key(), value);
             }
             _ => {}
         }
@@ -1363,7 +1368,7 @@ impl JsRuntime {
         self.realm.set_property(
             record,
             "status".to_owned(),
-            JsValue::String(status.to_owned()),
+            JsValue::String((status.to_owned()).into()),
         );
         self.realm.set_property(record, key.to_owned(), value);
         record
@@ -1388,7 +1393,7 @@ impl JsRuntime {
         self.aggregate_error_constructor(
             dom,
             constructor,
-            &[errors, JsValue::String(message.to_owned())],
+            &[errors, JsValue::String((message.to_owned()).into())],
         )
     }
 
@@ -1402,8 +1407,9 @@ impl JsRuntime {
         match value {
             JsValue::String(text) => {
                 return Ok(text
-                    .chars()
-                    .map(|character| JsValue::String(character.to_string()))
+                    .code_point_strings()
+                    .into_iter()
+                    .map(JsValue::String)
                     .collect());
             }
             JsValue::Object(object)
@@ -1463,7 +1469,7 @@ impl JsRuntime {
         let message = arguments
             .get(1)
             .filter(|value| !matches!(value, JsValue::Undefined))
-            .map(JsValue::to_js_string);
+            .map(|value| value.to_js_string().to_lossy());
         self.ensure_heap_capacity(1)?;
         let object = self.realm.create_error(prototype, message);
         self.realm.define_property(
@@ -1482,11 +1488,11 @@ impl JsRuntime {
             let name = self
                 .realm
                 .get_property(object, "name")
-                .unwrap_or_else(|| JsValue::String("AggregateError".to_owned()))
+                .unwrap_or_else(|| JsValue::String(("AggregateError".to_owned()).into()))
                 .to_js_string();
             let header = match self.realm.get_property(object, "message") {
                 Some(JsValue::String(text)) if !text.is_empty() => format!("{name}: {text}"),
-                _ => name,
+                _ => (name).to_key(),
             };
             format!("{header}{}", self.stack_frame_lines())
         };
@@ -1496,7 +1502,7 @@ impl JsRuntime {
             PropertyDescriptor {
                 getter: None,
                 setter: None,
-                value: JsValue::String(stack),
+                value: JsValue::String((stack).into()),
                 writable: true,
                 enumerable: false,
                 configurable: true,
@@ -1540,6 +1546,6 @@ fn describe_iterable(value: &JsValue) -> String {
         JsValue::Boolean(boolean) => format!("boolean {boolean}"),
         JsValue::Symbol(_) => "symbol".to_owned(),
         JsValue::Object(_) => "object".to_owned(),
-        JsValue::String(text) => text.clone(),
+        JsValue::String(text) => (text.clone()).to_lossy(),
     }
 }

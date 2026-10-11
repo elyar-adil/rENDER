@@ -20,6 +20,7 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::ElementRect;
+use crate::utf16::JsString;
 use crate::value::DomNodeKind;
 use crate::value::HTML_ELEMENT_INTERFACES;
 use crate::value::NativeFunction;
@@ -44,7 +45,7 @@ impl JsRuntime {
             NativeFunction::GetElementById => {
                 self.require_document(receiver)?;
                 let id = required_argument(arguments, 0, "getElementById")?.to_js_string();
-                match self.find_element_by_id(dom, &id)? {
+                match self.find_element_by_id(dom, &(id).to_lossy())? {
                     Some(node) => self.wrap_node(dom, node),
                     None => Ok(JsValue::Null),
                 }
@@ -52,7 +53,7 @@ impl JsRuntime {
             NativeFunction::QuerySelector => {
                 let root = self.query_root(receiver)?;
                 let selector = required_argument(arguments, 0, "querySelector")?.to_js_string();
-                let selectors = self.parse_selectors(&selector, "querySelector")?;
+                let selectors = self.parse_selectors(&(selector).to_lossy(), "querySelector")?;
                 match select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .next()
@@ -64,7 +65,7 @@ impl JsRuntime {
             NativeFunction::QuerySelectorAll => {
                 let root = self.query_root(receiver)?;
                 let selector = required_argument(arguments, 0, "querySelectorAll")?.to_js_string();
-                let selectors = self.parse_selectors(&selector, "querySelectorAll")?;
+                let selectors = self.parse_selectors(&(selector).to_lossy(), "querySelectorAll")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .map(|node| self.wrap_node(dom, node))
@@ -76,7 +77,7 @@ impl JsRuntime {
                 let tag = required_argument(arguments, 0, "getElementsByTagName")?.to_js_string();
                 // Type selectors match case-insensitively for HTML elements,
                 // which is exactly the legacy API contract.
-                let selectors = self.parse_selectors(&tag, "getElementsByTagName")?;
+                let selectors = self.parse_selectors(&(tag).to_lossy(), "getElementsByTagName")?;
                 let nodes = select_all(dom, root, &selectors, &MatchContext::default())
                     .into_iter()
                     .map(|node| self.wrap_node(dom, node))
@@ -85,8 +86,9 @@ impl JsRuntime {
             }
             NativeFunction::GetElementsByClassName => {
                 let root = self.query_root(receiver)?;
-                let names =
-                    required_argument(arguments, 0, "getElementsByClassName")?.to_js_string();
+                let names = required_argument(arguments, 0, "getElementsByClassName")?
+                    .to_js_string()
+                    .to_lossy();
                 let selector: String = names
                     .split_ascii_whitespace()
                     .map(|name| format!(".{name}"))
@@ -111,13 +113,17 @@ impl JsRuntime {
             }
             NativeFunction::CreateTextNode => {
                 self.require_document(receiver)?;
-                let data = required_argument(arguments, 0, "createTextNode")?.to_js_string();
+                let data = required_argument(arguments, 0, "createTextNode")?
+                    .to_js_string()
+                    .to_lossy();
                 let node = dom.create_text(data);
                 self.wrap_node(dom, node)
             }
             NativeFunction::CreateComment => {
                 self.require_document(receiver)?;
-                let data = required_argument(arguments, 0, "createComment")?.to_js_string();
+                let data = required_argument(arguments, 0, "createComment")?
+                    .to_js_string()
+                    .to_lossy();
                 let node = dom.create_comment(data);
                 self.wrap_node(dom, node)
             }
@@ -131,7 +137,8 @@ impl JsRuntime {
                 // Browsers accept several legacy interface names here. The
                 // generic Event object covers feature detection and exposes
                 // the timestamp read by framework schedulers.
-                let event = self.event_constructor(&[JsValue::String("event".to_owned())])?;
+                let event =
+                    self.event_constructor(&[JsValue::String(("event".to_owned()).into())])?;
                 if let JsValue::Object(object) = event {
                     self.realm
                         .set_property(object, "timeStamp".to_owned(), JsValue::Number(0.0));
@@ -174,7 +181,7 @@ impl JsRuntime {
             NativeFunction::CreateElement => {
                 self.require_document(receiver)?;
                 let name = required_argument(arguments, 0, "createElement")?.to_js_string();
-                if !valid_html_local_name(&name) {
+                if !valid_html_local_name(&(name).to_lossy()) {
                     return Err(self.dom_exception(
                         DomExceptionName::InvalidCharacter,
                         format!("{name:?} is not a supported HTML local name"),
@@ -185,7 +192,7 @@ impl JsRuntime {
                 }
                 self.ensure_heap_capacity(1)?;
                 self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
-                let node = dom.create_element(name);
+                let node = dom.create_element(name.to_lossy());
                 Ok(JsValue::Object(
                     self.realm.node_wrapper(node, dom_interface_name(dom, node)),
                 ))
@@ -194,18 +201,22 @@ impl JsRuntime {
                 let node = self.require_node(receiver)?;
                 let name = required_argument(arguments, 0, "getAttribute")?.to_js_string();
                 Ok(dom
-                    .attribute(node, &name)?
-                    .map_or(JsValue::Null, |value| JsValue::String(value.to_owned())))
+                    .attribute(node, &(name).to_lossy())?
+                    .map_or(JsValue::Null, |value| {
+                        JsValue::String((value.to_owned()).into())
+                    }))
             }
             NativeFunction::HasAttribute => {
                 let node = self.require_node(receiver)?;
                 let name = required_argument(arguments, 0, "hasAttribute")?.to_js_string();
-                Ok(JsValue::Boolean(dom.attribute(node, &name)?.is_some()))
+                Ok(JsValue::Boolean(
+                    dom.attribute(node, &(name).to_lossy())?.is_some(),
+                ))
             }
             NativeFunction::RemoveAttribute => {
                 let node = self.require_node(receiver)?;
                 let name = required_argument(arguments, 0, "removeAttribute")?.to_js_string();
-                dom.remove_attribute(node, &name)?;
+                dom.remove_attribute(node, &(name).to_lossy())?;
                 Ok(JsValue::Undefined)
             }
             NativeFunction::AppendChild => {
@@ -245,7 +256,7 @@ impl JsRuntime {
             NativeFunction::Matches => {
                 let node = self.require_node(receiver)?;
                 let selector = required_argument(arguments, 0, "matches")?.to_js_string();
-                let selectors = self.parse_selectors(&selector, "matches")?;
+                let selectors = self.parse_selectors(&(selector).to_lossy(), "matches")?;
                 Ok(JsValue::Boolean(matches_selector_list(
                     dom,
                     node,
@@ -261,7 +272,7 @@ impl JsRuntime {
                 self.realm
                     .set_property(options, "cancelable".to_owned(), JsValue::Boolean(true));
                 let event = self.event_constructor(&[
-                    JsValue::String("click".to_owned()),
+                    JsValue::String(("click".to_owned()).into()),
                     JsValue::Object(options),
                 ])?;
                 let _ = self.dispatch_event(dom, receiver, &[event])?;
@@ -279,7 +290,7 @@ impl JsRuntime {
                 };
                 let key = required_argument(arguments, 0, "item")?.to_js_string();
                 let attribute = if function == NativeFunction::NamedMapItem {
-                    let index_result = key.parse::<usize>();
+                    let index_result = key.to_lossy().parse::<usize>();
                     dom.node(map_node)
                         .and_then(|node| match node.kind() {
                             NodeKind::Element(element) => {
@@ -289,7 +300,8 @@ impl JsRuntime {
                         })
                         .map(|attribute| attribute.local_name.clone())
                 } else {
-                    dom.attribute(map_node, &key)?.map(|_value| key.clone())
+                    dom.attribute(map_node, &(key).to_lossy())?
+                        .map(|_value| key.to_lossy())
                 };
                 match attribute {
                     Some(name) => {
@@ -305,10 +317,10 @@ impl JsRuntime {
                     _ => return Err(JsError::type_error("incompatible Attr receiver")),
                 };
                 if function == NativeFunction::AttrGetName {
-                    Ok(JsValue::String(name))
+                    Ok(JsValue::String((name).into()))
                 } else {
                     Ok(JsValue::String(
-                        dom.attribute(owner, &name)?.unwrap_or_default().to_owned(),
+                        (dom.attribute(owner, &name)?.unwrap_or_default().to_owned()).into(),
                     ))
                 }
             }
@@ -845,7 +857,7 @@ impl JsRuntime {
                 format!("{property:?} is not a valid dataset property name"),
             ));
         };
-        Ok(dom.set_attribute(node, &name, value.to_js_string())?)
+        Ok(dom.set_attribute(node, &name, value.to_js_string().to_lossy())?)
     }
 
     /// `delete dataset.member`: removes the mapped `data-*` attribute and
@@ -884,7 +896,9 @@ impl JsRuntime {
         index: usize,
         function: &str,
     ) -> Result<String, JsError> {
-        let token = required_argument(arguments, index, function)?.to_js_string();
+        let token = required_argument(arguments, index, function)?
+            .to_js_string()
+            .to_lossy();
         if token.is_empty()
             || token
                 .chars()
@@ -1007,7 +1021,9 @@ impl JsRuntime {
         Ok(Self::class_list_tokens(dom, node)?
             .get(index)
             .cloned()
-            .map_or(JsValue::Null, JsValue::String))
+            .map_or(JsValue::Null, |token| {
+                JsValue::String(JsString::from(token))
+            }))
     }
 
     pub(in crate::runtime) fn class_list_to_string(
@@ -1017,7 +1033,7 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
         Ok(JsValue::String(
-            Self::class_list_tokens(dom, node)?.join(" "),
+            (Self::class_list_tokens(dom, node)?.join(" ")).into(),
         ))
     }
 
@@ -1163,8 +1179,8 @@ impl JsRuntime {
             .map(JsValue::to_js_string)
             .unwrap_or_default();
         let node = match kind {
-            DomNodeKind::Text => dom.create_text(data),
-            DomNodeKind::Comment => dom.create_comment(data),
+            DomNodeKind::Text => dom.create_text(data.to_lossy()),
+            DomNodeKind::Comment => dom.create_comment(data.to_lossy()),
             DomNodeKind::Fragment => dom.create_document_fragment(),
         };
         self.wrap_node(dom, node)

@@ -66,12 +66,12 @@ impl JsRuntime {
             | NativeFunction::DateSetYear => self.date_setter(dom, function, receiver, arguments),
             NativeFunction::DateSymbolToPrimitive => {
                 let hint = match arguments.first() {
-                    Some(JsValue::String(hint)) => hint.as_str(),
-                    _ => "",
+                    Some(JsValue::String(hint)) => hint.to_lossy(),
+                    _ => String::new(),
                 };
                 // ECMA-262 21.4.4.45: `string` and `default` try `toString` first,
                 // `number` tries `valueOf` first, and any other hint is a TypeError.
-                let string_first = match hint {
+                let string_first = match hint.as_str() {
                     "string" | "default" => true,
                     "number" => false,
                     _ => return Err(JsError::type_error("Invalid hint for Date to primitive")),
@@ -106,7 +106,7 @@ impl JsRuntime {
                         self.construct_standard_error(ErrorKind::RangeError, "Invalid time value")?;
                     return Err(JsError::thrown(error));
                 }
-                Ok(JsValue::String(Self::format_date_iso(ms)))
+                Ok(JsValue::String((Self::format_date_iso(ms)).into()))
             }
             NativeFunction::DateToJSON => {
                 let primitive = self.to_primitive_with_hint(
@@ -131,23 +131,26 @@ impl JsRuntime {
             NativeFunction::DateToDateString | NativeFunction::DateToLocaleDateString => {
                 let ms = self.require_date_value(receiver)?;
                 if !ms.is_finite() {
-                    return Ok(JsValue::String("Invalid Date".to_owned()));
+                    return Ok(JsValue::String(("Invalid Date".to_owned()).into()));
                 }
                 let (year, month, day, _, _, _, _, weekday) = Self::date_components(ms);
-                Ok(JsValue::String(format!(
-                    "{} {} {day:02} {}",
-                    DATE_WEEKDAYS[weekday as usize],
-                    DATE_MONTHS[month as usize],
-                    format_date_year(year),
-                )))
+                Ok(JsValue::String(
+                    (format!(
+                        "{} {} {day:02} {}",
+                        DATE_WEEKDAYS[weekday as usize],
+                        DATE_MONTHS[month as usize],
+                        format_date_year(year),
+                    ))
+                    .into(),
+                ))
             }
             NativeFunction::DateToTimeString | NativeFunction::DateToLocaleTimeString => {
                 let ms = self.require_date_value(receiver)?;
-                Ok(JsValue::String(Self::format_date_time_string(ms)))
+                Ok(JsValue::String((Self::format_date_time_string(ms)).into()))
             }
             NativeFunction::DateParse => {
                 let input = match arguments.first() {
-                    Some(value) => self.to_string_value(dom, value)?,
+                    Some(value) => self.to_string_value(dom, value)?.to_lossy(),
                     None => "undefined".to_owned(),
                 };
                 Ok(JsValue::Number(
@@ -173,11 +176,13 @@ impl JsRuntime {
             }
             NativeFunction::DateToString | NativeFunction::DateToLocaleString => {
                 let ms = self.require_date_value(receiver)?;
-                Ok(JsValue::String(Self::format_date_utc(ms)))
+                Ok(JsValue::String((Self::format_date_utc(ms)).into()))
             }
             NativeFunction::DateToGMTString => {
                 let ms = self.require_date_value(receiver)?;
-                Ok(JsValue::String(Self::format_date_to_utc_string(ms)))
+                Ok(JsValue::String(
+                    (Self::format_date_to_utc_string(ms)).into(),
+                ))
             }
             other => self.dispatch_promise_native(dom, other, receiver, arguments),
         }
@@ -391,7 +396,9 @@ impl JsRuntime {
                     return Ok(Self::time_clip(ms));
                 }
                 match self.to_primitive_with_hint(dom, value.clone(), PrimitiveHint::Default)? {
-                    JsValue::String(text) => Ok(Self::parse_date_string(&text).unwrap_or(f64::NAN)),
+                    JsValue::String(text) => {
+                        Ok(Self::parse_date_string(&(text).to_lossy()).unwrap_or(f64::NAN))
+                    }
                     primitive => Ok(Self::time_clip(to_number(&primitive)?)),
                 }
             }
@@ -952,14 +959,14 @@ mod tests {
         /// Evaluate an expression and render it with `String(...)`.
         fn scalar(&mut self, expression: &str) -> String {
             match self.eval(&format!("String({expression})")) {
-                JsValue::String(text) => text,
+                JsValue::String(text) => text.to_lossy(),
                 other => panic!("script returned {other:?}, expected a string"),
             }
         }
 
         /// Execute a script and render its completion value as a string.
         fn string(&mut self, source: &str) -> String {
-            self.eval(source).to_js_string()
+            self.eval(source).to_js_string().to_lossy()
         }
     }
 

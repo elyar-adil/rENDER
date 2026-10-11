@@ -310,7 +310,7 @@ impl JsRuntime {
             return Err(self.call_depth_exceeded());
         }
         self.calls_active = self.calls_active.saturating_add(1);
-        let result = self.run_eval(dom, &source, &context, direct);
+        let result = self.run_eval(dom, &(source).to_lossy(), &context, direct);
         self.calls_active = self.calls_active.saturating_sub(1);
         result
     }
