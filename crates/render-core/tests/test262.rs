@@ -1741,9 +1741,11 @@ language	88	2	0	1	200
     }
 
     #[test]
-    fn classifies_module_tests_as_unsupported() {
+    fn runs_module_tests_instead_of_classifying_them_unsupported() {
+        // Module-flagged files run as module graphs (ECMA-262 16.2.1), so the runner
+        // judges them rather than skipping them.
         let records = run_manifest_case("language/module-code/eval-export-dflt-cls-anon-semi.js");
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].status, Status::Unsupported);
+        assert_ne!(records[0].status, Status::Unsupported);
     }
 }

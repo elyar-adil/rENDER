@@ -2295,7 +2295,11 @@ mod tests {
             .expect("invalidation succeeds")
             .expect("script task is ready");
 
-        assert_eq!(turn.executions.len(), 3);
+        // The script task, then four jobs: the first reaction returns a promise, so
+        // NewPromiseResolveThenableJob (27.2.2.2) runs, which registers a reaction on
+        // the inner promise (27.2.5.4.1 PerformPromiseThen); that reaction resolves the
+        // derived promise, and the final `then` runs as the last reaction job.
+        assert_eq!(turn.executions.len(), 5);
         assert!(
             turn.executions
                 .iter()
@@ -2322,7 +2326,10 @@ mod tests {
             .expect("invalidation succeeds")
             .expect("script task is ready");
 
-        assert_eq!(turn.executions.len(), 2);
+        // The script task, then the NewPromiseResolveThenableJob (27.2.2.2) for the
+        // resolution with a promise, its reaction on the inner promise, and the
+        // reaction that settles the outer promise.
+        assert_eq!(turn.executions.len(), 4);
         assert!(
             turn.executions
                 .iter()
