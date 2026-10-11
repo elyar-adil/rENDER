@@ -177,6 +177,11 @@ pub(super) struct Token {
     /// spelling never acts as a keyword (ECMA-262 12.7.2), so the parser
     /// refuses it where a keyword is required.
     pub escaped: bool,
+    /// Whether the literal uses legacy syntax (Annex B.1.1, B.1.2): a number
+    /// with a leading zero, a string with a legacy octal escape, or a template
+    /// chunk with an escape that only a tagged template may use. Strict code
+    /// refuses the first two, and an untagged template refuses the last.
+    pub legacy_syntax: bool,
 }
 
 pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token>, JsError> {
@@ -200,10 +205,15 @@ pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token
         last_block_close: true,
         newline: false,
         escaped_name: false,
+        legacy_syntax: false,
     }
     .run()
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent token state (newline, escape, legacy syntax, block close)"
+)]
 struct Lexer<'a> {
     source: &'a str,
     offset: usize,
@@ -220,6 +230,9 @@ struct Lexer<'a> {
     /// Whether the identifier being scanned contained a Unicode escape. Taken
     /// by the next `push`, which records it on the token.
     escaped_name: bool,
+    /// Whether the literal being scanned uses legacy syntax (see
+    /// [`Token::legacy_syntax`]). Taken by the next `push`, like `escaped_name`.
+    legacy_syntax: bool,
 }
 
 /// ECMA-262 12.2 `WhiteSpace`: tab, vertical tab, form feed, space, no-break
@@ -964,11 +977,22 @@ impl Lexer<'_> {
                 return Ok(TokenKind::Number(radix_digits_to_number(&text, radix)));
             }
         }
+        // A leading zero before a digit makes a LegacyOctalIntegerLiteral or a
+        // NonOctalDecimalIntegerLiteral (Annex B.1.1), which strict code refuses.
+        // Neither admits a NumericLiteralSeparator (ECMA-262 12.8.6).
+        let legacy = self.peek() == Some('0')
+            && self
+                .peek_second()
+                .is_some_and(|value| value.is_ascii_digit());
+        self.legacy_syntax = legacy;
         // A separator cannot follow a leading zero (`0_1` is not a literal).
         if self.peek() == Some('0') && self.peek_second() == Some('_') {
             return Err(JsError::syntax("invalid numeric literal", start));
         }
         let integer_digits = self.digit_run(|value| value.is_ascii_digit());
+        if legacy && self.source[start..self.offset].contains('_') {
+            return Err(JsError::syntax("invalid numeric literal", start));
+        }
         if self.peek() == Some('n') {
             // A BigInt literal is a plain integer: a fraction or an exponent
             // makes `n` invalid. A leading zero before more digits is the legacy
@@ -1066,6 +1090,12 @@ impl Lexer<'_> {
                     '"' => '"',
                     'x' => self.hex_escape(2)?,
                     'u' => self.unicode_escape()?,
+                    // A LegacyOctalEscapeSequence or NonOctalDecimalEscapeSequence
+                    // (Annex B.1.2), which strict code refuses.
+                    digit @ '0'..='9' => {
+                        self.legacy_syntax = true;
+                        digit
+                    }
                     other => other,
                 };
                 value.push(escaped);
@@ -1205,6 +1235,12 @@ impl Lexer<'_> {
                         'v' => '\u{000b}',
                         'x' => self.hex_escape(2)?,
                         'u' => self.unicode_escape()?,
+                        // Octal and non-octal decimal escapes are refused by an untagged
+                        // template in any code (ECMA-262 13.2.8.1, B.1.2).
+                        digit @ '0'..='9' => {
+                            self.legacy_syntax = true;
+                            digit
+                        }
                         other => other,
                     };
                     text.push(escaped);
@@ -1236,6 +1272,7 @@ impl Lexer<'_> {
         let outer_last_block_close = self.last_block_close;
         let outer_newline = std::mem::take(&mut self.newline);
         let outer_escaped = std::mem::take(&mut self.escaped_name);
+        let outer_legacy = std::mem::take(&mut self.legacy_syntax);
         let mut depth = 0_u32;
         let result = loop {
             match self.next_token() {
@@ -1259,6 +1296,7 @@ impl Lexer<'_> {
         self.last_block_close = outer_last_block_close;
         self.newline = outer_newline;
         self.escaped_name = outer_escaped;
+        self.legacy_syntax = outer_legacy;
         result
     }
 
@@ -1301,6 +1339,7 @@ impl Lexer<'_> {
             offset,
             after_newline: std::mem::take(&mut self.newline),
             escaped: std::mem::take(&mut self.escaped_name),
+            legacy_syntax: std::mem::take(&mut self.legacy_syntax),
         });
         Ok(())
     }

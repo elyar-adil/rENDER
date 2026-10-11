@@ -1131,7 +1131,7 @@ struct Parser {
 
 impl Parser {
     fn program(mut self) -> Result<Vec<Statement>, JsError> {
-        self.strict = self.prologue_is_strict(self.cursor);
+        self.strict = self.prologue_is_strict(self.cursor)?;
         let statements = self.statement_list(false)?;
         validate_declaration_conflicts(&statements, true, self.strict)?;
         if has_use_strict_directive(&statements) {
@@ -2134,12 +2134,25 @@ impl Parser {
     /// Whether the directive prologue starting at token `index` contains
     /// `"use strict"` (ECMA-262 11.2.1). Each directive is a string literal
     /// that forms a whole expression statement.
-    fn prologue_is_strict(&self, mut index: usize) -> bool {
+    ///
+    /// A directive before `"use strict"` that contains a legacy octal escape is
+    /// an early error, because the strict code it precedes rejects it (ECMA-262
+    /// B.1.2): the prologue is scanned before the body's directives are parsed.
+    fn prologue_is_strict(&self, mut index: usize) -> Result<bool, JsError> {
+        let mut legacy_directive = None;
         loop {
-            let Some(TokenKind::String(text)) = self.tokens.get(index).map(|token| &token.kind)
+            let Some(Token {
+                kind: TokenKind::String(text),
+                legacy_syntax,
+                offset,
+                ..
+            }) = self.tokens.get(index)
             else {
-                return false;
+                return Ok(false);
             };
+            if *legacy_syntax && legacy_directive.is_none() {
+                legacy_directive = Some(*offset);
+            }
             let next = index + 1;
             index = match self.tokens.get(next) {
                 Some(Token {
@@ -2154,10 +2167,16 @@ impl Parser {
                 // A line break ends the directive only when the next token
                 // cannot continue the expression (`"a"\n(b)` is a call).
                 Some(token) if token.after_newline && !continues_expression(&token.kind) => next,
-                Some(_) => return false,
+                Some(_) => return Ok(false),
             };
             if text == "use strict" {
-                return true;
+                return match legacy_directive {
+                    Some(offset) => Err(JsError::syntax(
+                        "octal escape sequence in a directive before \"use strict\"",
+                        offset,
+                    )),
+                    None => Ok(true),
+                };
             }
         }
     }
@@ -2828,9 +2847,10 @@ impl Parser {
             let previous_function_depth = self.function_depth;
             let previous_loop_depth = self.loop_depth;
             let previous_strict = self.strict;
+            let body_strict = previous_strict || self.prologue_is_strict(self.cursor)?;
             self.function_depth = self.function_depth.saturating_add(1);
             self.loop_depth = 0;
-            self.strict = previous_strict || self.prologue_is_strict(self.cursor);
+            self.strict = body_strict;
             let body = self.statement_list(true);
             strict = self.strict;
             self.function_depth = previous_function_depth;
@@ -3456,6 +3476,7 @@ impl Parser {
     fn primary(&mut self) -> Result<Expr, JsError> {
         let token = self.advance();
         let escaped = token.escaped;
+        let legacy = token.legacy_syntax;
         match token.kind {
             TokenKind::Identifier(name)
                 if name == "async" && !escaped && self.at(&TokenKind::Function) =>
@@ -3598,6 +3619,11 @@ impl Parser {
             TokenKind::Let if self.strict => Err(self.error("let is reserved in strict code")),
             TokenKind::Let => Ok(Expr::Identifier("let".to_owned())),
             TokenKind::This => Ok(Expr::This),
+            // A legacy octal escape is refused in strict code (ECMA-262 B.1.2).
+            TokenKind::String(_) if legacy && self.strict => Err(JsError::syntax(
+                "octal escape sequence is not allowed in strict code",
+                token.offset,
+            )),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
             TokenKind::RegexLiteral { pattern, flags } => {
                 // ECMA-262 §22.2.1: a regular expression literal whose pattern or
@@ -3614,7 +3640,18 @@ impl Parser {
                     flags,
                 })
             }
+            // An untagged template refuses an octal or non-octal decimal escape in any
+            // code (ECMA-262 13.2.8.1); only a tagged template may contain one.
+            TokenKind::Template(_) if legacy => Err(JsError::syntax(
+                "octal escape sequence is not allowed in an untagged template",
+                token.offset,
+            )),
             TokenKind::Template(parts) => self.template_literal(parts, token.offset),
+            // A legacy octal or non-octal decimal number is refused in strict code (ECMA-262 B.1.1).
+            TokenKind::Number(_) if legacy && self.strict => Err(JsError::syntax(
+                "legacy octal number is not allowed in strict code",
+                token.offset,
+            )),
             TokenKind::Number(value) => Ok(Expr::Literal(JsValue::Number(value))),
             TokenKind::BigInt(value) => Ok(Expr::Literal(JsValue::BigInt(value))),
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
@@ -3995,6 +4032,7 @@ impl Parser {
         // so it sees the same `await`/`yield`, private names and `import.meta`.
         parser.in_async = self.in_async;
         parser.in_generator = self.in_generator;
+        parser.strict = self.strict;
         parser
             .private_references
             .clone_from(&self.private_references);
@@ -4232,10 +4270,11 @@ impl Parser {
         let previous_loop_depth = self.loop_depth;
         let previous_no_in = self.no_in;
         let previous_strict = self.strict;
+        let body_strict = previous_strict || self.prologue_is_strict(self.cursor)?;
         self.function_depth = self.function_depth.saturating_add(1);
         self.loop_depth = 0;
         self.no_in = false;
-        self.strict = previous_strict || self.prologue_is_strict(self.cursor);
+        self.strict = body_strict;
         let body = self.statement_list(true);
         let strict = self.strict;
         self.function_depth = previous_function_depth;
@@ -4499,8 +4538,30 @@ impl Parser {
         Ok(PropertyKey::Static(self.property_name()?))
     }
 
+    /// The name after a `.`: an `IdentifierName`, so a string or numeric literal is
+    /// not one (ECMA-262 13.3.2).
+    fn member_name(&mut self) -> Result<String, JsError> {
+        if matches!(
+            self.current().kind,
+            TokenKind::String(_) | TokenKind::Number(_) | TokenKind::BigInt(_)
+        ) {
+            return Err(self.error("expected a property name after '.'"));
+        }
+        self.property_name()
+    }
+
     fn property_name(&mut self) -> Result<String, JsError> {
         let token = self.advance();
+        // A numeric or string name with legacy syntax is refused in strict code (ECMA-262 B.1.1, B.1.2).
+        if token.legacy_syntax
+            && self.strict
+            && matches!(token.kind, TokenKind::Number(_) | TokenKind::String(_))
+        {
+            return Err(JsError::syntax(
+                "legacy octal syntax is not allowed in strict code",
+                token.offset,
+            ));
+        }
         match token.kind {
             TokenKind::Identifier(name)
             | TokenKind::EscapedReserved(name)
@@ -5821,5 +5882,95 @@ mod tests {
             .expect("source should tokenize");
         let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
         assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
+    }
+
+    /// Whether `source` is refused as a Script with a `SyntaxError`, from the
+    /// lexer or the parser.
+    fn script_is_syntax_error(source: &str) -> bool {
+        let limits = RuntimeLimits::default();
+        tokenize(source, &limits)
+            .and_then(|tokens| parse(tokens, &limits))
+            .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
+    }
+
+    /// Whether `source` is refused as a Module with a `SyntaxError`.
+    fn module_is_syntax_error(source: &str) -> bool {
+        let limits = RuntimeLimits::default();
+        tokenize(source, &limits)
+            .and_then(|tokens| super::parse_module(tokens, &limits))
+            .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
+    }
+
+    #[test]
+    fn legacy_octal_numbers_are_early_errors_in_strict_code() {
+        assert!(!script_is_syntax_error(
+            "010; 08; 08.5; 0.5; 0; 1_0; 0.0_1;"
+        ));
+        assert!(script_is_syntax_error("\"use strict\"; 010;"));
+        assert!(script_is_syntax_error("\"use strict\"; 07;"));
+        assert!(script_is_syntax_error("\"use strict\"; 08;"));
+        assert!(script_is_syntax_error("\"use strict\"; var x = 0123;"));
+        assert!(script_is_syntax_error(
+            "function f() { 'use strict'; return 00; }"
+        ));
+    }
+
+    #[test]
+    fn numeric_separators_are_refused_after_a_leading_zero() {
+        assert!(script_is_syntax_error("00_0;"));
+        assert!(script_is_syntax_error("07_0;"));
+        assert!(script_is_syntax_error("08_0;"));
+        assert!(script_is_syntax_error("09_0;"));
+        assert!(script_is_syntax_error("0_1;"));
+        assert!(!script_is_syntax_error("1_0;"));
+    }
+
+    #[test]
+    fn legacy_octal_string_escapes_are_early_errors_in_strict_code() {
+        assert!(!script_is_syntax_error(
+            "'\\1'; '\\08'; '\\8'; '\\0'; '\\\\1';"
+        ));
+        assert!(script_is_syntax_error("\"use strict\"; '\\1';"));
+        assert!(script_is_syntax_error("\"use strict\"; '\\08';"));
+        assert!(script_is_syntax_error("\"use strict\"; '\\8';"));
+        assert!(script_is_syntax_error("'use strict'; var s = '\\9';"));
+    }
+
+    #[test]
+    fn legacy_octal_escape_in_a_directive_before_use_strict_is_an_early_error() {
+        assert!(!script_is_syntax_error("function f() { '\\1'; }"));
+        assert!(script_is_syntax_error(
+            "function f() { '\\1'; 'use strict'; }"
+        ));
+        assert!(script_is_syntax_error(
+            "(function() { 'asterisk: \\052'; 'use strict'; })"
+        ));
+        assert!(!script_is_syntax_error(
+            "function f() { 'use strict'; 'a'; }"
+        ));
+    }
+
+    #[test]
+    fn legacy_octal_property_names_are_early_errors_in_strict_code() {
+        assert!(!script_is_syntax_error("({ 010: 1, '\\1': 2 });"));
+        assert!(script_is_syntax_error("'use strict'; ({ 010: 1 });"));
+        assert!(script_is_syntax_error("'use strict'; ({ '\\1': 2 });"));
+    }
+
+    #[test]
+    fn untagged_template_refuses_legacy_escapes_but_a_tag_accepts_them() {
+        assert!(!script_is_syntax_error("tag`\\1\\8\\00`;"));
+        assert!(!script_is_syntax_error("`\\0 \\n`;"));
+        assert!(script_is_syntax_error("`\\00`;"));
+        assert!(script_is_syntax_error("`\\8`;"));
+        assert!(script_is_syntax_error("`\\9`;"));
+        assert!(script_is_syntax_error("`\\1`;"));
+    }
+
+    #[test]
+    fn strict_code_refuses_legacy_literals_inside_template_substitutions() {
+        assert!(!script_is_syntax_error("`${'\\07'}`;"));
+        assert!(script_is_syntax_error("'use strict'; `${'\\07'}`;"));
+        assert!(script_is_syntax_error("'use strict'; `${010}`;"));
     }
 }
