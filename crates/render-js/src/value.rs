@@ -2996,7 +2996,13 @@ impl Realm {
         ) = Self::install_async_iteration(objects, object_prototype, function_prototype);
         let map_prototype =
             Self::install_collections(objects, global, object_prototype, function_prototype);
-        Self::install_typed_arrays(objects, global, object_prototype, function_prototype);
+        Self::install_typed_arrays(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+        );
         Self::install_binary_data(objects, global, object_prototype, function_prototype);
         Self::install_atomics(objects, global, object_prototype, function_prototype);
         Self::install_json(objects, global, object_prototype, function_prototype);
@@ -4313,6 +4319,7 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
+        array_prototype: ObjectId,
     ) {
         // §23.2.3: `%TypedArray%.prototype`, which the concrete prototypes inherit.
         let intrinsic_prototype = ObjectId(objects.len());
@@ -4410,7 +4417,6 @@ impl Realm {
             ),
             ("toReversed", NativeFunction::TypedArrayToReversed, 0.0),
             ("toSorted", NativeFunction::TypedArrayToSorted, 1.0),
-            ("toString", NativeFunction::TypedArrayJoin, 0.0),
             ("values", NativeFunction::TypedArrayValues, 0.0),
             ("with", NativeFunction::TypedArrayWith, 2.0),
         ];
@@ -4433,6 +4439,17 @@ impl Realm {
                 (symbol, PropertyDescriptor::builtin(JsValue::Object(values))),
             );
         }
+        // §23.2.3.32: `%TypedArray%.prototype.toString` is the initial value of
+        // `Array.prototype.toString`, the same function object.
+        if let Some(to_string) = objects[array_prototype.0]
+            .properties
+            .get("toString")
+            .cloned()
+        {
+            objects[intrinsic_prototype.0]
+                .properties
+                .insert("toString".to_owned(), to_string);
+        }
         // §23.2.3.3, §23.2.3.19 and §23.2.3.23: the `length`, `byteLength` and
         // `byteOffset` accessors.
         Self::install_getters(
@@ -4451,6 +4468,7 @@ impl Realm {
         objects.push(JsObject {
             prototype: Some(function_prototype),
             host: ObjectHost::NativeFunction(NativeFunction::TypedArrayToStringTagGetter),
+            properties: Self::function_metadata("get [Symbol.toStringTag]", 0.0),
             ..JsObject::default()
         });
         let tag = JsSymbol::well_known("@@toStringTag");

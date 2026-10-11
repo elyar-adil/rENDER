@@ -14,7 +14,7 @@
 )]
 
 use super::array::callback_this_argument;
-use super::object::{AccessorField, PartialDescriptor};
+use super::object::{AccessorField, PartialDescriptor, PropertyName};
 use crate::JsError;
 use crate::JsSymbol;
 use crate::JsValue;
@@ -70,7 +70,7 @@ impl JsRuntime {
             NativeFunction::TypedArrayIncludes => {
                 self.typed_array_includes(dom, receiver, arguments)
             }
-            NativeFunction::TypedArrayJoin => self.typed_array_join(receiver, arguments),
+            NativeFunction::TypedArrayJoin => self.typed_array_join(dom, receiver, arguments),
             NativeFunction::TypedArrayToLocaleString => {
                 // ECMA-262 23.2.3.32: the Array algorithm, over the view's length
                 // after ValidateTypedArray.
@@ -119,17 +119,7 @@ impl JsRuntime {
                 self.typed_array_to_sorted(dom, receiver, arguments)
             }
             NativeFunction::TypedArrayWith => self.typed_array_with(dom, receiver, arguments),
-            NativeFunction::TypedArrayFrom => {
-                let kind = match self.realm.host(receiver) {
-                    Some(ObjectHost::TypedArrayConstructor(kind)) => kind,
-                    _ => {
-                        return Err(JsError::type_error(
-                            "TypedArray.from requires a typed-array constructor receiver",
-                        ));
-                    }
-                };
-                self.typed_array_from(dom, receiver, kind, arguments)
-            }
+            NativeFunction::TypedArrayFrom => self.typed_array_from(dom, receiver, arguments),
             NativeFunction::TypedArrayOf => self.typed_array_of(dom, receiver, arguments),
             NativeFunction::TypedArraySpecies => Ok(JsValue::Object(receiver)),
             NativeFunction::TypedArrayBufferGetter => {
@@ -340,86 +330,166 @@ impl JsRuntime {
         }
     }
 
-    /// `TypedArray.from(source[, mapper[, thisArg]])` (ECMA-262 23.2.2.1): build
-    /// one typed array from another typed array, an array-like, or a string's
-    /// characters, with an optional mapping callback.
+    /// `%TypedArray%.from(source[, mapfn[, thisArg]])` (ECMA-262 23.2.2.1) on any
+    /// constructor `this`. A source with an `@@iterator` method is iterated and
+    /// its values listed before the target is created; any other source is read
+    /// as an array-like. The mapper sees each raw value, and each result is
+    /// assigned to the target with `Set`, which applies the element conversion.
     pub(in crate::runtime) fn typed_array_from(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
-        kind: TypedArrayKind,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
+        // Step 2: `this` must be a constructor.
+        if !self.is_constructor(constructor) {
+            return Err(JsError::type_error(
+                "TypedArray.from requires a constructor receiver",
+            ));
+        }
+        // Steps 3-4: a mapper that is not callable throws before the source is read.
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
-        let mut values = match &source {
-            JsValue::Object(_) => self.typed_array_source_values(dom, kind, &source)?,
-            // The string's code points are iterated as strings, and each one is
-            // converted like any other element (23.2.2.1 steps 5 and 6).
-            JsValue::String(text) => {
-                let mut converted = Vec::new();
-                for character in text.code_point_strings() {
-                    let character = JsValue::String(character);
-                    converted.push(self.typed_element_value(dom, kind, &character)?);
-                }
-                converted
+        let mapper = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => None,
+            Some(value) => Some(Self::require_callable_object(value, &self.realm)?),
+        };
+        let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
+        // Step 5: GetMethod(source, @@iterator). ToObject throws for undefined and null.
+        let pinned = self.transient_roots.len();
+        let object = self.to_object(&source)?;
+        self.transient_roots.push(object);
+        let method = self.get_symbol_value(dom, object, &JsSymbol::well_known("@@iterator"))?;
+        let (length, iterated) = match method {
+            JsValue::Undefined | JsValue::Null => (self.length_of_array_like(dom, object)?, None),
+            JsValue::Object(method) if Self::is_callable_object(method, &self.realm) => {
+                let values = self.typed_array_iterated_values(dom, &source, method)?;
+                (values.len() as f64, Some(values))
             }
             _ => {
                 return Err(JsError::type_error(
-                    "TypedArray.from requires an array-like or iterable source",
+                    "TypedArray.from requires a callable @@iterator",
                 ));
             }
         };
-        if let Some(JsValue::Object(mapper)) = arguments.get(1) {
-            let mapper = Self::require_callable_object(&JsValue::Object(*mapper), &self.realm)?;
-            let this_argument = arguments.get(2).cloned().unwrap_or(JsValue::Undefined);
-            for (index, value) in values.iter_mut().enumerate() {
-                let index_value = JsValue::Number(index as f64);
-                let element = self.call_with_this(
+        // Step 9-10: the target is created with the length before any mapping runs.
+        let target =
+            self.typed_array_create_from_constructor(dom, constructor, &[JsValue::Number(length)])?;
+        self.transient_roots.push(target);
+        for index in 0..length as usize {
+            let value = match &iterated {
+                Some(values) => values[index].clone(),
+                None => self.get_member(dom, object, &index.to_string())?,
+            };
+            let value = match mapper {
+                Some(mapper) => self.call_with_this(
                     dom,
                     mapper,
-                    &[value.clone(), index_value],
+                    &[value, JsValue::Number(index as f64)],
                     this_argument.clone(),
-                )?;
-                *value = self.typed_element_value(dom, kind, &element)?;
-            }
+                )?,
+                None => value,
+            };
+            self.typed_array_set_element_or_throw(dom, target, index, value)?;
         }
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        self.create_typed_array_from_elements(kind, &values, prototype)
+        self.transient_roots.truncate(pinned);
+        Ok(JsValue::Object(target))
     }
 
-    /// `TypedArray.of(...items)` (ECMA-262 23.2.2.2), for a concrete constructor.
+    /// `%TypedArray%.of(...items)` (ECMA-262 23.2.2.2) on any constructor `this`.
     fn typed_array_of(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let kind = match self.realm.host(constructor) {
-            Some(ObjectHost::TypedArrayConstructor(kind)) => kind,
-            _ => {
-                return Err(JsError::type_error(
-                    "TypedArray.of requires a typed-array constructor receiver",
-                ));
-            }
-        };
-        let mut values = Vec::with_capacity(arguments.len());
-        for argument in arguments {
-            values.push(self.typed_element_value(dom, kind, argument)?);
+        if !self.is_constructor(constructor) {
+            return Err(JsError::type_error(
+                "TypedArray.of requires a constructor receiver",
+            ));
         }
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        self.create_typed_array_from_elements(kind, &values, prototype)
+        let pinned = self.transient_roots.len();
+        let target = self.typed_array_create_from_constructor(
+            dom,
+            constructor,
+            &[JsValue::Number(arguments.len() as f64)],
+        )?;
+        self.transient_roots.push(target);
+        for (index, value) in arguments.iter().enumerate() {
+            self.typed_array_set_element_or_throw(dom, target, index, value.clone())?;
+        }
+        self.transient_roots.truncate(pinned);
+        Ok(JsValue::Object(target))
+    }
+
+    /// The values an iterable `source` produces through `method`, as
+    /// `IteratorToList` (ECMA-262 7.4.2). The iterator and each object value stay
+    /// pinned in `transient_roots` for the caller, which truncates them.
+    fn typed_array_iterated_values(
+        &mut self,
+        dom: &mut Dom,
+        source: &JsValue,
+        method: ObjectId,
+    ) -> Result<Vec<JsValue>, JsError> {
+        let iterator = match self.call_with_this(dom, method, &[], source.clone())? {
+            JsValue::Object(iterator) => iterator,
+            _ => return Err(JsError::type_error("iterator is not an object")),
+        };
+        self.transient_roots.push(iterator);
+        let next = match self.get_member(dom, iterator, "next")? {
+            JsValue::Object(next) if Self::is_callable_object(next, &self.realm) => next,
+            _ => return Err(JsError::type_error("iterator has no callable 'next'")),
+        };
+        self.transient_roots.push(next);
+        let mut values = Vec::new();
+        while let Some(step) = self.iterator_next(dom, iterator, next)? {
+            if let JsValue::Object(object) = step {
+                self.transient_roots.push(object);
+            }
+            values.push(step);
+        }
+        Ok(values)
+    }
+
+    /// `TypedArrayCreateFromConstructor(constructor, argumentList)` (ECMA-262
+    /// 23.2.4.2): `Construct` the constructor, then require a typed array in
+    /// bounds, at least as long as a single length argument.
+    pub(in crate::runtime) fn typed_array_create_from_constructor(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<ObjectId, JsError> {
+        let JsValue::Object(result) = self.construct(dom, constructor, arguments)? else {
+            return Err(JsError::type_error("constructor returned a primitive"));
+        };
+        let (_, _, _, length) = self.typed_array_host(result)?;
+        if let [JsValue::Number(requested)] = arguments
+            && (length as f64) < *requested
+        {
+            return Err(JsError::type_error(
+                "constructor returned a typed array that is too short",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// `Set(target, index, value, true)` for an element of a `from` or `of`
+    /// target: a refused assignment is a `TypeError` (ECMA-262 7.3.4).
+    fn typed_array_set_element_or_throw(
+        &mut self,
+        dom: &mut Dom,
+        target: ObjectId,
+        index: usize,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let key = PropertyName::String(index.to_string());
+        if self.set_property_checked(dom, target, &key, value)? {
+            Ok(())
+        } else {
+            Err(JsError::type_error(format!(
+                "cannot assign to read only property '{index}'"
+            )))
+        }
     }
 
     pub(in crate::runtime) fn create_typed_array(
@@ -631,23 +701,11 @@ impl JsRuntime {
             return Err(JsError::type_error("no default typed-array constructor"));
         };
         let species = self.species_constructor(dom, exemplar, default)?;
-        // TypedArrayCreateFromConstructor (ECMA-262 23.2.4.2).
-        let JsValue::Object(result) = self.construct(dom, species, arguments)? else {
-            return Err(JsError::type_error(
-                "species constructor returned a primitive",
-            ));
-        };
-        let (result_kind, _, _, length) = self.typed_array_host(result)?;
+        let result = self.typed_array_create_from_constructor(dom, species, arguments)?;
+        let (result_kind, _, _, _) = self.typed_array_host(result)?;
         if result_kind.is_bigint() != kind.is_bigint() {
             return Err(JsError::type_error(
                 "cannot mix BigInt and other types in typed array copies",
-            ));
-        }
-        if let [JsValue::Number(requested)] = arguments
-            && (length as f64) < *requested
-        {
-            return Err(JsError::type_error(
-                "species constructor returned a typed array that is too short",
             ));
         }
         Ok(result)
@@ -715,12 +773,47 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let (kind, _, _, length) = self.typed_array_host(receiver)?;
         let (begin, end) = self.typed_range(dom, arguments, length)?;
+        let result = self.typed_array_species_create(
+            dom,
+            receiver,
+            kind,
+            &[JsValue::Number((end - begin) as f64)],
+        )?;
+        if end <= begin {
+            return Ok(JsValue::Object(result));
+        }
+        // ECMA-262 23.2.3.27 step 13: the species constructor and the coercions
+        // may detach or shrink the source. A detached or out-of-bounds source
+        // throws, and the copy stops at the source's current length.
+        let (_, buffer, start, current) = self.typed_array_host(receiver)?;
+        let end = end.min(current);
+        if end <= begin {
+            return Ok(JsValue::Object(result));
+        }
         let count = end - begin;
-        let result =
-            self.typed_array_species_create(dom, receiver, kind, &[JsValue::Number(count as f64)])?;
-        for offset in 0..count {
-            let value = self.typed_array_get_index(receiver, begin + offset);
-            self.typed_array_set_index(dom, result, offset, &value)?;
+        let (result_kind, result_buffer, result_start, _) = self.typed_array_host(result)?;
+        if result_kind == kind {
+            // Same content type: the element bits transfer unchanged, so a NaN
+            // payload survives the copy (the same-type branch of step 13). That
+            // branch copies a byte at a time, forward, so when both views share a
+            // buffer an overlapping target reads the bytes it already wrote.
+            let size = kind.element_size();
+            let source_at = (start + begin) * size;
+            let target_at = result_start * size;
+            if buffer == result_buffer {
+                for offset in 0..count * size {
+                    let byte = buffer.read_bytes(source_at + offset, 1)?;
+                    result_buffer.write_bytes(target_at + offset, &byte);
+                }
+            } else {
+                let bytes = buffer.read_bytes(source_at, count * size)?;
+                result_buffer.write_bytes(target_at, &bytes);
+            }
+        } else {
+            for offset in 0..count {
+                let value = self.typed_array_get_index(receiver, begin + offset);
+                self.typed_array_set_index(dom, result, offset, &value)?;
+            }
         }
         Ok(JsValue::Object(result))
     }
@@ -991,13 +1084,16 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn typed_array_join(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        // ECMA-262 23.2.3.19: the separator is converted with ToString, which runs
+        // user `toString` and `valueOf` code, even when the view is empty.
         let separator = match arguments.first() {
             None | Some(JsValue::Undefined) => JsString::from(","),
-            Some(value) => value.to_js_string(),
+            Some(value) => self.to_string_value(dom, value)?,
         };
         let elements = buffer.elements_value(kind, start, length)?;
         // ECMA-262 23.2.3.19: each element is ToString'd and the parts are joined
@@ -1316,8 +1412,10 @@ impl JsRuntime {
         // The value's coercion can resize or detach the buffer, so the index is
         // checked against the length it leaves (IsValidIntegerIndex, ECMA-262
         // 23.2.3.38 step 9), and the copy reads past it as `undefined`.
-        let (_, _, _, current) = self.typed_array_host(receiver)?;
-        if index < 0.0 || index >= current as f64 {
+        // A detached or out-of-bounds view has no valid index at all, so that
+        // is the RangeError too, not a ValidateTypedArray TypeError.
+        let current = self.typed_array_parts(receiver)?.3;
+        if !current.is_some_and(|current| index >= 0.0 && index < current as f64) {
             return Err(self.range_error("Invalid typed array index"));
         }
         let current_elements = self.typed_array_elements(receiver)?;

@@ -3974,6 +3974,13 @@ impl JsRuntime {
                 if matches!(self.realm.host(*object), Some(ObjectHost::Proxy { .. })) {
                     return self.proxy_has(dom, *object, &(name).to_key());
                 }
+                // ECMA-262 10.4.5.2 [[HasProperty]]: a canonical numeric key of a
+                // typed array is answered by its validity alone, never the chain.
+                match self.realm.typed_key(*object, &name.to_key()) {
+                    TypedKey::Element(_) => return Ok(true),
+                    TypedKey::Invalid => return Ok(false),
+                    TypedKey::Ordinary => {}
+                }
                 if self.realm.get_property(*object, &(name).to_key()).is_some() {
                     return Ok(true);
                 }
@@ -5982,10 +5989,9 @@ impl JsRuntime {
             Some(ObjectHost::CollectionConstructor(_)) => {
                 Err(JsError::type_error("collection constructors require 'new'"))
             }
-            // Typed-array constructors also work when called without `new`.
-            Some(ObjectHost::TypedArrayConstructor(kind)) => {
-                self.typed_array_constructor(dom, callee, kind, arguments)
-            }
+            Some(ObjectHost::TypedArrayConstructor(_)) => Err(JsError::type_error(
+                "typed array constructors require 'new'",
+            )),
             Some(ObjectHost::RegExpConstructor) => {
                 // `RegExp(re)` called without `new` behaves like construction,
                 // except that a same-realm pattern is returned unchanged.

@@ -6096,6 +6096,119 @@ fn typed_array_canonical_numeric_keys_are_elements_or_nothing() {
 }
 
 #[test]
+fn typed_array_from_and_of_use_this_as_any_constructor() {
+    // 23.2.2.1 and 23.2.2.2: `this` is any constructor, a mapper that is not
+    // callable throws before the source is read, the mapper sees raw values, and
+    // the target exists before any element is mapped.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var log = '';
+                function C(...rest) { log += 'C'; return new Int8Array(...rest); }
+                var arrayLike = {
+                    get length() { log += 'l'; return 1; },
+                    get 0() { log += '0'; return 'q'; }
+                };
+                var mapperThrew = false;
+                try { Int8Array.from.call(C, arrayLike, () => { throw 1; }); }
+                catch (error) { mapperThrew = error === 1; }
+                var raw = [];
+                Int8Array.from(['a', 'b'], (value, index) => { raw.push(value + index); return 7; });
+                var constructed = Int8Array.from.call(function (len) { return new Int8Array(len); }, [1, 2]);
+                var badThis = false;
+                try { Int8Array.of.call(Array, 1); } catch (error) { badThis = error instanceof TypeError; }
+                var badMapper = false;
+                try { Int8Array.from([1], {}); } catch (error) { badMapper = error instanceof TypeError; }
+                mapperThrew && log === 'lC0' && raw.join(',') === 'a0,b1'
+                    && constructed.join(',') === '1,2' && Int8Array.of(1, '2', 3).join(',') === '1,2,3'
+                    && badThis && badMapper && Int8Array.from.length === 1 && Int8Array.of.length === 0;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_constructors_throw_when_called_without_new() {
+    // 23.2.5.1 step 1: a call whose NewTarget is undefined throws a TypeError.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var threw = 0;
+                for (const call of [
+                    () => Int8Array(1),
+                    () => Float64Array.call(null),
+                    () => Uint8Array.apply(null, [])
+                ]) {
+                    try { call(); } catch (error) { if (error instanceof TypeError) threw++; }
+                }
+                threw === 3 && new Int8Array(2).length === 2;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_to_string_is_array_to_string_and_join_converts_its_separator() {
+    // 23.2.3.32: %TypedArray%.prototype.toString is Array.prototype.toString.
+    // 23.2.3.19: the separator goes through ToString, which runs user code, and a
+    // Symbol throws. 10.4.5.2: an invalid canonical numeric key is never found on
+    // the prototype chain.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var proto = Object.getPrototypeOf(Int8Array.prototype);
+                var sameToString = proto.toString === Array.prototype.toString
+                    && proto.hasOwnProperty('toString')
+                    && !Int8Array.prototype.hasOwnProperty('toString');
+                var joined = new Int8Array([1, 2, 3]).join({ toString() { return 'foo'; } });
+                var symbolThrew = false;
+                try { new Int8Array().join(Symbol()); } catch (error) { symbolThrew = error instanceof TypeError; }
+                var view = new Int8Array(5);
+                proto[50] = 'hello';
+                sameToString
+                    && new Int8Array([1, 2]).toString() === '1,2'
+                    && joined === '1foo2foo3' && symbolThrew
+                    && (50 in view) === false
+                    && Object.getOwnPropertyDescriptor(proto, Symbol.toStringTag).get.name === 'get [Symbol.toStringTag]';
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
+fn typed_array_slice_copies_bits_and_checks_the_source_after_its_coercions() {
+    // 23.2.3.27 step 13: a source detached by a coercion throws once a copy is due,
+    // and a same-type copy moves each element's bits, so a NaN payload survives.
+    // 23.2.3.38 step 9: a view detached by the value's coercion has no valid index,
+    // so `with` throws a RangeError.
+    assert_eq!(
+        evaluate_script(
+            r"
+                var bits = new Uint32Array([0x7fc00001]);
+                var sameBits = new Uint32Array(new Float32Array(bits.buffer).slice(0).buffer)[0] === 0x7fc00001;
+                var source = new Int32Array(4);
+                var sliceThrew = false;
+                try {
+                    source.slice({ valueOf() { source.buffer.transfer(); return 0; } });
+                } catch (error) { sliceThrew = error instanceof TypeError; }
+                var empty = new Int32Array(0);
+                var emptyDetached = empty.slice({ valueOf() { empty.buffer.transfer(); return 0; } }).length === 0;
+                var target = new Int32Array(4);
+                var withThrew = false;
+                try {
+                    target.with(0, { valueOf() { target.buffer.transfer(); return 0; } });
+                } catch (error) { withThrew = error instanceof RangeError; }
+                sameBits && sliceThrew && emptyDetached && withThrew;
+            "
+        ),
+        JsValue::Boolean(true)
+    );
+}
+
+#[test]
 fn typed_array_set_checks_the_length_before_reading_the_source() {
     // 23.2.3.26.2 SetTypedArrayFromArrayLike: an overlong source throws a RangeError
     // before any element is read.

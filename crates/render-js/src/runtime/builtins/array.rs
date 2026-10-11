@@ -448,7 +448,11 @@ impl JsRuntime {
     /// `LengthOfArrayLike` (§7.3.18): `ToLength(Get(O, "length"))`. String
     /// wrappers expose their code-unit count as a virtual `length`, because
     /// that is what `String.prototype.length` is.
-    fn length_of_array_like(&mut self, dom: &mut Dom, object: ObjectId) -> Result<f64, JsError> {
+    pub(in crate::runtime) fn length_of_array_like(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<f64, JsError> {
         if let Some(ObjectHost::StringPrimitive(text)) = self.realm.host(object) {
             #[allow(clippy::cast_precision_loss)]
             return Ok(text.len() as f64);
