@@ -3172,10 +3172,33 @@ impl JsRuntime {
         arguments: &[Expr],
         strict: bool,
     ) -> Result<JsValue, JsError> {
+        // The argument values are reachable only from this frame until the call
+        // runs, so they stay pinned across the evaluation of later arguments and
+        // the call itself.
+        let roots = self.transient_roots.len();
+        let result = self.evaluate_call_with_pinned_arguments(dom, callee, arguments, strict);
+        self.transient_roots.truncate(roots);
+        result
+    }
+
+    fn evaluate_call_with_pinned_arguments(
+        &mut self,
+        dom: &mut Dom,
+        callee: &Expr,
+        arguments: &[Expr],
+        strict: bool,
+    ) -> Result<JsValue, JsError> {
         let (callee_value, receiver) = self.call_reference(dom, callee)?;
         let mut values = Vec::with_capacity(arguments.len());
+        let mut pinned_values = 0;
         for argument in arguments {
             self.evaluate_argument(dom, argument, &mut values)?;
+            for value in &values[pinned_values..] {
+                if let JsValue::Object(object) = value {
+                    self.transient_roots.push(*object);
+                }
+            }
+            pinned_values = values.len();
         }
         let callee_object = Self::callable_callee(&callee_value, callee)?;
         // ECMA-262 13.3.6.1: a call of the intrinsic `eval` through a bare

@@ -543,6 +543,10 @@ impl JsRuntime {
         if global {
             self.set_strict(dom, rx, "lastIndex", JsValue::Number(0.0))?;
         }
+        // Each exec result object is held only by this Rust vector until its
+        // replacement is built, and a later exec can collect garbage, so every
+        // result is pinned until the replacement is complete.
+        let pinned = self.transient_roots.len();
         let mut results = Vec::new();
         loop {
             match self.regexp_exec_step(dom, rx, text, &input)? {
@@ -562,6 +566,7 @@ impl JsRuntime {
                     }
                 }
                 Exec::Object(result) => {
+                    self.transient_roots.push(result);
                     results.push(Exec::Object(result));
                     if !global {
                         break;
@@ -630,6 +635,7 @@ impl JsRuntime {
         if next_source < input.len() {
             accumulated.extend_from_slice(&input[next_source..]);
         }
+        self.transient_roots.truncate(pinned);
         Ok(JsValue::String(utf16::JsString::from_units(&accumulated)))
     }
 

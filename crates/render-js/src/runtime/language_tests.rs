@@ -3326,3 +3326,16 @@ fn an_object_literal_method_has_no_own_caller_or_arguments() {
         "false:false true"
     );
 }
+
+#[test]
+fn a_regexp_argument_stays_alive_while_a_native_call_collects_garbage() {
+    // The regexp literal is held only by the argument list of `replace` while
+    // earlier calls fill the heap, so it must be pinned until the call returns
+    // (a swept object reads back as a prototype-less tombstone).
+    assert_eq!(
+        ok(
+            "var r; try { for (var j = 0; j < 43158; j++) { String.fromCharCode(j).replace(/\\S+/g, 'x'); } r = String.fromCharCode(43158).replace(/\\S+/g, 'x'); } catch (e) { r = 'ERR ' + e.message; } r;"
+        ),
+        "x"
+    );
+}
