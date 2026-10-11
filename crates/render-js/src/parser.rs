@@ -574,8 +574,12 @@ pub(super) fn parse_module(
     // Module code is always strict (ECMA-262 11.2.2).
     parser.strict = true;
     let statements = parser.statement_list(false)?;
-    validate_declaration_conflicts(&statements, true, true)?;
+    // A module's top-level function declarations are lexical, not var-scoped as
+    // a script's are (ECMA-262 16.2.1.1), and its whole body is strict code.
+    validate_declaration_conflicts(&statements, false, true)?;
+    validate_strict_statements(&statements)?;
     let info = parser.module.take().unwrap_or_default();
+    validate_module_names(&statements, &info)?;
     Ok((statements, info))
 }
 
@@ -1537,8 +1541,11 @@ impl Parser {
         self.module.as_mut().expect("module mode checked by caller")
     }
 
+    /// Whether the cursor is the contextual keyword `word`. A spelling with a
+    /// Unicode escape is an identifier, never the keyword (ECMA-262 12.7.2).
     fn at_contextual(&self, word: &str) -> bool {
         matches!(&self.current().kind, TokenKind::Identifier(name) if name == word)
+            && !self.current().escaped
     }
 
     fn module_specifier(&mut self) -> Result<String, JsError> {
@@ -1593,6 +1600,12 @@ impl Parser {
         }
         if self.in_async && name == "await" {
             return Err(self.error("await cannot be a binding name in async code"));
+        }
+        if self.module.is_some() && name == "await" {
+            return Err(self.error("await cannot be a binding name in module code"));
+        }
+        if self.strict && is_strict_reserved_word(name) {
+            return Err(self.error("strict reserved word cannot be a binding name"));
         }
         if self.in_generator && name == "yield" {
             return Err(self.error("yield cannot be a binding name in generator code"));
@@ -1696,7 +1709,10 @@ impl Parser {
         }
         if self.take(&TokenKind::LeftBrace) {
             let mut names = Vec::new();
+            // A string name is a valid local name only with a `from` clause (ECMA-262 16.2.3.1).
+            let mut string_local = false;
             while !self.at(&TokenKind::RightBrace) {
+                string_local |= matches!(self.current().kind, TokenKind::String(_));
                 let local = self.module_export_name()?;
                 let exported = if self.at_contextual("as") {
                     self.advance();
@@ -1721,6 +1737,9 @@ impl Parser {
                     });
                 }
             } else {
+                if string_local {
+                    return Err(self.error("a string export name needs a from clause"));
+                }
                 for (local, exported) in names {
                     self.module_info().local_exports.push((exported, local));
                 }
@@ -1778,8 +1797,14 @@ impl Parser {
                 (
                     self.tokens.get(self.cursor + 1).map(|token| &token.kind),
                     self.tokens.get(self.cursor + 2).map(|token| &token.kind),
+                    self.tokens.get(self.cursor + 3).map(|token| &token.kind),
                 ),
-                (Some(TokenKind::Function), Some(TokenKind::Identifier(_)))
+                (Some(TokenKind::Function), Some(TokenKind::Identifier(_)), _)
+                    | (
+                        Some(TokenKind::Function),
+                        Some(TokenKind::Star),
+                        Some(TokenKind::Identifier(_))
+                    )
             ),
             _ => false,
         };
@@ -1795,8 +1820,31 @@ impl Parser {
                 .push(("default".to_owned(), local));
             return Ok(declaration);
         }
-        // Anonymous function/class declarations and every other expression
-        // are evaluated in place and bound to the hidden default binding.
+        // An anonymous `function` or `async function` is a declaration, not an
+        // expression, so no operator or call can follow it on its statement
+        // (ECMA-262 16.2.3.1): `export default function () {}()` is refused.
+        let is_async = self.at_contextual("async")
+            && self.tokens.get(self.cursor + 1).is_some_and(|next| {
+                matches!(next.kind, TokenKind::Function) && !next.after_newline
+            });
+        if is_async || self.at(&TokenKind::Function) {
+            if is_async {
+                self.advance();
+            }
+            self.advance();
+            let value = self.function_expression(is_async)?;
+            self.module_info()
+                .local_exports
+                .push(("default".to_owned(), DEFAULT_BINDING.to_owned()));
+            return Ok(Statement::Variable {
+                kind: VariableKind::Const,
+                name: DEFAULT_BINDING.to_owned(),
+                value: Some(value),
+                offset: self.previous_offset(),
+            });
+        }
+        // Anonymous class declarations and every other expression are evaluated in
+        // place and bound to the hidden default binding.
         let value = self.assignment()?;
         self.end_statement()?;
         self.module_info()
@@ -3103,6 +3151,10 @@ impl Parser {
             Expr::Identifier(name) if self.strict && (name == "eval" || name == "arguments") => {
                 Err(self.error("assignment to eval or arguments in strict code"))
             }
+            // `import.meta` is not a reference, so it cannot be assigned (ECMA-262 13.15.1).
+            Expr::Identifier(name) if name == IMPORT_META_BINDING => {
+                Err(self.error("import.meta cannot be assigned"))
+            }
             _ => Ok(()),
         }
     }
@@ -3158,6 +3210,7 @@ impl Parser {
                 if !is_simple_target(&property.value) {
                     return Err(self.error("rest property target must be a simple target"));
                 }
+                self.validate_simple_target(&property.value)?;
             } else {
                 self.validate_destructuring_target(&property.value, true)?;
             }
@@ -3736,8 +3789,10 @@ impl Parser {
                     && self.module.is_some()
                     && self.at(&TokenKind::Dot)
                     && matches!(
-                        self.tokens.get(self.cursor + 1).map(|next| &next.kind),
-                        Some(TokenKind::Identifier(meta)) if meta == "meta"
+                        self.tokens.get(self.cursor + 1),
+                        Some(next)
+                            if !next.escaped
+                                && matches!(&next.kind, TokenKind::Identifier(meta) if meta == "meta")
                     ) =>
             {
                 self.advance();
@@ -3838,6 +3893,27 @@ impl Parser {
             {
                 Err(JsError::syntax(
                     format!("{name} is not allowed in a class static block"),
+                    token.offset,
+                ))
+            }
+            // `await` is reserved throughout module code and inside async code (ECMA-262
+            // 13.1.1), so an identifier reference to it is refused there, even when it is
+            // spelled with an escape. Outside those, an escaped `await` is an identifier.
+            TokenKind::Identifier(name)
+                if name == "await" && (self.module.is_some() || self.in_async) =>
+            {
+                Err(JsError::syntax(
+                    "await is a reserved word in async and module code",
+                    token.offset,
+                ))
+            }
+            // A strict reserved word is not an IdentifierReference in strict code
+            // (ECMA-262 13.1.1). `eval` and `arguments` remain ordinary references.
+            TokenKind::Identifier(name)
+                if self.strict && is_strict_reserved_word(&name) && name != "eval" =>
+            {
+                Err(JsError::syntax(
+                    format!("{name} is a reserved word in strict code"),
                     token.offset,
                 ))
             }
@@ -6689,6 +6765,114 @@ mod tests {
         assert!(script_is_syntax_error("// comment\rthis is code"));
         assert!(script_is_syntax_error("// comment\u{2028}this is code"));
         assert!(!script_is_syntax_error("// comment\r\nvar x = 1;"));
+    }
+
+    #[test]
+    fn module_code_is_strict_and_reserves_await() {
+        assert!(module_is_syntax_error("var public;"));
+        assert!(module_is_syntax_error("yield;"));
+        assert!(module_is_syntax_error("new await;"));
+        assert!(module_is_syntax_error("\\u0061wait 0;"));
+        assert!(module_is_syntax_error("function f() { await; }"));
+        assert!(module_is_syntax_error("var await;"));
+        assert!(!module_is_syntax_error("var x = 1; var y = await x;"));
+        assert!(!script_is_syntax_error("var await = 1; await;"));
+        assert!(!script_is_syntax_error("var \\u0061wait = 1;"));
+        assert!(script_is_syntax_error(
+            "async function f() { void \\u0061wait; }"
+        ));
+        assert!(!script_is_syntax_error("public; yield; eval;"));
+        assert!(script_is_syntax_error("'use strict'; public;"));
+        assert!(script_is_syntax_error("'use strict'; yield;"));
+    }
+
+    #[test]
+    fn module_top_level_functions_are_lexical() {
+        assert!(module_is_syntax_error("function x() {} function x() {}"));
+        assert!(module_is_syntax_error(
+            "function x() {} async function x() {}"
+        ));
+        assert!(module_is_syntax_error("var f; function f() {}"));
+        assert!(module_is_syntax_error("export default function () {}();"));
+        assert!(module_is_syntax_error(
+            "class AG {} export default async function * AG() {}"
+        ));
+        assert!(!module_is_syntax_error(
+            "export default async function * () {}"
+        ));
+        assert!(!module_is_syntax_error("export default function () {}"));
+        assert!(!module_is_syntax_error("export default function f() {}"));
+    }
+
+    #[test]
+    fn escaped_contextual_keywords_are_identifiers_in_module_syntax() {
+        assert!(module_is_syntax_error("export {} \\u0066rom './x.js';"));
+        assert!(module_is_syntax_error("import {} \\u0066rom './x.js';"));
+        assert!(module_is_syntax_error(
+            "import* \\u0061s self from './x.js';"
+        ));
+        assert!(module_is_syntax_error("var a; export { a \\u0061s b };"));
+        assert!(!module_is_syntax_error("var a; export { a as b };"));
+    }
+
+    #[test]
+    fn import_meta_is_not_an_assignment_target() {
+        assert!(module_is_syntax_error("import.meta = 0;"));
+        assert!(module_is_syntax_error("import.meta++;"));
+        assert!(module_is_syntax_error("for (import.meta of null) ;"));
+        assert!(module_is_syntax_error("import.m\\u0065ta;"));
+        assert!(module_is_syntax_error("({ ...import.meta } = {});"));
+        assert!(!module_is_syntax_error("var m = import.meta;"));
+    }
+
+    #[test]
+    fn exported_names_are_unique() {
+        assert!(module_is_syntax_error("var x; export { x }; export { x };"));
+        assert!(module_is_syntax_error(
+            "var x, y; export { x as z }; export { y as z };"
+        ));
+        assert!(module_is_syntax_error(
+            "var x, y; export default x; export { y as default };"
+        ));
+        assert!(module_is_syntax_error("export var a, a;"));
+        assert!(module_is_syntax_error(
+            "export function f() {} export function *f() {}"
+        ));
+        assert!(!module_is_syntax_error(
+            "var x, y; export { x as z, y as w };"
+        ));
+    }
+
+    #[test]
+    fn exported_local_names_are_declared_by_the_module() {
+        assert!(module_is_syntax_error("export { Number };"));
+        assert!(module_is_syntax_error("export { unresolvable };"));
+        assert!(!module_is_syntax_error("var x; export { x };"));
+        assert!(!module_is_syntax_error("{ var x; } export { x };"));
+        assert!(!module_is_syntax_error(
+            "import { x } from './x.js'; export { x };"
+        ));
+    }
+
+    #[test]
+    fn import_bindings_are_strict_names_bound_once() {
+        assert!(module_is_syntax_error(
+            "import { arguments } from './x.js';"
+        ));
+        assert!(module_is_syntax_error("import { eval } from './x.js';"));
+        assert!(module_is_syntax_error("import { x, y as x } from 'z';"));
+        assert!(module_is_syntax_error("import { x } from 'z'; let x;"));
+        assert!(!module_is_syntax_error("import { x, y as z } from 'z';"));
+    }
+
+    #[test]
+    fn string_export_names_need_a_from_clause_for_a_local_name() {
+        assert!(module_is_syntax_error(
+            "function foo() {} export { \"foo\" as \"bar\" };"
+        ));
+        assert!(!module_is_syntax_error(
+            "export { \"foo\" as \"bar\" } from './x.js';"
+        ));
     }
 
     #[test]
