@@ -41,6 +41,7 @@ pub(super) mod storage;
 pub(super) mod string;
 pub(super) mod structured_clone;
 pub(super) mod style;
+pub(crate) mod temporal;
 pub(super) mod timers;
 pub(super) mod typed_array;
 pub(super) mod url;

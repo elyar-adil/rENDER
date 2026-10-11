@@ -44,7 +44,7 @@ use url::Url;
 mod async_iteration;
 #[cfg(test)]
 mod bigint_tests;
-mod builtins;
+pub(crate) mod builtins;
 mod class;
 mod convert;
 mod coroutine;
@@ -69,6 +69,8 @@ mod module_tests;
 mod prelude_tests;
 mod types;
 
+#[cfg(test)]
+mod temporal_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
