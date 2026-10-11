@@ -167,12 +167,40 @@ pub(super) enum Instr {
     FinallyEnd {
         slot: usize,
     },
+    /// Dispose the resources of the innermost scope, last declared first, as
+    /// the scope is left with the pending completion of `slot`. An `await using`
+    /// resource suspends until its disposal settles. Used by the disposal
+    /// region [`Compiler::open_dispose_region`] opens.
+    DisposeScope {
+        slot: usize,
+    },
 }
 
 /// A compiled coroutine body.
 #[derive(Debug, Default)]
 pub(super) struct CoroutineCode {
     pub(super) instrs: Vec<Instr>,
+}
+
+/// A disposal region under construction (see [`Compiler::open_dispose_region`]).
+#[derive(Clone, Copy)]
+struct DisposeRegion {
+    /// Index of the placeholder that becomes the region's `TryEnter`.
+    enter: usize,
+    /// Pending-completion slot the region's disposal handler uses.
+    slot: usize,
+}
+
+/// Whether a statement list declares `using` or `await using` bindings directly,
+/// which makes the list a scope that disposes them.
+fn declares_using(statements: &[Statement]) -> bool {
+    statements.iter().any(|statement| {
+        matches!(
+            statement,
+            Statement::Variable { kind, .. } | Statement::VariableList { kind, .. }
+                if kind.is_disposable()
+        )
+    })
 }
 
 /// Name of the hidden binding for expression temporary `index`.
@@ -192,11 +220,18 @@ pub(super) fn statements_have_suspend(statements: &[Statement]) -> bool {
 
 pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
     match statement {
-        Statement::Variable { value, .. } => value.as_ref().is_some_and(expr_has_suspend),
-        Statement::VariableList { declarations, .. } => {
-            declarations.iter().any(|(target, value)| {
-                value.as_ref().is_some_and(expr_has_suspend) || target_has_suspend(target)
-            })
+        // `await using` disposes its value with an await when its scope is left
+        // (ECMA-262 14.3.3.1), so the scope must run as a coroutine.
+        Statement::Variable { kind, value, .. } => {
+            *kind == VariableKind::AwaitUsing || value.as_ref().is_some_and(expr_has_suspend)
+        }
+        Statement::VariableList {
+            kind, declarations, ..
+        } => {
+            *kind == VariableKind::AwaitUsing
+                || declarations.iter().any(|(target, value)| {
+                    value.as_ref().is_some_and(expr_has_suspend) || target_has_suspend(target)
+                })
         }
         Statement::Function { .. }
         | Statement::Break(_)
@@ -263,7 +298,12 @@ pub(super) fn statement_has_suspend(statement: &Statement) -> bool {
                 || update.as_ref().is_some_and(expr_has_suspend)
                 || statement_has_suspend(body)
         }
-        Statement::ForOf { is_await: true, .. } => true,
+        // `for await`, and an `await using` binding disposed at each iteration's end.
+        Statement::ForOf { is_await: true, .. }
+        | Statement::ForOf {
+            kind: VariableKind::AwaitUsing,
+            ..
+        } => true,
         Statement::ForIn { iterable, body, .. } | Statement::ForOf { iterable, body, .. } => {
             expr_has_suspend(iterable) || statement_has_suspend(body)
         }
@@ -560,12 +600,58 @@ impl Compiler {
         } else {
             body
         };
-        for statement in body {
-            compiler.statement(statement)?;
-        }
+        compiler.scope_body(body)?;
         Ok(CoroutineCode {
             instrs: compiler.instrs,
         })
+    }
+
+    /// Compile the statements of a scope whose scope the caller has pushed. A
+    /// list that declares `using` bindings runs inside a disposal region, so the
+    /// bindings are disposed however the list is left.
+    fn scope_body(&mut self, statements: &[Statement]) -> Result<(), JsError> {
+        let region = declares_using(statements).then(|| self.open_dispose_region());
+        for statement in statements {
+            self.statement(statement)?;
+        }
+        if let Some(region) = region {
+            self.close_dispose_region(region);
+        }
+        Ok(())
+    }
+
+    /// Open a disposal region: the instructions emitted until
+    /// [`Self::close_dispose_region`] run with the scope's `using` resources
+    /// disposed however they are left. A dispose handler is entered here, so
+    /// an abrupt exit (throw, `break`, `continue`, `return`) runs the disposal
+    /// on its way out, as a `finally` does.
+    fn open_dispose_region(&mut self) -> DisposeRegion {
+        let slot = self.fresh_slot();
+        // Patched to the `TryEnter` that the region's disposal handler needs.
+        let enter = self.emit(Instr::Jump(0));
+        DisposeRegion { enter, slot }
+    }
+
+    /// Close a disposal region at the current position. A normal exit reaches the
+    /// disposal through `TryExit`, and the statements after the region continue
+    /// after the disposal.
+    fn close_dispose_region(&mut self, region: DisposeRegion) {
+        let DisposeRegion { enter, slot } = region;
+        let exit = self.emit(Instr::Jump(0));
+        let dispose = self.here();
+        self.emit(Instr::DisposeScope { slot });
+        self.emit(Instr::FinallyEnd { slot });
+        let after = self.here();
+        self.instrs[enter] = Instr::TryEnter {
+            catch_pc: None,
+            finally_pc: Some(dispose),
+            slot,
+        };
+        self.instrs[exit] = Instr::TryExit {
+            finally_pc: Some(dispose),
+            after_pc: after,
+            slot,
+        };
     }
 
     fn here(&self) -> usize {
@@ -674,9 +760,7 @@ impl Compiler {
             }
             Statement::Block(statements) => {
                 self.emit(Instr::PushScope(Rc::new(statements.clone())));
-                for statement in statements {
-                    self.statement(statement)?;
-                }
+                self.scope_body(statements)?;
                 self.emit(Instr::PopScope);
             }
             Statement::If {
@@ -778,6 +862,11 @@ impl Compiler {
                     .map(|initializer| vec![initializer.clone()])
                     .unwrap_or_default();
                 self.emit(Instr::PushScope(Rc::new(scope_statements)));
+                // The head's `using` resources are disposed when the loop is left.
+                let region = initializer
+                    .as_deref()
+                    .is_some_and(|initializer| declares_using(std::slice::from_ref(initializer)))
+                    .then(|| self.open_dispose_region());
                 if let Some(initializer) = initializer {
                     self.statement(initializer)?;
                 }
@@ -805,7 +894,11 @@ impl Compiler {
                     self.patch(to_exit, exit);
                 }
                 self.emit(Instr::ExitLoop);
+                // `break` lands where the region's disposal begins, so it runs too.
                 let after = self.here();
+                if let Some(region) = region {
+                    self.close_dispose_region(region);
+                }
                 self.emit(Instr::PopScope);
                 self.instrs[enter] = Instr::EnterLoop(Rc::new(LoopInfo {
                     labels,
@@ -933,7 +1026,12 @@ impl Compiler {
         } else {
             self.emit(Instr::Jump(0))
         };
+        // A `using` binding is disposed at the end of each iteration, however it ends.
+        let region = (of && kind.is_disposable()).then(|| self.open_dispose_region());
         self.statement(body)?;
+        if let Some(region) = region {
+            self.close_dispose_region(region);
+        }
         self.emit(Instr::Jump(next));
         let done = self.here();
         self.emit(Instr::ExitLoop);
@@ -1036,9 +1134,7 @@ impl Compiler {
         let slot = self.fresh_slot();
         let enter = self.emit(Instr::Jump(0));
         self.emit(Instr::PushScope(Rc::new(body.to_vec())));
-        for statement in body {
-            self.statement(statement)?;
-        }
+        self.scope_body(body)?;
         self.emit(Instr::PopScope);
         let try_exit = self.emit(Instr::Jump(0));
         let mut catch_pc = None;
@@ -1050,9 +1146,7 @@ impl Compiler {
                 lexicals: Rc::new(catch.body.clone()),
                 slot,
             });
-            for statement in &catch.body {
-                self.statement(statement)?;
-            }
+            self.scope_body(&catch.body)?;
             self.emit(Instr::PopScope);
             catch_exit = Some(self.emit(Instr::Jump(0)));
         }
@@ -1060,9 +1154,7 @@ impl Compiler {
         if let Some(finally) = finally {
             finally_pc = Some(self.here());
             self.emit(Instr::PushScope(Rc::new(finally.to_vec())));
-            for statement in finally {
-                self.statement(statement)?;
-            }
+            self.scope_body(finally)?;
             self.emit(Instr::PopScope);
             self.emit(Instr::FinallyEnd { slot });
         }

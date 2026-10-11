@@ -497,7 +497,13 @@ impl JsRuntime {
                         // A static block is function-like: its own `let`/`const`
                         // and `var` declarations are local to it.
                         runtime.instantiate_statements(&element.body)?;
-                        runtime.evaluate_statements(dom, &element.body)
+                        // The block's own `using` resources live in the scope `with_this` made.
+                        let scope = runtime.environment.last().cloned();
+                        let result = runtime.evaluate_statements(dom, &element.body);
+                        match scope {
+                            Some(scope) => runtime.dispose_scope(dom, &scope, result),
+                            None => result,
+                        }
                     })?;
                 }
                 _ => {}

@@ -29,6 +29,23 @@ pub(super) enum VariableKind {
     Let,
     Const,
     Var,
+    /// `using x = …` (ECMA-262 14.3.1): a `const`-like binding whose value is
+    /// disposed when its scope is left.
+    Using,
+    /// `await using x = …` (ECMA-262 14.3.3): as `Using`, disposed asynchronously.
+    AwaitUsing,
+}
+
+impl VariableKind {
+    /// Bindings that cannot be assigned: `const`, `using` and `await using`.
+    pub(super) const fn is_immutable(self) -> bool {
+        matches!(self, Self::Const | Self::Using | Self::AwaitUsing)
+    }
+
+    /// `using` and `await using`, whose initial value becomes a disposable resource.
+    pub(super) const fn is_disposable(self) -> bool {
+        matches!(self, Self::Using | Self::AwaitUsing)
+    }
 }
 
 /// What a function call does with its body (ECMA-262 §15.2-§15.8).
@@ -1131,6 +1148,13 @@ impl Parser {
         while !self.at(&TokenKind::Eof) && (!until_right_brace || !self.at(&TokenKind::RightBrace))
         {
             self.reserve_statement()?;
+            // A Script's top level has no block scope to dispose its resources, so
+            // `using` is an early error there (ECMA-262 14.3.1.1); a module's is not.
+            if top_level && self.module.is_none() && self.using_declaration_start(false).is_some() {
+                return Err(
+                    self.error("using declaration is not allowed at the top level of a script")
+                );
+            }
             if top_level && self.at_module_declaration() {
                 statements.push(self.module_declaration()?);
             } else {
@@ -1380,12 +1404,90 @@ impl Parser {
             self.end_statement()?;
             return Ok(Statement::Return(value));
         }
-        if let Some(kind) = self.take_variable_kind() {
+        if let Some((kind, width)) = self.using_declaration_start(false) {
+            self.check_await_using_allowed(kind)?;
+            self.advance_by(width);
+            return self.variable_declaration(kind, true);
+        }
+        if !self.at_let_expression()
+            && let Some(kind) = self.take_variable_kind()
+        {
             return self.variable_declaration(kind, true);
         }
         let expression = self.expression()?;
         self.end_statement()?;
         Ok(Statement::Expression(expression))
+    }
+
+    /// Whether the `let` at the cursor is the identifier `let` starting an
+    /// expression statement, as in `let = 1`. A `let` declaration is followed by
+    /// a binding name or a destructuring pattern, and a name is a binding even
+    /// when it is `let` itself, which is then an early error (ECMA-262 14.3.1,
+    /// 13.3.1.1).
+    fn at_let_expression(&self) -> bool {
+        self.at(&TokenKind::Let)
+            && !matches!(
+                self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                Some(
+                    TokenKind::Identifier(_)
+                        | TokenKind::Let
+                        | TokenKind::LeftBracket
+                        | TokenKind::LeftBrace
+                )
+            )
+    }
+
+    /// The `using` or `await using` that begins a declaration at the cursor, and
+    /// how many tokens it spans (ECMA-262 14.3.1, 14.3.3). `using` is a
+    /// declaration only when a binding identifier follows on the same line, so
+    /// `using` then a line break, or `using[x]`, stays an expression. In a `for`
+    /// head `using of` is the identifier `using` unless `of` is followed by `=`,
+    /// `;` or `,` (ECMA-262 14.7.5.1, `for (using of of …)`).
+    fn using_declaration_start(&self, for_head: bool) -> Option<(VariableKind, usize)> {
+        let first = self.tokens.get(self.cursor)?;
+        let TokenKind::Identifier(word) = &first.kind else {
+            return None;
+        };
+        if first.escaped {
+            return None;
+        }
+        if word == "using" {
+            let binding = self.tokens.get(self.cursor + 1)?;
+            let TokenKind::Identifier(name) = &binding.kind else {
+                return None;
+            };
+            if for_head && name == "of" && !self.for_head_of_declares_binding(self.cursor + 2) {
+                return None;
+            }
+            return (!binding.after_newline).then_some((VariableKind::Using, 1));
+        }
+        if word == "await" && self.in_async {
+            let using = self.tokens.get(self.cursor + 1)?;
+            let binding = self.tokens.get(self.cursor + 2)?;
+            let is_using = matches!(&using.kind, TokenKind::Identifier(name) if name == "using")
+                && !using.escaped
+                && !using.after_newline;
+            let is_binding =
+                matches!(binding.kind, TokenKind::Identifier(_)) && !binding.after_newline;
+            return (is_using && is_binding).then_some((VariableKind::AwaitUsing, 2));
+        }
+        None
+    }
+
+    /// Whether the token at `index`, the one after `using of`, shows that `of` is
+    /// a declared binding name rather than the `of` keyword.
+    fn for_head_of_declares_binding(&self, index: usize) -> bool {
+        matches!(
+            self.tokens.get(index).map(|token| &token.kind),
+            Some(TokenKind::Equal | TokenKind::Semicolon | TokenKind::Comma)
+        )
+    }
+
+    /// Consume `count` tokens.
+    fn advance_by(&mut self, count: usize) {
+        for _ in 0..count {
+            self.advance();
+        }
     }
 
     /// One `import` or `export` declaration of a module (ECMA-262 §16.2).
@@ -1600,6 +1702,10 @@ impl Parser {
         }
         // `export var|let|const|function|class|async function`: the wrapped
         // declaration stays in the body and its bound names become exports.
+        // `using` is not an exportable declaration (ECMA-262 16.2.3).
+        if self.using_declaration_start(false).is_some() {
+            return Err(self.error("using declarations cannot be exported"));
+        }
         let declaration = self.statement()?;
         let mut names = Vec::new();
         match &declaration {
@@ -1758,6 +1864,29 @@ impl Parser {
         }
     }
 
+    /// The declaration keyword at the start of a `for` head, consumed: a
+    /// `let`/`const`/`var`, or a `using`/`await using` declaration.
+    fn take_for_head_declaration_kind(&mut self) -> Result<Option<VariableKind>, JsError> {
+        if let Some((kind, width)) = self.using_declaration_start(true) {
+            self.check_await_using_allowed(kind)?;
+            self.advance_by(width);
+            return Ok(Some(kind));
+        }
+        Ok(self.take_variable_kind())
+    }
+
+    /// `await using` is refused at a module's top level, which is not an async
+    /// function: this engine runs module code without top-level `await`, so there
+    /// is no suspension at which to dispose the bindings.
+    fn check_await_using_allowed(&self, kind: VariableKind) -> Result<(), JsError> {
+        if kind == VariableKind::AwaitUsing && self.module.is_some() && self.function_depth == 0 {
+            return Err(
+                self.error("await using declarations are not supported at a module's top level")
+            );
+        }
+        Ok(())
+    }
+
     fn variable_declaration(
         &mut self,
         kind: VariableKind,
@@ -1766,6 +1895,10 @@ impl Parser {
         let mut declarations = Vec::new();
         loop {
             if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                // A `using` binding is a plain identifier (ECMA-262 14.3.1.1).
+                if kind.is_disposable() {
+                    return Err(self.error("using declarations cannot destructure"));
+                }
                 let pattern = self.binding_pattern()?;
                 self.require(
                     &TokenKind::Equal,
@@ -1774,8 +1907,11 @@ impl Parser {
                 let initializer = self.assignment()?;
                 declarations.push((BindingTarget::Pattern(pattern), Some(initializer)));
             } else {
-                let TokenKind::Identifier(name) = self.advance().kind else {
-                    return Err(self.error("expected a binding after declaration keyword"));
+                let name = match self.advance().kind {
+                    TokenKind::Identifier(name) => name,
+                    // `var let` is a sloppy-mode binding (ECMA-262 14.3.2.1).
+                    TokenKind::Let if kind == VariableKind::Var && !self.strict => "let".to_owned(),
+                    _ => return Err(self.error("expected a binding after declaration keyword")),
                 };
                 self.check_contextual_binding(&name)?;
                 let value = if self.take(&TokenKind::Equal) {
@@ -1783,8 +1919,12 @@ impl Parser {
                 } else {
                     None
                 };
-                if kind == VariableKind::Const && value.is_none() {
-                    return Err(self.error("const declarations require an initializer"));
+                if kind.is_immutable() && value.is_none() {
+                    return Err(self.error(if kind.is_disposable() {
+                        "using declarations require an initializer"
+                    } else {
+                        "const declarations require an initializer"
+                    }));
                 }
                 declarations.push((BindingTarget::Name(name), value));
             }
@@ -2058,6 +2198,10 @@ impl Parser {
                 && !self.at(&TokenKind::Eof)
             {
                 self.reserve_statement()?;
+                // A clause's statements have no block scope to dispose a `using` in (ECMA-262 14.12.1).
+                if self.using_declaration_start(false).is_some() {
+                    return Err(self.error("using declaration is not allowed in a case clause"));
+                }
                 consequent.push(self.statement()?);
             }
             cases.push((tests, consequent));
@@ -2126,18 +2270,30 @@ impl Parser {
         self.no_in = true;
         let initializer = if self.take(&TokenKind::Semicolon) {
             None
-        } else if let Some(kind) = self.take_variable_kind() {
+        } else if let Some(kind) = self.take_for_head_declaration_kind()? {
             let declaration_start = self.cursor;
             let pattern = if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                if kind.is_disposable() {
+                    return Err(self.error("using declarations cannot destructure"));
+                }
                 Some(self.binding_pattern()?)
             } else {
-                let TokenKind::Identifier(name) = self.advance().kind else {
-                    return Err(self.error("expected an identifier after declaration keyword"));
+                let name = match self.advance().kind {
+                    TokenKind::Identifier(name) => name,
+                    // `for (var let …)` binds `let` in sloppy code (ECMA-262 14.3.2.1).
+                    TokenKind::Let if kind == VariableKind::Var && !self.strict => "let".to_owned(),
+                    _ => {
+                        return Err(self.error("expected an identifier after declaration keyword"));
+                    }
                 };
                 self.check_contextual_binding(&name)?;
                 Some(BindingPattern::Identifier(name))
             };
             if self.take(&TokenKind::In) {
+                // `for (using x in …)` has no `for-in` form (ECMA-262 14.7.5.1).
+                if kind.is_disposable() {
+                    return Err(self.error("using declarations are not allowed in for-in"));
+                }
                 self.no_in = false;
                 let iterable = self.expression()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-in clauses")?;
@@ -2146,6 +2302,11 @@ impl Parser {
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 let offset = self.previous_offset();
                 let body = body?;
+                if kind != VariableKind::Var {
+                    let mut names = Vec::new();
+                    collect_binding_names(pattern.as_ref().expect("pattern parsed"), &mut names);
+                    validate_head_against_body(&names, &body)?;
+                }
                 return Ok(match pattern.expect("pattern parsed") {
                     BindingPattern::Identifier(name) => Statement::ForIn {
                         offset,
@@ -2198,6 +2359,11 @@ impl Parser {
                 self.loop_depth = self.loop_depth.saturating_sub(1);
                 let body = body?;
                 let pattern = pattern.expect("pattern parsed");
+                if kind != VariableKind::Var {
+                    let mut names = Vec::new();
+                    collect_binding_names(&pattern, &mut names);
+                    validate_head_against_body(&names, &body)?;
+                }
                 let name = match pattern {
                     BindingPattern::Identifier(name) => name,
                     pattern => {
@@ -2352,12 +2518,26 @@ impl Parser {
         self.loop_depth = self.loop_depth.saturating_add(1);
         let body = self.statement_in(BodyPosition::LoopBody);
         self.loop_depth = self.loop_depth.saturating_sub(1);
+        let body = body?;
+        let head_names = match initializer.as_deref() {
+            Some(Statement::Variable { kind, name, .. }) if *kind != VariableKind::Var => {
+                vec![name.clone()]
+            }
+            Some(Statement::VariableList {
+                kind, declarations, ..
+            }) if *kind != VariableKind::Var => declarations
+                .iter()
+                .flat_map(|(target, _)| target.names())
+                .collect(),
+            _ => Vec::new(),
+        };
+        validate_head_against_body(&head_names, &body)?;
         Ok(Statement::For {
             offset: self.previous_offset(),
             initializer,
             condition,
             update,
-            body: Box::new(body?),
+            body: Box::new(body),
         })
     }
 
@@ -3083,7 +3263,8 @@ impl Parser {
                         property,
                     };
                 } else if self.take(&TokenKind::LeftBracket) {
-                    let property = self.assignment()?;
+                    // `MemberExpression [ Expression ]` admits a comma expression.
+                    let property = self.expression()?;
                     self.require(
                         &TokenKind::RightBracket,
                         "expected ']' after computed property",
@@ -3153,7 +3334,8 @@ impl Parser {
                         arguments,
                     };
                 } else if self.take(&TokenKind::LeftBracket) {
-                    let property = self.assignment()?;
+                    // `MemberExpression [ Expression ]` admits a comma expression.
+                    let property = self.expression()?;
                     self.require(
                         &TokenKind::RightBracket,
                         "expected ']' after computed property",
@@ -3197,7 +3379,8 @@ impl Parser {
                     property,
                 };
             } else if self.take(&TokenKind::LeftBracket) {
-                let property = self.assignment()?;
+                // `MemberExpression [ Expression ]` admits a comma expression.
+                let property = self.expression()?;
                 self.require(
                     &TokenKind::RightBracket,
                     "expected ']' after computed property",
@@ -3411,6 +3594,9 @@ impl Parser {
                 ))
             }
             TokenKind::Identifier(name) => Ok(Expr::Identifier(name)),
+            // `let` is a keyword only in declarations; elsewhere, in sloppy code, it is a name.
+            TokenKind::Let if self.strict => Err(self.error("let is reserved in strict code")),
+            TokenKind::Let => Ok(Expr::Identifier("let".to_owned())),
             TokenKind::This => Ok(Expr::This),
             TokenKind::String(value) => Ok(Expr::Literal(JsValue::String(value))),
             TokenKind::RegexLiteral { pattern, flags } => {
@@ -5473,6 +5659,20 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
 
 /// Early errors for declarations that clash within one statement list
 /// (ECMA-262 14.2.1 for blocks, 15.2.1 for function bodies, 16.1.1 for scripts).
+/// The early error for a `for` head whose lexical `names` the loop `body`
+/// declares again with `var` (ECMA-262 14.7.1.1, 14.7.4.1, 14.7.5.1).
+fn validate_head_against_body(names: &[String], body: &Statement) -> Result<(), JsError> {
+    let mut var_names = BTreeSet::new();
+    collect_var_names(body, &mut var_names);
+    match names.iter().find(|name| var_names.contains(*name)) {
+        Some(name) => Err(JsError::syntax(
+            format!("binding {name:?} conflicts with a var declaration"),
+            0,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// A lexical name (`let`, `const`, `class`, or a block-level function) may not
 /// be declared twice, nor be declared by a `var` in the list or in a block
 /// nested in it. In a function body or script (`top_level`), a function
@@ -5491,11 +5691,7 @@ fn validate_declaration_conflicts<'a>(
         |name: &str| JsError::syntax(format!("binding {name:?} is declared more than once"), 0);
     for statement in statements {
         match statement {
-            Statement::Variable {
-                kind: VariableKind::Let | VariableKind::Const,
-                name,
-                ..
-            } => {
+            Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
                 if !lexical.insert(name.clone()) {
                     return Err(duplicate(name));
                 }

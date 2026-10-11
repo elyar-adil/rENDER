@@ -51,6 +51,7 @@ mod coroutine;
 mod coroutine_run;
 #[cfg(test)]
 mod coroutine_tests;
+mod disposal;
 #[cfg(test)]
 mod dom_tests;
 mod eval;
@@ -70,6 +71,8 @@ mod types;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod using_tests;
 
 pub use types::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,

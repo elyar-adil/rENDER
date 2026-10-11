@@ -16,7 +16,9 @@ use super::coroutine::{
     next_result_name,
 };
 use super::eval::Completion;
-use super::types::{Binding, CallFrame, ClassFrame, Environment, EnvironmentRecord, UserFunction};
+use super::types::{
+    Binding, CallFrame, ClassFrame, Environment, EnvironmentRecord, ScopeResource, UserFunction,
+};
 use crate::parser::{FunctionKind, VariableKind};
 use crate::value::ObjectHost;
 use crate::{JsError, JsErrorKind, JsValue, ObjectId};
@@ -87,6 +89,10 @@ enum AfterAwait {
     /// method: the awaited `return()` result closes the iterator, and the
     /// protocol violation is thrown (step 7.b.iii).
     MissingThrow,
+    /// An `await using` disposal in the scope's disposal region at `slot` awaits
+    /// its result (`Dispose`, ECMA-262 14.3.3.1). A rejection is a disposal
+    /// throw, and disposal continues with the next resource either way.
+    DisposeAwait { slot: usize },
 }
 
 /// Suspend the coroutine until `result` settles, then handle it as an inner
@@ -648,6 +654,16 @@ impl JsRuntime {
             ) => Err(JsError::type_error(
                 "coroutine resumed with an unexpected return",
             )),
+            (AfterAwait::DisposeAwait { slot }, Resume::Next(_)) => {
+                self.dispose_scope_step(dom, co, slot)
+            }
+            (AfterAwait::DisposeAwait { slot }, Resume::Throw(reason)) => {
+                self.fold_pending_disposal(co, slot, reason)?;
+                self.dispose_scope_step(dom, co, slot)
+            }
+            (AfterAwait::DisposeAwait { .. }, Resume::Return(_)) => Err(JsError::type_error(
+                "coroutine resumed with an unexpected return",
+            )),
             (AfterAwait::CloseIterator(abrupt), resume) => {
                 // AsyncIteratorClose: a throw completion already in flight wins
                 // over whatever closing produced; otherwise the awaited
@@ -1019,7 +1035,68 @@ impl JsRuntime {
                     self.do_jump(dom, co, label.as_deref(), is_continue)
                 }
             },
+            Instr::DisposeScope { slot } => self.dispose_scope_step(dom, co, slot),
         }
+    }
+
+    /// Dispose the innermost scope's resources as the scope is left with the
+    /// pending completion of `slot`, last declared first (ECMA-262 9.4.3). A
+    /// resource's disposal that throws replaces the completion, or wraps a
+    /// pending throw in a `SuppressedError`. An `await using` resource suspends
+    /// until its result settles, and the steps resume through
+    /// [`AfterAwait::DisposeAwait`]. When none are left, control moves past the
+    /// region's `FinallyEnd`, which carries on with the completion.
+    fn dispose_scope_step(
+        &mut self,
+        dom: &mut Dom,
+        co: &mut Coroutine,
+        slot: usize,
+    ) -> Result<Flow, JsError> {
+        loop {
+            let scope = self.environment.last().cloned();
+            let next = scope
+                .as_ref()
+                .and_then(|scope| scope.borrow_mut().disposables.pop());
+            let Some(ScopeResource { resource, is_async }) = next else {
+                co.pc += 1;
+                return Ok(Flow::Next);
+            };
+            let pending_throw = match co.pending(slot) {
+                Pending::Throw(value) => Some(value),
+                _ => None,
+            };
+            match self.call_disposer(dom, &resource, pending_throw.as_ref()) {
+                // `Dispose` awaits every `await using` result, even one with no method.
+                Ok(result) if is_async => {
+                    co.after_await = Some(AfterAwait::DisposeAwait { slot });
+                    return Ok(Flow::Suspend(CoStep::Await(result)));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == JsErrorKind::ResourceLimit => return Err(error),
+                Err(error) => {
+                    let thrown = self.thrown_value_while_holding(&error, pending_throw.as_ref());
+                    self.fold_pending_disposal(co, slot, thrown)?;
+                }
+            }
+        }
+    }
+
+    /// Record a disposal that threw `thrown` against the pending completion of
+    /// `slot`: over a pending throw the two are wrapped in a `SuppressedError`,
+    /// and otherwise the disposal's throw becomes the completion.
+    fn fold_pending_disposal(
+        &mut self,
+        co: &mut Coroutine,
+        slot: usize,
+        thrown: JsValue,
+    ) -> Result<(), JsError> {
+        let pending_throw = match co.pending(slot) {
+            Pending::Throw(value) => Some(value),
+            _ => None,
+        };
+        let completion = self.fold_disposal_throw(pending_throw, thrown)?;
+        co.set_pending(slot, Pending::Throw(completion));
+        Ok(())
     }
 
     /// Drop every scope pushed since the innermost loop was entered, which is
@@ -1043,12 +1120,16 @@ impl JsRuntime {
         environment.borrow_mut().bindings.insert(
             binding.name.clone(),
             Binding {
-                value,
-                mutable: binding.kind != VariableKind::Const,
+                value: value.clone(),
+                mutable: !binding.kind.is_immutable(),
                 initialized: true,
                 kind: binding.kind,
             },
         );
+        if binding.kind.is_disposable() {
+            // The iteration's value is a `using` resource of this iteration's scope.
+            self.add_disposable_resource(dom, &environment, value, binding.kind)?;
+        }
         self.environment.push(environment);
         Ok(())
     }

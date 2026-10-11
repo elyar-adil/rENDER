@@ -84,6 +84,20 @@ pub(super) fn mark_environment(
     for binding in environment.borrow().bindings.values() {
         mark_value(runtime, marked, work, marked_environments, &binding.value);
     }
+    // A `using` scope's resources are reachable only through its record until
+    // the scope disposes them.
+    for scope_resource in &environment.borrow().disposables {
+        mark_value(
+            runtime,
+            marked,
+            work,
+            marked_environments,
+            &scope_resource.resource.value,
+        );
+        if let Some(method) = scope_resource.resource.method {
+            mark_object(runtime, marked, work, marked_environments, method);
+        }
+    }
     // A `with` body's binding object is reachable only through its record.
     let with_object = environment.borrow().with_object;
     if let Some(object) = with_object {

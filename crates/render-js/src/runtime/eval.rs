@@ -307,6 +307,20 @@ fn labelled_function(statement: &Statement) -> Option<&Statement> {
     (labelled && matches!(inner, Statement::Function { .. })).then_some(inner)
 }
 
+/// Whether `statement` completes empty, so it leaves the value of the statements
+/// before it as the completion value (ECMA-262 14.3.1.2, 14.3.3.2, 14.2.2 and
+/// 14.4.2): a `using` declaration, and a block or empty statement whose own
+/// statements all complete empty.
+fn completes_empty(statement: &Statement) -> bool {
+    match statement {
+        Statement::Variable { kind, .. } | Statement::VariableList { kind, .. } => {
+            kind.is_disposable()
+        }
+        Statement::Block(statements) => statements.iter().all(completes_empty),
+        _ => false,
+    }
+}
+
 /// The name `SetFunctionName` gives a function defined under a property key
 /// (ECMA-262 8.4.5): a symbol key contributes `[description]`, or the empty name
 /// when the symbol has no description.
@@ -359,7 +373,11 @@ impl JsRuntime {
                 self.transient_roots.clear();
             }
             match self.evaluate_statement(dom, statement)? {
-                Completion::Normal(next) => value = next,
+                Completion::Normal(next) => {
+                    if !completes_empty(statement) {
+                        value = next;
+                    }
+                }
                 abrupt @ (Completion::Return(_)
                 | Completion::Break(_)
                 | Completion::Continue(_)) => {
@@ -429,7 +447,11 @@ impl JsRuntime {
             let statement = labelled_function(statement).unwrap_or(statement);
             match statement {
                 Statement::Variable {
-                    kind: kind @ (VariableKind::Let | VariableKind::Const),
+                    kind:
+                        kind @ (VariableKind::Let
+                        | VariableKind::Const
+                        | VariableKind::Using
+                        | VariableKind::AwaitUsing),
                     name,
                     ..
                 } => {
@@ -542,7 +564,11 @@ impl JsRuntime {
                     }
                 }
                 Statement::Variable {
-                    kind: kind @ (VariableKind::Let | VariableKind::Const),
+                    kind:
+                        kind @ (VariableKind::Let
+                        | VariableKind::Const
+                        | VariableKind::Using
+                        | VariableKind::AwaitUsing),
                     name,
                     ..
                 } if declarations.insert(name.clone(), *kind).is_some() => {
@@ -1154,8 +1180,8 @@ impl JsRuntime {
                 }
             )
         );
-        self.environment
-            .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
+        let scope = Rc::new(RefCell::new(EnvironmentRecord::default()));
+        self.environment.push(Rc::clone(&scope));
         let result = (|| {
             if let Some(initializer) = initializer {
                 // Lexical loop variables live in the loop's own scope. `var`
@@ -1212,6 +1238,8 @@ impl JsRuntime {
             }
             Ok(Completion::Normal(value))
         })();
+        // The loop's own resources are disposed once the loop is left.
+        let result = self.dispose_scope(dom, &scope, result);
         self.environment.pop();
         result
     }
@@ -1247,7 +1275,7 @@ impl JsRuntime {
                     name.to_owned(),
                     Binding {
                         value: JsValue::String(property.clone()),
-                        mutable: kind != VariableKind::Const,
+                        mutable: !kind.is_immutable(),
                         initialized: true,
                         kind,
                     },
@@ -1365,7 +1393,7 @@ impl JsRuntime {
                     name.to_owned(),
                     Binding {
                         value: item.clone(),
-                        mutable: kind != VariableKind::Const,
+                        mutable: !kind.is_immutable(),
                         initialized: true,
                         kind,
                     },
@@ -1373,11 +1401,20 @@ impl JsRuntime {
                 self.environment.push(Rc::clone(&environment));
                 Some(environment)
             };
-            let completion = if kind == VariableKind::Var {
-                self.assign_binding(dom, name, item)
-                    .and_then(|()| self.evaluate_statement(dom, body))
-            } else {
-                self.evaluate_statement(dom, body)
+            let completion = match &iteration_environment {
+                // Each iteration's `using` value is disposed when the iteration ends.
+                Some(environment) => {
+                    let declared = if kind.is_disposable() {
+                        self.add_disposable_resource(dom, environment, item, kind)
+                    } else {
+                        Ok(())
+                    };
+                    let completion = declared.and_then(|()| self.evaluate_statement(dom, body));
+                    self.dispose_scope(dom, environment, completion)
+                }
+                None => self
+                    .assign_binding(dom, name, item)
+                    .and_then(|()| self.evaluate_statement(dom, body)),
             };
             if iteration_environment.is_some() {
                 self.environment.pop();
@@ -1442,11 +1479,12 @@ impl JsRuntime {
                     );
                 }
             }
-            self.environment.push(catch_environment);
-            result = self
+            self.environment.push(Rc::clone(&catch_environment));
+            let caught = self
                 .bind_catch_parameter(dom, catch.parameter.as_ref(), value)
                 .and_then(|()| self.instantiate_block_lexicals(&catch.body))
                 .and_then(|()| self.evaluate_statements(dom, &catch.body));
+            result = self.dispose_scope(dom, &catch_environment, caught);
             self.environment.pop();
         }
         if let Some(finally) = finally {
@@ -1507,11 +1545,12 @@ impl JsRuntime {
         dom: &mut Dom,
         statements: &[Statement],
     ) -> Result<Completion, JsError> {
-        self.environment
-            .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
+        let scope = Rc::new(RefCell::new(EnvironmentRecord::default()));
+        self.environment.push(Rc::clone(&scope));
         let result = self
             .instantiate_block_lexicals(statements)
             .and_then(|()| self.evaluate_statements(dom, statements));
+        let result = self.dispose_scope(dom, &scope, result);
         self.environment.pop();
         result
     }
@@ -3682,7 +3721,7 @@ impl JsRuntime {
         initialized: bool,
         value: JsValue,
     ) -> Result<(), JsError> {
-        let mutable = kind != VariableKind::Const;
+        let mutable = !kind.is_immutable();
         if self.environment.is_empty() {
             if let Some(existing) = self.global_bindings.get(name) {
                 if kind == VariableKind::Var && existing.kind == VariableKind::Var {
@@ -3772,6 +3811,16 @@ impl JsRuntime {
             && let Some(object) = self.with_object_at(depth)
         {
             return self.set_with_binding(dom, object, name, value);
+        }
+        if kind.is_disposable() {
+            // `InitializeBinding` with a non-normal hint adds the value to the
+            // resources of its scope, before the binding is initialized.
+            let scope = self
+                .environment
+                .last()
+                .cloned()
+                .ok_or_else(|| JsError::syntax("using declaration outside a block", 0))?;
+            self.add_disposable_resource(dom, &scope, value.clone(), kind)?;
         }
         self.initialize_declared_binding(name, value, kind)
     }
@@ -5967,7 +6016,16 @@ impl JsRuntime {
             Ok(()) if function.kind.is_coroutine() => self
                 .start_coroutine(dom, callee, index, &function, &call_environment)
                 .map(Completion::Return),
-            Ok(()) => self.evaluate_statements(dom, &function.body),
+            Ok(()) => {
+                // The body's own scope is the innermost one now, and its `using`
+                // resources are disposed when the body is left.
+                let scope = self.environment.last().cloned();
+                let result = self.evaluate_statements(dom, &function.body);
+                match scope {
+                    Some(scope) => self.dispose_scope(dom, &scope, result),
+                    None => result,
+                }
+            }
             // An async function reports a failing parameter list through its
             // promise rather than by throwing (ECMA-262 §10.2.1.1).
             Err(error) if function.kind == FunctionKind::Async => {

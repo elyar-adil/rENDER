@@ -47,6 +47,15 @@ pub(super) enum ObjectEntryKind {
     Entries,
 }
 
+/// A value a `using` or `await using` binding declared, held until the scope
+/// that declared it is left (ECMA-262 `[[DisposableResourceStack]]`).
+#[derive(Clone, Debug)]
+pub(super) struct ScopeResource {
+    pub(super) resource: crate::value::DisposeResource,
+    /// `await using`: the disposal result is awaited.
+    pub(super) is_async: bool,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct EnvironmentRecord {
     pub(super) bindings: BTreeMap<String, Binding>,
@@ -57,6 +66,9 @@ pub(super) struct EnvironmentRecord {
     /// (ECMA-262 9.1.1.2). Its properties are bindings, consulted before the
     /// records outside the `with` body.
     pub(super) with_object: Option<ObjectId>,
+    /// Resources declared by `using` bindings of this scope, in declaration
+    /// order. Disposal pops them, so a resource is disposed once.
+    pub(super) disposables: Vec<ScopeResource>,
 }
 
 pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;

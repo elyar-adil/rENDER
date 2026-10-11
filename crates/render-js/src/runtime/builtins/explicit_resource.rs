@@ -52,7 +52,7 @@ fn brand_error(kind: DisposeStackKind) -> JsError {
 
 impl JsRuntime {
     /// Run `body` with `roots` pinned as transient roots until it returns.
-    fn with_transient_roots<R>(
+    pub(in crate::runtime) fn with_transient_roots<R>(
         &mut self,
         roots: &[ObjectId],
         body: impl FnOnce(&mut Self) -> R,
@@ -207,7 +207,7 @@ impl JsRuntime {
     /// `@@asyncDispose` and falls back to `@@dispose`; the first method that
     /// is not `undefined` or `null` is taken, and anything else that is not
     /// callable throws.
-    fn dispose_method_of(
+    pub(in crate::runtime) fn dispose_method_of(
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
@@ -332,7 +332,7 @@ impl JsRuntime {
 
     /// `Call(method, value)` for one record. Its objects and the pending
     /// completion stay pinned while the method runs.
-    fn call_disposer(
+    pub(in crate::runtime) fn call_disposer(
         &mut self,
         dom: &mut Dom,
         resource: &DisposeResource,
@@ -351,7 +351,11 @@ impl JsRuntime {
     }
 
     /// The thrown value of `error`, converted while `held` stays reachable.
-    fn thrown_value_while_holding(&mut self, error: &JsError, held: Option<&JsValue>) -> JsValue {
+    pub(in crate::runtime) fn thrown_value_while_holding(
+        &mut self,
+        error: &JsError,
+        held: Option<&JsValue>,
+    ) -> JsValue {
         let roots: Vec<ObjectId> = held.and_then(object_of).into_iter().collect();
         self.with_transient_roots(&roots, |runtime| runtime.error_value(error))
     }
@@ -359,7 +363,7 @@ impl JsRuntime {
     /// Fold a disposer's throw into the completion, the way `DisposeResources`
     /// does: the first throw is kept as is, and a later one becomes a
     /// `SuppressedError` whose `error` is the new throw.
-    fn record_disposal_error(
+    pub(in crate::runtime) fn record_disposal_error(
         &mut self,
         completion: &mut Option<JsValue>,
         thrown: JsValue,
