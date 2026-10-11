@@ -1080,21 +1080,24 @@ fn default_harness_sources() -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// The `$262` host object (INTERPRETING.md, "Host-defined functions"). Only the
-/// member the measured directories use is provided: `detachArrayBuffer`.
+/// The `$262` host object of the current realm (INTERPRETING.md, "Host-defined
+/// functions"): `detachArrayBuffer`, `createRealm`, `evalScript` and `global`.
+/// Each realm gets its own, so a realm made by `createRealm` has one too.
 fn install_test262_host(
     runtime: &mut JsRuntime,
     dom: &mut render_core::dom::Dom,
 ) -> Result<(), String> {
-    let script = CompiledScript::compile("var $262 = {};", &RuntimeLimits::default())
+    let script = CompiledScript::compile("var $262 = { global: this };", &RuntimeLimits::default())
         .map_err(|error| error.message().to_owned())?;
     runtime
-        .execute_compiled(dom, &script)
+        .execute_nested(dom, &script)
         .map_err(|error| error.message().to_owned())?;
     let Some(JsValue::Object(host)) = runtime.realm().global("$262") else {
         return Err("the $262 host object is not defined".to_owned());
     };
     runtime.define_host_function(host, "detachArrayBuffer", detach_array_buffer_host);
+    runtime.define_host_function(host, "createRealm", create_realm_host);
+    runtime.define_host_function(host, "evalScript", eval_script_host);
     Ok(())
 }
 
@@ -1105,6 +1108,42 @@ fn detach_array_buffer_host(
 ) -> Result<JsValue, JsError> {
     runtime.detach_array_buffer(arguments.first().unwrap_or(&JsValue::Undefined))?;
     Ok(JsValue::Undefined)
+}
+
+/// `$262.createRealm()`: a new realm with its own global object, whose `$262`
+/// is returned. The new realm's `$262` is installed while it is current, so
+/// its functions belong to that realm.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "a host function is a HostFunction, which returns a Result"
+)]
+fn create_realm_host(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+    _arguments: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let realm = runtime.create_realm(dom);
+    runtime
+        .with_realm(realm, |runtime| install_test262_host(runtime, dom))
+        .expect("the $262 host installs in a fresh realm");
+    Ok(runtime
+        .with_realm(realm, |runtime| runtime.realm().global("$262"))
+        .unwrap_or(JsValue::Undefined))
+}
+
+/// `$262.evalScript(source)`: runs `source` as a script in the realm of the
+/// `evalScript` function. A parse error is a `SyntaxError` of that realm.
+fn eval_script_host(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+    arguments: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let source = arguments.first().map_or_else(
+        || "undefined".to_owned(),
+        |value| value.to_js_string().to_lossy(),
+    );
+    let script = CompiledScript::compile(&source, &RuntimeLimits::default())?;
+    Ok(runtime.execute_nested(dom, &script)?.value)
 }
 
 fn install_harness(

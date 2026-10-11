@@ -13,6 +13,7 @@ use crate::JsErrorKind;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
+use crate::RealmId;
 use crate::lexer;
 use crate::parser::BindingTarget;
 use crate::parser::EvalContext;
@@ -353,19 +354,62 @@ impl JsRuntime {
             self.class_frames.pop();
             return outcome;
         }
-        // An indirect eval sees no caller scope and no class context. The caller's
-        // environments stay rooted while the eval code runs.
+        self.run_indirect_eval(dom, &mut statements, strict)
+    }
+
+    /// Runs parsed eval code as an indirect eval does: it sees no caller scope
+    /// and no class context, and runs in the global environment of the current
+    /// realm. The caller's environments stay rooted while it runs.
+    fn run_indirect_eval(
+        &mut self,
+        dom: &mut Dom,
+        statements: &mut [Statement],
+        strict: bool,
+    ) -> Result<JsValue, JsError> {
         let depth = self.suspend_scopes();
         let caller_environment = std::mem::take(&mut self.environment);
         self.class_frames.push(ClassFrame {
             strict,
             ..ClassFrame::default()
         });
-        let outcome = self.evaluate_eval_code(dom, &mut statements, strict);
+        let outcome = self.evaluate_eval_code(dom, statements, strict);
         self.class_frames.pop();
         self.environment = caller_environment;
         self.resume_scopes(depth);
         outcome
+    }
+
+    /// Parses the source of a `ShadowRealm.prototype.evaluate` or `importValue`
+    /// call as a Script (`ShadowRealm` proposal, `PerformShadowRealmEval` step 2).
+    /// A parse error is the caller's `SyntaxError`, so it is reported apart from
+    /// what the evaluation later throws.
+    pub(in crate::runtime) fn parse_for_realm(
+        &self,
+        source: &str,
+    ) -> Result<(Vec<Statement>, bool), JsError> {
+        let tokens =
+            lexer::tokenize(source, &self.limits).map_err(|error| without_offset(&error))?;
+        parse_eval(
+            std::sync::Arc::from(source),
+            tokens,
+            &self.limits,
+            &EvalContext::default(),
+        )
+        .map_err(|error| without_offset(&error))
+    }
+
+    /// The evaluation half of `PerformShadowRealmEval`: `statements` run as
+    /// indirect eval code in `realm`, which is current while they run.
+    pub(in crate::runtime) fn evaluate_parsed_in_realm(
+        &mut self,
+        dom: &mut Dom,
+        statements: &mut [Statement],
+        strict: bool,
+        realm: RealmId,
+    ) -> Result<JsValue, JsError> {
+        self.with_realm(realm, |runtime| {
+            runtime.run_indirect_eval(dom, statements, strict)
+        })
     }
 
     /// Runs eval code in a new lexical environment, after its declarations are
@@ -584,7 +628,7 @@ impl JsRuntime {
     /// Whether the global environment binds `name` lexically
     /// (`HasLexicalDeclaration`).
     fn global_lexical(&self, name: &str) -> bool {
-        self.global_bindings
+        self.global_bindings()
             .get(name)
             .is_some_and(|binding| binding.kind != VariableKind::Var)
     }
@@ -624,13 +668,13 @@ impl JsRuntime {
     }
 
     /// `CanDeclareGlobalVar` (ECMA-262 9.1.1.4.15).
-    fn can_declare_global_var(&self, name: &str) -> bool {
+    pub(super) fn can_declare_global_var(&self, name: &str) -> bool {
         let global = self.realm.global_object();
         self.realm.own_property(global, name).is_some() || self.realm.is_extensible(global)
     }
 
     /// `CanDeclareGlobalFunction` (ECMA-262 9.1.1.4.16).
-    fn can_declare_global_function(&self, name: &str) -> bool {
+    pub(super) fn can_declare_global_function(&self, name: &str) -> bool {
         let global = self.realm.global_object();
         match self.realm.own_property(global, name) {
             None => self.realm.is_extensible(global),
@@ -683,7 +727,7 @@ impl JsRuntime {
 
     /// Records a global var name, so that later scripts see it as a var.
     fn declare_global_var_name(&mut self, name: &str) {
-        self.global_bindings
+        self.global_bindings_mut()
             .entry(name.to_owned())
             .or_insert(GlobalBinding {
                 mutable: true,

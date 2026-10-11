@@ -76,10 +76,6 @@
     return groups;
   });
 
-  // ---------------------------------------------------------------- String
-  define(String.prototype, 'trimLeft', String.prototype.trimStart);
-  define(String.prototype, 'trimRight', String.prototype.trimEnd);
-
   // ----------------------------------------------------------------- Error
   define(Error, 'captureStackTrace', function captureStackTrace(target) {
     if (target !== null && (typeof target === 'object' || typeof target === 'function')) {
@@ -91,44 +87,6 @@
       });
     }
   });
-
-  // ------------------------------------------------------------- WeakRef
-  // A strong reference: it never lets its target go. The specification allows
-  // a collector to keep a target alive for as long as it likes, and does not
-  // let a program observe the difference.
-  if (typeof WeakRef === 'undefined') {
-    var WeakRefImpl = function WeakRef(target) {
-      if (target === null || (typeof target !== 'object' && typeof target !== 'function')) {
-        throw new TypeError('WeakRef: target must be an object');
-      }
-      defineProperty(this, '__target', { value: target });
-    };
-    defineProperty(WeakRefImpl.prototype, 'deref', {
-      value: function deref() { return this.__target; },
-      writable: true, configurable: true, enumerable: false
-    });
-    defineProperty(global, 'WeakRef', {
-      value: WeakRefImpl, writable: true, configurable: true, enumerable: false
-    });
-  }
-  // Cleanup callbacks are allowed never to run, which is what happens here.
-  if (typeof FinalizationRegistry === 'undefined') {
-    var FinalizationRegistryImpl = function FinalizationRegistry(callback) {
-      if (typeof callback !== 'function') {
-        throw new TypeError('FinalizationRegistry: cleanup must be callable');
-      }
-    };
-    defineProperty(FinalizationRegistryImpl.prototype, 'register', {
-      value: function register() {}, writable: true, configurable: true, enumerable: false
-    });
-    defineProperty(FinalizationRegistryImpl.prototype, 'unregister', {
-      value: function unregister() { return false; },
-      writable: true, configurable: true, enumerable: false
-    });
-    defineProperty(global, 'FinalizationRegistry', {
-      value: FinalizationRegistryImpl, writable: true, configurable: true, enumerable: false
-    });
-  }
 
   // ---------------------------------------------------------------- timers
   define(global, 'setImmediate', function setImmediate(callback) {

@@ -350,6 +350,12 @@ impl JsRuntime {
             | NativeFunction::ObjectIsFrozen => {
                 self.dispatch_object_native(dom, function, receiver, arguments)
             }
+            NativeFunction::ShadowRealmEvaluate => {
+                self.shadow_realm_evaluate(dom, &JsValue::Object(receiver), arguments)
+            }
+            NativeFunction::ShadowRealmImportValue => {
+                self.shadow_realm_import_value(dom, &JsValue::Object(receiver), arguments)
+            }
             NativeFunction::StrCharAt => self.string_char_at(dom, receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(dom, receiver, arguments),
             NativeFunction::StrIndexOf => self.string_index_of(dom, receiver, arguments, false),

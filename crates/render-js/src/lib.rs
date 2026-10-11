@@ -29,7 +29,7 @@ pub use runtime::{
     JsMicrotask, JsRuntime, ModuleLoader, NavigationRequest, PendingFetch, TimerEntry, TimerKind,
     TimerRequest,
 };
-pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm};
+pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm, RealmId};
 
 use parser::Statement;
 

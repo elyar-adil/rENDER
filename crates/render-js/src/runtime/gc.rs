@@ -210,6 +210,8 @@ pub(super) fn mark_host(
         | ObjectHost::ModuleNamespace(_)
         | ObjectHost::AsyncModuleStep { .. }
         | ObjectHost::ModuleNamespaceOf { .. }
+        | ObjectHost::ShadowRealmImportFulfilled { .. }
+        | ObjectHost::ShadowRealmImportRejected
         | ObjectHost::AsyncGenerator(_)
         | ObjectHost::AsyncFromSyncValue { .. }
         | ObjectHost::PromiseConstructor
@@ -271,7 +273,14 @@ pub(super) fn mark_host(
         | ObjectHost::FormData { .. }
         | ObjectHost::ResponseConstructor
         | ObjectHost::Response { .. } => {}
-        ObjectHost::Blob { .. } | ObjectHost::BlobConstructor | ObjectHost::ProxyConstructor => {}
+        ObjectHost::Blob { .. }
+        | ObjectHost::BlobConstructor
+        | ObjectHost::ProxyConstructor
+        | ObjectHost::ShadowRealmConstructor
+        | ObjectHost::ShadowRealm(_) => {}
+        ObjectHost::WrappedFunction(target) => {
+            mark_object(runtime, marked, work, marked_environments, *target);
+        }
         ObjectHost::DisposableStack(state) => {
             // The resources, the throw completion of a pending `disposeAsync`
             // and the promise it resolves are the stack's own references.
@@ -588,7 +597,7 @@ impl JsRuntime {
                 }
             }
         }
-        for record in self.modules.values() {
+        for record in self.modules.iter().flat_map(BTreeMap::values) {
             mark_environment(
                 self,
                 &mut marked,

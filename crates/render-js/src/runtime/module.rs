@@ -129,6 +129,18 @@ impl JsRuntime {
         self.module_loader = Some(loader);
     }
 
+    /// The module records of the current realm. A module belongs to the realm
+    /// that declared it (ECMA-262 16.2.1.6): its environment, namespace and
+    /// evaluation state live in that realm's map.
+    fn modules(&self) -> &BTreeMap<String, ModuleRecord> {
+        &self.modules[self.realm.current_realm().0]
+    }
+
+    fn modules_mut(&mut self) -> &mut BTreeMap<String, ModuleRecord> {
+        let realm = self.realm.current_realm().0;
+        &mut self.modules[realm]
+    }
+
     /// Instantiate a module: create its environment, hoist its declarations,
     /// and wire its import bindings to the modules named in `resolutions`.
     ///
@@ -205,7 +217,7 @@ impl JsRuntime {
         let environment: Environment = Rc::new(RefCell::new(record));
         let statements = Rc::new(script.statements.clone());
         let has_tla = statements_have_suspend(&statements);
-        self.modules.insert(
+        self.modules_mut().insert(
             key.to_owned(),
             ModuleRecord {
                 environment: environment.clone(),
@@ -245,7 +257,7 @@ impl JsRuntime {
     /// Returns the first load, parse or declaration error of the graph. A graph
     /// that fails to load declares none of its modules.
     pub fn load_module(&mut self, key: &str, script: &CompiledScript) -> Result<(), JsError> {
-        if self.modules.contains_key(key) {
+        if self.modules().contains_key(key) {
             return Ok(());
         }
         self.with_module_loader(|runtime, loader| runtime.load_graph(loader, key, script.clone()))
@@ -254,7 +266,7 @@ impl JsRuntime {
     /// Whether a module with this key has been declared.
     #[must_use]
     pub fn has_module(&self, key: &str) -> bool {
-        self.modules.contains_key(key)
+        self.modules().contains_key(key)
     }
 
     /// The error that completed the evaluation of module `key`, if it failed.
@@ -262,7 +274,7 @@ impl JsRuntime {
     /// returns, so an embedder reads this once its job queue has drained.
     #[must_use]
     pub fn module_evaluation_error(&self, key: &str) -> Option<JsError> {
-        self.modules.get(key)?.evaluation_error.clone()
+        self.modules().get(key)?.evaluation_error.clone()
     }
 
     /// Link the graph of module `key` (ECMA-262 16.2.1.5.1 Link): every import
@@ -278,7 +290,7 @@ impl JsRuntime {
         let result = self.inner_module_linking(key, &mut stack, 0);
         if result.is_err() {
             for module in stack {
-                if let Some(record) = self.modules.get_mut(&module) {
+                if let Some(record) = self.modules_mut().get_mut(&module) {
                     record.status = Status::Unlinked;
                 }
             }
@@ -308,7 +320,7 @@ impl JsRuntime {
         let result = self
             .link_module(key)
             .and_then(|()| self.module_evaluate(dom, key))
-            .and_then(|_| match self.modules.get(key) {
+            .and_then(|_| match self.modules().get(key) {
                 Some(record) if record.status == Status::Evaluated => {
                     record.evaluation_error.clone().map_or(Ok(()), Err)
                 }
@@ -361,7 +373,7 @@ impl JsRuntime {
                     )));
                 };
                 let (target, target_script) = loader.load(&module_key, request, &[])?;
-                if !self.modules.contains_key(&target) && queued.insert(target.clone()) {
+                if !self.modules().contains_key(&target) && queued.insert(target.clone()) {
                     queue.push_back((target.clone(), target_script));
                 }
                 resolutions.insert(request.clone(), target);
@@ -378,7 +390,7 @@ impl JsRuntime {
     /// `GetActiveScriptOrModule`). Module code, and functions created in it, carry
     /// their module's environment in their scope chain, so the innermost one
     /// names the module. Code outside any module refers to the document's base URL.
-    fn active_script_or_module(&self) -> String {
+    pub(in crate::runtime) fn active_script_or_module(&self) -> String {
         self.environment
             .iter()
             .rev()
@@ -402,6 +414,23 @@ impl JsRuntime {
         let specifier = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let options = arguments.get(1).cloned();
         let request = self.import_request(dom, &specifier, options.as_ref());
+        self.start_import(&referrer, request, promise, object, phase)?;
+        Ok(JsValue::Object(object))
+    }
+
+    /// Starts an import of the `request` (a specifier and its attributes) made
+    /// from `referrer`, which settles `promise`, the promise object `object`.
+    /// The module is fetched through the loader now; the rest of
+    /// `ContinueDynamicImport` runs in a job, once the load settles. A request
+    /// that cannot be fetched rejects `promise` right away.
+    pub(in crate::runtime) fn start_import(
+        &mut self,
+        referrer: &str,
+        request: Result<(String, Vec<(String, String)>), JsError>,
+        promise: usize,
+        object: ObjectId,
+        phase: ImportPhase,
+    ) -> Result<(), JsError> {
         let fetched = request.and_then(|(specifier, attributes)| {
             self.with_module_loader(|runtime, loader| {
                 let Some(boxed) = loader.as_mut() else {
@@ -409,8 +438,8 @@ impl JsRuntime {
                         "import() cannot load a module: no module loader is installed",
                     ));
                 };
-                let (key, script) = boxed.load(&referrer, &specifier, &attributes)?;
-                if !runtime.modules.contains_key(&key) {
+                let (key, script) = boxed.load(referrer, &specifier, &attributes)?;
+                if !runtime.modules().contains_key(&key) {
                     runtime.load_graph(loader, &key, script)?;
                 }
                 Ok(key)
@@ -436,7 +465,7 @@ impl JsRuntime {
                 self.perform_then(load, Some(linked), None, None)?;
             }
         }
-        Ok(JsValue::Object(object))
+        Ok(())
     }
 
     /// The specifier string and import attributes of an `import()` call
@@ -538,7 +567,7 @@ impl JsRuntime {
         module: &str,
         deferred: bool,
     ) -> Result<ObjectId, JsError> {
-        let cached = self.modules.get(module).and_then(|record| {
+        let cached = self.modules().get(module).and_then(|record| {
             if deferred {
                 record.deferred_namespace
             } else {
@@ -550,7 +579,7 @@ impl JsRuntime {
         }
         let namespace = self.realm.create_object(None);
         // Recorded before the exports are read, so a cycle of `export * as` finds it.
-        if let Some(record) = self.modules.get_mut(module) {
+        if let Some(record) = self.modules_mut().get_mut(module) {
             if deferred {
                 record.deferred_namespace = Some(namespace);
             } else {
@@ -565,7 +594,7 @@ impl JsRuntime {
         for name in names {
             match self.resolve_export(module, &name, &mut Vec::new()) {
                 Resolution::Binding { module, local } => {
-                    let environment = self.modules[&module].environment.clone();
+                    let environment = self.modules()[&module].environment.clone();
                     exports.push((name, NamespaceExport::Binding { environment, local }));
                 }
                 Resolution::Namespace(target) => {
@@ -591,7 +620,7 @@ impl JsRuntime {
         if !visited.insert(module.to_owned()) {
             return;
         }
-        let Some(record) = self.modules.get(module) else {
+        let Some(record) = self.modules().get(module) else {
             return;
         };
         names.extend(
@@ -632,7 +661,7 @@ impl JsRuntime {
             return Resolution::Null;
         }
         resolve_set.push((module.to_owned(), name.to_owned()));
-        let Some(record) = self.modules.get(module) else {
+        let Some(record) = self.modules().get(module) else {
             return Resolution::Null;
         };
         for (exported, local) in &record.info.local_exports {
@@ -680,7 +709,7 @@ impl JsRuntime {
 
     /// The modules `module` requests, in source order, each once.
     fn requested_modules(&self, module: &str) -> Vec<String> {
-        self.modules.get(module).map_or_else(Vec::new, |record| {
+        self.modules().get(module).map_or_else(Vec::new, |record| {
             record
                 .info
                 .requests
@@ -695,7 +724,7 @@ impl JsRuntime {
     /// asynchronous modules it transitively depends on, and an ordinary one the
     /// module itself.
     fn evaluation_list(&self, module: &str) -> Vec<String> {
-        let Some(record) = self.modules.get(module) else {
+        let Some(record) = self.modules().get(module) else {
             return Vec::new();
         };
         let mut list: Vec<String> = Vec::new();
@@ -729,7 +758,7 @@ impl JsRuntime {
             return result;
         }
         seen.push(module.to_owned());
-        let Some(record) = self.modules.get(module) else {
+        let Some(record) = self.modules().get(module) else {
             return result;
         };
         if matches!(record.status, Status::Evaluating | Status::Evaluated) {
@@ -751,7 +780,7 @@ impl JsRuntime {
 
     /// The cycle root of `module`, or `module` itself before it has one.
     fn cycle_root_of(&self, module: &str) -> String {
-        self.modules
+        self.modules()
             .get(module)
             .and_then(|record| record.cycle_root.clone())
             .unwrap_or_else(|| module.to_owned())
@@ -764,7 +793,7 @@ impl JsRuntime {
         stack: &mut Vec<String>,
         mut index: usize,
     ) -> Result<usize, JsError> {
-        let Some(status) = self.modules.get(key).map(|record| record.status) else {
+        let Some(status) = self.modules().get(key).map(|record| record.status) else {
             return Err(JsError::reference(format!(
                 "module {key:?} is not declared"
             )));
@@ -772,7 +801,7 @@ impl JsRuntime {
         if status != Status::Unlinked {
             return Ok(index);
         }
-        if let Some(record) = self.modules.get_mut(key) {
+        if let Some(record) = self.modules_mut().get_mut(key) {
             record.status = Status::Linking;
             record.dfs_index = index;
             record.dfs_ancestor_index = index;
@@ -782,23 +811,23 @@ impl JsRuntime {
         for required in self.requested_modules(key) {
             index = self.inner_module_linking(&required, stack, index)?;
             let dependency = self
-                .modules
+                .modules()
                 .get(&required)
                 .map(|record| (record.status, record.dfs_ancestor_index));
             if let Some((Status::Linking, ancestor)) = dependency
-                && let Some(record) = self.modules.get_mut(key)
+                && let Some(record) = self.modules_mut().get_mut(key)
             {
                 record.dfs_ancestor_index = record.dfs_ancestor_index.min(ancestor);
             }
         }
         self.initialize_environment(key)?;
         let is_root = self
-            .modules
+            .modules()
             .get(key)
             .is_some_and(|record| record.dfs_ancestor_index == record.dfs_index);
         if is_root {
             pop_component(stack, key, |member| {
-                if let Some(record) = self.modules.get_mut(member) {
+                if let Some(record) = self.modules_mut().get_mut(member) {
                     record.status = Status::Linked;
                 }
             });
@@ -810,7 +839,7 @@ impl JsRuntime {
     /// named import must resolve to one binding, and namespace imports are bound.
     fn initialize_environment(&mut self, key: &str) -> Result<(), JsError> {
         let (indirect, imports, environment) = {
-            let record = &self.modules[key];
+            let record = &self.modules()[key];
             (
                 record.info.indirect_exports.clone(),
                 record.info.imports.clone(),
@@ -835,7 +864,7 @@ impl JsRuntime {
             }
         }
         for entry in &imports {
-            let target = self.modules[key].resolutions[&entry.request].clone();
+            let target = self.modules()[key].resolutions[&entry.request].clone();
             if entry.phase == ImportPhase::Source {
                 return Err(JsError::syntax(
                     format!("module {target:?} has no source phase import"),
@@ -877,25 +906,25 @@ impl JsRuntime {
     /// evaluation, started on the first call. A failure, synchronous or not,
     /// rejects it and is recorded on the module.
     fn module_evaluate(&mut self, dom: &mut Dom, key: &str) -> Result<usize, JsError> {
-        let root = match self.modules.get(key).map(|record| record.status) {
+        let root = match self.modules().get(key).map(|record| record.status) {
             Some(Status::EvaluatingAsync | Status::Evaluated) => self.cycle_root_of(key),
             _ => key.to_owned(),
         };
         if let Some(promise) = self
-            .modules
+            .modules()
             .get(&root)
             .and_then(|record| record.top_level_capability)
         {
             return Ok(promise);
         }
         let (promise, _) = self.create_promise_record()?;
-        if let Some(record) = self.modules.get_mut(&root) {
+        if let Some(record) = self.modules_mut().get_mut(&root) {
             record.top_level_capability = Some(promise);
         }
         let mut stack = Vec::new();
         if let Err(error) = self.inner_module_evaluation(dom, &root, &mut stack, 0) {
             for member in &stack {
-                if let Some(record) = self.modules.get_mut(member) {
+                if let Some(record) = self.modules_mut().get_mut(member) {
                     record.status = Status::Evaluated;
                     record.evaluation_error = Some(error.clone());
                 }
@@ -904,7 +933,7 @@ impl JsRuntime {
             self.reject_promise(promise, &reason);
         } else {
             let asynchronous = self
-                .modules
+                .modules()
                 .get(&root)
                 .is_some_and(|record| record.async_evaluation);
             if !asynchronous {
@@ -922,7 +951,7 @@ impl JsRuntime {
         stack: &mut Vec<String>,
         mut index: usize,
     ) -> Result<usize, JsError> {
-        let Some(record) = self.modules.get(key) else {
+        let Some(record) = self.modules().get(key) else {
             return Err(JsError::reference(format!(
                 "module {key:?} is not declared"
             )));
@@ -940,7 +969,7 @@ impl JsRuntime {
             }
             Status::Linked => {}
         }
-        if let Some(record) = self.modules.get_mut(key) {
+        if let Some(record) = self.modules_mut().get_mut(key) {
             record.status = Status::Evaluating;
             record.dfs_index = index;
             record.dfs_ancestor_index = index;
@@ -951,7 +980,7 @@ impl JsRuntime {
         for required in self.evaluation_list(key) {
             index = self.inner_module_evaluation(dom, &required, stack, index)?;
             let Some((status, ancestor)) = self
-                .modules
+                .modules()
                 .get(&required)
                 .map(|record| (record.status, record.dfs_ancestor_index))
             else {
@@ -959,13 +988,13 @@ impl JsRuntime {
             };
             let mut dependency = required.clone();
             if status == Status::Evaluating {
-                if let Some(record) = self.modules.get_mut(key) {
+                if let Some(record) = self.modules_mut().get_mut(key) {
                     record.dfs_ancestor_index = record.dfs_ancestor_index.min(ancestor);
                 }
             } else {
                 dependency = self.cycle_root_of(&required);
                 if let Some(error) = self
-                    .modules
+                    .modules()
                     .get(&dependency)
                     .and_then(|root| root.evaluation_error.clone())
                 {
@@ -973,25 +1002,25 @@ impl JsRuntime {
                 }
             }
             let asynchronous = self
-                .modules
+                .modules()
                 .get(&dependency)
                 .is_some_and(|record| record.async_evaluation);
             if asynchronous {
-                if let Some(root) = self.modules.get_mut(&dependency) {
+                if let Some(root) = self.modules_mut().get_mut(&dependency) {
                     root.async_parent_modules.push(key.to_owned());
                 }
-                if let Some(record) = self.modules.get_mut(key) {
+                if let Some(record) = self.modules_mut().get_mut(key) {
                     record.pending_async_dependencies += 1;
                 }
             }
         }
-        let (pending, has_tla) = self.modules.get(key).map_or((0, false), |record| {
+        let (pending, has_tla) = self.modules().get(key).map_or((0, false), |record| {
             (record.pending_async_dependencies, record.has_tla)
         });
         if pending > 0 || has_tla {
             self.async_evaluation_count += 1;
             let order = self.async_evaluation_count;
-            if let Some(record) = self.modules.get_mut(key) {
+            if let Some(record) = self.modules_mut().get_mut(key) {
                 record.async_evaluation = true;
                 record.async_order = order;
             }
@@ -1002,12 +1031,12 @@ impl JsRuntime {
             self.execute_module(dom, key)?;
         }
         let is_root = self
-            .modules
+            .modules()
             .get(key)
             .is_some_and(|record| record.dfs_ancestor_index == record.dfs_index);
         if is_root {
             pop_component(stack, key, |member| {
-                if let Some(record) = self.modules.get_mut(member) {
+                if let Some(record) = self.modules_mut().get_mut(member) {
                     record.status = if record.async_evaluation {
                         Status::EvaluatingAsync
                     } else {
@@ -1027,7 +1056,7 @@ impl JsRuntime {
             return true;
         }
         seen.push(module.to_owned());
-        let Some(record) = self.modules.get(module) else {
+        let Some(record) = self.modules().get(module) else {
             return false;
         };
         match record.status {
@@ -1056,11 +1085,19 @@ impl JsRuntime {
         if key == Some("then") {
             return Ok(());
         }
+        // The namespace's module belongs to the realm the namespace was made in,
+        // so its evaluation runs there.
+        let realm = self.realm.object_realm(object);
+        if realm != self.realm.current_realm() {
+            return self.with_realm(realm, |runtime| {
+                runtime.ensure_deferred_namespace(dom, object, key)
+            });
+        }
         let Some(module) = self.realm.deferred_namespace_module(object) else {
             return Ok(());
         };
         let status = self
-            .modules
+            .modules()
             .get(&module)
             .map(|record| (record.status, record.evaluation_error.clone()));
         match status {
@@ -1111,7 +1148,7 @@ impl JsRuntime {
     /// `ExecuteModule` (ECMA-262 16.2.1.5.3.1 step 9) for a module without
     /// top-level `await`: run its body now.
     fn execute_module(&mut self, dom: &mut Dom, key: &str) -> Result<(), JsError> {
-        let Some(record) = self.modules.get(key) else {
+        let Some(record) = self.modules().get(key) else {
             return Err(JsError::reference(format!(
                 "module {key:?} is not declared"
             )));
@@ -1149,7 +1186,7 @@ impl JsRuntime {
             rejected: true,
         });
         let _ = self.perform_then(promise, Some(fulfilled), Some(rejected), None);
-        let Some(record) = self.modules.get(key) else {
+        let Some(record) = self.modules().get(key) else {
             return;
         };
         let environment = record.environment.clone();
@@ -1163,7 +1200,7 @@ impl JsRuntime {
 
     /// `AsyncModuleExecutionFulfilled` (ECMA-262 16.2.1.5.3.3).
     fn async_module_execution_fulfilled(&mut self, dom: &mut Dom, key: &str) {
-        let Some(record) = self.modules.get_mut(key) else {
+        let Some(record) = self.modules_mut().get_mut(key) else {
             return;
         };
         if record.status == Status::Evaluated {
@@ -1178,13 +1215,13 @@ impl JsRuntime {
         let mut exec_list = Vec::new();
         self.gather_available_ancestors(key, &mut exec_list);
         exec_list.sort_by_key(|member| {
-            self.modules
+            self.modules()
                 .get(member)
                 .map_or(0, |record| record.async_order)
         });
         for member in exec_list {
             let Some((status, has_tla)) = self
-                .modules
+                .modules()
                 .get(&member)
                 .map(|record| (record.status, record.has_tla))
             else {
@@ -1200,7 +1237,7 @@ impl JsRuntime {
             if let Err(error) = self.execute_module(dom, &member) {
                 self.async_module_execution_rejected(&member, &error);
             } else {
-                let capability = self.modules.get_mut(&member).and_then(|record| {
+                let capability = self.modules_mut().get_mut(&member).and_then(|record| {
                     record.async_evaluation = false;
                     record.status = Status::Evaluated;
                     record.top_level_capability
@@ -1214,7 +1251,7 @@ impl JsRuntime {
 
     /// `AsyncModuleExecutionRejected` (ECMA-262 16.2.1.5.3.4).
     fn async_module_execution_rejected(&mut self, key: &str, error: &JsError) {
-        let Some(record) = self.modules.get_mut(key) else {
+        let Some(record) = self.modules_mut().get_mut(key) else {
             return;
         };
         if record.status == Status::Evaluated {
@@ -1237,19 +1274,19 @@ impl JsRuntime {
     /// evaluating modules that `module` was the last pending dependency of.
     fn gather_available_ancestors(&mut self, module: &str, exec_list: &mut Vec<String>) {
         let parents = self
-            .modules
+            .modules()
             .get(module)
             .map_or_else(Vec::new, |record| record.async_parent_modules.clone());
         for parent in parents {
             let root = self.cycle_root_of(&parent);
             let errored = self
-                .modules
+                .modules()
                 .get(&root)
                 .is_some_and(|record| record.evaluation_error.is_some());
             if exec_list.contains(&parent) || errored {
                 continue;
             }
-            let Some(record) = self.modules.get_mut(&parent) else {
+            let Some(record) = self.modules_mut().get_mut(&parent) else {
                 continue;
             };
             record.pending_async_dependencies = record.pending_async_dependencies.saturating_sub(1);
@@ -1291,10 +1328,10 @@ impl JsRuntime {
     pub(super) fn read_import(&self, import: &ImportRef) -> Result<JsValue, JsError> {
         match self.resolve_export(&import.module, &import.name, &mut Vec::new()) {
             Resolution::Binding { module, local } => {
-                read_binding(&self.modules[&module].environment, &local)
+                read_binding(&self.modules()[&module].environment, &local)
             }
             Resolution::Namespace(target) => self
-                .modules
+                .modules()
                 .get(&target)
                 .and_then(|record| record.namespace)
                 .map(JsValue::Object)
