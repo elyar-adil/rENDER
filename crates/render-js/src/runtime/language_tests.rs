@@ -669,6 +669,24 @@ fn source_phase_import_calls_parse_and_only_other_import_forms_are_rejected() {
 }
 
 #[test]
+fn legacy_octal_string_escapes_take_up_to_three_digits_as_a_code_unit() {
+    // Annex B.1.2: `\0` before a digit is still a LegacyOctalEscapeSequence, so
+    // `\00` is NUL and `\0002` is NUL then "2". `\1`-`\7` are octal values, and
+    // `\8` and `\9` stand for their own character.
+    assert_eq!(ok("'\\00'.charCodeAt(0)"), "0");
+    assert_eq!(ok("'1\\0002\\0003'.length"), "5");
+    assert_eq!(ok("'1\\0002\\0003'.charCodeAt(2)"), "50");
+    assert_eq!(
+        ok("'\\08'.charCodeAt(0) + ',' + '\\08'.charCodeAt(1)"),
+        "0,56"
+    );
+    assert_eq!(ok("'\\101'.charAt(0)"), "A");
+    assert_eq!(ok("'\\7'.charCodeAt(0)"), "7");
+    assert_eq!(ok("'\\400'.charCodeAt(0) + ',' + '\\400'.length"), "32,2");
+    assert_eq!(ok("'\\8\\9'"), "89");
+}
+
+#[test]
 fn string_positions_convert_with_to_integer_or_infinity() {
     // NaN is 0 (ToIntegerOrInfinity), so these read the first unit.
     assert_eq!(ok("'abc'.codePointAt(NaN)"), "97");

@@ -1107,9 +1107,14 @@ impl Lexer<'_> {
                     '"' => u32::from('"'),
                     'x' => self.hex_escape(2)?,
                     'u' => self.unicode_escape()?,
-                    // A LegacyOctalEscapeSequence or NonOctalDecimalEscapeSequence
-                    // (Annex B.1.2), which strict code refuses.
-                    digit @ '0'..='9' => {
+                    // A LegacyOctalEscapeSequence (Annex B.1.2), which strict code
+                    // refuses. `\8` and `\9` are NonOctalDecimalEscapeSequences and
+                    // stand for their own character.
+                    digit @ '0'..='7' => {
+                        self.legacy_syntax = true;
+                        self.legacy_octal_escape(digit)
+                    }
+                    digit @ ('8' | '9') => {
                         self.legacy_syntax = true;
                         u32::from(digit)
                     }
@@ -1123,6 +1128,22 @@ impl Lexer<'_> {
             }
         }
         Err(JsError::syntax("unterminated string literal", start))
+    }
+
+    /// The value of a `LegacyOctalEscapeSequence` (ECMA-262 B.1.2) whose first digit
+    /// `first` is consumed: up to two more octal digits, or one when `first` is 4
+    /// to 7, because `FourToSeven OctalDigit` is the longest form for those.
+    fn legacy_octal_escape(&mut self, first: char) -> u32 {
+        let mut value = first.to_digit(8).unwrap_or(0);
+        let more = if first <= '3' { 2 } else { 1 };
+        for _ in 0..more {
+            let Some(digit) = self.peek().and_then(|character| character.to_digit(8)) else {
+                break;
+            };
+            value = value * 8 + digit;
+            self.advance();
+        }
+        value
     }
 
     /// A `\xHH` escape: a code point below 0x100, always a scalar.
