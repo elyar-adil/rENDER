@@ -774,6 +774,18 @@ fn reaches_in_context(expression: &Expr, predicate: fn(&Expr) -> bool) -> bool {
             .any(|statement| statement_reaches(statement, predicate))
 }
 
+/// An `await` used as a name in an async arrow head: an identifier reference, or
+/// an arrow whose parameter is named `await` (ECMA-262 15.9.1).
+fn is_await_reference(expression: &Expr) -> bool {
+    match expression {
+        Expr::Identifier(name) => name == "await",
+        Expr::Arrow { parameters, .. } => parameters
+            .iter()
+            .any(|parameter| parameter_binding_name(parameter) == "await"),
+        _ => false,
+    }
+}
+
 fn statement_reaches(statement: &Statement, predicate: fn(&Expr) -> bool) -> bool {
     let mut expressions = Vec::new();
     let mut statements = Vec::new();
@@ -2785,17 +2797,73 @@ impl Parser {
         )
     }
 
+    /// Consume the `=>` that ends an arrow head. No line terminator may precede
+    /// it (ECMA-262 15.3), so a break before it is an early error.
+    fn take_arrow(&mut self) -> Result<bool, JsError> {
+        if !self.at(&TokenKind::Arrow) {
+            return Ok(false);
+        }
+        if self.current().after_newline {
+            return Err(self.error("line terminator is not allowed before =>"));
+        }
+        self.advance();
+        Ok(true)
+    }
+
+    /// The early errors of a confirmed arrow head: its bound names must be
+    /// valid binding names in this context, and an async arrow's head may not
+    /// use `await` (ECMA-262 15.3.1, 15.9.1).
+    fn validate_arrow_head(
+        &self,
+        parameters: &[String],
+        patterns: &[(usize, String, BindingPattern)],
+        markers: &[Statement],
+        is_async: bool,
+    ) -> Result<(), JsError> {
+        let mut names: Vec<String> = parameters
+            .iter()
+            .map(|parameter| parameter_binding_name(parameter).to_owned())
+            .collect();
+        for (_, _, pattern) in patterns {
+            collect_binding_names(pattern, &mut names);
+        }
+        for name in &names {
+            if is_async && name == "await" {
+                return Err(self.error("await cannot be a parameter of an async arrow function"));
+            }
+            self.check_contextual_binding(name)?;
+        }
+        if is_async {
+            for marker in markers {
+                if let Statement::ParameterDefault { value, .. } = marker
+                    && reaches_in_context(value, is_await_reference)
+                {
+                    return Err(
+                        self.error("await cannot be used in an async arrow function's parameters")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn arrow_function(&mut self) -> Result<Option<Expr>, JsError> {
         let checkpoint = self.cursor;
         let mut is_async_arrow = false;
         // Async arrows have the same callable shape in this synchronous
         // runtime; consume the marker while retaining their parameter/body.
+        // `async` and its parameter stay on one line (ECMA-262 15.9.1): a line break
+        // after `async` makes it an ordinary identifier.
         if matches!(&self.current().kind, TokenKind::Identifier(name) if name == "async")
             && !self.current().escaped
             && matches!(
                 self.tokens.get(self.cursor + 1).map(|token| &token.kind),
                 Some(TokenKind::LeftParen | TokenKind::Identifier(_))
             )
+            && self
+                .tokens
+                .get(self.cursor + 1)
+                .is_some_and(|token| !token.after_newline)
         {
             self.advance();
             is_async_arrow = true;
@@ -2805,7 +2873,7 @@ impl Parser {
         let parameters = if let TokenKind::Identifier(name) = &self.current().kind {
             let name = name.clone();
             self.advance();
-            if self.take(&TokenKind::Arrow) {
+            if self.take_arrow()? {
                 vec![name]
             } else {
                 self.cursor = checkpoint;
@@ -2841,10 +2909,14 @@ impl Parser {
                         };
                     let has_default = self.take(&TokenKind::Equal);
                     if has_default {
-                        let value = self.assignment()?;
+                        // A default value is part of the formal parameters, so a
+                        // `yield` or `await` expression in it is an early error.
+                        let previous_parameters = std::mem::replace(&mut self.in_parameters, true);
+                        let value = self.assignment();
+                        self.in_parameters = previous_parameters;
                         markers.push(Statement::ParameterDefault {
                             index: parameters.len(),
-                            value,
+                            value: value?,
                             offset: self.previous_offset(),
                         });
                     }
@@ -2858,7 +2930,7 @@ impl Parser {
                     }
                 }
             }
-            if !self.take(&TokenKind::RightParen) || !self.take(&TokenKind::Arrow) {
+            if !self.take(&TokenKind::RightParen) || !self.take_arrow()? {
                 self.cursor = checkpoint;
                 return Ok(None);
             }
@@ -2866,6 +2938,9 @@ impl Parser {
         } else {
             return Ok(None);
         };
+        // The `=>` is confirmed, so the head's names and defaults are checked as
+        // arrow parameters (ECMA-262 15.3.1, 15.9.1).
+        self.validate_arrow_head(&parameters, &patterns, &markers, is_async_arrow)?;
 
         // An arrow function has no `yield`, and its `await` is its own: it is
         // an operator only in an async arrow.
@@ -6378,6 +6453,60 @@ mod tests {
         assert!(script_is_syntax_error("async (a) => { let a; };"));
         assert!(script_is_syntax_error("({ m(a) { let a; } });"));
         assert!(script_is_syntax_error("class C { m(a) { let a; } }"));
+    }
+
+    #[test]
+    fn arrow_heads_reject_a_line_break_before_the_arrow() {
+        assert!(!script_is_syntax_error("var f = (a) => a; var g = x => x;"));
+        assert!(script_is_syntax_error("var af = x\n=> x;"));
+        assert!(script_is_syntax_error("var af = ()\n=> {};"));
+        assert!(script_is_syntax_error("var af = (x)\n=> x;"));
+    }
+
+    #[test]
+    fn async_keyword_does_not_start_an_arrow_across_a_line_break() {
+        assert!(!script_is_syntax_error(
+            "var f = async (a) => a; var g = async a => a;"
+        ));
+        assert!(!script_is_syntax_error("async(a);"));
+        assert!(script_is_syntax_error("async\n(foo) => { };"));
+    }
+
+    #[test]
+    fn arrow_parameters_are_checked_as_binding_names() {
+        assert!(script_is_syntax_error("var af = enum => 1;"));
+        assert!(script_is_syntax_error("var o = ({ extends }) => 0;"));
+        assert!(script_is_syntax_error("function* g() { (yield) => 1; }"));
+        assert!(script_is_syntax_error("async (await) => 1;"));
+        assert!(!script_is_syntax_error(
+            "var af = (yield) => 1; async(await);"
+        ));
+    }
+
+    #[test]
+    fn yield_and_await_expressions_are_not_arrow_parameter_defaults() {
+        assert!(script_is_syntax_error(
+            "function* g() { (x = yield) => {}; }"
+        ));
+        assert!(script_is_syntax_error(
+            "async function f() { (x = await 1) => {}; }"
+        ));
+        assert!(!script_is_syntax_error(
+            "function* g() { (x = function*() { yield; }) => x; }"
+        ));
+        assert!(!script_is_syntax_error(
+            "async function f() { (x = async () => { await 1; }) => x; }"
+        ));
+    }
+
+    #[test]
+    fn async_arrow_heads_may_not_use_await_as_a_name() {
+        assert!(script_is_syntax_error("var f = async (a = await) => 1;"));
+        assert!(script_is_syntax_error(
+            "var f = async (a = await => 0) => 1;"
+        ));
+        assert!(script_is_syntax_error("var f = async (await) => 1;"));
+        assert!(!script_is_syntax_error("var f = async (a = b) => 1;"));
     }
 
     #[test]
