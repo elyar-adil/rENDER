@@ -291,6 +291,11 @@ pub(super) enum Statement {
         offset: usize,
         kind: FunctionKind,
         strict: bool,
+        /// Set by the eval instantiation of a sloppy direct or indirect eval on a
+        /// block-level declaration whose name that instantiation gave a `var`
+        /// binding (ECMA-262 B.3.2.3). Evaluating the declaration then copies its
+        /// block binding's value to the variable environment.
+        annex_b_var: bool,
     },
     /// `class Name extends Base { ... }`, a lexical binding like `let`.
     Class {
@@ -513,6 +518,10 @@ pub(super) enum Expr {
         callee: Box<Self>,
         arguments: Vec<Self>,
         offset: usize,
+        /// The call's source text is strict mode code. A call of the intrinsic
+        /// `eval` through a bare identifier is a direct eval, and this flag is
+        /// its `strictCaller` (ECMA-262 13.3.6.1).
+        strict: bool,
     },
     /// `` tag`a${x}b` ``: the tag receives a template object followed by the
     /// substitution values, so it is not the same call shape as
@@ -581,6 +590,75 @@ pub(super) fn parse_module(
     let info = parser.module.take().unwrap_or_default();
     validate_module_names(&statements, &info)?;
     Ok((statements, info))
+}
+
+/// What the code around a direct `eval` lets its eval code use (ECMA-262
+/// 19.2.1.1 steps 5 to 7 and `AllPrivateIdentifiersValid`). An indirect eval
+/// passes the default, which allows none of it.
+#[derive(Clone, Debug, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent early-error context of the eval code"
+)]
+pub(super) struct EvalContext {
+    /// `strictCaller`: the calling code is strict mode code.
+    pub(super) strict: bool,
+    /// `new.target` is allowed (`inFunction`).
+    pub(super) new_target: bool,
+    /// `super.name` is allowed (`inMethod`).
+    pub(super) super_property: bool,
+    /// `super()` is allowed (`inDerivedConstructor`).
+    pub(super) super_call: bool,
+    /// `arguments` is an early error (`inClassFieldInitializer`).
+    pub(super) class_field_initializer: bool,
+    /// The private names the enclosing class bodies declare.
+    pub(super) private_names: Vec<String>,
+}
+
+/// Parse eval code as a Script (ECMA-262 19.2.1.1 `PerformEval` step 8). Returns
+/// the statements and whether the eval code is strict: strict when the caller
+/// is, or when its own directive prologue says so.
+pub(super) fn parse_eval(
+    tokens: Vec<Token>,
+    limits: &RuntimeLimits,
+    context: &EvalContext,
+) -> Result<(Vec<Statement>, bool), JsError> {
+    let mut parser = Parser::new(tokens, limits);
+    parser.new_target_allowed = context.new_target;
+    parser.super_property_allowed = context.super_property;
+    parser.super_call_allowed = context.super_call;
+    parser.strict = context.strict || parser.prologue_is_strict(parser.cursor)?;
+    let strict = parser.strict;
+    // Private names resolve through the enclosing class bodies, which this parse
+    // does not contain. The bottom entry collects every reference that no class
+    // body in the eval code declares; they must name an enclosing private name.
+    parser.private_references.push(Vec::new());
+    let statements = parser.statement_list(false)?;
+    let unresolved = parser.private_references.pop().unwrap_or_default();
+    if let Some((name, offset)) = unresolved
+        .into_iter()
+        .find(|(name, _)| !context.private_names.contains(name))
+    {
+        return Err(JsError::syntax(
+            format!("private name #{name} is not declared in an enclosing class"),
+            offset,
+        ));
+    }
+    validate_declaration_conflicts(&statements, true, strict)?;
+    if strict {
+        validate_strict_statements(&statements)?;
+    }
+    if context.class_field_initializer
+        && statements
+            .iter()
+            .any(|statement| statement_reaches(statement, is_arguments_reference))
+    {
+        return Err(JsError::syntax(
+            "'arguments' is not allowed in a class field initializer",
+            0,
+        ));
+    }
+    Ok((statements, strict))
 }
 
 /// True for `import(...)`, `import.defer(...)` and `import.source(...)`. These
@@ -2149,6 +2227,7 @@ impl Parser {
             body,
             kind,
             strict,
+            annex_b_var: false,
         })
     }
 
@@ -2156,9 +2235,9 @@ impl Parser {
         self.require(&TokenKind::LeftParen, "expected '(' after if")?;
         let condition = self.expression()?;
         self.require(&TokenKind::RightParen, "expected ')' after if condition")?;
-        let consequent = Box::new(self.statement_in(BodyPosition::IfClause)?);
+        let consequent = Box::new(self.if_clause()?);
         let alternate = if self.take(&TokenKind::Else) {
-            Some(Box::new(self.statement_in(BodyPosition::IfClause)?))
+            Some(Box::new(self.if_clause()?))
         } else {
             None
         };
@@ -2167,6 +2246,16 @@ impl Parser {
             condition,
             consequent,
             alternate,
+        })
+    }
+
+    /// A clause of an `if` statement. Annex B.3.4 treats a plain function
+    /// declaration there as the sole statement of a block, so it is one here.
+    fn if_clause(&mut self) -> Result<Statement, JsError> {
+        let statement = self.statement_in(BodyPosition::IfClause)?;
+        Ok(match statement {
+            Statement::Function { .. } => Statement::Block(vec![statement]),
+            statement => statement,
         })
     }
 
@@ -3632,6 +3721,7 @@ impl Parser {
                         offset: self.previous_offset(),
                         callee: Box::new(expression),
                         arguments,
+                        strict: self.strict,
                     };
                 } else if self.take(&TokenKind::LeftBracket) {
                     // `MemberExpression [ Expression ]` admits a comma expression.
@@ -3696,6 +3786,7 @@ impl Parser {
                     offset: self.previous_offset(),
                     callee: Box::new(expression),
                     arguments,
+                    strict: self.strict,
                 };
             } else if matches!(self.current().kind, TokenKind::Template(_)) {
                 if optional {
@@ -3824,6 +3915,7 @@ impl Parser {
                     offset: self.previous_offset(),
                     callee: Box::new(Expr::Identifier(name)),
                     arguments,
+                    strict: self.strict,
                 })
             }
             // `import.defer(specifier)` and `import.source(specifier)` (the
@@ -3865,6 +3957,7 @@ impl Parser {
                         offset: token.offset,
                     }),
                     arguments: vec![specifier],
+                    strict: self.strict,
                 })
             }
             TokenKind::Identifier(name) if name == "import" => Err(JsError::syntax(

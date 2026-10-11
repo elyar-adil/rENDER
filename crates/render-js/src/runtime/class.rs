@@ -45,6 +45,7 @@ use crate::runtime::types::ClassFunction;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::FunctionFlags;
 use crate::runtime::types::PrivateScope;
+use crate::runtime::types::ThisContext;
 use crate::value::ObjectHost;
 use crate::value::PropertyDescriptor;
 
@@ -235,9 +236,17 @@ impl JsRuntime {
         // The class body itself is a lexical private-name scope: nested
         // class expressions defined in keys, methods, or initializers see
         // this class's names.
+        // Heritage and computed keys run in the enclosing code, so they keep its
+        // function context.
+        let this_context = self
+            .class_frames
+            .last()
+            .map(|frame| frame.this_context)
+            .unwrap_or_default();
         self.class_frames.push(ClassFrame {
             function: None,
             private_scope: Some(private_names.clone()),
+            this_context,
         });
         let result = self.evaluate_class_body_inner(
             dom,
@@ -460,6 +469,14 @@ impl JsRuntime {
                 environment: self.environment.clone(),
             })),
             private_scope: Some(private_names.clone()),
+            // A static element is a method of the constructor: `super.x` is
+            // allowed, `super()` is not.
+            this_context: ThisContext {
+                function: true,
+                method: true,
+                derived_constructor: false,
+                class_field_initializer: false,
+            },
         });
         let result = self.define_static_elements(dom, constructor, elements, &resolved_keys);
         self.class_frames.pop();
@@ -484,10 +501,11 @@ impl JsRuntime {
             match element.kind {
                 ClassElementKind::Field => {
                     let value = match &element.initializer {
-                        Some(initializer) => self
-                            .with_this(JsValue::Object(constructor), |runtime| {
+                        Some(initializer) => self.in_field_initializer(|runtime| {
+                            runtime.with_this(JsValue::Object(constructor), |runtime| {
                                 runtime.evaluate_named(dom, initializer, &element_name(key))
-                            })?,
+                            })
+                        })?,
                         None => JsValue::Undefined,
                     };
                     self.define_field(dom, constructor, key, value)?;
@@ -510,6 +528,24 @@ impl JsRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Run `body` as a class field initializer, where a direct eval may not use
+    /// `arguments` (ECMA-262 19.2.1.1 step 7). The flag is set on the frame of
+    /// the class's static elements, and restored when `body` returns.
+    fn in_field_initializer<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, JsError>,
+    ) -> Result<T, JsError> {
+        let previous = self
+            .class_frames
+            .last_mut()
+            .map(|frame| std::mem::replace(&mut frame.this_context.class_field_initializer, true));
+        let result = body(self);
+        if let (Some(previous), Some(frame)) = (previous, self.class_frames.last_mut()) {
+            frame.this_context.class_field_initializer = previous;
+        }
+        result
     }
 
     /// Run `body` with `this` bound to `value` in a temporary environment,
@@ -674,6 +710,12 @@ impl JsRuntime {
         self.class_frames.push(ClassFrame {
             function: Some(class.clone()),
             private_scope: Some(class.private_names.clone()),
+            this_context: ThisContext {
+                function: true,
+                method: true,
+                derived_constructor: false,
+                class_field_initializer: true,
+            },
         });
         let result = self.with_this(JsValue::Object(instance), |runtime| {
             for field in &class.fields {

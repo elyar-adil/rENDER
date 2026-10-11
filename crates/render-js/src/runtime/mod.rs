@@ -55,6 +55,9 @@ mod disposal;
 #[cfg(test)]
 mod dom_tests;
 mod eval;
+mod eval_code;
+#[cfg(test)]
+mod eval_code_tests;
 #[cfg(test)]
 mod event_tests;
 #[cfg(test)]

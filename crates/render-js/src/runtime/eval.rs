@@ -63,6 +63,7 @@ use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::FunctionFlags;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::NavigationRequest;
+use crate::runtime::types::ThisContext;
 use crate::runtime::types::UserFunction;
 use crate::utf16;
 use crate::value::ErrorKind;
@@ -297,7 +298,7 @@ impl ArrayDestructuring {
 /// The plain function a chain of labels names, when a labelled function
 /// declaration (Annex B.3.2) is what the statement is. It is declared like an
 /// unlabelled function, so hoisting looks through the labels.
-fn labelled_function(statement: &Statement) -> Option<&Statement> {
+pub(super) fn labelled_function(statement: &Statement) -> Option<&Statement> {
     let mut inner = statement;
     let mut labelled = false;
     while let Statement::Labeled { body, .. } = inner {
@@ -309,13 +310,15 @@ fn labelled_function(statement: &Statement) -> Option<&Statement> {
 
 /// Whether `statement` completes empty, so it leaves the value of the statements
 /// before it as the completion value (ECMA-262 14.3.1.2, 14.3.3.2, 14.2.2 and
-/// 14.4.2): a `using` declaration, and a block or empty statement whose own
-/// statements all complete empty.
+/// 14.4.2): every variable and class declaration, every function declaration
+/// (15.2.6, B.3.2.3 included), and a block whose own statements all complete
+/// empty.
 fn completes_empty(statement: &Statement) -> bool {
     match statement {
-        Statement::Variable { kind, .. } | Statement::VariableList { kind, .. } => {
-            kind.is_disposable()
-        }
+        Statement::Variable { .. }
+        | Statement::VariableList { .. }
+        | Statement::Class { .. }
+        | Statement::Function { .. } => true,
         Statement::Block(statements) => statements.iter().all(completes_empty),
         _ => false,
     }
@@ -709,6 +712,16 @@ impl JsRuntime {
             .class_frames
             .last()
             .and_then(|frame| frame.private_scope.clone());
+        // An arrow has no function context of its own: it keeps the one of the
+        // code it is created in. A non-arrow function derives its own at each call.
+        let this_context = if arrow {
+            self.class_frames
+                .last()
+                .map(|frame| frame.this_context)
+                .unwrap_or_default()
+        } else {
+            ThisContext::default()
+        };
         self.functions.push(UserFunction {
             name: name.map(str::to_owned),
             parameters,
@@ -722,6 +735,7 @@ impl JsRuntime {
             private_scope,
             rest,
             kind,
+            this_context,
         });
         // Spec: the `name` of an anonymous function in progress is the empty
         // string (anonymous arrows included); `length` counts parameters
@@ -886,8 +900,18 @@ impl JsRuntime {
                 }
                 Ok(Completion::Normal(value))
             }
-            Statement::Function { name, .. } => {
-                self.lookup_binding(dom, name).map(Completion::Normal)
+            Statement::Function {
+                name, annex_b_var, ..
+            } => {
+                // A function declaration evaluates to an empty completion
+                // (ECMA-262 15.2.6). Annex B.3.2.3: a block-level declaration that
+                // eval instantiation gave a var binding copies its value there.
+                if *annex_b_var {
+                    let function = self.lookup_binding(dom, name)?;
+                    let scope = self.variable_scope_depth();
+                    self.write_resolved_binding(dom, scope, name, function)?;
+                }
+                Ok(Completion::Normal(JsValue::Undefined))
             }
             Statement::Class {
                 name,
@@ -1467,6 +1491,9 @@ impl JsRuntime {
                 // defaults run, so a default that reads a later name is a
                 // ReferenceError rather than a leak from an outer scope.
                 let mut scope = catch_environment.borrow_mut();
+                if let BindingTarget::Name(name) = parameter {
+                    scope.simple_catch_parameter = Some(name.clone());
+                }
                 for name in parameter.names() {
                     scope.bindings.insert(
                         name,
@@ -1824,8 +1851,11 @@ impl JsRuntime {
                 constructed
             }
             Expr::Call {
-                callee, arguments, ..
-            } => self.evaluate_call(dom, callee, arguments),
+                callee,
+                arguments,
+                strict,
+                ..
+            } => self.evaluate_call(dom, callee, arguments, *strict),
             Expr::TaggedTemplate {
                 tag,
                 quasis,
@@ -2358,19 +2388,18 @@ impl JsRuntime {
                     }
                 }
             }
-            // A binding in a `with` object environment is deleted from that
-            // object (ECMA-262 9.1.1.2.7); other bindings cannot be deleted.
-            Expr::Identifier(name) => {
-                match self
-                    .resolve_name(dom, name)?
-                    .and_then(|depth| self.with_object_at(depth))
-                {
+            Expr::Identifier(name) => match self.resolve_name(dom, name)? {
+                // A binding in a `with` object environment is deleted from that
+                // object (ECMA-262 9.1.1.2.7). A declarative binding goes only when
+                // eval code created it deletable.
+                Some(depth) => match self.with_object_at(depth) {
                     Some(object) => Ok(JsValue::Boolean(
                         self.delete_property_value(dom, object, name)?,
                     )),
-                    None => Ok(JsValue::Boolean(false)),
-                }
-            }
+                    None => Ok(JsValue::Boolean(self.delete_scope_binding(depth, name))),
+                },
+                None => Ok(JsValue::Boolean(false)),
+            },
             _ => {
                 self.evaluate(dom, operand)?;
                 Ok(JsValue::Boolean(true))
@@ -2929,6 +2958,7 @@ impl JsRuntime {
         dom: &mut Dom,
         callee: &Expr,
         arguments: &[Expr],
+        strict: bool,
     ) -> Result<JsValue, JsError> {
         let (callee_value, receiver) = self.call_reference(dom, callee)?;
         let mut values = Vec::with_capacity(arguments.len());
@@ -2936,6 +2966,16 @@ impl JsRuntime {
             self.evaluate_argument(dom, argument, &mut values)?;
         }
         let callee_object = Self::callable_callee(&callee_value, callee)?;
+        // ECMA-262 13.3.6.1: a call of the intrinsic `eval` through a bare
+        // identifier is a direct eval, which runs in the caller's scope.
+        if matches!(callee, Expr::Identifier(name) if name == "eval")
+            && self.is_intrinsic_eval(callee_object)
+        {
+            let Some(argument) = values.first().cloned() else {
+                return Ok(JsValue::Undefined);
+            };
+            return self.perform_eval(dom, argument, strict, true);
+        }
         self.call_with_this(dom, callee_object, &values, receiver)
     }
 
@@ -3735,12 +3775,31 @@ impl JsRuntime {
             // Global `var` declarations are allowed to coexist with an
             // existing Window property. The declaration itself must not
             // overwrite hosts such as the read-only `window.parent`.
-            let existing_window_property = kind == VariableKind::Var
-                && self
-                    .realm
-                    .own_property(self.realm.global_object(), name)
-                    .is_some();
-            if !existing_window_property && !self.realm.set_global(name.to_owned(), value) {
+            let global = self.realm.global_object();
+            let existing_window_property =
+                kind == VariableKind::Var && self.realm.own_property(global, name).is_some();
+            if kind == VariableKind::Var {
+                // CreateGlobalVarBinding(name, false) (ECMA-262 9.1.1.4.17): a
+                // script's `var` is a non-configurable global property.
+                if !existing_window_property
+                    && !self.realm.define_property(
+                        global,
+                        name,
+                        PropertyDescriptor {
+                            value,
+                            writable: true,
+                            enumerable: true,
+                            configurable: false,
+                            getter: None,
+                            setter: None,
+                        },
+                    )
+                {
+                    return Err(JsError::type_error(format!(
+                        "global property {name:?} cannot be defined"
+                    )));
+                }
+            } else if !self.realm.set_global(name.to_owned(), value) {
                 return Err(JsError::type_error(format!(
                     "global property {name:?} is not writable"
                 )));
@@ -5996,10 +6055,29 @@ impl JsRuntime {
         // `super` and `#name` resolve through the class context the function
         // was created in. An arrow's `class` was captured from the frame around
         // it, so arrows and nested functions see their lexical class, not the
-        // caller's.
+        // caller's. A non-arrow function is its own function context: a method
+        // has `super`, and a derived constructor has `super()`. An arrow keeps the
+        // context it was created in.
+        let this_context = if function.arrow {
+            function.this_context
+        } else {
+            ThisContext {
+                function: true,
+                method: function
+                    .class
+                    .as_ref()
+                    .is_some_and(|class| class.home_object.is_some()),
+                derived_constructor: function
+                    .class
+                    .as_ref()
+                    .is_some_and(|class| class.constructor && class.derived),
+                class_field_initializer: false,
+            }
+        };
         let class_context = ClassFrame {
             function: function.class.clone(),
             private_scope: function.private_scope.clone(),
+            this_context,
         };
         self.class_frames.push(class_context);
         let label = function
@@ -6016,9 +6094,13 @@ impl JsRuntime {
             _ => label,
         };
         self.call_stack.push(CallFrame { name: label });
-        let prepared = self
-            .bind_parameters(dom, &function, arguments, &call_environment)
-            .and_then(|()| self.instantiate_function_body(&function, &call_environment));
+        // Parameter expressions may run eval code, which sees this record as its
+        // variable environment; see `EnvironmentRecord::parameter_scope`.
+        call_environment.borrow_mut().parameter_scope = true;
+        let bound = self.bind_parameters(dom, &function, arguments, &call_environment);
+        call_environment.borrow_mut().parameter_scope = false;
+        let prepared =
+            bound.and_then(|()| self.instantiate_function_body(&function, &call_environment));
         let result = match prepared {
             Ok(()) if function.kind.is_coroutine() => self
                 .start_coroutine(dom, callee, index, &function, &call_environment)

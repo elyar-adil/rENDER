@@ -660,7 +660,7 @@ pub(crate) enum NativeFunction {
     GlobalAtob,
     GlobalBtoa,
     GlobalRandomBytes,
-    GlobalEvalStub,
+    GlobalEval,
     GlobalImport,
     GlobalNoop,
     HistoryPushState,
@@ -2785,7 +2785,7 @@ impl Realm {
             ("atob", NativeFunction::GlobalAtob),
             ("btoa", NativeFunction::GlobalBtoa),
             ("__render_random_bytes", NativeFunction::GlobalRandomBytes),
-            ("eval", NativeFunction::GlobalEvalStub),
+            ("eval", NativeFunction::GlobalEval),
             ("__render_noop", NativeFunction::GlobalNoop),
         ] {
             Self::define_global_function(&mut objects, global, name, function);
@@ -5270,6 +5270,8 @@ impl Realm {
             | "Int8Array" | "Uint16Array" | "Int16Array" | "Uint32Array" | "Int32Array"
             | "Float32Array" | "Float64Array" => 1,
             "BigInt" => 1,
+            // ECMA-262 19.2.1 `eval(x)`.
+            "eval" => 1,
             "Date" | "UTC" => 7,
             "RegExp" | "asIntN" | "asUintN" => 2,
             _ => 0,
@@ -10026,6 +10028,7 @@ mod tests {
             "parseFloat",
             "isNaN",
             "isFinite",
+            "eval",
             "parse",
             "exec",
             "test",

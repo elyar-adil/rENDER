@@ -433,10 +433,11 @@ impl JsRuntime {
                     .push(JsMicrotask::Callback(callback));
                 Ok(JsValue::Undefined)
             }
-            NativeFunction::GlobalEvalStub => {
-                // Indirect eval is not supported; return the argument
-                // unchanged so JSONP-style `eval(data)` patterns don't crash.
-                Ok(arguments.first().cloned().unwrap_or(JsValue::Undefined))
+            NativeFunction::GlobalEval => {
+                // ECMA-262 19.2.1.1 with `direct` false: an indirect eval, which
+                // runs in the global environment as sloppy code.
+                let argument = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                self.perform_eval(dom, argument, false, false)
             }
             NativeFunction::GlobalImport => {
                 // Module graph fetching belongs to the browser coordinator.

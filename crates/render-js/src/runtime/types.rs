@@ -23,6 +23,7 @@ use crate::runtime::builtins::promise::PromiseState;
 use crate::value::TypedBuffer;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::rc::Rc;
 
 #[derive(Clone, Debug)]
@@ -60,6 +61,16 @@ pub(super) struct ScopeResource {
 pub(super) struct EnvironmentRecord {
     pub(super) bindings: BTreeMap<String, Binding>,
     pub(super) function_scope: bool,
+    /// The name of a `catch` clause's simple (identifier) parameter. Annex B.3.4
+    /// lets eval code `var`-declare that name, so the record does not conflict.
+    pub(super) simple_catch_parameter: Option<String>,
+    /// The bindings eval code created in this record, which `delete` may remove:
+    /// ECMA-262 19.2.1.2 creates them with `CreateMutableBinding(name, true)`.
+    pub(super) deletable: BTreeSet<String>,
+    /// Set while a call binds its parameters, whose expressions may run eval code.
+    /// Eval code there may not `var`-declare a name this record binds, such as a
+    /// parameter or the implicit `arguments` (ECMA-262 10.2.11).
+    pub(super) parameter_scope: bool,
     /// Live import bindings of a module environment; empty elsewhere.
     pub(super) imports: BTreeMap<String, super::module::ImportRef>,
     /// The binding object of a `with` statement's object environment record
@@ -141,6 +152,29 @@ pub(super) struct UserFunction {
     pub(super) rest: bool,
     /// Whether calling the function starts a generator or an async activation.
     pub(super) kind: FunctionKind,
+    /// The function context an arrow inherits from the code it was created in.
+    /// Other functions derive theirs from their own metadata at each call.
+    pub(super) this_context: ThisContext,
+}
+
+/// The function context that `this` and the other per-function bindings come
+/// from: the nearest non-arrow function, class field initializer or static
+/// block (ECMA-262 19.2.1.1 steps 5 to 7). A direct eval inherits it, which
+/// decides the `new.target`, `super` and `arguments` its code may use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent early-error context of the eval code"
+)]
+pub(super) struct ThisContext {
+    /// `inFunction`: the code is in a function, so `new.target` is allowed.
+    pub(super) function: bool,
+    /// `inMethod`: `super.name` is allowed.
+    pub(super) method: bool,
+    /// `inDerivedConstructor`: `super()` is allowed.
+    pub(super) derived_constructor: bool,
+    /// `inClassFieldInitializer`: `arguments` is not allowed.
+    pub(super) class_field_initializer: bool,
 }
 
 /// One class body's private-name registry, chained to the lexically
@@ -161,6 +195,17 @@ impl PrivateScope {
             }
             scope = scope.outer.as_deref()?;
         }
+    }
+
+    /// Every private name visible from this scope, through the lexical chain.
+    pub(super) fn visible_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut scope = Some(self);
+        while let Some(current) = scope {
+            names.extend(current.names.keys().cloned());
+            scope = current.outer.as_deref();
+        }
+        names
     }
 }
 
@@ -211,6 +256,8 @@ pub(super) struct ClassFrame {
     /// Lexical private scope for `#name` resolution; set while class bodies,
     /// field initializers, and static blocks evaluate, even outside a call.
     pub(super) private_scope: Option<Rc<PrivateScope>>,
+    /// The function context of the code this frame runs; see [`ThisContext`].
+    pub(super) this_context: ThisContext,
 }
 
 /// One active JavaScript call frame, retained for stack traces and

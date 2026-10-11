@@ -1360,6 +1360,7 @@ impl Compiler {
                 callee,
                 arguments,
                 offset,
+                strict,
             } => {
                 let callee = self.explode_callee(callee, arguments.iter().any(expr_has_suspend))?;
                 let arguments = self.explode_list(arguments)?;
@@ -1367,6 +1368,7 @@ impl Compiler {
                     callee: Box::new(callee),
                     arguments,
                     offset: *offset,
+                    strict: *strict,
                 })
             }
             Expr::New {
