@@ -626,7 +626,7 @@ impl JsRuntime {
 
     /// `GetPrototypeFromConstructor(newTarget, fallback)`: `newTarget.prototype`
     /// when that is an object, and the intrinsic `fallback` otherwise.
-    fn prototype_from_new_target(
+    pub(in crate::runtime) fn prototype_from_new_target(
         &mut self,
         dom: &mut Dom,
         new_target: &JsValue,

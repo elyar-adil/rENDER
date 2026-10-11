@@ -5039,6 +5039,7 @@ impl JsRuntime {
                 | ObjectHost::AggregateErrorConstructor
                 | ObjectHost::SuppressedErrorConstructor
                 | ObjectHost::DisposableStackConstructor(_)
+                | ObjectHost::TemporalConstructor(_)
                 | ObjectHost::PromiseConstructor
                 | ObjectHost::EventConstructor
                 | ObjectHost::DomConstructor
@@ -5235,6 +5236,9 @@ impl JsRuntime {
             }
             Some(ObjectHost::DisposableStackConstructor(kind)) => {
                 self.disposable_stack_constructor(dom, &new_target, kind)
+            }
+            Some(ObjectHost::TemporalConstructor(kind)) => {
+                self.temporal_construct(dom, kind, &new_target, arguments)
             }
             Some(ObjectHost::PromiseConstructor) => self.construct_promise(dom, arguments),
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
@@ -5587,6 +5591,9 @@ impl JsRuntime {
                 } else {
                     "DisposableStack constructor requires 'new'"
                 }))
+            }
+            Some(ObjectHost::TemporalConstructor(_)) => {
+                Err(JsError::type_error("Temporal constructors require 'new'"))
             }
             Some(ObjectHost::DisposeAwaitResume { stack, rejected }) => {
                 let value = arguments.first().cloned().unwrap_or(JsValue::Undefined);

@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::bigint::JsBigInt;
 use crate::parser::FunctionKind;
+use crate::runtime::builtins::temporal::{TemporalKind, TemporalMethod, TemporalValue};
 use crate::utf16;
 
 /// Stable identity for an object allocated in a [`Realm`].
@@ -629,6 +630,8 @@ pub(crate) enum NativeFunction {
     NumberOp(NumberOp),
     /// A function of the `Atomics` namespace object.
     Atomics(AtomicsOp),
+    /// A method, accessor or static function of one Temporal class.
+    Temporal(TemporalKind, TemporalMethod),
     GetElementById,
     QuerySelector,
     QuerySelectorAll,
@@ -2000,6 +2003,10 @@ pub(crate) enum ObjectHost {
     DisposableStackConstructor(DisposeStackKind),
     /// A `DisposableStack` or `AsyncDisposableStack` instance.
     DisposableStack(DisposeStackState),
+    /// The constructor object of one Temporal class.
+    TemporalConstructor(TemporalKind),
+    /// An instance of one Temporal class, with the slots that class keeps.
+    Temporal(TemporalValue),
     /// The `onFulfilled` (`rejected == false`) or `onRejected` callback of an
     /// `await` inside `disposeAsync` on `stack`: it resumes the disposal.
     DisposeAwaitResume {
@@ -2276,6 +2283,7 @@ impl ObjectHost {
                 | Self::DisposeAwaitResume { .. }
                 | Self::SuppressedErrorConstructor
                 | Self::DisposableStackConstructor(_)
+                | Self::TemporalConstructor(_)
         )
     }
 }
@@ -2529,6 +2537,9 @@ pub struct Realm {
     disposable_stack_prototype: ObjectId,
     async_disposable_stack_prototype: ObjectId,
     suppressed_error_prototype: ObjectId,
+    /// `%Temporal.<class>.prototype%` for each class that has instances. The
+    /// intrinsics are rooted in `gc_identity_roots`, like the stack prototypes.
+    pub(crate) temporal_prototypes: BTreeMap<TemporalKind, ObjectId>,
     /// `%MediaQueryList.prototype%`. Root it explicitly: a script that drops
     /// every reference to a list still gets a live list that must keep
     /// evaluating, so the prototype outlives the lists too.
@@ -3364,7 +3375,7 @@ impl Realm {
             objects[unscopables.0].prototype = None;
         }
         Self::install_builtin_metadata(&mut objects);
-        Self {
+        let mut realm = Self {
             objects,
             global,
             document,
@@ -3400,7 +3411,12 @@ impl Realm {
             style_declaration_wrappers: BTreeMap::new(),
             dataset_wrappers: BTreeMap::new(),
             swept_objects: 0,
-        }
+            temporal_prototypes: BTreeMap::new(),
+        };
+        // Temporal is installed through the realm's public surface once the
+        // realm exists, so its members are built the same way a script builds them.
+        realm.install_temporal();
+        realm
     }
 
     fn define_global_function(
@@ -8820,6 +8836,7 @@ impl Realm {
         roots.push(self.async_disposable_stack_prototype);
         roots.push(self.suppressed_error_prototype);
         roots.push(self.media_query_list_prototype);
+        roots.extend(self.temporal_prototypes.values().copied());
         roots.extend(self.node_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
@@ -9690,6 +9707,27 @@ impl Realm {
             host: ObjectHost::AsyncFromSyncClose { iterator },
             ..JsObject::default()
         })
+    }
+
+    /// A new object of `prototype` whose internal slots are `host`.
+    pub(crate) fn allocate_host(
+        &mut self,
+        prototype: Option<ObjectId>,
+        host: ObjectHost,
+    ) -> ObjectId {
+        self.allocate(JsObject {
+            prototype,
+            host,
+            ..JsObject::default()
+        })
+    }
+
+    /// `%Temporal.<kind>.prototype%`, the prototype of that class's instances.
+    pub(crate) fn temporal_prototype(&self, kind: TemporalKind) -> ObjectId {
+        self.temporal_prototypes
+            .get(&kind)
+            .copied()
+            .unwrap_or(self.object_prototype)
     }
 
     /// A `DisposableStack` or `AsyncDisposableStack` instance with `state`.

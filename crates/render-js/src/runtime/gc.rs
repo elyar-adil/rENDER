@@ -242,6 +242,8 @@ pub(super) fn mark_host(
         | ObjectHost::AggregateErrorConstructor
         | ObjectHost::SuppressedErrorConstructor
         | ObjectHost::DisposableStackConstructor(_)
+        | ObjectHost::TemporalConstructor(_)
+        | ObjectHost::Temporal(_)
         | ObjectHost::CollectionConstructor(_)
         | ObjectHost::TypedArrayConstructor(_)
         | ObjectHost::DataViewConstructor
