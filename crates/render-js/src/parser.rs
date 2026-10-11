@@ -2068,7 +2068,14 @@ impl Parser {
         let TokenKind::Identifier(name) = self.advance().kind else {
             return Err(self.error("expected a function name"));
         };
+        // The name is bound in the enclosing code, so `await` and `yield` are
+        // checked against that code's own context (ECMA-262 14.1.1, 15.2.1).
+        self.check_contextual_binding(&name)?;
         let (parameters, body, strict) = self.function_tail(kind)?;
+        // The name of a function whose code is strict is a restricted binding (ECMA-262 15.2.1).
+        if strict && is_strict_restricted_binding(&name) {
+            return Err(self.error("function name is not allowed in strict code"));
+        }
         Ok(Statement::Function {
             offset: self.previous_offset(),
             name,
@@ -2592,15 +2599,24 @@ impl Parser {
                     };
                     BindingTarget::Name(name)
                 };
+                // The parameter's names are bound once each, and are valid binding names here (ECMA-262 14.15.1).
+                let mut bound = BTreeSet::new();
+                for name in target.names() {
+                    self.check_contextual_binding(&name)?;
+                    if !bound.insert(name) {
+                        return Err(self.error("catch parameter names must be distinct"));
+                    }
+                }
                 self.require(&TokenKind::RightParen, "expected ')' after catch parameter")?;
                 Some(target)
             } else {
                 None
             };
-            Some(CatchClause {
-                parameter,
-                body: self.required_block("expected '{' after catch")?,
-            })
+            let body = self.required_block("expected '{' after catch")?;
+            if let Some(target) = &parameter {
+                validate_catch_body(&target.names(), &body)?;
+            }
+            Some(CatchClause { parameter, body })
         } else {
             None
         };
@@ -2929,6 +2945,7 @@ impl Parser {
             body = markers;
         }
         validate_declaration_conflicts(&body, true, self.strict)?;
+        validate_parameters_against_body(&parameters, &body)?;
         Ok(Some(Expr::Arrow {
             offset: self.previous_offset(),
             parameters,
@@ -4136,18 +4153,22 @@ impl Parser {
             None
         };
         // The name of a function expression takes its own kind's `yield`/`await`
-        // restriction (ECMA-262 15.5, 15.6, 15.8). Code inside a class body is
-        // strict, so the strict reserved words are refused too.
+        // restriction (ECMA-262 15.5, 15.6, 15.8).
         if let Some(name) = &name {
-            let restricted = (kind.is_generator() && name == "yield")
-                || (kind.is_async() && name == "await")
-                || (!self.private_references.is_empty()
-                    && (is_strict_reserved_word(name) || name == "arguments"));
+            let restricted =
+                (kind.is_generator() && name == "yield") || (kind.is_async() && name == "await");
             if restricted {
                 return Err(self.error("function expression name is not allowed here"));
             }
         }
         let (parameters, body, strict) = self.function_tail(kind)?;
+        // Strict code, including a body with its own directive, refuses a restricted name (ECMA-262 15.2.1).
+        if let Some(name) = &name
+            && strict
+            && is_strict_restricted_binding(name)
+        {
+            return Err(self.error("function expression name is not allowed in strict code"));
+        }
         Ok(Expr::Function {
             offset: self.previous_offset(),
             name,
@@ -4256,10 +4277,15 @@ impl Parser {
         self.static_block_await = previous_static_await;
         let (parameters, body, strict) = result?;
         validate_declaration_conflicts(&body, true, self.strict)?;
+        validate_parameters_against_body(&parameters, &body)?;
+        // Parameters of strict code are checked as strict code, including an
+        // inherited strictness such as a class body's (ECMA-262 11.2.2, 15.2.1).
+        if strict {
+            validate_strict_parameters(&parameters)?;
+        }
         // A function whose own body is strict is checked as strict code here,
         // whatever the enclosing script is (ECMA-262 11.2.2).
         if has_use_strict_directive(&body) {
-            validate_strict_parameters(&parameters)?;
             validate_strict_statements(&body)?;
         }
         Ok((parameters, body, strict))
@@ -5790,8 +5816,130 @@ pub(super) fn collect_var_names(statement: &Statement, names: &mut BTreeSet<Stri
     }
 }
 
-/// Early errors for declarations that clash within one statement list
-/// (ECMA-262 14.2.1 for blocks, 15.2.1 for function bodies, 16.1.1 for scripts).
+/// A catch block's lexical declarations, functions included, may not repeat a
+/// name bound by the catch parameter (ECMA-262 14.15.1). Annex B.3.4 relaxes
+/// only `var` declarations.
+fn validate_catch_body(parameter_names: &[String], body: &[Statement]) -> Result<(), JsError> {
+    for statement in body {
+        let declared: Vec<String> = match statement {
+            Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
+                vec![name.clone()]
+            }
+            Statement::VariableList {
+                kind, declarations, ..
+            } if *kind != VariableKind::Var => declarations
+                .iter()
+                .flat_map(|(target, _)| target.names())
+                .collect(),
+            Statement::Class { name, .. } | Statement::Function { name, .. } => vec![name.clone()],
+            _ => continue,
+        };
+        if let Some(name) = declared.iter().find(|name| parameter_names.contains(name)) {
+            return Err(JsError::syntax(
+                format!("binding {name:?} conflicts with a catch parameter"),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A function body's lexical declarations may not repeat a parameter name
+/// (ECMA-262 15.2.1, 15.3.1, 15.5.1 and their async and generator forms).
+/// Destructured parameters are checked by `validate_declaration_conflicts`,
+/// which sees their lowered `var` declarations in the body.
+fn validate_parameters_against_body(
+    parameters: &[String],
+    body: &[Statement],
+) -> Result<(), JsError> {
+    for statement in body {
+        let declared: Vec<String> = match statement {
+            Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
+                vec![name.clone()]
+            }
+            Statement::VariableList {
+                kind, declarations, ..
+            } if *kind != VariableKind::Var => declarations
+                .iter()
+                .flat_map(|(target, _)| target.names())
+                .collect(),
+            Statement::Class { name, .. } => vec![name.clone()],
+            _ => continue,
+        };
+        if let Some(name) = declared.iter().find(|name| {
+            parameters
+                .iter()
+                .any(|parameter| parameter_binding_name(parameter) == name.as_str())
+        }) {
+            return Err(JsError::syntax(
+                format!("binding {name:?} conflicts with a parameter"),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Module-level name early errors (ECMA-262 16.2.1.1, 16.2.3.1). An imported
+/// binding is strict-mode code's binding: it must be a valid strict name and be
+/// bound once, and it may not be declared again by the module. Each local export
+/// must name a binding the module declares, and each exported name is exported once.
+fn validate_module_names(statements: &[Statement], info: &ModuleInfo) -> Result<(), JsError> {
+    let mut declared = BTreeSet::new();
+    for statement in statements {
+        match statement {
+            Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
+                declared.insert(name.clone());
+            }
+            Statement::VariableList {
+                kind, declarations, ..
+            } if *kind != VariableKind::Var => {
+                for (target, _) in declarations {
+                    declared.extend(target.names());
+                }
+            }
+            Statement::Class { name, .. } | Statement::Function { name, .. } => {
+                declared.insert(name.clone());
+            }
+            _ => {}
+        }
+        collect_var_names(statement, &mut declared);
+    }
+    let mut imported = BTreeSet::new();
+    for entry in &info.imports {
+        validate_strict_binding_names([entry.local.clone()])?;
+        if !imported.insert(entry.local.clone()) || declared.contains(&entry.local) {
+            return Err(JsError::syntax(
+                format!("binding {:?} is declared more than once", entry.local),
+                0,
+            ));
+        }
+    }
+    for (_, local) in &info.local_exports {
+        if local != DEFAULT_BINDING && !declared.contains(local) && !imported.contains(local) {
+            return Err(JsError::syntax(
+                format!("export of {local:?}, which the module does not declare"),
+                0,
+            ));
+        }
+    }
+    let mut exported = BTreeSet::new();
+    let names = info
+        .local_exports
+        .iter()
+        .map(|(exported, _)| exported)
+        .chain(info.indirect_exports.iter().map(|entry| &entry.exported));
+    for name in names {
+        if !exported.insert(name.clone()) {
+            return Err(JsError::syntax(
+                format!("{name:?} is exported more than once"),
+                0,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The early error for a `for` head whose lexical `names` the loop `body`
 /// declares again with `var` (ECMA-262 14.7.1.1, 14.7.4.1, 14.7.5.1).
 fn validate_head_against_body(names: &[String], body: &Statement) -> Result<(), JsError> {
@@ -6186,6 +6334,86 @@ mod tests {
         ));
         assert!(!script_is_syntax_error(
             "async function f() { (await 1) ** 2; }"
+        ));
+    }
+
+    #[test]
+    fn restricted_function_names_are_early_errors_in_strict_code() {
+        assert!(!script_is_syntax_error(
+            "function eval() {} (function arguments() {});"
+        ));
+        assert!(script_is_syntax_error("function eval() { 'use strict'; }"));
+        assert!(script_is_syntax_error(
+            "function arguments() { 'use strict'; }"
+        ));
+        assert!(script_is_syntax_error("'use strict'; function eval() {}"));
+        assert!(script_is_syntax_error(
+            "(function arguments() { 'use strict'; });"
+        ));
+        assert!(script_is_syntax_error(
+            "'use strict'; (function eval() {});"
+        ));
+        assert!(script_is_syntax_error(
+            "'use strict'; (async function arguments() {});"
+        ));
+        assert!(script_is_syntax_error(
+            "class C { m() { return function arguments() {}; } }"
+        ));
+    }
+
+    #[test]
+    fn lexical_body_declarations_may_not_repeat_a_parameter() {
+        assert!(!script_is_syntax_error("function f(a) { var a; }"));
+        assert!(!script_is_syntax_error("function f(a) { function a() {} }"));
+        assert!(!script_is_syntax_error("function f(a) { { let a; } }"));
+        assert!(!script_is_syntax_error("function f(a) { let b; }"));
+        assert!(script_is_syntax_error("function f(a) { let a; }"));
+        assert!(script_is_syntax_error("function f(a) { const a = 1; }"));
+        assert!(script_is_syntax_error("function f(a) { class a {} }"));
+        assert!(script_is_syntax_error("function f({ a }) { let a; }"));
+        assert!(script_is_syntax_error("function* g(a) { const a = 3; }"));
+        assert!(script_is_syntax_error("async function h(a) { let a; }"));
+        assert!(script_is_syntax_error("(async function* k(a) { let a; });"));
+        assert!(script_is_syntax_error("(a) => { let a; };"));
+        assert!(script_is_syntax_error("async (a) => { let a; };"));
+        assert!(script_is_syntax_error("({ m(a) { let a; } });"));
+        assert!(script_is_syntax_error("class C { m(a) { let a; } }"));
+    }
+
+    #[test]
+    fn function_names_follow_the_enclosing_await_and_yield_context() {
+        assert!(script_is_syntax_error(
+            "async function foo() { function await() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "function* g() { function yield() {} }"
+        ));
+        assert!(!script_is_syntax_error(
+            "function await() {} async function f() {}"
+        ));
+    }
+
+    #[test]
+    fn class_method_parameters_are_checked_as_strict_code() {
+        assert!(script_is_syntax_error(
+            "class Foo { async foo(arguments) {} }"
+        ));
+        assert!(!script_is_syntax_error(
+            "var o = { async foo(arguments) {} };"
+        ));
+    }
+
+    #[test]
+    fn catch_parameters_are_distinct_and_not_redeclared_by_the_block() {
+        assert!(!script_is_syntax_error("try {} catch (e) { var e; }"));
+        assert!(!script_is_syntax_error("try {} catch ([a, b]) { let c; }"));
+        assert!(script_is_syntax_error("try {} catch ([x, x]) {}"));
+        assert!(script_is_syntax_error("try {} catch (x) { let x; }"));
+        assert!(script_is_syntax_error(
+            "try {} catch (e) { function e() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "class C { static { try {} catch (await) {} } }"
         ));
     }
 
