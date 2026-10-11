@@ -3975,6 +3975,25 @@ impl JsRuntime {
                 "global property {name:?} is not writable"
             )));
         }
+        // A sloppy `var` whose binding a `delete` removed while its initializer ran is
+        // created again in the variable scope (ECMA-262 9.1.1.2.5 step 3).
+        if let Some(depth) = self
+            .variable_scope_depth()
+            .filter(|_| kind == VariableKind::Var && !self.code_is_strict())
+        {
+            let mut record = self.environment[depth].borrow_mut();
+            record.bindings.insert(
+                name.to_owned(),
+                Binding {
+                    value,
+                    mutable: true,
+                    initialized: true,
+                    kind: VariableKind::Var,
+                },
+            );
+            record.deletable.insert(name.to_owned());
+            return Ok(());
+        }
         Err(JsError::reference(format!("{name} is not defined")))
     }
 

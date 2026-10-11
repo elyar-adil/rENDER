@@ -2981,3 +2981,17 @@ fn undefined_is_an_ordinary_identifier_that_is_not_writable() {
         "TypeError"
     );
 }
+
+#[test]
+fn a_var_deleted_during_its_own_initializer_is_created_again() {
+    // ECMA-262 9.1.1.2.5 step 3: the reference was resolved before the initializer
+    // ran, and a sloppy write recreates the binding that `delete` removed.
+    assert_eq!(
+        ok("(function () { eval('var x = delete x'); return typeof x; })()"),
+        "boolean"
+    );
+    assert_eq!(
+        ok("(function () { eval('var x = delete x'); return x; })()"),
+        "true"
+    );
+}
