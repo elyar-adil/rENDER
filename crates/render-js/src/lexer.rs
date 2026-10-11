@@ -188,6 +188,20 @@ pub(super) struct Token {
 }
 
 pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token>, JsError> {
+    tokenize_source(source, limits, false)
+}
+
+/// Tokenize module code. In a module `await` is always the operator
+/// (ECMA-262 16.2.1), so a `/` after it opens a regex literal.
+pub(super) fn tokenize_module(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token>, JsError> {
+    tokenize_source(source, limits, true)
+}
+
+fn tokenize_source(
+    source: &str,
+    limits: &RuntimeLimits,
+    module_code: bool,
+) -> Result<Vec<Token>, JsError> {
     if source.len() > limits.max_source_bytes {
         return Err(JsError::new(
             JsErrorKind::ResourceLimit,
@@ -209,6 +223,7 @@ pub(super) fn tokenize(source: &str, limits: &RuntimeLimits) -> Result<Vec<Token
         newline: false,
         escaped_name: false,
         legacy_syntax: false,
+        module_code,
     }
     .run()
 }
@@ -236,6 +251,8 @@ struct Lexer<'a> {
     /// Whether the literal being scanned uses legacy syntax (see
     /// [`Token::legacy_syntax`]). Taken by the next `push`, like `escaped_name`.
     legacy_syntax: bool,
+    /// Whether the source is module code, where `await` is a reserved operator.
+    module_code: bool,
 }
 
 /// ECMA-262 12.2 `WhiteSpace`: tab, vertical tab, form feed, space, no-break
@@ -464,6 +481,7 @@ impl Lexer<'_> {
             // expression value misclassifies the slash as division and leaves
             // the regexp escape (for example `\w`) as an unsupported token.
             Some(TokenKind::RightParen) if self.paren_closes_control_head() => true,
+            Some(TokenKind::Identifier(name)) if self.module_code && name == "await" => true,
             Some(kind) => !matches!(
                 kind,
                 TokenKind::Identifier(_)

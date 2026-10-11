@@ -836,6 +836,10 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_set_property(dom, object, key, value, receiver);
         }
+        // ECMA-262 10.4.6.8: a module namespace's [[Set]] of a string key is false.
+        if matches!(key, PropertyName::String(_)) && self.realm.is_module_namespace(object) {
+            return Ok(false);
+        }
         if matches!(receiver, JsValue::Object(this) if this == object) {
             return self.set_property_checked(dom, object, key, value);
         }

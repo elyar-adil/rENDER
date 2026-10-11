@@ -674,6 +674,10 @@ pub(crate) enum NativeFunction {
     GlobalRandomBytes,
     GlobalEval,
     GlobalImport,
+    /// `import.defer(specifier)`: the deferred namespace, without evaluation.
+    GlobalImportDefer,
+    /// `import.source(specifier)`: a source-phase import, which source text cannot provide.
+    GlobalImportSource,
     GlobalNoop,
     HistoryPushState,
     HistoryReplaceState,
@@ -1965,6 +1969,56 @@ pub(crate) struct DisposeStackState {
     pub(crate) disposal: Option<PendingDisposal>,
 }
 
+/// Where the value of one export of a module namespace object is read from
+/// (ECMA-262 10.4.6.8 [[Get]]): a live module binding, or another namespace.
+#[derive(Clone, Debug)]
+pub(crate) enum NamespaceExport {
+    Binding {
+        environment: crate::runtime::Environment,
+        local: String,
+    },
+    Namespace(ObjectId),
+}
+
+/// The exports of one module namespace object, sorted by code unit, and the
+/// module it is the namespace of.
+#[derive(Debug)]
+pub(crate) struct ModuleNamespaceExports {
+    pub(crate) module: String,
+    /// Whether this is the deferred namespace of `import defer`, which evaluates
+    /// its module on first use.
+    pub(crate) deferred: bool,
+    pub(crate) exports: Vec<(String, NamespaceExport)>,
+}
+
+/// The value a namespace export reads: the live value of its binding, which is
+/// `undefined` while uninitialized (the caller raises the temporal dead zone error).
+fn namespace_export_value(export: &NamespaceExport) -> JsValue {
+    match export {
+        NamespaceExport::Binding { environment, local } => {
+            match environment.borrow().binding_value(local) {
+                crate::runtime::BindingRead::Value(value) => value,
+                crate::runtime::BindingRead::Absent
+                | crate::runtime::BindingRead::Uninitialized => JsValue::Undefined,
+            }
+        }
+        NamespaceExport::Namespace(object) => JsValue::Object(*object),
+    }
+}
+
+/// The descriptor of a namespace export: writable and enumerable, not
+/// configurable (ECMA-262 10.4.6.5).
+fn namespace_export_descriptor(export: &NamespaceExport) -> PropertyDescriptor {
+    PropertyDescriptor {
+        getter: None,
+        setter: None,
+        value: namespace_export_value(export),
+        writable: true,
+        enumerable: true,
+        configurable: false,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum ObjectHost {
     #[default]
@@ -2050,6 +2104,31 @@ pub(crate) enum ObjectHost {
     DisposeAwaitResume {
         stack: ObjectId,
         rejected: bool,
+    },
+    /// A module namespace object (ECMA-262 10.4.6); the index names its export
+    /// table in the realm.
+    ModuleNamespace(usize),
+    /// The fulfilment (`rejected == false`) or rejection handler that completes
+    /// the asynchronous evaluation of `module` (ECMA-262 16.2.1.5.3.2).
+    AsyncModuleStep {
+        module: String,
+        rejected: bool,
+    },
+    /// The job that continues a dynamic `import()` once its module graph has
+    /// loaded: it links and evaluates `module` (or, for a deferred or source
+    /// phase import, only links it), then settles `promise`, whose promise object
+    /// is `object` (ECMA-262 13.3.10.1).
+    DynamicImportLinked {
+        module: String,
+        promise: usize,
+        object: ObjectId,
+        phase: crate::module::ImportPhase,
+    },
+    /// The reaction that gives a dynamic import the namespace of `module` once
+    /// its evaluation has completed. `deferred` names the deferred namespace.
+    ModuleNamespaceOf {
+        module: String,
+        deferred: bool,
     },
     /// The `DOMException` constructor object (`WebIDL` §4.4).
     DomExceptionConstructor,
@@ -2535,6 +2614,10 @@ impl JsObject {
 #[derive(Debug)]
 pub struct Realm {
     objects: Vec<JsObject>,
+    /// The export tables of the module namespace objects, indexed by `ObjectHost::ModuleNamespace`.
+    module_namespaces: Vec<ModuleNamespaceExports>,
+    /// How many of `module_namespaces` are deferred namespaces (`import defer`).
+    deferred_namespaces: usize,
     global: ObjectId,
     document: ObjectId,
     object_prototype: ObjectId,
@@ -2860,11 +2943,14 @@ impl Realm {
         // The source-phase proposals' `import.defer(...)` and `import.source(...)`
         // reach the same host hook as `import()`, so their arguments evaluate
         // before the call like any other call's.
-        for phase in ["defer", "source"] {
+        for (phase, function) in [
+            ("defer", NativeFunction::GlobalImportDefer),
+            ("source", NativeFunction::GlobalImportSource),
+        ] {
             let phase_import = ObjectId(objects.len());
             objects.push(JsObject {
                 host: ObjectHost::BoundFunction {
-                    function: NativeFunction::GlobalImport,
+                    function,
                     receiver: global,
                 },
                 ..JsObject::default()
@@ -3418,6 +3504,8 @@ impl Realm {
         Self::install_builtin_metadata(&mut objects);
         let mut realm = Self {
             objects,
+            module_namespaces: Vec::new(),
+            deferred_namespaces: 0,
             global,
             document,
             object_prototype,
@@ -9164,6 +9252,9 @@ impl Realm {
         object: ObjectId,
         key: &str,
     ) -> Option<(JsValue, ObjectId)> {
+        if let Some(export) = self.namespace_export(object, key) {
+            return Some((namespace_export_value(export), object));
+        }
         if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
             return Some((descriptor.value, object));
         }
@@ -9181,6 +9272,116 @@ impl Realm {
             }
         }
         None
+    }
+
+    /// The index of `object`'s export table, when `object` is a module namespace.
+    fn namespace_index(&self, object: ObjectId) -> Option<usize> {
+        match &self.objects.get(object.0)?.host {
+            ObjectHost::ModuleNamespace(index) => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// The export `key` of `object`, when `object` is a module namespace object.
+    fn namespace_export(&self, object: ObjectId, key: &str) -> Option<&NamespaceExport> {
+        let exports = &self.module_namespaces[self.namespace_index(object)?].exports;
+        let position = exports
+            .binary_search_by(|(name, _)| name.encode_utf16().cmp(key.encode_utf16()))
+            .ok()?;
+        Some(&exports[position].1)
+    }
+
+    /// Make `object` a module namespace object exporting `exports`, which are
+    /// sorted by code unit (ECMA-262 10.4.6 and 26.3.1). It is not extensible.
+    pub(crate) fn make_module_namespace(
+        &mut self,
+        object: ObjectId,
+        module: &str,
+        deferred: bool,
+        exports: Vec<(String, NamespaceExport)>,
+    ) {
+        let index = self.module_namespaces.len();
+        if deferred {
+            self.deferred_namespaces += 1;
+        }
+        self.module_namespaces.push(ModuleNamespaceExports {
+            module: module.to_owned(),
+            deferred,
+            exports,
+        });
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.host = ObjectHost::ModuleNamespace(index);
+        }
+        let tag = JsSymbol::well_known("@@toStringTag");
+        // A deferred namespace is tagged apart from an evaluated one (import-defer, 26.3.1).
+        let tag_name = if deferred {
+            "Deferred Module"
+        } else {
+            "Module"
+        };
+        let _ = self.define_symbol_property(
+            object,
+            &tag,
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::String(tag_name.to_owned().into()),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        // Sealed last: the tag above is defined while the object can still take it.
+        if let Some(target) = self.objects.get_mut(object.0) {
+            target.extensible = false;
+        }
+    }
+
+    /// Whether any deferred namespace object exists, so a read that could reach
+    /// one through a prototype needs the walk only then.
+    pub(crate) fn has_deferred_namespace(&self) -> bool {
+        self.deferred_namespaces > 0
+    }
+
+    /// The module whose deferred namespace `object` is, when it is one.
+    pub(crate) fn deferred_namespace_module(&self, object: ObjectId) -> Option<String> {
+        let index = self.namespace_index(object)?;
+        let namespace = self.module_namespaces.get(index)?;
+        namespace.deferred.then(|| namespace.module.clone())
+    }
+
+    /// The local name of the binding behind namespace export `key` of `object`,
+    /// when that binding is still uninitialized (its temporal dead zone).
+    pub(crate) fn uninitialized_namespace_binding(
+        &self,
+        object: ObjectId,
+        key: &str,
+    ) -> Option<String> {
+        match self.namespace_export(object, key)? {
+            NamespaceExport::Binding { environment, local }
+                if matches!(
+                    environment.borrow().binding_value(local),
+                    crate::runtime::BindingRead::Uninitialized
+                ) =>
+            {
+                Some(local.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// The URL of the document this realm belongs to. Classic scripts resolve
+    /// their relative module specifiers against it.
+    pub(crate) fn document_base_url(&self) -> String {
+        match self.global("location") {
+            Some(JsValue::Object(location)) => {
+                match self.objects.get(location.0).map(|object| &object.host) {
+                    Some(ObjectHost::Location(url)) => url.to_string(),
+                    _ => "about:blank".to_owned(),
+                }
+            }
+            _ => "about:blank".to_owned(),
+        }
     }
 
     /// `[[GetOwnProperty]]` for a String exotic object, consulted by the
@@ -9202,6 +9403,9 @@ impl Realm {
     }
 
     pub(crate) fn get_property(&self, object: ObjectId, key: &str) -> Option<JsValue> {
+        if let Some(export) = self.namespace_export(object, key) {
+            return Some(namespace_export_value(export));
+        }
         if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
             return Some(descriptor.value);
         }
@@ -9261,12 +9465,18 @@ impl Realm {
 
     /// Whether `object` has an own property named `key`, without cloning it.
     pub(crate) fn has_own_string_key(&self, object: ObjectId, key: &str) -> bool {
+        if self.namespace_export(object, key).is_some() {
+            return true;
+        }
         self.objects
             .get(object.0)
             .is_some_and(|target| target.properties.contains_key(key))
     }
 
     pub(crate) fn own_property(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
+        if let Some(export) = self.namespace_export(object, key) {
+            return Some(namespace_export_descriptor(export));
+        }
         let target = self.objects.get(object.0)?;
         if let Some(descriptor) = target.properties.get(key) {
             return Some(descriptor.clone());
@@ -9453,14 +9663,20 @@ impl Realm {
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
-        if target
-            .symbols
-            .get(&symbol.id())
-            .is_some_and(|(_, descriptor)| !descriptor.configurable)
-        {
-            return false;
+        match target.symbols.get(&symbol.id()) {
+            Some((_, descriptor)) if !descriptor.configurable => false,
+            Some(_) => {
+                target.symbols.remove(&symbol.id());
+                true
+            }
+            // Not an own property: the delete succeeds (ECMA-262 10.1.10.1 step 3).
+            None => true,
         }
-        target.symbols.remove(&symbol.id()).is_some()
+    }
+
+    /// Whether `object` is a module namespace object.
+    pub(crate) fn is_module_namespace(&self, object: ObjectId) -> bool {
+        self.namespace_index(object).is_some()
     }
 
     /// Own symbol-keyed property symbols, id order, for
@@ -9481,6 +9697,9 @@ impl Realm {
     /// must not run user code stay on `get_property`; accessor invocation
     /// belongs to the runtime's [[Get]]/[[Set]] layer.
     pub(crate) fn get_descriptor(&self, object: ObjectId, key: &str) -> Option<PropertyDescriptor> {
+        if let Some(export) = self.namespace_export(object, key) {
+            return Some(namespace_export_descriptor(export));
+        }
         if let Some(descriptor) = self.string_exotic_descriptor(object, key) {
             return Some(descriptor);
         }
@@ -9540,6 +9759,16 @@ impl Realm {
     }
 
     pub(crate) fn own_property_names(&self, object: ObjectId) -> Option<Vec<String>> {
+        if let Some(index) = self.namespace_index(object) {
+            // ECMA-262 10.4.6.11: a namespace's string keys are its exports, sorted.
+            return Some(
+                self.module_namespaces[index]
+                    .exports
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect(),
+            );
+        }
         let target = self.objects.get(object.0)?;
         // Integer indices ascend first; the remaining string keys follow
         // first-insertion order, then any bootstrap keys the order list
@@ -9661,6 +9890,10 @@ impl Realm {
     }
 
     pub(crate) fn delete_property(&mut self, object: ObjectId, key: &str) -> bool {
+        // ECMA-262 10.4.6.7: an export of a namespace cannot be deleted.
+        if self.namespace_export(object, key).is_some() {
+            return false;
+        }
         // ECMA-262 10.4.5.6 [[Delete]]: a valid element cannot be deleted, and an
         // invalid canonical numeric key names nothing to delete.
         match self.typed_key(object, key) {
@@ -9711,6 +9944,10 @@ impl Realm {
     }
 
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {
+        // ECMA-262 10.4.6.8: a namespace's [[Set]] never succeeds, since it is not extensible.
+        if self.namespace_index(object).is_some() {
+            return false;
+        }
         // The runtime converts a typed-array write before it reaches here, so
         // an element takes only a value already of the view's content type.
         match self.typed_key(object, &key) {

@@ -175,6 +175,7 @@ impl JsRuntime {
                     0,
                     "Object.getOwnPropertySymbols",
                 )?)?;
+                self.ensure_deferred_namespace(dom, object, None)?;
                 let symbols = self
                     .realm
                     .own_symbols(object)
@@ -1150,12 +1151,16 @@ impl JsRuntime {
         key: &PropertyName,
         partial: PartialDescriptor,
     ) -> Result<bool, JsError> {
-        // ECMA-262 10.4.5.3: a canonical numeric key of a typed array is an
-        // element, so it never reaches the ordinary definition below.
-        if let PropertyName::String(name) = key
-            && self.realm.typed_key(object, name) != TypedKey::Ordinary
-        {
-            return self.typed_array_define_own_property(dom, object, name, &partial);
+        if let PropertyName::String(name) = key {
+            // ECMA-262 10.4.5.3: a canonical numeric key of a typed array is an
+            // element, so it never reaches the ordinary definition below.
+            if self.realm.typed_key(object, name) != TypedKey::Ordinary {
+                return self.typed_array_define_own_property(dom, object, name, &partial);
+            }
+            self.ensure_deferred_namespace(dom, object, Some(name))?;
+            if self.realm.is_module_namespace(object) {
+                return self.define_namespace_export(dom, object, name, &partial);
+            }
         }
         match self.realm.host(object) {
             Some(ObjectHost::Proxy { .. }) => {
@@ -1354,6 +1359,15 @@ impl JsRuntime {
         object: ObjectId,
         key: &PropertyName,
     ) -> Result<Option<PropertyDescriptor>, JsError> {
+        if let PropertyName::String(name) = key {
+            self.ensure_deferred_namespace(dom, object, Some(name))?;
+            // An export's descriptor reads its binding, which throws in its temporal dead zone (ECMA-262 10.4.6.5).
+            if let Some(local) = self.realm.uninitialized_namespace_binding(object, name) {
+                return Err(JsError::reference(format!(
+                    "cannot access {local} before initialization"
+                )));
+            }
+        }
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_get_own_property(dom, object, key);
         }
@@ -1364,7 +1378,11 @@ impl JsRuntime {
     }
 
     /// The string keys of `[[OwnPropertyKeys]]`, in order.
-    fn own_string_keys(&mut self, dom: &mut Dom, object: ObjectId) -> Result<Vec<String>, JsError> {
+    pub(in crate::runtime) fn own_string_keys(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+    ) -> Result<Vec<String>, JsError> {
         Ok(self
             .own_property_keys(dom, object)?
             .into_iter()
@@ -1382,6 +1400,7 @@ impl JsRuntime {
         dom: &mut Dom,
         object: ObjectId,
     ) -> Result<Vec<PropertyName>, JsError> {
+        self.ensure_deferred_namespace(dom, object, None)?;
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_own_property_keys(dom, object);
         }
@@ -1419,6 +1438,35 @@ impl JsRuntime {
     /// `object` itself: the first own descriptor on the chain decides, an
     /// accessor runs its setter, and a data write is defined on the receiver.
     /// Returns `false` where the spec's `[[Set]]` returns `false`.
+    /// [[`DefineOwnProperty`]] of a module namespace for a string key (ECMA-262
+    /// 10.4.6.6): an export can only be restated with its current value.
+    fn define_namespace_export(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        name: &str,
+        partial: &PartialDescriptor,
+    ) -> Result<bool, JsError> {
+        let Some(current) =
+            self.own_descriptor(dom, object, &PropertyName::String(name.to_owned()))?
+        else {
+            return Ok(false);
+        };
+        let accessor = !matches!(partial.get, AccessorField::Absent)
+            || !matches!(partial.set, AccessorField::Absent);
+        if partial.configurable == Some(true)
+            || partial.enumerable == Some(false)
+            || partial.writable == Some(false)
+            || accessor
+        {
+            return Ok(false);
+        }
+        Ok(match &partial.value {
+            Some(value) => crate::value::same_value(value, &current.value),
+            None => true,
+        })
+    }
+
     pub(in crate::runtime) fn set_property_checked(
         &mut self,
         dom: &mut Dom,

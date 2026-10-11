@@ -17,7 +17,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use render_core::html::parse_document;
-use render_core::js::{CompiledScript, JsError, JsErrorKind, JsRuntime, JsValue, RuntimeLimits};
+use render_core::js::{
+    CompiledScript, JsError, JsErrorKind, JsRuntime, JsValue, ModuleLoader, RuntimeLimits,
+};
+use url::Url;
 
 const TEST262_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/test262");
 const REVISION: &str = "5ef1e5723be95296f36afb0386676fed0205869c";
@@ -751,11 +754,9 @@ fn expected_variants(path: &str) -> Vec<String> {
     };
     if path.contains("_FIXTURE") {
         vec!["fixture".to_owned()]
-    } else if metadata
-        .flags
-        .iter()
-        .any(|flag| flag == "module" || flag == "async")
-    {
+    } else if metadata.flags.iter().any(|flag| flag == "module") {
+        vec!["module".to_owned()]
+    } else if metadata.flags.iter().any(|flag| flag == "async") {
         vec!["unsupported".to_owned()]
     } else if metadata.flags.iter().any(|flag| flag == "raw") {
         vec!["raw".to_owned()]
@@ -880,7 +881,7 @@ fn run_manifest_case(relative_path: &str) -> Vec<ResultRecord> {
         );
     }
     if metadata.flags.iter().any(|flag| flag == "module") {
-        return run_module_parse_negative(relative_path, &source, &metadata);
+        return run_module_test(relative_path, &source, &metadata);
     }
 
     let variants = if metadata.flags.iter().any(|flag| flag == "raw") {
@@ -923,7 +924,7 @@ fn run_variant(
     };
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
-    let mut runtime = JsRuntime::with_limits(&document.dom, test262_limits());
+    let mut runtime = test_runtime(&document.dom, relative_path);
     if !raw
         && let Err(detail) = install_harness(&mut runtime, &mut document.dom, &metadata.includes)
     {
@@ -981,7 +982,7 @@ fn run_async_variant(
     };
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
-    let mut runtime = JsRuntime::with_limits(&document.dom, test262_limits());
+    let mut runtime = test_runtime(&document.dom, relative_path);
     let shim = CompiledScript::compile(PRINT_SHIM, &RuntimeLimits::default())
         .expect("print shim compiles");
     if let Err(error) = runtime.execute_compiled(&mut document.dom, &shim) {
@@ -1013,11 +1014,28 @@ fn run_async_variant(
             error.message()
         ));
     }
+    async_completion(&mut runtime, &mut document.dom, relative_path, variant)
+}
+
+/// Judge an async test by what `$DONE` printed: the test passes only when the
+/// log holds `Test262:AsyncTestComplete`.
+fn async_completion(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+    relative_path: &str,
+    variant: &str,
+) -> ResultRecord {
+    let fail = |detail: String| ResultRecord {
+        path: relative_path.to_owned(),
+        variant: variant.to_owned(),
+        status: Status::Fail,
+        detail,
+    };
     let log = match CompiledScript::compile(PRINTED_LOG, &RuntimeLimits::default()) {
         Ok(log) => log,
         Err(error) => return fail(format!("print log expression: {}", error.message())),
     };
-    let printed = match runtime.execute_compiled(&mut document.dom, &log) {
+    let printed = match runtime.execute_compiled(dom, &log) {
         Ok(outcome) => outcome.value.to_js_string().to_lossy(),
         Err(error) => return fail(format!("print log failed: {}", error.message())),
     };
@@ -1214,46 +1232,231 @@ fn negative_matches(expected: &NegativeExpectation, error: &JsError) -> bool {
     expected.phase == actual_phase && expected.error_type == actual_type
 }
 
-/// A module test is judged only where it asserts a parse-phase error: the
-/// module must fail to compile with that error. Positive module tests need the
-/// module loader, which the runner does not drive yet, so they stay unsupported.
-fn run_module_parse_negative(path: &str, source: &str, metadata: &Metadata) -> Vec<ResultRecord> {
-    let Some(expected) = metadata
+/// A module test (test262 INTERPRETING.md, `module` flag): the file is the
+/// entry module. Its phases are the spec's: a parse, the load of its graph
+/// (resolution), its link, and its evaluation (runtime).
+fn run_module_test(path: &str, source: &str, metadata: &Metadata) -> Vec<ResultRecord> {
+    let record = match metadata
         .negative
         .as_ref()
-        .filter(|expected| expected.phase == "parse")
-    else {
-        return unsupported(path, "module evaluation is not implemented");
+        .map(|expected| expected.phase.as_str())
+    {
+        Some("parse") => {
+            let expected = metadata.negative.as_ref().expect("negative metadata");
+            let (status, detail) =
+                match CompiledScript::compile_module(source, &RuntimeLimits::default()) {
+                    Err(error) if negative_matches(expected, &error) => (
+                        Status::Pass,
+                        format!(
+                            "matched negative {}:{}",
+                            expected.phase, expected.error_type
+                        ),
+                    ),
+                    Err(error) => (
+                        Status::Fail,
+                        format!(
+                            "negative mismatch expected {}:{} but got {error}",
+                            expected.phase, expected.error_type
+                        ),
+                    ),
+                    Ok(_) => (
+                        Status::Fail,
+                        format!(
+                            "negative expected {}:{} but the module compiled",
+                            expected.phase, expected.error_type
+                        ),
+                    ),
+                };
+            ResultRecord {
+                path: path.to_owned(),
+                variant: "module".to_owned(),
+                status,
+                detail,
+            }
+        }
+        _ => run_module_variant(path, source, metadata),
     };
-    let (status, detail) = match CompiledScript::compile_module(source, &RuntimeLimits::default()) {
-        Err(error) if negative_matches(expected, &error) => (
-            Status::Pass,
-            format!(
-                "matched negative {}:{}",
-                expected.phase, expected.error_type
-            ),
-        ),
-        Err(error) => (
-            Status::Fail,
-            format!(
-                "negative mismatch expected {}:{} but got {error}",
-                expected.phase, expected.error_type
-            ),
-        ),
-        Ok(_) => (
-            Status::Fail,
-            format!(
-                "negative expected {}:{} but the module compiled",
-                expected.phase, expected.error_type
-            ),
-        ),
+    vec![record]
+}
+
+/// The URL of a test file in the checkout: the base of its relative specifiers.
+fn test_file_url(relative_path: &str) -> Result<Url, String> {
+    let path = Path::new(TEST262_ROOT).join("test").join(relative_path);
+    let canonical = fs::canonicalize(&path)
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))?;
+    Url::from_file_path(&canonical)
+        .map_err(|()| format!("{} is not an absolute file path", canonical.display()))
+}
+
+/// A runtime whose script base URL is the test file, with the file loader
+/// installed, so `import()` and module requests resolve relative to the test.
+fn test_runtime(dom: &render_core::dom::Dom, relative_path: &str) -> JsRuntime {
+    let url = test_file_url(relative_path)
+        .unwrap_or_else(|_| Url::parse("about:blank").expect("about:blank is a URL"));
+    let mut runtime = JsRuntime::with_limits_and_url(dom, test262_limits(), &url);
+    runtime.set_module_loader(Box::new(Test262ModuleLoader));
+    runtime
+}
+
+/// Loads modules from the test262 checkout (ECMA-262 16.2.1.10
+/// `HostLoadImportedModule` for a file host). A specifier resolves against the
+/// URL of the module or script that requests it.
+#[derive(Debug)]
+struct Test262ModuleLoader;
+
+impl ModuleLoader for Test262ModuleLoader {
+    fn load(
+        &mut self,
+        referrer: &str,
+        specifier: &str,
+        attributes: &[(String, String)],
+    ) -> Result<(String, CompiledScript), JsError> {
+        if !attributes.is_empty() {
+            return Err(JsError::type_error(
+                "import attributes are not supported by the test262 host",
+            ));
+        }
+        let base = Url::parse(referrer)
+            .map_err(|error| JsError::type_error(format!("bad referrer {referrer}: {error}")))?;
+        let url = base
+            .join(specifier)
+            .map_err(|error| JsError::type_error(format!("bad specifier {specifier}: {error}")))?;
+        let path = url
+            .to_file_path()
+            .map_err(|()| JsError::type_error(format!("{url} is not a file")))?;
+        let source = fs::read_to_string(&path)
+            .map_err(|error| JsError::type_error(format!("cannot load {url}: {error}")))?;
+        let script = CompiledScript::compile_module(&source, &RuntimeLimits::default())?;
+        Ok((url.to_string(), script))
+    }
+}
+
+/// Whether an error is the one a negative expectation names, at the stage it occurred.
+fn module_error_matches(expected: &NegativeExpectation, stage: &str, error: &JsError) -> bool {
+    let actual_type = match error.kind() {
+        JsErrorKind::Syntax => "SyntaxError",
+        JsErrorKind::Reference => "ReferenceError",
+        JsErrorKind::Type => "TypeError",
+        JsErrorKind::Dom | JsErrorKind::ResourceLimit | JsErrorKind::Throw => "Error",
     };
-    vec![ResultRecord {
-        path: path.to_owned(),
-        variant: "module".to_owned(),
-        status,
+    expected.phase == stage && expected.error_type == actual_type
+}
+
+/// Run a module test's stages in order and judge the first outcome against the
+/// test's negative expectation, if any.
+#[allow(clippy::too_many_lines)]
+fn run_module_variant(relative_path: &str, source: &str, metadata: &Metadata) -> ResultRecord {
+    let variant = "module";
+    let fail = |detail: String| ResultRecord {
+        path: relative_path.to_owned(),
+        variant: variant.to_owned(),
+        status: Status::Fail,
         detail,
-    }]
+    };
+    let url = match test_file_url(relative_path) {
+        Ok(url) => url,
+        Err(detail) => return fail(detail),
+    };
+    let key = url.to_string();
+    let script = match CompiledScript::compile_module(source, &RuntimeLimits::default()) {
+        Ok(script) => script,
+        Err(error) => {
+            return fail(format!(
+                "unexpected {:?}: {}",
+                error.kind(),
+                error.message()
+            ));
+        }
+    };
+    let mut document = parse_document("<!doctype html><p>test262</p>");
+    let mut runtime = JsRuntime::with_url(&document.dom, &url);
+    runtime.set_module_loader(Box::new(Test262ModuleLoader));
+    let asynchronous = metadata.flags.iter().any(|flag| flag == "async");
+    let mut includes = metadata.includes.clone();
+    if asynchronous {
+        let shim = CompiledScript::compile(PRINT_SHIM, &RuntimeLimits::default())
+            .expect("print shim compiles");
+        if let Err(error) = runtime.execute_compiled(&mut document.dom, &shim) {
+            return fail(format!("print shim failed: {}", error.message()));
+        }
+        if !includes
+            .iter()
+            .any(|include| include == "doneprintHandle.js")
+        {
+            includes.push("doneprintHandle.js".to_owned());
+        }
+    }
+    if let Err(detail) = install_harness(&mut runtime, &mut document.dom, &includes) {
+        return fail(detail);
+    }
+
+    // Each stage either fails with an error (judged against a negative
+    // expectation) or moves on.
+    let stage_error = match runtime.load_module(&key, &script) {
+        Err(error) => Some(("resolution", error)),
+        Ok(()) => None,
+    }
+    .or_else(|| {
+        runtime
+            .link_module(&key)
+            .err()
+            .map(|error| ("resolution", error))
+    })
+    .or_else(|| {
+        runtime
+            .evaluate_module(&mut document.dom, &key)
+            .err()
+            .map(|error| ("runtime", error))
+    });
+    let stage_error = match stage_error {
+        Some(failure) => Some(failure),
+        None => match drain_microtasks(&mut runtime, &mut document.dom) {
+            Err(error) => Some(("runtime", error)),
+            Ok(()) => runtime
+                .module_evaluation_error(&key)
+                .map(|error| ("runtime", error)),
+        },
+    };
+    if let Some((stage, error)) = stage_error {
+        return match &metadata.negative {
+            Some(expected) if module_error_matches(expected, stage, &error) => ResultRecord {
+                path: relative_path.to_owned(),
+                variant: variant.to_owned(),
+                status: Status::Pass,
+                detail: format!(
+                    "matched negative {}:{}",
+                    expected.phase, expected.error_type
+                ),
+            },
+            Some(expected) => fail(format!(
+                "negative mismatch expected {}:{} but got {stage} {:?}: {}",
+                expected.phase,
+                expected.error_type,
+                error.kind(),
+                error.message()
+            )),
+            None => fail(format!(
+                "unexpected {stage} {:?}: {}",
+                error.kind(),
+                error.message()
+            )),
+        };
+    }
+    if let Some(expected) = &metadata.negative {
+        return fail(format!(
+            "negative expected {}:{} but the module completed",
+            expected.phase, expected.error_type
+        ));
+    }
+    if asynchronous {
+        return async_completion(&mut runtime, &mut document.dom, relative_path, variant);
+    }
+    ResultRecord {
+        path: relative_path.to_owned(),
+        variant: variant.to_owned(),
+        status: Status::Pass,
+        detail: "module completed without an uncaught exception".to_owned(),
+    }
 }
 
 fn unsupported(path: &str, detail: &str) -> Vec<ResultRecord> {

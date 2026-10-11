@@ -26,7 +26,6 @@ use crate::runtime::convert::required_argument;
 use crate::runtime::eval::Completion;
 use crate::runtime::types::CallFrame;
 use crate::runtime::types::ClassFrame;
-use crate::runtime::types::Environment;
 use crate::runtime::types::GlobalBinding;
 use crate::runtime::types::PromiseRecord;
 use crate::runtime::types::RegexRecord;
@@ -40,6 +39,7 @@ use render_dom::DomError;
 use render_dom::DomRevision;
 use render_dom::NodeId;
 use std::collections::BTreeMap;
+pub(crate) use types::{BindingRead, Environment};
 use url::Url;
 
 mod async_iteration;
@@ -67,6 +67,7 @@ mod gc;
 #[cfg(test)]
 mod language_tests;
 mod module;
+pub use module::ModuleLoader;
 #[cfg(test)]
 mod module_tests;
 #[cfg(test)]
@@ -119,6 +120,10 @@ pub struct JsRuntime {
     suspended_environments: Vec<Environment>,
     /// Declared modules by key (the module's absolute URL).
     modules: BTreeMap<String, module::ModuleRecord>,
+    /// The host's module loader, which dynamic `import()` and `load_module` fetch through.
+    module_loader: Option<Box<dyn module::ModuleLoader>>,
+    /// The count of modules that have begun asynchronous evaluation, which orders their completion.
+    async_evaluation_count: u64,
     /// Whether the self-hosted built-ins in `prelude.js` have been installed.
     prelude_installed: bool,
     /// Labels written directly in front of the loop about to run.
@@ -266,6 +271,8 @@ impl JsRuntime {
             environment: Vec::new(),
             suspended_environments: Vec::new(),
             modules: BTreeMap::new(),
+            module_loader: None,
+            async_evaluation_count: 0,
             prelude_installed: false,
             pending_loop_labels: Vec::new(),
             coroutines: Vec::new(),

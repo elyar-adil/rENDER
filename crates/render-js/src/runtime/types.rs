@@ -59,7 +59,7 @@ pub(super) struct ScopeResource {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct EnvironmentRecord {
+pub(crate) struct EnvironmentRecord {
     pub(super) bindings: BTreeMap<String, Binding>,
     pub(super) function_scope: bool,
     /// The name of a `catch` clause's simple (identifier) parameter. Annex B.3.4
@@ -74,6 +74,9 @@ pub(super) struct EnvironmentRecord {
     pub(super) parameter_scope: bool,
     /// Live import bindings of a module environment; empty elsewhere.
     pub(super) imports: BTreeMap<String, super::module::ImportRef>,
+    /// The key of the module this record is the environment of; `None` elsewhere.
+    /// Dynamic `import()` in code of the module resolves against it.
+    pub(super) module: Option<String>,
     /// The binding object of a `with` statement's object environment record
     /// (ECMA-262 9.1.1.2). Its properties are bindings, consulted before the
     /// records outside the `with` body.
@@ -83,7 +86,27 @@ pub(super) struct EnvironmentRecord {
     pub(super) disposables: Vec<ScopeResource>,
 }
 
-pub(super) type Environment = Rc<RefCell<EnvironmentRecord>>;
+pub(crate) type Environment = Rc<RefCell<EnvironmentRecord>>;
+
+/// What a read of one binding of an environment finds.
+pub(crate) enum BindingRead {
+    /// The record has no binding of that name.
+    Absent,
+    /// The binding exists but is still in its temporal dead zone.
+    Uninitialized,
+    Value(crate::JsValue),
+}
+
+impl EnvironmentRecord {
+    /// The state of binding `name` of this record.
+    pub(crate) fn binding_value(&self, name: &str) -> BindingRead {
+        match self.bindings.get(name) {
+            None => BindingRead::Absent,
+            Some(binding) if binding.initialized => BindingRead::Value(binding.value.clone()),
+            Some(_) => BindingRead::Uninitialized,
+        }
+    }
+}
 
 /// Upper bound on buffered `console.*` messages; the oldest entry is dropped
 /// when script logs past it so a chatty page cannot exhaust memory.

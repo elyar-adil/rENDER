@@ -357,13 +357,17 @@ mod tests {
             run("Object.keys(new DOMException('m', 'NotFoundError')).length"),
             "0"
         );
-        // A strict-mode write to a getter-only accessor throws; the engine
-        // reports the *attempted* value unchanged either way, which is the part
-        // a caller can observe.
-        assert_eq!(
+        // A write to a getter-only accessor is refused (ECMA-262 10.1.9.2): a
+        // strict-mode write throws, and a sloppy one is ignored, so the slot is
+        // unchanged either way.
+        assert!(
             run(
                 "'use strict'; var e = new DOMException('m', 'NotFoundError'); e.name = 'x'; e.name"
-            ),
+            )
+            .starts_with("<threw ")
+        );
+        assert_eq!(
+            run("var e = new DOMException('m', 'NotFoundError'); e.name = 'x'; e.name"),
             "NotFoundError"
         );
         assert_eq!(

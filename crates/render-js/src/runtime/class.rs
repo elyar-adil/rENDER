@@ -811,6 +811,9 @@ impl JsRuntime {
         };
         let receiver = self.current_this()?;
         let base = self.realm.get_prototype(home);
+        if self.realm.has_deferred_namespace() {
+            self.ensure_deferred_read(dom, base, property)?;
+        }
         self.read_from_base(dom, base, property, receiver)
     }
 
@@ -849,6 +852,46 @@ impl JsRuntime {
         }
     }
 
+    /// `super[symbol]`: a read of a symbol key from the home object's prototype.
+    /// Nothing a symbol names triggers a deferred namespace (import defer).
+    pub(super) fn read_super_symbol(
+        &mut self,
+        dom: &mut Dom,
+        symbol: &crate::JsSymbol,
+    ) -> Result<JsValue, JsError> {
+        let class = self.class_frame().ok_or_else(|| {
+            JsError::new(JsErrorKind::Syntax, "'super' keyword unexpected here", None)
+        })?;
+        let Some(home) = class.home_object else {
+            return Err(JsError::new(
+                JsErrorKind::Syntax,
+                "'super' keyword unexpected here",
+                None,
+            ));
+        };
+        let receiver = self.current_this()?;
+        let Some(mut owner) = self.realm.get_prototype(home) else {
+            return Ok(JsValue::Undefined);
+        };
+        loop {
+            match self.realm.own_symbol_property(owner, symbol) {
+                Some(descriptor) => {
+                    if descriptor.is_accessor() {
+                        let Some(getter) = descriptor.getter else {
+                            return Ok(JsValue::Undefined);
+                        };
+                        return self.call_with_this(dom, getter, &[], receiver);
+                    }
+                    return Ok(descriptor.value);
+                }
+                None => match self.realm.get_prototype(owner) {
+                    Some(next) => owner = next,
+                    None => return Ok(JsValue::Undefined),
+                },
+            }
+        }
+    }
+
     /// `super.property = value`.
     pub(super) fn write_super_property(
         &mut self,
@@ -867,6 +910,10 @@ impl JsRuntime {
             ));
         };
         let receiver = self.current_this()?;
+        // OrdinarySet reads the receiver's own descriptor, which a deferred namespace answers by evaluating its module.
+        if let JsValue::Object(target) = receiver {
+            self.ensure_deferred_namespace(dom, target, Some(property))?;
+        }
         let base = self.realm.get_prototype(home);
         if let Some(base) = base
             && let Some(descriptor) = self.realm.get_descriptor(base, property)
