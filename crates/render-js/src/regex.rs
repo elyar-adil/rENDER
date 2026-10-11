@@ -235,7 +235,14 @@ pub struct Compiled {
     source: String,
 }
 
-const MAX_MATCH_STEPS: u32 = 1_000_000;
+/// Work budget of one match attempt, in matcher steps. Every node visit and
+/// every repetition attempt costs one step, and so does every character a
+/// repetition scans. The budget grows with the input, by twice its length, so a
+/// single pass over the whole input always fits (a `\p{…}+` over a plane of
+/// over a million code points must match) while nested backtracking stays
+/// bounded by a multiple of the input size.
+const MATCH_STEPS_BASE: usize = 1_000_000;
+const MATCH_STEPS_PER_UNIT: usize = 2;
 
 /// Recursion bound of the backtracking matcher. A match that would nest deeper
 /// fails instead of overflowing the native stack, which would abort the whole
@@ -301,6 +308,17 @@ impl Compiled {
         })
     }
 
+    /// Whether every match must begin at index 0: the pattern opens with `^`
+    /// outside multiline mode (ECMA-262 22.2.2.5 `Assertion` `^`), so no later
+    /// start position can succeed and the search need not try them.
+    fn starts_at_input_start(&self) -> bool {
+        let first = match &self.root {
+            Node::Sequence(items) => items.first(),
+            other => Some(other),
+        };
+        !self.flags.multiline && matches!(first, Some(Node::AnchorStart))
+    }
+
     fn find_with_depth(&self, input: &[u16], from: usize, max_depth: u32) -> Option<MatchRanges> {
         let unicode = self.flags.unicode;
         let mut start = from.min(input.len());
@@ -308,12 +326,14 @@ impl Compiled {
         if unicode && is_trail_inside_pair(input, start) {
             start -= 1;
         }
+        let max_steps = MATCH_STEPS_BASE + MATCH_STEPS_PER_UNIT * input.len();
         loop {
             let mut matcher = Matcher {
                 input,
                 flags: self.flags,
                 captures: vec![None; self.group_count + 1],
                 steps: 0,
+                max_steps,
                 depth: 0,
                 max_depth,
                 backward: false,
@@ -334,7 +354,7 @@ impl Compiled {
                     names: self.group_names.clone().into(),
                 });
             }
-            if self.flags.sticky || start >= input.len() {
+            if self.flags.sticky || start >= input.len() || self.starts_at_input_start() {
                 return None;
             }
             start += if unicode {
@@ -350,7 +370,8 @@ struct Matcher<'a> {
     input: &'a [u16],
     flags: Flags,
     captures: Vec<Option<(usize, usize)>>,
-    steps: u32,
+    steps: usize,
+    max_steps: usize,
     depth: u32,
     max_depth: u32,
     /// Matching right to left, as the body of a lookbehind does (ECMA-262
@@ -364,7 +385,7 @@ type Continuation<'k> = dyn FnMut(&mut Matcher<'_>, usize) -> Option<()> + 'k;
 impl Matcher<'_> {
     fn tick(&mut self) -> Option<()> {
         self.steps += 1;
-        if self.steps > MAX_MATCH_STEPS {
+        if self.steps > self.max_steps {
             None
         } else {
             Some(())
@@ -376,7 +397,7 @@ impl Matcher<'_> {
         if self.depth >= self.max_depth {
             // Out of recursion budget: give up on this path rather than
             // overflow the native stack.
-            self.steps = MAX_MATCH_STEPS + 1;
+            self.steps = self.max_steps + 1;
             return None;
         }
         self.depth += 1;
@@ -507,6 +528,7 @@ impl Matcher<'_> {
                     // The lookahead sees the same captures.
                     captures: std::mem::take(&mut self.captures),
                     steps: self.steps,
+                    max_steps: self.max_steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
                     backward: false,
@@ -527,6 +549,7 @@ impl Matcher<'_> {
                     flags: self.flags,
                     captures: std::mem::take(&mut self.captures),
                     steps: self.steps,
+                    max_steps: self.max_steps,
                     depth: self.depth,
                     max_depth: self.max_depth,
                     backward: true,
@@ -652,7 +675,9 @@ impl Matcher<'_> {
         position: usize,
         next: &mut Continuation<'_>,
     ) -> Option<()> {
-        // `ends[k]` is the position after `k` repetitions.
+        // `ends[k]` is the position after `k` repetitions. Each character of
+        // the run is one step, so the scan is bounded by the budget like every
+        // other piece of work.
         let mut ends = vec![position];
         while max.is_none_or(|limit| ends.len() - 1 < limit as usize) {
             let last = ends[ends.len() - 1];
@@ -2891,6 +2916,38 @@ mod tests {
         let compiled: Compiled = compile(r"(a+)+$", "").expect("compiles");
         let input = units("aaaaaaaaaaaaaaaaaaaaaaaaaaaaab");
         assert_eq!(compiled.find(&input, 0), None);
+        // Scans are charged too, so nested repetition over a long run stays
+        // within the budget that grows with the input.
+        let long = units(&"a".repeat(600));
+        let nested = compile("^(?:a*)*b", "").expect("compiles");
+        assert_eq!(nested.find(&long, 0), None);
+    }
+
+    #[test]
+    fn long_single_character_runs_match_in_full() {
+        // A run longer than the base budget must still match: the budget grows
+        // with the input, and test262 property-escape tests match whole planes
+        // of over a million code points with one `+`.
+        let run: Vec<u16> = vec![u16::from(b'a'); 1_500_000];
+        let plus = compile("^a+$", "").expect("compiles");
+        let found = plus.find(&run, 0).expect("the whole run matches");
+        assert_eq!((found.start, found.end), (0, run.len()));
+        let unicode = compile(r"^\p{Any}+$", "u").expect("compiles");
+        let astral: Vec<u16> = "\u{10000}".repeat(1_200_000).encode_utf16().collect();
+        let found = unicode.find(&astral, 0).expect("every code point matches");
+        assert_eq!((found.start, found.end), (0, astral.len()));
+    }
+
+    #[test]
+    fn anchored_patterns_only_try_the_input_start() {
+        assert_eq!(matches("^b", "", "ab"), None);
+        assert_eq!(matches("^b", "", "ba"), Some((0, 1)));
+        let compiled = compile("^b", "").expect("compiles");
+        assert_eq!(
+            compiled.find(&units("ba"), 1).map(|found| found.start),
+            None
+        );
+        assert_eq!(matches("^b", "m", "a\nb"), Some((2, 3)));
     }
 
     #[test]
