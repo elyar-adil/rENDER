@@ -330,6 +330,16 @@ fn is_canonical_index(key: &str) -> bool {
         .is_some_and(|index| index.to_string() == key)
 }
 
+/// How a property key meets an integer-indexed exotic object (ECMA-262
+/// 10.4.5): an ordinary key, a valid integer index of the view, or a canonical
+/// numeric string that names no element and therefore no property at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypedKey {
+    Ordinary,
+    Element(usize),
+    Invalid,
+}
+
 /// ECMA-262 §10.4.3.1 `StringGetOwnProperty`: the own slots a String wrapper
 /// exposes for the primitive it hosts. Indexed characters are writable:false,
 /// enumerable:true, configurable:false; `length` is writable:false,
@@ -997,16 +1007,28 @@ pub(crate) enum NativeFunction {
     PerformanceNow,
     PerformanceGetEntries,
     PerformanceGetEntriesByType,
-    CollectionGet,
-    CollectionSet,
-    CollectionAdd,
-    CollectionHas,
-    CollectionDelete,
-    CollectionClear,
-    CollectionForEach,
-    CollectionKeys,
-    CollectionValues,
-    CollectionEntries,
+    /// The collection methods carry the brand their receiver must have (ECMA-262
+    /// 24.1.3, 24.2.3, 24.3.3, 24.4.3): a `Map` method refuses a `WeakMap`.
+    CollectionGet(CollectionKind),
+    CollectionSet(CollectionKind),
+    CollectionAdd(CollectionKind),
+    CollectionHas(CollectionKind),
+    CollectionDelete(CollectionKind),
+    CollectionClear(CollectionKind),
+    CollectionForEach(CollectionKind),
+    CollectionKeys(CollectionKind),
+    CollectionValues(CollectionKind),
+    CollectionEntries(CollectionKind),
+    /// `Map.prototype.getOrInsert` and `WeakMap.prototype.getOrInsert`.
+    CollectionGetOrInsert(CollectionKind),
+    /// `Map.prototype.getOrInsertComputed` and `WeakMap.prototype.getOrInsertComputed`.
+    CollectionGetOrInsertComputed(CollectionKind),
+    /// `get Map.prototype.size` and `get Set.prototype.size`.
+    CollectionSize(CollectionKind),
+    /// `get Map[@@species]` and `get Set[@@species]`: `this`.
+    CollectionSpecies,
+    /// `Map.groupBy(items, callback)` (ECMA-262 24.1.2.1).
+    MapGroupBy,
     CollectionUnion,
     CollectionIntersection,
     CollectionDifference,
@@ -1022,6 +1044,7 @@ pub(crate) enum NativeFunction {
     TypedArrayFill,
     TypedArrayIndexOf,
     TypedArrayJoin,
+    TypedArrayToLocaleString,
     TypedArrayFrom,
     TypedArrayIncludes,
     TypedArrayForEach,
@@ -1078,6 +1101,9 @@ pub(crate) enum NativeFunction {
     IteratorConstructor,
     IteratorFrom,
     IteratorPrototypeIterator,
+    /// `%IteratorPrototype%[@@dispose]` (explicit resource management): calls the
+    /// iterator's `return` method, if it has one.
+    IteratorPrototypeDispose,
     GeneratorNext,
     GeneratorReturn,
     GeneratorThrow,
@@ -2525,6 +2551,8 @@ pub struct Realm {
     /// `%Promise%`, the intrinsic constructor `SpeciesConstructor` falls back to.
     promise_constructor: ObjectId,
     promise_prototype: ObjectId,
+    /// `%Map.prototype%`, the prototype `Map.groupBy` creates its result with.
+    map_prototype: ObjectId,
     element_prototype: ObjectId,
     /// The prototype of every DOM interface, by interface name.
     dom_prototypes: BTreeMap<&'static str, ObjectId>,
@@ -2763,7 +2791,8 @@ impl Realm {
         for name in ["localStorage", "sessionStorage"] {
             Self::install_storage_area(&mut objects, global, storage_prototype, name);
         }
-        Self::install_collections(&mut objects, global, object_prototype, function_prototype);
+        let map_prototype =
+            Self::install_collections(&mut objects, global, object_prototype, function_prototype);
         Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
         Self::install_atomics(&mut objects, global, object_prototype, function_prototype);
         Self::install_encoding(&mut objects, global, object_prototype, function_prototype);
@@ -3403,6 +3432,7 @@ impl Realm {
             promise_constructor,
             bigint_prototype,
             promise_prototype,
+            map_prototype,
             element_prototype,
             dom_prototypes,
             iterator_prototype,
@@ -3743,7 +3773,8 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) {
+    ) -> ObjectId {
+        let mut map_prototype = object_prototype;
         for (name, kind) in [
             ("Map", CollectionKind::Map),
             ("WeakMap", CollectionKind::WeakMap),
@@ -3751,55 +3782,75 @@ impl Realm {
             ("WeakSet", CollectionKind::WeakSet),
         ] {
             let prototype = ObjectId(objects.len());
+            if kind == CollectionKind::Map {
+                map_prototype = prototype;
+            }
             objects.push(JsObject {
                 prototype: Some(object_prototype),
                 ..JsObject::default()
             });
-            let methods: &[(&str, NativeFunction)] = if kind.is_map() {
-                &[
-                    ("get", NativeFunction::CollectionGet),
-                    ("set", NativeFunction::CollectionSet),
-                    ("has", NativeFunction::CollectionHas),
-                    ("delete", NativeFunction::CollectionDelete),
-                    ("clear", NativeFunction::CollectionClear),
-                    ("forEach", NativeFunction::CollectionForEach),
-                    ("keys", NativeFunction::CollectionKeys),
-                    ("values", NativeFunction::CollectionValues),
-                    ("entries", NativeFunction::CollectionEntries),
+            // Each method carries its `length` (ECMA-262 24.1.3, 24.2.3, and the
+            // upsert proposal's `getOrInsert` and `getOrInsertComputed`).
+            let methods: Vec<(&str, NativeFunction, f64)> = if kind.is_map() {
+                vec![
+                    ("get", NativeFunction::CollectionGet(kind), 1.0),
+                    ("set", NativeFunction::CollectionSet(kind), 2.0),
+                    ("has", NativeFunction::CollectionHas(kind), 1.0),
+                    ("delete", NativeFunction::CollectionDelete(kind), 1.0),
+                    ("clear", NativeFunction::CollectionClear(kind), 0.0),
+                    ("forEach", NativeFunction::CollectionForEach(kind), 1.0),
+                    ("keys", NativeFunction::CollectionKeys(kind), 0.0),
+                    ("values", NativeFunction::CollectionValues(kind), 0.0),
+                    ("entries", NativeFunction::CollectionEntries(kind), 0.0),
+                    (
+                        "getOrInsert",
+                        NativeFunction::CollectionGetOrInsert(kind),
+                        2.0,
+                    ),
+                    (
+                        "getOrInsertComputed",
+                        NativeFunction::CollectionGetOrInsertComputed(kind),
+                        2.0,
+                    ),
                 ]
             } else {
-                &[
-                    ("add", NativeFunction::CollectionAdd),
-                    ("has", NativeFunction::CollectionHas),
-                    ("delete", NativeFunction::CollectionDelete),
-                    ("clear", NativeFunction::CollectionClear),
-                    ("forEach", NativeFunction::CollectionForEach),
-                    ("keys", NativeFunction::CollectionKeys),
-                    ("values", NativeFunction::CollectionValues),
-                    ("entries", NativeFunction::CollectionEntries),
-                    ("union", NativeFunction::CollectionUnion),
-                    ("intersection", NativeFunction::CollectionIntersection),
-                    ("difference", NativeFunction::CollectionDifference),
+                vec![
+                    ("add", NativeFunction::CollectionAdd(kind), 1.0),
+                    ("has", NativeFunction::CollectionHas(kind), 1.0),
+                    ("delete", NativeFunction::CollectionDelete(kind), 1.0),
+                    ("clear", NativeFunction::CollectionClear(kind), 0.0),
+                    ("forEach", NativeFunction::CollectionForEach(kind), 1.0),
+                    ("keys", NativeFunction::CollectionKeys(kind), 0.0),
+                    ("values", NativeFunction::CollectionValues(kind), 0.0),
+                    ("entries", NativeFunction::CollectionEntries(kind), 0.0),
+                    ("union", NativeFunction::CollectionUnion, 1.0),
+                    ("intersection", NativeFunction::CollectionIntersection, 1.0),
+                    ("difference", NativeFunction::CollectionDifference, 1.0),
                     (
                         "symmetricDifference",
                         NativeFunction::CollectionSymmetricDifference,
+                        1.0,
                     ),
-                    ("isSubsetOf", NativeFunction::CollectionIsSubsetOf),
-                    ("isSupersetOf", NativeFunction::CollectionIsSupersetOf),
-                    ("isDisjointFrom", NativeFunction::CollectionIsDisjointFrom),
+                    ("isSubsetOf", NativeFunction::CollectionIsSubsetOf, 1.0),
+                    ("isSupersetOf", NativeFunction::CollectionIsSupersetOf, 1.0),
+                    (
+                        "isDisjointFrom",
+                        NativeFunction::CollectionIsDisjointFrom,
+                        1.0,
+                    ),
                 ]
             };
-            for &(method_name, function) in methods {
+            for (method_name, function, arity) in methods {
                 // Weak collections intentionally expose only get/set/add,
                 // has, and delete. They are not enumerable and have no size.
                 if kind.is_weak()
                     && matches!(
                         function,
-                        NativeFunction::CollectionClear
-                            | NativeFunction::CollectionForEach
-                            | NativeFunction::CollectionKeys
-                            | NativeFunction::CollectionValues
-                            | NativeFunction::CollectionEntries
+                        NativeFunction::CollectionClear(_)
+                            | NativeFunction::CollectionForEach(_)
+                            | NativeFunction::CollectionKeys(_)
+                            | NativeFunction::CollectionValues(_)
+                            | NativeFunction::CollectionEntries(_)
                             | NativeFunction::CollectionUnion
                             | NativeFunction::CollectionIntersection
                             | NativeFunction::CollectionDifference
@@ -3811,12 +3862,8 @@ impl Realm {
                 {
                     continue;
                 }
-                let method = ObjectId(objects.len());
-                objects.push(JsObject {
-                    prototype: Some(function_prototype),
-                    host: ObjectHost::NativeFunction(function),
-                    ..JsObject::default()
-                });
+                let method =
+                    Self::install_native_method(objects, function_prototype, function, arity);
                 objects[prototype.0].properties.insert(
                     method_name.to_owned(),
                     PropertyDescriptor::builtin(JsValue::Object(method)),
@@ -3852,6 +3899,39 @@ impl Realm {
                 "constructor".to_owned(),
                 PropertyDescriptor::builtin(JsValue::Object(constructor)),
             );
+            // ECMA-262 24.1.1, 24.2.1 and their weak counterparts: the constructor's
+            // `length` is 0.
+            Self::install_length(objects, constructor, 0.0);
+            // ECMA-262 24.1.3.10 and 24.2.3.9: `size` is an accessor, and
+            // 24.1.2.2 and 24.2.2.2: `@@species` returns `this`. Weak collections
+            // have neither.
+            if !kind.is_weak() {
+                Self::install_getters(
+                    objects,
+                    function_prototype,
+                    prototype,
+                    &[("size", NativeFunction::CollectionSize(kind))],
+                );
+                Self::install_species_getter(
+                    objects,
+                    function_prototype,
+                    constructor,
+                    NativeFunction::CollectionSpecies,
+                );
+            }
+            // ECMA-262 24.1.2.1: `Map.groupBy` is the only static method of `Map`.
+            if kind == CollectionKind::Map {
+                let group_by = Self::install_native_method(
+                    objects,
+                    function_prototype,
+                    NativeFunction::MapGroupBy,
+                    2.0,
+                );
+                objects[constructor.0].properties.insert(
+                    "groupBy".to_owned(),
+                    PropertyDescriptor::builtin(JsValue::Object(group_by)),
+                );
+            }
             // ECMA-262 24.1.3.14, 24.2.3.13, 24.3.3.12, 24.4.3.13: the prototype's
             // `@@toStringTag` names the collection, and it is what
             // `Object.prototype.toString` reads.
@@ -3882,6 +3962,7 @@ impl Realm {
                 },
             );
         }
+        map_prototype
     }
 
     /// Install the typed-array family (ECMA-262 23.2): `%TypedArray%`, the
@@ -3987,6 +4068,11 @@ impl Realm {
             ("some", NativeFunction::TypedArraySome, 1.0),
             ("sort", NativeFunction::TypedArraySort, 1.0),
             ("subarray", NativeFunction::TypedArraySubarray, 2.0),
+            (
+                "toLocaleString",
+                NativeFunction::TypedArrayToLocaleString,
+                0.0,
+            ),
             ("toReversed", NativeFunction::TypedArrayToReversed, 0.0),
             ("toSorted", NativeFunction::TypedArrayToSorted, 1.0),
             ("toString", NativeFunction::TypedArrayJoin, 0.0),
@@ -4236,7 +4322,14 @@ impl Realm {
             symbol.id(),
             (
                 symbol,
-                PropertyDescriptor::builtin(JsValue::String((tag.to_owned()).into())),
+                PropertyDescriptor {
+                    value: JsValue::String((tag.to_owned()).into()),
+                    writable: false,
+                    getter: None,
+                    setter: None,
+                    enumerable: false,
+                    configurable: true,
+                },
             ),
         );
         let constructor = ObjectId(objects.len());
@@ -4908,6 +5001,23 @@ impl Realm {
             (
                 symbol.clone(),
                 PropertyDescriptor::builtin(JsValue::Object(self_iterator)),
+            ),
+        );
+        // `%IteratorPrototype%[@@dispose]` (explicit resource management), which is
+        // named `[Symbol.dispose]` and takes no arguments.
+        let dispose = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(NativeFunction::IteratorPrototypeDispose),
+            properties: Self::function_metadata("[Symbol.dispose]", 0.0),
+            ..JsObject::default()
+        });
+        let dispose_symbol = JsSymbol::well_known("@@dispose");
+        objects[prototype.0].symbols.insert(
+            dispose_symbol.id(),
+            (
+                dispose_symbol,
+                PropertyDescriptor::builtin(JsValue::Object(dispose)),
             ),
         );
         // `%IteratorHelperPrototype%` and `%WrapForValidIteratorPrototype%` each
@@ -8712,10 +8822,15 @@ impl Realm {
         key: impl Into<String>,
         descriptor: PropertyDescriptor,
     ) -> bool {
+        let key = key.into();
+        // A typed array's canonical numeric keys are elements, never stored
+        // properties; the runtime's [[DefineOwnProperty]] writes them.
+        if self.typed_key(object, &key) != TypedKey::Ordinary {
+            return false;
+        }
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
-        let key = key.into();
         // ECMA-262 §10.4.3.2: a String exotic object rejects every
         // `[[DefineOwnProperty]]` whose key is a canonical numeric index string
         // or `"length"`; those slots are non-configurable and non-writable, so
@@ -9029,6 +9144,12 @@ impl Realm {
         self.objects.get(object.0).map(|object| object.host.clone())
     }
 
+    /// The host of `object`, borrowed in place. Unlike [`Self::host`] this does not
+    /// clone, so a collection's entries are inspected without copying them.
+    pub(crate) fn host_ref(&self, object: ObjectId) -> Option<&ObjectHost> {
+        self.objects.get(object.0).map(|record| &record.host)
+    }
+
     pub(crate) fn host_mut(&mut self, object: ObjectId) -> Option<&mut ObjectHost> {
         self.objects
             .get_mut(object.0)
@@ -9152,7 +9273,117 @@ impl Realm {
         }
         match &target.host {
             ObjectHost::StringPrimitive(text) => string_exotic_property(text, key),
+            // ECMA-262 10.4.5.1: a valid element is a writable, enumerable,
+            // configurable data property whose value is read from the buffer.
+            ObjectHost::TypedArray { .. } => match self.typed_key(object, key) {
+                TypedKey::Element(index) => Some(PropertyDescriptor::data(
+                    self.typed_element_at(object, index),
+                )),
+                TypedKey::Ordinary | TypedKey::Invalid => None,
+            },
             _ => None,
+        }
+    }
+
+    /// ECMA-262 10.4.5 integer-indexed exotic object: classifies `key` for
+    /// `object`. Only a typed array treats a canonical numeric string as an
+    /// element, and a numeric string that is not a valid index names no
+    /// property at all, whatever the prototype chain holds.
+    pub(crate) fn typed_key(&self, object: ObjectId, key: &str) -> TypedKey {
+        let Some(ObjectHost::TypedArray {
+            kind,
+            buffer,
+            start,
+            length,
+        }) = self.objects.get(object.0).map(|record| &record.host)
+        else {
+            return TypedKey::Ordinary;
+        };
+        let Some(number) = canonical_numeric_key(key) else {
+            return TypedKey::Ordinary;
+        };
+        // IsValidIntegerIndex (ECMA-262 10.4.5.14): an integer that is not -0 and
+        // lies below the view's current length, which is none when the view is
+        // out of bounds or detached.
+        let current = buffer.view_length(kind.element_size(), *start, *length);
+        let valid = number.fract() == 0.0
+            && (number != 0.0 || number.is_sign_positive())
+            && number >= 0.0
+            && current.is_some_and(|current| {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "typed-array lengths stay far below any precision boundary"
+                )]
+                let current = current as f64;
+                number < current
+            });
+        if valid {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "the number is a non-negative integer below the view length"
+            )]
+            let index = number as usize;
+            TypedKey::Element(index)
+        } else {
+            TypedKey::Invalid
+        }
+    }
+
+    /// The value of element `index` of the typed array `object`. The caller has
+    /// classified the index as a valid element with [`Self::typed_key`].
+    pub(crate) fn typed_element_at(&self, object: ObjectId, index: usize) -> JsValue {
+        match self.objects.get(object.0).map(|record| &record.host) {
+            Some(ObjectHost::TypedArray {
+                kind,
+                buffer,
+                start,
+                ..
+            }) => buffer
+                .element_value(*kind, start + index)
+                .unwrap_or(JsValue::Undefined),
+            _ => JsValue::Undefined,
+        }
+    }
+
+    /// Whether the first typed array on `object`'s prototype chain that answers
+    /// for `key` is an invalid index of it, which absorbs an assignment to `key`
+    /// without creating a property (ECMA-262 10.4.5.5 step 1.b). An ordinary
+    /// holder of the key, or a valid element, ends the search first.
+    pub(crate) fn typed_invalid_on_chain(&self, object: ObjectId, key: &str) -> bool {
+        let mut holder = self.get_prototype(object);
+        let mut visited = 0usize;
+        while let Some(current) = holder {
+            match self.typed_key(current, key) {
+                TypedKey::Invalid => return true,
+                TypedKey::Element(_) => return false,
+                TypedKey::Ordinary => {
+                    if self.own_property(current, key).is_some() {
+                        return false;
+                    }
+                }
+            }
+            visited = visited.saturating_add(1);
+            if visited > self.objects.len() {
+                return false;
+            }
+            holder = self.get_prototype(current);
+        }
+        false
+    }
+
+    /// The element `index` of the typed array `object` takes `value`, which is
+    /// already converted to the view's content type. The caller has classified
+    /// the index as a valid element with [`Self::typed_key`].
+    pub(crate) fn typed_element_store(&self, object: ObjectId, index: usize, value: &JsValue) {
+        if let Some(ObjectHost::TypedArray {
+            kind,
+            buffer,
+            start,
+            ..
+        }) = self.objects.get(object.0).map(|record| &record.host)
+        {
+            buffer.set_converted_element(*kind, start + index, value);
         }
     }
 
@@ -9328,6 +9559,20 @@ impl Realm {
                     .filter(|key| !target.properties.contains_key(key)),
             );
         }
+        if let ObjectHost::TypedArray {
+            kind,
+            buffer,
+            start,
+            length,
+        } = &target.host
+        {
+            // ECMA-262 10.4.5.7 [[OwnPropertyKeys]]: the valid element indices
+            // come first; an out-of-bounds or detached view has none.
+            let count = buffer
+                .view_length(kind.element_size(), *start, *length)
+                .unwrap_or(0);
+            indices.extend((0..count).map(|index| index.to_string()));
+        }
         indices.sort_by_cached_key(|key| key.parse::<u32>().unwrap_or(0));
         indices.dedup();
         let ordered = target
@@ -9361,6 +9606,25 @@ impl Realm {
         let mut first = true;
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
+            // A typed array's valid element indices are enumerable own keys (ECMA-262
+            // 10.4.5.7), ahead of its named properties.
+            if let ObjectHost::TypedArray {
+                kind,
+                buffer,
+                start,
+                length,
+            } = &current.host
+            {
+                let count = buffer
+                    .view_length(kind.element_size(), *start, *length)
+                    .unwrap_or(0);
+                for index in 0..count {
+                    let key = index.to_string();
+                    if seen.insert(key.clone()) {
+                        names.push(key);
+                    }
+                }
+            }
             for (key, descriptor) in &current.properties {
                 if seen.insert(key.clone()) && descriptor.enumerable {
                     names.push(key.clone());
@@ -9397,6 +9661,13 @@ impl Realm {
     }
 
     pub(crate) fn delete_property(&mut self, object: ObjectId, key: &str) -> bool {
+        // ECMA-262 10.4.5.6 [[Delete]]: a valid element cannot be deleted, and an
+        // invalid canonical numeric key names nothing to delete.
+        match self.typed_key(object, key) {
+            TypedKey::Element(_) => return false,
+            TypedKey::Invalid => return true,
+            TypedKey::Ordinary => {}
+        }
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
@@ -9440,6 +9711,16 @@ impl Realm {
     }
 
     pub(crate) fn set_property(&mut self, object: ObjectId, key: String, value: JsValue) -> bool {
+        // The runtime converts a typed-array write before it reaches here, so
+        // an element takes only a value already of the view's content type.
+        match self.typed_key(object, &key) {
+            TypedKey::Element(index) => {
+                self.typed_element_store(object, index, &value);
+                return true;
+            }
+            TypedKey::Invalid => return true,
+            TypedKey::Ordinary => {}
+        }
         let Some(target) = self.objects.get_mut(object.0) else {
             return false;
         };
@@ -9944,6 +10225,11 @@ impl Realm {
     /// `%Promise%`, the intrinsic constructor.
     pub(crate) const fn promise_constructor(&self) -> ObjectId {
         self.promise_constructor
+    }
+
+    /// `%Map.prototype%`, the intrinsic prototype of every `Map`.
+    pub(crate) const fn map_prototype(&self) -> ObjectId {
+        self.map_prototype
     }
 
     pub(crate) fn collection(

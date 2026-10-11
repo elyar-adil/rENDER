@@ -71,6 +71,7 @@ use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::TypedKey;
 use render_css::stylesheet::parse_declaration_list;
 use render_dom::Dom;
 use render_dom::NodeKind;
@@ -1898,16 +1899,14 @@ impl JsRuntime {
                 arguments,
                 ..
             } => {
+                // ECMA-262 13.3.5.1 steps 2-3: an operand that is not a constructor
+                // is a TypeError, whatever it is.
                 let evaluated = self.evaluate(dom, constructor)?;
-                if matches!(evaluated, JsValue::Null | JsValue::Undefined) {
-                    return Ok(JsValue::Undefined);
-                }
                 let JsValue::Object(constructor) = evaluated else {
-                    // An unavailable feature constructor evaluates to a
-                    // primitive in some compatibility branches.  Treat that
-                    // branch as an inert construction result so the rest of
-                    // the page can continue initializing.
-                    return Ok(JsValue::Undefined);
+                    return Err(JsError::type_error(format!(
+                        "{} is not a constructor",
+                        evaluated.to_js_string()
+                    )));
                 };
                 let mut values = Vec::with_capacity(arguments.len());
                 for argument in arguments {
@@ -2761,6 +2760,11 @@ impl JsRuntime {
         key: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
+        // ECMA-262 10.4.5.5 step 1.b: an invalid index of a typed array on the
+        // prototype chain absorbs the write, so nothing is created on `object`.
+        if self.realm.typed_invalid_on_chain(object, key) {
+            return Ok(());
+        }
         if let Some(own) = self.realm.own_property(object, key) {
             if own.is_accessor() {
                 if let Some(setter) = own.setter {
@@ -4364,6 +4368,14 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_get(dom, object, property);
         }
+        // ECMA-262 10.4.5.4 [[Get]]: a canonical numeric key of a typed array is
+        // an element read, and one that is not a valid index reads as undefined
+        // without consulting the prototype chain.
+        match self.realm.typed_key(object, property) {
+            TypedKey::Element(index) => return Ok(self.realm.typed_element_at(object, index)),
+            TypedKey::Invalid => return Ok(JsValue::Undefined),
+            TypedKey::Ordinary => {}
+        }
         // Own data properties win outright (instance fields such as a
         // RegExp's `source`); own accessors run their getter.
         if let Some(descriptor) = self.realm.own_property(object, property) {
@@ -4753,55 +4765,13 @@ impl JsRuntime {
                     }
                 }
             }
-            Some(ObjectHost::Collection { kind, entries })
-                if property == "size" && !kind.is_weak() =>
-            {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "collection sizes are bounded by the JavaScript heap limit"
-                )]
-                return Ok(JsValue::Number(entries.len() as f64));
-            }
-            Some(ObjectHost::TypedArray {
-                kind,
-                buffer,
-                start,
-                length,
-            }) => {
+            Some(ObjectHost::TypedArray { kind, .. }) => {
                 if property == "BYTES_PER_ELEMENT" {
                     #[allow(
                         clippy::cast_precision_loss,
                         reason = "element sizes are tiny integers"
                     )]
                     return Ok(JsValue::Number(kind.element_size() as f64));
-                }
-                // §10.4.5.4 [[Get]]: a canonical numeric key is an element read,
-                // and one that is not a valid integer index reads as undefined
-                // without consulting the prototype chain. Any other key is a
-                // method or property access.
-                if let Some(number) = crate::value::canonical_numeric_key(property) {
-                    // IsValidIntegerIndex: the index must lie below the view's
-                    // current length, which is zero-or-absent when out of bounds.
-                    let current = buffer.view_length(kind.element_size(), start, length);
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "typed-array lengths stay far below any precision boundary"
-                    )]
-                    let in_range = number.is_sign_positive()
-                        && number.fract() == 0.0
-                        && current.is_some_and(|current| number < current as f64);
-                    let element = if in_range {
-                        #[allow(
-                            clippy::cast_possible_truncation,
-                            clippy::cast_sign_loss,
-                            reason = "the index is a non-negative integer below the length"
-                        )]
-                        let index = number as usize;
-                        buffer.element_value(kind, start + index)
-                    } else {
-                        None
-                    };
-                    return Ok(element.unwrap_or(JsValue::Undefined));
                 }
             }
             Some(ObjectHost::StringPrimitive(text)) => {
@@ -5038,6 +5008,12 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_set(dom, object, property, value);
         }
+        // ECMA-262 10.4.5.5 [[Set]] with the typed array as its own receiver: a
+        // canonical numeric key writes through TypedArraySetElement and never
+        // creates a property, so the write always succeeds.
+        if self.realm.typed_key(object, property) != TypedKey::Ordinary {
+            return self.typed_array_set_element(dom, object, property, &value);
+        }
         let location_base = match self.realm.host(object) {
             Some(ObjectHost::Location(url)) => Some(url.clone()),
             _ => None,
@@ -5153,41 +5129,6 @@ impl JsRuntime {
                             JsError::type_error("array length exceeds the supported range")
                         })?;
                         self.set_array_length(object, next_length)?;
-                    }
-                    return Ok(());
-                }
-            }
-            Some(ObjectHost::TypedArray {
-                kind,
-                buffer,
-                start,
-                length,
-            }) => {
-                if let Ok(index) = property.parse::<usize>() {
-                    // Out-of-bounds indexed writes are silently ignored and
-                    // never create ordinary properties, per the
-                    // integer-indexed exotic object contract.
-                    // TypedArraySetElement converts the value first and only then
-                    // checks the index against the view's current length. This
-                    // path does not know the receiver, and §10.4.5.5 converts an
-                    // out-of-range value only when the receiver is the typed array
-                    // itself.
-                    if kind.is_bigint() {
-                        let bigint = self.to_bigint_value(dom, &value)?;
-                        if buffer
-                            .view_length(kind.element_size(), start, length)
-                            .is_some_and(|current| index < current)
-                        {
-                            buffer.set_bigint_element(kind, start + index, &bigint);
-                        }
-                    } else {
-                        let number = self.to_number_value(dom, &value)?;
-                        if buffer
-                            .view_length(kind.element_size(), start, length)
-                            .is_some_and(|current| index < current)
-                        {
-                            buffer.set_element(kind, start + index, number);
-                        }
                     }
                     return Ok(());
                 }

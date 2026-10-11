@@ -29,6 +29,7 @@ use crate::utf16::JsString;
 use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::TypedKey;
 use crate::value::same_value;
 use render_dom::Dom;
 
@@ -1149,6 +1150,13 @@ impl JsRuntime {
         key: &PropertyName,
         partial: PartialDescriptor,
     ) -> Result<bool, JsError> {
+        // ECMA-262 10.4.5.3: a canonical numeric key of a typed array is an
+        // element, so it never reaches the ordinary definition below.
+        if let PropertyName::String(name) = key
+            && self.realm.typed_key(object, name) != TypedKey::Ordinary
+        {
+            return self.typed_array_define_own_property(dom, object, name, &partial);
+        }
         match self.realm.host(object) {
             Some(ObjectHost::Proxy { .. }) => {
                 return self.proxy_define_own_property(dom, object, key, partial);
@@ -1418,11 +1426,12 @@ impl JsRuntime {
         key: &PropertyName,
         value: JsValue,
     ) -> Result<bool, JsError> {
-        if let (PropertyName::String(name), Some(ObjectHost::TypedArray { .. })) =
-            (key, self.realm.host(object))
+        if let PropertyName::String(name) = key
+            && self.realm.typed_key(object, name) != TypedKey::Ordinary
         {
-            // Integer-indexed writes keep their buffer semantics in the set path.
-            self.set_member(dom, object, name, value)?;
+            // ECMA-262 10.4.5.5 step 1.a: a typed array that is its own receiver
+            // writes the element through TypedArraySetElement and reports success.
+            self.typed_array_set_element(dom, object, name, &value)?;
             return Ok(true);
         }
         let mut inherited = None;
@@ -1431,6 +1440,13 @@ impl JsRuntime {
             if matches!(self.realm.host(current), Some(ObjectHost::Proxy { .. })) {
                 // The proxy's [[Set]] receives the original object as receiver.
                 return self.proxy_set_property(dom, current, key, value, JsValue::Object(object));
+            }
+            // ECMA-262 10.4.5.5 step 1.b: an invalid index of a typed array on the
+            // chain ends the write as successful, creating nothing on the receiver.
+            if let PropertyName::String(name) = key
+                && self.realm.typed_key(current, name) == TypedKey::Invalid
+            {
+                return Ok(true);
             }
             if let Some(descriptor) = self.own_descriptor(dom, current, key)? {
                 inherited = Some(descriptor);
@@ -1724,7 +1740,6 @@ impl JsRuntime {
                 Some(ObjectHost::StringPrimitive(_)) => "String".to_owned(),
                 Some(ObjectHost::DateInstance(_)) => "Date".to_owned(),
                 Some(ObjectHost::RegExp(_)) => "RegExp".to_owned(),
-                Some(ObjectHost::TypedArray { kind, .. }) => kind.name().to_owned(),
                 // Hosts whose interface names them through a `@@toStringTag`
                 // that the engine does not install on every prototype.
                 Some(ObjectHost::Document(_)) => "HTMLDocument".to_owned(),

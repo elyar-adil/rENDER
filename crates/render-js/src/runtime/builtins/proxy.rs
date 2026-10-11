@@ -11,6 +11,7 @@ use crate::runtime::builtins::object::{AccessorField, PartialDescriptor, Propert
 use crate::runtime::convert::required_argument;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
+use crate::value::TypedKey;
 use crate::value::same_value;
 use render_dom::Dom;
 
@@ -657,6 +658,15 @@ impl JsRuntime {
             if matches!(self.realm.host(current), Some(ObjectHost::Proxy { .. })) {
                 return self.proxy_has_property(dom, current, key);
             }
+            // ECMA-262 10.4.5.2 [[HasProperty]]: a canonical numeric key of a typed
+            // array is decided by IsValidIntegerIndex, without the prototype chain.
+            if let PropertyName::String(name) = key {
+                match self.realm.typed_key(current, name) {
+                    TypedKey::Element(_) => return Ok(true),
+                    TypedKey::Invalid => return Ok(false),
+                    TypedKey::Ordinary => {}
+                }
+            }
             if self.own_descriptor(dom, current, key)?.is_some() {
                 return Ok(true);
             }
@@ -722,6 +732,17 @@ impl JsRuntime {
         loop {
             if matches!(self.realm.host(current), Some(ObjectHost::Proxy { .. })) {
                 return self.proxy_get_property(dom, current, key, receiver);
+            }
+            // ECMA-262 10.4.5.4 [[Get]]: a typed array answers a canonical numeric
+            // key itself, and an invalid one reads as undefined.
+            if let PropertyName::String(name) = key {
+                match self.realm.typed_key(current, name) {
+                    TypedKey::Element(index) => {
+                        return Ok(self.realm.typed_element_at(current, index));
+                    }
+                    TypedKey::Invalid => return Ok(JsValue::Undefined),
+                    TypedKey::Ordinary => {}
+                }
             }
             if let Some(descriptor) = self.own_descriptor(dom, current, key)? {
                 if !descriptor.is_accessor() {
@@ -817,6 +838,13 @@ impl JsRuntime {
         }
         if matches!(receiver, JsValue::Object(this) if this == object) {
             return self.set_property_checked(dom, object, key, value);
+        }
+        // ECMA-262 10.4.5.5 step 1.b: an invalid index of a typed array that is
+        // not the receiver ends the write as successful.
+        if let PropertyName::String(name) = key
+            && self.realm.typed_key(object, name) == TypedKey::Invalid
+        {
+            return Ok(true);
         }
         self.ordinary_set_with_receiver(dom, object, key, value, receiver)
     }

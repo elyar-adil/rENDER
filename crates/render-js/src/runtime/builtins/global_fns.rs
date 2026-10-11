@@ -724,6 +724,7 @@ impl JsRuntime {
             NativeFunction::IteratorConstructor
             | NativeFunction::IteratorFrom
             | NativeFunction::IteratorPrototypeIterator
+            | NativeFunction::IteratorPrototypeDispose
             | NativeFunction::IteratorHelperNext
             | NativeFunction::IteratorHelperReturn
             | NativeFunction::IteratorMap
@@ -814,24 +815,24 @@ impl JsRuntime {
             NativeFunction::CloneNode => {
                 self.dispatch_dom_native(dom, NativeFunction::CloneNode, receiver, arguments)
             }
-            NativeFunction::CollectionAdd => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionAdd,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionClear => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionClear,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionDelete => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionDelete,
-                receiver,
-                arguments,
-            ),
+            NativeFunction::CollectionAdd(_)
+            | NativeFunction::CollectionClear(_)
+            | NativeFunction::CollectionDelete(_)
+            | NativeFunction::CollectionEntries(_)
+            | NativeFunction::CollectionForEach(_)
+            | NativeFunction::CollectionGet(_)
+            | NativeFunction::CollectionGetOrInsert(_)
+            | NativeFunction::CollectionGetOrInsertComputed(_)
+            | NativeFunction::CollectionHas(_)
+            | NativeFunction::CollectionKeys(_)
+            | NativeFunction::CollectionSet(_)
+            | NativeFunction::CollectionSize(_)
+            | NativeFunction::CollectionValues(_)
+            | NativeFunction::CollectionSpecies
+            | NativeFunction::CollectionIteratorNext
+            | NativeFunction::MapGroupBy => {
+                self.dispatch_collections_native(dom, function, receiver, arguments)
+            }
             NativeFunction::CollectionUnion
             | NativeFunction::CollectionIntersection
             | NativeFunction::CollectionDifference
@@ -841,54 +842,6 @@ impl JsRuntime {
             | NativeFunction::CollectionIsDisjointFrom => {
                 self.dispatch_collections_native(dom, function, receiver, arguments)
             }
-            NativeFunction::CollectionEntries => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionEntries,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionForEach => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionForEach,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionGet => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionGet,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionHas => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionHas,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionIteratorNext => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionIteratorNext,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionKeys => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionKeys,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionSet => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionSet,
-                receiver,
-                arguments,
-            ),
-            NativeFunction::CollectionValues => self.dispatch_collections_native(
-                dom,
-                NativeFunction::CollectionValues,
-                receiver,
-                arguments,
-            ),
             NativeFunction::CompareDocumentPosition => self.dispatch_dom_native(
                 dom,
                 NativeFunction::CompareDocumentPosition,
@@ -1480,6 +1433,12 @@ impl JsRuntime {
             NativeFunction::TypedArrayJoin => self.dispatch_typed_array_native(
                 dom,
                 NativeFunction::TypedArrayJoin,
+                receiver,
+                arguments,
+            ),
+            NativeFunction::TypedArrayToLocaleString => self.dispatch_typed_array_native(
+                dom,
+                NativeFunction::TypedArrayToLocaleString,
                 receiver,
                 arguments,
             ),

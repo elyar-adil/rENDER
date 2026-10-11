@@ -14,6 +14,7 @@
 )]
 
 use super::array::callback_this_argument;
+use super::object::{AccessorField, PartialDescriptor};
 use crate::JsError;
 use crate::JsSymbol;
 use crate::JsValue;
@@ -26,6 +27,7 @@ use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::TypedArrayKind;
 use crate::value::TypedBuffer;
+use crate::value::TypedKey;
 use render_dom::Dom;
 
 /// What a callback scan over a typed array reports (ECMA-262 23.2.3.x).
@@ -69,6 +71,13 @@ impl JsRuntime {
                 self.typed_array_includes(dom, receiver, arguments)
             }
             NativeFunction::TypedArrayJoin => self.typed_array_join(receiver, arguments),
+            NativeFunction::TypedArrayToLocaleString => {
+                // ECMA-262 23.2.3.32: the Array algorithm, over the view's length
+                // after ValidateTypedArray.
+                let (_, _, _, length) = self.typed_array_host(receiver)?;
+                let length = length as f64;
+                self.locale_string_of(dom, receiver, length)
+            }
             NativeFunction::TypedArrayValues => {
                 self.typed_array_host(receiver)?;
                 self.array_view_iterator(receiver, ArrayView::Values)
@@ -170,14 +179,8 @@ impl JsRuntime {
         kind: TypedArrayKind,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
         let Some(first) = arguments.first() else {
+            let prototype = self.new_target_prototype(dom, constructor)?;
             return Ok(JsValue::Object(self.realm.typed_array(
                 kind,
                 TypedBuffer::default(),
@@ -194,6 +197,7 @@ impl JsRuntime {
             JsValue::Object(object) => self.realm.host(*object),
             _ => None,
         } {
+            let prototype = self.new_target_prototype(dom, constructor)?;
             return self.typed_array_over_buffer(
                 dom,
                 kind,
@@ -203,14 +207,18 @@ impl JsRuntime {
                 prototype,
             );
         }
+        // The source is validated before the prototype is read, so a source that
+        // throws a TypeError does so before any custom `prototype` is accessed.
         let elements = match first {
             JsValue::Undefined | JsValue::Null => Vec::new(),
             JsValue::Object(_) => self.typed_array_source_values(dom, kind, first)?,
             other => {
                 let length = self.typed_index(dom, other)?;
+                let prototype = self.new_target_prototype(dom, constructor)?;
                 return self.create_typed_array(kind, length, prototype);
             }
         };
+        let prototype = self.new_target_prototype(dom, constructor)?;
         self.create_typed_array_from_elements(kind, &elements, prototype)
     }
 
@@ -539,60 +547,51 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        let (kind, buffer, start, length) = self.typed_array_host(receiver)?;
+        // ECMA-262 23.2.3.27 steps 2-5: the receiver must be a typed array, and the
+        // offset converts before the source or the view's state is examined.
+        self.typed_array_parts(receiver)?;
         let source = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let offset = self.optional_integer_value(dom, arguments.get(1))?;
         if offset < 0.0 {
             return Err(self.range_error("offset is out of bounds"));
         }
-        let values: Vec<JsValue> = match &source {
-            JsValue::Object(object) => {
-                if let Some(ObjectHost::TypedArray { .. }) = self.realm.host(*object) {
-                    let (source_kind, source_buffer, source_start, source_length) =
-                        self.typed_array_host(*object)?;
-                    if source_kind.is_bigint() != kind.is_bigint() {
-                        return Err(JsError::type_error(
-                            "cannot mix BigInt and other types in typed array copies",
-                        ));
-                    }
-                    // The source is read in full before any write, so a source
-                    // over the same buffer copies correctly.
-                    source_buffer.elements_value(source_kind, source_start, source_length)?
-                } else {
-                    // SetTypedArrayFromArrayLike: the length is `ToLength` of the
-                    // object's `length`, and each element converts to the kind.
-                    let count = self.array_like_length(dom, *object)?;
-                    let mut values = Vec::with_capacity(count);
-                    for index in 0..count {
-                        let element = self.get_member(dom, *object, &index.to_string())?;
-                        values.push(self.typed_element_value(dom, kind, &element)?);
-                    }
-                    values
-                }
-            }
-            // A string is an array-like of its characters, each converted to the
-            // element type like any other value.
-            JsValue::String(text) => {
-                let mut values = Vec::new();
-                for character in text.code_point_strings() {
-                    let character = JsValue::String(character);
-                    values.push(self.typed_element_value(dom, kind, &character)?);
-                }
-                values
-            }
-            JsValue::Undefined | JsValue::Null => {
+        if let JsValue::Object(source_object) = source
+            && let Some(ObjectHost::TypedArray { .. }) = self.realm.host(source_object)
+        {
+            // SetTypedArrayFromTypedArray (ECMA-262 23.2.3.26.1): both views must be in
+            // bounds, the content types must match, and the copy is taken in full
+            // before any write, so a source over the same buffer copies correctly.
+            let (target_kind, target_buffer, target_start, target_length) =
+                self.typed_array_host(receiver)?;
+            let (source_kind, source_buffer, source_start, source_length) =
+                self.typed_array_host(source_object)?;
+            if source_kind.is_bigint() != target_kind.is_bigint() {
                 return Err(JsError::type_error(
-                    "typed-array set requires an array-like source",
+                    "cannot mix BigInt and other types in typed array copies",
                 ));
             }
-            // Other primitives box to an object with no `length`, so there are
-            // no elements to copy.
-            _ => Vec::new(),
-        };
-        if offset + values.len() as f64 > length as f64 {
+            if offset == f64::INFINITY || source_length as f64 + offset > target_length as f64 {
+                return Err(self.range_error("source is too large"));
+            }
+            let values = source_buffer.elements_value(source_kind, source_start, source_length)?;
+            let first = target_start + offset as usize;
+            store_typed_elements(&target_buffer, target_kind, first, &values);
+            return Ok(JsValue::Undefined);
+        }
+        // SetTypedArrayFromArrayLike (ECMA-262 23.2.3.26.2): the target must be in
+        // bounds, the source's length is checked against it before any element is
+        // read, and each element is read and then written in order.
+        let (_, _, _, target_length) = self.typed_array_host(receiver)?;
+        let source_object = self.to_object(&source)?;
+        let count = self.array_like_length(dom, source_object)?;
+        if offset == f64::INFINITY || count as f64 + offset > target_length as f64 {
             return Err(self.range_error("source is too large"));
         }
-        store_typed_elements(&buffer, kind, start + offset as usize, &values);
+        let first = offset as usize;
+        for index in 0..count {
+            let element = self.get_member(dom, source_object, &index.to_string())?;
+            self.typed_array_set_index(dom, receiver, first + index, &element)?;
+        }
         Ok(JsValue::Undefined)
     }
 
@@ -627,28 +626,11 @@ impl JsRuntime {
         kind: TypedArrayKind,
         arguments: &[JsValue],
     ) -> Result<ObjectId, JsError> {
-        // SpeciesConstructor (ECMA-262 7.3.22).
-        let default = self
-            .realm
-            .global(kind.name())
-            .and_then(|value| match value {
-                JsValue::Object(constructor) => Some(constructor),
-                _ => None,
-            });
-        let species = match self.get_member(dom, exemplar, "constructor")? {
-            JsValue::Undefined => default,
-            JsValue::Object(constructor) => {
-                match self.get_symbol_value(dom, constructor, &JsSymbol::well_known("@@species"))? {
-                    JsValue::Undefined | JsValue::Null => default,
-                    JsValue::Object(species) if self.is_constructor(species) => Some(species),
-                    _ => return Err(JsError::type_error("species is not a constructor")),
-                }
-            }
-            _ => return Err(JsError::type_error("constructor is not an object")),
-        };
-        let Some(species) = species else {
+        // SpeciesConstructor over the kind's intrinsic constructor (ECMA-262 7.3.22).
+        let Some(JsValue::Object(default)) = self.realm.global(kind.name()) else {
             return Err(JsError::type_error("no default typed-array constructor"));
         };
+        let species = self.species_constructor(dom, exemplar, default)?;
         // TypedArrayCreateFromConstructor (ECMA-262 23.2.4.2).
         let JsValue::Object(result) = self.construct(dom, species, arguments)? else {
             return Err(JsError::type_error(
@@ -681,8 +663,11 @@ impl JsRuntime {
         index: usize,
         value: &JsValue,
     ) -> Result<(), JsError> {
-        let (kind, buffer, start, length) = self.typed_array_parts(target)?;
+        // TypedArraySetElement (ECMA-262 10.4.5.16): the conversion runs first, and
+        // the index is checked against the view as it is afterwards.
+        let (kind, _, _, _) = self.typed_array_parts(target)?;
         let converted = self.typed_element_value(dom, kind, value)?;
+        let (_, buffer, start, length) = self.typed_array_parts(target)?;
         if length.is_some_and(|length| index < length) {
             buffer.set_converted_element(kind, start + index, &converted);
         }
@@ -1398,6 +1383,101 @@ impl JsRuntime {
             return Err(self.range_error("invalid typed array index"));
         }
         Ok(number as usize)
+    }
+
+    /// `GetPrototypeFromConstructor(newTarget, ...)` (ECMA-262 10.1.14) for a
+    /// built-in constructor: the `prototype` of the constructor `new` (or
+    /// `Reflect.construct`) was applied to, which is `constructor` itself unless a
+    /// subclass or an explicit new target says otherwise.
+    pub(in crate::runtime) fn new_target_prototype(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+    ) -> Result<Option<ObjectId>, JsError> {
+        let new_target = match self.new_target_stack.last() {
+            Some(JsValue::Object(target)) => *target,
+            _ => constructor,
+        };
+        match self.get_member(dom, new_target, "prototype")? {
+            JsValue::Object(prototype) => Ok(Some(prototype)),
+            // A `prototype` that is not an object selects the intrinsic default
+            // of `constructor` (ECMA-262 10.1.14 step 3).
+            _ => Ok(match self.realm.get_property(constructor, "prototype") {
+                Some(JsValue::Object(prototype)) => Some(prototype),
+                _ => None,
+            }),
+        }
+    }
+
+    /// `SpeciesConstructor(O, defaultConstructor)` (ECMA-262 7.3.22): the
+    /// `constructor` of `exemplar`, then its `@@species` when that is a constructor,
+    /// else `default`.
+    pub(in crate::runtime) fn species_constructor(
+        &mut self,
+        dom: &mut Dom,
+        exemplar: ObjectId,
+        default: ObjectId,
+    ) -> Result<ObjectId, JsError> {
+        let constructor = match self.get_member(dom, exemplar, "constructor")? {
+            JsValue::Undefined => return Ok(default),
+            JsValue::Object(constructor) => constructor,
+            _ => return Err(JsError::type_error("constructor is not an object")),
+        };
+        match self.get_symbol_value(dom, constructor, &JsSymbol::well_known("@@species"))? {
+            JsValue::Undefined | JsValue::Null => Ok(default),
+            JsValue::Object(species) if self.is_constructor(species) => Ok(species),
+            _ => Err(JsError::type_error("species is not a constructor")),
+        }
+    }
+
+    /// `TypedArraySetElement` (ECMA-262 10.4.5.16): the value converts first, and
+    /// the element is written only if `key` is still a valid index afterwards,
+    /// because a conversion may detach the buffer or shrink the view.
+    pub(in crate::runtime) fn typed_array_set_element(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &str,
+        value: &JsValue,
+    ) -> Result<(), JsError> {
+        let kind = match self.realm.host(object) {
+            Some(ObjectHost::TypedArray { kind, .. }) => kind,
+            _ => return Ok(()),
+        };
+        let converted = self.typed_element_value(dom, kind, value)?;
+        if let TypedKey::Element(index) = self.realm.typed_key(object, key) {
+            self.realm.typed_element_store(object, index, &converted);
+        }
+        Ok(())
+    }
+
+    /// `[[DefineOwnProperty]]` of a canonical numeric key on a typed array
+    /// (ECMA-262 10.4.5.3): the key must be a valid index, the descriptor may not
+    /// make the element non-configurable, non-enumerable, non-writable or an
+    /// accessor, and a value is written through `TypedArraySetElement`.
+    pub(in crate::runtime) fn typed_array_define_own_property(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        key: &str,
+        descriptor: &PartialDescriptor,
+    ) -> Result<bool, JsError> {
+        if !matches!(self.realm.typed_key(object, key), TypedKey::Element(_)) {
+            return Ok(false);
+        }
+        let accessor = !matches!(descriptor.get, AccessorField::Absent)
+            || !matches!(descriptor.set, AccessorField::Absent);
+        if accessor
+            || descriptor.configurable == Some(false)
+            || descriptor.enumerable == Some(false)
+            || descriptor.writable == Some(false)
+        {
+            return Ok(false);
+        }
+        if let Some(value) = &descriptor.value {
+            self.typed_array_set_element(dom, object, key, value)?;
+        }
+        Ok(true)
     }
 }
 

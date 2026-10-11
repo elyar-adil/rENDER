@@ -53,12 +53,11 @@ impl JsRuntime {
     /// The Set the method was called on. Any other receiver, including a Map,
     /// is a `TypeError`.
     fn set_receiver(&self, receiver: ObjectId) -> Result<ObjectId, JsError> {
-        let target = self.collection_target(receiver);
-        match self.realm.host(target) {
+        match self.realm.host_ref(receiver) {
             Some(ObjectHost::Collection {
                 kind: CollectionKind::Set,
                 ..
-            }) => Ok(target),
+            }) => Ok(receiver),
             _ => Err(JsError::type_error(
                 "Set method called on an incompatible receiver",
             )),

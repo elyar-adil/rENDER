@@ -428,20 +428,16 @@ impl JsRuntime {
         // §25.1.4.1 steps 2-3: `ToIndex(length)`, then the options.
         let length = usize_from(self.to_index_value(dom, arguments.first())?);
         let max_byte_length = self.array_buffer_max_option(dom, arguments.get(1))?;
-        // §25.1.3.1 AllocateArrayBuffer: a length past the maximum is refused
-        // before the object is created.
+        // §25.1.3.1 AllocateArrayBuffer: a length past the maximum is refused before
+        // the object is created.
         if max_byte_length.is_some_and(|max| length > max) {
             return Err(self.range_error("ArrayBuffer length exceeds maxByteLength"));
         }
-        let prototype = self
-            .realm
-            .get_property(constructor, "prototype")
-            .and_then(|value| match value {
-                JsValue::Object(object) => Some(object),
-                _ => None,
-            });
-        // CreateByteDataBlock runs after the object exists (§25.1.3.1 step 5),
-        // and a size the engine cannot hold is a RangeError.
+        // Step 2: the object is created with the prototype of newTarget
+        // (GetPrototypeFromConstructor), so a getter there runs at this point.
+        let prototype = self.new_target_prototype(dom, constructor)?;
+        // CreateByteDataBlock runs after the object exists, and a size the engine
+        // cannot hold is a RangeError.
         if length > Self::MAX_TYPED_ARRAY_ELEMENTS
             || max_byte_length.is_some_and(|max| max > Self::MAX_TYPED_ARRAY_ELEMENTS)
         {
@@ -665,18 +661,51 @@ impl JsRuntime {
             reason = "both bounds are clamped into 0..=total"
         )]
         // The conversions above can run user code, and that code may detach the
-        // buffer before the copy is made.
+        // buffer before the result is made.
         buffer.ensure_attached()?;
-        let (start, end) = (start as usize, end as usize);
-        let copied = buffer.read_bytes(start.min(end), end - start.min(end))?;
-        let prototype = self.realm.get_prototype(receiver);
-        let copy = if shared {
-            TypedBuffer::new_shared(copied, None)
+        // §25.1.6.7 steps 8-9: the result is `newLen` bytes, from
+        // SpeciesConstructor(O, %ArrayBuffer%) or %SharedArrayBuffer%.
+        let new_length = (end - start).max(0.0);
+        let default_name = if shared {
+            "SharedArrayBuffer"
         } else {
-            TypedBuffer::new(copied)
+            "ArrayBuffer"
         };
-        let object = self.new_array_buffer(prototype, &copy)?;
-        Ok(JsValue::Object(object))
+        let Some(JsValue::Object(default)) = self.realm.global(default_name) else {
+            return Err(JsError::type_error("no default buffer constructor"));
+        };
+        let constructor = self.species_constructor(dom, receiver, default)?;
+        let JsValue::Object(created) =
+            self.construct(dom, constructor, &[JsValue::Number(new_length)])?
+        else {
+            return Err(JsError::type_error(
+                "slice species constructor returned a non-object",
+            ));
+        };
+        // Steps 11-14: the result is a buffer of the same kind, attached, distinct
+        // from the receiver, and at least `newLen` bytes long.
+        let created_buffer = self.buffer_host(created, shared, "slice")?;
+        created_buffer.ensure_attached()?;
+        if created == receiver {
+            return Err(JsError::type_error(
+                "slice species constructor returned the receiver",
+            ));
+        }
+        if (created_buffer.byte_length() as f64) < new_length {
+            return Err(JsError::type_error(
+                "slice species constructor returned a smaller buffer",
+            ));
+        }
+        // Steps 16-18: the receiver may have been detached while the constructor
+        // ran, and the bytes are copied from it as it is then.
+        buffer.ensure_attached()?;
+        let current = buffer.byte_length() as f64;
+        if start < current {
+            let count = new_length.min(current - start);
+            let copied = buffer.read_bytes(start as usize, count as usize)?;
+            created_buffer.write_bytes(0, &copied);
+        }
+        Ok(JsValue::Object(created))
     }
 
     /// Reads one `DataView` method: `GetViewValue` (§25.2.1.5) for a getter, and
