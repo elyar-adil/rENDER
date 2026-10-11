@@ -1069,6 +1069,7 @@ impl Parser {
             in_parameters: false,
             super_property_allowed: false,
             super_call_allowed: false,
+            new_target_allowed: false,
             labels: Vec::new(),
             static_block: false,
             static_block_await: false,
@@ -1116,6 +1117,10 @@ struct Parser {
     /// `super(...)` is valid only in the constructor of a derived class, and in
     /// arrows nested in it (ECMA-262 13.3.7.1, 15.7.1).
     super_call_allowed: bool,
+    /// `new.target` is valid in an ordinary function, a class field initializer or
+    /// a static block, and in arrows nested in them, since an arrow has no
+    /// `new.target` of its own (ECMA-262 13.3.12.1).
+    new_target_allowed: bool,
     /// The labels enclosing the statement being parsed, innermost last, with
     /// whether each labels an iteration statement (`break`/`continue` targets).
     labels: Vec<(String, bool)>,
@@ -3480,8 +3485,8 @@ impl Parser {
                 }
                 // `new.target` is only valid in function code, eval code
                 // contained in a function, and class field/static-block
-                // initializers.
-                if self.function_depth == 0 && self.private_references.is_empty() {
+                // initializers (ECMA-262 13.3.12.1).
+                if !self.new_target_allowed {
                     return Err(self.error("new.target is only allowed inside functions"));
                 }
                 return self.postfix_tail(Expr::NewTarget);
@@ -4260,6 +4265,7 @@ impl Parser {
             .clone_from(&self.private_references);
         parser.super_property_allowed = self.super_property_allowed;
         parser.super_call_allowed = self.super_call_allowed;
+        parser.new_target_allowed = self.new_target_allowed;
         parser.function_depth = self.function_depth;
         parser.module = self.module.as_ref().map(|_| ModuleInfo::default());
         let expression = parser.expression()?;
@@ -4349,17 +4355,19 @@ impl Parser {
         Ok(body)
     }
 
-    /// Parse a class field initializer or static block: `super.name` is valid
-    /// there, and `super()` is not (ECMA-262 15.7.1).
+    /// Parse a class field initializer or static block: `super.name` and
+    /// `new.target` are valid there, and `super()` is not (ECMA-262 15.7.1).
     fn with_super_property<T>(
         &mut self,
         parse: impl FnOnce(&mut Self) -> Result<T, JsError>,
     ) -> Result<T, JsError> {
         let previous_property = std::mem::replace(&mut self.super_property_allowed, true);
         let previous_call = std::mem::replace(&mut self.super_call_allowed, false);
+        let previous_new_target = std::mem::replace(&mut self.new_target_allowed, true);
         let result = parse(self);
         self.super_property_allowed = previous_property;
         self.super_call_allowed = previous_call;
+        self.new_target_allowed = previous_new_target;
         result
     }
 
@@ -4398,10 +4406,12 @@ impl Parser {
         let previous_switch_depth = std::mem::replace(&mut self.switch_depth, 0);
         let previous_static_block = std::mem::replace(&mut self.static_block, false);
         let previous_static_await = std::mem::replace(&mut self.static_block_await, false);
+        let previous_new_target = std::mem::replace(&mut self.new_target_allowed, true);
         let result = self.function_tail_inner(super_call);
         self.in_async = previous_async;
         self.in_generator = previous_generator;
         self.in_parameters = previous_parameters;
+        self.new_target_allowed = previous_new_target;
         self.super_property_allowed = previous_super_property;
         self.super_call_allowed = previous_super_call;
         self.labels = previous_labels;
@@ -6650,6 +6660,19 @@ mod tests {
         ));
         assert!(script_is_syntax_error(
             "class C { static { try {} catch (await) {} } }"
+        ));
+    }
+
+    #[test]
+    fn new_target_needs_an_ordinary_function_or_a_class_initializer() {
+        assert!(script_is_syntax_error("() => { new.target; };"));
+        assert!(script_is_syntax_error("new.target;"));
+        assert!(!script_is_syntax_error(
+            "function f() { () => new.target; }"
+        ));
+        assert!(!script_is_syntax_error("class C { x = new.target; }"));
+        assert!(!script_is_syntax_error(
+            "class C { static { new.target; } }"
         ));
     }
 
