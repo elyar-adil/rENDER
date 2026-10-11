@@ -2995,3 +2995,25 @@ fn a_var_deleted_during_its_own_initializer_is_created_again() {
         "true"
     );
 }
+
+#[test]
+fn a_script_cannot_declare_a_global_function_the_global_object_refuses() {
+    // ECMA-262 16.1.7 GlobalDeclarationInstantiation steps 16 and 17: a function
+    // or var that CanDeclareGlobalFunction or CanDeclareGlobalVar refuses throws a
+    // TypeError, and no binding of the script is created.
+    assert_eq!(
+        ok(
+            "Object.defineProperty(this, 'frozenData', { value: 0, writable: false, enumerable: false, configurable: false });
+             var outcome = []; try { eval('var pending; function frozenData() {}'); } catch (e) { outcome.push(e.constructor.name); }
+             outcome.push(typeof pending); outcome.join()"
+        ),
+        "TypeError,undefined"
+    );
+    // A writable, enumerable, non-configurable data property can take the function.
+    assert_eq!(
+        ok(
+            "Object.defineProperty(this, 'sealedGlobal', { value: 1, writable: true, enumerable: true, configurable: false }); eval('function sealedGlobal() {}'); typeof sealedGlobal"
+        ),
+        "function"
+    );
+}

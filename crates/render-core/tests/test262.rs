@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, mpsc};
@@ -910,6 +910,7 @@ fn run_variant(
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
     let mut runtime = JsRuntime::new(&document.dom);
+    runtime.set_module_loader(module_loader(test_directory(relative_path)));
     if !raw
         && let Err(detail) = install_harness(&mut runtime, &mut document.dom, &metadata.includes)
     {
@@ -968,6 +969,7 @@ fn run_async_variant(
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
     let mut runtime = JsRuntime::new(&document.dom);
+    runtime.set_module_loader(module_loader(test_directory(relative_path)));
     let shim = CompiledScript::compile(PRINT_SHIM, &RuntimeLimits::default())
         .expect("print shim compiles");
     if let Err(error) = runtime.execute_compiled(&mut document.dom, &shim) {
@@ -1048,21 +1050,67 @@ fn default_harness_sources() -> io::Result<Vec<String>> {
         .collect()
 }
 
-/// The `$262` host object (INTERPRETING.md, "Host-defined functions"). Only the
-/// member the measured directories use is provided: `detachArrayBuffer`.
+/// The directory of a test, which is where its `import()` specifiers start.
+fn test_directory(relative_path: &str) -> PathBuf {
+    let test_path = Path::new(TEST262_ROOT).join("test").join(relative_path);
+    test_path
+        .parent()
+        .map_or_else(|| PathBuf::from(TEST262_ROOT), Path::to_path_buf)
+}
+
+/// The host's module loader for the runner: a specifier resolves against the
+/// directory of the module that imports it, or against the test's directory when a
+/// script imports. Module source comes from the pinned test262 tree.
+fn module_loader(
+    test_directory: PathBuf,
+) -> impl Fn(&str, &str) -> Result<(String, String), String> + 'static {
+    move |specifier: &str, referrer: &str| {
+        let base = if referrer.is_empty() {
+            test_directory.clone()
+        } else {
+            Path::new(referrer)
+                .parent()
+                .map_or_else(|| test_directory.clone(), Path::to_path_buf)
+        };
+        let path = normalized(&base.join(specifier));
+        let source = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        Ok((path.to_string_lossy().into_owned(), source))
+    }
+}
+
+/// `path` with its `.` and `..` components resolved, without touching the disk.
+fn normalized(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::CurDir => {}
+            other => normal.push(other.as_os_str()),
+        }
+    }
+    normal
+}
+
+/// The `$262` host object of the current realm (INTERPRETING.md, "Host-defined
+/// functions"): `detachArrayBuffer`, `createRealm`, `evalScript` and `global`.
+/// Each realm gets its own, so a realm made by `createRealm` has one too.
 fn install_test262_host(
     runtime: &mut JsRuntime,
     dom: &mut render_core::dom::Dom,
 ) -> Result<(), String> {
-    let script = CompiledScript::compile("var $262 = {};", &RuntimeLimits::default())
+    let script = CompiledScript::compile("var $262 = { global: this };", &RuntimeLimits::default())
         .map_err(|error| error.message().to_owned())?;
     runtime
-        .execute_compiled(dom, &script)
+        .execute_nested(dom, &script)
         .map_err(|error| error.message().to_owned())?;
     let Some(JsValue::Object(host)) = runtime.realm().global("$262") else {
         return Err("the $262 host object is not defined".to_owned());
     };
     runtime.define_host_function(host, "detachArrayBuffer", detach_array_buffer_host);
+    runtime.define_host_function(host, "createRealm", create_realm_host);
+    runtime.define_host_function(host, "evalScript", eval_script_host);
     Ok(())
 }
 
@@ -1073,6 +1121,42 @@ fn detach_array_buffer_host(
 ) -> Result<JsValue, JsError> {
     runtime.detach_array_buffer(arguments.first().unwrap_or(&JsValue::Undefined))?;
     Ok(JsValue::Undefined)
+}
+
+/// `$262.createRealm()`: a new realm with its own global object, whose `$262`
+/// is returned. The new realm's `$262` is installed while it is current, so
+/// its functions belong to that realm.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "a host function is a HostFunction, which returns a Result"
+)]
+fn create_realm_host(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+    _arguments: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let realm = runtime.create_realm(dom);
+    runtime
+        .with_realm(realm, |runtime| install_test262_host(runtime, dom))
+        .expect("the $262 host installs in a fresh realm");
+    Ok(runtime
+        .with_realm(realm, |runtime| runtime.realm().global("$262"))
+        .unwrap_or(JsValue::Undefined))
+}
+
+/// `$262.evalScript(source)`: runs `source` as a script in the realm of the
+/// `evalScript` function. A parse error is a `SyntaxError` of that realm.
+fn eval_script_host(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+    arguments: &[JsValue],
+) -> Result<JsValue, JsError> {
+    let source = arguments.first().map_or_else(
+        || "undefined".to_owned(),
+        |value| value.to_js_string().to_lossy(),
+    );
+    let script = CompiledScript::compile(&source, &RuntimeLimits::default())?;
+    Ok(runtime.execute_nested(dom, &script)?.value)
 }
 
 fn install_harness(

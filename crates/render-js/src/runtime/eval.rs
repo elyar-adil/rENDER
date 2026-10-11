@@ -529,6 +529,27 @@ impl JsRuntime {
             ));
         }
 
+        // GlobalDeclarationInstantiation steps 16 and 17 (ECMA-262 16.1.7): at the
+        // top level of a script, a function or var that the global object cannot
+        // take throws before any binding is created.
+        if self.environment.is_empty() {
+            if let Some((name, ..)) = functions
+                .iter()
+                .find(|(name, ..)| !self.can_declare_global_function(name))
+            {
+                return Err(JsError::type_error(format!(
+                    "cannot declare the global function {name:?}"
+                )));
+            }
+            if let Some(name) = var_names
+                .iter()
+                .find(|name| !self.can_declare_global_var(name))
+            {
+                return Err(JsError::type_error(format!(
+                    "cannot declare the global variable {name:?}"
+                )));
+            }
+        }
         for (name, kind) in lexical_declarations {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
@@ -2425,7 +2446,7 @@ impl JsRuntime {
     fn delete_global_name(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
         // A name in the global declarative record is not deletable (ECMA-262
         // 9.1.1.4.7).
-        if self.global_bindings.contains_key(name) {
+        if self.global_bindings().contains_key(name) {
             return Ok(JsValue::Boolean(false));
         }
         // An unresolvable reference deletes to true (ECMA-262 13.5.1.2 step 3); a
@@ -3803,7 +3824,7 @@ impl JsRuntime {
     ) -> Result<(), JsError> {
         let mutable = !kind.is_immutable();
         if self.environment.is_empty() {
-            if let Some(existing) = self.global_bindings.get(name) {
+            if let Some(existing) = self.global_bindings().get(name) {
                 if kind == VariableKind::Var && existing.kind == VariableKind::Var {
                     return Ok(());
                 }
@@ -3844,7 +3865,7 @@ impl JsRuntime {
                     "global property {name:?} is not writable"
                 )));
             }
-            self.global_bindings.insert(
+            self.global_bindings_mut().insert(
                 name.to_owned(),
                 GlobalBinding {
                     mutable,
@@ -3955,7 +3976,7 @@ impl JsRuntime {
                 return Ok(());
             }
         }
-        if let Some(binding) = self.global_bindings.get_mut(name) {
+        if let Some(binding) = self.global_bindings_mut().get_mut(name) {
             if binding.initialized && kind != VariableKind::Var {
                 return Err(JsError::syntax(
                     format!("global binding {name:?} is already initialized"),
@@ -4118,7 +4139,7 @@ impl JsRuntime {
     }
 
     fn read_global_binding(&self, name: &str) -> Result<JsValue, JsError> {
-        if let Some(binding) = self.global_bindings.get(name)
+        if let Some(binding) = self.global_bindings().get(name)
             && !binding.initialized
         {
             return Err(JsError::reference(format!(
@@ -4193,7 +4214,7 @@ impl JsRuntime {
     }
 
     fn write_global_binding(&mut self, name: &str, value: JsValue) -> Result<(), JsError> {
-        if let Some(binding) = self.global_bindings.get(name) {
+        if let Some(binding) = self.global_bindings().get(name) {
             if !binding.initialized {
                 return Err(JsError::reference(format!(
                     "cannot access {name} before initialization"
@@ -4233,7 +4254,7 @@ impl JsRuntime {
     /// Whether `name` is bound in the global environment (its global
     /// bindings or the global object).
     fn global_name_exists(&self, name: &str) -> bool {
-        self.global_bindings.contains_key(name) || self.realm.global(name).is_some()
+        self.global_bindings().contains_key(name) || self.realm.global(name).is_some()
     }
 
     /// `with (object) body` (ECMA-262 14.11.2): the body runs in an object
@@ -5189,6 +5210,7 @@ impl JsRuntime {
                 | ObjectHost::ErrorConstructor(_)
                 | ObjectHost::AggregateErrorConstructor
                 | ObjectHost::SuppressedErrorConstructor
+                | ObjectHost::ShadowRealmConstructor
                 | ObjectHost::DisposableStackConstructor(_)
                 | ObjectHost::TemporalConstructor(_)
                 | ObjectHost::PromiseConstructor
@@ -5237,6 +5259,23 @@ impl JsRuntime {
     }
 
     pub(super) fn construct(
+        &mut self,
+        dom: &mut Dom,
+        constructor: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let target_realm = self.realm.object_realm(constructor);
+        if target_realm == self.realm.current_realm() {
+            return self.construct_in_current_realm(dom, constructor, arguments);
+        }
+        let previous_realm = self.realm.enter_realm(target_realm);
+        let result = self.construct_in_current_realm(dom, constructor, arguments);
+        let result = self.thrown_in_current_realm(result);
+        self.realm.enter_realm(previous_realm);
+        result
+    }
+
+    fn construct_in_current_realm(
         &mut self,
         dom: &mut Dom,
         constructor: ObjectId,
@@ -5431,6 +5470,9 @@ impl JsRuntime {
                 self.response_constructor(constructor, arguments)
             }
             Some(ObjectHost::BlobConstructor) => self.blob_constructor(dom, constructor, arguments),
+            Some(ObjectHost::ShadowRealmConstructor) => {
+                self.shadow_realm_construct(dom, &new_target)
+            }
             Some(ObjectHost::ProxyConstructor) => self.proxy_constructor(constructor, arguments),
             Some(ObjectHost::IntersectionObserverConstructor) => {
                 self.intersection_observer_constructor(dom, constructor, arguments)
@@ -5621,11 +5663,52 @@ impl JsRuntime {
         self.call_with_this(dom, callee, arguments, JsValue::Undefined)
     }
 
+    /// [[Call]] of `callee` with `receiver` as `this`. The call runs in the
+    /// callee's realm: its [[Realm]] becomes the realm of the running execution
+    /// context (ECMA-262 9.3.3 and 9.4). An error that leaves that realm is
+    /// materialized there, as an exception of the realm that raised it.
+    pub(super) fn call_with_this(
+        &mut self,
+        dom: &mut Dom,
+        callee: ObjectId,
+        arguments: &[JsValue],
+        receiver: JsValue,
+    ) -> Result<JsValue, JsError> {
+        let target_realm = self.realm.object_realm(callee);
+        if target_realm == self.realm.current_realm() {
+            return self.call_in_current_realm(dom, callee, arguments, receiver);
+        }
+        let previous_realm = self.realm.enter_realm(target_realm);
+        let result = self.call_in_current_realm(dom, callee, arguments, receiver);
+        let result = self.thrown_in_current_realm(result);
+        self.realm.enter_realm(previous_realm);
+        result
+    }
+
+    /// Turns an error that is about to leave the current realm into the
+    /// realm's own thrown value (a standard error is created in this realm), so
+    /// the caller sees the exception the callee's realm raised.
+    fn thrown_in_current_realm(
+        &mut self,
+        result: Result<JsValue, JsError>,
+    ) -> Result<JsValue, JsError> {
+        match result {
+            Err(error)
+                if error.thrown_value().is_none()
+                    && !matches!(error.kind(), JsErrorKind::Throw) =>
+            {
+                let value = self.error_to_thrown_value(&error)?;
+                Err(JsError::thrown_with_message(value, error.message()))
+            }
+            other => other,
+        }
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "call dispatch covers all callable host variants"
     )]
-    pub(super) fn call_with_this(
+    fn call_in_current_realm(
         &mut self,
         dom: &mut Dom,
         callee: ObjectId,
@@ -5823,6 +5906,18 @@ impl JsRuntime {
                 Ok(JsValue::Boolean(
                     self.ordinary_has_instance(dom, &receiver, &value)?,
                 ))
+            }
+            Some(ObjectHost::ShadowRealmConstructor) => Err(JsError::type_error(
+                "ShadowRealm constructor requires 'new'",
+            )),
+            Some(ObjectHost::NativeFunction(NativeFunction::ShadowRealmEvaluate)) => {
+                self.shadow_realm_evaluate(dom, &receiver, arguments)
+            }
+            Some(ObjectHost::NativeFunction(NativeFunction::ShadowRealmImportValue)) => {
+                self.shadow_realm_import_value(dom, &receiver, arguments)
+            }
+            Some(ObjectHost::WrappedFunction(target)) => {
+                self.call_wrapped_function(dom, target, arguments, receiver)
             }
             Some(ObjectHost::NativeFunction(NativeFunction::FunctionCall)) => {
                 self.function_call(dom, &receiver, arguments)

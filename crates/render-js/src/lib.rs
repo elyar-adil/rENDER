@@ -27,7 +27,7 @@ pub use runtime::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
     JsMicrotask, JsRuntime, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
 };
-pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm};
+pub use value::{JsObject, JsSymbol, JsValue, ObjectId, PropertyDescriptor, Realm, RealmId};
 
 use parser::Statement;
 

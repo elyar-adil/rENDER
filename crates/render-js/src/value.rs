@@ -91,7 +91,7 @@ impl JsSymbol {
     }
 
     #[must_use]
-    pub const fn id(&self) -> u64 {
+    pub fn id(&self) -> u64 {
         self.id
     }
 
@@ -261,7 +261,7 @@ impl PropertyDescriptor {
     /// Accessor properties carry function objects in the getter/setter
     /// slots and never use the value slot.
     #[must_use]
-    pub const fn is_accessor(&self) -> bool {
+    pub fn is_accessor(&self) -> bool {
         self.getter.is_some() || self.setter.is_some()
     }
 }
@@ -1114,6 +1114,8 @@ pub(crate) enum NativeFunction {
     ReflectPreventExtensions,
     ProxyRevocable,
     ProxyRevoke,
+    ShadowRealmEvaluate,
+    ShadowRealmImportValue,
     ResponseText,
     ResponseJson,
     ResponseHeadersGet,
@@ -2208,6 +2210,13 @@ pub(crate) enum ObjectHost {
     },
     BlobConstructor,
     ProxyConstructor,
+    /// The `ShadowRealm` constructor (`ShadowRealm` proposal).
+    ShadowRealmConstructor,
+    /// A `ShadowRealm` instance: the realm it owns, its `[[ShadowRealm]]` slot.
+    ShadowRealm(RealmId),
+    /// A wrapped function (`ShadowRealm` proposal): calling it calls `target`, which
+    /// lives in another realm, with the values wrapped across the boundary.
+    WrappedFunction(ObjectId),
     /// A Proxy exotic object. `handler` is `None` once the proxy is revoked;
     /// `target` stays so the proxy keeps the callability it was created with.
     Proxy {
@@ -2231,7 +2240,7 @@ impl ObjectHost {
     /// `typeof` - and the two copies had drifted in the same direction, which
     /// is how four installed constructors came to report `typeof` `"object"`.
     /// One function cannot drift from itself, so this is the one.
-    pub(crate) const fn is_callable(&self) -> bool {
+    pub(crate) fn is_callable(&self) -> bool {
         matches!(
             self,
             Self::NativeFunction(_)
@@ -2265,6 +2274,8 @@ impl ObjectHost {
                 | Self::ResponseConstructor
                 | Self::BlobConstructor
                 | Self::ProxyConstructor
+                | Self::ShadowRealmConstructor
+                | Self::WrappedFunction(_)
                 | Self::IntersectionObserverConstructor
                 | Self::CollectionConstructor(_)
                 | Self::TypedArrayConstructor(_)
@@ -2412,6 +2423,9 @@ pub struct JsObject {
     /// prototypes and constructors). Instance lookup walks the prototype
     /// chain, mirroring how private methods are reachable from derived code.
     private_methods: BTreeMap<u64, PropertyDescriptor>,
+    /// The realm this object was created in: its [[Realm]] slot for a function,
+    /// which is the realm a call of the function runs in (ECMA-262 9.3.3).
+    realm: RealmId,
 }
 
 impl Default for JsObject {
@@ -2425,6 +2439,7 @@ impl Default for JsObject {
             extensible: true,
             private_fields: BTreeMap::new(),
             private_methods: BTreeMap::new(),
+            realm: RealmId::default(),
         }
     }
 }
@@ -2436,7 +2451,7 @@ impl JsObject {
     }
 
     #[must_use]
-    pub const fn prototype(&self) -> Option<ObjectId> {
+    pub fn prototype(&self) -> Option<ObjectId> {
         self.prototype
     }
 
@@ -2492,10 +2507,16 @@ impl JsObject {
     }
 }
 
-/// Global state and object identity for one JavaScript realm.
+/// Identity of one realm (ECMA-262 9.3) on an agent's heap. `RealmId(0)` is the
+/// page's realm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RealmId(pub(crate) usize);
+
+/// The objects a realm's global environment and intrinsics name, held in one
+/// record per realm. Every realm of an agent shares the one object heap in
+/// [`Realm`], so an object created in one realm can be used from another.
 #[derive(Debug)]
-pub struct Realm {
-    objects: Vec<JsObject>,
+pub struct RealmRecord {
     global: ObjectId,
     document: ObjectId,
     object_prototype: ObjectId,
@@ -2536,6 +2557,8 @@ pub struct Realm {
     disposable_stack_prototype: ObjectId,
     async_disposable_stack_prototype: ObjectId,
     suppressed_error_prototype: ObjectId,
+    /// `%ShadowRealm.prototype%` (`ShadowRealm` proposal), the prototype of every `ShadowRealm`.
+    pub(crate) shadow_realm_prototype: ObjectId,
     /// `%Temporal.<class>.prototype%` for each class that has instances. The
     /// intrinsics are rooted in `gc_identity_roots`, like the stack prototypes.
     pub(crate) temporal_prototypes: BTreeMap<TemporalKind, ObjectId>,
@@ -2551,36 +2574,164 @@ pub struct Realm {
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
     dataset_wrappers: BTreeMap<NodeId, ObjectId>,
+}
+
+/// The objects that the browser host's globals contribute to a realm's record.
+/// A realm without the host globals (one from `CreateRealm`) gets inert
+/// placeholders that no script can reach.
+struct HostIntrinsics {
+    element_prototype: ObjectId,
+    dom_prototypes: BTreeMap<&'static str, ObjectId>,
+    storage_prototype: ObjectId,
+    media_query_list_prototype: ObjectId,
+}
+
+impl HostIntrinsics {
+    fn placeholders(objects: &mut Vec<JsObject>, object_prototype: ObjectId) -> Self {
+        let mut placeholder = || {
+            let id = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(object_prototype),
+                ..JsObject::default()
+            });
+            id
+        };
+        Self {
+            element_prototype: placeholder(),
+            dom_prototypes: BTreeMap::new(),
+            storage_prototype: placeholder(),
+            media_query_list_prototype: placeholder(),
+        }
+    }
+}
+
+/// The object heap of an agent together with its realms. Realm-specific state
+/// lives in a [`RealmRecord`]; the current realm (the one the running
+/// execution context uses, ECMA-262 9.4) is reached through `Deref`, so the
+/// intrinsics read the same way whichever realm is current.
+#[derive(Debug)]
+pub struct Realm {
+    objects: Vec<JsObject>,
+    /// Every realm of this agent, indexed by [`RealmId`].
+    realms: Vec<RealmRecord>,
+    current: RealmId,
     /// Number of object slots that became garbage and were swept. Object
     /// identities are never moved or reused, so a swept slot always reads as
     /// an empty ordinary object even if some bookkeeping still references it.
     swept_objects: usize,
 }
 
+impl std::ops::Deref for Realm {
+    type Target = RealmRecord;
+
+    fn deref(&self) -> &RealmRecord {
+        &self.realms[self.current.0]
+    }
+}
+
+impl std::ops::DerefMut for Realm {
+    fn deref_mut(&mut self) -> &mut RealmRecord {
+        &mut self.realms[self.current.0]
+    }
+}
+
 impl Realm {
+    /// Makes `realm` the current realm and returns the one that was current.
+    pub(crate) fn enter_realm(&mut self, realm: RealmId) -> RealmId {
+        std::mem::replace(&mut self.current, realm)
+    }
+
+    /// The current realm.
+    pub(crate) fn current_realm(&self) -> RealmId {
+        self.current
+    }
+
+    /// The [[Realm]] of an object: the realm it was created in (ECMA-262 9.1.x
+    /// `[[Realm]]` slots). It selects the intrinsics a call of the object runs
+    /// with.
+    pub(crate) fn object_realm(&self, object: ObjectId) -> RealmId {
+        self.objects
+            .get(object.0)
+            .map_or(self.current, |object| object.realm)
+    }
+
+    /// The record of `realm`, for intrinsics of a realm that is not current.
+    pub(crate) fn record(&self, realm: RealmId) -> &RealmRecord {
+        &self.realms[realm.0]
+    }
+
+    /// Allocates a wrapped function (`ShadowRealm` proposal, `WrappedFunctionCreate`)
+    /// whose [[Realm]] is `realm`, so its prototype is that realm's
+    /// `%Function.prototype%`.
+    pub(crate) fn create_wrapped_function(&mut self, realm: RealmId, target: ObjectId) -> ObjectId {
+        let prototype = self.realms[realm.0].function_prototype;
+        let id = ObjectId(self.objects.len());
+        self.objects.push(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::WrappedFunction(target),
+            realm,
+            ..JsObject::default()
+        });
+        id
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "bootstrap installs every builtin in one explicit sequence"
     )]
+    /// Builds the page's realm: its heap, intrinsics and global object, with
+    /// the browser host's globals (ECMA-262 9.3, HTML, CSSOM).
     pub(crate) fn bootstrap(document_node: NodeId, document_url: &Url) -> Self {
-        let mut objects = vec![JsObject::default()];
-        let global = ObjectId(0);
+        let mut objects = Vec::new();
+        let record = Self::install_intrinsics(&mut objects, Some((document_node, document_url)));
+        let mut realm = Self {
+            objects,
+            realms: vec![record],
+            current: RealmId(0),
+            swept_objects: 0,
+        };
+        realm.install_temporal();
+        realm
+    }
+
+    /// `CreateRealm()` (ECMA-262 9.3.1) on this heap: a realm with the
+    /// ECMAScript intrinsics and a global object that carries only the
+    /// ECMAScript globals (`SetDefaultGlobalBindings`), so no page state is
+    /// reachable from it. The new realm is current while its Temporal namespace
+    /// is built; the previous current realm is restored afterwards.
+    pub(crate) fn create_realm(&mut self) -> RealmId {
+        let id = RealmId(self.realms.len());
+        let base = self.objects.len();
+        let record = Self::install_intrinsics(&mut self.objects, None);
+        for object in &mut self.objects[base..] {
+            object.realm = id;
+        }
+        self.realms.push(record);
+        let previous = self.enter_realm(id);
+        self.install_temporal();
+        self.enter_realm(previous);
+        id
+    }
+
+    /// Installs the intrinsics and global object of one realm into `objects`.
+    /// `host` is the page's document and URL; only the page's realm gets the
+    /// host globals (`install_host_globals`).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "bootstrap installs every builtin in one explicit sequence"
+    )]
+    fn install_intrinsics(
+        objects: &mut Vec<JsObject>,
+        host: Option<(NodeId, &Url)>,
+    ) -> RealmRecord {
+        let base = objects.len();
+        let global = ObjectId(base);
+        objects.push(JsObject::default());
+        let document = ObjectId(objects.len());
         objects.push(JsObject {
-            host: ObjectHost::Document(document_node),
+            host: host.map_or(ObjectHost::Ordinary, |(node, _)| ObjectHost::Document(node)),
             ..JsObject::default()
         });
-        let document = ObjectId(1);
-        objects[global.0].properties.insert(
-            "document".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Object(document),
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            },
-        );
         for (name, value) in [
             ("NaN", JsValue::Number(f64::NAN)),
             ("Infinity", JsValue::Number(f64::INFINITY)),
@@ -2598,6 +2749,258 @@ impl Realm {
                 },
             );
         }
+        // ECMA-262 19.1: `globalThis` is a writable, configurable data property.
+        objects[global.0].properties.insert(
+            "globalThis".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(global)),
+        );
+        let object_prototype = Self::install_object(objects, global);
+        let function_prototype = Self::install_function(objects, global, object_prototype);
+        // §20.1.1: `Object` is a built-in function, so its [[Prototype]] is
+        // `%Function.prototype%`; the constructor exists only once `install_object` ran.
+        if let Some(JsValue::Object(object_constructor)) = objects[global.0]
+            .properties
+            .get("Object")
+            .map(|descriptor| descriptor.value.clone())
+        {
+            objects[object_constructor.0].prototype = Some(function_prototype);
+        }
+        let error_prototype =
+            Self::install_errors(objects, global, object_prototype, function_prototype);
+        let string_prototype =
+            Self::install_string(objects, global, object_prototype, function_prototype);
+        let regexp_prototype =
+            Self::install_regexp(objects, global, object_prototype, function_prototype);
+
+        let number_primitive_prototype =
+            Self::install_number(objects, global, object_prototype, function_prototype);
+        let boolean_primitive_prototype =
+            Self::install_boolean(objects, global, object_prototype, function_prototype);
+        let date_prototype =
+            Self::install_date(objects, global, object_prototype, function_prototype);
+        let symbol_prototype =
+            Self::install_symbol(objects, global, object_prototype, function_prototype);
+        let bigint_prototype =
+            Self::install_bigint(objects, global, object_prototype, function_prototype);
+        Self::install_math(objects, global, object_prototype);
+        let (promise_constructor, promise_prototype) = Self::install_promise(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            error_prototype,
+        );
+        let suppressed_error_prototype =
+            Self::install_suppressed_error(objects, global, function_prototype, error_prototype);
+        let shadow_realm_prototype =
+            Self::install_shadow_realm(objects, global, object_prototype, function_prototype);
+        let disposable_stack_prototype = Self::install_disposable_stack(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            DisposeStackKind::Sync,
+        );
+        let async_disposable_stack_prototype = Self::install_disposable_stack(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            DisposeStackKind::Async,
+        );
+        let array_prototype =
+            Self::install_array(objects, global, object_prototype, function_prototype);
+        let (iterator_prototype, iterator_helper_prototype, iterator_wrap_prototype) =
+            Self::install_iterator(objects, global, object_prototype, function_prototype);
+        let regexp_string_iterator_prototype =
+            Self::install_regexp_string_iterator(objects, iterator_prototype, function_prototype);
+        let generator_prototype =
+            Self::install_generator(objects, function_prototype, iterator_prototype);
+        let (
+            async_generator_prototype,
+            async_from_sync_iterator_prototype,
+            async_generator_function_prototype,
+        ) = Self::install_async_iteration(objects, object_prototype, function_prototype);
+        Self::install_collections(objects, global, object_prototype, function_prototype);
+        Self::install_typed_arrays(objects, global, object_prototype, function_prototype);
+        Self::install_binary_data(objects, global, object_prototype, function_prototype);
+        Self::install_atomics(objects, global, object_prototype, function_prototype);
+        Self::install_json(objects, global, object_prototype, function_prototype);
+        Self::install_proxy_reflect(objects, global, object_prototype, function_prototype);
+        for (name, function) in [
+            ("parseInt", NativeFunction::GlobalParseInt),
+            ("parseFloat", NativeFunction::GlobalParseFloat),
+            ("isNaN", NativeFunction::GlobalIsNaN),
+            ("isFinite", NativeFunction::GlobalIsFinite),
+            ("encodeURI", NativeFunction::GlobalEncodeURI),
+            (
+                "encodeURIComponent",
+                NativeFunction::GlobalEncodeURIComponent,
+            ),
+            ("decodeURI", NativeFunction::GlobalDecodeURI),
+            (
+                "decodeURIComponent",
+                NativeFunction::GlobalDecodeURIComponent,
+            ),
+            ("escape", NativeFunction::GlobalEscape),
+            ("unescape", NativeFunction::GlobalUnescape),
+            ("eval", NativeFunction::GlobalEval),
+        ] {
+            Self::define_global_function(objects, global, name, function);
+        }
+        let host_intrinsics = match host {
+            Some((_, document_url)) => Self::install_host_globals(
+                objects,
+                global,
+                document,
+                object_prototype,
+                function_prototype,
+                error_prototype,
+                document_url,
+            ),
+            None => HostIntrinsics::placeholders(objects, object_prototype),
+        };
+        let HostIntrinsics {
+            element_prototype,
+            dom_prototypes,
+            storage_prototype,
+            media_query_list_prototype,
+        } = host_intrinsics;
+        // Every callable native object inherits Function.prototype.  A number
+        // of older installers predate the shared function prototype and left
+        // their methods as prototype-less host objects.  Real-world shims use
+        // patterns such as `Array.prototype.slice.call(...)` and
+        // `fn.apply(...)` during bootstrap, so repair the invariant in one
+        // place instead of relying on each installer to remember it.
+        for object in &mut objects[base..] {
+            if matches!(
+                &object.host,
+                ObjectHost::NativeFunction(_)
+                    | ObjectHost::BoundFunction { .. }
+                    | ObjectHost::BoundCallable { .. }
+                    | ObjectHost::PromiseSettler { .. }
+                    | ObjectHost::AsyncResume { .. }
+                    | ObjectHost::AsyncFromSyncValue { .. }
+                    | ObjectHost::AsyncFromSyncClose { .. }
+                    | ObjectHost::DisposeAwaitResume { .. }
+            ) && object.prototype.is_none()
+            {
+                object.prototype = Some(function_prototype);
+            }
+        }
+        for (index, object) in objects.iter_mut().enumerate().skip(base) {
+            if object.prototype.is_none() {
+                object.prototype = match &object.host {
+                    ObjectHost::NativeFunction(_)
+                    | ObjectHost::BoundFunction { .. }
+                    | ObjectHost::BoundCallable { .. }
+                    | ObjectHost::UserFunction(_)
+                    | ObjectHost::ArrowFunction(_)
+                    | ObjectHost::FunctionConstructor
+                    | ObjectHost::StringConstructor
+                    | ObjectHost::NumberConstructor
+                    | ObjectHost::BigIntConstructor
+                    | ObjectHost::BooleanConstructor
+                    | ObjectHost::DateConstructor
+                    | ObjectHost::SymbolConstructor
+                    | ObjectHost::ArrayConstructor
+                    | ObjectHost::RegExpConstructor
+                    | ObjectHost::EventConstructor
+                    | ObjectHost::DomConstructor
+                    | ObjectHost::DomNodeConstructor(_)
+                    | ObjectHost::ImageConstructor
+                    | ObjectHost::VideoConstructor
+                    | ObjectHost::IntersectionObserverConstructor
+                    | ObjectHost::MutationObserverConstructor
+                    | ObjectHost::ErrorConstructor(_)
+                    | ObjectHost::PromiseSettler { .. }
+                    | ObjectHost::AsyncResume { .. }
+                    | ObjectHost::AsyncFromSyncValue { .. }
+                    | ObjectHost::AsyncFromSyncClose { .. }
+                    | ObjectHost::DisposeAwaitResume { .. }
+                    | ObjectHost::SuppressedErrorConstructor
+                    | ObjectHost::DisposableStackConstructor(_)
+                    | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
+                    _ if index != object_prototype.0 => Some(object_prototype),
+                    _ => None,
+                };
+            }
+        }
+        // `Array.prototype[Symbol.unscopables]` has no prototype at all, which the
+        // loop above would have replaced with `Object.prototype`.
+        let unscopables = JsSymbol::well_known("@@unscopables");
+        if let Some((_, descriptor)) = objects[array_prototype.0].symbols.get(&unscopables.id())
+            && let JsValue::Object(unscopables) = descriptor.value
+        {
+            objects[unscopables.0].prototype = None;
+        }
+        Self::install_builtin_metadata(objects, base);
+        RealmRecord {
+            global,
+            document,
+            object_prototype,
+            function_prototype,
+            array_prototype,
+            string_prototype,
+            number_primitive_prototype,
+            boolean_primitive_prototype,
+            regexp_prototype,
+            date_prototype,
+            symbol_prototype,
+            promise_constructor,
+            bigint_prototype,
+            promise_prototype,
+            element_prototype,
+            dom_prototypes,
+            iterator_prototype,
+            regexp_string_iterator_prototype,
+            generator_prototype,
+            async_generator_prototype,
+            async_generator_function_prototype,
+            async_from_sync_iterator_prototype,
+            iterator_helper_prototype,
+            iterator_wrap_prototype,
+            storage_prototype,
+            disposable_stack_prototype,
+            async_disposable_stack_prototype,
+            suppressed_error_prototype,
+            shadow_realm_prototype,
+            media_query_list_prototype,
+            node_wrappers: BTreeMap::new(),
+            class_list_wrappers: BTreeMap::new(),
+            style_declaration_wrappers: BTreeMap::new(),
+            dataset_wrappers: BTreeMap::new(),
+            temporal_prototypes: BTreeMap::new(),
+        }
+    }
+
+    /// Installs the browser host's globals (HTML, DOM, CSSOM, Web IDL, Fetch,
+    /// `WebStorage`, console and timers) into the page's realm. Only that realm
+    /// has them: a realm from `CreateRealm` carries the ECMAScript globals alone.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the host globals are installed in one explicit sequence"
+    )]
+    fn install_host_globals(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        document: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+        error_prototype: ObjectId,
+        document_url: &Url,
+    ) -> HostIntrinsics {
+        objects[global.0].properties.insert(
+            "document".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(document),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
         let queue_microtask = ObjectId(objects.len());
         objects.push(JsObject {
             host: ObjectHost::BoundFunction {
@@ -2617,23 +3020,8 @@ impl Realm {
                 configurable: true,
             },
         );
-        let object_prototype = Self::install_object(&mut objects, global);
-        let function_prototype = Self::install_function(&mut objects, global, object_prototype);
-        // §20.1.1: `Object` is a built-in function, so its [[Prototype]] is
-        // `%Function.prototype%`; the constructor exists only once `install_object` ran.
-        if let Some(JsValue::Object(object_constructor)) = objects[global.0]
-            .properties
-            .get("Object")
-            .map(|descriptor| descriptor.value.clone())
-        {
-            objects[object_constructor.0].prototype = Some(function_prototype);
-        }
-        let (element_prototype, dom_prototypes) = Self::install_dom_interfaces(
-            &mut objects,
-            global,
-            object_prototype,
-            function_prototype,
-        );
+        let (element_prototype, dom_prototypes) =
+            Self::install_dom_interfaces(objects, global, object_prototype, function_prototype);
         // DOM libraries feature-detect and use `instanceof Document` during
         // startup. Keep a dedicated prototype for the live document wrapper
         // so the check has the same result as a browser while the constructor
@@ -2672,124 +3060,40 @@ impl Realm {
             );
         }
         Self::install_location(
-            &mut objects,
+            objects,
             global,
             document,
             object_prototype,
             function_prototype,
             document_url,
         );
-        Self::install_navigator(&mut objects, global, object_prototype);
-        Self::install_screen(&mut objects, global, object_prototype);
-        Self::install_performance(&mut objects, global, object_prototype, function_prototype);
-        let error_prototype =
-            Self::install_errors(&mut objects, global, object_prototype, function_prototype);
-        Self::install_dom_exception(&mut objects, global, error_prototype, function_prototype);
-        Self::install_event(&mut objects, global, object_prototype, function_prototype);
-        let string_prototype =
-            Self::install_string(&mut objects, global, object_prototype, function_prototype);
-        let regexp_prototype =
-            Self::install_regexp(&mut objects, global, object_prototype, function_prototype);
-
-        let number_primitive_prototype =
-            Self::install_number(&mut objects, global, object_prototype, function_prototype);
-        let boolean_primitive_prototype =
-            Self::install_boolean(&mut objects, global, object_prototype, function_prototype);
-        let date_prototype =
-            Self::install_date(&mut objects, global, object_prototype, function_prototype);
-        let symbol_prototype =
-            Self::install_symbol(&mut objects, global, object_prototype, function_prototype);
-        let bigint_prototype =
-            Self::install_bigint(&mut objects, global, object_prototype, function_prototype);
-        Self::install_math(&mut objects, global, object_prototype);
-        let (promise_constructor, promise_prototype) = Self::install_promise(
-            &mut objects,
-            global,
-            object_prototype,
-            function_prototype,
-            error_prototype,
-        );
-        let suppressed_error_prototype = Self::install_suppressed_error(
-            &mut objects,
-            global,
-            function_prototype,
-            error_prototype,
-        );
-        let disposable_stack_prototype = Self::install_disposable_stack(
-            &mut objects,
-            global,
-            object_prototype,
-            function_prototype,
-            DisposeStackKind::Sync,
-        );
-        let async_disposable_stack_prototype = Self::install_disposable_stack(
-            &mut objects,
-            global,
-            object_prototype,
-            function_prototype,
-            DisposeStackKind::Async,
-        );
-        let array_prototype =
-            Self::install_array(&mut objects, global, object_prototype, function_prototype);
-        let (iterator_prototype, iterator_helper_prototype, iterator_wrap_prototype) =
-            Self::install_iterator(&mut objects, global, object_prototype, function_prototype);
-        let regexp_string_iterator_prototype = Self::install_regexp_string_iterator(
-            &mut objects,
-            iterator_prototype,
-            function_prototype,
-        );
-        let generator_prototype =
-            Self::install_generator(&mut objects, function_prototype, iterator_prototype);
-        let (
-            async_generator_prototype,
-            async_from_sync_iterator_prototype,
-            async_generator_function_prototype,
-        ) = Self::install_async_iteration(&mut objects, object_prototype, function_prototype);
+        Self::install_navigator(objects, global, object_prototype);
+        Self::install_screen(objects, global, object_prototype);
+        Self::install_performance(objects, global, object_prototype, function_prototype);
+        Self::install_dom_exception(objects, global, error_prototype, function_prototype);
+        Self::install_event(objects, global, object_prototype, function_prototype);
         let storage_prototype =
-            Self::install_storage(&mut objects, global, object_prototype, function_prototype);
+            Self::install_storage(objects, global, object_prototype, function_prototype);
         for name in ["localStorage", "sessionStorage"] {
-            Self::install_storage_area(&mut objects, global, storage_prototype, name);
+            Self::install_storage_area(objects, global, storage_prototype, name);
         }
-        Self::install_collections(&mut objects, global, object_prototype, function_prototype);
-        Self::install_typed_arrays(&mut objects, global, object_prototype, function_prototype);
-        Self::install_atomics(&mut objects, global, object_prototype, function_prototype);
-        Self::install_encoding(&mut objects, global, object_prototype, function_prototype);
-        Self::install_json(&mut objects, global, object_prototype, function_prototype);
-        Self::install_fetch(&mut objects, global, object_prototype, function_prototype);
-        Self::install_proxy_reflect(&mut objects, global, object_prototype, function_prototype);
-        Self::install_video(&mut objects, global, object_prototype, function_prototype);
+        Self::install_encoding(objects, global, object_prototype, function_prototype);
+        Self::install_fetch(objects, global, object_prototype, function_prototype);
+        Self::install_video(objects, global, object_prototype, function_prototype);
         Self::define_global_function(
-            &mut objects,
+            objects,
             global,
             "getComputedStyle",
             NativeFunction::GetComputedStyle,
         );
         for (name, function) in [
-            ("parseInt", NativeFunction::GlobalParseInt),
-            ("parseFloat", NativeFunction::GlobalParseFloat),
-            ("isNaN", NativeFunction::GlobalIsNaN),
-            ("isFinite", NativeFunction::GlobalIsFinite),
-            ("encodeURI", NativeFunction::GlobalEncodeURI),
-            (
-                "encodeURIComponent",
-                NativeFunction::GlobalEncodeURIComponent,
-            ),
-            ("decodeURI", NativeFunction::GlobalDecodeURI),
-            (
-                "decodeURIComponent",
-                NativeFunction::GlobalDecodeURIComponent,
-            ),
-            ("escape", NativeFunction::GlobalEscape),
-            ("unescape", NativeFunction::GlobalUnescape),
             ("atob", NativeFunction::GlobalAtob),
             ("btoa", NativeFunction::GlobalBtoa),
             ("__render_random_bytes", NativeFunction::GlobalRandomBytes),
-            ("eval", NativeFunction::GlobalEval),
             ("__render_noop", NativeFunction::GlobalNoop),
         ] {
-            Self::define_global_function(&mut objects, global, name, function);
+            Self::define_global_function(objects, global, name, function);
         }
-
         // `import()` is callable in module scripts and also carries the
         // standard `import.meta` object. Resolution is delegated to the
         // embedding, so the runtime returns an already-fulfilled namespace
@@ -2897,29 +3201,6 @@ impl Realm {
             "System".to_owned(),
             PropertyDescriptor::builtin(JsValue::Object(system)),
         );
-
-        // Every callable native object inherits Function.prototype.  A number
-        // of older installers predate the shared function prototype and left
-        // their methods as prototype-less host objects.  Real-world shims use
-        // patterns such as `Array.prototype.slice.call(...)` and
-        // `fn.apply(...)` during bootstrap, so repair the invariant in one
-        // place instead of relying on each installer to remember it.
-        for object in &mut objects {
-            if matches!(
-                &object.host,
-                ObjectHost::NativeFunction(_)
-                    | ObjectHost::BoundFunction { .. }
-                    | ObjectHost::BoundCallable { .. }
-                    | ObjectHost::PromiseSettler { .. }
-                    | ObjectHost::AsyncResume { .. }
-                    | ObjectHost::AsyncFromSyncValue { .. }
-                    | ObjectHost::AsyncFromSyncClose { .. }
-                    | ObjectHost::DisposeAwaitResume { .. }
-            ) && object.prototype.is_none()
-            {
-                object.prototype = Some(function_prototype);
-            }
-        }
         // Browser constructors used by page bootstrap and resource discovery.
         let image = ObjectId(objects.len());
         objects.push(JsObject {
@@ -3320,102 +3601,19 @@ impl Realm {
             },
         );
         Self::define_global_function(
-            &mut objects,
+            objects,
             global,
             "matchMedia",
             NativeFunction::WindowMatchMedia,
         );
-        Self::install_console(&mut objects, global);
-        Self::install_timers(&mut objects, global);
-        for (index, object) in objects.iter_mut().enumerate() {
-            if object.prototype.is_none() {
-                object.prototype = match &object.host {
-                    ObjectHost::NativeFunction(_)
-                    | ObjectHost::BoundFunction { .. }
-                    | ObjectHost::BoundCallable { .. }
-                    | ObjectHost::UserFunction(_)
-                    | ObjectHost::ArrowFunction(_)
-                    | ObjectHost::FunctionConstructor
-                    | ObjectHost::StringConstructor
-                    | ObjectHost::NumberConstructor
-                    | ObjectHost::BigIntConstructor
-                    | ObjectHost::BooleanConstructor
-                    | ObjectHost::DateConstructor
-                    | ObjectHost::SymbolConstructor
-                    | ObjectHost::ArrayConstructor
-                    | ObjectHost::RegExpConstructor
-                    | ObjectHost::EventConstructor
-                    | ObjectHost::DomConstructor
-                    | ObjectHost::DomNodeConstructor(_)
-                    | ObjectHost::ImageConstructor
-                    | ObjectHost::VideoConstructor
-                    | ObjectHost::IntersectionObserverConstructor
-                    | ObjectHost::MutationObserverConstructor
-                    | ObjectHost::ErrorConstructor(_)
-                    | ObjectHost::PromiseSettler { .. }
-                    | ObjectHost::AsyncResume { .. }
-                    | ObjectHost::AsyncFromSyncValue { .. }
-                    | ObjectHost::AsyncFromSyncClose { .. }
-                    | ObjectHost::DisposeAwaitResume { .. }
-                    | ObjectHost::SuppressedErrorConstructor
-                    | ObjectHost::DisposableStackConstructor(_)
-                    | ObjectHost::CollectionConstructor(_) => Some(function_prototype),
-                    _ if index != object_prototype.0 => Some(object_prototype),
-                    _ => None,
-                };
-            }
-        }
-        // `Array.prototype[Symbol.unscopables]` has no prototype at all, which the
-        // loop above would have replaced with `Object.prototype`.
-        let unscopables = JsSymbol::well_known("@@unscopables");
-        if let Some((_, descriptor)) = objects[array_prototype.0].symbols.get(&unscopables.id())
-            && let JsValue::Object(unscopables) = descriptor.value
-        {
-            objects[unscopables.0].prototype = None;
-        }
-        Self::install_builtin_metadata(&mut objects);
-        let mut realm = Self {
-            objects,
-            global,
-            document,
-            object_prototype,
-            function_prototype,
-            array_prototype,
-            string_prototype,
-            number_primitive_prototype,
-            boolean_primitive_prototype,
-            regexp_prototype,
-            date_prototype,
-            symbol_prototype,
-            promise_constructor,
-            bigint_prototype,
-            promise_prototype,
+        Self::install_console(objects, global);
+        Self::install_timers(objects, global);
+        HostIntrinsics {
             element_prototype,
             dom_prototypes,
-            iterator_prototype,
-            regexp_string_iterator_prototype,
-            generator_prototype,
-            async_generator_prototype,
-            async_generator_function_prototype,
-            async_from_sync_iterator_prototype,
-            iterator_helper_prototype,
-            iterator_wrap_prototype,
             storage_prototype,
-            disposable_stack_prototype,
-            async_disposable_stack_prototype,
-            suppressed_error_prototype,
             media_query_list_prototype,
-            node_wrappers: BTreeMap::new(),
-            class_list_wrappers: BTreeMap::new(),
-            style_declaration_wrappers: BTreeMap::new(),
-            dataset_wrappers: BTreeMap::new(),
-            swept_objects: 0,
-            temporal_prototypes: BTreeMap::new(),
-        };
-        // Temporal is installed through the realm's public surface once the
-        // realm exists, so its members are built the same way a script builds them.
-        realm.install_temporal();
-        realm
+        }
     }
 
     fn define_global_function(
@@ -4286,13 +4484,11 @@ impl Realm {
     /// `TextEncoder`, `TextDecoder` (Encoding Standard) and `DataView`
     /// (ECMAScript 25.2.5).
     ///
-    /// `TextEncoder` is UTF-8 only, so its instances carry no state. `TextDecoder`
-    /// keeps its label, its `fatal` flag, and the bytes a streaming decode held
-    /// back; `DataView` keeps the shared buffer and its byte window. All three
-    /// are installed here so a page that feature-detects them finds all or the
-    /// one it asked for, never a half-present interface.
+    /// The ECMAScript binary-data intrinsics: `ArrayBuffer` and its
+    /// `isView`, `SharedArrayBuffer` and `DataView` (ECMA-262 25.1 and 25.2).
+    /// `ArrayBuffer` is installed first, because a `DataView` is built over it.
     #[allow(clippy::too_many_lines)]
-    fn install_encoding(
+    fn install_binary_data(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
@@ -4413,6 +4609,63 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(is_view)),
         );
 
+        let (data_view_prototype, data_view_constructor) = Self::install_host_interface(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+            "DataView",
+            ObjectHost::DataViewConstructor,
+            &[
+                ("getInt8", NativeFunction::DataViewGetInt8),
+                ("getUint8", NativeFunction::DataViewGetUint8),
+                ("getInt16", NativeFunction::DataViewGetInt16),
+                ("getUint16", NativeFunction::DataViewGetUint16),
+                ("getInt32", NativeFunction::DataViewGetInt32),
+                ("getUint32", NativeFunction::DataViewGetUint32),
+                ("getFloat32", NativeFunction::DataViewGetFloat32),
+                ("getFloat16", NativeFunction::DataViewGetFloat16),
+                ("getFloat64", NativeFunction::DataViewGetFloat64),
+                ("getBigInt64", NativeFunction::DataViewGetBigInt64),
+                ("getBigUint64", NativeFunction::DataViewGetBigUint64),
+                ("setInt8", NativeFunction::DataViewSetInt8),
+                ("setUint8", NativeFunction::DataViewSetUint8),
+                ("setInt16", NativeFunction::DataViewSetInt16),
+                ("setUint16", NativeFunction::DataViewSetUint16),
+                ("setInt32", NativeFunction::DataViewSetInt32),
+                ("setUint32", NativeFunction::DataViewSetUint32),
+                ("setFloat16", NativeFunction::DataViewSetFloat16),
+                ("setFloat32", NativeFunction::DataViewSetFloat32),
+                ("setFloat64", NativeFunction::DataViewSetFloat64),
+                ("setBigInt64", NativeFunction::DataViewSetBigInt64),
+                ("setBigUint64", NativeFunction::DataViewSetBigUint64),
+            ],
+            "DataView",
+        );
+        Self::install_getters(
+            objects,
+            function_prototype,
+            data_view_prototype,
+            &[
+                ("buffer", NativeFunction::DataViewBufferGetter),
+                ("byteLength", NativeFunction::DataViewByteLengthGetter),
+                ("byteOffset", NativeFunction::DataViewByteOffsetGetter),
+            ],
+        );
+        Self::install_length(objects, data_view_constructor, 1.0);
+    }
+
+    /// `TextEncoder` and `TextDecoder` (WHATWG Encoding). `TextEncoder` is
+    /// UTF-8 only, so its instances carry no state. `TextDecoder` keeps its
+    /// label, its `fatal` flag, and the bytes a streaming decode held back. Both
+    /// are browser interfaces, so only the page's realm has them.
+    #[allow(clippy::too_many_lines)]
+    fn install_encoding(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) {
         let encoder_prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -4517,51 +4770,6 @@ impl Realm {
                 configurable: true,
             },
         );
-
-        let (data_view_prototype, data_view_constructor) = Self::install_host_interface(
-            objects,
-            global,
-            object_prototype,
-            function_prototype,
-            "DataView",
-            ObjectHost::DataViewConstructor,
-            &[
-                ("getInt8", NativeFunction::DataViewGetInt8),
-                ("getUint8", NativeFunction::DataViewGetUint8),
-                ("getInt16", NativeFunction::DataViewGetInt16),
-                ("getUint16", NativeFunction::DataViewGetUint16),
-                ("getInt32", NativeFunction::DataViewGetInt32),
-                ("getUint32", NativeFunction::DataViewGetUint32),
-                ("getFloat32", NativeFunction::DataViewGetFloat32),
-                ("getFloat16", NativeFunction::DataViewGetFloat16),
-                ("getFloat64", NativeFunction::DataViewGetFloat64),
-                ("getBigInt64", NativeFunction::DataViewGetBigInt64),
-                ("getBigUint64", NativeFunction::DataViewGetBigUint64),
-                ("setInt8", NativeFunction::DataViewSetInt8),
-                ("setUint8", NativeFunction::DataViewSetUint8),
-                ("setInt16", NativeFunction::DataViewSetInt16),
-                ("setUint16", NativeFunction::DataViewSetUint16),
-                ("setInt32", NativeFunction::DataViewSetInt32),
-                ("setUint32", NativeFunction::DataViewSetUint32),
-                ("setFloat16", NativeFunction::DataViewSetFloat16),
-                ("setFloat32", NativeFunction::DataViewSetFloat32),
-                ("setFloat64", NativeFunction::DataViewSetFloat64),
-                ("setBigInt64", NativeFunction::DataViewSetBigInt64),
-                ("setBigUint64", NativeFunction::DataViewSetBigUint64),
-            ],
-            "DataView",
-        );
-        Self::install_getters(
-            objects,
-            function_prototype,
-            data_view_prototype,
-            &[
-                ("buffer", NativeFunction::DataViewBufferGetter),
-                ("byteLength", NativeFunction::DataViewByteLengthGetter),
-                ("byteOffset", NativeFunction::DataViewByteOffsetGetter),
-            ],
-        );
-        Self::install_length(objects, data_view_constructor, 1.0);
     }
 
     /// Give `constructor` a `get [Symbol.species]` accessor whose getter is
@@ -5017,11 +5225,11 @@ impl Realm {
         clippy::too_many_lines,
         reason = "builtin metadata is a single bootstrap pass"
     )]
-    fn install_builtin_metadata(objects: &mut [JsObject]) {
+    fn install_builtin_metadata(objects: &mut [JsObject], base: usize) {
         let mut names: Vec<Option<String>> = vec![None; objects.len()];
         let mut prototype_owner: Vec<Option<ObjectId>> = vec![None; objects.len()];
         let mut callable: Vec<bool> = vec![false; objects.len()];
-        for (index, object) in objects.iter().enumerate() {
+        for (index, object) in objects.iter().enumerate().skip(base) {
             // One answer, from one list. This used to be a second hand-written
             // copy of the callable-host set, and it had drifted from the first:
             // `ArrayBuffer`, `DataView`, `TextEncoder` and `TextDecoder` were
@@ -5058,7 +5266,7 @@ impl Realm {
                 }
             }
         }
-        for (index, object) in objects.iter_mut().enumerate() {
+        for (index, object) in objects.iter_mut().enumerate().skip(base) {
             if let Some(owner) = prototype_owner[index]
                 && callable[owner.0]
                 && !object.properties.contains_key("constructor")
@@ -5483,7 +5691,7 @@ impl Realm {
             );
         }
         // The top-level browsing context is its own parent and top window.
-        for name in ["window", "self", "globalThis", "parent", "top"] {
+        for name in ["window", "self", "parent", "top"] {
             objects[global.0].properties.insert(
                 name.to_owned(),
                 PropertyDescriptor {
@@ -8058,6 +8266,79 @@ impl Realm {
     /// `%Error%` and the prototype inherits `%Error.prototype%`. Instances get
     /// `error` and `suppressed` as own, non-enumerable properties, which the
     /// runtime defines itself (`runtime::builtins::explicit_resource`).
+    /// `ShadowRealm` and `%ShadowRealm.prototype%` (`ShadowRealm` proposal): the
+    /// constructor, `evaluate` and `@@toStringTag`.
+    fn install_shadow_realm(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        object_prototype: ObjectId,
+        function_prototype: ObjectId,
+    ) -> ObjectId {
+        let prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let constructor = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::ShadowRealmConstructor,
+            properties: Self::function_metadata("ShadowRealm", 0.0),
+            ..JsObject::default()
+        });
+        objects[constructor.0].properties.insert(
+            "prototype".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(prototype),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        );
+        for (name, function, length) in [
+            ("evaluate", NativeFunction::ShadowRealmEvaluate, 1.0),
+            ("importValue", NativeFunction::ShadowRealmImportValue, 2.0),
+        ] {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(function),
+                properties: Self::function_metadata(name, length),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
+        objects[prototype.0].properties.insert(
+            "constructor".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[prototype.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(("ShadowRealm".to_owned()).into()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        objects[global.0].properties.insert(
+            "ShadowRealm".to_owned(),
+            PropertyDescriptor::builtin(JsValue::Object(constructor)),
+        );
+        prototype
+    }
+
     fn install_suppressed_error(
         objects: &mut Vec<JsObject>,
         global: ObjectId,
@@ -8501,12 +8782,12 @@ impl Realm {
     }
 
     #[must_use]
-    pub const fn global_object(&self) -> ObjectId {
+    pub fn global_object(&self) -> ObjectId {
         self.global
     }
 
     #[must_use]
-    pub const fn document_object(&self) -> ObjectId {
+    pub fn document_object(&self) -> ObjectId {
         self.document
     }
 
@@ -8642,19 +8923,19 @@ impl Realm {
 
     /// The realm's `%Object.prototype%`.
     #[must_use]
-    pub(crate) const fn object_prototype(&self) -> ObjectId {
+    pub(crate) fn object_prototype(&self) -> ObjectId {
         self.object_prototype
     }
 
     /// The realm's `%Function.prototype%`.
-    pub(crate) const fn function_prototype(&self) -> ObjectId {
+    pub(crate) fn function_prototype(&self) -> ObjectId {
         self.function_prototype
     }
 
     /// The realm's `%MediaQueryList.prototype%`, which `matchMedia` stamps onto
     /// each list it creates.
     #[must_use]
-    pub(crate) const fn media_query_list_prototype(&self) -> ObjectId {
+    pub(crate) fn media_query_list_prototype(&self) -> ObjectId {
         self.media_query_list_prototype
     }
 
@@ -8817,8 +9098,19 @@ impl Realm {
     }
 
     /// Fixed identity roots that must survive every collection: the global
-    /// realm wrappers and every existing DOM/platform wrapper identity.
+    /// objects and intrinsics of every realm, and every existing DOM/platform
+    /// wrapper identity.
     pub(crate) fn gc_identity_roots(&self) -> Vec<ObjectId> {
+        self.realms
+            .iter()
+            .flat_map(RealmRecord::identity_roots)
+            .collect()
+    }
+}
+
+impl RealmRecord {
+    /// The identity roots of this realm (see [`Realm::gc_identity_roots`]).
+    fn identity_roots(&self) -> Vec<ObjectId> {
         let mut roots = Vec::with_capacity(
             4 + self.node_wrappers.len()
                 + self.class_list_wrappers.len()
@@ -8843,6 +9135,7 @@ impl Realm {
         roots.push(self.disposable_stack_prototype);
         roots.push(self.async_disposable_stack_prototype);
         roots.push(self.suppressed_error_prototype);
+        roots.push(self.shadow_realm_prototype);
         roots.push(self.media_query_list_prototype);
         roots.extend(self.temporal_prototypes.values().copied());
         roots.extend(self.node_wrappers.values().copied());
@@ -8851,7 +9144,9 @@ impl Realm {
         roots.extend(self.dataset_wrappers.values().copied());
         roots
     }
+}
 
+impl Realm {
     pub(crate) fn objects(&self) -> &[JsObject] {
         &self.objects
     }
@@ -9629,7 +9924,7 @@ impl Realm {
     /// A standalone native function object (used to build callables that
     /// capture per-call state through `bound_callable`).
     #[must_use]
-    pub(crate) const fn object_prototype_id(&self) -> ObjectId {
+    pub(crate) fn object_prototype_id(&self) -> ObjectId {
         self.object_prototype
     }
 
@@ -9762,10 +10057,7 @@ impl Realm {
     }
 
     /// `%DisposableStack.prototype%` or `%AsyncDisposableStack.prototype%`.
-    pub(crate) const fn intrinsic_disposable_stack_prototype(
-        &self,
-        kind: DisposeStackKind,
-    ) -> ObjectId {
+    pub(crate) fn intrinsic_disposable_stack_prototype(&self, kind: DisposeStackKind) -> ObjectId {
         match kind {
             DisposeStackKind::Sync => self.disposable_stack_prototype,
             DisposeStackKind::Async => self.async_disposable_stack_prototype,
@@ -9773,7 +10065,7 @@ impl Realm {
     }
 
     /// `%SuppressedError.prototype%`.
-    pub(crate) const fn intrinsic_suppressed_error_prototype(&self) -> ObjectId {
+    pub(crate) fn intrinsic_suppressed_error_prototype(&self) -> ObjectId {
         self.suppressed_error_prototype
     }
 
@@ -9809,7 +10101,7 @@ impl Realm {
     }
 
     /// `%Promise%`, the intrinsic constructor.
-    pub(crate) const fn promise_constructor(&self) -> ObjectId {
+    pub(crate) fn promise_constructor(&self) -> ObjectId {
         self.promise_constructor
     }
 
@@ -9931,12 +10223,14 @@ impl Realm {
     }
 
     /// `%Iterator.prototype%`, the intrinsic that `Iterator.from` tests against.
-    pub(crate) const fn iterator_prototype_id(&self) -> ObjectId {
+    pub(crate) fn iterator_prototype_id(&self) -> ObjectId {
         self.iterator_prototype
     }
 
-    fn allocate(&mut self, object: JsObject) -> ObjectId {
+    /// Appends `object` to the heap, stamped with the current realm.
+    fn allocate(&mut self, mut object: JsObject) -> ObjectId {
         let id = ObjectId(self.objects.len());
+        object.realm = self.current;
         self.objects.push(object);
         id
     }

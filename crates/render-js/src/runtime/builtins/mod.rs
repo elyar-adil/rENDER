@@ -37,6 +37,7 @@ pub(super) mod proxy;
 pub(super) mod regexp;
 pub(super) mod regexp_symbols;
 pub(super) mod set_methods;
+pub(super) mod shadow_realm;
 pub(super) mod storage;
 pub(super) mod string;
 pub(super) mod structured_clone;

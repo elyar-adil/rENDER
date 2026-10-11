@@ -346,6 +346,12 @@ impl JsRuntime {
             | NativeFunction::ObjectIsFrozen => {
                 self.dispatch_object_native(dom, function, receiver, arguments)
             }
+            NativeFunction::ShadowRealmEvaluate => {
+                self.shadow_realm_evaluate(dom, &JsValue::Object(receiver), arguments)
+            }
+            NativeFunction::ShadowRealmImportValue => {
+                self.shadow_realm_import_value(dom, &JsValue::Object(receiver), arguments)
+            }
             NativeFunction::StrCharAt => self.string_char_at(dom, receiver, arguments),
             NativeFunction::StrCharCodeAt => self.string_char_code_at(dom, receiver, arguments),
             NativeFunction::StrIndexOf => self.string_index_of(dom, receiver, arguments, false),
@@ -442,12 +448,24 @@ impl JsRuntime {
                 self.perform_eval(dom, argument, false, false)
             }
             NativeFunction::GlobalImport => {
-                // Module graph fetching belongs to the browser coordinator.
-                // Keep dynamic import thenable so feature detection and
-                // optional chunks do not turn into a fatal ReferenceError.
+                // ECMA-262 13.3.10.1 `ImportCall`: the promise settles with the
+                // namespace of the module, or with the error that stopped its loading.
                 let (promise, result) = self.create_promise()?;
-                let namespace = self.realm.create_ordinary_object();
-                self.resolve_promise(promise, &JsValue::Object(namespace));
+                let argument = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+                let outcome = match self.to_string_value(dom, &argument) {
+                    Ok(specifier) => {
+                        let realm = self.realm.current_realm();
+                        self.import_module(dom, realm, &specifier.to_lossy(), "")
+                    }
+                    Err(error) => Err(error),
+                };
+                match outcome {
+                    Ok(namespace) => self.resolve_promise(promise, &JsValue::Object(namespace)),
+                    Err(error) => {
+                        let reason = self.error_to_thrown_value(&error)?;
+                        self.reject_promise(promise, &reason);
+                    }
+                }
                 Ok(result)
             }
             NativeFunction::GlobalNoop => Ok(JsValue::Undefined),

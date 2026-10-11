@@ -19,6 +19,7 @@ use crate::JsSymbol;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::Realm;
+use crate::RealmId;
 use crate::RuntimeLimits;
 use crate::ScriptOutcome;
 use crate::parser::Statement;
@@ -71,6 +72,8 @@ mod module;
 mod module_tests;
 #[cfg(test)]
 mod prelude_tests;
+#[cfg(test)]
+mod realm_tests;
 mod types;
 
 #[cfg(test)]
@@ -117,8 +120,10 @@ pub struct JsRuntime {
     /// are held here, not only in the caller's Rust locals, so a collection
     /// during the call still sees them.
     suspended_environments: Vec<Environment>,
-    /// Declared modules by key (the module's absolute URL).
-    modules: BTreeMap<String, module::ModuleRecord>,
+    /// Declared modules by key (the module's absolute URL), one map per realm.
+    modules: Vec<BTreeMap<String, module::ModuleRecord>>,
+    /// The host's module loader, which `import()` and `importValue` fetch through.
+    module_loader: Option<module::ModuleLoaderHandle>,
     /// Whether the self-hosted built-ins in `prelude.js` have been installed.
     prelude_installed: bool,
     /// Labels written directly in front of the loop about to run.
@@ -155,7 +160,8 @@ pub struct JsRuntime {
     /// Per-event dispatch state, present only while the event is dispatched.
     event_flags: BTreeMap<ObjectId, types::EventFlags>,
     event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
-    global_bindings: BTreeMap<String, GlobalBinding>,
+    /// Global lexical declarations of each realm, indexed by [`RealmId`].
+    global_bindings: Vec<BTreeMap<String, GlobalBinding>>,
     timers: BTreeMap<u64, TimerEntry>,
     next_timer_id: u64,
     pending_timer_requests: Vec<TimerRequest>,
@@ -219,6 +225,8 @@ impl From<DomError> for JsError {
 
 /// The self-hosted standard library; see `JsRuntime::ensure_prelude`.
 const PRELUDE_SOURCE: &str = include_str!("../prelude.js");
+/// The ECMAScript built-ins written in JavaScript, which every realm gets.
+const INTRINSICS_PRELUDE_SOURCE: &str = include_str!("../prelude_intrinsics.js");
 
 /// A Rust function an embedder installs in the realm with
 /// [`JsRuntime::define_host_function`]. It receives the arguments of each call.
@@ -265,7 +273,8 @@ impl JsRuntime {
             dom_nodes_created: 0,
             environment: Vec::new(),
             suspended_environments: Vec::new(),
-            modules: BTreeMap::new(),
+            modules: vec![BTreeMap::new()],
+            module_loader: None,
             prelude_installed: false,
             pending_loop_labels: Vec::new(),
             coroutines: Vec::new(),
@@ -285,7 +294,7 @@ impl JsRuntime {
             event_listeners: BTreeMap::new(),
             event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
-            global_bindings: BTreeMap::new(),
+            global_bindings: vec![BTreeMap::new()],
             timers: BTreeMap::new(),
             next_timer_id: 1,
             pending_timer_requests: Vec::new(),
@@ -335,6 +344,74 @@ impl JsRuntime {
     #[must_use]
     pub const fn realm(&self) -> &Realm {
         &self.realm
+    }
+
+    /// `CreateRealm()` (ECMA-262 9.3.1): a new realm with its own global object
+    /// and ECMAScript intrinsics. It shares this runtime's heap, so objects can
+    /// pass between realms, and it has no browser globals. Enter it with
+    /// [`Self::with_realm`] to run code in it.
+    ///
+    /// # Panics
+    ///
+    /// The ECMAScript built-ins are a fixed script that installs in any fresh
+    /// realm, so a failure there is a bug in the runtime.
+    pub fn create_realm(&mut self, dom: &mut Dom) -> RealmId {
+        let realm = self.realm.create_realm();
+        self.global_bindings.push(BTreeMap::new());
+        self.modules.push(BTreeMap::new());
+        self.with_realm(realm, |runtime| {
+            runtime.run_self_hosted(dom, INTRINSICS_PRELUDE_SOURCE)
+        })
+        .expect("the ECMAScript built-ins install in a fresh realm");
+        realm
+    }
+
+    /// Runs `body` with `realm` as the current realm, the realm of the running
+    /// execution context, and restores the previous current realm afterwards.
+    pub fn with_realm<T>(&mut self, realm: RealmId, body: impl FnOnce(&mut Self) -> T) -> T {
+        let previous = self.realm.enter_realm(realm);
+        let result = body(self);
+        self.realm.enter_realm(previous);
+        result
+    }
+
+    /// The realm the running execution context uses.
+    #[must_use]
+    pub fn current_realm(&self) -> RealmId {
+        self.realm.current_realm()
+    }
+
+    /// The global lexical declarations of the current realm.
+    fn global_bindings(&self) -> &BTreeMap<String, GlobalBinding> {
+        &self.global_bindings[self.realm.current_realm().0]
+    }
+
+    fn global_bindings_mut(&mut self) -> &mut BTreeMap<String, GlobalBinding> {
+        let realm = self.realm.current_realm().0;
+        &mut self.global_bindings[realm]
+    }
+
+    /// Runs a compiled script in the current realm from inside a host function
+    /// that a running script called. Unlike [`Self::execute_compiled`] it keeps
+    /// the caller's scopes and does not collect garbage, since the caller is
+    /// still executing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::execute_compiled`].
+    pub fn execute_nested(
+        &mut self,
+        dom: &mut Dom,
+        script: &super::CompiledScript,
+    ) -> Result<ScriptOutcome, JsError> {
+        let from_revision = dom.revision();
+        let suspended = self.suspend_scopes();
+        let environment = std::mem::take(&mut self.environment);
+        let outcome =
+            self.run_compiled_script(dom, &script.statements, script.is_strict(), from_revision);
+        self.environment = environment;
+        self.resume_scopes(suspended);
+        outcome
     }
 
     /// Interpreter steps consumed by the script currently running (or the last
@@ -913,6 +990,23 @@ impl JsRuntime {
             .set_property(target, name.to_owned(), JsValue::Object(function));
     }
 
+    /// Runs one self-hosted built-ins script in the current realm, with its own
+    /// execution budget. The caller's scopes are kept aside while it runs.
+    fn run_self_hosted(&mut self, dom: &mut Dom, source: &str) -> Result<(), JsError> {
+        let script = super::CompiledScript::compile(source, &self.limits)?;
+        let saved_steps =
+            std::mem::replace(&mut self.steps_remaining, self.limits.max_execution_steps);
+        let from_revision = dom.revision();
+        let suspended = self.suspend_scopes();
+        let environment = std::mem::take(&mut self.environment);
+        let outcome =
+            self.run_compiled_script(dom, &script.statements, script.is_strict(), from_revision);
+        self.environment = environment;
+        self.resume_scopes(suspended);
+        self.steps_remaining = saved_steps;
+        outcome.map(|_| ())
+    }
+
     /// Install the built-ins that are written in JavaScript (`prelude.js`).
     ///
     /// Engines commonly self-host the parts of the standard library that are
@@ -924,6 +1018,9 @@ impl JsRuntime {
             return;
         }
         self.prelude_installed = true;
+        if let Err(error) = self.run_self_hosted(dom, INTRINSICS_PRELUDE_SOURCE) {
+            self.prelude_error = Some(error);
+        }
         thread_local! {
             // Parsing the prelude is most of its cost, and a thread's runtimes
             // can all run the same tree.
