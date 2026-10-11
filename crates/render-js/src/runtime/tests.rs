@@ -5431,6 +5431,30 @@ fn array_from_keeps_its_iterator_alive_across_collections() {
 }
 
 #[test]
+fn a_mapped_arguments_object_keeps_its_parameters_alive_across_collections() {
+    // The call's parameter record is reachable only through the arguments object,
+    // whose mapped index reads the parameter. A collection must trace that record,
+    // or the object stored in the parameter would be swept while still bound.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let limits = crate::RuntimeLimits {
+        max_heap_objects: 4_096,
+        ..crate::RuntimeLimits::default()
+    };
+    let mut runtime = JsRuntime::with_limits(&parsed.dom, limits);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                var kept = (function (a) { a = { tag: 'kept' }; return arguments; })(1);
+                for (var i = 0; i < 6000; i++) { var junk = { i: i, pad: [i] }; }
+                kept[0].tag + ',' + (kept[0] === kept[0]);
+            ",
+        )
+        .expect("a mapped arguments object survives collections");
+    assert_eq!(outcome.value, JsValue::String("kept,true".into()));
+}
+
+#[test]
 fn typed_array_from_an_iterable_keeps_its_iterator_alive_across_collections() {
     // The iterator object is referenced only by the Rust loop that drains it, so a
     // collection during the drain must keep it and its `next` method alive.

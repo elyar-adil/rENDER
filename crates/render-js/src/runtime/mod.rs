@@ -75,7 +75,7 @@ mod module_tests;
 mod prelude_tests;
 #[cfg(test)]
 mod realm_tests;
-mod types;
+pub(crate) mod types;
 
 #[cfg(test)]
 mod temporal_tests;

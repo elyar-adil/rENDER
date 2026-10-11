@@ -3316,6 +3316,245 @@ fn a_primitive_receiver_converts_as_the_primitive_not_through_its_prototype() {
 }
 
 #[test]
+fn a_mapped_arguments_index_and_its_parameter_stay_in_step() {
+    // The arguments object's [[GetOwnProperty]], [[Get]] and [[Set]]: a write
+    // either way is seen from the other side.
+    assert_eq!(
+        ok(
+            "function f(a, b) { a = 10; arguments[1] = 20; return [a, b, arguments[0], arguments[1]].join(); } f(1, 2)"
+        ),
+        "10,20,10,20"
+    );
+    // CreateMappedArgumentsObject: an index maps only when an argument was passed.
+    assert_eq!(
+        ok("function f(a, b) { b = 5; return arguments.length + ':' + arguments[1]; } f(1)"),
+        "1:undefined"
+    );
+    // CreateMappedArgumentsObject: a repeated name maps only at its last position.
+    assert_eq!(
+        ok(
+            "function f(a, a) { a = 'x'; return arguments[0] + ',' + arguments[1] + ',' + a; } f(1, 2)"
+        ),
+        "1,x,x"
+    );
+    assert_eq!(
+        ok("function f(a) { eval('a = 8'); return arguments[0]; } f(1)"),
+        "8"
+    );
+}
+
+#[test]
+fn an_unmapped_arguments_object_is_detached_from_its_parameters() {
+    // CreateUnmappedArgumentsObject: strict code, and a non-simple parameter
+    // list, get no mapping.
+    assert_eq!(
+        ok(
+            "function f(a) { 'use strict'; a = 2; arguments[0] = 3; return a + ',' + arguments[0]; } f(1)"
+        ),
+        "2,3"
+    );
+    assert_eq!(
+        ok("function f(a = 0) { a = 2; arguments[0] = 9; return a + ',' + arguments[0]; } f(1)"),
+        "2,9"
+    );
+    assert_eq!(
+        ok("function f(a, ...rest) { a = 5; return arguments[0]; } f(1, 2)"),
+        "1"
+    );
+    // Strictness is the function's own: nested in strict code, or a class method.
+    assert_eq!(
+        ok(
+            "(function () { 'use strict'; return (function (a) { a = 2; return arguments[0]; })(1); })()"
+        ),
+        "1"
+    );
+    assert_eq!(
+        ok("class C { m(a) { a = 2; return arguments[0]; } } new C().m(1)"),
+        "1"
+    );
+}
+
+#[test]
+fn arguments_object_is_an_ordinary_object_with_the_spec_own_properties() {
+    // 20.1.3.6 builtinTag Arguments, and the own properties the creation
+    // operations define.
+    assert_eq!(
+        ok("(function () { return Object.prototype.toString.call(arguments); })(1)"),
+        "[object Arguments]"
+    );
+    assert_eq!(
+        ok("(function () { return Array.isArray(arguments); })(1, 2)"),
+        "false"
+    );
+    assert_eq!(
+        ok("(function () { return Object.getOwnPropertyNames(arguments).join(); })(1, 2)"),
+        "0,1,length,callee"
+    );
+    assert_eq!(
+        ok(
+            "(function () { 'use strict'; return Object.getOwnPropertyNames(arguments).join(); })(1, 2)"
+        ),
+        "0,1,length,callee"
+    );
+    // The `length` property is writable and configurable but not enumerable.
+    assert_eq!(
+        ok(
+            "(function () { var d = Object.getOwnPropertyDescriptor(arguments, 'length'); return [d.value, d.writable, d.enumerable, d.configurable].join(); })(1, 2, 3)"
+        ),
+        "3,true,false,true"
+    );
+    // @@iterator is the same function object as %Array.prototype.values%.
+    assert_eq!(
+        ok(
+            "(function () { var d = Object.getOwnPropertyDescriptor(arguments, Symbol.iterator); return [d.value === Array.prototype.values, d.writable, d.enumerable, d.configurable].join(); })()"
+        ),
+        "true,true,false,true"
+    );
+    assert_eq!(
+        ok("(function () { return [...arguments].join(); })(1, 'b')"),
+        "1,b"
+    );
+    // Indices enumerate in ascending numeric order, not string order.
+    assert_eq!(
+        ok(
+            "(function () { return Object.keys(arguments).join(); })(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)"
+        ),
+        "0,1,2,3,4,5,6,7,8,9,10,11"
+    );
+    // for-in sees the enumerable indices only, not `length` or `callee`.
+    assert_eq!(
+        ok(
+            "(function () { var keys = []; for (var k in arguments) keys.push(k); return keys.join(); })(7, 8)"
+        ),
+        "0,1"
+    );
+    // A descriptor read of a mapped index sees the parameter's current value.
+    assert_eq!(
+        ok(
+            "function f(a) { a = 5; return Object.getOwnPropertyDescriptor(arguments, '0').value; } f(1)"
+        ),
+        "5"
+    );
+    // CreateListFromArrayLike reads length and the indices of an arguments object.
+    assert_eq!(
+        ok("function g() { return Math.max.apply(null, arguments); } g(1, 5, 3)"),
+        "5"
+    );
+    assert_eq!(
+        ok(
+            "(function () { return Array.prototype.map.call(arguments, function (x) { return x * 2; }).join(); })(1, 2, 3)"
+        ),
+        "2,4,6"
+    );
+    assert_eq!(
+        ok(
+            "(function () { return JSON.stringify(arguments) + ' ' + Object.keys(arguments).join(); })(1, 'x')"
+        ),
+        "{\"0\":1,\"1\":\"x\"} 0,1"
+    );
+}
+
+#[test]
+fn arguments_callee_is_the_function_when_mapped_and_throws_when_unmapped() {
+    // CreateMappedArgumentsObject: a mapped object's callee is the function itself.
+    assert_eq!(
+        ok("function f() { return arguments.callee === f; } f()"),
+        "true"
+    );
+    // CreateUnmappedArgumentsObject: an unmapped object's callee is
+    // %ThrowTypeError%, which
+    // is also the getter and setter of Function.prototype.caller.
+    assert_eq!(
+        ok(
+            "(function () { 'use strict'; var d = Object.getOwnPropertyDescriptor(arguments, 'callee'); return [d.get === Object.getOwnPropertyDescriptor(Function.prototype, 'caller').get, d.set === d.get, d.enumerable, d.configurable, 'value' in d].join(); })()"
+        ),
+        "true,true,false,false,false"
+    );
+    assert_eq!(
+        ok(
+            "var r; try { (function () { 'use strict'; return arguments.callee; })(); } catch (e) { r = e.name; } r"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn an_arguments_object_is_reached_through_arrows_defaults_and_eval() {
+    // A call builds the arguments object only for a body that can name it, so
+    // every route to the enclosing function's `arguments` must still reach it.
+    assert_eq!(
+        ok("(function () { return (() => arguments[0])(); })(9)"),
+        "9"
+    );
+    assert_eq!(
+        ok("(function () { return (x => arguments[0] + x)(1); })(4)"),
+        "5"
+    );
+    assert_eq!(
+        ok("(function () { return ((y = arguments[0]) => y)(); })(5)"),
+        "5"
+    );
+    // The second parameter has no argument, so its default runs.
+    assert_eq!(ok("(function (a, b = arguments[0]) { return b; })(7)"), "7");
+    assert_eq!(
+        ok("(function (a, b = eval('arguments.length')) { return b; })(1)"),
+        "1"
+    );
+    assert_eq!(
+        ok("(function () { return eval('arguments[1]'); })(3, 6)"),
+        "6"
+    );
+    // A nested ordinary function has its own arguments object, so the outer
+    // body needs none and the inner call still sees its own three arguments.
+    assert_eq!(
+        ok("(function () { return (function () { return arguments.length; })(1, 2, 3); })(9)"),
+        "3"
+    );
+}
+
+#[test]
+fn deleting_or_redefining_a_mapped_index_breaks_its_link() {
+    // The arguments object's [[Delete]] and [[DefineOwnProperty]].
+    assert_eq!(
+        ok("function f(a) { delete arguments[0]; a = 5; return String(arguments[0]); } f(1)"),
+        "undefined"
+    );
+    assert_eq!(
+        ok(
+            "function f(a) { Object.defineProperty(arguments, '0', { writable: false }); a = 9; return arguments[0]; } f(1)"
+        ),
+        "1"
+    );
+    assert_eq!(
+        ok("function f(a) { Object.defineProperty(arguments, '0', { value: 7 }); return a; } f(1)"),
+        "7"
+    );
+    assert_eq!(
+        ok(
+            "function f(a) { Object.defineProperty(arguments, '0', { get: function () { return 3; } }); a = 9; return arguments[0]; } f(1)"
+        ),
+        "3"
+    );
+    // A non-configurable mapped index stays mapped, and refuses delete.
+    assert_eq!(
+        ok(
+            "function f(a) { Object.defineProperty(arguments, '0', { configurable: false }); a = 4; return delete arguments[0] + ',' + arguments[0]; } f(1)"
+        ),
+        "false,4"
+    );
+    // Freezing makes every index read-only, which unmaps it ([[DefineOwnProperty]]).
+    assert_eq!(
+        ok("function f(a) { Object.freeze(arguments); a = 2; return arguments[0]; } f(1)"),
+        "1"
+    );
+    // A mapped object on a prototype chain answers for its indices.
+    assert_eq!(
+        ok("function f(a) { var o = Object.create(arguments); a = 6; return o[0]; } f(1)"),
+        "6"
+    );
+}
+
+#[test]
 fn an_object_literal_method_has_no_own_caller_or_arguments() {
     // A method definition is not a plain sloppy function, so it carries neither
     // own property (ECMA-262 15.4); a plain sloppy function keeps them.

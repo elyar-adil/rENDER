@@ -1176,9 +1176,51 @@ impl JsRuntime {
                     }
                 }
             }
+            Some(ObjectHost::Arguments(_)) => {
+                if let PropertyName::String(name) = key {
+                    return Ok(self.arguments_define_own_property(object, name, partial));
+                }
+            }
             _ => {}
         }
         Ok(self.ordinary_define_own_property(object, key, partial))
+    }
+
+    /// The arguments object's `[[DefineOwnProperty]]` (ECMA-262 10.4).
+    /// The ordinary definition runs first. An index still mapped to a parameter
+    /// then changes that parameter when the definition sets a value, and loses
+    /// its link when the definition makes it an accessor or read-only. An
+    /// unmapped object's indices are ordinary properties, so it has no link to
+    /// change.
+    fn arguments_define_own_property(
+        &mut self,
+        object: ObjectId,
+        name: &str,
+        partial: PartialDescriptor,
+    ) -> bool {
+        let accessor = !matches!(partial.get, AccessorField::Absent)
+            || !matches!(partial.set, AccessorField::Absent);
+        let value = partial.value.clone();
+        let read_only = partial.writable == Some(false);
+        let key = PropertyName::String(name.to_owned());
+        if !self.ordinary_define_own_property(object, &key, partial) {
+            return false;
+        }
+        if let Some(map) = self.realm.argument_map_mut(object)
+            && map.is_mapped(name)
+        {
+            if accessor {
+                map.unmap(name);
+            } else {
+                if let Some(value) = &value {
+                    map.store(name, value);
+                }
+                if read_only {
+                    map.unmap(name);
+                }
+            }
+        }
+        true
     }
 
     /// ECMA-262 10.1.6.1 `OrdinaryDefineOwnProperty` with
@@ -1788,6 +1830,8 @@ impl JsRuntime {
                 Some(ObjectHost::StringPrimitive(_)) => "String".to_owned(),
                 Some(ObjectHost::DateInstance(_)) => "Date".to_owned(),
                 Some(ObjectHost::RegExp(_)) => "RegExp".to_owned(),
+                // ECMA-262 20.1.3.6: an arguments object's builtinTag is Arguments.
+                Some(ObjectHost::Arguments(_)) => "Arguments".to_owned(),
                 // Hosts whose interface names them through a `@@toStringTag`
                 // that the engine does not install on every prototype.
                 Some(ObjectHost::Document(_)) => "HTMLDocument".to_owned(),

@@ -108,6 +108,82 @@ impl EnvironmentRecord {
     }
 }
 
+/// The `[[ParameterMap]]` of a mapped arguments object (ECMA-262 10.4.4). Each
+/// index that is still mapped reads and writes the binding of its parameter in
+/// the call's environment record, so the object and the parameter stay in step.
+#[derive(Clone)]
+pub(crate) struct ArgumentsMap {
+    environment: Environment,
+    /// Index key to parameter name, for each index still mapped. Shared so that
+    /// cloning the object's host, which the runtime does for every member read,
+    /// does not copy the table.
+    names: Rc<BTreeMap<String, String>>,
+}
+
+impl ArgumentsMap {
+    pub(crate) fn new(environment: Environment, names: BTreeMap<String, String>) -> Self {
+        Self {
+            environment,
+            names: Rc::new(names),
+        }
+    }
+
+    /// The parameter record that the mapped indices read and write.
+    pub(crate) fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    /// Whether the index `key` is still linked to its parameter.
+    pub(crate) fn is_mapped(&self, key: &str) -> bool {
+        self.names.contains_key(key)
+    }
+
+    /// The value of the parameter that the mapped index `key` is linked to,
+    /// which the arguments object's `[[GetOwnProperty]]` and `[[Get]]` report,
+    /// or `None` when `key` is not mapped.
+    pub(crate) fn mapped_value(&self, key: &str) -> Option<JsValue> {
+        let name = self.names.get(key)?;
+        match self.environment.borrow().binding_value(name) {
+            BindingRead::Value(value) => Some(value),
+            BindingRead::Absent | BindingRead::Uninitialized => None,
+        }
+    }
+
+    /// Writes `value` to the parameter that the mapped index `key` is linked to,
+    /// as the arguments object's `[[Set]]` and `[[DefineOwnProperty]]` do. Does
+    /// nothing when `key` is not mapped.
+    pub(crate) fn store(&self, key: &str, value: &JsValue) {
+        if let Some(name) = self.names.get(key)
+            && let Some(binding) = self.environment.borrow_mut().bindings.get_mut(name)
+        {
+            binding.value = value.clone();
+        }
+    }
+
+    /// Removes the link of `key`, as the arguments object's `[[DefineOwnProperty]]`
+    /// and `[[Delete]]` do: the index is an ordinary property from now on.
+    pub(crate) fn unmap(&mut self, key: &str) {
+        if self.names.contains_key(key) {
+            Rc::make_mut(&mut self.names).remove(key);
+        }
+    }
+}
+
+impl PartialEq for ArgumentsMap {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.environment, &other.environment) && self.names == other.names
+    }
+}
+
+impl std::fmt::Debug for ArgumentsMap {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArgumentsMap")
+            .field("names", &self.names)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Upper bound on buffered `console.*` messages; the oldest entry is dropped
 /// when script logs past it so a chatty page cannot exhaust memory.
 pub(super) const MAX_BUFFERED_CONSOLE_MESSAGES: usize = 4096;
@@ -148,6 +224,10 @@ pub(super) struct FunctionFlags {
 }
 
 #[derive(Clone, Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is an independent fact about the function's code"
+)]
 pub(super) struct UserFunction {
     pub(super) name: Option<String>,
     pub(super) parameters: Vec<String>,
@@ -179,6 +259,10 @@ pub(super) struct UserFunction {
     pub(super) rest: bool,
     /// Whether calling the function starts a generator or an async activation.
     pub(super) kind: FunctionKind,
+    /// Whether the body can reach the arguments object (see
+    /// `parser::body_observes_arguments`). A call builds the object only then:
+    /// nothing else can name it, so an unobserved object is never visible.
+    pub(super) uses_arguments: bool,
     /// The function context an arrow inherits from the code it was created in.
     /// Other functions derive theirs from their own metadata at each call.
     pub(super) this_context: ThisContext,

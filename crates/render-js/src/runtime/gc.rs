@@ -199,6 +199,7 @@ pub(super) fn mark_host(
         ObjectHost::SymbolInstance(_)
         | ObjectHost::Ordinary
         | ObjectHost::Array
+        | ObjectHost::Arguments(None)
         | ObjectHost::Document(_)
         | ObjectHost::Node(_)
         | ObjectHost::ClassList(_)
@@ -302,6 +303,16 @@ pub(super) fn mark_host(
         }
         ObjectHost::DynamicImportLinked { object, .. } => {
             mark_object(runtime, marked, work, marked_environments, *object);
+        }
+        ObjectHost::Arguments(Some(map)) => {
+            // A mapped index reads its parameter, so the parameter record stays live.
+            mark_environment(
+                runtime,
+                marked,
+                work,
+                marked_environments,
+                map.environment(),
+            );
         }
         ObjectHost::Proxy { target, handler } => {
             mark_object(runtime, marked, work, marked_environments, *target);

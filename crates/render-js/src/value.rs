@@ -11,6 +11,7 @@ use url::Url;
 use crate::bigint::JsBigInt;
 use crate::parser::FunctionKind;
 use crate::runtime::builtins::temporal::{TemporalKind, TemporalMethod, TemporalValue};
+use crate::runtime::types::ArgumentsMap;
 use crate::utf16::JsString;
 
 /// Stable identity for an object allocated in a [`Realm`].
@@ -250,7 +251,7 @@ impl PropertyDescriptor {
         }
     }
 
-    const fn builtin(value: JsValue) -> Self {
+    pub(crate) const fn builtin(value: JsValue) -> Self {
         Self {
             value,
             writable: true,
@@ -267,6 +268,31 @@ impl PropertyDescriptor {
     pub fn is_accessor(&self) -> bool {
         self.getter.is_some() || self.setter.is_some()
     }
+}
+
+/// The value of the own data property `property` of `target` under `key`. A
+/// mapped index of an arguments object reads its parameter, as the arguments
+/// object's `[[GetOwnProperty]]` does, so the stored value stands only for an
+/// unmapped property.
+fn stored_value(target: &JsObject, key: &str, property: &PropertyDescriptor) -> JsValue {
+    if let ObjectHost::Arguments(Some(map)) = &target.host
+        && let Some(value) = map.mapped_value(key)
+    {
+        return value;
+    }
+    property.value.clone()
+}
+
+/// The descriptor of the own property `property` of `target` under `key`, with
+/// the value [`stored_value`] reads.
+fn stored_descriptor(
+    target: &JsObject,
+    key: &str,
+    property: &PropertyDescriptor,
+) -> PropertyDescriptor {
+    let mut descriptor = property.clone();
+    descriptor.value = stored_value(target, key, property);
+    descriptor
 }
 
 /// ECMAScript `SameValue` for two JavaScript values: `NaN` equals itself and
@@ -2351,6 +2377,9 @@ pub(crate) enum ObjectHost {
         target: ObjectId,
         handler: Option<ObjectId>,
     },
+    /// An arguments object (ECMA-262 10.4.4). `Some` for a mapped object, whose
+    /// indices are linked to the parameters of the call; `None` for an unmapped one.
+    Arguments(Option<ArgumentsMap>),
     /// The `Video` (`HTMLVideoElement`) constructor object.
     VideoConstructor,
     /// One `HTMLVideoElement` instance with its playback state. Script
@@ -2649,7 +2678,14 @@ pub struct RealmRecord {
     document: ObjectId,
     object_prototype: ObjectId,
     function_prototype: ObjectId,
+    /// `%ThrowTypeError%` (ECMA-262 10.2.4.1), the getter and setter of an
+    /// unmapped arguments object's `callee`.
+    throw_type_error: ObjectId,
     array_prototype: ObjectId,
+    /// `%Array.prototype.values%`, the function an arguments object's
+    /// `@@iterator` is (`CreateMappedArgumentsObject` and
+    /// `CreateUnmappedArgumentsObject`).
+    array_prototype_values: ObjectId,
     string_prototype: ObjectId,
     number_primitive_prototype: ObjectId,
     boolean_primitive_prototype: ObjectId,
@@ -2891,7 +2927,8 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(global)),
         );
         let object_prototype = Self::install_object(objects, global);
-        let function_prototype = Self::install_function(objects, global, object_prototype);
+        let (function_prototype, throw_type_error) =
+            Self::install_function(objects, global, object_prototype);
         // §20.1.1: `Object` is a built-in function, so its [[Prototype]] is
         // `%Function.prototype%`; the constructor exists only once `install_object` ran.
         if let Some(JsValue::Object(object_constructor)) = objects[global.0]
@@ -2944,7 +2981,7 @@ impl Realm {
             function_prototype,
             DisposeStackKind::Async,
         );
-        let array_prototype =
+        let (array_prototype, array_prototype_values) =
             Self::install_array(objects, global, object_prototype, function_prototype);
         let (iterator_prototype, iterator_helper_prototype, iterator_wrap_prototype) =
             Self::install_iterator(objects, global, object_prototype, function_prototype);
@@ -3077,7 +3114,9 @@ impl Realm {
             document,
             object_prototype,
             function_prototype,
+            throw_type_error,
             array_prototype,
+            array_prototype_values,
             string_prototype,
             number_primitive_prototype,
             boolean_primitive_prototype,
@@ -7576,7 +7615,7 @@ impl Realm {
         objects: &mut Vec<JsObject>,
         global: ObjectId,
         object_prototype: ObjectId,
-    ) -> ObjectId {
+    ) -> (ObjectId, ObjectId) {
         let prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(object_prototype),
@@ -7725,7 +7764,7 @@ impl Realm {
                 configurable: true,
             },
         );
-        prototype
+        (prototype, thrower)
     }
 
     #[allow(
@@ -9001,7 +9040,7 @@ impl Realm {
         global: ObjectId,
         object_prototype: ObjectId,
         function_prototype: ObjectId,
-    ) -> ObjectId {
+    ) -> (ObjectId, ObjectId) {
         // ECMA-262 23.1.3: `Array.prototype` is itself an Array exotic object
         // whose `length` is +0.
         let prototype = ObjectId(objects.len());
@@ -9071,17 +9110,21 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        let values = match objects[prototype.0]
+            .properties
+            .get("values")
+            .map(|descriptor| &descriptor.value)
+        {
+            Some(JsValue::Object(values)) => *values,
+            _ => unreachable!("Array.prototype.values is installed by the loop above"),
+        };
         // `Array.prototype[Symbol.iterator]` is the same function object as
         // `values`, so iterator helpers work on arrays directly.
-        if let Some(values) = objects[prototype.0].properties.get("values")
-            && let JsValue::Object(values) = values.value
-        {
-            let symbol = JsSymbol::well_known("@@iterator");
-            objects[prototype.0].symbols.insert(
-                symbol.id(),
-                (symbol, PropertyDescriptor::builtin(JsValue::Object(values))),
-            );
-        }
+        let symbol = JsSymbol::well_known("@@iterator");
+        objects[prototype.0].symbols.insert(
+            symbol.id(),
+            (symbol, PropertyDescriptor::builtin(JsValue::Object(values))),
+        );
         let array = ObjectId(objects.len());
         objects.push(JsObject {
             host: ObjectHost::ArrayConstructor,
@@ -9115,7 +9158,7 @@ impl Realm {
                 configurable: true,
             },
         );
-        prototype
+        (prototype, values)
     }
 
     #[must_use]
@@ -9169,6 +9212,35 @@ impl Realm {
             );
         }
         error
+    }
+
+    /// A fresh arguments object of the current realm with no own properties
+    /// yet: its prototype is `%Object.prototype%`, as both creation operations
+    /// of ECMA-262 10.4 make it. `map` is its `[[ParameterMap]]`, if it is mapped.
+    pub(crate) fn create_arguments_object(&mut self, map: Option<ArgumentsMap>) -> ObjectId {
+        self.allocate(JsObject {
+            prototype: Some(self.object_prototype),
+            host: ObjectHost::Arguments(map),
+            ..JsObject::default()
+        })
+    }
+
+    /// The `[[ParameterMap]]` of `object`, when it is a mapped arguments object.
+    pub(crate) fn argument_map_mut(&mut self, object: ObjectId) -> Option<&mut ArgumentsMap> {
+        match &mut self.objects.get_mut(object.0)?.host {
+            ObjectHost::Arguments(Some(map)) => Some(map),
+            _ => None,
+        }
+    }
+
+    /// The realm's `%ThrowTypeError%`.
+    pub(crate) fn throw_type_error(&self) -> ObjectId {
+        self.throw_type_error
+    }
+
+    /// The realm's `%Array.prototype.values%`.
+    pub(crate) fn array_prototype_values(&self) -> ObjectId {
+        self.array_prototype_values
     }
 
     pub(crate) fn create_array(&mut self) -> ObjectId {
@@ -9461,6 +9533,8 @@ impl RealmRecord {
         );
         roots.push(self.global);
         roots.push(self.document);
+        roots.push(self.throw_type_error);
+        roots.push(self.array_prototype_values);
         // The iterator prototypes are only reachable through helper objects,
         // which may all be garbage at collection time; keep them rooted.
         roots.push(self.iterator_prototype);
@@ -9568,7 +9642,7 @@ impl Realm {
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
             if let Some(property) = current.properties.get(key) {
-                return Some((property.value.clone(), id));
+                return Some((stored_value(current, key, property), id));
             }
             candidate = current.prototype;
             visited = visited.saturating_add(1);
@@ -9719,7 +9793,7 @@ impl Realm {
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
             if let Some(property) = current.properties.get(key) {
-                return Some(property.value.clone());
+                return Some(stored_value(current, key, property));
             }
             candidate = current.prototype;
             visited = visited.saturating_add(1);
@@ -9784,7 +9858,7 @@ impl Realm {
         }
         let target = self.objects.get(object.0)?;
         if let Some(descriptor) = target.properties.get(key) {
-            return Some(descriptor.clone());
+            return Some(stored_descriptor(target, key, descriptor));
         }
         match &target.host {
             ObjectHost::StringPrimitive(text) => string_exotic_property(text, key),
@@ -10013,7 +10087,7 @@ impl Realm {
         while let Some(id) = candidate {
             let current = self.objects.get(id.0)?;
             if let Some(descriptor) = current.properties.get(key) {
-                return Some(descriptor.clone());
+                return Some(stored_descriptor(current, key, descriptor));
             }
             candidate = current.prototype;
             visited = visited.saturating_add(1);
@@ -10217,6 +10291,9 @@ impl Realm {
             return false;
         }
         target.properties.remove(key);
+        if let ObjectHost::Arguments(Some(map)) = &mut target.host {
+            map.unmap(key);
+        }
         if !is_canonical_index(key) {
             // A truncating `length` deletes many index keys in a row, so only
             // named keys pay for a scan of the insertion order.
@@ -10269,6 +10346,10 @@ impl Realm {
         if let Some(property) = target.properties.get_mut(&key) {
             if !property.writable {
                 return false;
+            }
+            // The arguments object's `[[Set]]`: a mapped index writes its parameter too.
+            if let ObjectHost::Arguments(Some(map)) = &target.host {
+                map.store(&key, &value);
             }
             property.value = value;
         } else {

@@ -36,6 +36,7 @@ use crate::parser::SourceSpan;
 use crate::parser::Statement;
 use crate::parser::UnaryOp;
 use crate::parser::VariableKind;
+use crate::parser::body_observes_arguments;
 use crate::parser::collect_var_names;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
@@ -56,6 +57,7 @@ use crate::runtime::convert::to_int32;
 use crate::runtime::convert::to_number;
 use crate::runtime::convert::unsigned_shift_right;
 use crate::runtime::coroutine_run::Resume;
+use crate::runtime::types::ArgumentsMap;
 use crate::runtime::types::Binding;
 use crate::runtime::types::CallFrame;
 use crate::runtime::types::ClassFrame;
@@ -786,6 +788,7 @@ impl JsRuntime {
         let class_is_none = class.is_none();
         self.ensure_heap_capacity(if arrow { 1 } else { 2 })?;
         let function_index = self.functions.len();
+        let uses_arguments = !arrow && body_observes_arguments(body);
         let (body, defaults, patterns) = Self::extract_parameter_markers(body);
         let (parameters, length, rest) = Self::binding_parameters(parameters);
         let defaults = (0..parameters.len())
@@ -821,6 +824,7 @@ impl JsRuntime {
             private_scope,
             rest,
             kind,
+            uses_arguments,
             this_context,
             source: None,
         });
@@ -6406,29 +6410,8 @@ impl JsRuntime {
                 primitive => JsValue::Object(self.to_object(&primitive)?),
             }
         };
-        // The arguments object is allocated before the scope swap, so a failed
-        // allocation leaves the caller's frame untouched. The values it copies
-        // and the receiver are pinned while it may collect garbage.
-        let arguments_object = if create_arguments_binding {
-            let pinned = self.transient_roots.len();
-            self.transient_roots.extend(
-                arguments
-                    .iter()
-                    .chain(std::iter::once(&receiver))
-                    .filter_map(|value| match value {
-                        JsValue::Object(object) => Some(*object),
-                        _ => None,
-                    }),
-            );
-            let created = self.create_array_from_values(arguments);
-            self.transient_roots.truncate(pinned);
-            Some(created?)
-        } else {
-            None
-        };
-        let suspended = self.suspend_scopes();
-        let previous_environment =
-            std::mem::replace(&mut self.environment, function.captured_environment.clone());
+        // The parameter record is built before the scope swap, so a failed
+        // allocation of the arguments object leaves the caller's frame untouched.
         let mut call_environment = EnvironmentRecord {
             function_scope: true,
             ..EnvironmentRecord::default()
@@ -6444,20 +6427,9 @@ impl JsRuntime {
             call_environment.bindings.insert(
                 "this".to_owned(),
                 Binding {
-                    value: receiver,
+                    value: receiver.clone(),
                     mutable: true,
                     initialized: !derived_constructor,
-                    kind: VariableKind::Var,
-                },
-            );
-        }
-        if let Some(arguments_object) = arguments_object {
-            call_environment.bindings.insert(
-                "arguments".to_owned(),
-                Binding {
-                    value: JsValue::Object(arguments_object),
-                    mutable: true,
-                    initialized: true,
                     kind: VariableKind::Var,
                 },
             );
@@ -6480,6 +6452,45 @@ impl JsRuntime {
             }
         }
         let call_environment = Rc::new(RefCell::new(call_environment));
+        // The arguments object links to the parameter record, so it is made
+        // once that record exists. A failed allocation returns before the
+        // scope swap below. The values it copies and the receiver are pinned
+        // while it may collect garbage. A body that never names `arguments` cannot
+        // observe the object, so it is skipped. In FunctionDeclarationInstantiation
+        // (ECMA-262 10.2.11) a parameter named `arguments` means none is needed.
+        let arguments_needed = create_arguments_binding
+            && function.uses_arguments
+            && !function
+                .parameters
+                .iter()
+                .any(|parameter| parameter == "arguments");
+        if arguments_needed {
+            let pinned = self.transient_roots.len();
+            self.transient_roots.extend(
+                arguments
+                    .iter()
+                    .chain(std::iter::once(&receiver))
+                    .filter_map(|value| match value {
+                        JsValue::Object(object) => Some(*object),
+                        _ => None,
+                    }),
+            );
+            let created =
+                self.create_arguments_object(callee, &function, arguments, &call_environment);
+            self.transient_roots.truncate(pinned);
+            call_environment.borrow_mut().bindings.insert(
+                "arguments".to_owned(),
+                Binding {
+                    value: JsValue::Object(created?),
+                    mutable: true,
+                    initialized: true,
+                    kind: VariableKind::Var,
+                },
+            );
+        }
+        let suspended = self.suspend_scopes();
+        let previous_environment =
+            std::mem::replace(&mut self.environment, function.captured_environment.clone());
         self.environment.push(call_environment.clone());
         // `super` and `#name` resolve through the class context the function
         // was created in. An arrow's `class` was captured from the frame around
@@ -6599,6 +6610,82 @@ impl JsRuntime {
                 None,
             )),
         }
+    }
+
+    /// `CreateMappedArgumentsObject` (ECMA-262 10.4) for a sloppy function with a
+    /// simple parameter list, and `CreateUnmappedArgumentsObject` otherwise.
+    /// `environment` is the call's parameter record, which a mapped object's
+    /// indices link to.
+    fn create_arguments_object(
+        &mut self,
+        callee: ObjectId,
+        function: &UserFunction,
+        arguments: &[JsValue],
+        environment: &Environment,
+    ) -> Result<ObjectId, JsError> {
+        self.ensure_heap_capacity(1)?;
+        // A parameter list is simple (IsSimpleParameterList) when it has no
+        // defaults, no rest element and no destructuring; only a sloppy function
+        // with a simple list gets a mapped object.
+        let simple = !function.rest
+            && function.defaults.iter().all(Option::is_none)
+            && function.patterns.iter().all(Option::is_none);
+        let map = (simple && !function.strict).then(|| {
+            // CreateMappedArgumentsObject: a repeated parameter name maps only at its
+            // last position, and an index maps only when an argument was passed for it.
+            let mut seen = BTreeSet::new();
+            let mut names = BTreeMap::new();
+            for (index, name) in function.parameters.iter().enumerate().rev() {
+                if seen.insert(name.as_str()) && index < arguments.len() {
+                    names.insert(index.to_string(), name.clone());
+                }
+            }
+            ArgumentsMap::new(environment.clone(), names)
+        });
+        let mapped = map.is_some();
+        let object = self.realm.create_arguments_object(map);
+        // Both creation operations: one writable, enumerable, configurable
+        // property per argument.
+        for (index, value) in arguments.iter().enumerate() {
+            self.realm.define_property(
+                object,
+                index.to_string(),
+                PropertyDescriptor::data(value.clone()),
+            );
+        }
+        let length = JsValue::Number(f64::from(
+            u32::try_from(arguments.len()).unwrap_or(u32::MAX),
+        ));
+        self.realm.define_property(
+            object,
+            "length".to_owned(),
+            PropertyDescriptor::builtin(length),
+        );
+        // `@@iterator` is %Array.prototype.values%, writable, non-enumerable and
+        // configurable.
+        self.realm.define_symbol_property(
+            object,
+            &JsSymbol::well_known("@@iterator"),
+            PropertyDescriptor::builtin(JsValue::Object(self.realm.array_prototype_values())),
+        );
+        // A mapped object's `callee` is the function itself. An unmapped one's is
+        // an accessor that throws, which is `%ThrowTypeError%` and non-configurable.
+        let callee_property = if mapped {
+            PropertyDescriptor::builtin(JsValue::Object(callee))
+        } else {
+            let thrower = self.realm.throw_type_error();
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: Some(thrower),
+                setter: Some(thrower),
+                enumerable: false,
+                configurable: false,
+            }
+        };
+        self.realm
+            .define_property(object, "callee".to_owned(), callee_property);
+        Ok(object)
     }
 
     /// Bind a user function's parameters in order. Each parameter takes its

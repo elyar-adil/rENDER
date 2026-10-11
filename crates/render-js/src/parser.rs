@@ -873,6 +873,19 @@ fn is_arguments_reference(expression: &Expr) -> bool {
     matches!(expression, Expr::Identifier(name) if name == "arguments")
 }
 
+/// Whether a function body can reach its own arguments object: it names
+/// `arguments`, or `eval` whose direct call may name it, in the body's own
+/// context. Nested ordinary functions have their own `arguments`, so they are
+/// not searched. Parameter defaults and destructuring are part of `body`.
+pub(crate) fn body_observes_arguments(body: &[Statement]) -> bool {
+    body.iter()
+        .any(|statement| statement_reaches(statement, is_arguments_or_eval))
+}
+
+fn is_arguments_or_eval(expression: &Expr) -> bool {
+    matches!(expression, Expr::Identifier(name) if name == "arguments" || name == "eval")
+}
+
 fn is_super_call(expression: &Expr) -> bool {
     matches!(expression, Expr::SuperCall { .. })
 }
