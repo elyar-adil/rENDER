@@ -1050,6 +1050,24 @@ fn regex_global_test_and_sticky_track_last_index() {
 }
 
 #[test]
+fn regex_property_escape_matches_a_run_longer_than_the_backtracking_budget() {
+    // A million-code-point plane is what the generated property-escape tests
+    // match with one `+` run; the match must not fail for the size of the run.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let outcome = runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                var astral = "\u{10000}".repeat(1200000);
+                [/^\p{Any}+$/u.test(astral), /^\p{Lu}+$/u.test(astral)].join(",");
+            "#,
+        )
+        .expect("property escape over a long run should execute");
+    assert_eq!(outcome.value, JsValue::String("true,false".into()));
+}
+
+#[test]
 fn string_methods_cover_indexing_slicing_and_case() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

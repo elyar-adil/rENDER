@@ -4913,8 +4913,11 @@ impl JsRuntime {
         let reacts = matches!(self.realm.host(object), Some(ObjectHost::Node(_)))
             && (matches!(property, "innerHTML" | "outerHTML" | "textContent")
                 || node_attribute_property(property).is_some());
+        if !reacts {
+            return self.set_member_native(dom, object, property, value);
+        }
         let hook = match self.realm.global(CUSTOM_ELEMENT_REACTION) {
-            Some(JsValue::Object(hook)) if reacts => hook,
+            Some(JsValue::Object(hook)) => hook,
             _ => return self.set_member_native(dom, object, property, value),
         };
         let property_name = JsValue::String((property.to_owned()).into());

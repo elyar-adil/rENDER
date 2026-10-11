@@ -25,6 +25,20 @@ const BASELINE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/test262-
 
 static DEFAULT_HARNESS: OnceLock<Result<Vec<CompiledScript>, String>> = OnceLock::new();
 
+/// Execution-step budget of each test262 script. The browser keeps the
+/// default budget, which is sized for page scripts. Generated Unicode
+/// property-escape tests build and scan strings of about a million code points
+/// inside the test body, work the specification does not bound and that a
+/// page never does, so only this host raises the budget.
+const TEST262_EXECUTION_STEPS: usize = 50_000_000;
+
+fn test262_limits() -> RuntimeLimits {
+    RuntimeLimits {
+        max_execution_steps: TEST262_EXECUTION_STEPS,
+        ..RuntimeLimits::default()
+    }
+}
+
 #[derive(Debug, Default)]
 struct Metadata {
     flags: Vec<String>,
@@ -909,7 +923,7 @@ fn run_variant(
     };
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
-    let mut runtime = JsRuntime::new(&document.dom);
+    let mut runtime = JsRuntime::with_limits(&document.dom, test262_limits());
     if !raw
         && let Err(detail) = install_harness(&mut runtime, &mut document.dom, &metadata.includes)
     {
@@ -967,7 +981,7 @@ fn run_async_variant(
     };
 
     let mut document = parse_document("<!doctype html><p>test262</p>");
-    let mut runtime = JsRuntime::new(&document.dom);
+    let mut runtime = JsRuntime::with_limits(&document.dom, test262_limits());
     let shim = CompiledScript::compile(PRINT_SHIM, &RuntimeLimits::default())
         .expect("print shim compiles");
     if let Err(error) = runtime.execute_compiled(&mut document.dom, &shim) {
