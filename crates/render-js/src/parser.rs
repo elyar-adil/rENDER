@@ -2006,6 +2006,7 @@ impl Parser {
                     && shorthand_candidate
                     && is_identifier_name(property)
                 {
+                    self.check_contextual_binding(property)?;
                     BindingPattern::Identifier(property.clone())
                 } else {
                     return Err(self.error("object binding shorthand requires an identifier"));
@@ -2410,7 +2411,9 @@ impl Parser {
             if self.at_contextual("of") && !self.current().escaped {
                 self.advance();
                 self.no_in = false;
-                let iterable = self.expression()?;
+                // `for (… of …)` takes an AssignmentExpression, so a comma is not
+                // allowed here (ECMA-262 14.7.5.1).
+                let iterable = self.assignment()?;
                 self.require(&TokenKind::RightParen, "expected ')' after for-of clauses")?;
                 self.loop_depth = self.loop_depth.saturating_add(1);
                 let body = self.statement_in(BodyPosition::LoopBody);
@@ -2520,6 +2523,23 @@ impl Parser {
                 });
             }
             if self.at_contextual("of") && !self.current().escaped {
+                // `for (async of …)` is not a for-of head: the head may not begin with
+                // the unescaped identifier `async` (ECMA-262 14.7.5.1). A parenthesized
+                // `(async)` is not the bare identifier, so it is still allowed.
+                let bare_async = self
+                    .cursor
+                    .checked_sub(1)
+                    .and_then(|index| self.tokens.get(index))
+                    .is_some_and(|token| {
+                        matches!(&token.kind, TokenKind::Identifier(name) if name == "async")
+                            && !token.escaped
+                    });
+                if !is_await
+                    && bare_async
+                    && matches!(&expression, Expr::Identifier(name) if name == "async")
+                {
+                    return Err(self.error("for-of head may not begin with async"));
+                }
                 // `for (LHS of iterable)` with an assignment target, which may be
                 // a destructuring pattern. The loop binds one temporary, and the
                 // body first assigns the pattern from it, so the target is
@@ -3040,6 +3060,11 @@ impl Parser {
         if operator.is_some() && !is_simple_target(&target) {
             return Err(self.error("invalid compound assignment target"));
         }
+        // A parenthesized literal is a PrimaryExpression, not an ObjectLiteral or
+        // ArrayLiteral, so it cannot become a destructuring pattern (ECMA-262 13.15.1).
+        if parenthesized_target && matches!(target, Expr::Array(_) | Expr::Object(_)) {
+            return Err(self.error("a parenthesized literal is not a destructuring pattern"));
+        }
         self.validate_assignment_target(&target)?;
         let value = self.assignment()?;
         Ok(match operator {
@@ -3248,7 +3273,30 @@ impl Parser {
         )
     }
 
+    /// `RelationalExpression` (ECMA-262 13.10). `#name in ShiftExpression` starts one,
+    /// and its right operand is a `ShiftExpression`, so `#x in a + b` tests `a + b`.
     fn comparison(&mut self) -> Result<Expr, JsError> {
+        let mut expression = match self.current().kind.clone() {
+            TokenKind::PrivateName(name)
+                if !self.no_in
+                    && matches!(
+                        self.tokens.get(self.cursor + 1).map(|token| &token.kind),
+                        Some(TokenKind::In)
+                    ) =>
+            {
+                let offset = self.current().offset;
+                self.private_reference(&name, offset)?;
+                self.advance();
+                self.advance();
+                let object = self.shift()?;
+                Expr::PrivateIn {
+                    name,
+                    object: Box::new(object),
+                    offset,
+                }
+            }
+            _ => self.shift()?,
+        };
         let mut operators = vec![
             (&TokenKind::LessEqual, BinaryOp::LessEqual),
             (&TokenKind::GreaterEqual, BinaryOp::GreaterEqual),
@@ -3259,7 +3307,17 @@ impl Parser {
         if !self.no_in {
             operators.push((&TokenKind::In, BinaryOp::In));
         }
-        self.binary_level(Self::shift, &operators)
+        while let Some((_, operator)) = operators.iter().find(|(token, _)| self.at(token)) {
+            self.advance();
+            let right = self.shift()?;
+            expression = Expr::Binary {
+                offset: self.previous_offset(),
+                operator: *operator,
+                left: Box::new(expression),
+                right: Box::new(right),
+            };
+        }
+        Ok(expression)
     }
 
     fn shift(&mut self) -> Result<Expr, JsError> {
@@ -3416,7 +3474,7 @@ impl Parser {
             if self.take(&TokenKind::Dot) {
                 // An escaped `target` spells the name but is not the keyword (ECMA-262 12.7.2).
                 let escaped = self.current().escaped;
-                let property = self.property_name()?;
+                let property = self.member_name()?;
                 if property != "target" || escaped {
                     return Err(self.error("expected 'new.target'"));
                 }
@@ -3440,7 +3498,7 @@ impl Parser {
             }
             loop {
                 if self.take(&TokenKind::Dot) {
-                    let property = self.property_name()?;
+                    let property = self.member_name()?;
                     target = Expr::Member {
                         offset: self.previous_offset(),
                         object: Box::new(target),
@@ -3538,7 +3596,7 @@ impl Parser {
                         name,
                     };
                 } else {
-                    let property = self.property_name()?;
+                    let property = self.member_name()?;
                     expression = Expr::Member {
                         offset: self.previous_offset(),
                         object: Box::new(expression),
@@ -3556,7 +3614,7 @@ impl Parser {
                     };
                     continue;
                 }
-                let property = self.property_name()?;
+                let property = self.member_name()?;
                 expression = Expr::Member {
                     offset: self.previous_offset(),
                     object: Box::new(expression),
@@ -3867,7 +3925,7 @@ impl Parser {
             ));
         }
         if self.take(&TokenKind::Dot) {
-            let property = self.property_name()?;
+            let property = self.member_name()?;
             return Ok(Expr::SuperMember { property, offset });
         }
         if self.take(&TokenKind::LeftBracket) {
@@ -4563,6 +4621,20 @@ impl Parser {
             let key = self.property_key()?;
             let name = static_key_name(&key);
             let (parameters, body, strict) = self.method_tail(FunctionKind::Normal, false)?;
+            // A getter takes no parameters; a setter takes exactly one, which may
+            // carry a default but may not be a rest parameter (ECMA-262 15.4.1).
+            match accessor {
+                ObjectAccessorKind::Getter if !parameters.is_empty() => {
+                    return Err(self.error("an object getter must not have parameters"));
+                }
+                ObjectAccessorKind::Setter
+                    if parameters.len() != 1
+                        || parameters[0].starts_with(PARAMETER_REST_MARKER) =>
+                {
+                    return Err(self.error("an object setter must have exactly one parameter"));
+                }
+                _ => {}
+            }
             return Ok(ObjectProperty {
                 key,
                 value: Expr::Function {
@@ -6533,6 +6605,41 @@ mod tests {
     }
 
     #[test]
+    fn object_accessors_take_the_right_number_of_parameters() {
+        assert!(!script_is_syntax_error(
+            "({ get a() {}, set a(v) {}, set b(v = 1) {} });"
+        ));
+        assert!(script_is_syntax_error("({ get a(x) {} });"));
+        assert!(script_is_syntax_error("({ set a() {} });"));
+        assert!(script_is_syntax_error("({ set a(x, y) {} });"));
+        assert!(script_is_syntax_error("({ set a(...x) {} });"));
+    }
+
+    #[test]
+    fn a_member_name_after_a_dot_is_an_identifier_name() {
+        assert!(!script_is_syntax_error("a.if; a.b; a?.c;"));
+        assert!(script_is_syntax_error("a.'x';"));
+        assert!(script_is_syntax_error("a.1;"));
+    }
+
+    #[test]
+    fn for_of_takes_an_assignment_expression_and_is_not_async() {
+        assert!(!script_is_syntax_error("for (var x of [1]) ;"));
+        assert!(!script_is_syntax_error("for (x of [1]) ;"));
+        assert!(!script_is_syntax_error("var async; for ((async) of [1]) ;"));
+        assert!(script_is_syntax_error("for (let x of [], []) {}"));
+        assert!(script_is_syntax_error("for (var x of [], []) {}"));
+        assert!(script_is_syntax_error("var async; for (async of [1]) ;"));
+    }
+
+    #[test]
+    fn a_parenthesized_literal_is_not_a_destructuring_pattern() {
+        assert!(!script_is_syntax_error("var a; (a) = 1; ({ x: a } = {});"));
+        assert!(script_is_syntax_error("({}) = 1;"));
+        assert!(script_is_syntax_error("var f = () => ({}) = 1;"));
+    }
+
+    #[test]
     fn catch_parameters_are_distinct_and_not_redeclared_by_the_block() {
         assert!(!script_is_syntax_error("try {} catch (e) { var e; }"));
         assert!(!script_is_syntax_error("try {} catch ([a, b]) { let c; }"));
@@ -6547,10 +6654,38 @@ mod tests {
     }
 
     #[test]
+    fn static_block_refuses_await_as_a_shorthand_binding() {
+        assert!(script_is_syntax_error(
+            "class C { static { var {await} = {}; } }"
+        ));
+        assert!(!script_is_syntax_error("var {await} = {};"));
+    }
+
+    #[test]
     fn a_line_terminator_ends_a_single_line_comment() {
         assert!(script_is_syntax_error("// comment\rthis is code"));
         assert!(script_is_syntax_error("// comment\u{2028}this is code"));
         assert!(!script_is_syntax_error("// comment\r\nvar x = 1;"));
+    }
+
+    #[test]
+    fn private_name_in_tests_a_shift_expression_outside_a_for_head() {
+        assert!(!script_is_syntax_error(
+            "class C { #x; m(a) { return #x in this && a < 1 || #x in a + 1; } }"
+        ));
+        assert!(!script_is_syntax_error(
+            "class C { #x; m() { return (#x in this) < 1; } }"
+        ));
+        assert!(script_is_syntax_error(
+            "class C { #x; m() { for (#x in this;;) break; } }"
+        ));
+        assert!(script_is_syntax_error(
+            "class C { #x; m() { return #x in #x in this; } }"
+        ));
+        assert!(script_is_syntax_error(
+            "class C { #x; m() { return 1 < #x in this; } }"
+        ));
+        assert!(script_is_syntax_error("#x in this;"));
     }
 
     #[test]
