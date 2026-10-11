@@ -1223,6 +1223,15 @@ impl Parser {
         if is_refused_body(&statement, position) {
             return Err(self.error("declaration is not allowed in statement position"));
         }
+        // Annex B.3.4 admits a plain function as an `if` clause in sloppy code only (ECMA-262 14.6.1).
+        if self.strict
+            && position == BodyPosition::IfClause
+            && matches!(statement, Statement::Function { .. })
+        {
+            return Err(
+                self.error("function declaration is not allowed as an if clause in strict code")
+            );
+        }
         // Annex B.3.2 allows a labelled plain function in sloppy code only (ECMA-262 14.13.1).
         if self.strict
             && position == BodyPosition::LabelBody
@@ -2193,6 +2202,7 @@ impl Parser {
             "expected '{' after switch expression",
         )?;
         let mut cases = Vec::new();
+        let mut has_default = false;
         self.switch_depth = self.switch_depth.saturating_add(1);
         while !self.at(&TokenKind::RightBrace) && !self.at(&TokenKind::Eof) {
             let tests = if self.take(&TokenKind::Case) {
@@ -2205,6 +2215,11 @@ impl Parser {
                 self.require(&TokenKind::Colon, "expected ':' after case expression")?;
                 tests
             } else if self.take(&TokenKind::Default) {
+                // A CaseBlock has at most one DefaultClause (ECMA-262 14.12.1).
+                if has_default {
+                    return Err(self.error("a switch statement may have only one default clause"));
+                }
+                has_default = true;
                 self.require(&TokenKind::Colon, "expected ':' after default")?;
                 Vec::new()
             } else {
@@ -5734,12 +5749,15 @@ fn validate_head_against_body(names: &[String], body: &Statement) -> Result<(), 
     }
 }
 
+/// Early errors for declarations that clash within one statement list
+/// (ECMA-262 14.2.1 for blocks, 15.2.1 for function bodies, 16.1.1 for scripts).
+///
 /// A lexical name (`let`, `const`, `class`, or a block-level function) may not
 /// be declared twice, nor be declared by a `var` in the list or in a block
 /// nested in it. In a function body or script (`top_level`), a function
-/// declaration is var-scoped rather than lexical. Duplicate block-level
-/// functions are accepted: sloppy code allows them (Annex B.3.3.4), and the
-/// parser does not yet know the code's strictness.
+/// declaration is var-scoped rather than lexical. A block-level function may
+/// repeat only in sloppy code, and only when every declaration of that name is
+/// a plain function (Annex B.3.2.4).
 fn validate_declaration_conflicts<'a>(
     statements: impl IntoIterator<Item = &'a Statement>,
     top_level: bool,
@@ -5747,6 +5765,7 @@ fn validate_declaration_conflicts<'a>(
 ) -> Result<(), JsError> {
     let mut lexical = BTreeSet::new();
     let mut block_functions = BTreeSet::new();
+    let mut non_plain_functions = BTreeSet::new();
     let mut var_names = BTreeSet::new();
     let duplicate =
         |name: &str| JsError::syntax(format!("binding {name:?} is declared more than once"), 0);
@@ -5781,13 +5800,25 @@ fn validate_declaration_conflicts<'a>(
                     return Err(duplicate(name));
                 }
             }
-            Statement::Function { name, .. } => {
+            Statement::Function { name, kind, .. } => {
                 if top_level {
                     var_names.insert(name.clone());
-                } else if !block_functions.insert(name.clone()) && strict {
-                    // Annex B.3.3 lets sloppy code repeat a block-level function;
-                    // strict code makes each one lexical (ECMA-262 14.2.1).
-                    return Err(duplicate(name));
+                } else {
+                    // Annex B.3.2.4 lets sloppy code repeat a block-level name only when
+                    // every declaration of it is a plain FunctionDeclaration. Strict code
+                    // makes each one lexical (ECMA-262 14.2.1). A generator or async
+                    // declaration is never repeatable.
+                    let repeated = !block_functions.insert(name.clone());
+                    if repeated
+                        && (strict
+                            || *kind != FunctionKind::Normal
+                            || non_plain_functions.contains(name))
+                    {
+                        return Err(duplicate(name));
+                    }
+                    if *kind != FunctionKind::Normal {
+                        non_plain_functions.insert(name.clone());
+                    }
                 }
             }
             other => collect_var_names(other, &mut var_names),
@@ -5899,6 +5930,82 @@ mod tests {
         tokenize(source, &limits)
             .and_then(|tokens| super::parse_module(tokens, &limits))
             .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
+    }
+
+    #[test]
+    fn duplicate_block_functions_are_early_errors_unless_both_are_plain_sloppy() {
+        assert!(!script_is_syntax_error(
+            "{ function f() {} function f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "\"use strict\"; { function f() {} function f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "{ async function f() {} function f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "{ function f() {} async function f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "{ function* f() {} function* f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "{ function f() {} function* f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "{ async function* f() {} async function f() {} }"
+        ));
+    }
+
+    #[test]
+    fn duplicate_switch_case_functions_are_early_errors_unless_both_are_plain_sloppy() {
+        assert!(!script_is_syntax_error(
+            "switch (0) { case 1: function f() {} default: function f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "switch (0) { case 1: function f() {} default: function* f() {} }"
+        ));
+        assert!(script_is_syntax_error(
+            "switch (0) { case 1: async function f() {} default: function f() {} }"
+        ));
+    }
+
+    #[test]
+    fn a_switch_has_at_most_one_default_clause() {
+        assert!(!script_is_syntax_error(
+            "switch (0) { case 1: break; default: break; }"
+        ));
+        assert!(script_is_syntax_error(
+            "switch (0) { default: break; default: break; }"
+        ));
+        assert!(script_is_syntax_error(
+            "switch (0) { case 0: default: default: }"
+        ));
+    }
+
+    #[test]
+    fn top_level_function_declarations_may_repeat() {
+        assert!(!script_is_syntax_error(
+            "function f() {} async function f() {} function* f() {}"
+        ));
+        assert!(!script_is_syntax_error(
+            "function g() { function f() {} function* f() {} }"
+        ));
+    }
+
+    #[test]
+    fn plain_function_as_if_clause_is_an_early_error_in_strict_code_only() {
+        assert!(!script_is_syntax_error("if (true) function f() {}"));
+        assert!(!script_is_syntax_error("if (true) {} else function g() {}"));
+        assert!(script_is_syntax_error(
+            "\"use strict\"; if (true) function f() {}"
+        ));
+        assert!(script_is_syntax_error(
+            "\"use strict\"; if (false) ; else function f() {}"
+        ));
+        assert!(script_is_syntax_error(
+            "function g() { 'use strict'; if (true) function f() {} }"
+        ));
     }
 
     #[test]
