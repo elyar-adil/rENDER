@@ -1862,6 +1862,105 @@ fn regexp_flags_getter_reads_each_flag_through_get() {
 }
 
 #[test]
+fn regexp_folds_simple_cases_and_allocates_from_new_target() {
+    // CaseFolding (C and S): `\u{17f}` folds to `s` and `\u{b5}` to `\u{3bc}` under `iu`, while
+    // dotless `\u{131}` and `\u{130}` fold to themselves.
+    assert_eq!(
+        ok(
+            r#"String([/\u017F/iu.test("S"), /S/iu.test("\u017F"), /(\xB5)/ui.test("\u039C"), /i/iu.test("\u0131"), /\u0130/iu.test("i")])"#
+        ),
+        "true,true,true,false,false"
+    );
+    // CharacterSetMatcher: a single-character class member matches the input when
+    // both fold to the same character, so `[K]` takes U+212A under `iu`.
+    assert_eq!(
+        ok(
+            r#"String([/[\u212A]+/iu.exec("<k\u212A>")[0], /[K]+/iu.exec("<Kk\u212A>")[0].length])"#
+        ),
+        "k\u{212a},3"
+    );
+    // 22.2.4.1 step 7: RegExpAlloc reads newTarget.prototype before the flags
+    // are converted, and a subclass instance keeps its own prototype.
+    assert_eq!(
+        ok(
+            r#"var order = ""; var flags = { toString() { order += "s"; return "g"; } };
+            var newTarget = Object.defineProperty(function () {}.bind(null), "prototype", {
+                get() { order += "p"; return RegExp.prototype; }
+            });
+            Reflect.construct(RegExp, ["a", flags], newTarget);
+            class Sub extends RegExp {}
+            var sub = new Sub("a", "g");
+            order + "," + (sub instanceof Sub) + "," + sub.test("a")"#
+        ),
+        "ps,true,true"
+    );
+    // 22.2.7.2 step 2: ToLength(lastIndex) runs before the flags are read, so a
+    // recompilation inside its valueOf makes the match global.
+    assert_eq!(
+        ok(
+            r#"var m = /a/; m.lastIndex = { valueOf() { m.compile("a", "g"); return 0; } };
+            m[Symbol.match]("a"); String(m.lastIndex)"#
+        ),
+        "1"
+    );
+    // B.2.4.1: compile recompiles in place and resets lastIndex.
+    assert_eq!(
+        ok(r#"var r = /a/g; r.lastIndex = 4; r.compile("b", "i");
+            [r.source, r.flags, r.lastIndex, r.test("B")].join(",")"#),
+        "b,i,0,true"
+    );
+    // 22.2.6.17 step 2: a receiver that is not an Object throws before any read.
+    assert_eq!(
+        ok(r#"var threw = 0; for (var receiver of [undefined, 1, ""]) {
+            try { RegExp.prototype.toString.call(receiver); } catch (error) { if (error instanceof TypeError) threw++; }
+        } String(threw)"#),
+        "3"
+    );
+    // 22.2.6.17: toString reads source and flags from any object.
+    assert_eq!(
+        ok(r#"RegExp.prototype.toString.call({ source: "a", flags: "gi" })"#),
+        "/a/gi"
+    );
+}
+
+#[test]
+fn super_references_and_object_literal_methods_follow_the_spec() {
+    // 13.5.1.2: deleting a super reference throws a ReferenceError. 6.2.5.5 PutValue:
+    // a read-only inherited property refuses the write, which throws in strict code
+    // and is silent in sloppy code. 15.4.4: an object-literal method is not a
+    // constructor and has no `prototype`, but a generator method keeps one.
+    assert_eq!(
+        ok(r#"
+            Object.defineProperty(Object.prototype, "prop", { value: 1, writable: false });
+            class B {}
+            class A extends B {
+                deleted() { try { delete super.x; return "no"; } catch (error) { return error instanceof ReferenceError; } }
+                written() { try { super.prop = 2; return "no"; } catch (error) { return error instanceof TypeError; } }
+            }
+            var sloppy = { write() { super.prop = 3; return "quiet"; } };
+            [new A().deleted(), new A().written(), sloppy.write(),
+             ({ m() {} }).m.hasOwnProperty("prototype"), ({ *g() {} }).g.hasOwnProperty("prototype")].join(",")
+        "#),
+        "true,true,quiet,false,true"
+    );
+}
+
+#[test]
+fn object_literal_accessors_are_named_with_their_get_or_set_prefix() {
+    // ECMA-262 15.4.5 (SetFunctionName with a prefix): an accessor's function is
+    // named `get ` or `set ` before its key, for identifier, numeric and symbol keys.
+    assert_eq!(
+        ok(
+            r#"var s = Symbol("q"); var o = { get a() {}, set a(v) {}, get 123() {}, get [s]() {} };
+            var a = Object.getOwnPropertyDescriptor(o, "a");
+            [a.get.name, a.set.name, Object.getOwnPropertyDescriptor(o, "123").get.name,
+             Object.getOwnPropertyDescriptor(o, s).get.name].join(",")"#
+        ),
+        "get a,set a,get 123,get [q]"
+    );
+}
+
+#[test]
 fn a_unicode_back_reference_matches_whole_code_points() {
     assert_eq!(
         ok(r#"String(/foo(.+)bar\1/u.exec("foo\uD834bar\uD834\uDC00"))"#),

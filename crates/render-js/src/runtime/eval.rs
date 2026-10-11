@@ -836,7 +836,8 @@ impl JsRuntime {
         let function = if arrow {
             self.realm.arrow_function(function_index, name, length)
         } else {
-            self.realm.user_function(function_index, name, length, kind)
+            self.realm
+                .user_function(function_index, name, length, kind, method)
         };
         // A sloppy ordinary function carries its own `caller` and `arguments`
         // (both null, non-writable and non-configurable), so reading them does
@@ -2513,7 +2514,18 @@ impl JsRuntime {
         operand: &Expr,
     ) -> Result<JsValue, JsError> {
         match operand {
-            Expr::Member { .. } | Expr::ComputedMember { .. } => {
+            Expr::Member { .. }
+            | Expr::ComputedMember { .. }
+            | Expr::SuperMember { .. }
+            | Expr::SuperComputedMember { .. } => {
+                // 13.3.7.1 step 2: a super reference reads `this` before the
+                // property expression runs, so an uninitialized `this` throws first.
+                if matches!(
+                    operand,
+                    Expr::SuperMember { .. } | Expr::SuperComputedMember { .. }
+                ) {
+                    self.current_this()?;
+                }
                 let reference = self.resolve_assignment_reference(dom, operand)?;
                 match reference {
                     AssignmentReference::Property { object, property } => {
@@ -2531,10 +2543,14 @@ impl JsRuntime {
                         let deleted = self.delete_property_on(dom, object, &key)?;
                         self.refuse_failed_delete(deleted)
                     }
-                    AssignmentReference::Private { .. }
-                    | AssignmentReference::SuperProperty { .. } => Err(JsError::new(
+                    // ECMA-262 13.5.1.2: deleting a super reference throws a
+                    // ReferenceError once the reference is evaluated.
+                    AssignmentReference::SuperProperty { .. } => {
+                        Err(JsError::reference("super properties cannot be deleted"))
+                    }
+                    AssignmentReference::Private { .. } => Err(JsError::new(
                         JsErrorKind::Syntax,
-                        "private and super members cannot be deleted",
+                        "private members cannot be deleted",
                         None,
                     )),
                     AssignmentReference::Binding { .. } => {
@@ -3557,9 +3573,17 @@ impl JsRuntime {
             } = &property.value
             {
                 // A method or accessor does not bind its own name in its body,
-                // unlike a named function expression (ECMA-262 15.4).
-                let value =
-                    self.create_method(name.as_deref(), parameters, body, *kind, *strict)?;
+                // unlike a named function expression (ECMA-262 15.4). An accessor
+                // is named `get ` or `set ` before its key (ECMA-262 15.4.5).
+                let accessor_name = property.accessor.map(|accessor| {
+                    let prefix = match accessor {
+                        ObjectAccessorKind::Getter => "get ",
+                        ObjectAccessorKind::Setter => "set ",
+                    };
+                    format!("{prefix}{}", property_key_function_name(&key_value))
+                });
+                let name = accessor_name.as_deref().or(name.as_deref());
+                let value = self.create_method(name, parameters, body, *kind, *strict)?;
                 self.attach_function_source(&value, source);
                 value
             } else {
@@ -6048,6 +6072,17 @@ impl JsRuntime {
             Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeValueOf)) => {
                 Ok(JsValue::Object(self.to_object(&receiver)?))
             }
+            // ECMA-262 22.2.6.17 `RegExp.prototype.toString` step 2: a `this` that is
+            // not an Object is a `TypeError`, so a primitive or undefined receiver never
+            // reaches a wrapper or the global object.
+            Some(ObjectHost::NativeFunction(NativeFunction::RegExpToString)) => match receiver {
+                JsValue::Object(object) => {
+                    self.call_native(dom, NativeFunction::RegExpToString, object, arguments)
+                }
+                _ => Err(JsError::type_error(
+                    "RegExp.prototype.toString requires an object receiver",
+                )),
+            },
             // ECMA-262 21.4.4.45 `Date.prototype[@@toPrimitive]` reads `this` as an
             // Object, so a primitive receiver is a `TypeError`, not a wrapper.
             Some(ObjectHost::NativeFunction(NativeFunction::DateSymbolToPrimitive)) => {

@@ -238,15 +238,13 @@ impl JsRuntime {
         index: usize,
         input: &[u16],
     ) -> Result<Option<MatchRanges>, JsError> {
+        // Step 2 reads `lastIndex` with ToLength before step 3 reads the flags, so a
+        // recompilation from a `valueOf` takes effect for this match.
+        let stored = self.get_member(dom, rx, "lastIndex")?;
+        let to_length = self.to_length_value(dom, &stored)?;
         let flags = self.regexes[index].compiled.flags();
         let tracks = flags.global || flags.sticky;
-        let stored = self.get_member(dom, rx, "lastIndex")?;
-        let last_index = if tracks {
-            self.to_length_value(dom, &stored)?
-        } else {
-            self.to_length_value(dom, &stored)?;
-            0.0
-        };
+        let last_index = if tracks { to_length } else { 0.0 };
         if last_index > input.len() as f64 {
             if tracks {
                 self.set_strict(dom, rx, "lastIndex", JsValue::Number(0.0))?;

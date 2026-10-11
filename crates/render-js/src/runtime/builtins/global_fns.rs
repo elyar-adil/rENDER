@@ -1290,6 +1290,9 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::RegExpCompile => {
+                self.dispatch_regexp_native(dom, NativeFunction::RegExpCompile, receiver, arguments)
+            }
             NativeFunction::RegExpAccessor(_)
             | NativeFunction::RegExpSymbolMatch
             | NativeFunction::RegExpSymbolMatchAll

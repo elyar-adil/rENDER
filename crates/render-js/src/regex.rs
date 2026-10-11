@@ -902,19 +902,34 @@ fn is_word(value: u32, flags: Flags) -> bool {
 }
 
 /// The canonical form that case-insensitive matching compares: the single
-/// uppercase mapping without `u`, and the single lowercase mapping (an
-/// approximation of simple case folding) with `u`.
+/// uppercase mapping without `u`, and simple case folding with `u`.
 fn canonicalize(value: u32, unicode: bool) -> u32 {
     let Some(character) = char::from_u32(value) else {
         return value;
     };
     if unicode {
-        return single_char(character.to_lowercase()).unwrap_or(value);
+        return simple_case_fold(character);
     }
     match single_char(character.to_uppercase()) {
         Some(upper) if upper <= 0xffff && !(value >= 128 && upper < 128) => upper,
         _ => value,
     }
+}
+
+/// Simple case folding (Unicode CaseFolding.txt statuses C and S), from the
+/// single-character uppercase and lowercase mappings: a letter folds to the
+/// lowercase of its uppercase, so `ſ` folds to `s` and `µ` to `μ`. The one
+/// lowercase letter whose uppercase is an ASCII letter yet which has no folding
+/// is dotless `ı` (U+0131), so it folds to itself. A mapping to several
+/// characters, such as `ß` to `SS`, leaves the character unchanged.
+fn simple_case_fold(character: char) -> u32 {
+    if character == '\u{131}' {
+        return u32::from(character);
+    }
+    let upper = single_char(character.to_uppercase())
+        .and_then(char::from_u32)
+        .unwrap_or(character);
+    single_char(upper.to_lowercase()).unwrap_or(u32::from(character))
 }
 
 /// The character itself and its single-character case mappings: the values a
@@ -938,19 +953,23 @@ fn single_char(mut mapping: impl Iterator<Item = char>) -> Option<u32> {
 }
 
 fn class_contains(items: &[ClassItem], value: u32, flags: Flags) -> bool {
-    if flags.ignore_case {
-        // A member matches when it canonicalizes to the same character as the
-        // input, so only variants with that canonical form may match.
-        let canonical = canonicalize(value, flags.unicode);
-        case_variants(value).into_iter().any(|candidate| {
-            canonicalize(candidate, flags.unicode) == canonical
-                && items
-                    .iter()
-                    .any(|item| item_matches(item, candidate, flags))
-        })
-    } else {
-        items.iter().any(|item| item_matches(item, value, flags))
+    if !flags.ignore_case {
+        return items.iter().any(|item| item_matches(item, value, flags));
     }
+    // CharacterSetMatcher (ECMA-262 22.2.2.7.3): a member matches when it
+    // canonicalizes to the input's canonical character. A single character item
+    // is compared that way directly, so `[K]` matches U+212A under `iu`, which is
+    // no case variant of `k`. Other items are tested through the input's case
+    // variants.
+    let canonical = canonicalize(value, flags.unicode);
+    let variants = case_variants(value);
+    items.iter().any(|item| match item {
+        ClassItem::Char(member) => canonicalize(*member, flags.unicode) == canonical,
+        _ => variants.into_iter().any(|candidate| {
+            canonicalize(candidate, flags.unicode) == canonical
+                && item_matches(item, candidate, flags)
+        }),
+    })
 }
 
 fn item_matches(item: &ClassItem, value: u32, flags: Flags) -> bool {

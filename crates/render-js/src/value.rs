@@ -766,6 +766,8 @@ pub(crate) enum NativeFunction {
     RegExpExec,
     RegExpTest,
     RegExpToString,
+    /// `RegExp.prototype.compile` (Annex B.2.4.1).
+    RegExpCompile,
     RegExpAccessor(RegExpAccessor),
     /// `RegExp.prototype[@@match]`, `[@@matchAll]`, `[@@replace]`, `[@@search]`
     /// and `[@@split]` (ECMA-262 22.2.6.8-12).
@@ -5743,7 +5745,7 @@ impl Realm {
             "setMonth" | "setSeconds" | "setUTCMonth" | "setUTCSeconds" => 2,
             "setFullYear" | "setMinutes" | "setUTCFullYear" | "setUTCMinutes" => 3,
             "setHours" | "setUTCHours" => 4,
-            "construct" => 2,
+            "construct" | "compile" => 2,
             "toString" | "valueOf" | "toISOString" | "toUTCString" | "toDateString" | "now"
             | "getTime" | "getFullYear" | "getUTCFullYear" | "getMonth" | "getUTCMonth"
             | "getDate" | "getUTCDate" | "getDay" | "getUTCDay" | "getHours" | "getUTCHours"
@@ -6574,6 +6576,7 @@ impl Realm {
             ("exec", NativeFunction::RegExpExec),
             ("test", NativeFunction::RegExpTest),
             ("toString", NativeFunction::RegExpToString),
+            ("compile", NativeFunction::RegExpCompile),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -6675,17 +6678,6 @@ impl Realm {
                     configurable: true,
                 },
             ),
-        );
-        objects[prototype.0].properties.insert(
-            "lastIndex".to_owned(),
-            PropertyDescriptor {
-                getter: None,
-                setter: None,
-                value: JsValue::Number(0.0),
-                writable: true,
-                enumerable: false,
-                configurable: false,
-            },
         );
         objects[constructor.0].properties.insert(
             "prototype".to_owned(),
@@ -10588,9 +10580,13 @@ impl Realm {
         name: &str,
         length: usize,
         kind: FunctionKind,
+        method: bool,
     ) -> ObjectId {
         let prototype = match kind {
             FunctionKind::Async => None,
+            // A method is not a constructor, so it has no `prototype` (ECMA-262
+            // 15.4.4). A generator method still has one, for its generator objects.
+            FunctionKind::Normal if method => None,
             FunctionKind::Normal => Some(self.create_ordinary_object()),
             FunctionKind::Generator => Some(self.allocate(JsObject {
                 prototype: Some(self.generator_prototype),

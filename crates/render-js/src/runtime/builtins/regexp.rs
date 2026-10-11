@@ -20,6 +20,7 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::regex::MatchRanges;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::object::PropertyName;
 use crate::runtime::types::RegexRecord;
 use crate::utf16;
 use crate::utf16::JsString;
@@ -38,7 +39,8 @@ impl JsRuntime {
         match function {
             NativeFunction::RegExpExec => self.regexp_exec(dom, receiver, arguments),
             NativeFunction::RegExpTest => self.regexp_test(dom, receiver, arguments),
-            NativeFunction::RegExpToString => self.regexp_to_string(receiver),
+            NativeFunction::RegExpToString => self.regexp_to_string(dom, receiver),
+            NativeFunction::RegExpCompile => self.regexp_compile(dom, receiver, arguments),
             NativeFunction::RegExpAccessor(accessor) => {
                 self.regexp_accessor(dom, receiver, accessor)
             }
@@ -60,12 +62,8 @@ impl JsRuntime {
 }
 
 impl JsRuntime {
-    /// Compile `pattern` with `flags` and allocate a `RegExp` instance.
-    pub(in crate::runtime) fn construct_regex(
-        &mut self,
-        pattern: &JsString,
-        flags: &str,
-    ) -> Result<ObjectId, JsError> {
+    /// Compile `pattern` with `flags`, through the bounded compile cache.
+    fn compile_regex(&mut self, pattern: &JsString, flags: &str) -> Result<RegexRecord, JsError> {
         let key = (pattern.to_key(), flags.to_owned());
         let compiled = if let Some(compiled) = self.regex_cache.get(&key) {
             std::rc::Rc::clone(compiled)
@@ -85,8 +83,18 @@ impl JsRuntime {
             self.regex_cache.insert(key, std::rc::Rc::clone(&compiled));
             compiled
         };
+        Ok(RegexRecord { compiled })
+    }
+
+    /// Compile `pattern` with `flags` and allocate a `RegExp` instance.
+    pub(in crate::runtime) fn construct_regex(
+        &mut self,
+        pattern: &JsString,
+        flags: &str,
+    ) -> Result<ObjectId, JsError> {
+        let record = self.compile_regex(pattern, flags)?;
         let index = self.regexes.len();
-        self.regexes.push(RegexRecord { compiled });
+        self.regexes.push(record);
         let object = self.realm.regexp_wrapper(index);
         // The flags and source are prototype accessors, not own properties; only
         // `lastIndex` is an own property of an instance.
@@ -150,6 +158,20 @@ impl JsRuntime {
             }
             _ => (pattern.clone(), flags.clone()),
         };
+        // Step 7: RegExpAlloc(newTarget) reads the prototype before RegExpInitialize
+        // (step 8) converts the source and flags. A call without `new` uses the
+        // constructor itself as newTarget.
+        let new_target = match (called_without_new, self.new_target_stack.last()) {
+            (false, Some(JsValue::Object(target))) => *target,
+            _ => active,
+        };
+        let prototype = match self.get_member(dom, new_target, "prototype")? {
+            JsValue::Object(prototype) => Some(prototype),
+            _ => match self.realm.get_property(active, "prototype") {
+                Some(JsValue::Object(prototype)) => Some(prototype),
+                _ => None,
+            },
+        };
         let source = match source {
             JsValue::Undefined => JsString::empty(),
             value => self.to_string_coerced(dom, &value)?,
@@ -159,7 +181,60 @@ impl JsRuntime {
             value => self.to_string_coerced(dom, &value)?.to_lossy(),
         };
         let object = self.construct_regex(&source, &flags_text)?;
+        if let Some(prototype) = prototype {
+            self.realm.set_prototype(object, Some(prototype));
+        }
         Ok(JsValue::Object(object))
+    }
+
+    /// `RegExp.prototype.compile(pattern, flags)` (Annex B.2.4.1): recompiles the
+    /// receiver in place. A `RegExp` `pattern` supplies its own source and flags,
+    /// and then `flags` must be undefined. Otherwise both are converted with
+    /// `ToString`, undefined reading as the empty string. `RegExpInitialize`
+    /// (22.2.3.2) then sets `lastIndex` to 0 with a throwing `Set`.
+    pub(in crate::runtime) fn regexp_compile(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let index = self.regex_index(receiver)?;
+        let pattern = arguments.first().cloned().unwrap_or(JsValue::Undefined);
+        let flags = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
+        let source_record = match &pattern {
+            JsValue::Object(object) => match self.realm.host(*object) {
+                Some(ObjectHost::RegExp(source_index)) => Some(source_index),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (source, flags_text) = if let Some(source_index) = source_record {
+            if !matches!(flags, JsValue::Undefined) {
+                return Err(JsError::type_error(
+                    "flags must be undefined when the pattern is a RegExp",
+                ));
+            }
+            let compiled = &self.regexes[source_index].compiled;
+            (compiled.source(), compiled.flags().describe())
+        } else {
+            let source = match pattern {
+                JsValue::Undefined => JsString::empty(),
+                value => self.to_string_coerced(dom, &value)?,
+            };
+            let flags_text = match flags {
+                JsValue::Undefined => String::new(),
+                value => self.to_string_coerced(dom, &value)?.to_lossy(),
+            };
+            (source, flags_text)
+        };
+        self.regexes[index] = self.compile_regex(&source, &flags_text)?;
+        let last_index = PropertyName::String("lastIndex".to_owned());
+        if !self.set_property_checked(dom, receiver, &last_index, JsValue::Number(0.0))? {
+            return Err(JsError::type_error(
+                "cannot assign to read only property 'lastIndex'",
+            ));
+        }
+        Ok(JsValue::Object(receiver))
     }
 
     /// The accessors ECMA-262 22.2.6 defines on %RegExp.prototype%. An instance
@@ -463,16 +538,22 @@ impl JsRuntime {
         )))
     }
 
+    /// `RegExp.prototype.toString()` (ECMA-262 22.2.6.17): `/`, then `source` and
+    /// `flags` read with `Get` and converted with `ToString`, then `/`. Any object
+    /// is a valid receiver, so a RegExp-like object reads its own accessors.
     pub(in crate::runtime) fn regexp_to_string(
         &mut self,
+        dom: &mut Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
-        let index = self.regex_index(receiver)?;
-        let source = escaped_source(&self.regexes[index].compiled.source());
-        let flags = self.regexes[index].compiled.flags().describe();
-        Ok(JsValue::String(JsString::from(format!(
-            "/{source}/{flags}"
-        ))))
+        let source = self.get_member(dom, receiver, "source")?;
+        let source = self.to_string_coerced(dom, &source)?;
+        let flags = self.get_member(dom, receiver, "flags")?;
+        let flags = self.to_string_coerced(dom, &flags)?;
+        let slash = JsString::from("/");
+        Ok(JsValue::String(
+            slash.concat(&source).concat(&slash).concat(&flags),
+        ))
     }
 
     /// `RegExp.escape(string)`: the source text that matches `string` literally.

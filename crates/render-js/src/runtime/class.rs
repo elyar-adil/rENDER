@@ -919,13 +919,25 @@ impl JsRuntime {
         let base = self.realm.get_prototype(home);
         if let Some(base) = base
             && let Some(descriptor) = self.realm.get_descriptor(base, property)
-            && descriptor.is_accessor()
         {
-            let Some(setter) = descriptor.setter else {
-                return Err(JsError::type_error("property has no setter"));
-            };
-            self.call_with_this(dom, setter, &[value], receiver)?;
-            return Ok(());
+            if descriptor.is_accessor() {
+                let Some(setter) = descriptor.setter else {
+                    return Err(JsError::type_error("property has no setter"));
+                };
+                self.call_with_this(dom, setter, &[value], receiver)?;
+                return Ok(());
+            }
+            // OrdinarySet on the base (ECMA-262 10.1.9.2): a read-only data
+            // property found there refuses the write. PutValue (6.2.5.5 step 6.c)
+            // throws for that refusal in strict code.
+            if !descriptor.writable {
+                if self.code_is_strict() {
+                    return Err(JsError::type_error(format!(
+                        "cannot assign to read only property '{property}'"
+                    )));
+                }
+                return Ok(());
+            }
         }
         let JsValue::Object(receiver) = receiver else {
             return Err(JsError::type_error("cannot set a property on a primitive"));
