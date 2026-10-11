@@ -247,6 +247,8 @@ impl JsRuntime {
             function: None,
             private_scope: Some(private_names.clone()),
             this_context,
+            // Class bodies are always strict mode code (ECMA-262 11.2.1).
+            strict: true,
         });
         let result = self.evaluate_class_body_inner(
             dom,
@@ -477,6 +479,7 @@ impl JsRuntime {
                 derived_constructor: false,
                 class_field_initializer: false,
             },
+            strict: true,
         });
         let result = self.define_static_elements(dom, constructor, elements, &resolved_keys);
         self.class_frames.pop();
@@ -716,6 +719,7 @@ impl JsRuntime {
                 derived_constructor: false,
                 class_field_initializer: true,
             },
+            strict: true,
         });
         let result = self.with_this(JsValue::Object(instance), |runtime| {
             for field in &class.fields {

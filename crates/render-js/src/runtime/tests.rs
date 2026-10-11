@@ -5347,6 +5347,45 @@ fn typed_array_copy_within_revalidates_after_its_arguments_detach_the_buffer() {
 }
 
 #[test]
+fn typed_array_with_checks_the_index_after_its_value_resizes_the_buffer() {
+    // ECMA-262 23.2.3.38 step 9: the index is validated after the value is
+    // coerced, against the length the coercion leaves. A shrink makes the index
+    // invalid (RangeError), and it must not reach the element copy.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var out = 'pending';
+                var rab = new ArrayBuffer(4, { maxByteLength: 4 });
+                var ta = new Uint8Array(rab);
+                try {
+                    ta.with(-1, { valueOf: function () { rab.resize(1); return 1; } });
+                    out = 'no throw';
+                } catch (error) {
+                    out = error.name;
+                }
+            ",
+            "",
+            "out",
+        ),
+        "RangeError"
+    );
+    // A grow keeps the index valid; the copy reads the new elements as well.
+    assert_eq!(
+        settle_then_read(
+            r"
+                var rab = new ArrayBuffer(2, { maxByteLength: 4 });
+                var ta = new Uint8Array(rab);
+                var copy = ta.with(0, { valueOf: function () { rab.resize(4); return 9; } });
+                var out = copy.length + ':' + copy[0];
+            ",
+            "",
+            "out",
+        ),
+        "2:9"
+    );
+}
+
+#[test]
 fn array_from_keeps_its_iterator_alive_across_collections() {
     // `Array.from` drives the iterator from Rust locals. With a heap this small,
     // the allocations of each step collect garbage, so an iterator or `next` that

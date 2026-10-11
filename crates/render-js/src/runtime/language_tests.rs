@@ -2881,3 +2881,103 @@ fn template_substitution_ends_at_the_brace_the_tokenizer_finds() {
     assert_eq!(ok("`x${`y${1 + 1}z`}w`"), "xy2zw");
     assert_eq!(ok("var a = 6; `${a / 2 / 1}`"), "3");
 }
+
+/// The name of the error a script throws, or `"no throw"`.
+fn thrown_name(source: &str) -> String {
+    let wrapped = format!(
+        "var __r; try {{ {source}; __r = 'no throw'; }} catch (e) {{ __r = e.constructor.name; }} __r;"
+    );
+    ok(&wrapped)
+}
+
+#[test]
+fn a_named_function_expressions_own_name_is_silently_immutable_in_sloppy_code() {
+    // CreateImmutableBinding(name, false): sloppy writes are ignored, direct or
+    // through a direct eval (ECMA-262 9.1.1.1.5 and 19.2.1.1).
+    assert_eq!(
+        ok("var f = function g() { g = 1; return typeof g; }; f();"),
+        "function"
+    );
+    assert_eq!(
+        ok("var f = function g() { eval('g = 1'); return typeof g; }; f();"),
+        "function"
+    );
+    // Strict code throws on the same write.
+    assert_eq!(
+        thrown_name("var f = function g() { 'use strict'; g = 1; }; f()"),
+        "TypeError"
+    );
+    // A strict eval inside sloppy code is strict itself.
+    assert_eq!(
+        thrown_name("var f = function g() { eval('\"use strict\"; g = 1'); }; f()"),
+        "TypeError"
+    );
+}
+
+#[test]
+fn strict_code_throws_on_an_assignment_to_an_undeclared_name() {
+    // PutValue on an unresolvable reference throws in strict code only (ECMA-262
+    // 6.2.5.6); sloppy code creates the global.
+    assert_eq!(
+        ok(
+            "'use strict'; var r; try { undeclaredStrictName = 1; r = 'no throw'; } catch (e) { r = e.constructor.name; } r;"
+        ),
+        "ReferenceError"
+    );
+    assert_eq!(
+        ok("undeclaredSloppyName = 1; typeof undeclaredSloppyName"),
+        "number"
+    );
+    // Class bodies are strict, and so is a generator declared in strict code.
+    assert_eq!(
+        thrown_name("class C { m() { undeclaredInClass = 1; } } new C().m()"),
+        "ReferenceError"
+    );
+    assert_eq!(
+        ok(
+            "'use strict'; var r; function* gen() { yield (undeclaredInGen = 1); } try { gen().next(); r = 'no throw'; } catch (e) { r = e.constructor.name; } r;"
+        ),
+        "ReferenceError"
+    );
+}
+
+#[test]
+fn delete_follows_the_reference_it_is_given() {
+    // An unresolvable reference deletes to true (ECMA-262 13.5.1.2 step 3).
+    assert_eq!(
+        ok("(function () { return delete unresolvableName; })()"),
+        "true"
+    );
+    assert_eq!(
+        ok("(function () { return eval('delete (unresolvableName)'); })()"),
+        "true"
+    );
+    // A global declaration is not deletable; a configurable global property is.
+    assert_eq!(ok("var keptGlobal = 1; delete keptGlobal"), "false");
+    assert_eq!(
+        ok(
+            "globalThis.removedGlobal = 1; var r = delete removedGlobal; r + ':' + typeof removedGlobal"
+        ),
+        "true:undefined"
+    );
+    // `undefined` and `NaN` are non-configurable global properties.
+    assert_eq!(ok("delete undefined"), "false");
+    assert_eq!(ok("delete NaN"), "false");
+}
+
+#[test]
+fn undefined_is_an_ordinary_identifier_that_is_not_writable() {
+    // It can be shadowed by a declaration (ECMA-262 9.1.1.4.2 / 16.1.7).
+    assert_eq!(
+        ok("(function () { var undefined = 5; return undefined; })()"),
+        "5"
+    );
+    // A sloppy write to a non-writable global is ignored; a strict one throws.
+    assert_eq!(ok("undefined = 5; undefined"), "undefined");
+    assert_eq!(
+        ok(
+            "'use strict'; var r; try { undefined = 5; r = 'no throw'; } catch (e) { r = e.constructor.name; } r;"
+        ),
+        "TypeError"
+    );
+}

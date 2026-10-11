@@ -258,6 +258,9 @@ pub(super) struct ClassFrame {
     pub(super) private_scope: Option<Rc<PrivateScope>>,
     /// The function context of the code this frame runs; see [`ThisContext`].
     pub(super) this_context: ThisContext,
+    /// Whether the code this frame runs is strict mode code. Writes to
+    /// immutable bindings and undeclared names depend on it.
+    pub(super) strict: bool,
 }
 
 /// One active JavaScript call frame, retained for stack traces and

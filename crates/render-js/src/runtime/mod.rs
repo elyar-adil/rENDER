@@ -135,6 +135,9 @@ pub struct JsRuntime {
     /// Class context of each active user-function call, for `super`,
     /// `new.target`, and field initialization.
     class_frames: Vec<ClassFrame>,
+    /// Strictness of the top-level script code that is running, used when no
+    /// [`ClassFrame`] is active (ECMA-262 11.2.2 and 16.1.7).
+    root_strict: bool,
     /// `new.target` of each active construction, `Undefined` for plain calls.
     new_target_stack: Vec<JsValue>,
     /// Set across the `construct` of a `super()` call; see `dispatch_new_target`.
@@ -271,6 +274,7 @@ impl JsRuntime {
             prelude_error: None,
             functions: Vec::new(),
             class_frames: Vec::new(),
+            root_strict: false,
             new_target_stack: Vec::new(),
             super_call_pending: false,
             arrays_joining: Vec::new(),
@@ -943,7 +947,7 @@ impl JsRuntime {
             self.calls_active = 0;
             self.environment.clear();
             let from_revision = dom.revision();
-            self.run_compiled_script(dom, &script.statements, from_revision)
+            self.run_compiled_script(dom, &script.statements, script.is_strict(), from_revision)
         });
         if let Err(error) = outcome {
             if std::env::var_os("RENDER_JS_TRACE").is_some() {
@@ -996,7 +1000,8 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
-        let outcome = self.run_compiled_script(dom, &script.statements, from_revision);
+        let outcome =
+            self.run_compiled_script(dom, &script.statements, script.is_strict(), from_revision);
         if let Err(error) = &outcome {
             self.report_uncaught_error(dom, error);
         }
@@ -1007,6 +1012,19 @@ impl JsRuntime {
     /// uncaught failures of the whole script; the caller reports them as
     /// window `error` events after they have been source-positioned.
     fn run_compiled_script(
+        &mut self,
+        dom: &mut Dom,
+        statements: &[Statement],
+        strict: bool,
+        from_revision: DomRevision,
+    ) -> Result<ScriptOutcome, JsError> {
+        let previous_root_strict = std::mem::replace(&mut self.root_strict, strict);
+        let outcome = self.run_script_statements(dom, statements, from_revision);
+        self.root_strict = previous_root_strict;
+        outcome
+    }
+
+    fn run_script_statements(
         &mut self,
         dom: &mut Dom,
         statements: &[Statement],

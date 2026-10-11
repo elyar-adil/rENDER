@@ -233,6 +233,10 @@ pub struct CompiledScript {
     /// byte offsets into line/column positions.
     source: String,
     statements: Vec<Statement>,
+    /// Whether the script's own code is strict mode code (a `"use strict"`
+    /// directive prologue, or a module). Strict code throws on assignments that
+    /// sloppy code ignores.
+    strict: bool,
     /// Import/export tables; `Some` only for scripts compiled as modules.
     module: Option<module::ModuleInfo>,
 }
@@ -246,10 +250,11 @@ impl CompiledScript {
     /// never ignored or deferred until execution.
     pub fn compile(source: &str, limits: &RuntimeLimits) -> Result<Self, JsError> {
         let tokens = lexer::tokenize(source, limits)?;
-        let statements = parser::parse(tokens, limits)?;
+        let (statements, strict) = parser::parse(tokens, limits)?;
         Ok(Self {
             source: source.to_owned(),
             statements,
+            strict,
             module: None,
         })
     }
@@ -266,8 +271,16 @@ impl CompiledScript {
         Ok(Self {
             source: source.to_owned(),
             statements,
+            // Module code is always strict (ECMA-262 11.2.2).
+            strict: true,
             module: Some(module),
         })
+    }
+
+    /// Whether the script's code is strict mode code.
+    #[must_use]
+    pub(crate) fn is_strict(&self) -> bool {
+        self.strict
     }
 
     /// Module specifiers this module imports or re-exports from, in source

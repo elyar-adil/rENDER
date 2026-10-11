@@ -2411,13 +2411,32 @@ impl JsRuntime {
                     )),
                     None => Ok(JsValue::Boolean(self.delete_scope_binding(depth, name))),
                 },
-                None => Ok(JsValue::Boolean(false)),
+                None => self.delete_global_name(dom, name),
             },
             _ => {
                 self.evaluate(dom, operand)?;
                 Ok(JsValue::Boolean(true))
             }
         }
+    }
+
+    /// `delete name` where no local or `with` binding holds the name: the global
+    /// declarative record, the global object, or an unresolvable reference.
+    fn delete_global_name(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
+        // A name in the global declarative record is not deletable (ECMA-262
+        // 9.1.1.4.7).
+        if self.global_bindings.contains_key(name) {
+            return Ok(JsValue::Boolean(false));
+        }
+        // An unresolvable reference deletes to true (ECMA-262 13.5.1.2 step 3); a
+        // global-object property goes if it is configurable.
+        if self.realm.global(name).is_none() {
+            return Ok(JsValue::Boolean(true));
+        }
+        let global = self.realm.global_object();
+        Ok(JsValue::Boolean(
+            self.delete_property_value(dom, global, name)?,
+        ))
     }
 
     /// ECMA-262 [[Get]]: read a property through the prototype chain,
@@ -3202,9 +3221,9 @@ impl JsRuntime {
         self.environment
             .push(Rc::new(RefCell::new(EnvironmentRecord::default())));
         let result = (|| {
-            self.create_binding(name, VariableKind::Const, false, JsValue::Undefined)?;
+            self.create_binding(name, VariableKind::FunctionName, false, JsValue::Undefined)?;
             let value = self.create_function(Some(name), parameters, body, kind, strict)?;
-            self.initialize_declared_binding(name, value.clone(), VariableKind::Const)?;
+            self.initialize_declared_binding(name, value.clone(), VariableKind::FunctionName)?;
             Ok(value)
         })();
         self.environment.pop();
@@ -4099,6 +4118,14 @@ impl JsRuntime {
             .ok_or_else(|| JsError::reference(format!("{name} is not defined")))
     }
 
+    /// Whether the running code is strict mode code: the innermost active frame's
+    /// own strictness, or the top-level script's when no frame is active.
+    pub(super) fn code_is_strict(&self) -> bool {
+        self.class_frames
+            .last()
+            .map_or(self.root_strict, |frame| frame.strict)
+    }
+
     pub(super) fn lookup_binding(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
         let scope = self.resolve_name(dom, name)?;
         self.read_resolved_binding(dom, scope, name)
@@ -4119,6 +4146,7 @@ impl JsRuntime {
         if let Some(object) = self.with_object_at(depth) {
             return self.set_with_binding(dom, object, name, value);
         }
+        let strict = self.code_is_strict();
         let mut environment = self.environment[depth].borrow_mut();
         if let Some(binding) = environment.bindings.get_mut(name) {
             if !binding.initialized {
@@ -4127,6 +4155,11 @@ impl JsRuntime {
                 )));
             }
             if !binding.mutable {
+                // An immutable binding made with `strict = false` ignores the write
+                // in sloppy code (CreateImmutableBinding, ECMA-262 9.1.1.1.2).
+                if binding.kind == VariableKind::FunctionName && !strict {
+                    return Ok(());
+                }
                 return Err(JsError::type_error(format!(
                     "assignment to constant binding {name:?}"
                 )));
@@ -4153,9 +4186,13 @@ impl JsRuntime {
                 )));
             }
         }
-        // Implicit global creation (sloppy-mode assignment to undeclared).
-        // Per spec, strict mode would throw here; we treat all code as sloppy.
-        if self.realm.set_global(name.to_owned(), value) {
+        // An unresolvable reference in strict code throws (PutValue, ECMA-262
+        // 6.2.5.6); sloppy code creates the global.
+        if self.code_is_strict() && self.realm.global(name).is_none() {
+            return Err(JsError::reference(format!("{name} is not defined")));
+        }
+        // A failed [[Set]] throws only in strict code (PutValue, ECMA-262 6.2.5.6).
+        if self.realm.set_global(name.to_owned(), value) || !self.code_is_strict() {
             Ok(())
         } else {
             Err(JsError::type_error(format!(
@@ -6122,6 +6159,8 @@ impl JsRuntime {
             function: function.class.clone(),
             private_scope: function.private_scope.clone(),
             this_context,
+            // A call runs the function's own code, strict or sloppy as written.
+            strict: function.strict,
         };
         self.class_frames.push(class_context);
         let label = function

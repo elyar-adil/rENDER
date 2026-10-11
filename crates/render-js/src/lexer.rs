@@ -90,7 +90,6 @@ pub(super) enum TokenKind {
     True,
     False,
     Null,
-    Undefined,
     This,
     Dot,
     Ellipsis,
@@ -474,7 +473,6 @@ impl Lexer<'_> {
                     | TokenKind::True
                     | TokenKind::False
                     | TokenKind::Null
-                    | TokenKind::Undefined
                     | TokenKind::This
                     | TokenKind::RightParen
                     | TokenKind::RightBracket
@@ -552,7 +550,6 @@ impl Lexer<'_> {
             | TokenKind::True
             | TokenKind::False
             | TokenKind::Null
-            | TokenKind::Undefined
             | TokenKind::This
             | TokenKind::Return
             | TokenKind::Typeof
@@ -871,7 +868,6 @@ impl Lexer<'_> {
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "null" => TokenKind::Null,
-            "undefined" => TokenKind::Undefined,
             "this" => TokenKind::This,
             _ => TokenKind::Identifier(identifier),
         })

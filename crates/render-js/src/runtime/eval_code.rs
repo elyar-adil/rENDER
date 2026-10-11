@@ -340,13 +340,26 @@ impl JsRuntime {
         let (mut statements, strict) =
             parse_eval(tokens, &self.limits, context).map_err(|error| without_offset(&error))?;
         if direct {
-            return self.evaluate_eval_code(dom, &mut statements, strict);
+            if strict == self.code_is_strict() {
+                return self.evaluate_eval_code(dom, &mut statements, strict);
+            }
+            // Strict eval code inside sloppy code runs under a frame that keeps the
+            // caller's class context and differs only in strictness.
+            let mut frame = self.class_frames.last().cloned().unwrap_or_default();
+            frame.strict = strict;
+            self.class_frames.push(frame);
+            let outcome = self.evaluate_eval_code(dom, &mut statements, strict);
+            self.class_frames.pop();
+            return outcome;
         }
         // An indirect eval sees no caller scope and no class context. The caller's
         // environments stay rooted while the eval code runs.
         let depth = self.suspend_scopes();
         let caller_environment = std::mem::take(&mut self.environment);
-        self.class_frames.push(ClassFrame::default());
+        self.class_frames.push(ClassFrame {
+            strict,
+            ..ClassFrame::default()
+        });
         let outcome = self.evaluate_eval_code(dom, &mut statements, strict);
         self.class_frames.pop();
         self.environment = caller_environment;

@@ -35,12 +35,20 @@ pub(super) enum VariableKind {
     Using,
     /// `await using x = …` (ECMA-262 14.3.3): as `Using`, disposed asynchronously.
     AwaitUsing,
+    /// The own name of a named function expression (ECMA-262 15.2.5 step 3,
+    /// `CreateImmutableBinding(name, false)`): assignment throws only in strict
+    /// code and is silently ignored in sloppy code.
+    FunctionName,
 }
 
 impl VariableKind {
-    /// Bindings that cannot be assigned: `const`, `using` and `await using`.
+    /// Bindings that cannot be assigned: `const`, `using`, `await using`, and a
+    /// named function expression's own name.
     pub(super) const fn is_immutable(self) -> bool {
-        matches!(self, Self::Const | Self::Using | Self::AwaitUsing)
+        matches!(
+            self,
+            Self::Const | Self::Using | Self::AwaitUsing | Self::FunctionName
+        )
     }
 
     /// `using` and `await using`, whose initial value becomes a disposable resource.
@@ -567,7 +575,10 @@ pub(super) enum Expr {
     OptionalGuard(Box<Self>),
 }
 
-pub(super) fn parse(tokens: Vec<Token>, limits: &RuntimeLimits) -> Result<Vec<Statement>, JsError> {
+pub(super) fn parse(
+    tokens: Vec<Token>,
+    limits: &RuntimeLimits,
+) -> Result<(Vec<Statement>, bool), JsError> {
     Parser::new(tokens, limits).program()
 }
 
@@ -1230,14 +1241,17 @@ struct Parser {
 }
 
 impl Parser {
-    fn program(mut self) -> Result<Vec<Statement>, JsError> {
+    /// Parse a classic script and report whether its code is strict (its own
+    /// directive prologue opens with `"use strict"`).
+    fn program(mut self) -> Result<(Vec<Statement>, bool), JsError> {
         self.strict = self.prologue_is_strict(self.cursor)?;
+        let strict = self.strict;
         let statements = self.statement_list(false)?;
-        validate_declaration_conflicts(&statements, true, self.strict)?;
+        validate_declaration_conflicts(&statements, true, strict)?;
         if has_use_strict_directive(&statements) {
             validate_strict_statements(&statements)?;
         }
-        Ok(statements)
+        Ok((statements, strict))
     }
 
     fn statement_list(&mut self, until_right_brace: bool) -> Result<Vec<Statement>, JsError> {
@@ -2131,10 +2145,7 @@ impl Parser {
                 // carry an arbitrary expression evaluated in binding order.
                 // Only an identifier token may stand alone; a keyword or an
                 // escaped reserved word spelling the same name may not.
-                let shorthand_candidate = matches!(
-                    &self.current().kind,
-                    TokenKind::Identifier(_) | TokenKind::Undefined
-                );
+                let shorthand_candidate = matches!(&self.current().kind, TokenKind::Identifier(_));
                 let key = self.property_key()?;
                 let mut pattern = if self.take(&TokenKind::Colon) {
                     self.binding_pattern()?
@@ -4058,7 +4069,6 @@ impl Parser {
             TokenKind::True => Ok(Expr::Literal(JsValue::Boolean(true))),
             TokenKind::False => Ok(Expr::Literal(JsValue::Boolean(false))),
             TokenKind::Null => Ok(Expr::Literal(JsValue::Null)),
-            TokenKind::Undefined => Ok(Expr::Literal(JsValue::Undefined)),
             TokenKind::Function => self.function_expression(false),
             TokenKind::LeftBrace => self.object_literal(),
             TokenKind::LeftBracket => self.array_literal(),
@@ -4644,11 +4654,8 @@ impl Parser {
                     patterns.push((parameters.len(), temporary.clone(), pattern));
                     bound_names.push(temporary);
                 } else {
-                    // `undefined` is an ordinary identifier in parameter position.
-                    let parameter = match self.advance().kind {
-                        TokenKind::Identifier(name) => name,
-                        TokenKind::Undefined => "undefined".to_owned(),
-                        _ => return Err(self.error("expected a parameter name")),
+                    let TokenKind::Identifier(parameter) = self.advance().kind else {
+                        return Err(self.error("expected a parameter name"));
                     };
                     self.check_contextual_binding(&parameter)?;
                     bound_names.push(parameter);
@@ -4836,10 +4843,10 @@ impl Parser {
         }
         // A shorthand member names an IdentifierReference, so a reserved word,
         // a literal or a string cannot stand alone.
-        // `let` and `undefined` are lexed as keywords but are ordinary names here.
+        // `let` is lexed as a keyword but is an ordinary name here.
         let shorthand_allowed = match &self.current().kind {
             TokenKind::Identifier(name) => !ALWAYS_RESERVED_NAMES.contains(&name.as_str()),
-            TokenKind::Let | TokenKind::Undefined => true,
+            TokenKind::Let => true,
             _ => false,
         };
         let key = self.property_key()?;
@@ -5028,7 +5035,6 @@ impl Parser {
             TokenKind::True => Ok("true".to_owned()),
             TokenKind::False => Ok("false".to_owned()),
             TokenKind::Null => Ok("null".to_owned()),
-            TokenKind::Undefined => Ok("undefined".to_owned()),
             _ => Err(JsError::syntax("expected a property name", token.offset)),
         }
     }
@@ -6387,7 +6393,9 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        let statements = parse(tokens, &RuntimeLimits::default())
+            .expect("source should parse")
+            .0;
         assert!(
             matches!(statements.as_slice(), [Statement::Function { name, .. }] if name == "classify")
         );
@@ -6400,7 +6408,9 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        let statements = parse(tokens, &RuntimeLimits::default())
+            .expect("source should parse")
+            .0;
         assert!(matches!(statements.first(), Some(Statement::For { .. })));
         assert!(matches!(
             statements.get(1),
@@ -6415,7 +6425,9 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        let statements = parse(tokens, &RuntimeLimits::default())
+            .expect("source should parse")
+            .0;
         assert!(matches!(
             statements.first(),
             Some(Statement::ForIn {
@@ -6446,7 +6458,9 @@ mod tests {
     fn parses_unicode_escaped_variable_name() {
         let tokens = tokenize(r"let \u0061 = 1;", &RuntimeLimits::default())
             .expect("source should tokenize");
-        let statements = parse(tokens, &RuntimeLimits::default()).expect("source should parse");
+        let statements = parse(tokens, &RuntimeLimits::default())
+            .expect("source should parse")
+            .0;
         assert!(matches!(statements.as_slice(), [Statement::Variable { name, .. }] if name == "a"));
     }
 
@@ -6455,7 +6469,7 @@ mod tests {
     fn script_is_syntax_error(source: &str) -> bool {
         let limits = RuntimeLimits::default();
         tokenize(source, &limits)
-            .and_then(|tokens| parse(tokens, &limits))
+            .and_then(|tokens| parse(tokens, &limits).map(|(statements, _)| statements))
             .is_err_and(|error| error.kind() == super::JsErrorKind::Syntax)
     }
 

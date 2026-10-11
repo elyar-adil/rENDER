@@ -1328,11 +1328,25 @@ impl JsRuntime {
         } else {
             len + relative
         };
-        if index < 0.0 || index >= len {
+        // The value's coercion can resize or detach the buffer, so the index is
+        // checked against the length it leaves (IsValidIntegerIndex, ECMA-262
+        // 23.2.3.38 step 9), and the copy reads past it as `undefined`.
+        let (_, _, _, current) = self.typed_array_host(receiver)?;
+        if index < 0.0 || index >= current as f64 {
             return Err(self.range_error("Invalid typed array index"));
         }
-        let mut elements = self.typed_array_elements(receiver)?;
-        elements[index as usize] = number;
+        let current_elements = self.typed_array_elements(receiver)?;
+        let mut elements = Vec::with_capacity(length);
+        for position in 0..length {
+            let element = if position as f64 == index {
+                number.clone()
+            } else if let Some(element) = current_elements.get(position) {
+                element.clone()
+            } else {
+                self.typed_element_value(dom, kind, &JsValue::Undefined)?
+            };
+            elements.push(element);
+        }
         let prototype = self.typed_array_derived_prototype(receiver);
         self.create_typed_array_from_elements(kind, &elements, prototype)
     }

@@ -255,7 +255,10 @@ impl JsRuntime {
         self.source_line_starts = build_line_starts(&source);
         let suspended = self.suspend_scopes();
         let saved = std::mem::replace(&mut self.environment, vec![Rc::clone(&environment)]);
+        // Module code is strict (ECMA-262 11.2.2) and has no class frame of its own.
+        let previous_root_strict = std::mem::replace(&mut self.root_strict, true);
         let completion = self.evaluate_statements(dom, &statements);
+        self.root_strict = previous_root_strict;
         // The module's own `using` resources are disposed when its body is left.
         let completion = self.dispose_scope(dom, &environment, completion);
         self.environment = saved;
