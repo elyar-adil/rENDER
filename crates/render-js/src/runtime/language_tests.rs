@@ -3734,3 +3734,16 @@ fn a_regexp_argument_stays_alive_while_a_native_call_collects_garbage() {
         "x"
     );
 }
+
+#[test]
+fn regexp_compile_is_refused_for_an_instance_without_legacy_features() {
+    // Annex B.2.4.1 step 3: a subclass instance has no [[LegacyFeaturesEnabled]],
+    // so `compile` throws; a RegExp made by %RegExp% recompiles in place.
+    assert_eq!(
+        ok(
+            "var s = new (class extends RegExp {})(''); var r; try { s.compile(); r = 'no'; } catch (e) { r = e.constructor.name; } r;"
+        ),
+        "TypeError"
+    );
+    assert_eq!(ok("var p = /a/; p.compile('b'); p.source;"), "b");
+}

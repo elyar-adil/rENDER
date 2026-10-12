@@ -83,7 +83,10 @@ impl JsRuntime {
             self.regex_cache.insert(key, std::rc::Rc::clone(&compiled));
             compiled
         };
-        Ok(RegexRecord { compiled })
+        Ok(RegexRecord {
+            compiled,
+            legacy: true,
+        })
     }
 
     /// Compile `pattern` with `flags` and allocate a `RegExp` instance.
@@ -184,6 +187,13 @@ impl JsRuntime {
         if let Some(prototype) = prototype {
             self.realm.set_prototype(object, Some(prototype));
         }
+        // Only an instance that %RegExp% itself allocates has legacy features
+        // (Annex B.2.4): a subclass's `new.target` clears the flag.
+        if new_target != active
+            && let Some(ObjectHost::RegExp(index)) = self.realm.host(object)
+        {
+            self.regexes[index].legacy = false;
+        }
         Ok(JsValue::Object(object))
     }
 
@@ -199,6 +209,12 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let index = self.regex_index(receiver)?;
+        // Step 3: only an instance with [[LegacyFeaturesEnabled]] may be recompiled.
+        if !self.regexes[index].legacy {
+            return Err(JsError::type_error(
+                "RegExp.prototype.compile requires a RegExp created by the RegExp constructor",
+            ));
+        }
         let pattern = arguments.first().cloned().unwrap_or(JsValue::Undefined);
         let flags = arguments.get(1).cloned().unwrap_or(JsValue::Undefined);
         let source_record = match &pattern {
@@ -227,7 +243,11 @@ impl JsRuntime {
             };
             (source, flags_text)
         };
-        self.regexes[index] = self.compile_regex(&source, &flags_text)?;
+        let legacy = self.regexes[index].legacy;
+        self.regexes[index] = RegexRecord {
+            legacy,
+            ..self.compile_regex(&source, &flags_text)?
+        };
         let last_index = PropertyName::String("lastIndex".to_owned());
         if !self.set_property_checked(dom, receiver, &last_index, JsValue::Number(0.0))? {
             return Err(JsError::type_error(

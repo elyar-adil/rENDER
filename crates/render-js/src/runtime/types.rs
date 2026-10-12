@@ -571,6 +571,9 @@ pub struct FetchOutcome {
 #[derive(Debug)]
 pub(super) struct RegexRecord {
     pub(super) compiled: std::rc::Rc<crate::regex::Compiled>,
+    /// `[[LegacyFeaturesEnabled]]` (Annex B.2.4): set when the instance is made by
+    /// `%RegExp%` itself, so `compile` is available only to such instances.
+    pub(super) legacy: bool,
 }
 
 /// Severity of a buffered `console.*` message.
