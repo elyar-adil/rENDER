@@ -615,15 +615,21 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         section: "3.2.1 Rendered and non-rendered elements, 3.11 Overflow, \
                    7 Shapes, 8 Paths and 4.2 Presentation attributes",
         status: SupportStatus::Partial,
-        notes: "An inline `<svg>` element is detected in the SVG namespace, its \
-                subtree is serialised with the prefixes restored, rasterised by the \
-                same rasteriser that draws an `<img src=icon.svg>`, and registered as \
-                an image resource so it paints through the ordinary image command; its \
-                size comes from the `width`/`height` geometry attributes with a \
-                `viewBox` fallback, and the never-rendered element types take no part \
-                in layout. The rasteriser's subset is shapes, `path` with \
-                `M m L l H h V v C c S s Q q T t Z z` where `A` degrades to a line, \
-                `<g>` transforms, `fill`/`stroke` inheritance and `viewBox` sizing. \
+        notes: "An inline `<svg>` element is detected in the SVG namespace and its \
+                subtree is serialised with the prefixes restored. The document pipeline \
+                rasterises it after the cascade with the same rasteriser that draws an \
+                `<img src=icon.svg>`, layers the raster over the page's images, and paints \
+                it through the ordinary image command into the element's laid-out box. Its \
+                size comes from the `width`/`height` geometry attributes with a `viewBox` \
+                fallback. `currentColor` resolves to the element's computed `color`, and a \
+                root `fill` or `stroke` attribute is inherited by its shapes. The \
+                never-rendered element types take no part in layout. The rasteriser's \
+                subset is shapes, `path` with `M m L l H h V v C c S s Q q T t Z z` where \
+                `A` degrades to a line, `<g>` transforms and `viewBox` sizing; a stroke is \
+                one device pixel wide. Not implemented: author CSS on the svg's children, \
+                because `fill` and `stroke` are not implemented properties, so a shape \
+                styled only by a stylesheet is filled black where a browser would use the \
+                stylesheet's fill. \
                 Not implemented: `use` and `symbol` indirection, which SVG 2 3.2.4 \
                 renders as a shadow tree cloned from its target; gradients; `text`; \
                 `clipPath`; `mask`; `filter`; `<image>`; and `foreignObject` \

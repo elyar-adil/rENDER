@@ -120,11 +120,13 @@ pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, Ima
         attribute(&root, "height").and_then(parse_length),
         view_box,
     );
-    decode_viewport(&root, view_box, width_f, height_f, limits)
+    // A standalone image has no surrounding `color` to inherit, so
+    // `currentColor` takes the initial value of `color`.
+    decode_viewport(&root, view_box, width_f, height_f, Color::BLACK, limits)
 }
 
 /// Decode an SVG document into an RGBA image of exactly `width` x `height`
-/// device pixels.
+/// device pixels, resolving `currentColor` to `current_color`.
 ///
 /// The `viewBox`, when the root has one, still supplies the user-space
 /// mapping: the geometry is scaled to fill the given viewport rather than to
@@ -132,6 +134,10 @@ pub fn decode_svg(bytes: &[u8], limits: ImageLimits) -> Result<DecodedImage, Ima
 /// device-pixel size their page box will occupy - the inline-SVG path in
 /// [`crate::image::inline_svg`] resolves it from the element's geometry
 /// attributes - use this so the raster is produced at the size it is painted.
+///
+/// `current_color` is the value `currentColor` takes. An inline `<svg>`
+/// passes its element's computed `color`; a standalone image passes the
+/// initial value, which is what [`decode_svg`] does.
 ///
 /// # Errors
 ///
@@ -141,6 +147,7 @@ pub fn decode_svg_viewport(
     bytes: &[u8],
     width: u32,
     height: u32,
+    current_color: Color,
     limits: ImageLimits,
 ) -> Result<DecodedImage, ImageDecodeError> {
     let text = str::from_utf8(bytes)
@@ -154,6 +161,7 @@ pub fn decode_svg_viewport(
         view_box,
         width.max(1) as f32,
         height.max(1) as f32,
+        current_color,
         limits,
     )
 }
@@ -173,6 +181,7 @@ fn decode_viewport(
     view_box: Option<(f32, f32, f32, f32)>,
     width_f: f32,
     height_f: f32,
+    current_color: Color,
     limits: ImageLimits,
 ) -> Result<DecodedImage, ImageDecodeError> {
     let width = width_f.round().max(1.0) as u32;
@@ -213,11 +222,19 @@ fn decode_viewport(
         Affine::IDENTITY
     };
 
+    // The root's own `fill` and `stroke` are the inherited starting values for
+    // every shape below it, so they are read here: `walk` only reads the
+    // attributes of the children it visits. Their initial values are black
+    // fill and no stroke. An unparseable value is ignored, which leaves the
+    // initial value in force.
+    let fill = root_paint(root, "fill", current_color, Paint::Color(Color::BLACK));
+    let stroke = root_paint(root, "stroke", current_color, Paint::None);
     walk(
         root,
         root_transform,
-        Paint::Inherit,
-        Paint::None,
+        fill,
+        stroke,
+        current_color,
         &mut raster,
     );
     DecodedImage::from_pixels(width, height, raster.pixels)
@@ -293,19 +310,36 @@ impl Raster {
     }
 }
 
+/// The paint a root `svg`'s own `fill` or `stroke` attribute gives the shapes
+/// below it. An absent or unparseable value leaves `initial` in force.
+fn root_paint(root: &XmlNode, name: &str, current_color: Color, initial: Paint) -> Paint {
+    match attribute(root, name).map(|raw| parse_paint(raw.trim(), current_color)) {
+        None | Some(Paint::Inherit) => initial,
+        Some(paint) => paint,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one shape-arm per SVG element reads clearest as a flat match"
 )]
-fn walk(element: &XmlNode, transform: Affine, fill: Paint, stroke: Paint, raster: &mut Raster) {
+fn walk(
+    element: &XmlNode,
+    transform: Affine,
+    fill: Paint,
+    stroke: Paint,
+    current_color: Color,
+    raster: &mut Raster,
+) {
     for child_node in &element.children {
         let attribute = |name: &str| {
             attribute(child_node, name)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
         };
-        let child_fill = attribute("fill").map_or(fill, parse_paint);
-        let child_stroke = attribute("stroke").map_or(stroke, parse_paint);
+        let child_fill = attribute("fill").map_or(fill, |raw| parse_paint(raw, current_color));
+        let child_stroke =
+            attribute("stroke").map_or(stroke, |raw| parse_paint(raw, current_color));
         let child_transform = match attribute("transform") {
             Some(specification) => transform.then(parse_transform(specification)),
             None => transform,
@@ -412,6 +446,7 @@ fn walk(element: &XmlNode, transform: Affine, fill: Paint, stroke: Paint, raster
                     child_transform,
                     child_fill,
                     child_stroke,
+                    current_color,
                     raster,
                 );
             }
@@ -422,6 +457,7 @@ fn walk(element: &XmlNode, transform: Affine, fill: Paint, stroke: Paint, raster
                     child_transform,
                     child_fill,
                     child_stroke,
+                    current_color,
                     raster,
                 );
             }
@@ -689,11 +725,11 @@ fn rect_polygon(
     ])
 }
 
-fn parse_paint(raw: &str) -> Paint {
+fn parse_paint(raw: &str, current_color: Color) -> Paint {
     let trimmed = raw.trim();
     match trimmed.to_ascii_lowercase().as_str() {
         "none" | "transparent" => Paint::None,
-        "currentcolor" => Paint::Color(Color::rgb(0, 0, 0)),
+        "currentcolor" => Paint::Color(current_color),
         _ => parse_color(trimmed).map_or(Paint::Inherit, Paint::Color),
     }
 }
@@ -1242,7 +1278,8 @@ mod tests {
     #[test]
     fn explicit_viewport_overrides_the_root_size() {
         let svg = br#"<svg width="20" height="20" viewBox="0 0 10 10"><rect width="10" height="10" fill="black"/></svg>"#;
-        let image = decode_svg_viewport(svg, 40, 20, ImageLimits::default()).expect("decodes");
+        let image = decode_svg_viewport(svg, 40, 20, Color::BLACK, ImageLimits::default())
+            .expect("decodes");
         assert_eq!((image.width(), image.height()), (40, 20));
         // 2:1 stretch of the 1:1 viewBox, so the whole viewport is covered.
         assert_eq!(image.pixel(0, 0), Some(Color::rgb(0, 0, 0)));
@@ -1255,6 +1292,39 @@ mod tests {
         let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
         assert_eq!(image.pixel(3, 3), Some(Color::rgb(0, 0, 255)));
         assert_eq!(image.pixel(1, 1), Some(Color::rgba(0, 0, 0, 0)));
+    }
+
+    /// The initial value of `fill` is black, so a shape with no fill anywhere
+    /// above it is filled. The rasteriser used to start the root with "no
+    /// inherited paint", which left such a shape unpainted.
+    #[test]
+    fn a_shape_with_no_fill_anywhere_is_filled_black() {
+        let svg = br#"<svg width="10" height="10"><rect width="4" height="4"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(Color::rgb(0, 0, 0)));
+        assert_eq!(image.pixel(6, 6), Some(Color::rgba(0, 0, 0, 0)));
+    }
+
+    /// A root `fill="none"` is inherited by the shapes below it. Before the
+    /// root's own attributes were read, this shape was filled black.
+    #[test]
+    fn a_root_fill_none_is_inherited_by_its_children() {
+        let svg = br#"<svg width="10" height="10" fill="none" stroke="red"><rect width="4" height="4"/><line x1="6" y1="1" x2="8" y2="1"/></svg>"#;
+        let image = decode_svg(svg, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(2, 2), Some(Color::rgba(0, 0, 0, 0)));
+        assert_eq!(image.pixel(7, 1), Some(Color::rgb(255, 0, 0)));
+    }
+
+    /// `currentColor` takes the colour the caller supplies, for fill and for
+    /// stroke alike, and not a fixed black.
+    #[test]
+    fn current_color_resolves_to_the_callers_colour() {
+        let svg = br#"<svg width="8" height="8"><rect width="4" height="8" fill="currentColor"/><line x1="5" y1="1" x2="7" y2="1" stroke="CurrentColor" stroke-width="1"/></svg>"#;
+        let green = Color::rgb(0, 128, 0);
+        let image = decode_svg_viewport(svg, 8, 8, green, ImageLimits::default()).expect("decodes");
+        assert_eq!(image.pixel(1, 1), Some(green));
+        assert_eq!(image.pixel(6, 1), Some(green));
+        assert_eq!(image.pixel(6, 5), Some(Color::rgba(0, 0, 0, 0)));
     }
 
     #[test]

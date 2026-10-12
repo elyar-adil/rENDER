@@ -17,12 +17,15 @@ use crate::css::computed::{
     ComputationDiagnostic, ComputationLimits, ComputedStyle, PropertyRegistry,
     compute_document_styles_with_hints,
 };
+use crate::css::properties::TypedPropertyValue;
 use crate::css::selector::MatchContext;
 use crate::css::stylesheet::{Declaration, StyleSheet, StyleSheetDiagnostic, parse_stylesheet};
 use crate::dom::{Dom, DomRevision, ElementData, Namespace, Node, NodeId, NodeKind};
 use crate::html::{HtmlParseError, QuirksMode, parse_document_with_scripting};
-use crate::image::ImageResources;
-use crate::image::inline_svg::svg_geometry;
+use crate::image::inline_svg::{
+    InlineSvgDiagnostic, InlineSvgDiscovery, discover_inline_svgs_with_colors, svg_geometry,
+};
+use crate::image::{ImageLimits, ImageResources};
 use crate::layout::{
     FormattingDiagnostic, FormattingLimits, FormattingTree, LayoutDiagnostic, LayoutOptions,
     LayoutOutput, PhysicalPoint, SimpleTextMeasurer, TextMeasurer, build_formatting_tree,
@@ -31,7 +34,7 @@ use crate::layout::{
 use crate::paint::{
     Color, CpuRasterOutput, CpuRasterizer, DisplayListBuildOutput, DisplayListBuilderOptions,
     DisplayListDiagnostic, GlyphMaskProvider, NoGlyphMasks, RasterDiagnostic, ReferenceTextShaper,
-    TextShaper, build_display_list_with_images,
+    SystemPalette, TextShaper, build_display_list_with_images,
 };
 
 /// The HTML user-agent style sheet.
@@ -966,6 +969,9 @@ pub struct DocumentRenderDiagnostics {
     pub layout: Vec<LayoutDiagnostic>,
     pub display_list: Vec<DisplayListDiagnostic>,
     pub raster: Vec<RasterDiagnostic>,
+    /// Inline `svg` elements that could not be rasterised or stored. The
+    /// element then paints nothing, and this is where that is reported.
+    pub inline_svg: Vec<InlineSvgDiagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -1244,6 +1250,17 @@ fn render_dom(
         &|node| presentational_hint_declarations(dom, node, quirks_mode),
     );
     stage_elapsed("cascade", &mut stage_mark);
+    // An inline `svg` is rasterised from its own markup, so it needs no fetch
+    // and is discovered here, after the cascade has given every `svg` element
+    // its `color` for `currentColor`. The rasters are layered over the
+    // caller's images, so layout and paint find them by element like any
+    // other image resource.
+    let inline_svg = discover_inline_svgs_with_colors(dom, ImageLimits::default(), |node| {
+        computed_text_color(&styles, node)
+    });
+    let (inline_images, inline_svg_diagnostics) = with_inline_svgs(images, &inline_svg);
+    let images = inline_images.as_ref().or(images);
+    stage_elapsed("inline-svg", &mut stage_mark);
     let formatting = build_formatting_tree(dom, &styles, &options.formatting_limits);
     stage_elapsed("formatting", &mut stage_mark);
     let layout = layout_formatting_tree_with_images(
@@ -1320,6 +1337,7 @@ fn render_dom(
         layout: layout.diagnostics.clone(),
         display_list: display.diagnostics.clone(),
         raster: raster.diagnostics.clone(),
+        inline_svg: inline_svg_diagnostics,
     };
 
     DocumentRenderOutput {
@@ -1332,6 +1350,38 @@ fn render_dom(
         raster,
         diagnostics,
     }
+}
+
+/// The colour `currentColor` resolves to on an `svg` element: its computed
+/// `color`, resolved the same way the display list resolves `currentColor` on
+/// a box. Black when the cascade left no colour, which is the initial value.
+fn computed_text_color(styles: &BTreeMap<NodeId, ComputedStyle>, node: NodeId) -> Color {
+    match styles.get(&node).and_then(|style| style.typed("color")) {
+        Some(TypedPropertyValue::Color(value)) => {
+            SystemPalette::default().resolve(*value, Color::BLACK)
+        }
+        _ => Color::BLACK,
+    }
+}
+
+/// The caller's image resources with this page's inline `svg` rasters
+/// installed beside them, and every diagnostic the discovery and the install
+/// reported.
+///
+/// `None` when no inline `svg` rasterised, so a page without icons neither
+/// copies the caller's store nor allocates a second one.
+fn with_inline_svgs(
+    images: Option<&ImageResources>,
+    discovery: &InlineSvgDiscovery,
+) -> (Option<ImageResources>, Vec<InlineSvgDiagnostic>) {
+    let mut diagnostics = discovery.diagnostics.clone();
+    if discovery.resources.is_empty() {
+        return (None, diagnostics);
+    }
+    let mut layered = images.cloned().unwrap_or_default();
+    let (_, installed) = discovery.install(&mut layered, ImageLimits::default());
+    diagnostics.extend(installed);
+    (Some(layered), diagnostics)
 }
 
 struct CollectedStyleSheets {
@@ -1738,7 +1788,7 @@ fn style_bytes_diagnostic(node: NodeId) -> DocumentDiagnostic {
 mod tests {
     use super::{
         AuthorStyleSlot, AuthorStyleSource, Document, DocumentDiagnosticCode, DocumentLimits,
-        DocumentRenderOptions, ExternalStyleSheetKey, ExternalStyleSheets,
+        DocumentRenderOptions, DocumentRenderOutput, ExternalStyleSheetKey, ExternalStyleSheets,
     };
     use crate::css::computed::ComputedValue;
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
@@ -3001,5 +3051,150 @@ mod tests {
             Some(Color::rgb(0, 0, 255))
         );
         assert_eq!(scrolled.raster.surface.height(), 10);
+    }
+
+    /// The colour of the pixel at the centre of `node`'s laid-out content box.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "test coordinates are small, finite, non-negative device pixels"
+    )]
+    fn centre_pixel(output: &DocumentRenderOutput, node: NodeId) -> Option<Color> {
+        let content = output
+            .layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Box(geometry) if fragment.source == Some(node) => {
+                    Some(geometry.content_rect)
+                }
+                _ => None,
+            })?;
+        let x = (content.origin.x + content.size.width / 2.0) as u32;
+        let y = (content.origin.y + content.size.height / 2.0) as u32;
+        output.raster.surface.pixel(x, y)
+    }
+
+    /// An inline `svg` is laid out as a box and its raster is painted into that
+    /// box, with no caller installing anything: the pipeline discovers it.
+    #[test]
+    fn an_inline_svg_is_painted_into_its_box_by_the_document_pipeline() {
+        let document = Document::parse(
+            r##"<!doctype html><style>body { margin:0 }</style>
+               <svg id=icon width=16 height=16 viewBox="0 0 16 16">
+               <rect width=16 height=16 fill="#ff0000"/></svg>"##,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let icon = target_id(document.dom(), "#icon");
+
+        let painted: Vec<_> = output
+            .display
+            .list
+            .items()
+            .iter()
+            .filter(|item| item.source == Some(icon))
+            .filter_map(|item| match &item.command {
+                DisplayCommand::Image(paint) => Some(paint.destination),
+                _ => None,
+            })
+            .collect();
+        let laid_out = output
+            .layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Box(geometry) if fragment.source == Some(icon) => {
+                    Some(geometry.content_rect)
+                }
+                _ => None,
+            })
+            .expect("the inline svg lays out a box");
+        assert_eq!(
+            (laid_out.size.width, laid_out.size.height),
+            (16.0, 16.0),
+            "the box did not come from the svg's width and height"
+        );
+        assert_eq!(painted, vec![laid_out]);
+        assert_eq!(centre_pixel(&output, icon), Some(Color::rgb(255, 0, 0)));
+        assert!(output.diagnostics.inline_svg.is_empty());
+    }
+
+    /// `currentColor` inside an inline `svg` takes the element's computed
+    /// `color`, and changing that colour under unchanged markup re-rasterises
+    /// the icon on the next render.
+    #[test]
+    fn current_color_in_an_inline_svg_follows_the_computed_color() {
+        let mut document = Document::parse(
+            r#"<!doctype html><style>body { margin:0 } div { color: rgb(0, 128, 0) }</style>
+               <div><svg id=icon width=16 height=16 viewBox="0 0 16 16">
+               <rect width=16 height=16 fill="currentColor"/></svg></div>"#,
+        );
+        let icon = target_id(document.dom(), "#icon");
+        let green = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(centre_pixel(&green, icon), Some(Color::rgb(0, 128, 0)));
+
+        let div = target_id(document.dom(), "div");
+        document
+            .dom_mut()
+            .set_attribute(div, "style", "color: rgb(0, 0, 255)")
+            .expect("the style attribute is set");
+        let blue = document.render_reference(DocumentRenderOptions::default());
+        assert_eq!(centre_pixel(&blue, icon), Some(Color::rgb(0, 0, 255)));
+    }
+
+    /// An author `width: auto` overrides the presentation hint that carries an
+    /// `svg`'s `width` attribute. The `svg` is a replaced element, so it then
+    /// takes its intrinsic width, as a browser does, rather than collapsing to
+    /// zero. A page logo written this way was invisible before.
+    #[test]
+    fn an_inline_svg_with_an_auto_width_takes_its_intrinsic_width() {
+        let document = Document::parse(
+            r##"<!doctype html><style>body { margin:0 } svg { width:auto }</style>
+               <svg id=logo width=40 height=10 viewBox="0 0 40 10">
+               <rect width=40 height=10 fill="#0000ff"/></svg>"##,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let logo = target_id(document.dom(), "#logo");
+        let laid_out = output
+            .layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Box(geometry) if fragment.source == Some(logo) => {
+                    Some(geometry.content_rect)
+                }
+                _ => None,
+            })
+            .expect("the inline svg lays out a box");
+        assert_eq!(
+            (laid_out.size.width, laid_out.size.height),
+            (40.0, 10.0),
+            "an auto-width svg did not take its intrinsic size"
+        );
+        assert_eq!(centre_pixel(&output, logo), Some(Color::rgb(0, 0, 255)));
+    }
+
+    /// With no `width`, `height` or `viewBox`, an inline `svg` has no size of
+    /// its own, so it takes the 300x150 default its raster is made at.
+    #[test]
+    fn an_inline_svg_with_no_size_takes_the_default_replaced_size() {
+        let document = Document::parse(
+            r##"<!doctype html><style>body { margin:0 }</style>
+               <svg id=bare><rect width=10 height=10 fill="#ff0000"/></svg>"##,
+        );
+        let output = document.render_reference(DocumentRenderOptions::default());
+        let bare = target_id(document.dom(), "#bare");
+        let laid_out = output
+            .layout
+            .fragments
+            .iter()
+            .find_map(|fragment| match &fragment.kind {
+                FragmentKind::Box(geometry) if fragment.source == Some(bare) => {
+                    Some(geometry.content_rect)
+                }
+                _ => None,
+            })
+            .expect("the inline svg lays out a box");
+        assert_eq!((laid_out.size.width, laid_out.size.height), (300.0, 150.0));
     }
 }
