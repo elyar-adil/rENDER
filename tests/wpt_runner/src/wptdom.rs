@@ -46,7 +46,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use render_core::html::parse_document;
-use render_core::js::{CompiledScript, JsRuntime, RuntimeLimits, TimerRequest};
+use render_core::js::{
+    CompiledScript, DocumentReadyState, JsRuntime, RuntimeLimits, TimerRequest,
+};
 
 use crate::classify::Capability;
 use crate::engine::{Engine, HarnessError, TestContext, Verdict};
@@ -303,21 +305,24 @@ impl WptHarnessEngine {
             }
         }
 
-        // 3b. The page's own `load` event, once its scripts have run (HTML 8.1.7, "the
-        //     end"). testharness.js completes only after this event, so a page that never
-        //     gets it never finishes, and its own timeout then reports TIMEOUT.
-        if let Err(error) = runtime.dispatch_page_load(&mut parsed.dom) {
-            if error.kind() == render_core::js::JsErrorKind::ResourceLimit {
-                return Ok(Execution {
-                    status: HarnessStatus::NotRun,
-                    name: ctx.path.to_owned(),
-                    message: Some(format!("engine step budget exhausted: {error}")),
-                    assertions: 0,
-                    harness_asserts: 0,
-                    mechanism: Some("engine-step-budget".to_owned()),
-                    category: Category::HarnessLimitation,
-                });
-            }
+        // 3b. The document lifecycle a browser runs once the page's scripts have run
+        //     (HTML "the end"). The page's own `load` event is fired through
+        //     `dispatch_page_load`, the one path that fires it; the steps before it
+        //     are the readiness changes and their events. testharness.js completes a
+        //     file only after `load`, and a test waiting for any of these events
+        //     never starts without them.
+        if let Err(error) = run_page_lifecycle(&mut runtime, &mut parsed.dom)
+            && error.kind() == render_core::js::JsErrorKind::ResourceLimit
+        {
+            return Ok(Execution {
+                status: HarnessStatus::NotRun,
+                name: ctx.path.to_owned(),
+                message: Some(format!("engine step budget exhausted: {error}")),
+                assertions: 0,
+                harness_asserts: 0,
+                mechanism: Some("engine-step-budget".to_owned()),
+                category: Category::HarnessLimitation,
+            });
         }
 
         // 4. Drain the queues. `promise_test` and `async_test` finish in
@@ -415,6 +420,28 @@ impl WptHarnessEngine {
         }
         DrainOutcome { settled: false }
     }
+}
+
+/// Runs the document lifecycle after a page's scripts (HTML "the end"): the
+/// readiness becomes `interactive` and `DOMContentLoaded` is dispatched at the
+/// document; the readiness becomes `complete`, and `readystatechange` fires
+/// before the page's `load` event. A step that fails for any reason other than
+/// the resource budget is ignored, as a listener's own throw is.
+fn run_page_lifecycle(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+) -> Result<(), render_core::js::JsError> {
+    let document = dom.document();
+    let step = |result: Result<(), render_core::js::JsError>| match result {
+        Err(error) if error.kind() == render_core::js::JsErrorKind::ResourceLimit => Err(error),
+        _ => Ok(()),
+    };
+    runtime.set_document_ready_state(DocumentReadyState::Interactive);
+    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
+    step(runtime.dispatch_dom_event(dom, document, "DOMContentLoaded", true, false, &[]).map(drop))?;
+    runtime.set_document_ready_state(DocumentReadyState::Complete);
+    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
+    step(runtime.dispatch_page_load(dom))
 }
 
 /// A scheduled timer on the drain's virtual clock.
@@ -937,9 +964,27 @@ impl Execution {
                     self.message.as_deref().unwrap_or("<no message>")
                 ),
             },
+            // TIMEOUT is the harness's own timeout firing, not this runner's drain
+            // bound (that is `event-loop-never-settles`). It means a test was
+            // started and waited for something that never happened, or the file
+            // registered no test at all, which is the case without any results.
+            HarnessStatus::Timeout
+                if self.mechanism.as_deref() == Some("no-verdict-from-harness") =>
+            {
+                Verdict::Unsupported {
+                    capability: None,
+                    reason: "the file registered no testharness test before the harness \
+                             timeout, so it has no testharness verdict. It is a reftest, \
+                             crashtest, manual or support file, or its tests never started."
+                        .to_owned(),
+                }
+            }
             HarnessStatus::Timeout => Verdict::Unsupported {
                 capability: None,
-                reason: "the test did not complete within the drain bound".to_owned(),
+                reason: format!(
+                    "the test did not finish before the harness timeout: {}",
+                    self.message.as_deref().unwrap_or("no message")
+                ),
             },
             // An unknown status is the case where guessing would be most
             // tempting and most dangerous. It becomes an explained skip, which
