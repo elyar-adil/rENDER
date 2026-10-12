@@ -476,20 +476,11 @@ pub enum FocusNavigationDirection {
     Backward,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FocusCause {
-    Programmatic,
-    Sequential(FocusNavigationDirection),
-    RemovedOrDisabled,
-    Cleared,
-}
-
-/// State transition from which a frontend can synthesize blur/focus events.
+/// The focused area before and after one sequential focus navigation step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FocusTransition {
     pub previous: Option<NodeId>,
     pub current: Option<NodeId>,
-    pub cause: FocusCause,
 }
 
 impl FocusTransition {
@@ -499,91 +490,40 @@ impl FocusTransition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FocusManager {
-    focused: Option<NodeId>,
-}
-
-impl FocusManager {
-    #[must_use]
-    pub const fn focused(&self) -> Option<NodeId> {
-        self.focused
-    }
-
-    /// Focus a programmatically focusable element.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown, hidden, disabled, or non-focusable
-    /// target.
-    pub fn focus(
-        &mut self,
-        dom: &Dom,
-        target: NodeId,
-    ) -> Result<FocusTransition, InteractionError> {
-        if dom.node(target).is_none() {
-            return Err(InteractionError::new(
-                InteractionErrorKind::UnknownNode,
-                "focus target does not exist",
-            ));
-        }
-        if !is_programmatically_focusable(dom, target) {
-            return Err(InteractionError::new(
-                InteractionErrorKind::NotFocusable,
-                "target is not programmatically focusable",
-            ));
-        }
-        Ok(self.transition_to(Some(target), FocusCause::Programmatic))
-    }
-
-    #[must_use]
-    pub fn clear(&mut self) -> FocusTransition {
-        self.transition_to(None, FocusCause::Cleared)
-    }
-
-    /// Advance through the sequential focus order, wrapping at either end.
-    #[must_use]
-    pub fn advance(&mut self, dom: &Dom, direction: FocusNavigationDirection) -> FocusTransition {
-        let order = sequential_focus_order(dom);
-        let next = if order.is_empty() {
-            None
-        } else {
-            let current_index = self
-                .focused
-                .and_then(|focused| order.iter().position(|candidate| *candidate == focused));
-            let index = match (direction, current_index) {
-                (FocusNavigationDirection::Forward, Some(index)) => (index + 1) % order.len(),
-                (FocusNavigationDirection::Backward, Some(0) | None) => order.len() - 1,
-                (FocusNavigationDirection::Backward, Some(index)) => index - 1,
-                (FocusNavigationDirection::Forward, None) => 0,
-            };
-            Some(order[index])
+/// Move the focused area to the next (or previous) element of the sequential
+/// focus order, wrapping at either end (HTML §6.6.3, "sequential focus
+/// navigation"). With no focused element, forward starts at the first element of
+/// the order and backward at the last.
+///
+/// The focused area is document state, so this stores it on `dom`. It fires no
+/// events: the focusing steps that run the events belong to the script bindings.
+pub fn advance_sequential_focus(
+    dom: &mut Dom,
+    direction: FocusNavigationDirection,
+) -> FocusTransition {
+    let previous = dom.focused_element();
+    let order = sequential_focus_order(dom);
+    let next = if order.is_empty() {
+        None
+    } else {
+        let current_index =
+            previous.and_then(|focused| order.iter().position(|candidate| *candidate == focused));
+        let index = match (direction, current_index) {
+            (FocusNavigationDirection::Forward, Some(index)) => (index + 1) % order.len(),
+            (FocusNavigationDirection::Backward, Some(0) | None) => order.len() - 1,
+            (FocusNavigationDirection::Backward, Some(index)) => index - 1,
+            (FocusNavigationDirection::Forward, None) => 0,
         };
-        self.transition_to(next, FocusCause::Sequential(direction))
-    }
-
-    /// Clear focus if mutations detached, disabled, or hid the focused node.
-    #[must_use]
-    pub fn apply_mutations(&mut self, dom: &Dom, _batch: &MutationBatch) -> FocusTransition {
-        let previous = self.focused;
-        if previous.is_some_and(|node| !is_programmatically_focusable(dom, node)) {
-            self.focused = None;
-        }
-        FocusTransition {
-            previous,
-            current: self.focused,
-            cause: FocusCause::RemovedOrDisabled,
-        }
-    }
-
-    fn transition_to(&mut self, current: Option<NodeId>, cause: FocusCause) -> FocusTransition {
-        let previous = self.focused;
-        self.focused = current;
-        FocusTransition {
-            previous,
-            current,
-            cause,
-        }
+        Some(order[index])
+    };
+    let stored = dom.set_focused_element(next);
+    debug_assert!(
+        stored,
+        "the sequential focus order holds only focusable areas"
+    );
+    FocusTransition {
+        previous,
+        current: dom.focused_element(),
     }
 }
 
@@ -619,63 +559,15 @@ pub fn sequential_focus_order(dom: &Dom) -> Vec<NodeId> {
 }
 
 fn sequential_tab_index(dom: &Dom, node: NodeId) -> Option<i32> {
-    if !is_programmatically_focusable(dom, node) {
+    if !dom.is_focusable_area(node) {
         return None;
     }
-    match parsed_tab_index(dom, node) {
+    match dom.parsed_tab_index(node) {
         Some(value) if value < 0 => None,
         Some(value) => Some(value),
-        None if is_natively_focusable(dom, node) => Some(0),
+        None if dom.is_natively_focusable(node) => Some(0),
         None => None,
     }
-}
-
-fn is_programmatically_focusable(dom: &Dom, node: NodeId) -> bool {
-    if !dom.is_connected(node) || is_hidden_by_html(dom, node) || is_disabled_control(dom, node) {
-        return false;
-    }
-    parsed_tab_index(dom, node).is_some() || is_natively_focusable(dom, node)
-}
-
-fn is_natively_focusable(dom: &Dom, node: NodeId) -> bool {
-    let Some(element) = html_element(dom, node) else {
-        return false;
-    };
-    match element.local_name.as_str() {
-        "a" => has_attribute(dom, node, "href"),
-        "button" | "select" | "textarea" => true,
-        "input" => !attribute_equals_ascii_case(dom, node, "type", "hidden"),
-        _ => false,
-    }
-}
-
-fn is_disabled_control(dom: &Dom, node: NodeId) -> bool {
-    let Some(element) = html_element(dom, node) else {
-        return false;
-    };
-    matches!(
-        element.local_name.as_str(),
-        "button" | "input" | "select" | "textarea"
-    ) && has_attribute(dom, node, "disabled")
-}
-
-fn is_hidden_by_html(dom: &Dom, node: NodeId) -> bool {
-    let mut candidate = Some(node);
-    while let Some(current) = candidate {
-        if has_attribute(dom, current, "hidden") {
-            return true;
-        }
-        candidate = dom.parent(current);
-    }
-    false
-}
-
-fn parsed_tab_index(dom: &Dom, node: NodeId) -> Option<i32> {
-    dom.attribute(node, "tabindex")
-        .ok()
-        .flatten()
-        .map(str::trim)
-        .and_then(|value| value.parse::<i32>().ok())
 }
 
 fn html_element(dom: &Dom, node: NodeId) -> Option<&crate::dom::ElementData> {
@@ -688,13 +580,6 @@ fn html_element(dom: &Dom, node: NodeId) -> Option<&crate::dom::ElementData> {
 fn has_attribute(dom: &Dom, node: NodeId, name: &str) -> bool {
     dom.attribute(node, name)
         .is_ok_and(|attribute| attribute.is_some())
-}
-
-fn attribute_equals_ascii_case(dom: &Dom, node: NodeId, name: &str, expected: &str) -> bool {
-    dom.attribute(node, name)
-        .ok()
-        .flatten()
-        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1126,10 +1011,10 @@ fn button_behavior(dom: &Dom, node: NodeId) -> ButtonBehavior {
 #[cfg(test)]
 mod tests {
     use super::{
-        BoundaryPoint, DefaultActionKind, DefaultActionStatus, DomRange, FocusManager,
-        FocusNavigationDirection, FormEnctype, FormMethod, InteractionErrorKind, InteractiveKind,
-        Selection, SelectionDirection, SelectionRepair, activation_plan, plan_form_submission,
-        sequential_focus_order,
+        BoundaryPoint, DefaultActionKind, DefaultActionStatus, DomRange, FocusNavigationDirection,
+        FormEnctype, FormMethod, InteractionErrorKind, InteractiveKind, Selection,
+        SelectionDirection, SelectionRepair, activation_plan, advance_sequential_focus,
+        plan_form_submission, sequential_focus_order,
     };
     use crate::dom::{Dom, NodeId, NodeKind};
     use crate::html::parse_document;
@@ -1256,7 +1141,7 @@ mod tests {
 
     #[test]
     fn sequential_focus_order_obeys_tabindex_and_exclusions() {
-        let parsed = parse_document(
+        let mut parsed = parse_document(
             "<!doctype html><body>
                 <button id='natural'>N</button>
                 <a id='link' href='/'>L</a>
@@ -1278,13 +1163,14 @@ mod tests {
             ]
         );
 
-        let mut focus = FocusManager::default();
-        let first = focus.advance(&parsed.dom, FocusNavigationDirection::Forward);
+        let first = advance_sequential_focus(&mut parsed.dom, FocusNavigationDirection::Forward);
         assert_eq!(first.current, Some(by_id(&parsed.dom, "one")));
-        focus
-            .focus(&parsed.dom, by_id(&parsed.dom, "negative"))
-            .expect("negative tabindex remains programmatically focusable");
-        let next = focus.advance(&parsed.dom, FocusNavigationDirection::Forward);
+        // A negative tabindex keeps an element focusable by script, while the
+        // Tab order skips it, so a forward step from it starts the order again.
+        let negative = by_id(&parsed.dom, "negative");
+        assert!(parsed.dom.is_focusable_area(negative));
+        assert!(parsed.dom.set_focused_element(Some(negative)));
+        let next = advance_sequential_focus(&mut parsed.dom, FocusNavigationDirection::Forward);
         assert_eq!(next.current, Some(by_id(&parsed.dom, "one")));
     }
 

@@ -9,6 +9,10 @@ use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+mod focus;
+
+pub use focus::parse_html_integer;
+
 const DEFAULT_MUTATION_JOURNAL_CAPACITY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -436,6 +440,8 @@ pub struct Dom {
     mutation_journal: VecDeque<MutationRecord>,
     mutation_journal_capacity: usize,
     oldest_available_revision: DomRevision,
+    /// The document's focused area (HTML §6.6.2). See [`Dom::focused_element`].
+    focused_area: Option<NodeId>,
 }
 
 impl Default for Dom {
@@ -460,6 +466,7 @@ impl Dom {
             mutation_journal: VecDeque::new(),
             mutation_journal_capacity: DEFAULT_MUTATION_JOURNAL_CAPACITY,
             oldest_available_revision: DomRevision::default(),
+            focused_area: None,
         }
     }
 
@@ -1440,6 +1447,7 @@ impl Dom {
         if mutations.is_empty() {
             return;
         }
+        self.apply_focus_fixup();
         self.mutation_revision = self.mutation_revision.saturating_add(1);
         let revision = self.revision();
         for kind in mutations {
