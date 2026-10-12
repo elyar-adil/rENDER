@@ -47,6 +47,7 @@ use crate::runtime::builtins::dom::html_element_type;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
+use crate::runtime::builtins::dom::window_reflecting_body_handler;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::builtins::hyperlink::is_hyperlink_component;
 use crate::runtime::builtins::object::PropertyName;
@@ -5097,6 +5098,14 @@ impl JsRuntime {
                         self.realm.child_collection_wrapper(node, elements_only),
                     ));
                 }
+                property if window_reflecting_body_handler(dom, node, property) => {
+                    // A body's forwarded handler is the Window's own handler.
+                    let window = self.realm.global_object();
+                    return Ok(self
+                        .realm
+                        .get_property(window, property)
+                        .unwrap_or(JsValue::Null));
+                }
                 property if property.starts_with("on") && property.len() > 2 => {
                     let event_type = property[2..].to_ascii_lowercase();
                     return Ok(self
@@ -5672,6 +5681,21 @@ impl JsRuntime {
                         "class",
                         value.to_js_string().to_lossy(),
                     )?);
+                }
+                if window_reflecting_body_handler(dom, node, property) {
+                    // Assigning a body's forwarded handler assigns the Window's
+                    // handler. As for every event handler, null clears it and any
+                    // other value must be callable (WebIDL callback conversion).
+                    let handler = match value {
+                        JsValue::Null | JsValue::Undefined => JsValue::Null,
+                        value => {
+                            JsValue::Object(Self::require_callable_object(&value, &self.realm)?)
+                        }
+                    };
+                    let window = self.realm.global_object();
+                    self.realm
+                        .set_property(window, property.to_owned(), handler);
+                    return Ok(());
                 }
                 if property.starts_with("on") && property.len() > 2 {
                     let event_type = property[2..].to_ascii_lowercase();

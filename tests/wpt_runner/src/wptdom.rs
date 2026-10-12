@@ -46,7 +46,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use render_core::html::parse_document;
-use render_core::js::{CompiledScript, JsRuntime, RuntimeLimits, TimerRequest};
+use render_core::js::{
+    CompiledScript, DocumentReadyState, JsRuntime, RuntimeLimits, TimerRequest,
+};
 
 use crate::classify::Capability;
 use crate::engine::{Engine, HarnessError, TestContext, Verdict};
@@ -59,7 +61,7 @@ pub const ENGINE_DESCRIPTION: &str = concat!(
     "realm, results read through add_result_callback"
 );
 
-/// Maximum microtask and timer turns drained per test.
+/// Maximum microtask batches and timer callbacks drained per test.
 ///
 /// Not a preference. `promise_test` and `async_test` need their queues drained,
 /// and a test that never settles would otherwise spin forever. The bound turns
@@ -303,21 +305,24 @@ impl WptHarnessEngine {
             }
         }
 
-        // 3b. The page's own `load` event, once its scripts have run (HTML 8.1.7, "the
-        //     end"). testharness.js completes only after this event, so a page that never
-        //     gets it never finishes, and its own timeout then reports TIMEOUT.
-        if let Err(error) = runtime.dispatch_page_load(&mut parsed.dom) {
-            if error.kind() == render_core::js::JsErrorKind::ResourceLimit {
-                return Ok(Execution {
-                    status: HarnessStatus::NotRun,
-                    name: ctx.path.to_owned(),
-                    message: Some(format!("engine step budget exhausted: {error}")),
-                    assertions: 0,
-                    harness_asserts: 0,
-                    mechanism: Some("engine-step-budget".to_owned()),
-                    category: Category::HarnessLimitation,
-                });
-            }
+        // 3b. The document lifecycle a browser runs once the page's scripts have run
+        //     (HTML "the end"). The page's own `load` event is fired through
+        //     `dispatch_page_load`, the one path that fires it; the steps before it
+        //     are the readiness changes and their events. testharness.js completes a
+        //     file only after `load`, and a test waiting for any of these events
+        //     never starts without them.
+        if let Err(error) = run_page_lifecycle(&mut runtime, &mut parsed.dom)
+            && error.kind() == render_core::js::JsErrorKind::ResourceLimit
+        {
+            return Ok(Execution {
+                status: HarnessStatus::NotRun,
+                name: ctx.path.to_owned(),
+                message: Some(format!("engine step budget exhausted: {error}")),
+                assertions: 0,
+                harness_asserts: 0,
+                mechanism: Some("engine-step-budget".to_owned()),
+                category: Category::HarnessLimitation,
+            });
         }
 
         // 4. Drain the queues. `promise_test` and `async_test` finish in
@@ -342,47 +347,110 @@ impl WptHarnessEngine {
         Ok(read_results(&mut runtime, &mut parsed.dom, ctx.path))
     }
 
-    /// Drain microtasks and timers to a fixed bound.
+    /// Drain microtasks and timers to a fixed bound, in HTML timer order.
+    ///
+    /// Timers fire in order of their due time on a virtual clock: a timer is due
+    /// at the clock value when it was requested plus its delay, and the clock
+    /// advances to the due time of each timer that fires (HTML 8.6, timer
+    /// initialization steps). Firing in request order instead lets a
+    /// testharness.js global timeout requested before a test's own
+    /// `step_timeout` run first and end the test as TIMEOUT.
+    ///
+    /// Microtasks are run to completion before each timer, as a microtask
+    /// checkpoint does. Intervals are re-armed from the period
+    /// [`JsRuntime::fire_timer_reporting`] returns, so a `clearInterval` inside
+    /// the callback stops them.
     ///
     /// Returns whether the loop settled. A loop that never settles is a harness
     /// limitation, never a fail: the test did not assert anything wrong, it
     /// simply never finished, and those are different claims.
-    fn drain(
-        &mut self,
-        runtime: &mut JsRuntime,
-        dom: &mut render_core::dom::Dom,
-    ) -> DrainOutcome {
+    fn drain(&mut self, runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom) -> DrainOutcome {
+        let mut clock = 0.0_f64;
+        let mut sequence = 0_u64;
+        let mut pending: Vec<PendingTimer> = Vec::new();
         for _ in 0..MAX_DRAIN_TURNS {
-            let mut did_work = false;
-
-            for microtask in runtime.take_pending_microtasks() {
-                did_work = true;
-                // A rejection inside a microtask is the test's business; the
-                // harness's `unhandledrejection` handler records it. Swallowing
-                // it here is correct precisely because something downstream
-                // does account for it.
-                let _ = runtime.invoke_microtask(dom, microtask);
+            // A batch of microtasks is one step. Its timer requests are absorbed
+            // only once no microtask is left, so a request made inside the
+            // checkpoint is ordered with the rest.
+            let batch = runtime.take_pending_microtasks();
+            if !batch.is_empty() {
+                for microtask in batch {
+                    // A rejection inside a microtask is the test's business; the
+                    // harness's `unhandledrejection` handler records it. Swallowing
+                    // it here is correct precisely because something downstream
+                    // does account for it.
+                    let _ = runtime.invoke_microtask(dom, microtask);
+                }
+                continue;
             }
 
-            let requests = runtime.take_pending_timer_requests();
-            let mut fireable: Vec<u64> = Vec::new();
-            for request in requests {
+            for request in runtime.take_pending_timer_requests() {
                 match request {
-                    TimerRequest::Schedule { id, .. } => fireable.push(id),
-                    TimerRequest::Cancel { .. } => {}
+                    TimerRequest::Schedule { id, delay_ms } => {
+                        pending.push(PendingTimer {
+                            due: clock + delay_ms,
+                            sequence,
+                            id,
+                        });
+                        sequence += 1;
+                    }
+                    TimerRequest::Cancel { id } => pending.retain(|timer| timer.id != id),
                 }
             }
-            for id in fireable {
-                did_work = true;
-                let _ = runtime.fire_timer(dom, id);
-            }
 
-            if !did_work {
+            let Some(next) = pending
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.due.total_cmp(&b.due).then(a.sequence.cmp(&b.sequence)))
+                .map(|(index, _)| index)
+            else {
                 return DrainOutcome { settled: true };
+            };
+            let timer = pending.swap_remove(next);
+            clock = clock.max(timer.due);
+            let (period, _outcome) = runtime.fire_timer_reporting(dom, timer.id);
+            if let Some(period) = period {
+                pending.push(PendingTimer {
+                    due: clock + period,
+                    sequence,
+                    id: timer.id,
+                });
+                sequence += 1;
             }
         }
         DrainOutcome { settled: false }
     }
+}
+
+/// Runs the document lifecycle after a page's scripts (HTML "the end"): the
+/// readiness becomes `interactive` and `DOMContentLoaded` is dispatched at the
+/// document; the readiness becomes `complete`, and `readystatechange` fires
+/// before the page's `load` event. A step that fails for any reason other than
+/// the resource budget is ignored, as a listener's own throw is.
+fn run_page_lifecycle(
+    runtime: &mut JsRuntime,
+    dom: &mut render_core::dom::Dom,
+) -> Result<(), render_core::js::JsError> {
+    let document = dom.document();
+    let step = |result: Result<(), render_core::js::JsError>| match result {
+        Err(error) if error.kind() == render_core::js::JsErrorKind::ResourceLimit => Err(error),
+        _ => Ok(()),
+    };
+    runtime.set_document_ready_state(DocumentReadyState::Interactive);
+    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
+    step(runtime.dispatch_dom_event(dom, document, "DOMContentLoaded", true, false, &[]).map(drop))?;
+    runtime.set_document_ready_state(DocumentReadyState::Complete);
+    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
+    step(runtime.dispatch_page_load(dom))
+}
+
+/// A scheduled timer on the drain's virtual clock.
+struct PendingTimer {
+    /// Virtual time at which the timer is due, in milliseconds.
+    due: f64,
+    /// Request order, which breaks ties between timers due at the same time.
+    sequence: u64,
+    id: u64,
 }
 
 struct DrainOutcome {
@@ -734,6 +802,15 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             .as_ref()
             .map_or(0, |c| c.tests)
             .saturating_sub(harvest.results.len() as u32);
+        // A timeout with no result is either a file that registered no test at
+        // all, which is not a testharness file, or a file whose tests started and
+        // waited for something that never happened. Those are different gaps.
+        let timed_out = status.map(HarnessStatus::from_number) == Some(HarnessStatus::Timeout);
+        let mechanism = match (timed_out, registered) {
+            (true, 0) => "no-testharness-test",
+            (true, _) => "tests-never-finished",
+            (false, _) => "no-verdict-from-harness",
+        };
         return Execution {
             status: match status {
                 Some(value) => HarnessStatus::from_number(value),
@@ -756,7 +833,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             }),
             assertions: 0,
             harness_asserts: 0,
-            mechanism: Some("no-verdict-from-harness".to_owned()),
+            mechanism: Some(mechanism.to_owned()),
             category: Category::HarnessLimitation,
         };
     }
@@ -896,9 +973,26 @@ impl Execution {
                     self.message.as_deref().unwrap_or("<no message>")
                 ),
             },
+            // TIMEOUT is the harness's own timeout firing, not this runner's drain
+            // bound (that is `event-loop-never-settles`). The file either registered
+            // no test, or its tests started and waited for something that never
+            // happened; the mechanism says which, see `read_results`.
             HarnessStatus::Timeout => Verdict::Unsupported {
                 capability: None,
-                reason: "the test did not complete within the drain bound".to_owned(),
+                reason: match self.mechanism.as_deref() {
+                    Some("no-testharness-test") => "the file registered no testharness test \
+                        before the harness timeout, so it has no testharness verdict. It is a \
+                        reftest, crashtest, manual or support file."
+                        .to_owned(),
+                    Some("tests-never-finished") => "the file's tests started, and none \
+                        finished before the harness timeout: each waited for an event, step or \
+                        driver that the engine did not provide."
+                        .to_owned(),
+                    _ => format!(
+                        "the test did not finish before the harness timeout: {}",
+                        self.message.as_deref().unwrap_or("no message")
+                    ),
+                },
             },
             // An unknown status is the case where guessing would be most
             // tempting and most dangerous. It becomes an explained skip, which
