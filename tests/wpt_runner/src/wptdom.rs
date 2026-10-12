@@ -303,6 +303,23 @@ impl WptHarnessEngine {
             }
         }
 
+        // 3b. The page's own `load` event, once its scripts have run (HTML 8.1.7, "the
+        //     end"). testharness.js completes only after this event, so a page that never
+        //     gets it never finishes, and its own timeout then reports TIMEOUT.
+        if let Err(error) = runtime.dispatch_page_load(&mut parsed.dom) {
+            if error.kind() == render_core::js::JsErrorKind::ResourceLimit {
+                return Ok(Execution {
+                    status: HarnessStatus::NotRun,
+                    name: ctx.path.to_owned(),
+                    message: Some(format!("engine step budget exhausted: {error}")),
+                    assertions: 0,
+                    harness_asserts: 0,
+                    mechanism: Some("engine-step-budget".to_owned()),
+                    category: Category::HarnessLimitation,
+                });
+            }
+        }
+
         // 4. Drain the queues. `promise_test` and `async_test` finish in
         //    microtasks and timers, and stopping before they run would report
         //    NOTRUN for every async test - a systematic under-count that looks
