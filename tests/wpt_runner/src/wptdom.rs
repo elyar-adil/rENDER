@@ -59,7 +59,7 @@ pub const ENGINE_DESCRIPTION: &str = concat!(
     "realm, results read through add_result_callback"
 );
 
-/// Maximum microtask and timer turns drained per test.
+/// Maximum microtask batches and timer callbacks drained per test.
 ///
 /// Not a preference. `promise_test` and `async_test` need their queues drained,
 /// and a test that never settles would otherwise spin forever. The bound turns
@@ -342,47 +342,88 @@ impl WptHarnessEngine {
         Ok(read_results(&mut runtime, &mut parsed.dom, ctx.path))
     }
 
-    /// Drain microtasks and timers to a fixed bound.
+    /// Drain microtasks and timers to a fixed bound, in HTML timer order.
+    ///
+    /// Timers fire in order of their due time on a virtual clock: a timer is due
+    /// at the clock value when it was requested plus its delay, and the clock
+    /// advances to the due time of each timer that fires (HTML 8.6, timer
+    /// initialization steps). Firing in request order instead lets a
+    /// testharness.js global timeout requested before a test's own
+    /// `step_timeout` run first and end the test as TIMEOUT.
+    ///
+    /// Microtasks are run to completion before each timer, as a microtask
+    /// checkpoint does. Intervals are re-armed from the period
+    /// [`JsRuntime::fire_timer_reporting`] returns, so a `clearInterval` inside
+    /// the callback stops them.
     ///
     /// Returns whether the loop settled. A loop that never settles is a harness
     /// limitation, never a fail: the test did not assert anything wrong, it
     /// simply never finished, and those are different claims.
-    fn drain(
-        &mut self,
-        runtime: &mut JsRuntime,
-        dom: &mut render_core::dom::Dom,
-    ) -> DrainOutcome {
+    fn drain(&mut self, runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom) -> DrainOutcome {
+        let mut clock = 0.0_f64;
+        let mut sequence = 0_u64;
+        let mut pending: Vec<PendingTimer> = Vec::new();
         for _ in 0..MAX_DRAIN_TURNS {
-            let mut did_work = false;
-
-            for microtask in runtime.take_pending_microtasks() {
-                did_work = true;
-                // A rejection inside a microtask is the test's business; the
-                // harness's `unhandledrejection` handler records it. Swallowing
-                // it here is correct precisely because something downstream
-                // does account for it.
-                let _ = runtime.invoke_microtask(dom, microtask);
+            // A batch of microtasks is one step. Its timer requests are absorbed
+            // only once no microtask is left, so a request made inside the
+            // checkpoint is ordered with the rest.
+            let batch = runtime.take_pending_microtasks();
+            if !batch.is_empty() {
+                for microtask in batch {
+                    // A rejection inside a microtask is the test's business; the
+                    // harness's `unhandledrejection` handler records it. Swallowing
+                    // it here is correct precisely because something downstream
+                    // does account for it.
+                    let _ = runtime.invoke_microtask(dom, microtask);
+                }
+                continue;
             }
 
-            let requests = runtime.take_pending_timer_requests();
-            let mut fireable: Vec<u64> = Vec::new();
-            for request in requests {
+            for request in runtime.take_pending_timer_requests() {
                 match request {
-                    TimerRequest::Schedule { id, .. } => fireable.push(id),
-                    TimerRequest::Cancel { .. } => {}
+                    TimerRequest::Schedule { id, delay_ms } => {
+                        pending.push(PendingTimer {
+                            due: clock + delay_ms,
+                            sequence,
+                            id,
+                        });
+                        sequence += 1;
+                    }
+                    TimerRequest::Cancel { id } => pending.retain(|timer| timer.id != id),
                 }
             }
-            for id in fireable {
-                did_work = true;
-                let _ = runtime.fire_timer(dom, id);
-            }
 
-            if !did_work {
+            let Some(next) = pending
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| a.due.total_cmp(&b.due).then(a.sequence.cmp(&b.sequence)))
+                .map(|(index, _)| index)
+            else {
                 return DrainOutcome { settled: true };
+            };
+            let timer = pending.swap_remove(next);
+            clock = clock.max(timer.due);
+            let (period, _outcome) = runtime.fire_timer_reporting(dom, timer.id);
+            if let Some(period) = period {
+                pending.push(PendingTimer {
+                    due: clock + period,
+                    sequence,
+                    id: timer.id,
+                });
+                sequence += 1;
             }
         }
         DrainOutcome { settled: false }
     }
+}
+
+/// A scheduled timer on the drain's virtual clock.
+struct PendingTimer {
+    /// Virtual time at which the timer is due, in milliseconds.
+    due: f64,
+    /// Request order, which breaks ties between timers due at the same time.
+    sequence: u64,
+    id: u64,
 }
 
 struct DrainOutcome {
