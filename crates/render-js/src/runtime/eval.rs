@@ -4978,7 +4978,12 @@ impl JsRuntime {
                 "defaultView" | "parentWindow" => {
                     return Ok(JsValue::Object(self.realm.global_object()));
                 }
+                // HTML §6.6.2: the focused area's element, or `body` when the
+                // viewport is the focused area.
                 "activeElement" => {
+                    if let Some(node) = dom.focused_element() {
+                        return self.wrap_node(dom, node);
+                    }
                     return match self.find_element_by_tag(dom, document, "body")? {
                         Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
@@ -5393,6 +5398,8 @@ impl JsRuntime {
             (Some(ObjectHost::Node(_)), "contains") => Some(NativeFunction::Contains),
             (Some(ObjectHost::Node(_)), "matches") => Some(NativeFunction::Matches),
             (Some(ObjectHost::Node(_)), "click") => Some(NativeFunction::Click),
+            (Some(ObjectHost::Node(_)), "focus") => Some(NativeFunction::Focus),
+            (Some(ObjectHost::Node(_)), "blur") => Some(NativeFunction::Blur),
             (Some(ObjectHost::Node(_)), "getBoundingClientRect") => {
                 Some(NativeFunction::GetBoundingClientRect)
             }

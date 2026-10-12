@@ -843,6 +843,12 @@ impl JsRuntime {
             NativeFunction::Click => {
                 self.dispatch_dom_native(dom, NativeFunction::Click, receiver, arguments)
             }
+            NativeFunction::Focus => {
+                self.dispatch_dom_native(dom, NativeFunction::Focus, receiver, arguments)
+            }
+            NativeFunction::Blur => {
+                self.dispatch_dom_native(dom, NativeFunction::Blur, receiver, arguments)
+            }
             NativeFunction::CloneNode => {
                 self.dispatch_dom_native(dom, NativeFunction::CloneNode, receiver, arguments)
             }

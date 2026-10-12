@@ -299,6 +299,46 @@ fn event_classes_carry_their_fields() {
 }
 
 #[test]
+fn focus_moves_the_focused_area_and_fires_focus_events() {
+    assert_eq!(
+        eval(
+            "var log = []; var one = $('one'), two = $('two'); \
+             one.setAttribute('tabindex', '0'); two.setAttribute('tabindex', '-1'); \
+             one.addEventListener('focus', function (e) { log.push('focus:' + e.isTrusted + ',' + e.bubbles + ',' + document.activeElement.id + ',' + (e.relatedTarget === null) + ',' + (e instanceof FocusEvent)); }); \
+             one.addEventListener('blur', function (e) { log.push('blur:' + document.activeElement.nodeName + ',' + e.relatedTarget.id); }); \
+             document.addEventListener('focusin', function (e) { log.push('focusin:' + e.target.id); }); \
+             document.addEventListener('focusout', function (e) { log.push('focusout:' + e.target.id); }); \
+             two.addEventListener('focus', function (e) { log.push('two-focus:' + e.relatedTarget.id); }); \
+             var before = document.activeElement.nodeName; \
+             one.focus(); one.focus(); two.focus(); \
+             [before, document.activeElement.id, log.join(' ')].join('|')"
+        ),
+        "BODY|two|focus:true,false,one,true,true focusin:one blur:BODY,two focusout:one two-focus:one focusin:two"
+    );
+    assert_eq!(
+        eval(
+            "var li = $('three'); li.focus(); var first = document.activeElement.nodeName; \
+             li.setAttribute('tabindex', '-1'); li.setAttribute('hidden', ''); li.focus(); \
+             var hidden = document.activeElement.nodeName; \
+             var one = $('one'); one.setAttribute('tabindex', '0'); one.focus(); one.blur(); \
+             [first, hidden, document.activeElement.nodeName].join(',')"
+        ),
+        "BODY,BODY,BODY"
+    );
+    assert_eq!(
+        eval(
+            "var button = document.createElement('button'); document.body.appendChild(button); \
+             button.focus(); var focused = document.activeElement.nodeName; \
+             button.setAttribute('disabled', ''); var disabled = document.activeElement.nodeName; \
+             button.removeAttribute('disabled'); button.focus(); var refocused = document.activeElement.nodeName; \
+             button.parentNode.removeChild(button); \
+             [focused, disabled, refocused, document.activeElement.nodeName].join(',')"
+        ),
+        "BUTTON,BODY,BUTTON,BODY"
+    );
+}
+
+#[test]
 fn messaging_primitives_deliver_asynchronously() {
     let mut dom = parse_document(PAGE).dom;
     let mut runtime = JsRuntime::new(&dom);

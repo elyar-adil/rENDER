@@ -27,6 +27,7 @@ pub(super) mod encoding;
 pub(super) mod events;
 pub(super) mod explicit_resource;
 pub(super) mod fetch;
+pub(super) mod focus;
 pub(super) mod function;
 pub(super) mod global_fns;
 pub(super) mod hyperlink;

@@ -540,8 +540,8 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | `addEventListener / removeEventListener` | 🟡 **第三个参数被完全忽略**（`runtime/builtins/events.rs:106-127` 只读 type 与 callback），故 `{ once, capture, passive }` 一律无效。冒泡 ✅（`:163-168,236,283`，最后冒泡到 window） |
 | `Event` / `CustomEvent` 构造、`bubbles` | ✅ `events.rs:58-92`；`stopPropagation` / `stopImmediatePropagation` / `preventDefault` 🟡（`preventDefault` 驱动壳的默认动作，`crates/render-browser/src/app.rs:2048-2069`；两个 stop 方法 ❓ 未核实） |
 | 鼠标事件 `click / mousedown / mouseup / mouseover / mouseout / mousemove` | 🟡 指针事件到 DOM 事件的映射在 `crates/render-core/src/interaction/hit_test.rs`；❓ 逐类型未核实 |
-| 键盘事件 `keydown / keyup` | 🟡 焦点模型在 `crates/render-core/src/interaction.rs:474-563`（`FocusNavigationDirection` / `FocusTransition`）；❓ JS 事件构造未核实 |
-| 表单事件 `submit / change / input / focus / blur` | 🟡 `submit` ✅（`app.rs:2048-2069`，可取消）；`focus`/`blur` 🔴（因为焦点态从不写入 `MatchContext.focused`，见 4.1） |
+| 键盘事件 `keydown / keyup` | 🟡 焦点态在 `crates/render-dom/src/focus.rs`（可聚焦判定、`set_focused_element`、焦点修正），顺序导航在 `crates/render-core/src/interaction.rs`（`advance_sequential_focus`）；❓ JS 事件构造未核实 |
+| 表单事件 `submit / change / input / focus / blur` | 🟡 `submit` ✅（`app.rs:2048-2069`，可取消）；`focus` / `blur` / `focusin` / `focusout` ✅ 由 `focus()` / `blur()` 触发（`crates/render-js/src/runtime/builtins/focus.rs`，焦点更新步骤）；`:focus` 样式匹配仍 🔴（焦点态未写入 `MatchContext.focused`，见 4.1） |
 | 触摸 / Pointer Events | ⛔ |
 | Drag / Clipboard | ⛔ |
 | Composition / IME 事件 | 🟡 输入法合成状态被跟踪（`app.rs:2923,3093` 有"合成期间不提交表单"的闩锁），完整 Composition 事件 ⛔ |
@@ -658,7 +658,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | 复杂脚本整形 | 🔵 见 4.5；上一版的 "⛔ NON-GOAL（依赖 HarfBuzz，超出 PyQt 默认能力）" 已删除 |
 | ARIA 属性反射到 DOM | 🔴（`aria-*` 只是普通属性，无消费者） |
 | 可访问性树 / 屏幕阅读器对接 | ⛔ |
-| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点模型 ✅（`crates/render-core/src/interaction.rs:474-563`）；**可见焦点环 🔴**（`:focus` 永不匹配，见 4.1） |
+| 键盘导航：Tab 焦点环、Enter/Space 触发按钮 | 🟡 顺序焦点排序与前进/后退 ✅（`crates/render-core/src/interaction.rs`，`sequential_focus_order` / `advance_sequential_focus`）；`focus()` / `blur()` ✅；**Tab 键未接到页面输入路径 🔴**；**可见焦点环 🔴**（`:focus` 永不匹配，见 4.1） |
 | `Intl.*` | ⛔ |
 | 高 DPI（device pixel ratio）一致绘制 | 🔴 恒 1.0（见 7.7） |
 | 用户缩放 / 页面缩放 | ⛔ |

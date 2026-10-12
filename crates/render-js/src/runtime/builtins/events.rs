@@ -135,14 +135,32 @@ impl JsRuntime {
         composed: bool,
         trusted: bool,
     ) -> Result<ObjectId, JsError> {
+        self.create_event_object_of("Event", event_type, bubbles, cancelable, composed, trusted)
+    }
+
+    /// A new event object whose prototype is the one of `interface` (`Event`, or a
+    /// subclass such as `FocusEvent`), with the standard data properties.
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        reason = "the four flags are the Event initialisation dictionary's own booleans"
+    )]
+    pub(in crate::runtime) fn create_event_object_of(
+        &mut self,
+        interface: &str,
+        event_type: &str,
+        bubbles: bool,
+        cancelable: bool,
+        composed: bool,
+        trusted: bool,
+    ) -> Result<ObjectId, JsError> {
         let constructor = self
             .realm
-            .global("Event")
+            .global(interface)
             .and_then(|value| match value {
                 JsValue::Object(object) => Some(object),
                 _ => None,
             })
-            .ok_or_else(|| JsError::type_error("Event constructor is unavailable"))?;
+            .ok_or_else(|| JsError::type_error("event constructor is unavailable"))?;
         let prototype = self
             .realm
             .get_property(constructor, "prototype")

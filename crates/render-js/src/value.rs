@@ -811,6 +811,9 @@ pub(crate) enum NativeFunction {
     Contains,
     Matches,
     Click,
+    /// `HTMLElement.prototype.focus` and `blur` (HTML §6.6.4).
+    Focus,
+    Blur,
     AddEventListener,
     RemoveEventListener,
     DispatchEvent,

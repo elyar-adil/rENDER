@@ -438,6 +438,16 @@ impl JsRuntime {
                     &MatchContext::default(),
                 )))
             }
+            NativeFunction::Focus => {
+                let node = self.require_node(receiver)?;
+                self.focus_element(dom, node)?;
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::Blur => {
+                let node = self.require_node(receiver)?;
+                self.blur_element(dom, node)?;
+                Ok(JsValue::Undefined)
+            }
             NativeFunction::Click => {
                 self.require_node(receiver)?;
                 let options = self.realm.create_ordinary_object();
