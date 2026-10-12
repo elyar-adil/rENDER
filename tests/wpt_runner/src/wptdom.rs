@@ -262,6 +262,10 @@ impl WptHarnessEngine {
         runtime.set_document_loader(Box::new(SuiteLoader {
             root: self.suite_root.clone(),
         }));
+        // The 2D canvas surface is an embedder service, installed as `Page`
+        // installs it. Without a host, `getContext` answers null, and every
+        // canvas test would measure the missing host rather than the engine.
+        runtime.install_canvas_host(Box::new(render_core::canvas::CanvasHandle::default()));
 
         // 1. Load WPT's harness, unmodified, from the pinned checkout.
         runtime
