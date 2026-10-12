@@ -28,7 +28,7 @@ use super::CanvasHandle;
 
 /// Runs `script` on a page with one 10 by 10 `<canvas id="c">` and returns the
 /// string it evaluates to.
-fn run(script: &str) -> String {
+pub(super) fn run(script: &str) -> String {
     let output = render_html::parse_document(
         "<!doctype html><body><canvas id=c width=10 height=10></canvas>",
     );

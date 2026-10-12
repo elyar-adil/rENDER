@@ -23,7 +23,7 @@
 
 use crate::canvas::{
     Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
-    CanvasValue, FillRule, PixelBuffer,
+    CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
 };
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
@@ -402,6 +402,8 @@ impl JsRuntime {
                         message: "getImageData requires a non-zero width and height".to_owned(),
                     }));
                 }
+                // The saturating cast keeps an absurd request within the bound check.
+                self.checked_pixel_bytes(width.abs() as u32, height.abs() as u32)?;
                 let value = self.canvas_call(
                     dom,
                     receiver,
@@ -427,11 +429,7 @@ impl JsRuntime {
                         message: "createImageData requires a non-zero width and height".to_owned(),
                     }));
                 }
-                let bytes = usize::try_from(width)
-                    .ok()
-                    .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
-                    .and_then(|pixels| pixels.checked_mul(4))
-                    .ok_or_else(|| JsError::resource("ImageData is too large"))?;
+                let bytes = self.checked_pixel_bytes(width, height)?;
                 self.image_data_blank(width, height, bytes)
             }
         }
@@ -526,6 +524,7 @@ impl JsRuntime {
     fn canvas_error(&mut self, error: CanvasError) -> JsError {
         let name = match error.kind {
             CanvasErrorKind::IndexSize => DomExceptionName::IndexSize,
+            CanvasErrorKind::Range => return self.range_error(&error.message),
         };
         match self.construct_dom_exception(name, &error.message) {
             Ok(value) => JsError::thrown(value),
@@ -701,12 +700,19 @@ impl JsRuntime {
                 message: "ImageData requires a non-zero width and height".to_owned(),
             }));
         }
-        let bytes = usize::try_from(width)
-            .ok()
-            .and_then(|w| usize::try_from(height).ok().and_then(|h| w.checked_mul(h)))
-            .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or_else(|| JsError::resource("ImageData is too large"))?;
+        let bytes = self.checked_pixel_bytes(width, height)?;
         self.image_data_blank(width, height, bytes)
+    }
+
+    /// The RGBA byte count of a `width` by `height` image, or a `RangeError`
+    /// when the image would exceed `MAX_IMAGE_PIXELS`.
+    fn checked_pixel_bytes(&mut self, width: u32, height: u32) -> Result<usize, JsError> {
+        let pixels = u64::from(width) * u64::from(height);
+        if pixels > MAX_IMAGE_PIXELS {
+            return Err(self.range_error("the image is too large for the canvas surface"));
+        }
+        usize::try_from(pixels * 4)
+            .map_err(|_| self.range_error("the image is too large for the canvas surface"))
     }
 
     /// An all-zero `ImageData` of the given size.
@@ -958,7 +964,9 @@ impl JsRuntime {
         } else {
             0
         };
-        let mut values = Vec::with_capacity(length);
+        // The length is the script's own claim, so memory is reserved as the
+        // elements are read rather than up front.
+        let mut values = Vec::new();
         for index in 0..length {
             let element = self
                 .realm

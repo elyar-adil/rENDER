@@ -11,6 +11,11 @@
 
 use render_dom::{Dom, NodeId};
 
+/// The largest number of pixels a single `ImageData` or `getImageData` result may
+/// hold (33,554,432 pixels, 128 MiB of RGBA bytes). A larger request throws a
+/// `RangeError` before any memory is allocated for it.
+pub const MAX_IMAGE_PIXELS: u64 = 1 << 25;
+
 /// Identity of one canvas: an element's bitmap or an `OffscreenCanvas`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CanvasId(pub u64);
@@ -196,6 +201,8 @@ pub struct CanvasError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CanvasErrorKind {
     IndexSize,
+    /// A size the implementation will not allocate; reported as a `RangeError`.
+    Range,
 }
 
 /// The host side of the 2D canvas seam.

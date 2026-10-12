@@ -30,6 +30,9 @@ use std::f64::consts::TAU;
 use super::path::Point;
 use super::style::{LineCap, LineJoin};
 
+/// The most dash intervals one subpath is split into.
+const MAX_DASH_INTERVALS: usize = 1 << 20;
+
 /// The parameters a stroke is built with, in user-space units.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StrokeStyle {
@@ -81,6 +84,10 @@ fn dash_pieces(points: &[Point], closed: bool, dash: &[f64], offset: f64) -> Vec
         None
     };
     let mut pieces = Vec::new();
+    // A dash far shorter than the path would split it into an unbounded number of
+    // pieces. Past this many intervals the rest of the path is left undashed,
+    // which is visually the same stroke.
+    let mut intervals = 0_usize;
     for window in vertices.windows(2) {
         let (a, b) = (window[0], window[1]);
         let length = distance(a, b);
@@ -89,6 +96,10 @@ fn dash_pieces(points: &[Point], closed: bool, dash: &[f64], offset: f64) -> Vec
         }
         let mut walked = 0.0;
         while length - walked > remaining_in_dash {
+            intervals += 1;
+            if intervals > MAX_DASH_INTERVALS {
+                break;
+            }
             walked += remaining_in_dash;
             let point = lerp(a, b, walked / length);
             if let Some(mut piece) = current.take() {

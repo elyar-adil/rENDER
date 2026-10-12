@@ -35,6 +35,8 @@ mod style;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
+mod limit_tests;
+#[cfg(test)]
 mod tests;
 
 use std::cell::RefCell;
@@ -45,7 +47,7 @@ use std::sync::Arc;
 use render_dom::{Dom, NodeId};
 use render_js::canvas::{
     Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
-    CanvasValue, FillRule, PixelBuffer,
+    CanvasValue, FillRule, MAX_IMAGE_PIXELS, PixelBuffer,
 };
 
 use crate::paint::coverage::{contains, polygon_coverage};
@@ -561,6 +563,12 @@ impl Canvas {
                 let (left, span_width) = normalise_span(x, width);
                 let (top, span_height) = normalise_span(y, height);
                 let (span_width, span_height) = (clamp_u32(span_width), clamp_u32(span_height));
+                if u64::from(span_width) * u64::from(span_height) > MAX_IMAGE_PIXELS {
+                    return Err(CanvasError {
+                        kind: CanvasErrorKind::Range,
+                        message: "the image is too large for the canvas surface".to_owned(),
+                    });
+                }
                 let data = self
                     .bitmap
                     .read_straight(left, top, span_width, span_height);
