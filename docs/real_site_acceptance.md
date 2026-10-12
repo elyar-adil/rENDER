@@ -335,7 +335,6 @@ so these are to-do markers, not workarounds.
 | Ignored test | Gap |
 | --- | --- |
 | `text_measurement_depends_on_the_requested_font_family` | S1 - `TextStyle` carries no family, weight, or style |
-| `an_inline_svg_shape_is_laid_out_and_painted` | S5 - an inline SVG shape still lays out no box |
 | `a_sticky_header_stays_in_the_scrollport` | S6 - `position: sticky` has no layout consumer |
 | `the_capability_registry_declares_web_font_and_animation_support` | S4 / S9 - `@font-face` is discarded and untracked |
 | `no_fixture_reports_any_parse_error` | not yet listed - see below |
@@ -351,9 +350,13 @@ capability landed while the fixtures were being built:
   the assertion is permanent.
 - `inline_svg_is_parsed_as_foreign_content_with_geometry` was the S5 marker. The
   foreign-content half landed - an inline `<svg>` and its `<path>` are in the SVG
-  namespace - so that half is now a permanent test. The geometry half did not
-  land, so it was split out into
-  `an_inline_svg_shape_is_laid_out_and_painted`, which is what remains ignored.
+  namespace - so that half is a permanent test. The geometry half was split out
+  into `an_inline_svg_shape_is_laid_out_and_painted`, which asserted a box for
+  each `<path>`. That assumed SVG shapes are CSS boxes, and they are not, so the
+  assertion now checks the `<svg>` element instead:
+  `an_inline_svg_is_laid_out_as_a_box_and_painted_into_it`. It passes, and it is
+  a permanent test. `every_fixture_paints_its_inline_svgs` pins the per-fixture
+  inline `<svg>` counts.
 
 ### An engine defect this harness found
 
