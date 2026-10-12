@@ -198,11 +198,12 @@ pub(super) struct Listener {
     pub(super) passive: bool,
 }
 
-/// Dispatch state that belongs to an `Event` while it is being dispatched
-/// (DOM Standard §2.2 "stop propagation flag" and friends).
+/// Dispatch state that belongs to an `Event` while it is being dispatched.
+/// The canceled and stop-propagation flags persist on the event object
+/// itself (`ObjectHost::Event`), because the spec lets them be set outside a
+/// dispatch.
 #[derive(Clone, Debug, Default)]
 pub(super) struct EventFlags {
-    pub(super) stop_propagation: bool,
     pub(super) stop_immediate: bool,
     /// Set while a passive listener runs, where `preventDefault` is ignored.
     pub(super) in_passive_listener: bool,

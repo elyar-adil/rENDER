@@ -478,6 +478,62 @@ pub(crate) const HTML_ELEMENT_INTERFACES: &[(&str, &[&str])] = &[
     ("HTMLVideoElement", &["video"]),
 ];
 
+/// The `cancelBubble`, `returnValue` and `defaultPrevented` accessors of
+/// `Event.prototype` (DOM §2.2). They read the event's flags rather than being
+/// own data properties: an own property would shadow them, and would accept the
+/// writes the setters must reject (`cancelBubble = false` has no effect, and
+/// `defaultPrevented` is read-only).
+fn install_event_accessors(
+    objects: &mut Vec<JsObject>,
+    prototype: ObjectId,
+    function_prototype: ObjectId,
+) {
+    for (name, getter, setter) in [
+        (
+            "cancelBubble",
+            NativeFunction::EventGetCancelBubble,
+            Some(NativeFunction::EventSetCancelBubble),
+        ),
+        (
+            "returnValue",
+            NativeFunction::EventGetReturnValue,
+            Some(NativeFunction::EventSetReturnValue),
+        ),
+        (
+            "defaultPrevented",
+            NativeFunction::EventGetDefaultPrevented,
+            None,
+        ),
+    ] {
+        let getter_object = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(getter),
+            ..JsObject::default()
+        });
+        let setter_object = setter.map(|setter| {
+            let id = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(setter),
+                ..JsObject::default()
+            });
+            id
+        });
+        objects[prototype.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: Some(getter_object),
+                setter: setter_object,
+                enumerable: true,
+                configurable: true,
+            },
+        );
+    }
+}
+
 /// The `Math` functions that are a single pure `f64` operation, so one native
 /// variant covers them all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -753,6 +809,15 @@ pub(crate) enum NativeFunction {
     RemoveEventListener,
     DispatchEvent,
     EventPreventDefault,
+    /// The `cancelBubble`, `returnValue` and `defaultPrevented` accessors, and
+    /// `initEvent` (DOM §2.2). One native per member, since each getter or
+    /// setter has its own behaviour.
+    EventGetCancelBubble,
+    EventSetCancelBubble,
+    EventGetReturnValue,
+    EventSetReturnValue,
+    EventGetDefaultPrevented,
+    EventInitEvent,
     EventStopPropagation,
     EventStopImmediatePropagation,
     EventComposedPath,
@@ -2102,6 +2167,14 @@ pub(crate) enum ObjectHost {
     RegExp(usize),
     RegExpConstructor,
     EventConstructor,
+    /// An `Event` instance. The canceled flag (DOM §2.2) and the stop-propagation
+    /// flag persist here for the object's whole life, since the spec lets them
+    /// be set outside a dispatch and read the `cancelBubble`, `returnValue` and
+    /// `defaultPrevented` accessors.
+    Event {
+        canceled: bool,
+        stop_propagation: bool,
+    },
     DomConstructor,
     ImageConstructor,
     IntersectionObserverConstructor,
@@ -7304,6 +7377,7 @@ impl Realm {
                 NativeFunction::EventStopImmediatePropagation,
             ),
             ("composedPath", NativeFunction::EventComposedPath),
+            ("initEvent", NativeFunction::EventInitEvent),
         ] {
             let method = ObjectId(objects.len());
             objects.push(JsObject {
@@ -7316,6 +7390,7 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+        install_event_accessors(objects, prototype, function_prototype);
         for (name, value) in [
             ("NONE", 0.0),
             ("CAPTURING_PHASE", 1.0),

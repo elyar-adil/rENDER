@@ -271,7 +271,7 @@ impl JsRuntime {
             | NativeFunction::VideoCanPlayType => {
                 self.dispatch_video_native(dom, function, receiver, arguments)
             }
-            NativeFunction::AddEventListener => self.add_event_listener(receiver, arguments),
+            NativeFunction::AddEventListener => self.add_event_listener(dom, receiver, arguments),
             NativeFunction::RemoveEventListener => self.remove_event_listener(receiver, arguments),
             NativeFunction::DispatchEvent => self.dispatch_event(dom, receiver, arguments),
             NativeFunction::LocationToString => match self.realm.host(receiver) {
@@ -1011,6 +1011,12 @@ impl JsRuntime {
                 arguments,
             ),
             NativeFunction::EventPreventDefault
+            | NativeFunction::EventGetCancelBubble
+            | NativeFunction::EventSetCancelBubble
+            | NativeFunction::EventGetReturnValue
+            | NativeFunction::EventSetReturnValue
+            | NativeFunction::EventGetDefaultPrevented
+            | NativeFunction::EventInitEvent
             | NativeFunction::EventStopPropagation
             | NativeFunction::EventStopImmediatePropagation
             | NativeFunction::EventComposedPath => {

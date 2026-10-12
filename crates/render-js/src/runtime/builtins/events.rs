@@ -24,6 +24,15 @@ use crate::value::ObjectHost;
 use render_dom::Dom;
 use render_dom::NodeId;
 
+/// The event types whose listeners are passive by default on the window, the
+/// document, its root element and its body (DOM §2.10 "default passive value").
+fn default_passive_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "touchstart" | "touchmove" | "wheel" | "mousewheel"
+    )
+}
+
 /// The phases of an event's travel (DOM Standard §2.2 `eventPhase`).
 const AT_TARGET: f64 = 2.0;
 const CAPTURING_PHASE: f64 = 1.0;
@@ -46,27 +55,47 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         match function {
             NativeFunction::EventPreventDefault => Ok(self.event_prevent_default(receiver)),
+            NativeFunction::EventGetCancelBubble => {
+                Ok(JsValue::Boolean(self.event_stop_propagation(receiver)))
+            }
+            // DOM §2.2: the setter only ever sets the stop-propagation flag, so
+            // `cancelBubble = false` has no effect.
+            NativeFunction::EventSetCancelBubble => {
+                if arguments.first().is_some_and(JsValue::is_truthy) {
+                    self.with_event_flags(receiver, |_, stop| *stop = true);
+                }
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::EventGetReturnValue => {
+                Ok(JsValue::Boolean(!self.event_canceled(receiver)))
+            }
+            // DOM §2.2: `returnValue = false` sets the canceled flag, but only
+            // on a cancelable event, and `true` has no effect.
+            NativeFunction::EventSetReturnValue => {
+                if !arguments.first().is_some_and(JsValue::is_truthy)
+                    && self
+                        .realm
+                        .get_property(receiver, "cancelable")
+                        .is_some_and(|value| value.is_truthy())
+                {
+                    self.with_event_flags(receiver, |canceled, _| *canceled = true);
+                }
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::EventGetDefaultPrevented => {
+                Ok(JsValue::Boolean(self.event_canceled(receiver)))
+            }
+            NativeFunction::EventInitEvent => self.event_init(receiver, arguments),
             NativeFunction::EventStopPropagation => {
-                self.event_flags
-                    .entry(receiver)
-                    .or_default()
-                    .stop_propagation = true;
-                self.realm.set_property(
-                    receiver,
-                    "cancelBubble".to_owned(),
-                    JsValue::Boolean(true),
-                );
+                self.with_event_flags(receiver, |_, stop| *stop = true);
                 Ok(JsValue::Undefined)
             }
             NativeFunction::EventStopImmediatePropagation => {
-                let flags = self.event_flags.entry(receiver).or_default();
-                flags.stop_propagation = true;
-                flags.stop_immediate = true;
-                self.realm.set_property(
-                    receiver,
-                    "cancelBubble".to_owned(),
-                    JsValue::Boolean(true),
-                );
+                self.with_event_flags(receiver, |_, stop| *stop = true);
+                // Only a dispatch in progress has transient flags to set.
+                if let Some(flags) = self.event_flags.get_mut(&receiver) {
+                    flags.stop_immediate = true;
+                }
                 Ok(JsValue::Undefined)
             }
             NativeFunction::EventComposedPath => {
@@ -123,24 +152,97 @@ impl JsRuntime {
             });
         self.ensure_heap_capacity(1)?;
         let event = self.realm.create_object(prototype);
+        self.set_event_host(event);
         for (name, value) in [
             ("type", JsValue::String((event_type.to_owned()).into())),
             ("bubbles", JsValue::Boolean(bubbles)),
             ("cancelable", JsValue::Boolean(cancelable)),
             ("composed", JsValue::Boolean(composed)),
-            ("defaultPrevented", JsValue::Boolean(false)),
             ("eventPhase", JsValue::Number(0.0)),
             ("isTrusted", JsValue::Boolean(trusted)),
-            ("timeStamp", JsValue::Number(Self::monotonic_now_ms())),
+            // HR-Time §5.4: the time is coarsened to 100 µs for a context that is not
+            // cross-origin isolated, so it cannot expose the clock's finer resolution.
+            (
+                "timeStamp",
+                JsValue::Number((Self::monotonic_now_ms() * 10.0).floor() / 10.0),
+            ),
             ("target", JsValue::Null),
             ("srcElement", JsValue::Null),
             ("currentTarget", JsValue::Null),
-            ("returnValue", JsValue::Boolean(true)),
-            ("cancelBubble", JsValue::Boolean(false)),
         ] {
             self.realm.set_property(event, name.to_owned(), value);
         }
         Ok(event)
+    }
+
+    /// Give `event` the `Event` host, whose flags the `cancelBubble`,
+    /// `returnValue` and `defaultPrevented` accessors read.
+    pub(in crate::runtime) fn set_event_host(&mut self, event: ObjectId) {
+        if let Some(host) = self.realm.host_mut(event) {
+            *host = ObjectHost::Event {
+                canceled: false,
+                stop_propagation: false,
+            };
+        }
+    }
+
+    /// Run `update` on the canceled and stop-propagation flags of `event`.
+    /// Does nothing for an object that is not an event.
+    pub(in crate::runtime) fn with_event_flags(
+        &mut self,
+        event: ObjectId,
+        update: impl FnOnce(&mut bool, &mut bool),
+    ) {
+        if let Some(ObjectHost::Event {
+            canceled,
+            stop_propagation,
+        }) = self.realm.host_mut(event)
+        {
+            update(canceled, stop_propagation);
+        }
+    }
+
+    fn event_canceled(&self, event: ObjectId) -> bool {
+        matches!(
+            self.realm.host_ref(event),
+            Some(ObjectHost::Event { canceled: true, .. })
+        )
+    }
+
+    fn event_stop_propagation(&self, event: ObjectId) -> bool {
+        matches!(
+            self.realm.host_ref(event),
+            Some(ObjectHost::Event {
+                stop_propagation: true,
+                ..
+            })
+        )
+    }
+
+    /// `Event.prototype.initEvent` (DOM §2.2): reinitialise the event, which
+    /// clears its flags. A dispatch in progress makes this a no-op.
+    fn event_init(&mut self, event: ObjectId, arguments: &[JsValue]) -> Result<JsValue, JsError> {
+        if self.event_flags.contains_key(&event) {
+            return Ok(JsValue::Undefined);
+        }
+        let event_type = required_argument(arguments, 0, "initEvent")?.to_js_string();
+        let bubbles = arguments.get(1).is_some_and(JsValue::is_truthy);
+        let cancelable = arguments.get(2).is_some_and(JsValue::is_truthy);
+        self.with_event_flags(event, |canceled, stop| {
+            *canceled = false;
+            *stop = false;
+        });
+        for (name, value) in [
+            ("isTrusted", JsValue::Boolean(false)),
+            ("target", JsValue::Null),
+            ("srcElement", JsValue::Null),
+            ("type", JsValue::String(event_type)),
+            ("bubbles", JsValue::Boolean(bubbles)),
+            ("cancelable", JsValue::Boolean(cancelable)),
+        ] {
+            self.realm.set_property(event, name.to_owned(), value);
+        }
+        Ok(JsValue::Undefined)
     }
 
     pub(in crate::runtime) fn event_constructor(
@@ -182,12 +284,26 @@ impl JsRuntime {
         }
     }
 
+    /// Whether `target` is a node for which the default passive value applies:
+    /// the document, its root element or its body (DOM §2.10).
+    fn is_default_passive_target(&mut self, dom: &Dom, target: NodeId) -> Result<bool, JsError> {
+        let document = dom.document();
+        if target == document {
+            return Ok(true);
+        }
+        if self.find_element_by_tag(dom, document, "html")? == Some(target) {
+            return Ok(true);
+        }
+        Ok(self.find_element_by_tag(dom, document, "body")? == Some(target))
+    }
+
     /// The `callback` and options of an `addEventListener` /
     /// `removeEventListener` call. `Ok(None)` means "no callback": a no-op.
     fn listener_from_arguments(
         &self,
         arguments: &[JsValue],
         method: &str,
+        passive_default: bool,
     ) -> Result<Option<Listener>, JsError> {
         let callback = match arguments.get(1) {
             None | Some(JsValue::Null | JsValue::Undefined) => return Ok(None),
@@ -198,7 +314,7 @@ impl JsRuntime {
                 )));
             }
         };
-        let (mut capture, mut once, mut passive) = (false, false, false);
+        let (mut capture, mut once, mut passive) = (false, false, passive_default);
         match arguments.get(2) {
             Some(JsValue::Object(options)) => {
                 let read = |name: &str| {
@@ -208,7 +324,13 @@ impl JsRuntime {
                 };
                 capture = read("capture");
                 once = read("once");
-                passive = read("passive");
+                // An absent (or undefined) `passive` member takes the default
+                // passive value; only an explicit value overrides it.
+                if let Some(value) = self.realm.get_property(*options, "passive")
+                    && !matches!(value, JsValue::Undefined)
+                {
+                    passive = value.is_truthy();
+                }
             }
             Some(other) => capture = other.is_truthy(),
             None => {}
@@ -232,12 +354,17 @@ impl JsRuntime {
 
     pub(in crate::runtime) fn add_event_listener(
         &mut self,
+        dom: &Dom,
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let target = self.event_target_node(receiver)?;
         let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
-        let Some(listener) = self.listener_from_arguments(arguments, "addEventListener")? else {
+        let passive_default = default_passive_event_type(&event_type.to_lossy())
+            && self.is_default_passive_target(dom, target)?;
+        let Some(listener) =
+            self.listener_from_arguments(arguments, "addEventListener", passive_default)?
+        else {
             return Ok(JsValue::Undefined);
         };
         let listeners = self
@@ -257,7 +384,9 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let target = self.event_target_node(receiver)?;
         let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
-        let Some(listener) = self.listener_from_arguments(arguments, "removeEventListener")? else {
+        let Some(listener) =
+            self.listener_from_arguments(arguments, "removeEventListener", false)?
+        else {
             return Ok(JsValue::Undefined);
         };
         if let Some(listeners) = self
@@ -306,7 +435,11 @@ impl JsRuntime {
             ));
         }
         let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
-        let Some(listener) = self.listener_from_arguments(arguments, "addEventListener")? else {
+        // The window is always an eligible target for the default passive value.
+        let passive_default = default_passive_event_type(&event_type.to_lossy());
+        let Some(listener) =
+            self.listener_from_arguments(arguments, "addEventListener", passive_default)?
+        else {
             return Ok(JsValue::Undefined);
         };
         let listeners = self
@@ -328,7 +461,9 @@ impl JsRuntime {
             ));
         }
         let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
-        let Some(listener) = self.listener_from_arguments(arguments, "removeEventListener")? else {
+        let Some(listener) =
+            self.listener_from_arguments(arguments, "removeEventListener", false)?
+        else {
             return Ok(JsValue::Undefined);
         };
         if let Some(listeners) = self.window_event_handlers.get_mut(&event_type.to_key()) {
@@ -546,12 +681,7 @@ impl JsRuntime {
             },
         );
 
-        let stopped = |runtime: &Self| {
-            runtime
-                .event_flags
-                .get(&event)
-                .is_some_and(|flags| flags.stop_propagation)
-        };
+        let stopped = |runtime: &Self| runtime.event_stop_propagation(event);
 
         let result = (|| -> Result<(), JsError> {
             // Capture: from the outermost stop down to the target's parent.
@@ -584,18 +714,15 @@ impl JsRuntime {
         })();
 
         self.event_flags.remove(&event);
+        // DOM §2.10 (dispatch): the dispatch unsets the stop-propagation flag.
+        // The canceled flag stays set, so `defaultPrevented` reads true afterwards.
+        self.with_event_flags(event, |_, stop| *stop = false);
         self.realm
             .set_property(event, "currentTarget".to_owned(), JsValue::Null);
         self.realm
             .set_property(event, "eventPhase".to_owned(), JsValue::Number(0.0));
         result?;
-        let canceled = self
-            .realm
-            .get_property(event, "defaultPrevented")
-            .is_some_and(|value| value.is_truthy());
-        self.realm
-            .set_property(event, "returnValue".to_owned(), JsValue::Boolean(!canceled));
-        Ok(!canceled)
+        Ok(!self.event_canceled(event))
     }
 
     pub(in crate::runtime) fn event_prevent_default(&mut self, receiver: ObjectId) -> JsValue {
@@ -609,11 +736,7 @@ impl JsRuntime {
             .get(&receiver)
             .is_some_and(|flags| flags.in_passive_listener);
         if cancelable && !passive {
-            self.realm.set_property(
-                receiver,
-                "defaultPrevented".to_owned(),
-                JsValue::Boolean(true),
-            );
+            self.with_event_flags(receiver, |canceled, _| *canceled = true);
         }
         JsValue::Undefined
     }

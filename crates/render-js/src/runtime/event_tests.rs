@@ -294,3 +294,119 @@ fn text_comment_and_fragment_are_constructible() {
         "true"
     );
 }
+
+#[test]
+fn return_value_cancels_only_a_cancelable_event_and_true_is_a_no_op() {
+    // DOM §2.2: `returnValue = false` sets the canceled flag on a cancelable
+    // event; `returnValue = true` never clears it, and `defaultPrevented` is read-only.
+    assert_eq!(
+        run(
+            "var plain = new Event('x'); plain.returnValue = false; log.push(plain.returnValue, plain.defaultPrevented);"
+        ),
+        "true,false"
+    );
+    assert_eq!(
+        run(
+            "var c = new Event('x', { cancelable: true }); c.returnValue = false; log.push(c.returnValue, c.defaultPrevented); c.returnValue = true; log.push(c.returnValue); c.defaultPrevented = false; log.push(c.defaultPrevented);"
+        ),
+        "false,true,false,true"
+    );
+}
+
+#[test]
+fn cancel_bubble_only_sets_and_clears_after_dispatch() {
+    // DOM §2.2: the `cancelBubble` setter ignores `false`. The dispatch unsets
+    // the stop-propagation flag when it ends, so the flag does not outlive it.
+    assert_eq!(
+        run(
+            "var e = new Event('x'); e.cancelBubble = true; log.push(e.cancelBubble); e.cancelBubble = false; log.push(e.cancelBubble);"
+        ),
+        "true,true"
+    );
+    assert_eq!(
+        run(
+            "var ev = new Event('x', { bubbles: true }); leaf.addEventListener('x', function (e) { e.stopPropagation(); log.push('leaf'); }); leaf.dispatchEvent(ev); log.push(ev.cancelBubble);"
+        ),
+        "leaf,false"
+    );
+}
+
+#[test]
+fn prevent_default_during_dispatch_sets_the_canceled_flag_for_good() {
+    assert_eq!(
+        run(
+            "var ev = new Event('x', { cancelable: true }); leaf.addEventListener('x', function (e) { e.preventDefault(); }); log.push(leaf.dispatchEvent(ev), ev.defaultPrevented, ev.returnValue);"
+        ),
+        "false,true,false"
+    );
+}
+
+#[test]
+fn init_event_reinitialises_the_flags_and_the_fields() {
+    // DOM §2.2 initEvent: clears the canceled and stop-propagation flags and
+    // sets type, bubbles and cancelable.
+    assert_eq!(
+        run(
+            "var e = new Event('x', { cancelable: true }); e.preventDefault(); e.cancelBubble = true; e.initEvent('y', true, true); log.push(e.type, e.bubbles, e.cancelable, e.defaultPrevented, e.returnValue, e.cancelBubble);"
+        ),
+        "y,true,true,false,true,false"
+    );
+}
+
+#[test]
+fn touch_and_wheel_listeners_are_passive_by_default_on_the_document_and_body() {
+    // DOM §2.10 "default passive value": touchstart, touchmove, wheel and
+    // mousewheel listeners are passive on the document and its body unless
+    // `passive` is given explicitly.
+    assert_eq!(
+        run(
+            "document.addEventListener('wheel', function (e) { e.preventDefault(); log.push(e.defaultPrevented); }); \
+             log.push(document.dispatchEvent(new Event('wheel', { cancelable: true })));"
+        ),
+        "false,true"
+    );
+    assert_eq!(
+        run(
+            "document.body.addEventListener('touchmove', function (e) { e.preventDefault(); }); \
+             log.push(document.body.dispatchEvent(new Event('touchmove', { cancelable: true })));"
+        ),
+        "true"
+    );
+    // The default does not reach other nodes or other types, and an explicit
+    // `passive: false` overrides it.
+    assert_eq!(
+        run(
+            "leaf.addEventListener('touchstart', function (e) { e.preventDefault(); }); \
+             document.addEventListener('touchend', function (e) { e.preventDefault(); }); \
+             document.addEventListener('wheel', function (e) { e.preventDefault(); }, { passive: false }); \
+             log.push(leaf.dispatchEvent(new Event('touchstart', { cancelable: true })), \
+                      document.dispatchEvent(new Event('touchend', { cancelable: true })), \
+                      document.dispatchEvent(new Event('wheel', { cancelable: true })));"
+        ),
+        "false,false,false"
+    );
+}
+
+#[test]
+fn create_event_makes_an_uninitialized_event_that_init_event_sets_up() {
+    // DOM §4.5: `createEvent("Event")` has an empty type until `initEvent`.
+    assert_eq!(
+        eval_dom(
+            "var e = document.createEvent('Event'); var before = [e.type, e.bubbles, e.cancelable].join('/'); \
+             e.initEvent('foo', true, false); before + ';' + e.type + '/' + e.bubbles + '/' + e.cancelable"
+        ),
+        "/false/false;foo/true/false"
+    );
+}
+
+#[test]
+fn time_stamp_is_coarsened_to_a_hundred_microseconds() {
+    // HR-Time §5.4: the clock is coarsened, so a timestamp is a whole number of
+    // hundredths of a millisecond.
+    assert_eq!(
+        eval_dom(
+            "var t = new Event('x').timeStamp; String(Math.abs(Math.round(t * 10) - t * 10) < 1e-6)"
+        ),
+        "true"
+    );
+}

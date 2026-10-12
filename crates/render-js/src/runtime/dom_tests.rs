@@ -351,3 +351,21 @@ fn window_surface_is_present() {
         "1,function,false,,,true,true,false,true,0"
     );
 }
+
+#[test]
+fn element_type_returns_the_spec_default_and_canonical_keyword() {
+    // Button (HTML 4.10.6.3): keyword match is ASCII case-insensitive, and a
+    // missing or invalid value means `submit`. Input (4.10.5.1.1) defaults to
+    // `text`. Textarea, output and fieldset have fixed values.
+    assert_eq!(
+        eval(
+            "var b = document.createElement('button'); var i = document.createElement('input'); \
+             var out = [b.type]; b.setAttribute('type', 'RESET'); out.push(b.type); \
+             b.setAttribute('type', 'bogus'); out.push(b.type); \
+             out.push(i.type); i.setAttribute('type', 'CheckBox'); out.push(i.type); \
+             out.push(document.createElement('textarea').type, document.createElement('output').type, \
+                      document.createElement('fieldset').type); out.join()"
+        ),
+        "submit,reset,submit,text,checkbox,textarea,output,fieldset"
+    );
+}

@@ -134,18 +134,10 @@ impl JsRuntime {
             }
             NativeFunction::CreateEvent => {
                 self.require_document(receiver)?;
-                // Browsers accept several legacy interface names here. The
-                // generic Event object covers feature detection and exposes
-                // the timestamp read by framework schedulers.
-                let event =
-                    self.event_constructor(&[JsValue::String(("event".to_owned()).into())])?;
-                if let JsValue::Object(object) = event {
-                    self.realm
-                        .set_property(object, "timeStamp".to_owned(), JsValue::Number(0.0));
-                    Ok(JsValue::Object(object))
-                } else {
-                    Ok(event)
-                }
+                // DOM §4.5 `createEvent("Event")` makes an uninitialized event:
+                // its type is the empty string until `initEvent` sets it.
+                let event = self.create_event_object("", false, false, false, false)?;
+                Ok(JsValue::Object(event))
             }
             NativeFunction::GetComputedStyle => {
                 let argument = required_argument(arguments, 0, "getComputedStyle")?;
@@ -464,6 +456,61 @@ pub(in crate::runtime) fn node_boolean_property(property: &str) -> bool {
             | "autofocus"
             | "autoFocus"
     )
+}
+
+/// The `type` IDL attribute of an HTML element whose value is not a plain
+/// reflection of its content attribute.
+///
+/// * `button` (HTML §4.10.6.3): an ASCII-case-insensitive keyword, else
+///   `submit`, which is also the value for a missing or invalid attribute.
+/// * `input` (HTML §4.10.5.1.1): an ASCII-case-insensitive keyword, else `text`.
+/// * `textarea`, `output` and `fieldset` (HTML §4.10.11, §4.10.13, §4.10.15):
+///   fixed values that ignore the attribute, since they have no `type` content
+///   attribute of their own.
+///
+/// `None` for every other element, whose `type` reflects its attribute.
+pub(in crate::runtime) fn html_element_type(
+    local_name: &str,
+    attribute: Option<&str>,
+) -> Option<String> {
+    const INPUT_TYPES: &[&str] = &[
+        "hidden",
+        "text",
+        "search",
+        "tel",
+        "url",
+        "email",
+        "password",
+        "date",
+        "month",
+        "week",
+        "time",
+        "datetime-local",
+        "number",
+        "range",
+        "color",
+        "checkbox",
+        "radio",
+        "file",
+        "submit",
+        "image",
+        "reset",
+        "button",
+    ];
+    let keyword = |allowed: &[&str], default: &str| {
+        attribute
+            .map(str::to_ascii_lowercase)
+            .filter(|value| allowed.contains(&value.as_str()))
+            .unwrap_or_else(|| default.to_owned())
+    };
+    match local_name {
+        "button" => Some(keyword(&["submit", "reset", "button"], "submit")),
+        "input" => Some(keyword(INPUT_TYPES, "text")),
+        "textarea" => Some("textarea".to_owned()),
+        "output" => Some("output".to_owned()),
+        "fieldset" => Some("fieldset".to_owned()),
+        _ => None,
+    }
 }
 
 /// `DocumentPosition` bitmask values for `compareDocumentPosition`.

@@ -43,6 +43,7 @@ use crate::parser::collect_var_names;
 use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
 use crate::runtime::builtins::dom::css_prop_from_member;
+use crate::runtime::builtins::dom::html_element_type;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
@@ -5009,6 +5010,15 @@ impl JsRuntime {
                     let attribute = node_attribute_property(property).expect("checked above");
                     if node_boolean_property(property) {
                         return Ok(JsValue::Boolean(dom.attribute(node, attribute)?.is_some()));
+                    }
+                    if property == "type"
+                        && let Some(NodeKind::Element(element)) =
+                            dom.node(node).map(render_dom::Node::kind)
+                        && element.namespace == render_dom::Namespace::Html
+                        && let Some(value) =
+                            html_element_type(&element.local_name, dom.attribute(node, attribute)?)
+                    {
+                        return Ok(JsValue::String(value.into()));
                     }
                     return Ok(JsValue::String(
                         (dom.attribute(node, attribute)?

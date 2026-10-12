@@ -236,6 +236,7 @@ pub(super) fn mark_host(
         | ObjectHost::RegExp(_)
         | ObjectHost::RegExpConstructor
         | ObjectHost::EventConstructor
+        | ObjectHost::Event { .. }
         | ObjectHost::DomConstructor
         | ObjectHost::DomNodeConstructor(_)
         | ObjectHost::ImageConstructor

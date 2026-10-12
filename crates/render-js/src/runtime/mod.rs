@@ -925,11 +925,11 @@ impl JsRuntime {
             _ => JsString::from(error.message()),
         };
         let event = self.realm.create_object(prototype);
+        self.set_event_host(event);
         for (name, value) in [
             ("type", JsValue::String(("error".to_owned()).into())),
             ("bubbles", JsValue::Boolean(false)),
             ("cancelable", JsValue::Boolean(true)),
-            ("defaultPrevented", JsValue::Boolean(false)),
             ("target", JsValue::Null),
             ("currentTarget", JsValue::Null),
             ("message", JsValue::String(message)),
