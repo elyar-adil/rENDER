@@ -90,6 +90,9 @@ pub struct JsError {
     offset: Option<usize>,
     position: Option<(usize, usize)>,
     thrown: Option<JsValue>,
+    /// The DOM failure this error reports, when it came from `render-dom`.
+    /// Script sees it as the `DOMException` named for this kind (DOM §2.4).
+    dom_kind: Option<render_dom::DomErrorKind>,
     /// Internal control-flow marker for `?.`: the chain ended early at a
     /// nullish base. Never observable: the enclosing optional chain turns it
     /// into `undefined` before any script can see it.
@@ -100,6 +103,12 @@ impl JsError {
     #[must_use]
     pub const fn kind(&self) -> JsErrorKind {
         self.kind
+    }
+
+    /// The `render-dom` failure kind behind this error, if any.
+    #[must_use]
+    pub const fn dom_kind(&self) -> Option<render_dom::DomErrorKind> {
+        self.dom_kind
     }
 
     #[must_use]
@@ -152,7 +161,17 @@ impl JsError {
             offset,
             position: None,
             thrown: None,
+            dom_kind: None,
             optional_short_circuit: false,
+        }
+    }
+
+    /// The error for a `render-dom` failure, keeping its kind so the script
+    /// boundary can name the `DOMException` it becomes.
+    pub(crate) fn from_dom(error: &render_dom::DomError) -> Self {
+        Self {
+            dom_kind: Some(error.kind()),
+            ..Self::new(JsErrorKind::Dom, error.to_string(), None)
         }
     }
 
@@ -198,6 +217,7 @@ impl JsError {
             offset: None,
             position: None,
             thrown: Some(value),
+            dom_kind: None,
             optional_short_circuit: false,
         }
     }
@@ -209,6 +229,7 @@ impl JsError {
             offset: None,
             position: None,
             thrown: Some(value),
+            dom_kind: None,
             optional_short_circuit: false,
         }
     }

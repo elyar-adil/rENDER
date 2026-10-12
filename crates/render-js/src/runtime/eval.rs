@@ -47,6 +47,7 @@ use crate::runtime::builtins::dom::html_element_type;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
+use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::builtins::object::PropertyName;
 use crate::runtime::builtins::string::string_method_native;
 use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
@@ -77,6 +78,7 @@ use crate::value::ErrorKind;
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use crate::value::TypedKey;
+use crate::value::is_canonical_index;
 use render_css::stylesheet::parse_declaration_list;
 use render_dom::Dom;
 use render_dom::NodeKind;
@@ -1787,6 +1789,13 @@ impl JsRuntime {
     pub(super) fn error_to_thrown_value(&mut self, error: &JsError) -> Result<JsValue, JsError> {
         if let Some(value) = error.thrown_value().cloned() {
             return Ok(value);
+        }
+        if let Some(dom_kind) = error.dom_kind() {
+            // A DOM failure is a `DOMException` named for its kind, not a
+            // plain `Error`: `e.name` and `instanceof DOMException` are the
+            // contract every Web API caller tests against.
+            let name = DomExceptionName::from_dom(dom_kind);
+            return self.construct_dom_exception(name, error.message());
         }
         let kind = match error.kind() {
             JsErrorKind::Syntax => ErrorKind::SyntaxError,
@@ -4777,6 +4786,15 @@ impl JsRuntime {
                 return Ok(JsValue::Number(f64::from(value)));
             }
         }
+        // A live collection or static NodeList answers `length` and its indexed
+        // members from its own members, before any prototype member.
+        if matches!(
+            self.realm.host_ref(object),
+            Some(ObjectHost::LiveCollection { .. } | ObjectHost::StaticNodeList(_))
+        ) && let Some(value) = self.collection_property(dom, object, property)?
+        {
+            return Ok(value);
+        }
         // Node identity properties apply to every node wrapper, including
         // the Document host.
         if matches!(
@@ -4798,25 +4816,96 @@ impl JsRuntime {
                             Some(NodeKind::Document) => 9.0,
                             Some(NodeKind::DocumentType(_)) => 10.0,
                             Some(NodeKind::DocumentFragment) => 11.0,
+                            Some(NodeKind::ProcessingInstruction { .. }) => 7.0,
                             _ => 0.0,
                         },
                     ));
                 }
                 "nodeName" | "tagName" => {
                     let name = match dom.node(node_id).map(render_dom::Node::kind) {
-                        Some(NodeKind::Element(element)) => element.local_name.to_ascii_uppercase(),
+                        // The qualified name is upper-cased only for HTML
+                        // elements in an HTML document (DOM §4.9.1).
+                        Some(NodeKind::Element(element)) => {
+                            let qualified = element.qualified_name();
+                            if element.namespace == render_dom::Namespace::Html {
+                                qualified.to_ascii_uppercase()
+                            } else {
+                                qualified
+                            }
+                        }
                         Some(other) => other.name().to_owned(),
                         None => String::new(),
                     };
                     return Ok(JsValue::String((name).into()));
                 }
+                "namespaceURI" | "localName" | "prefix" => {
+                    if let Some(NodeKind::Element(element)) =
+                        dom.node(node_id).map(render_dom::Node::kind)
+                    {
+                        let value = match property {
+                            "namespaceURI" => {
+                                element.namespace.uri().map_or(JsValue::Null, |uri| {
+                                    JsValue::String((uri.to_owned()).into())
+                                })
+                            }
+                            "localName" => JsValue::String((element.local_name.clone()).into()),
+                            _ => element
+                                .prefix
+                                .clone()
+                                .map_or(JsValue::Null, |prefix| JsValue::String((prefix).into())),
+                        };
+                        return Ok(value);
+                    }
+                }
+                // DOM §4.4: the base URL. A document without a `base` element
+                // has the document URL as its base, which is the only base this
+                // engine resolves against.
+                "baseURI" => {
+                    return Ok(JsValue::String((self.document_url_string()).into()));
+                }
+                "target" => {
+                    if let Some(NodeKind::ProcessingInstruction { target, .. }) =
+                        dom.node(node_id).map(render_dom::Node::kind)
+                    {
+                        return Ok(JsValue::String((target.clone()).into()));
+                    }
+                }
+                "name" | "publicId" | "systemId" => {
+                    if let Some(NodeKind::DocumentType(doctype)) =
+                        dom.node(node_id).map(render_dom::Node::kind)
+                    {
+                        let value = match property {
+                            "name" => doctype.name.clone(),
+                            "publicId" => doctype.public_id.clone(),
+                            _ => doctype.system_id.clone(),
+                        };
+                        return Ok(JsValue::String((value).into()));
+                    }
+                }
+                "length" => {
+                    if let Some(length) =
+                        crate::runtime::builtins::dom_character_data::character_data_length(
+                            dom, node_id,
+                        )
+                    {
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            reason = "text lengths stay far below any precision boundary"
+                        )]
+                        return Ok(JsValue::Number(length as f64));
+                    }
+                }
                 "nodeValue" | "data" => {
-                    return Ok(match dom.node(node_id).map(render_dom::Node::kind) {
-                        Some(NodeKind::Text(data) | NodeKind::Comment(data)) => {
-                            JsValue::String((data.clone()).into())
-                        }
-                        _ => JsValue::Null,
-                    });
+                    if let Some(data) =
+                        crate::runtime::builtins::dom_character_data::character_data(dom, node_id)
+                    {
+                        return Ok(JsValue::String((data.to_owned()).into()));
+                    }
+                    // `nodeValue` is null for every node that holds no data;
+                    // `data` is not a member of those nodes at all.
+                    if property == "nodeValue" {
+                        return Ok(JsValue::Null);
+                    }
                 }
                 _ => {}
             }
@@ -4851,22 +4940,11 @@ impl JsRuntime {
                     };
                 }
                 "childNodes" | "children" => {
+                    self.ensure_heap_capacity(1)?;
                     let elements_only = property == "children";
-                    let values = dom
-                        .children(document)
-                        .unwrap_or_default()
-                        .iter()
-                        .copied()
-                        .filter(|child| {
-                            !elements_only
-                                || matches!(
-                                    dom.node(*child).map(render_dom::Node::kind),
-                                    Some(NodeKind::Element(_))
-                                )
-                        })
-                        .map(|child| self.wrap_node(dom, child))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(JsValue::Object(self.create_array_from_values(&values)?));
+                    return Ok(JsValue::Object(
+                        self.realm.child_collection_wrapper(document, elements_only),
+                    ));
                 }
                 "readyState" => {
                     return Ok(JsValue::String(
@@ -4980,22 +5058,11 @@ impl JsRuntime {
                 }
                 "ownerDocument" => return Ok(JsValue::Object(self.realm.document_object())),
                 "children" | "childNodes" => {
+                    self.ensure_heap_capacity(1)?;
                     let elements_only = property == "children";
-                    let values = dom
-                        .children(node)
-                        .unwrap_or_default()
-                        .iter()
-                        .copied()
-                        .filter(|child| {
-                            !elements_only
-                                || matches!(
-                                    dom.node(*child).map(render_dom::Node::kind),
-                                    Some(NodeKind::Element(_))
-                                )
-                        })
-                        .map(|child| self.wrap_node(dom, child))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    return Ok(JsValue::Object(self.create_array_from_values(&values)?));
+                    return Ok(JsValue::Object(
+                        self.realm.child_collection_wrapper(node, elements_only),
+                    ));
                 }
                 property if property.starts_with("on") && property.len() > 2 => {
                     let event_type = property[2..].to_ascii_lowercase();
@@ -5087,9 +5154,17 @@ impl JsRuntime {
                     return Ok(JsValue::Number(length));
                 }
                 "value" => {
-                    return Ok(JsValue::String(
-                        (Self::class_list_tokens(dom, node)?.join(" ")).into(),
-                    ));
+                    return Ok(JsValue::String((Self::class_list_value(dom, node)?).into()));
+                }
+                index if is_canonical_index(index) => {
+                    let tokens = Self::class_list_tokens(dom, node)?;
+                    let token = index
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|position| tokens.get(position));
+                    return Ok(token.map_or(JsValue::Undefined, |token| {
+                        JsValue::String((token.clone()).into())
+                    }));
                 }
                 _ => {}
             },
@@ -5265,6 +5340,19 @@ impl JsRuntime {
             (Some(ObjectHost::Attr { .. }), "getName") => Some(NativeFunction::AttrGetName),
             (Some(ObjectHost::Attr { .. }), "getValue") => Some(NativeFunction::AttrGetValue),
             (Some(ObjectHost::Document(_)), "createElement") => Some(NativeFunction::CreateElement),
+            (Some(ObjectHost::Document(_)), "createElementNS") => {
+                Some(NativeFunction::CreateElementNs)
+            }
+            (Some(ObjectHost::Document(_)), "createCDATASection") => {
+                Some(NativeFunction::CreateCdataSection)
+            }
+            (Some(ObjectHost::Document(_)), "createProcessingInstruction") => {
+                Some(NativeFunction::CreateProcessingInstruction)
+            }
+            (Some(ObjectHost::Document(_)), "importNode") => Some(NativeFunction::ImportNode),
+            (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "getElementsByTagNameNS") => {
+                Some(NativeFunction::GetElementsByTagNameNs)
+            }
             (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "addEventListener") => {
                 Some(NativeFunction::AddEventListener)
             }
@@ -5298,12 +5386,6 @@ impl JsRuntime {
                 Some(NativeFunction::StyleRemoveProperty)
             }
             (Some(ObjectHost::CssStyleDeclaration(_)), "item") => Some(NativeFunction::StyleItem),
-            (Some(ObjectHost::ClassList(_)), "add") => Some(NativeFunction::ClassListAdd),
-            (Some(ObjectHost::ClassList(_)), "remove") => Some(NativeFunction::ClassListRemove),
-            (Some(ObjectHost::ClassList(_)), "toggle") => Some(NativeFunction::ClassListToggle),
-            (Some(ObjectHost::ClassList(_)), "contains") => Some(NativeFunction::ClassListContains),
-            (Some(ObjectHost::ClassList(_)), "item") => Some(NativeFunction::ClassListItem),
-            (Some(ObjectHost::ClassList(_)), "toString") => Some(NativeFunction::ClassListToString),
             (Some(ObjectHost::RegExp(_)), "exec") => Some(NativeFunction::RegExpExec),
             (Some(ObjectHost::RegExp(_)), "test") => Some(NativeFunction::RegExpTest),
             (Some(ObjectHost::RegExp(_)), "toString") => Some(NativeFunction::RegExpToString),
@@ -5427,6 +5509,17 @@ impl JsRuntime {
             return Err(JsError::type_error(format!(
                 "Location property {property:?} is read-only; navigation is owned by the embedding browser"
             )));
+        }
+        if let (Some(ObjectHost::Node(node)), "nodeValue" | "data") =
+            (self.realm.host(object), property)
+            && crate::runtime::builtins::dom_character_data::character_data(dom, node).is_some()
+        {
+            dom.set_character_data(node, (value.to_js_string()).to_lossy())?;
+            return Ok(());
+        }
+        if let (Some(ObjectHost::ClassList(node)), "value") = (self.realm.host(object), property) {
+            dom.set_attribute(node, "class", (value.to_js_string()).to_lossy())?;
+            return Ok(());
         }
         if let (Some(ObjectHost::Node(node)), "textContent") = (self.realm.host(object), property) {
             return self.set_text_content(dom, node, (value.to_js_string()).to_lossy());

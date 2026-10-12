@@ -196,6 +196,63 @@ pub enum Namespace {
     Other(String),
 }
 
+impl ElementData {
+    /// The qualified name: the prefix and local name joined by `:`, or the
+    /// local name alone (DOM §4.9.1 `tagName` before any case folding).
+    #[must_use]
+    pub fn qualified_name(&self) -> String {
+        match &self.prefix {
+            Some(prefix) => format!("{prefix}:{}", self.local_name),
+            None => self.local_name.clone(),
+        }
+    }
+}
+
+impl Attribute {
+    /// Whether this attribute's qualified name (its prefix and local name
+    /// joined by `:`) is `name`. DOM §4.9.2 matches attributes by qualified
+    /// name, whatever their namespace.
+    #[must_use]
+    pub fn has_qualified_name(&self, name: &str) -> bool {
+        match self.prefix.as_deref() {
+            None => self.local_name == name,
+            Some(prefix) => {
+                name.strip_prefix(prefix)
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    == Some(self.local_name.as_str())
+            }
+        }
+    }
+}
+
+impl Namespace {
+    /// The namespace URI this namespace stands for, or `None` for the null
+    /// namespace (DOM §4.9, the `namespaceURI` of a node with no namespace).
+    #[must_use]
+    pub fn uri(&self) -> Option<&str> {
+        match self {
+            Self::Html => Some("http://www.w3.org/1999/xhtml"),
+            Self::Svg => Some("http://www.w3.org/2000/svg"),
+            Self::MathMl => Some("http://www.w3.org/1998/Math/MathML"),
+            Self::Other(uri) if uri.is_empty() => None,
+            Self::Other(uri) => Some(uri),
+        }
+    }
+
+    /// The namespace for a namespace URI, where `None` and `""` are the null
+    /// namespace (DOM §4.9.1 `createElementNS`, `setAttributeNS`).
+    #[must_use]
+    pub fn from_uri(uri: Option<&str>) -> Self {
+        match uri {
+            None | Some("") => Self::Other(String::new()),
+            Some("http://www.w3.org/1999/xhtml") => Self::Html,
+            Some("http://www.w3.org/2000/svg") => Self::Svg,
+            Some("http://www.w3.org/1998/Math/MathML") => Self::MathMl,
+            Some(uri) => Self::Other(uri.to_owned()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
     pub namespace: Option<String>,
@@ -207,6 +264,10 @@ pub struct Attribute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ElementData {
     pub namespace: Namespace,
+    /// The namespace prefix of the qualified name, if the element was created
+    /// with one (`createElementNS(ns, "x:foo")`). Elements from the parser and
+    /// `createElement` never have one.
+    pub prefix: Option<String>,
     pub local_name: String,
     pub attributes: Vec<Attribute>,
     /// The element's template contents, for an HTML `template` element and
@@ -530,7 +591,7 @@ impl Dom {
 
     pub fn create_element(&mut self, local_name: impl Into<String>) -> NodeId {
         let local_name = local_name.into().to_ascii_lowercase();
-        let data = self.new_element_data(Namespace::Html, local_name);
+        let data = self.new_element_data(Namespace::Html, None, local_name);
         self.allocate(NodeKind::Element(data))
     }
 
@@ -539,7 +600,19 @@ impl Dom {
         namespace: Namespace,
         local_name: impl Into<String>,
     ) -> NodeId {
-        let data = self.new_element_data(namespace, local_name.into());
+        self.create_element_qualified(namespace, None, local_name)
+    }
+
+    /// Create an element with a namespace and, optionally, the prefix of its
+    /// qualified name (DOM §4.9.1 `createElementNS`). The caller has validated
+    /// the name; the prefix is kept only for the qualified name it reports.
+    pub fn create_element_qualified(
+        &mut self,
+        namespace: Namespace,
+        prefix: Option<String>,
+        local_name: impl Into<String>,
+    ) -> NodeId {
+        let data = self.new_element_data(namespace, prefix, local_name.into());
         self.allocate(NodeKind::Element(data))
     }
 
@@ -1004,7 +1077,7 @@ impl Dom {
         if let Some(attribute) = data
             .attributes
             .iter_mut()
-            .find(|attribute| attribute.namespace.is_none() && attribute.local_name == local_name)
+            .find(|attribute| attribute.has_qualified_name(&local_name))
         {
             attribute.value = value;
         } else {
@@ -1042,9 +1115,10 @@ impl Dom {
         let NodeKind::Element(data) = &mut node.kind else {
             unreachable!("element kind was checked")
         };
-        let removed = data.attributes.iter().position(|attribute| {
-            attribute.namespace.is_none() && attribute.local_name == normalized
-        });
+        let removed = data
+            .attributes
+            .iter()
+            .position(|attribute| attribute.has_qualified_name(&normalized));
         if let Some(index) = removed {
             data.attributes.remove(index);
             self.record_mutations([MutationKind::Attribute {
@@ -1072,7 +1146,7 @@ impl Dom {
         Ok(data
             .attributes
             .iter()
-            .find(|attribute| attribute.namespace.is_none() && attribute.local_name == normalized)
+            .find(|attribute| attribute.has_qualified_name(&normalized))
             .map(|attribute| attribute.value.as_str()))
     }
 
@@ -1152,6 +1226,39 @@ impl Dom {
                 attribute.namespace.as_deref() == namespace && attribute.local_name == local_name
             })
             .map(|attribute| attribute.value.as_str()))
+    }
+
+    /// Remove a namespaced attribute, as `Element.removeAttributeNS` does.
+    /// A missing attribute is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomErrorKind::NotFound`] for an unknown node and
+    /// [`DomErrorKind::InvalidNodeType`] when the node is not an element.
+    pub fn remove_attribute_ns(
+        &mut self,
+        element: NodeId,
+        namespace: Option<&str>,
+        local_name: &str,
+    ) -> Result<(), DomError> {
+        if !matches!(self.kind(element)?, NodeKind::Element(_)) {
+            return Err(DomError::invalid_node_type("attributes require an element"));
+        }
+        let node = self.node_mut(element)?;
+        let NodeKind::Element(data) = &mut node.kind else {
+            unreachable!("element kind was checked")
+        };
+        let removed = data.attributes.iter().position(|attribute| {
+            attribute.namespace.as_deref() == namespace && attribute.local_name == local_name
+        });
+        if let Some(index) = removed {
+            data.attributes.remove(index);
+            self.record_mutations([MutationKind::Attribute {
+                target: element,
+                local_name: local_name.to_owned(),
+            }]);
+        }
+        Ok(())
     }
 
     /// Replace character data for a Text, Comment, or `ProcessingInstruction`.
@@ -1354,11 +1461,17 @@ impl Dom {
     /// The fragment is allocated before the element, so the element is the node
     /// that a caller ends up holding. Identifiers are only ever compared, never
     /// used to imply tree order.
-    fn new_element_data(&mut self, namespace: Namespace, local_name: String) -> ElementData {
+    fn new_element_data(
+        &mut self,
+        namespace: Namespace,
+        prefix: Option<String>,
+        local_name: String,
+    ) -> ElementData {
         let template_contents = (namespace == Namespace::Html && local_name == "template")
             .then(|| self.create_document_fragment());
         ElementData {
             namespace,
+            prefix,
             local_name,
             attributes: Vec::new(),
             template_contents,
@@ -1652,10 +1765,12 @@ mod tests {
         .unwrap();
 
         // The null-namespace and the XLink attribute are distinct even though
-        // their local names differ only by the prefix in the source markup.
+        // their local names differ only by the prefix in the source markup. A
+        // by-name read matches the qualified name (DOM §4.9.2), so the prefixed
+        // attribute answers to `xlink:href` and not to `href`.
         assert_eq!(dom.attribute(element, "d").unwrap(), Some("M0 0"));
         assert_eq!(dom.attribute(element, "href").unwrap(), None);
-        assert_eq!(dom.attribute(element, "xlink:href").unwrap(), None);
+        assert_eq!(dom.attribute(element, "xlink:href").unwrap(), Some("#b"));
         assert_eq!(
             dom.attribute_ns(element, Some("http://www.w3.org/1999/xlink"), "href")
                 .unwrap(),

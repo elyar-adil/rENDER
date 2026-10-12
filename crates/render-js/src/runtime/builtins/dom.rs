@@ -17,10 +17,12 @@ use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
 use crate::runtime::JsRuntime;
+use crate::runtime::builtins::dom_collections::unsigned_long;
 use crate::runtime::builtins::dom_exception::DomExceptionName;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::ElementRect;
 use crate::utf16::JsString;
+use crate::value::CollectionFilter;
 use crate::value::DomNodeKind;
 use crate::value::HTML_ELEMENT_INTERFACES;
 use crate::value::NativeFunction;
@@ -44,8 +46,31 @@ impl JsRuntime {
         let result: Result<JsValue, JsError> = match function {
             NativeFunction::GetElementById => {
                 self.require_document(receiver)?;
-                let id = required_argument(arguments, 0, "getElementById")?.to_js_string();
-                match self.find_element_by_id(dom, &(id).to_lossy())? {
+                let id = required_argument(arguments, 0, "getElementById")?
+                    .to_js_string()
+                    .to_lossy();
+                // The empty string names no element, even one with `id=""`.
+                let found = if id.is_empty() {
+                    None
+                } else {
+                    self.find_element_by_id(dom, &id)?
+                };
+                match found {
+                    Some(node) => self.wrap_node(dom, node),
+                    None => Ok(JsValue::Null),
+                }
+            }
+            NativeFunction::NonElementGetElementById => {
+                let root = self.require_node(receiver)?;
+                let id = required_argument(arguments, 0, "getElementById")?
+                    .to_js_string()
+                    .to_lossy();
+                let found = if id.is_empty() {
+                    None
+                } else {
+                    self.find_element_by_id_within(dom, root, &id)?
+                };
+                match found {
                     Some(node) => self.wrap_node(dom, node),
                     None => Ok(JsValue::Null),
                 }
@@ -66,45 +91,202 @@ impl JsRuntime {
                 let root = self.query_root(receiver)?;
                 let selector = required_argument(arguments, 0, "querySelectorAll")?.to_js_string();
                 let selectors = self.parse_selectors(&(selector).to_lossy(), "querySelectorAll")?;
-                let nodes = select_all(dom, root, &selectors, &MatchContext::default())
-                    .into_iter()
-                    .map(|node| self.wrap_node(dom, node))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
+                // A static NodeList: the matches at this moment, never updated.
+                let nodes = select_all(dom, root, &selectors, &MatchContext::default());
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.static_node_list_wrapper(nodes)))
             }
             NativeFunction::GetElementsByTagName => {
                 let root = self.query_root(receiver)?;
-                let tag = required_argument(arguments, 0, "getElementsByTagName")?.to_js_string();
-                // Type selectors match case-insensitively for HTML elements,
-                // which is exactly the legacy API contract.
-                let selectors = self.parse_selectors(&(tag).to_lossy(), "getElementsByTagName")?;
-                let nodes = select_all(dom, root, &selectors, &MatchContext::default())
-                    .into_iter()
-                    .map(|node| self.wrap_node(dom, node))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
+                let name = required_argument(arguments, 0, "getElementsByTagName")?
+                    .to_js_string()
+                    .to_lossy();
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.live_collection_wrapper(
+                    root,
+                    CollectionFilter::TagName(name),
+                    "HTMLCollection",
+                )))
             }
             NativeFunction::GetElementsByClassName => {
                 let root = self.query_root(receiver)?;
                 let names = required_argument(arguments, 0, "getElementsByClassName")?
                     .to_js_string()
                     .to_lossy();
-                let selector: String = names
-                    .split_ascii_whitespace()
-                    .map(|name| format!(".{name}"))
-                    .fold(String::new(), |mut acc, part| {
-                        acc.push_str(&part);
-                        acc
-                    });
-                if selector.is_empty() {
-                    return Ok(JsValue::Object(self.create_array_from_values(&[])?));
+                let tokens = names.split_ascii_whitespace().map(str::to_owned).collect();
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.live_collection_wrapper(
+                    root,
+                    CollectionFilter::ClassNames(tokens),
+                    "HTMLCollection",
+                )))
+            }
+            NativeFunction::CollectionItem => self.collection_item(dom, receiver, arguments),
+            NativeFunction::CollectionLength => self.collection_length_native(dom, receiver),
+            NativeFunction::CollectionNamedItem => {
+                self.collection_named_item(dom, receiver, arguments)
+            }
+            NativeFunction::CharacterDataSubstringData
+            | NativeFunction::CharacterDataAppendData
+            | NativeFunction::CharacterDataInsertData
+            | NativeFunction::CharacterDataDeleteData
+            | NativeFunction::CharacterDataReplaceData => {
+                self.character_data_native(dom, function, receiver, arguments)
+            }
+            NativeFunction::ImplementationHasFeature => Ok(JsValue::Boolean(true)),
+            NativeFunction::CreateElementNs => {
+                self.require_document(receiver)?;
+                let namespace = nullable_string_argument(arguments, 0);
+                let qualified = required_argument(arguments, 1, "createElementNS")?
+                    .to_js_string()
+                    .to_lossy();
+                let (namespace, prefix, local) =
+                    self.validate_and_extract(namespace.as_deref(), &qualified)?;
+                if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
+                    return Err(JsError::resource("DOM node creation limit exceeded"));
                 }
-                let selectors = self.parse_selectors(&selector, "getElementsByClassName")?;
-                let nodes = select_all(dom, root, &selectors, &MatchContext::default())
-                    .into_iter()
-                    .map(|node| self.wrap_node(dom, node))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(JsValue::Object(self.create_array_from_values(&nodes)?))
+                self.ensure_heap_capacity(1)?;
+                self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
+                let node = dom.create_element_qualified(
+                    render_dom::Namespace::from_uri(namespace.as_deref()),
+                    prefix,
+                    local,
+                );
+                self.wrap_node(dom, node)
+            }
+            NativeFunction::SetAttributeNs => {
+                let node = self.require_node(receiver)?;
+                let namespace = nullable_string_argument(arguments, 0);
+                let qualified = required_argument(arguments, 1, "setAttributeNS")?
+                    .to_js_string()
+                    .to_lossy();
+                let value = required_argument(arguments, 2, "setAttributeNS")?
+                    .to_js_string()
+                    .to_lossy();
+                let (namespace, prefix, local) =
+                    self.validate_and_extract(namespace.as_deref(), &qualified)?;
+                dom.set_attribute_ns(node, namespace.as_deref(), prefix.as_deref(), local, value)?;
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::GetAttributeNs => {
+                let node = self.require_node(receiver)?;
+                let namespace = null_namespace_as_none(nullable_string_argument(arguments, 0));
+                let local = required_argument(arguments, 1, "getAttributeNS")?
+                    .to_js_string()
+                    .to_lossy();
+                Ok(dom
+                    .attribute_ns(node, namespace.as_deref(), &local)?
+                    .map_or(JsValue::Null, |value| {
+                        JsValue::String((value.to_owned()).into())
+                    }))
+            }
+            NativeFunction::HasAttributeNs => {
+                let node = self.require_node(receiver)?;
+                let namespace = null_namespace_as_none(nullable_string_argument(arguments, 0));
+                let local = required_argument(arguments, 1, "hasAttributeNS")?
+                    .to_js_string()
+                    .to_lossy();
+                Ok(JsValue::Boolean(
+                    dom.attribute_ns(node, namespace.as_deref(), &local)?
+                        .is_some(),
+                ))
+            }
+            NativeFunction::RemoveAttributeNs => {
+                let node = self.require_node(receiver)?;
+                let namespace = null_namespace_as_none(nullable_string_argument(arguments, 0));
+                let local = required_argument(arguments, 1, "removeAttributeNS")?
+                    .to_js_string()
+                    .to_lossy();
+                dom.remove_attribute_ns(node, namespace.as_deref(), &local)?;
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::GetElementsByTagNameNs => {
+                let root = self.query_root(receiver)?;
+                // DOM §4.2.6.2: `*` is the namespace wildcard, and an empty or
+                // null namespace is the null namespace, matched by "".
+                let namespace = match nullable_string_argument(arguments, 0) {
+                    Some(uri) if uri == "*" => None,
+                    Some(uri) if !uri.is_empty() => Some(uri),
+                    _ => Some(String::new()),
+                };
+                let local = required_argument(arguments, 1, "getElementsByTagNameNS")?
+                    .to_js_string()
+                    .to_lossy();
+                let local = (local != "*").then_some(local);
+                self.ensure_heap_capacity(1)?;
+                Ok(JsValue::Object(self.realm.live_collection_wrapper(
+                    root,
+                    CollectionFilter::TagNameNs { namespace, local },
+                    "HTMLCollection",
+                )))
+            }
+            NativeFunction::CreateCdataSection => {
+                self.require_document(receiver)?;
+                // DOM §4.5: CDATA sections exist only in XML documents.
+                Err(self.dom_exception(
+                    DomExceptionName::NotSupported,
+                    "CDATA sections are not supported in HTML documents",
+                ))
+            }
+            NativeFunction::CreateProcessingInstruction => {
+                self.require_document(receiver)?;
+                let target = required_argument(arguments, 0, "createProcessingInstruction")?
+                    .to_js_string()
+                    .to_lossy();
+                let data = required_argument(arguments, 1, "createProcessingInstruction")?
+                    .to_js_string()
+                    .to_lossy();
+                if !valid_xml_name(&target) || data.contains("?>") {
+                    return Err(self.dom_exception(
+                        DomExceptionName::InvalidCharacter,
+                        format!("{target:?} is not a valid processing instruction target"),
+                    ));
+                }
+                self.ensure_heap_capacity(1)?;
+                let node = dom.create_processing_instruction(target, data);
+                self.wrap_node(dom, node)
+            }
+            NativeFunction::ImportNode => {
+                self.require_document(receiver)?;
+                let node = self.value_as_node(required_argument(arguments, 0, "importNode")?)?;
+                if node == dom.document() {
+                    return Err(self.dom_exception(
+                        DomExceptionName::NotSupported,
+                        "a Document node cannot be imported",
+                    ));
+                }
+                let deep = arguments.get(1).is_some_and(JsValue::is_truthy);
+                self.clone_node_value(dom, node, deep)
+            }
+            NativeFunction::IsSameNode => {
+                let node = self.require_node(receiver)?;
+                let same = match arguments.first() {
+                    Some(JsValue::Object(other)) => self.require_node(*other).ok() == Some(node),
+                    _ => false,
+                };
+                Ok(JsValue::Boolean(same))
+            }
+            NativeFunction::ImplementationCreateDocumentType => {
+                let name = required_argument(arguments, 0, "createDocumentType")?
+                    .to_js_string()
+                    .to_lossy();
+                let public_id = required_argument(arguments, 1, "createDocumentType")?
+                    .to_js_string()
+                    .to_lossy();
+                let system_id = required_argument(arguments, 2, "createDocumentType")?
+                    .to_js_string()
+                    .to_lossy();
+                // DOM §4.5: a qualified name that is not a valid XML name is an
+                // `InvalidCharacterError`.
+                if !valid_xml_name(&name) {
+                    return Err(self.dom_exception(
+                        DomExceptionName::InvalidCharacter,
+                        format!("{name:?} is not a valid doctype name"),
+                    ));
+                }
+                self.ensure_heap_capacity(1)?;
+                let node = dom.create_document_type(name, public_id, system_id);
+                self.wrap_node(dom, node)
             }
             NativeFunction::CloneNode => {
                 let node = self.require_node(receiver)?;
@@ -275,6 +457,7 @@ impl JsRuntime {
             NativeFunction::ClassListToggle => self.class_list_toggle(dom, receiver, arguments),
             NativeFunction::ClassListContains => self.class_list_contains(dom, receiver, arguments),
             NativeFunction::ClassListItem => self.class_list_item(dom, receiver, arguments),
+            NativeFunction::ClassListReplace => self.class_list_replace(dom, receiver, arguments),
             NativeFunction::ClassListToString => self.class_list_to_string(dom, receiver),
             NativeFunction::NamedMapItem | NativeFunction::NamedMapGetNamedItem => {
                 let Some(ObjectHost::NamedNodeMap(map_node)) = self.realm.host(receiver) else {
@@ -533,6 +716,38 @@ pub(in crate::runtime) enum CloneSource {
     Text(String),
     Comment(String),
     Fragment,
+}
+
+/// A nullable `DOMString` argument (`WebIDL` §3.2.12): `null` and `undefined`
+/// are `None`, anything else is its string value.
+fn nullable_string_argument(arguments: &[JsValue], index: usize) -> Option<String> {
+    match arguments.get(index) {
+        None | Some(JsValue::Null | JsValue::Undefined) => None,
+        Some(value) => Some(value.to_js_string().to_lossy()),
+    }
+}
+
+/// DOM §4.9.2: an empty namespace argument means the null namespace.
+fn null_namespace_as_none(namespace: Option<String>) -> Option<String> {
+    namespace.filter(|uri| !uri.is_empty())
+}
+
+/// The XML namespace (Namespaces in XML 1.0 §3) and the XMLNS namespace.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// Whether `name` is a valid XML `Name` (XML 1.0 §2.3), as the DOM requires of
+/// a doctype name and of element names (DOM §4.5, §4.9). Non-ASCII characters
+/// are accepted as name characters, so this is an ASCII-accurate check.
+pub(in crate::runtime) fn valid_xml_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters.next().is_some_and(|character| {
+        character.is_alphabetic() || matches!(character, '_' | ':') || !character.is_ascii()
+    }) && characters.all(|character| {
+        character.is_alphanumeric()
+            || matches!(character, '_' | ':' | '-' | '.' | '\u{b7}')
+            || !character.is_ascii()
+    })
 }
 
 pub(in crate::runtime) fn valid_html_local_name(name: &str) -> bool {
@@ -865,12 +1080,68 @@ impl JsRuntime {
         Ok(None)
     }
 
+    /// DOM §4.9.1 "validate and extract": the namespace (`""` is null), prefix
+    /// and local name for a qualified name in a namespace. A malformed name is
+    /// an `InvalidCharacterError`, and a prefix and namespace that disagree are
+    /// a `NamespaceError`.
+    pub(in crate::runtime) fn validate_and_extract(
+        &mut self,
+        namespace: Option<&str>,
+        qualified_name: &str,
+    ) -> Result<(Option<String>, Option<String>, String), JsError> {
+        let namespace = namespace.filter(|uri| !uri.is_empty());
+        let (prefix, local) = match qualified_name.split_once(':') {
+            Some((prefix, local)) => (Some(prefix), local),
+            None => (None, qualified_name),
+        };
+        let well_formed = valid_xml_name(local)
+            && !local.contains(':')
+            && prefix.is_none_or(|prefix| valid_xml_name(prefix) && !prefix.contains(':'));
+        if !well_formed {
+            return Err(self.dom_exception(
+                DomExceptionName::InvalidCharacter,
+                format!("{qualified_name:?} is not a valid qualified name"),
+            ));
+        }
+        let xmlns_name = prefix == Some("xmlns") || qualified_name == "xmlns";
+        let namespace_error = (prefix.is_some() && namespace.is_none())
+            || (prefix == Some("xml") && namespace != Some(XML_NAMESPACE))
+            || (namespace == Some(XML_NAMESPACE)
+                && prefix != Some("xml")
+                && qualified_name != "xml")
+            || (xmlns_name != (namespace == Some(XMLNS_NAMESPACE)));
+        if namespace_error {
+            return Err(self.dom_exception(
+                DomExceptionName::Namespace,
+                format!("{qualified_name:?} does not match its namespace"),
+            ));
+        }
+        Ok((
+            namespace.map(str::to_owned),
+            prefix.map(str::to_owned),
+            local.to_owned(),
+        ))
+    }
+
+    /// The token set of an element's `class` attribute: the ordered set of its
+    /// ASCII-whitespace-separated tokens, first occurrence wins (DOM §4.7).
     pub(in crate::runtime) fn class_list_tokens(
         dom: &Dom,
         node: NodeId,
     ) -> Result<Vec<String>, JsError> {
-        let value = dom.attribute(node, "class")?.unwrap_or_default();
-        Ok(value.split_ascii_whitespace().map(str::to_owned).collect())
+        let value = Self::class_list_value(dom, node)?;
+        let mut tokens: Vec<String> = Vec::new();
+        for token in value.split_ascii_whitespace() {
+            if !tokens.iter().any(|existing| existing == token) {
+                tokens.push(token.to_owned());
+            }
+        }
+        Ok(tokens)
+    }
+
+    /// The literal `class` attribute value, or the empty string when absent.
+    pub(in crate::runtime) fn class_list_value(dom: &Dom, node: NodeId) -> Result<String, JsError> {
+        Ok(dom.attribute(node, "class")?.unwrap_or_default().to_owned())
     }
 
     /// `dataset.member` read: the value of the mapped `data-*` attribute.
@@ -959,6 +1230,17 @@ impl JsRuntime {
         Ok(token)
     }
 
+    /// DOM §4.7 "update steps": write the serialized token set back to the
+    /// `class` attribute. The steps run after every change the specification
+    /// makes, so the attribute is normalised even when a call changes nothing.
+    fn class_list_update(dom: &mut Dom, node: NodeId, tokens: &[String]) -> Result<(), JsError> {
+        if tokens.is_empty() && dom.attribute(node, "class")?.is_none() {
+            return Ok(());
+        }
+        dom.set_attribute(node, "class", tokens.join(" "))?;
+        Ok(())
+    }
+
     pub(in crate::runtime) fn class_list_add(
         &mut self,
         dom: &mut Dom,
@@ -967,17 +1249,15 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
         let mut tokens = Self::class_list_tokens(dom, node)?;
-        let mut changed = false;
+        // Every token is validated before the attribute is written, so a
+        // rejected token leaves the attribute untouched.
         for index in 0..arguments.len() {
             let token = self.class_list_token(arguments, index, "classList.add")?;
             if !tokens.contains(&token) {
                 tokens.push(token);
-                changed = true;
             }
         }
-        if changed {
-            dom.set_attribute(node, "class", tokens.join(" "))?;
-        }
+        Self::class_list_update(dom, node, &tokens)?;
         Ok(JsValue::Undefined)
     }
 
@@ -989,21 +1269,16 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
         let mut tokens = Self::class_list_tokens(dom, node)?;
-        let original_len = tokens.len();
         for index in 0..arguments.len() {
             let token = self.class_list_token(arguments, index, "classList.remove")?;
             tokens.retain(|candidate| candidate != &token);
         }
-        if tokens.len() != original_len {
-            if tokens.is_empty() {
-                dom.remove_attribute(node, "class")?;
-            } else {
-                dom.set_attribute(node, "class", tokens.join(" "))?;
-            }
-        }
+        Self::class_list_update(dom, node, &tokens)?;
         Ok(JsValue::Undefined)
     }
 
+    /// DOM §4.7 `toggle(token, force)`. An omitted or `undefined` `force` is
+    /// "not given", and the update steps run only when the set changed.
     pub(in crate::runtime) fn class_list_toggle(
         &mut self,
         dom: &mut Dom,
@@ -1013,23 +1288,50 @@ impl JsRuntime {
         let node = self.require_class_list(receiver)?;
         let token = self.class_list_token(arguments, 0, "classList.toggle")?;
         let mut tokens = Self::class_list_tokens(dom, node)?;
-        let present = tokens.iter().any(|candidate| candidate == &token);
-        let next = match arguments.get(1) {
+        let present = tokens.contains(&token);
+        let keep = match arguments.get(1) {
+            None | Some(JsValue::Undefined) => !present,
             Some(force) => force.is_truthy(),
-            None => !present,
         };
-        if next && !present {
-            tokens.push(token);
-            dom.set_attribute(node, "class", tokens.join(" "))?;
-        } else if !next && present {
-            tokens.retain(|candidate| candidate != &token);
-            if tokens.is_empty() {
-                dom.remove_attribute(node, "class")?;
+        if keep != present {
+            if keep {
+                tokens.push(token);
             } else {
-                dom.set_attribute(node, "class", tokens.join(" "))?;
+                tokens.retain(|candidate| candidate != &token);
+            }
+            Self::class_list_update(dom, node, &tokens)?;
+        }
+        Ok(JsValue::Boolean(keep))
+    }
+
+    /// DOM §4.7 `replace(token, newToken)`: swap `token` for `newToken` at its
+    /// position, keeping the set free of duplicates, and report whether
+    /// `token` was present.
+    pub(in crate::runtime) fn class_list_replace(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_class_list(receiver)?;
+        let token = self.class_list_token(arguments, 0, "classList.replace")?;
+        let new_token = self.class_list_token(arguments, 1, "classList.replace")?;
+        let tokens = Self::class_list_tokens(dom, node)?;
+        let Some(position) = tokens.iter().position(|candidate| candidate == &token) else {
+            return Ok(JsValue::Boolean(false));
+        };
+        let mut replaced: Vec<String> = Vec::with_capacity(tokens.len());
+        for (index, candidate) in tokens.into_iter().enumerate() {
+            if index == position {
+                if !replaced.contains(&new_token) {
+                    replaced.push(new_token.clone());
+                }
+            } else if candidate != token && candidate != new_token {
+                replaced.push(candidate);
             }
         }
-        Ok(JsValue::Boolean(next))
+        Self::class_list_update(dom, node, &replaced)?;
+        Ok(JsValue::Boolean(true))
     }
 
     pub(in crate::runtime) fn class_list_contains(
@@ -1054,17 +1356,9 @@ impl JsRuntime {
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        let index =
-            self.to_number_value(dom, required_argument(arguments, 0, "classList.item")?)?;
-        if !index.is_finite() || index < 0.0 || index.fract() != 0.0 {
-            return Ok(JsValue::Null);
-        }
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "index was validated as a finite non-negative integer"
-        )]
-        let index = index as usize;
+        let index = unsigned_long(
+            self.to_number_value(dom, required_argument(arguments, 0, "classList.item")?)?,
+        ) as usize;
         Ok(Self::class_list_tokens(dom, node)?
             .get(index)
             .cloned()
@@ -1073,15 +1367,15 @@ impl JsRuntime {
             }))
     }
 
+    /// The `DOMTokenList` stringifier is its `value`: the attribute's literal
+    /// value, not the serialized token set (DOM §4.7).
     pub(in crate::runtime) fn class_list_to_string(
         &self,
         dom: &Dom,
         receiver: ObjectId,
     ) -> Result<JsValue, JsError> {
         let node = self.require_class_list(receiver)?;
-        Ok(JsValue::String(
-            (Self::class_list_tokens(dom, node)?.join(" ")).into(),
-        ))
+        Ok(JsValue::String((Self::class_list_value(dom, node)?).into()))
     }
 
     pub(in crate::runtime) fn find_element_by_id(
@@ -1089,7 +1383,24 @@ impl JsRuntime {
         dom: &Dom,
         id: &str,
     ) -> Result<Option<NodeId>, JsError> {
-        let mut pending = vec![dom.document()];
+        self.find_element_by_id_within(dom, dom.document(), id)
+    }
+
+    /// The first element, in tree order, among the descendants of `root` whose
+    /// `id` is `id` (DOM §4.2.6.2 `getElementById`). `root` itself is excluded.
+    pub(in crate::runtime) fn find_element_by_id_within(
+        &mut self,
+        dom: &Dom,
+        root: NodeId,
+        id: &str,
+    ) -> Result<Option<NodeId>, JsError> {
+        let mut pending: Vec<NodeId> = dom
+            .children(root)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .copied()
+            .collect();
         while let Some(node) = pending.pop() {
             self.consume_step()?;
             if matches!(
@@ -1100,7 +1411,7 @@ impl JsRuntime {
                 return Ok(Some(node));
             }
             if let Some(children) = dom.children(node) {
-                pending.extend(children.iter().rev());
+                pending.extend(children.iter().rev().copied());
             }
         }
         Ok(None)
@@ -1265,6 +1576,8 @@ pub(in crate::runtime) fn dom_interface_name(dom: &Dom, node: NodeId) -> &'stati
         Some(NodeKind::Text(_)) => "Text",
         Some(NodeKind::Comment(_)) => "Comment",
         Some(NodeKind::DocumentFragment) => "DocumentFragment",
+        Some(NodeKind::DocumentType(_)) => "DocumentType",
+        Some(NodeKind::ProcessingInstruction { .. }) => "ProcessingInstruction",
         _ => "Node",
     }
 }

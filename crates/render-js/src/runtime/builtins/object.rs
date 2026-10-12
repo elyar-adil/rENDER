@@ -1415,6 +1415,22 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_get_own_property(dom, object, key);
         }
+        // The indexed members of a NodeList, HTMLCollection or DOMTokenList are
+        // own, enumerable, read-only properties (WebIDL §3.10.4).
+        if let PropertyName::String(name) = key
+            && crate::value::is_canonical_index(name)
+            && let Ok(index) = name.parse::<usize>()
+            && let Some(value) = self.indexed_list_member(dom, object, index)?
+        {
+            return Ok(Some(PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value,
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            }));
+        }
         Ok(match key {
             PropertyName::String(name) => self.realm.own_property(object, name),
             PropertyName::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
