@@ -485,6 +485,13 @@ impl Harvest {
         i += 1;
         while let Some(object) = take_object(bytes, &mut i) {
             out.results.push(parse_test(&object));
+            // Objects in an array are separated by a comma. Without stepping over it,
+            // the second `take_object` finds a `,` and the loop ends after one result,
+            // so every file's verdict was the verdict of its first subtest.
+            skip_ws(bytes, &mut i);
+            if bytes.get(i) == Some(&b',') {
+                i += 1;
+            }
         }
 
         // `completion` object, which may be `null`.
@@ -709,6 +716,8 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         mechanism: None,
         category: Category::HarnessLimitation,
     };
+    let registered = harvest.completion.as_ref().map_or(0, |c| c.tests);
+    let reported = harvest.results.len() as u32;
     for test in harvest.results {
         let status = HarnessStatus::from_number(test.status);
         // `asserts_run` is cumulative across the whole file, so it is taken from
@@ -721,6 +730,20 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             worst.name = test.name;
             worst.message = test.message;
         }
+    }
+    // A pass needs every subtest the harness registered to have reported. A registered
+    // subtest with no result is a verdict this runner cannot see, and a pass computed from
+    // the others would claim more than was checked. A failure among the reported ones
+    // still stands, because it is a real result whatever else went unreported.
+    if worst.status == HarnessStatus::Pass && registered > reported {
+        worst.status = HarnessStatus::Unknown;
+        worst.message = Some(format!(
+            "{} of {registered} registered subtest(s) reported no result",
+            registered - reported
+        ));
+        worst.mechanism = Some("subtest-unreported".to_owned());
+        worst.category = Category::HarnessLimitation;
+        return worst;
     }
     worst.category = match worst.status {
         HarnessStatus::Pass => Category::AcceptableDifference,
@@ -1777,5 +1800,17 @@ mod tests {
         assert!(!Category::AcceptableDifference.is_a_defect());
         assert!(Category::EngineDefect.is_a_defect());
         assert_ne!(Outcome::Pass, Outcome::Fail);
+    }
+
+    #[test]
+    fn a_harvest_reads_every_subtest_not_only_the_first() {
+        // Every subtest after the first used to be dropped: the array's separators were
+        // never stepped over, so the verdict of a file was its first subtest's verdict.
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1},{"name":"b","status":1,"message":"x","asserts":2},{"name":"c","status":0,"message":null,"asserts":3}],"completion":{"status":0,"message":null,"num_tests":3}}"#;
+        let harvest = Harvest::parse(json).expect("a well-formed harvest parses");
+        assert_eq!(harvest.results.len(), 3);
+        assert_eq!(harvest.results[1].name, "b");
+        assert_eq!(harvest.results[2].name, "c");
+        assert_eq!(harvest.completion.as_ref().map(|c| c.tests), Some(3));
     }
 }
