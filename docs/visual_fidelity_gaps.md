@@ -394,29 +394,12 @@ webfonts work on pages whose 223 faces are all dropped.
 So the diagnostics this round produced are **counted but not displayed**. That is a real gap,
 and it is the difference between "the engine told us" and "we can see that the engine told us".
 
-## S5 - Closed, see "S5 - Closed: inline SVG parses and rasterises" below
+## S5 - Partly closed, see "S5 - Partly closed: inline SVG is parsed and painted" below
 
-Superseded. The parsing half landed earlier and the rendering half has now landed too, so
-this entry is kept only as a pointer. The `use`/`symbol`/`defs` and `foreignObject`
-omissions recorded here are still accurate.
-
-The parsing half is closed - see the Closed table. The rendering half is not, and it is
-worth stating precisely what is missing, because "inline SVG is supported" is now half
-true and that is an easy thing to be wrong about.
-
-- `render-layout` and `render-core` produce **zero geometry** for foreign content.
-- An `<svg>` element's size must come from its `width`/`height`/`viewBox` attributes,
-  because layout cannot measure it. No replaced-element sizing path exists for it.
-- The available seam is good: the DOM is now faithful (case-adjusted local names such as
-  `clipPath`, `foreignObject`, `viewBox`; namespaced attributes preserved as
-  `xlink:href`, `xml:lang`, `xmlns:xlink`), `render_html::serialize_html_node` is
-  namespace-aware, and `crates/render-core/src/image/svg.rs` already rasterises standalone
-  SVG. So the intended path is: detect an `svg` element in the `Svg` namespace, serialise
-  its subtree, feed it to that rasteriser, and register the result as an image resource so
-  replaced-element sizing works. Roughly a hundred lines and no new rendering code.
-- Read namespaced attributes with `attribute_ns(node, Some("http://www.w3.org/1999/xlink"), "href")`.
-  `attribute(node, "href")` deliberately returns `None` for `xlink:href`, because that
-  attribute is in a different namespace from a null-namespace `href`.
+Superseded by the entry below, which is the current record of S5. The text that stood here
+said the rendering half had landed, and the section further down said nothing called the
+rasteriser. Both were partly right and both are out of date. The parsing half is closed (see
+the Closed table).
 
 ## S14 - Closed: `<template>` contents are now inert
 
@@ -1837,43 +1820,76 @@ exercises the same path, with positive cases added alongside. This is the one ch
 round that wants independent review, because editing a test to accommodate a behaviour change
 is exactly where a real regression hides.
 
-## S5 - **NOT closed.** The rasteriser works; nothing ever calls it
+## S5 - Partly closed: inline SVG is parsed and painted; CSS styling of its children and `use` are not
 
-> **Correction.** Like S6, I closed this row on unit tests. The acceptance harness then established
-> that **`discover_inline_svgs` and `InlineSvgDiscovery::install` are called from nowhere** - not
-> from `Document::render_with_external_style_sheets_and_images`, not from `render-browser`, and not
-> from anywhere outside `inline_svg.rs` itself. Verified independently. So the capability is a
-> **function nobody calls**, and the registry note claiming the raster "paints through the ordinary
-> image command" describes a path that does not exist.
+This is the single current record of S5. It supersedes the two earlier S5 sections, which
+disagreed with each other and with the code. It was checked by reading the code and by the
+real-site gate (`an_inline_svg_is_laid_out_as_a_box_and_painted_into_it`,
+`every_fixture_paints_its_inline_svgs`) and the `render-core` document tests.
 
-The work is real and correct - it is the *call* that is missing. Both halves of the *implementation*
-are done: the parsing half, and the rendering half via the existing
-`crates/render-core/src/image/svg.rs` with no new rendering code, through a new
-`src/image/inline_svg.rs` that discovers `svg` elements in the `Svg` namespace, serialises the
-subtree with the namespace-aware `serialize_html_node`, rasterises, and registers the result as an
-image resource.
+**Closed**
 
-What it renders, once something calls it: `<rect>`, `<circle>`, `<ellipse>`, `<polygon>`,
-`<polyline>`, `<line>`, `path` (`M m L l H h V v C c S s Q q T t A Z z`), `<g>`/`a`/`switch`
-transforms, `fill`/`stroke` inheritance, and `viewBox` scaling.
+- **Parsing.** An inline `<svg>` and its children are foreign content in the SVG namespace (see
+  the Closed table).
+- **The call.** `Document`'s render path runs `discover_inline_svgs_with_colors` after the cascade
+  and layers the rasters over the caller's images (`render_dom`,
+  `crates/render-core/src/document.rs`). Before this, nothing in the pipeline ran discovery, and a
+  page's icons were never rasterised.
+- **Box.** An inline `svg` is a replaced element. Its size comes from its `width`/`height`
+  presentation hints or its `viewBox`, and from its raster when author CSS sets `width: auto`
+  (`replaced_size`, `crates/render-layout/src/solver/inline.rs`). Before this, an author `auto`
+  width collapsed the svg to zero, because the hint it overrode was the only size layout had. The
+  unit test `an_inline_svg_with_an_auto_width_takes_its_intrinsic_size` covers that case. With no
+  size and no `viewBox` the box is the rasteriser's 300x150 default.
+- **Paint.** The raster is painted into that box by the ordinary `Image` command.
+- **`currentColor`.** It resolves to the `svg` element's computed `color`. Before, it was always
+  black.
+- **Rasteriser defects fixed on the way.** A shape with no `fill` anywhere is filled black, which
+  is the initial value and was previously left unpainted. A root `fill` or `stroke` attribute is
+  inherited by its shapes, where it was previously ignored.
+- **Diagnostics.** Discovery and install failures are reported in
+  `DocumentRenderDiagnostics::inline_svg` and counted under the gate's `InlineSvg` stage.
 
-**One seam did not exist as planned, and the report says so rather than working around it
-silently:** `render-layout`'s `replaced_size` hard-gates on `img | video`, so a registered
-image on an `svg` node is *not* consumed for sizing. Sizing therefore comes from the
-`width`/`height`/`viewBox` attributes - which is what the brief specified anyway - fed into a
-new `svg::decode_svg_viewport(bytes, w, h, limits)`.
+**Not closed**
 
-Deliberately left out, each documented in the module: `use`/`symbol`/`defs` indirection
-(needs a shadow tree - an honest absence, not a stub), `foreignObject` (its HTML lays out as
-ordinary in-flow HTML, correct only for `x=0 y=0` with no scaling), aspect-ratio preservation
-when the box ratio differs from the viewBox, and a percentage `width` resolving to the
-viewBox extent rather than 100% of the container.
+1. **Author CSS does not reach the svg's children.** The rasteriser reads presentation attributes
+   only, and `fill` and `stroke` are not implemented CSS properties: `render-css` has no such
+   property, and `fill` appears only as the `object-fit` keyword. A shape styled only by a
+   stylesheet is painted black where a browser paints the stylesheet's fill. `google_home` styles
+   its icons this way (`fill: currentColor` on a class rule), so those icons are wrong in colour
+   until this is closed.
+2. **`use`, `symbol` and `defs` indirection** (SVG 2 §3.2.4) needs a shadow tree. A `<use>`
+   contributes nothing. An honest absence, recorded in the module.
+3. **`foreignObject`** is not rasterised. Its HTML is laid out as ordinary flow, which is correct
+   only at `x=0 y=0` with no scaling.
+4. **Aspect ratio.** The raster is stretched to the box (`object-fit: fill`), and
+   `preserveAspectRatio` is not read.
+5. **`currentColor` sources.** The colour comes from the computed `color` only. The `color`
+   presentation attribute is not read. A descendant that sets its own `color` in CSS resolves to
+   the outer `svg`'s colour, because the raster is built from markup.
+6. **Percentage or absent `width`** resolves to the `viewBox` extent, not to the containing block.
+   This is a documented difference, and it is the safe direction.
+7. **Stroke width** is one device pixel. `stroke-width` is not read.
+8. **Cost.** Discovery rasterises every inline `svg` on every render of the document, with no
+   cache. `crates/render-core/examples/inline_svg_cost.rs` measures this. A cache keyed by DOM
+   revision and resolved colour is the next step if render-perf shows it.
 
-One UA rule was **chosen rather than quoted**, and is commented as such: `svg { display:
+**Measured this round**
+
+- The gate's registered fixtures: `netease_163_home` has 1 inline `svg`, `sticky_toolbar` has 1.
+  Both are laid out as boxes and painted.
+- Fixture files outside the gate, rendered without their external stylesheets: `yahoo_hk_home` has
+  38 (38 laid out, 38 painted). `google_home` has 8 (5 laid out, 4 painted; the logo's box is zero
+  wide in that render, and its cause was not traced past the CSS-free render, so it is not claimed
+  as an svg defect). `youtube_home` has 3 with no boxes, because its `ytd-masthead` subtree lays
+  out no text in that render either. `hacker_news_home`, `wikipedia_main_page`, `baidu_home` and
+  `zhihu_home` have none.
+
+One UA rule is **chosen rather than quoted**, and is commented as such: `svg { display:
 inline-block }`, because `inline` is a character-level box with no geometry. By contrast
-`svg { overflow: hidden }` is SVG 2 §3.11 verbatim, and the never-rendered list is SVG 2
-§3.2.1 verbatim, declared as data and asserted against the spec text so the sheet rule and the
-constant cannot drift.
+`svg { overflow: hidden }` is SVG 2 §3.11 verbatim, and the never-rendered list is SVG 2 §3.2.1
+verbatim, declared as data and asserted against the spec text so the sheet rule and the constant
+cannot drift.
 
 ## S7 - Quirks mode: parse side done, behaviour not started
 
