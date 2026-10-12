@@ -315,6 +315,15 @@ impl JsRuntime {
         let owner = self.realm_of_node(dom, frame);
         let base = self.contexts[owner.0].base.clone();
         let (url, source) = self.frame_document_source(dom, frame, &base);
+        // An iframe with neither `src` nor `srcdoc` keeps the initial `about:blank`
+        // window it already has. That document is not replaced, so what script
+        // set up on it before this task ran is still there.
+        if url.as_str() == ABOUT_BLANK
+            && let Some(FrameState::Realm(_)) = self.frames.get(&frame)
+        {
+            self.schedule(InternalTask::FrameLoad { frame });
+            return Ok(());
+        }
         let document = dom.graft_document(render_html::parse_document(&source).dom);
         let Ok(realm) = self.create_browsing_context(dom, document, &url, Some(frame)) else {
             // The frame keeps the window it already has, if it has one, and its
@@ -334,9 +343,11 @@ impl JsRuntime {
         self.with_realm(realm, |runtime| {
             runtime.run_document_scripts(dom, document, &document_base);
         });
-        self.dispatch_window_load(dom, realm)?;
+        // The frame's `load` follows its window's, even when a `load` listener
+        // reports a failure, so the embedding still hears about the frame.
+        let window_load = self.dispatch_window_load(dom, realm);
         self.schedule(InternalTask::FrameLoad { frame });
-        Ok(())
+        window_load
     }
 
     /// The URL and source text of the document an iframe displays. `srcdoc`

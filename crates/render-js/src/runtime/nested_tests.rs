@@ -344,6 +344,25 @@ fn an_about_blank_frame_takes_its_creators_origin_so_same_origin_messages_reach_
 }
 
 #[test]
+fn a_frame_without_src_keeps_the_window_script_set_up_before_its_load_task() {
+    let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
+    run(
+        &mut dom,
+        &mut runtime,
+        "var f = document.createElement('iframe'); document.body.appendChild(f); f.contentWindow.kept = 'yes';",
+    );
+    settle(&mut dom, &mut runtime);
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "document.querySelector('iframe').contentWindow.kept"
+        ),
+        "yes"
+    );
+}
+
+#[test]
 fn a_srcdoc_script_resolves_its_src_against_the_embedding_document() {
     let mut documents = BTreeMap::new();
     documents.insert(
