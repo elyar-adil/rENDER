@@ -167,11 +167,11 @@ fn describe_mechanism(key: &str, file: &FileResult) -> (String, crate::mechanism
     use crate::mechanism::Category;
     match key {
         "lacks-nested-browsing-context" => (
-            "render-core implements no nested browsing context, so an `iframe` renders as \
-             nothing. Implementing nested browsing contexts is the single highest-leverage \
-             change: it is the only blocker that gates the area where the engine is strongest, \
-             because 1,314 CSS tests are `testcss.js` tests and every one of them builds an \
-             iframe."
+            "the computed-value adapter hosts one document and declines nested browsing \
+             contexts, so an `iframe` is never driven there. The dom/html adapter does drive \
+             them. Every CSS test that reaches this key is a `testcss.js` test, which builds an \
+             iframe, and it stays a skip until the CSS area runs through a harness-driven \
+             adapter."
                 .to_owned(),
             Category::UnimplementedFeature,
         ),

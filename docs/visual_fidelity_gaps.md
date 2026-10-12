@@ -1372,54 +1372,71 @@ A missing global is worse than a wrong one, because it throws a `ReferenceError`
 the point of use and takes the surrounding script with it. Every remaining entry above is a
 candidate to check against real-site script corpora already in `.diag/`.
 
-## S11 - No nested browsing contexts, and this is now known to gate **measurement**, not just pages
+## S11 - Nested browsing contexts: the script side is implemented, painting is not
 
-`iframe` appears in `crates/render-core/src/document.rs:262,269` only as a member of
-element classification lists. There is no nested browsing context: no second document,
-no separate event loop or task queue, no `postMessage`, no `window.open`. Every
-`<iframe>` - embedded video, ad slots, third-party widgets, login frames - renders as
-nothing at all. `target="_blank"` and `window.open` are equally absent, so a link that
-opens a new context silently does nothing.
+**Status: partly closed.** An `<iframe>` is a browsing context with its own document and realm, and the page's scripts can reach it and it can reach the page. Still open: a nested document is **not painted**, `window.open` and `target=_blank` do nothing, frames have no cross-origin restrictions, and a frame cannot be navigated to a new URL.
 
-### Why this is no longer one gap among twelve
+### What is implemented (verified by tests)
 
-The WPT runner is built, the suite is censusued at **32,576 scored tests across `css/`, `dom/` and
-`html/`**, and **it cannot run a single one of them.** WPT's CSS tests are `testcss.js` tests, and
-`testcss.js` is an **iframe driver**. `render-core` has no nested browsing contexts.
+- `render-dom` (`crates/render-dom/src/lib.rs`): `Dom::graft_document` moves a parsed document into the page's arena as a detached tree. The owner's node ids do not change, and no mutation is recorded.
+- `render-js`: one heap, one realm per browsing context (`Realm::create_document_realm`). Window listeners, the event path and node wrappers are per realm.
+- Nested contexts, `crates/render-js/src/runtime/nested.rs`:
+  - A connected `<iframe>` gets an `about:blank` window the first time something asks for `contentWindow`. Its document loads in a later task: `srcdoc`, then `src` through the host's `DocumentLoader`, then an empty document. Its classic scripts run in its own realm, and its window `load` fires.
+  - An `about:blank` or `about:srcdoc` document takes the origin and base URL of the document that created its iframe (HTML 7.4.2.3). An iframe with neither `src` nor `srcdoc` keeps the window it already has.
+  - The iframe's `load` event fires after its window's `load`, even when a window `load` listener reports a failure.
+  - `window.parent`, `window.top`, `window.frameElement` and `postMessage`. A message is structured-cloned at the call and delivered as a task. `targetOrigin` is `*`, `/`, or a URL whose origin is compared; an unparseable one throws `SyntaxError` (HTML 9.4.3). The `source` is the calling window.
+  - `contentWindow`, `contentDocument`, `getElementById` on a child document, and `ownerDocument`. Removing an iframe ends its context.
+- Heap: a realm costs about 1,840 objects. A frame that cannot get one is refused: it has no window, its `load` still fires, and the page keeps running.
+- WPT runner (`tests/wpt_runner`): the dom/html adapter runs each test at `http://web-platform.test/<path>`, and a `SuiteLoader` serves the pinned checkout for that host. `NestedBrowsingContext` and `WindowProxy` are reported available. The CSS computed-value adapter still declines nested tests, because it hosts one document.
+- Tests: `crates/render-dom/src/lib.rs` (graft); `crates/render-js/src/runtime/nested_tests.rs` (16 tests, one per behaviour above); `crates/render-core/tests/nested_browsing_contexts.rs` (the page pipeline, and the no-paint check).
 
-**The largest area with a real cascade, a real selector matcher and a real layout engine is the one
-whose harness cannot run.** The runner reports **no conformance rate at all** - its `Rate` returns
-`None` on a zero denominator, so an empty run prints nothing rather than `0%` - and it reports **no
-engine defect list**, correctly labelling that "blocked, not empty" rather than "zero defects",
-because nothing was evaluated.
+### What is not implemented
 
-So the cost of this row is not one page type. **An engine that cannot host a nested document cannot
-be scored by the largest CSS conformance suite in existence**, so the absence costs the project its
-ability to *know* whether its CSS is right - which is the measurement this project has been missing
-all along, and which two runners are now queued to supply.
+- **Painting.** A nested document is not laid out or painted, and its iframe renders as nothing. `nested_browsing_contexts.rs::a_nested_document_is_not_painted_into_the_page` pins that. Needed: the iframe as a replaced element with its own viewport, scroll offset and input routing (`render-browser`).
+- **The browser shell installs no `DocumentLoader`**, so an iframe `src` is an empty document in the browser.
+- `window.open`, `target=_blank`, cross-origin restrictions on frames, navigating an existing frame to a new URL, CSP sandboxing, and the `onmessage` window event-handler attribute.
+- The WPT runner does not dispatch the top-level window `load`, so a test that waits for `window.onload` does not start. That is the page lifecycle, not nested contexts.
+- Frame loads and messages run through the embedding's timer drain. An embedding that never drains timer requests never loads a frame.
+- Frames of a replaced document are not discarded when the document is replaced.
+- An `about:blank` iframe's `load` fires in a later task. HTML fires it synchronously when the iframe is inserted without `src`.
 
-Nested browsing contexts alone block **1,772** of the tests that otherwise look statically
-executable. That is the number to weight this row by.
+### Measured effect (WPT `dom/` and `html/`, pinned revision c7fdee80, 10,908 tests)
 
-### What building it must include, so it is not another DOM-only half
+Three runs on the same suite revision. **Master as shipped** is the baseline in `tools/wpt/results/wpt-results.jsonl`, produced by a runner whose scorer reads only the first subtest of each file (see Decisions). **Master + scorer fix** is master with only that fix. **Branch** is this branch.
 
-The scope written down for the DOM half (`render-dom` + `render-html`: a nested `Document`,
-`srcdoc`, the form element pointer across the boundary) is necessary and **not sufficient**, and the
-precedent that makes this explicit is the form owner: that one was delivered correctly as a
-relationship plus a written consumption contract, with rendering explicitly reported absent. For
-iframes the consuming side is a whole second document going through parse, style, layout and paint -
-so the unit is:
+| | master as shipped | master + scorer fix | branch |
+| --- | ---: | ---: | ---: |
+| pass | 332 | 232 | 250 |
+| fail | 2,157 | 2,248 | 2,635 |
+| skipped | 8,388 | 8,397 | 7,992 |
+| error | 31 | 31 | 31 |
+| skipped: `lacks-nested-browsing-context` | 643 | 643 | 0 |
+| skipped: `lacks-window-proxy` | 106 | 106 | 0 |
+| skipped: harness did not complete within the drain bound | not separated | 3,304 | 3,811 |
+| test files refused a pass for unreported subtests | 0 | 64 | 68 |
 
-- `render-dom` / `render-html`: the nested `Document`, `srcdoc`, `contentDocument`, the parser
-  boundary
-- `render-core`: a second document through the **whole** pipeline, and the containing block /
-  stacking context an iframe establishes
-- `render-browser`: the shell side - a second view, its own scroll offset, and its own input
-  routing, because an iframe is a nested viewport and not a decoration
-- `render-js`: `postMessage`, `window.open`, `target="_blank"`
+Pass rate (pass / (pass + fail)): master + scorer fix 232 / 2,480 = 9.4%; branch 250 / 2,885 = 8.7%. The rate falls because tests that the nested-context gate used to block now execute, and most of them fail.
 
-**A nested document that parses but never paints is worse than none**, because the iframe currently
-renders as nothing and would then render as a plausible-looking empty box.
+- **Branch against master + scorer fix: 0 lost passes, 18 gained.** Compared key by key on test path. The WPT result rows have no mode field, so mode does not apply. Of the 18, 4 have full assertion coverage; 14 carry a "not reached" note. That note compares the static assertion-site count with the runner's summed counter, which overstates a file's assertions. `location_host.html` has one `assert_equals`, and it passes.
+- Against master as shipped, 98 passes are not passes on the branch. The same engine under the corrected scorer loses 100 of them, so the loss belongs to the scorer.
+- Drain-bound stalls rose by 507. These are tests that were blocked and now run. A sample was mostly media-element, navigation and harness-less crashtests. Not characterised in full.
+
+### Decisions
+
+- **The scorer fix comes first.** `Harvest::parse` stepped over each subtest but not the comma between them, so a file's verdict was its first subtest's verdict alone. Master's `html/semantics/embedded-content/the-iframe-element/sandbox-inherit-to-blank-document-unsandboxed.html` passed on its first assertion (1 of 6 sites). That assertion holds only because the top-level document was `about:blank`, with an opaque origin, and CSP sandboxing is not implemented. Under the fixed scorer master does not pass that file, and the branch fails it with the honest value (`expected "null" but got "http://web-platform.test"`). Restoring it would mean keeping `about:blank` for every top-level test, which is the wrong URL for relative `src` resolution. It is not restored.
+- **Frames are tasks, not synchronous.** An iframe gets its window at once, but its document loads in a later task, matching the spec's asynchronous navigation.
+- **Top-level tests run at their own URL**, `http://web-platform.test/<path>`, so relative `src` resolves against the test. This changes the origin every top-level test sees, which is the cause of the single false pass above.
+
+### How to check
+
+```bash
+cargo test -p render-dom --lib
+cargo test -p render-js --lib nested_tests
+cargo test -p render-core --test nested_browsing_contexts
+cargo build --release --manifest-path tests/wpt_runner/Cargo.toml --features engine
+tests/wpt_runner/target/release/wpt-runner selftest
+tests/wpt_runner/target/release/wpt-runner run --areas dom,html --out <dir>
+```
 
 ## S12 - Closed: only `rgb()` had been supported, and `hsl()` is now implemented
 
@@ -2230,7 +2247,7 @@ it is deliberately not expressed as a percentage, because the percentages were r
 | **`window.matchMedia`** | zero occurrences. Every responsive site that gates behaviour in script gets nothing |
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **WebSocket / `requestIdleCallback` / `PerformanceObserver`** | absent |
-| **Iframes** | S11 - no second document, so any page embedding one loses that content entirely |
+| **Iframes** | S11 - a nested document runs its scripts in its own realm, but an iframe is not painted, so its content is still invisible |
 | **Animations and transitions** | `@keyframes` is parsed, diagnosed, and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
 | **Video pixel decode** | S8 - container parsing only |
 | **Selection / Range** | S13 |

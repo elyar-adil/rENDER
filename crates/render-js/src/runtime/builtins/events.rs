@@ -16,6 +16,7 @@
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
+use crate::RealmId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::{EventFlags, Listener};
@@ -42,7 +43,8 @@ const BUBBLING_PHASE: f64 = 3.0;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stop {
     Node(NodeId),
-    Window,
+    /// The window of a realm.
+    Window(RealmId),
 }
 
 impl JsRuntime {
@@ -447,11 +449,11 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        if receiver != self.realm.global_object() {
+        let Some(realm) = self.realm_of_global(receiver) else {
             return Err(JsError::type_error(
                 "window listeners must be added on the global object",
             ));
-        }
+        };
         let event_type = required_argument(arguments, 0, "addEventListener")?.to_js_string();
         // The window is always an eligible target for the default passive value.
         let passive_default = default_passive_event_type(&event_type.to_lossy());
@@ -460,8 +462,7 @@ impl JsRuntime {
         else {
             return Ok(JsValue::Undefined);
         };
-        let listeners = self
-            .window_event_handlers
+        let listeners = self.window_event_handlers[realm.0]
             .entry((event_type).to_key())
             .or_default();
         Self::insert_listener(listeners, listener);
@@ -473,18 +474,18 @@ impl JsRuntime {
         receiver: ObjectId,
         arguments: &[JsValue],
     ) -> Result<JsValue, JsError> {
-        if receiver != self.realm.global_object() {
+        let Some(realm) = self.realm_of_global(receiver) else {
             return Err(JsError::type_error(
                 "window listeners must be removed from the global object",
             ));
-        }
+        };
         let event_type = required_argument(arguments, 0, "removeEventListener")?.to_js_string();
         let Some(listener) =
             self.listener_from_arguments(arguments, "removeEventListener", false)?
         else {
             return Ok(JsValue::Undefined);
         };
-        if let Some(listeners) = self.window_event_handlers.get_mut(&event_type.to_key()) {
+        if let Some(listeners) = self.window_event_handlers[realm.0].get_mut(&event_type.to_key()) {
             listeners.retain(|candidate| {
                 !(candidate.callback == listener.callback && candidate.capture == listener.capture)
             });
@@ -494,8 +495,11 @@ impl JsRuntime {
 
     fn stop_wrapper(&mut self, dom: &Dom, stop: Stop) -> Result<ObjectId, JsError> {
         match stop {
-            Stop::Window => Ok(self.realm.global_object()),
-            Stop::Node(node) if node == dom.document() => Ok(self.realm.document_object()),
+            Stop::Window(realm) => Ok(self.realm.global_of(realm)),
+            Stop::Node(node) if self.realm_of_document(node).is_some() => {
+                let realm = self.realm_of_document(node).expect("checked by the guard");
+                Ok(self.realm.document_of(realm))
+            }
             Stop::Node(node) => {
                 self.ensure_heap_capacity(1)?;
                 let interface = super::dom::dom_interface_name(dom, node);
@@ -506,7 +510,7 @@ impl JsRuntime {
 
     fn stop_listeners(&self, stop: Stop, event_type: &str) -> Vec<Listener> {
         match stop {
-            Stop::Window => self.window_event_handlers.get(event_type),
+            Stop::Window(realm) => self.window_event_handlers[realm.0].get(event_type),
             Stop::Node(node) => self
                 .event_listeners
                 .get(&node)
@@ -528,7 +532,7 @@ impl JsRuntime {
 
     fn remove_listener_record(&mut self, stop: Stop, event_type: &str, listener: &Listener) {
         let listeners = match stop {
-            Stop::Window => self.window_event_handlers.get_mut(event_type),
+            Stop::Window(realm) => self.window_event_handlers[realm.0].get_mut(event_type),
             Stop::Node(node) => self
                 .event_listeners
                 .get_mut(&node)
@@ -680,13 +684,16 @@ impl JsRuntime {
             path.push(Stop::Node(node));
             ancestor = dom.parent(node);
         }
-        let attached = path
-            .last()
-            .is_some_and(|stop| *stop == Stop::Node(dom.document()));
-        if attached {
-            path.push(Stop::Window);
+        // A tree that ends at a browsing context's document reaches that
+        // context's window, which is the page's window for the page's tree.
+        let window = path.last().and_then(|stop| match stop {
+            Stop::Node(root) => self.realm_of_document(*root),
+            Stop::Window(_) => None,
+        });
+        if let Some(realm) = window {
+            path.push(Stop::Window(realm));
         }
-        let bubbles_to_window = bubbles || target == dom.document();
+        let bubbles_to_window = bubbles || self.realm_of_document(target).is_some();
         let mut wrappers = Vec::with_capacity(path.len());
         for stop in &path {
             wrappers.push(self.stop_wrapper(dom, *stop)?);
@@ -723,7 +730,7 @@ impl JsRuntime {
                 if stopped(self) {
                     return Ok(());
                 }
-                if !(bubbles || bubbles_to_window && *stop == Stop::Window) {
+                if !(bubbles || bubbles_to_window && matches!(stop, Stop::Window(_))) {
                     continue;
                 }
                 self.invoke_stop(dom, *stop, event, event_type, BUBBLING_PHASE, false)?;

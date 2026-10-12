@@ -45,7 +45,9 @@ impl JsRuntime {
     ) -> Result<JsValue, JsError> {
         let result: Result<JsValue, JsError> = match function {
             NativeFunction::GetElementById => {
-                self.require_document(receiver)?;
+                // A document's own tree: a nested browsing context's document
+                // searches its own elements, not the page's.
+                let root = self.require_document(receiver)?;
                 let id = required_argument(arguments, 0, "getElementById")?
                     .to_js_string()
                     .to_lossy();
@@ -53,7 +55,7 @@ impl JsRuntime {
                 let found = if id.is_empty() {
                     None
                 } else {
-                    self.find_element_by_id(dom, &id)?
+                    self.find_element_by_id_within(dom, root, &id)?
                 };
                 match found {
                     Some(node) => self.wrap_node(dom, node),
@@ -1424,14 +1426,6 @@ impl JsRuntime {
         Ok(JsValue::String((Self::class_list_value(dom, node)?).into()))
     }
 
-    pub(in crate::runtime) fn find_element_by_id(
-        &mut self,
-        dom: &Dom,
-        id: &str,
-    ) -> Result<Option<NodeId>, JsError> {
-        self.find_element_by_id_within(dom, dom.document(), id)
-    }
-
     /// The first element, in tree order, among the descendants of `root` whose
     /// `id` is `id` (DOM §4.2.6.2 `getElementById`). `root` itself is excluded.
     pub(in crate::runtime) fn find_element_by_id_within(
@@ -1595,6 +1589,12 @@ impl JsRuntime {
         dom: &Dom,
         node: NodeId,
     ) -> Result<JsValue, JsError> {
+        // A wrapper belongs to the realm of the document that owns its node, so a
+        // node of a nested document gets that document's prototypes and identity.
+        let owner = self.realm_of_node(dom, node);
+        if owner != self.realm.current_realm() {
+            return self.with_realm(owner, |runtime| runtime.wrap_node(dom, node));
+        }
         if matches!(
             dom.node(node).map(render_dom::Node::kind),
             Some(NodeKind::Document)

@@ -436,6 +436,7 @@ impl JsRuntime {
                 self.require_string_receiver(dom, receiver)?.len() as f64,
             )),
             NativeFunction::StrIterator => self.string_iterator(dom, receiver),
+            NativeFunction::WindowPostMessage => self.window_post_message(receiver, arguments),
             NativeFunction::QueueMicrotask => {
                 let callback = Self::require_callable_object(
                     required_argument(arguments, 0, "queueMicrotask")?,

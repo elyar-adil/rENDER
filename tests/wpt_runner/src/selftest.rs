@@ -23,7 +23,7 @@
 //! engine is unavailable, the boundary is *still* proven, and the run says so
 //! rather than quietly reporting nothing.
 
-use crate::classify::{Blocker, Capability, HarnessShape};
+use crate::classify::{Blocker, Capability};
 use crate::engine::{run_one, Engine, HarnessError, TestContext, Verdict};
 use crate::outcome::{Outcome, SkipReason, Tally};
 
@@ -267,9 +267,13 @@ pub fn run() -> SelfTest {
         );
     }
 
-    // 8. A test blocked by a missing engine capability is never executable.
+    // 8. A test blocked by a missing engine capability is never executable. The
+    //    capability is one the engine still lacks: nested browsing contexts are
+    //    implemented, so a testcss.js test no longer blocks on them.
     {
-        let scan = crate::source::scan("<script>test_parsed_value('color','red','red');</script>");
+        let scan = crate::source::scan(
+            "<script>assert_equals(document.createElement('canvas').getContext('2d') !== null, true);</script>",
+        );
         let inline: Vec<&str> = scan
             .scripts
             .iter()
@@ -277,12 +281,14 @@ pub fn run() -> SelfTest {
             .collect();
         let classification = crate::classify::classify(&scan, &inline, None, None);
         let held = !classification.is_executable()
-            && matches!(classification.blocker, Some(Blocker::MissingEngine(_)))
-            && classification.shapes.contains(&HarnessShape::TestCss);
+            && matches!(
+                classification.blocker,
+                Some(Blocker::MissingEngine(Capability::Canvas))
+            );
         record(
             &mut out,
             "a test needing a missing capability is blocked, never executable",
-            "is_executable=false, blocker=MissingEngine",
+            "is_executable=false, blocker=MissingEngine(canvas)",
             format!("is_executable={}, blocker={:?}", classification.is_executable(), classification.blocker.as_ref().map(Blocker::describe)),
             held,
             "counting a test as runnable when it is known not to run is how a denominator \

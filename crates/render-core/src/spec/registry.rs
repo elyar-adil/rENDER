@@ -719,9 +719,9 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 entry of the same document without a load and fire `popstate` with its \
                 state; an entry of another document is loaded. Not implemented: restoring \
                 `history.state` when a traversal loads a document, and `scrollRestoration`. \
-                `history.length` reflects the list as of each turn's start. Nested browsing \
-                contexts are not, so an `iframe` renders as nothing and `window.open` and \
-                `target=_blank` do nothing.",
+                `history.length` reflects the list as of each turn's start. An `iframe` has \
+                its own document and realm (`contentWindow`, `parent`, `top`, `postMessage`), \
+                but it is not painted, and `window.open` and `target=_blank` do nothing.",
         dependencies: &[URL_PARSER],
         tests: NAVIGATION_TESTS,
     },

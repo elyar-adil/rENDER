@@ -144,6 +144,41 @@ pub struct WptHarnessEngine {
     /// Number of `PASS` results seen, so a run that suddenly passes everything
     /// is visible in the output rather than only in the numerator.
     passed: u32,
+    /// The pinned checkout. Nested browsing contexts load their documents and
+    /// scripts from it, through [`SuiteLoader`].
+    suite_root: std::path::PathBuf,
+}
+
+/// The host that WPT's own test server serves the suite from. The suite is
+/// read from disk instead, so a test's URLs resolve against this host and map
+/// onto the checkout.
+const WPT_HOST: &str = "web-platform.test";
+
+/// The URL a suite test runs at: its path under the suite's own host.
+fn test_url(path: &str) -> url::Url {
+    url::Url::parse(&format!("http://{WPT_HOST}/{path}"))
+        .unwrap_or_else(|_| url::Url::parse("about:blank").expect("constant URL"))
+}
+
+/// Serves the pinned checkout to nested browsing contexts: a URL under the
+/// suite's host names a file under the checkout, and every other URL is
+/// unavailable.
+#[derive(Debug)]
+struct SuiteLoader {
+    root: std::path::PathBuf,
+}
+
+impl render_core::js::DocumentLoader for SuiteLoader {
+    fn load_text(&mut self, url: &url::Url) -> Option<String> {
+        if url.host_str() != Some(WPT_HOST) {
+            return None;
+        }
+        let relative = url.path().trim_start_matches('/');
+        if relative.split('/').any(|part| part == "..") {
+            return None;
+        }
+        std::fs::read_to_string(self.root.join(relative)).ok()
+    }
 }
 
 impl WptHarnessEngine {
@@ -167,6 +202,7 @@ impl WptHarnessEngine {
             harness,
             limits,
             passed: 0,
+            suite_root: suite_root.to_path_buf(),
         })
     }
 
@@ -195,7 +231,7 @@ impl Engine for WptHarnessEngine {
             return Ok(Verdict::Unsupported {
                 capability: Some(capability),
                 reason: format!(
-                    "render-core implements no nested browsing context, so {} cannot be driven",
+                    "the engine lacks {}, so the test cannot be driven",
                     capability.label()
                 ),
             });
@@ -220,7 +256,10 @@ impl WptHarnessEngine {
         // document between tests would let state leak and turn an engine
         // ordering bug into a hundred apparent failures.
         let mut parsed = parse_document(ctx.source);
-        let mut runtime = JsRuntime::with_limits(&parsed.dom, self.limits);
+        let mut runtime = JsRuntime::with_limits_and_url(&parsed.dom, self.limits, &test_url(ctx.path));
+        runtime.set_document_loader(Box::new(SuiteLoader {
+            root: self.suite_root.clone(),
+        }));
 
         // 1. Load WPT's harness, unmodified, from the pinned checkout.
         runtime
@@ -261,6 +300,23 @@ impl WptHarnessEngine {
                         category: Category::HarnessLimitation,
                     });
                 }
+            }
+        }
+
+        // 3b. The page's own `load` event, once its scripts have run (HTML 8.1.7, "the
+        //     end"). testharness.js completes only after this event, so a page that never
+        //     gets it never finishes, and its own timeout then reports TIMEOUT.
+        if let Err(error) = runtime.dispatch_page_load(&mut parsed.dom) {
+            if error.kind() == render_core::js::JsErrorKind::ResourceLimit {
+                return Ok(Execution {
+                    status: HarnessStatus::NotRun,
+                    name: ctx.path.to_owned(),
+                    message: Some(format!("engine step budget exhausted: {error}")),
+                    assertions: 0,
+                    harness_asserts: 0,
+                    mechanism: Some("engine-step-budget".to_owned()),
+                    category: Category::HarnessLimitation,
+                });
             }
         }
 
@@ -717,14 +773,14 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         category: Category::HarnessLimitation,
     };
     let registered = harvest.completion.as_ref().map_or(0, |c| c.tests);
-    let reported = harvest.results.len() as u32;
+    let reported = u32::try_from(harvest.results.len()).unwrap_or(u32::MAX);
     for test in harvest.results {
         let status = HarnessStatus::from_number(test.status);
         // `asserts_run` is cumulative across the whole file, so it is taken from
         // the last result rather than summed - summing would multiply it by the
         // number of subtests.
         worst.harness_asserts = test.asserts;
-        worst.assertions = worst.assertions.saturating_add(test.asserts);
+        worst.assertions = test.asserts;
         if severity(status) > severity(worst.status) {
             worst.status = status;
             worst.name = test.name;

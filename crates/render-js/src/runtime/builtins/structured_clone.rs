@@ -57,7 +57,7 @@ impl JsRuntime {
         self.structured_clone_value(&value, &mut Memo::new())
     }
 
-    fn structured_clone_value(
+    pub(in crate::runtime) fn structured_clone_value(
         &mut self,
         value: &JsValue,
         memo: &mut Memo,
