@@ -503,7 +503,9 @@ fn the_diagnostic_counts_are_reported() {
 // `no_fixture_reports_any_parse_error`, because the tokenizer defect it named was
 // fixed, and it is now a permanent assertion above; and
 // `a_sticky_header_stays_in_the_scrollport`, because the raster now applies the
-// sticky displacement (S6), so the marker joined the gate.
+// sticky displacement (S6), so the marker joined the gate; and
+// `a_multi_column_property_produces_more_than_one_column`, because the flow is
+// distributed into columns (S6).
 // ---------------------------------------------------------------------------
 
 /// `text-decoration` now reaches paint, so the underline the UA sheet asks for
@@ -1029,22 +1031,17 @@ fn a_sticky_box_in_a_nested_scrollport_resolves_against_that_scrollport() {
     );
 }
 
-/// Gap, found by the two-column fixture: a rail can be laid out in a column
-/// that overlaps the main column, or below it, and every other check still
-/// passes.
+/// A page that asks for `columns: 2` is laid out in two columns.
 ///
-/// The previous `ordered_scroll_region` check only ever saw single-column pages,
-/// so nothing in the harness could have noticed. This marker is retained for the
-/// case the fixture *does* pin - see `contract::column_shapes` for the passing
-/// one - and covers the specific half that is not implemented: multi-column
-/// layout. A page that asked for `columns: 2` would be laid out as one column,
-/// and this marker says so.
+/// This was a gap marker for `docs/visual_fidelity_gaps.md` S6 (multi-column
+/// layout), found by the two-column fixture: a page that asked for columns was
+/// laid out as one. It joined the gate when the flow was distributed into its
+/// columns.
 ///
-/// Note that it uses `columns` as the *declaration*, not as the shape: the
-/// fixture's own two columns come from flex, and a flex row is a correct answer
-/// that no gap marker should be asserting against.
+/// It uses `columns` as the *declaration*, not as the shape: the fixture's own
+/// two columns come from flex, and a flex row is a correct answer that this test
+/// does not assert against.
 #[test]
-#[ignore = "docs/visual_fidelity_gaps.md S6: multi-column layout is not implemented"]
 fn a_multi_column_property_produces_more_than_one_column() {
     let document = render_core::document::Document::parse(
         "<!doctype html><style>\

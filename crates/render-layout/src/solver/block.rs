@@ -10,6 +10,7 @@ use crate::solver::FloatArea;
 use crate::solver::LayoutDiagnostic;
 use crate::solver::LayoutDiagnosticCode;
 use crate::solver::Solver;
+use crate::solver::columns::ColumnFlow;
 use crate::solver::inline::InlineTextContextSource;
 use crate::solver::resolve::position;
 use crate::tree::FormattingContextKind;
@@ -626,10 +627,39 @@ impl Solver<'_> {
                 depth.saturating_add(1),
             ),
             _ => {
+                // CSS Multi-column §2: the children are laid out at the width of
+                // one column, and distributed into the columns afterwards.
+                let columns = self.column_geometry(style, content_width, node.source);
+                let flow_width = columns.map_or(content_width, |geometry| geometry.width);
+                // The column set being filled runs from `set_top`, and its children
+                // are `children[set_start..]`. A spanning child starts a new set.
+                let mut set_start = 0;
+                let mut set_top = content_y;
+                let remaining = |top: f32| {
+                    specified_content_height.map(|height| (height - (top - content_y)).max(0.0))
+                };
                 let mut cursor_y = content_y;
                 let mut children = Vec::new();
                 let mut floats = Vec::new();
                 for child in flow_children {
+                    // CSS Multi-column §4: a spanning child closes the column set before
+                    // it, and is laid out at the full width of the container.
+                    let spans = columns.is_some()
+                        && self.float_side(child) == Float::None
+                        && self.spans_all_columns(child);
+                    let child_width = if spans { content_width } else { flow_width };
+                    if let Some(geometry) = columns.filter(|_| spans) {
+                        cursor_y = self.distribute_column_set(
+                            &mut children,
+                            set_start,
+                            ColumnFlow {
+                                top: set_top,
+                                height: (cursor_y - set_top).max(0.0),
+                                constrained_height: remaining(set_top),
+                                geometry,
+                            },
+                        );
+                    }
                     cursor_y = self.cleared_y(child, cursor_y, &floats);
                     let float = self.float_side(child);
                     if float == Float::None {
@@ -646,7 +676,7 @@ impl Solver<'_> {
                                 PhysicalRect::new(
                                     content_x,
                                     content_y,
-                                    content_width,
+                                    child_width,
                                     child_containing_height,
                                 ),
                                 positioned_child_containing,
@@ -656,7 +686,7 @@ impl Solver<'_> {
                             )
                         } else {
                             let band =
-                                float_band(&floats, cursor_y, content_x, content_x + content_width);
+                                float_band(&floats, cursor_y, content_x, content_x + child_width);
                             self.layout_block_like(
                                 child,
                                 PhysicalRect::new(
@@ -681,7 +711,7 @@ impl Solver<'_> {
                         PhysicalRect::new(
                             content_x,
                             content_y,
-                            content_width,
+                            child_width,
                             child_containing_height,
                         ),
                         positioned_child_containing,
@@ -693,8 +723,28 @@ impl Solver<'_> {
                         floats.push(area);
                         children.push(fragment);
                     }
+                    if spans {
+                        // What follows a spanning child starts a new column set.
+                        set_start = children.len();
+                        set_top = cursor_y;
+                    }
                 }
-                let flow_height = (cursor_y - content_y).max(0.0);
+                let flow_height = match columns {
+                    Some(geometry) => {
+                        let end = self.distribute_column_set(
+                            &mut children,
+                            set_start,
+                            ColumnFlow {
+                                top: set_top,
+                                height: (cursor_y - set_top).max(0.0),
+                                constrained_height: remaining(set_top),
+                                geometry,
+                            },
+                        );
+                        (end - content_y).max(0.0)
+                    }
+                    None => (cursor_y - content_y).max(0.0),
+                };
                 // A non-visible overflow establishes a block formatting
                 // context, so floats inside it contribute to its auto height
                 // instead of escaping into the parent flow.
@@ -706,6 +756,9 @@ impl Solver<'_> {
                             ..
                         }))
                     )
+                    // CSS Multi-column §2 makes a multi-column container an
+                    // independent formatting context, as it is for floats.
+                    || columns.is_some()
                     || establishes_block_formatting_context(style);
                 let float_height = floats
                     .iter()
@@ -786,7 +839,8 @@ impl Solver<'_> {
         // border) behind higher positioned content, and a sticky box behind the
         // in-flow siblings it can overlap, while preserving source order within
         // a layer.
-        children.sort_by_key(|child| self.paint_layer(*child));
+        // The key walks each child's subtree, so it is computed once per child.
+        children.sort_by_cached_key(|child| self.paint_layer(*child));
         self.set_children(fragment, children);
         if position == Position::Relative {
             self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);

@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use render_dom::{Dom, NodeId};
 
 use super::properties::{
-    expand_flex_shorthand, expand_gap_shorthand, expand_grid_axis_shorthand, parse_typed_property,
+    expand_columns_shorthand, expand_flex_shorthand, expand_gap_shorthand,
+    expand_grid_axis_shorthand, parse_typed_property,
 };
 use super::selector::{MatchContext, Specificity, matching_specificity};
 use super::stylesheet::{CssWideKeyword, Declaration, LayerName, StyleSheet, css_wide_keyword};
@@ -579,6 +580,7 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
         && name != "flex"
         && name != "flex-flow"
         && name != "overflow"
+        && name != "columns"
     {
         return vec![(name.to_owned(), value.to_owned())];
     }
@@ -591,6 +593,8 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
             vec!["flex-grow", "flex-shrink", "flex-basis"]
         } else if name == "flex-flow" {
             vec!["flex-direction", "flex-wrap"]
+        } else if name == "columns" {
+            vec!["column-width", "column-count"]
         } else {
             vec!["overflow-x", "overflow-y"]
         };
@@ -600,6 +604,15 @@ fn expand_legacy_longhands(name: &str, value: &str) -> Vec<(String, String)> {
             .collect();
     }
     match name {
+        "columns" => expand_columns_shorthand(value).map_or_else(
+            || vec![(name.to_owned(), value.to_owned())],
+            |(width, count)| {
+                vec![
+                    ("column-width".to_owned(), width),
+                    ("column-count".to_owned(), count),
+                ]
+            },
+        ),
         "gap" | "grid-gap" => expand_gap_shorthand(value).map_or_else(
             || vec![(name.to_owned(), value.to_owned())],
             |(row, column)| {

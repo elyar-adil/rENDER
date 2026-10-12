@@ -575,15 +575,17 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         section: "Formatting structure and layout",
         status: SupportStatus::Partial,
         notes: "Block, inline, inline-block, list-item and flex formatting, floats, \
-                absolute and relative positioning, margin collapsing, the intrinsic \
-                and min/max sizing passes and text shaping through a measurer seam are \
-                implemented. Not implemented: multi-column layout, `position: sticky`'s \
-                displacement (layout resolves a constraint against the nearest scroll \
-                container, but no paint consumer applies it, so a sticky box still scrolls \
-                with the page), `direction` and RTL mirroring, and scrolling a nested scroll \
-                container. Each one has a scrollport geometry in the fragment tree, but only \
-                the page viewport owns a scroll offset, so `overflow: auto` on a `div` clips \
-                its content with no way to reach it.",
+                absolute, relative and sticky positioning, multi-column layout with \
+                `column-count`, `column-width`, `column-gap`, `column-fill` and \
+                `column-span: all`, margin collapsing, the intrinsic and min/max sizing \
+                passes and text shaping through a measurer seam are implemented. A sticky \
+                box is displaced when it is painted and hit tested, against the page's \
+                scroll offset; a sticky box inside a nested scroll container uses that \
+                container's offset as zero, because nested containers have no offset yet. \
+                Not implemented: `column-rule`, `direction` and RTL mirroring, and scrolling \
+                a nested scroll container. Each one has a scrollport geometry in the \
+                fragment tree, but only the page viewport owns a scroll offset, so \
+                `overflow: auto` on a `div` clips its content with no way to reach it.",
         dependencies: &[DOM_TREE, CSS_USED_VALUES, CSS_FLEXBOX, CSS_GRID],
         tests: LAYOUT_TESTS,
     },

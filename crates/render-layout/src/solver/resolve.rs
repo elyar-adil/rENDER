@@ -1,6 +1,7 @@
 //! Deterministic reference layout for block and inline formatting contexts.
 
 use super::inline::parse_font_size;
+use crate::fragment::Fragment;
 use crate::fragment::FragmentId;
 use crate::fragment::FragmentKind;
 use crate::geometry::EdgeSizes;
@@ -41,6 +42,20 @@ pub(super) fn length_depends_on_percentage(value: &LengthPercentage) -> bool {
             NumericType::Percentage | NumericType::LengthPercentage
         ),
         LengthPercentage::Zero | LengthPercentage::Length(_) => false,
+    }
+}
+
+/// Moves one fragment's own rectangle, and the content rectangle or baseline it
+/// owns, by `(dx, dy)`. Its children are left to the caller.
+pub(super) fn translate_fragment(fragment: &mut Fragment, dx: f32, dy: f32) {
+    fragment.rect.origin.x += dx;
+    fragment.rect.origin.y += dy;
+    match &mut fragment.kind {
+        FragmentKind::Box(geometry) => {
+            geometry.content_rect.origin.x += dx;
+            geometry.content_rect.origin.y += dy;
+        }
+        FragmentKind::Text(text) => text.baseline += dy,
     }
 }
 
@@ -94,15 +109,15 @@ impl Solver<'_> {
             let Some(fragment) = self.fragment_mut(id) else {
                 continue;
             };
-            fragment.rect.origin.x += dx;
-            fragment.rect.origin.y += dy;
-            if let FragmentKind::Box(geometry) = &mut fragment.kind {
-                geometry.content_rect.origin.x += dx;
-                geometry.content_rect.origin.y += dy;
-            } else if let FragmentKind::Text(text) = &mut fragment.kind {
-                text.baseline += dy;
-            }
+            translate_fragment(fragment, dx, dy);
             stack.extend(fragment.children.iter().copied());
+        }
+    }
+
+    /// Moves one fragment, and not its children, by `(dx, dy)`.
+    pub(super) fn translate_fragment_own(&mut self, id: FragmentId, dx: f32, dy: f32) {
+        if let Some(fragment) = self.fragment_mut(id) {
+            translate_fragment(fragment, dx, dy);
         }
     }
 

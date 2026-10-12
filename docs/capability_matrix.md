@@ -87,7 +87,7 @@ entry with a blank note**, so it cannot decay back into a list of `Partial`s tha
 | --- | --- | --- |
 | inline SVG | shapes, path commands, group transforms, fill/stroke inheritance, `viewBox` scaling, sized from attributes and painted through the ordinary image path | `use`/`symbol`/`defs` indirection, `foreignObject`, aspect-ratio preservation when the box ratio differs from the viewBox |
 | scrollports | `ScrollportGeometry` with mode, clip and scrollable range, structurally distinct from `overflow: hidden` clipping | the shell side: no offset store, no scrollbar chrome, no keyboard scrolling, no scroll anchoring, and a sticky box in a *nested* scrollport cannot be resolved |
-| position | `static`/`relative`/`absolute`/`sticky` with the constraint rectangle, the containing-block clamp, and the rule that an auto inset is not a zero inset | `z-index` is read as raw text and sorts block siblings only; flex and grid children unsorted; the paint layer has no z-index awareness; only `transform`/`opacity` create a stacking context |
+| position | `static`/`relative`/`absolute`/`sticky`: the sticky constraint is resolved against the nearest scroll container and painted and hit tested at the scroll offset; the containing-block clamp; an auto inset is not a zero inset | `z-index` sorts block siblings only (with positioned boxes after in-flow ones of the same layer); flex and grid children unsorted; no stacking-context tree; only `transform`/`opacity` create a stacking context; a nested scroll container's offset is zero |
 | video | container and bitstream parsing, poster handling | **pixel decode** - no frame is ever rasterised |
 | text properties | `text-decoration` (all four longhands, with the spec's omitted-values rule), `text-shadow`, `text-overflow`, `text-indent`, `letter-spacing`, `text-transform` | the font axis landed this session; `font-synthesis` is not in the property registry, so `font-synthesis: none` does nothing yet |
 | quirks mode | the flag is wired into the headless path and the rendering rules are implemented with a per-rule citation | two box-model items remain uncited and unimplemented, and they are solver behaviour |
@@ -113,7 +113,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
 | **HTTP/2** | structurally rejected: a pooled connection leaves the pool while in use and is held for the whole request, so one connection carries one in-flight request. Multiplexing is the inverse |
-| Multi-column layout | no `column-count`/`column-width` |
+| Multi-column layout | `column-count`, `column-width`, `columns`, `column-gap`, `column-fill` and `column-span: all`: the flow is cut at line boundaries, and a block that a break crosses is split with `box-decoration-break: slice` | `column-rule` is not implemented; `column-span` applies to direct block children only |
 | `filter`, `clip-path`, `backdrop-filter`, `mask-image`, `mix-blend-mode` | zero occurrences in the paint layer. Not approximated - absent |
 | `WebSocket`, `requestIdleCallback`, `PerformanceObserver` | absent |
 

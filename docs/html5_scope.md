@@ -384,7 +384,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 ### 4.10 CSS 总体 ⛔ NON-GOAL 汇总
 
 Color 4 / Color 5、Houdini、Container Queries（规则层）、Subgrid、Masonry、
-Scroll-driven Animations、Anchor Positioning、View Transitions、Multi-column。
+Scroll-driven Animations、Anchor Positioning、View Transitions。Multi-column 已实现 `column-count` / `column-width` / `column-gap` / `column-fill` / `column-span: all`（不含 `column-rule`）。
 
 ---
 
@@ -757,7 +757,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | CSS 语法 + 样式表 | `crates/render-css/src/{properties,length,stylesheet}.rs` | 🟡 token/escape 与复杂 at-rule 行为有缺口；`@font-face`/`@keyframes`/`@import` 丢弃；`@supports` 条件丢弃 |
 | 选择器 | `crates/render-css/src/selector.rs` | 🟡 语法面很宽（7 种属性选择器算子 + 31 个伪类，含 `:has()`/`:is()`/`:where()`），但动态伪类状态从不接线 |
 | Cascade / computed | `crates/render-css/src/{cascade,computed}.rs` | 🟡 origin + `@layer` + `revert-layer` 完整；CSS-wide keywords 逐项行为 ❓ 部分未核实 |
-| 布局求解 | `crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs` | 🟡 block/inline/flex/grid/table 五套上下文齐备；**margin collapsing 🔴**、sticky 🔴、RTL 🔴 |
+| 布局求解 | `crates/render-layout/src/solver/{block,inline,flex,grid,table,resolve}.rs` | 🟡 block/inline/flex/grid/table 五套上下文齐备；**margin collapsing 🔴**、sticky 🟡（绘制与命中测试已位移；嵌套滚动偏移未实现）、multi-column 🟡（不含 `column-rule`）、RTL 🔴 |
 | 格式化结构 | `crates/render-layout/src/{tree,fragment,geometry}.rs` | 🟡 匿名块与 `display:contents` ✅；**伪元素盒 🔴** |
 | JS 引擎 | `crates/render-js/src/{lexer,parser,value,regex}.rs` + `runtime/` | 🟡 test262 31.41%；generator/async 🔴、BigInt 字面量 🔴、模块依赖图 🔴 |
 | 事件循环 | `crates/render-core/src/event_loop.rs` | ✅ task/microtask/rendering opportunity 三段式齐备 |

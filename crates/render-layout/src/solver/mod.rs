@@ -27,12 +27,15 @@ use render_dom::NodeKind;
 use std::collections::BTreeMap;
 
 mod block;
+mod columns;
 mod flex;
 mod grid;
 mod inline;
 pub(crate) mod resolve;
 mod table;
 
+#[cfg(test)]
+mod columns_tests;
 #[cfg(test)]
 mod linebreak_tests;
 #[cfg(test)]

@@ -1002,6 +1002,14 @@ keyword_enum!(BorderCollapse {
     Separate => "separate",
     Collapse => "collapse",
 });
+keyword_enum!(ColumnFill {
+    Balance => "balance",
+    Auto => "auto",
+});
+keyword_enum!(ColumnSpan {
+    None => "none",
+    All => "all",
+});
 keyword_enum!(TableLayout {
     Auto => "auto",
     Fixed => "fixed",
@@ -1104,6 +1112,21 @@ pub enum FlexBasis {
 pub enum Gap {
     Normal,
     LengthPercentage(LengthPercentage),
+}
+
+/// `column-count` (CSS Multi-column Layout §3.1): `auto`, or a positive integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnCount {
+    Auto,
+    Count(u32),
+}
+
+/// `column-width` (CSS Multi-column Layout §3.2): `auto`, or a non-negative
+/// length. Percentages are not valid here, so only a length or zero is stored.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ColumnWidth {
+    Auto,
+    Length(LengthPercentage),
 }
 
 /// A supported explicit grid track list. Integer `repeat()` values are
@@ -1309,6 +1332,10 @@ pub enum TypedPropertyValue {
     LineBreak(LineBreak),
     Order(i32),
     Gap(Gap),
+    ColumnCount(ColumnCount),
+    ColumnWidth(ColumnWidth),
+    ColumnFill(ColumnFill),
+    ColumnSpan(ColumnSpan),
     GridTemplate(GridTemplate),
     GridLine(GridLine),
     AspectRatio(AspectRatio),
@@ -1364,6 +1391,10 @@ impl TypedPropertyValue {
             Self::LineBreak(_) => "line-break",
             Self::Order(_) => "order",
             Self::Gap(_) => "gap",
+            Self::ColumnCount(_) => "column-count",
+            Self::ColumnWidth(_) => "column-width",
+            Self::ColumnFill(_) => "column-fill",
+            Self::ColumnSpan(_) => "column-span",
             Self::GridTemplate(_) => "grid-template",
             Self::GridLine(_) => "grid-line",
             Self::AspectRatio(_) => "aspect-ratio",
@@ -1418,6 +1449,10 @@ impl TypedPropertyValue {
             Self::LineBreak(value) => value.as_str().to_owned(),
             Self::Order(value) => value.to_string(),
             Self::Gap(value) => value.to_css(),
+            Self::ColumnCount(value) => value.to_css(),
+            Self::ColumnWidth(value) => value.to_css(),
+            Self::ColumnFill(value) => value.as_str().to_owned(),
+            Self::ColumnSpan(value) => value.as_str().to_owned(),
             Self::GridTemplate(value) => value.to_css(),
             Self::GridLine(value) => value.to_css(),
             Self::AspectRatio(value) => value.to_css(),
@@ -1589,6 +1624,24 @@ impl Gap {
     }
 }
 
+impl ColumnCount {
+    fn to_css(self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Count(count) => count.to_string(),
+        }
+    }
+}
+
+impl ColumnWidth {
+    fn to_css(&self) -> String {
+        match self {
+            Self::Auto => "auto".to_owned(),
+            Self::Length(value) => value.to_css(),
+        }
+    }
+}
+
 impl GridTemplate {
     fn to_css(&self) -> String {
         match self {
@@ -1724,6 +1777,10 @@ pub const DECLARED_GRAMMARS: &[&str] = &[
     "order",
     "row-gap",
     "column-gap",
+    "column-count",
+    "column-width",
+    "column-fill",
+    "column-span",
     "grid-template-columns",
     "grid-template-rows",
     "grid-column-start",
@@ -1817,6 +1874,14 @@ fn parse_property<'i>(
         "line-break" => parse_keyword(input, LineBreak::parse).map(TypedPropertyValue::LineBreak),
         "order" => parse_integer(input).map(TypedPropertyValue::Order),
         "row-gap" | "column-gap" => parse_gap(input).map(TypedPropertyValue::Gap),
+        "column-count" => parse_column_count(input).map(TypedPropertyValue::ColumnCount),
+        "column-width" => parse_column_width(input).map(TypedPropertyValue::ColumnWidth),
+        "column-fill" => {
+            parse_keyword(input, ColumnFill::parse).map(TypedPropertyValue::ColumnFill)
+        }
+        "column-span" => {
+            parse_keyword(input, ColumnSpan::parse).map(TypedPropertyValue::ColumnSpan)
+        }
         "grid-template-columns" | "grid-template-rows" => {
             parse_grid_template(input).map(TypedPropertyValue::GridTemplate)
         }
@@ -3048,6 +3113,41 @@ fn parse_flex_basis<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, FlexBasis> 
     }
 }
 
+/// `column-count` (CSS Multi-column Layout §3.1): `auto`, or a positive integer.
+fn parse_column_count<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, ColumnCount> {
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("auto"))
+        .is_ok()
+    {
+        return Ok(ColumnCount::Auto);
+    }
+    let location = input.current_source_location();
+    let count = parse_integer(input)?;
+    u32::try_from(count)
+        .ok()
+        .filter(|count| *count >= 1)
+        .map(ColumnCount::Count)
+        .ok_or_else(|| location.new_custom_error(()))
+}
+
+/// `column-width` (CSS Multi-column Layout §3.2): `auto`, or a non-negative
+/// length. A percentage is not a valid column width.
+fn parse_column_width<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, ColumnWidth> {
+    if input
+        .try_parse(|candidate| candidate.expect_ident_matching("auto"))
+        .is_ok()
+    {
+        return Ok(ColumnWidth::Auto);
+    }
+    let location = input.current_source_location();
+    match parse_length_percentage(input, true)? {
+        value @ (LengthPercentage::Length(_) | LengthPercentage::Zero) => {
+            Ok(ColumnWidth::Length(value))
+        }
+        _ => Err(location.new_custom_error(())),
+    }
+}
+
 fn parse_gap<'i>(input: &mut Parser<'i, '_>) -> CssResult<'i, Gap> {
     if input
         .try_parse(|candidate| candidate.expect_ident_matching("normal"))
@@ -3313,6 +3413,34 @@ pub(crate) fn expand_gap_shorthand(css: &str) -> Option<(String, String)> {
             Ok((row.to_css(), column.to_css()))
         })
         .ok()
+}
+
+/// `columns` (CSS Multi-column Layout §3): `<'column-width'> || <'column-count'>`,
+/// where an omitted longhand is `auto`. Each token is classified by the grammar
+/// it parses under, and a token that fits neither, or a repeated kind, is invalid.
+/// Returns the `(column-width, column-count)` longhand values.
+pub(crate) fn expand_columns_shorthand(css: &str) -> Option<(String, String)> {
+    let mut width = None;
+    let mut count = None;
+    for token in css.split_ascii_whitespace() {
+        if token.eq_ignore_ascii_case("auto") {
+            continue;
+        }
+        let is_count = matches!(parse_typed_property("column-count", token), Some(Ok(_)));
+        let is_width = matches!(parse_typed_property("column-width", token), Some(Ok(_)));
+        let slot = match (is_count, is_width) {
+            (true, _) => &mut count,
+            (false, true) => &mut width,
+            (false, false) => return None,
+        };
+        if slot.replace(token).is_some() {
+            return None;
+        }
+    }
+    Some((
+        width.unwrap_or("auto").to_owned(),
+        count.unwrap_or("auto").to_owned(),
+    ))
 }
 
 pub(crate) fn expand_flex_shorthand(css: &str) -> Option<(String, String, String)> {
@@ -3967,6 +4095,24 @@ mod tests {
         assert_eq!(parse("align-items", "stretch").to_css(), "stretch");
         assert_eq!(parse("order", "-3").to_css(), "-3");
         assert_eq!(parse("column-gap", "1rem").to_css(), "1rem");
+        assert_eq!(parse("column-count", "auto").to_css(), "auto");
+        assert_eq!(parse("column-count", "3").to_css(), "3");
+        assert!(parse_typed_property("column-count", "0").unwrap().is_err());
+        assert!(
+            parse_typed_property("column-count", "2.5")
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(parse("column-width", "200px").to_css(), "200px");
+        assert_eq!(parse("column-width", "0").to_css(), "0px");
+        // CSS Multi-column §3.2: a percentage is not a column width.
+        assert!(
+            parse_typed_property("column-width", "50%")
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(parse("column-fill", "auto").to_css(), "auto");
+        assert_eq!(parse("column-fill", "balance").to_css(), "balance");
         assert!(parse_typed_property("flex-grow", "-1").unwrap().is_err());
         assert!(parse_typed_property("order", "1.5").unwrap().is_err());
         assert_eq!(
@@ -3981,6 +4127,31 @@ mod tests {
             super::expand_flex_shorthand("1"),
             Some(("1".to_owned(), "1".to_owned(), "0%".to_owned()))
         );
+    }
+
+    #[test]
+    fn columns_shorthand_expands_into_column_width_and_column_count() {
+        // CSS Multi-column §3: each longhand that is omitted is `auto`, and each
+        // token is classified by the grammar it parses under.
+        let expand = super::expand_columns_shorthand;
+        assert_eq!(expand("2"), Some(("auto".to_owned(), "2".to_owned())));
+        assert_eq!(
+            expand("200px"),
+            Some(("200px".to_owned(), "auto".to_owned()))
+        );
+        assert_eq!(
+            expand("200px 3"),
+            Some(("200px".to_owned(), "3".to_owned()))
+        );
+        assert_eq!(
+            expand("3 200px"),
+            Some(("200px".to_owned(), "3".to_owned()))
+        );
+        assert_eq!(expand("auto"), Some(("auto".to_owned(), "auto".to_owned())));
+        // A repeated kind, or a token that is neither, makes the shorthand invalid.
+        assert_eq!(expand("2 3"), None);
+        assert_eq!(expand("50% 2"), None);
+        assert_eq!(expand("2 foo"), None);
     }
 
     #[test]

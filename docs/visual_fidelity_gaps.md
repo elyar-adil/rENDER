@@ -566,7 +566,7 @@ declarations inside surviving rules. A gap report that counts the wrong unit wil
 zero problems while hundreds of declarations are being discarded. It now diffs
 declaration-level acceptance too.
 
-## S6 - Sticky positioning: paint and hit testing consume the constraint; z-order and multi-column are open
+## S6 - Sticky positioning is painted and hit tested; multi-column is partly implemented; z-order is open
 
 Was: `render-css/src/properties.rs:758` parsed the `sticky` keyword, and layout recorded a constraint
 that nothing read, so a pinned header scrolled away with the content. The earlier closure rested on
@@ -595,6 +595,20 @@ the paint consumer and tested it through pixels and hit tests.
   box against in-flow content. A sticky box is positioned, so it paints after the in-flow siblings it
   can overlap. Painting and hit testing both walk the children in that order. Without it a section's
   background painted after the header would cover the header.
+- **Multi-column (CSS Multi-column Layout 1), implemented this round.** `column-count`, `column-width`
+  and the `columns` shorthand, `column-gap` (`normal` is one em of the container's font), `column-fill`
+  (`balance` by default; `auto` fills a constrained height and overflows into further columns to the
+  right), and `column-span: all` on a direct block child. The container's in-flow children are laid
+  out at one column's width, and `solver/columns.rs` distributes that flow. A line is never cut: a line
+  that would cross a column's end moves to the top of the next column. A block that a break crosses is
+  split into one fragment per column, and each piece keeps the top edges only where its flow starts and
+  the bottom edges only where it ends (`box-decoration-break: slice`). The balanced height is the least
+  height that fits the content in the column count. A spanning child closes the column set before it,
+  and it is laid out at the container's full width. The gate test
+  `a_multi_column_property_produces_more_than_one_column` is no longer ignored. Eight layout tests in
+  `solver/columns_tests.rs` assert the exact placement: balance, a line moved whole, a split block with
+  its edges sliced, count and width resolution, `column-gap: normal`, overflow columns, and a spanning
+  child.
 - **Evidence.** The gate test `a_sticky_header_stays_in_the_scrollport` is no longer ignored and
   passes. `a_sticky_box_in_a_nested_scrollport_resolves_against_that_scrollport` checks that the
   constraint names its container. Eight render-core unit tests in `paint/sticky.rs` assert pixels and
@@ -607,6 +621,9 @@ the paint consumer and tested it through pixels and hit tests.
 
 ### Decisions
 
+- Columns are distributed after layout, not during it. The children are wrapped once, at the column
+  width, and the cut only moves whole pieces, so no text is re-wrapped and the inline layout is
+  unchanged. The cost is that a column cannot be measured against its own height while it is laid out.
 - The sticky scope wraps the stacking context, not the other way round. A transformed layer anchors
   on the offset in effect when it opens, so a sticky displacement applied inside it would pivot the
   transform around the layout position.
@@ -639,7 +656,11 @@ the paint consumer and tested it through pixels and hit tests.
   extends the page's scrollable width: `scrollable_content_size` measures 1320 against a 1280 viewport
   when a 1300px strip sits inside a 1240px scroller. A real navbar that is its own scroller therefore
   produces a spurious horizontal page scrollbar. This round did not change it.
-- **Multi-column** is the other open item on this row, recorded in its own entry.
+- **Multi-column, what is not done.** `column-rule` is neither parsed nor painted. `column-span` applies
+  only to a direct block child, not to a float or to a spanning element nested deeper. An absolutely
+  positioned descendant of a column box keeps the position layout gave it, so it does not follow the
+  box when the box moves to another column. `break-inside`, `orphans` and `widows` are not
+  implemented: a line is the only unit that is never cut, and a block is always splittable.
 
 ### Two general defects found in the helpers, both fixed at the source
 
@@ -1227,7 +1248,7 @@ Measured over the combined corpus, with every "cannot" a zero cross-checked by t
 
 - **can exercise:** S1, S4, S4b, S6 stacking, S8, S10, S13 scroll containers, S14, S16 (mechanism
   only), S19, S22, S26
-- **partial:** S5, S6 multi-column, S24
+- **partial:** S5, S24 (the S6 multi-column measurement predates its implementation; see S6)
 - **cannot:** S7 quirks mode (no doctype-less page), S11 nested browsing contexts (no captured
   iframe `src`), S13 Selection/Range (no interaction recording), S18 device pixel ratio, and S24's
   actual case
