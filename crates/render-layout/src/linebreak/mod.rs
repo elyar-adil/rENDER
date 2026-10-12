@@ -871,7 +871,14 @@ fn decide(context: &Context, at: usize) -> Break {
     {
         return Break::Prohibited;
     }
-    if matches!(before, LineBreakClass::Hy | LineBreakClass::Is)
+    // LB25 holds a hyphen to a following number (`HY × NU`) and an infix
+    // separator to what follows it (`IS × NU`, and LB29's `IS × (AL | HL)`).
+    // A hyphen before a letter is not in any of these rules, so `margin-left`
+    // may break after its hyphen and wrap as `margin-` and `left`. The infix
+    // arm applies to every following class here, which is wider than LB29's
+    // letters-only pair; that over-restriction is unchanged by this round.
+    if matches!(before, LineBreakClass::Is)
+        || before == LineBreakClass::Hy && after == LineBreakClass::Nu
         || after == LineBreakClass::Nu && context.preceded_by_number(at)
     {
         return Break::Prohibited;

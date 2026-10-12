@@ -7,6 +7,7 @@ use crate::fragment::FragmentId;
 use crate::fragment::FragmentKind;
 use crate::fragment::FragmentTree;
 use crate::geometry::EdgeSizes;
+use crate::geometry::PhysicalPoint;
 use crate::geometry::PhysicalRect;
 use crate::geometry::PhysicalSize;
 use crate::linebreak::LineBreakOptions;
@@ -17,8 +18,11 @@ use crate::tree::FormattingNodeKind;
 use crate::tree::FormattingTree;
 use render_css::computed::ComputedStyle;
 use render_css::properties::Float;
+use render_css::properties::Overflow;
 use render_dom::Dom;
+use render_dom::Node;
 use render_dom::NodeId;
+use render_dom::NodeKind;
 use std::collections::BTreeMap;
 
 mod block;
@@ -679,17 +683,95 @@ impl Solver<'_> {
                 continue;
             };
             let insets = self.sticky_insets(fragment.formatting_node, block.size.width);
+            let (scrollport_origin, scrollport) = self.sticky_scrollport(id, &parents);
             constraints.insert(
                 id,
                 StickyConstraint {
                     margin_rect,
                     containing_block: block,
                     insets,
-                    scrollport: self.options.viewport,
+                    scrollport,
+                    scrollport_origin,
                 },
             );
         }
         constraints
+    }
+
+    /// CSS Positioned Layout 4 §4.1: a sticky box is constrained by its nearest
+    /// scrollport, which is the padding box of its nearest ancestor scroll
+    /// container, and by the viewport only when it has no such ancestor. Returns
+    /// that box's document-space origin at scroll offset zero, and its size.
+    ///
+    /// The walk starts at the box's parent, so a sticky box that is itself a
+    /// scroll container is not its own scrollport.
+    fn sticky_scrollport(&self, id: FragmentId, parents: &[u32]) -> (PhysicalPoint, PhysicalSize) {
+        let mut current = id.as_u32();
+        while let Some(&parent) = parents.get(current as usize) {
+            if parent == u32::MAX {
+                break;
+            }
+            let Some(fragment) = self.fragments.get(parent as usize) else {
+                break;
+            };
+            if let FragmentKind::Box(geometry) = &fragment.kind
+                && self.is_scroll_container(fragment)
+            {
+                let padding = geometry.padding_rect();
+                return (padding.origin, padding.size);
+            }
+            current = parent;
+        }
+        (PhysicalPoint::default(), self.options.viewport)
+    }
+
+    /// CSS Overflow 3: a scroll container is a box whose `overflow` is other
+    /// than `visible` or `clip` on at least one axis. That includes `hidden`,
+    /// which `scrollport_geometries` models as a clip because it has no user
+    /// scroll range; a sticky box is still constrained by it.
+    fn is_scroll_container(&self, fragment: &Fragment) -> bool {
+        let Some(source) = fragment.source else {
+            return false;
+        };
+        if self.overflow_is_propagated(source) {
+            return false;
+        }
+        let (x, y) = block::overflow_axes(self.styles.get(&source));
+        [x, y]
+            .into_iter()
+            .any(|value| !matches!(value, Overflow::Visible | Overflow::Clip))
+    }
+
+    /// CSS Overflow 3 propagates the root element's `overflow` to the viewport,
+    /// and the `body`'s when the root's is `visible`. A box whose `overflow` was
+    /// propagated is not a scroll container of its own, because the viewport is
+    /// the scrollport those values produce. Without this a page with
+    /// `body { overflow-x: hidden }` would constrain every sticky box to the
+    /// body's own padding box.
+    fn overflow_is_propagated(&self, source: NodeId) -> bool {
+        let Some(parent) = self.dom.parent(source) else {
+            return false;
+        };
+        if matches!(
+            self.dom.node(parent).map(Node::kind),
+            Some(NodeKind::Document)
+        ) {
+            return true;
+        }
+        let is_body = matches!(
+            self.dom.node(source).map(Node::kind),
+            Some(NodeKind::Element(element)) if element.local_name == "body"
+        );
+        let parent_is_root = self
+            .dom
+            .parent(parent)
+            .and_then(|grandparent| self.dom.node(grandparent))
+            .is_some_and(|node| matches!(node.kind(), NodeKind::Document));
+        if !(is_body && parent_is_root) {
+            return false;
+        }
+        let (x, y) = block::overflow_axes(self.styles.get(&parent));
+        matches!(x, Overflow::Visible) && matches!(y, Overflow::Visible)
     }
 
     /// The content box of the nearest block container ancestor of `id`.

@@ -214,6 +214,32 @@ fn lb25_never_breaks_a_number() {
 }
 
 #[test]
+fn lb25_holds_a_hyphen_to_a_number_but_not_to_a_word() {
+    // LB25's `HY × NU` is the only hyphen pair the rules hold together. A hyphen
+    // before a letter has no rule of its own, so LB31 allows the break after it:
+    // `margin-left` wraps as `margin-` and `left`, and its min-content width is
+    // the seven-character `margin-`, not the whole eleven-character word.
+    assert!(!breaks_before("a-5", 2, plain()), "HY × NU");
+    assert!(
+        !breaks_before("margin-left", 6, plain()),
+        "no break before the hyphen (LB21)"
+    );
+    assert!(
+        breaks_before("margin-left", 7, plain()),
+        "a break after the hyphen, before a letter"
+    );
+    assert_eq!(
+        widest_unbreakable_run(
+            &characters("margin-left"),
+            plain(),
+            |run| run.chars().count() as f32
+        ),
+        7.0,
+        "the widest run is `margin-`"
+    );
+}
+
+#[test]
 fn lb26_never_breaks_a_hangul_syllable_block() {
     // Conjoining jamo: L, V and T form one syllable block, so no break falls
     // inside `L V T L`.

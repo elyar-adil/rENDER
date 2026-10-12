@@ -1037,6 +1037,54 @@ fn a_cell_min_width_can_exceed_the_tables_max_content_width() {
 }
 
 #[test]
+fn a_fixed_column_grows_to_the_min_content_width_of_its_cells() {
+    // CSS 2.1 §17.5.2.2: a column's minimum is the larger of its specified width
+    // and what its cells' content needs, and the content "may not overflow the
+    // cell box". A 20px cell holding one unbreakable word is therefore as wide
+    // as the word, and the table grows around it.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t'>\
+           <tr><td id='a' style='width:20px'>position</td><td id='b'>x</td></tr>\
+         </table></body>",
+        &format!("{TABLE_CSS} table {{ width: 200px }}"),
+        900.0,
+    );
+    let dom = &output.dom;
+    let a = rect(&layout, find(dom, "#a"));
+    let word = text_rect(&layout, "position");
+    assert!(a.size.width > 20.0 + 0.01, "{a:?} kept its specified width");
+    assert!(
+        word.right() <= a.right() + 0.01,
+        "the word runs to {} past the cell's edge at {}",
+        word.right(),
+        a.right()
+    );
+}
+
+#[test]
+fn a_fixed_column_wraps_a_hyphenated_word_inside_the_cell() {
+    // The hyphen is a break opportunity before a letter (LB25 holds only `HY ×
+    // NU`), so `margin-left` wraps after `margin-` and the 68px column stays 68px
+    // wide instead of growing to fit the whole word.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><table id='t'>\
+           <tr><td id='a' style='width:68px'>margin-left</td><td id='b'>x</td></tr>\
+         </table></body>",
+        &format!("{TABLE_CSS} table {{ width: 200px }}"),
+        900.0,
+    );
+    let dom = &output.dom;
+    let a = rect(&layout, find(dom, "#a"));
+    let first = text_rect(&layout, "margin-");
+    assert!(near(a.size.width, 68.0), "{a:?}");
+    assert!(first.right() <= a.right() + 0.01, "{first:?} in {a:?}");
+    assert!(
+        first.origin.y < text_rect(&layout, "left").origin.y,
+        "left is not on a second line"
+    );
+}
+
+#[test]
 fn border_spacing_separates_every_column_and_the_table_edges() {
     // §17.6.1: one horizontal spacing precedes every column and the table.
     let (output, _, layout) = pipeline(

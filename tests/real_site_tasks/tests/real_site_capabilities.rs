@@ -873,22 +873,21 @@ fn a_sticky_header_stays_in_the_scrollport() {
     );
 }
 
-/// Gap, found by the sticky-toolbar fixture: a sticky box inside a **nested**
-/// scrollport resolves against the wrong scrollport.
+/// A sticky box inside a **nested** scrollport resolves against that scrollport.
 ///
-/// The layout code uses `options.viewport` for *every* sticky box
-/// (`crates/render-layout/src/solver/mod.rs`), so a sticky element inside a
-/// scrollport gets the page's scrollport rather than the one it is in. The
-/// recorded constraint therefore says the box may be displaced across the whole
-/// page, when the specification says it is constrained to the scrollport it is
-/// in. The layout code records this as a known dependency rather than papering
-/// over it; this marker is the observable side of that.
+/// This was a gap: every sticky box was constrained by the page viewport, so a
+/// sticky element inside a scroll container was displaced across the whole page.
+/// Layout now records, for each sticky box, the padding box of its nearest
+/// ancestor scroll container (`crates/render-layout/src/solver/mod.rs`, the
+/// `sticky_scrollport` walk), and the viewport only when there is none. The
+/// constraint carries that scrollport's origin as well as its size, so the
+/// displacement is applied against the scrollport the box is actually in.
 ///
 /// Asserted against the fixture, because the fixture is the only thing that
 /// contains the shape: a real navbar that is its own horizontal scroller, with
-/// its first chip sticky against it.
+/// its first chip sticky against it. The paint-side consumer that applies the
+/// displacement is still missing; see `docs/visual_fidelity_gaps.md` S6.
 #[test]
-#[ignore = "docs/visual_fidelity_gaps.md S6: a sticky box in a nested scrollport uses the page scrollport"]
 fn a_sticky_box_in_a_nested_scrollport_resolves_against_that_scrollport() {
     use render_core::layout::PhysicalSize;
 

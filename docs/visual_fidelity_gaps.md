@@ -620,9 +620,14 @@ all of it is unreachable.
   `max_scroll_offset` is non-zero, then bubbles outwards to the page.
 - Not in `render-layout`, and not to be faked there: the offset store, scrollbar chrome, keyboard
   scrolling, scroll anchoring.
-- **A sticky box inside a *nested* scrollport cannot be resolved** by `sticky_offset` as written,
-  because the nearest scrollport's offset is unknown at layout time. That is a recorded dependency,
-  not a papering-over.
+- **A sticky box inside a *nested* scrollport is constrained by that scrollport.** Layout records
+  the padding box of the box's nearest ancestor scroll container on the constraint (`scrollport`,
+  its size, and `scrollport_origin`, its document-space origin); the viewport only when there is
+  none. `sticky_offset` takes the offset of that same container, which the consumer looks up in the
+  offset store. Using the page's offset for such a box is the defect the consumer must not make.
+  `overflow: hidden` counts as a scroll container here, as CSS Overflow 3 defines it, while the
+  scrollport geometry below still models it as a clip with no user scroll range. The root element's
+  `overflow`, and the body's when the root's is `visible`, are the viewport's and do not count.
 
 ### The two general defects found while building it, both fixed at the helper
 
@@ -696,9 +701,10 @@ possible to do by accident.
 
 `z-index` (read as raw text at `render-layout/src/solver/mod.rs:399`; flex and grid children are
 not sorted and the paint layer has no z-index awareness), multi-column layout, and the shell-side
-half of scrolling: the offset store, scrollbar chrome, keyboard scrolling, scroll anchoring. A
-sticky box inside a *nested* scrollport also cannot yet be resolved, because the nearest
-scrollport's offset is unknown at layout time - recorded as a dependency, not papered over.
+half of scrolling: the offset store, scrollbar chrome, keyboard scrolling, scroll anchoring, and the
+paint-side consumer of `sticky_offset`. The nested-scrollport constraint is no longer open: layout
+now resolves a sticky box against its nearest scroll container, and the consumer supplies that
+container's offset (see the paint-side contract above).
 
 ### Two general defects found in the helpers, both fixed at the source
 
