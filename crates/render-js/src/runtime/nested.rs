@@ -415,6 +415,10 @@ impl JsRuntime {
     /// embedding calls this once, after the page's own scripts have run; a `load`
     /// listener that is not run here is never run. `testharness.js` completes only
     /// after this event, so a page that never gets it never finishes.
+    ///
+    /// # Errors
+    ///
+    /// When the event dispatch fails, for example when a resource limit is reached.
     pub fn dispatch_page_load(&mut self, dom: &mut Dom) -> Result<(), JsError> {
         self.dispatch_window_load(dom, RealmId::default())
     }
