@@ -350,7 +350,7 @@ fn non_configurable_redefinition_allowed(
 /// ECMA-262 §6.1.7 `CanonicalNumericIndexString`: a property key is a
 /// canonical numeric index string when it is the shortest decimal form of a
 /// non-negative integer below 2^32-1.
-fn is_canonical_index(key: &str) -> bool {
+pub(crate) fn is_canonical_index(key: &str) -> bool {
     key.parse::<u32>()
         .ok()
         .is_some_and(|index| index.to_string() == key)
@@ -827,6 +827,35 @@ pub(crate) enum NativeFunction {
     ClassListContains,
     ClassListItem,
     ClassListToString,
+    ClassListReplace,
+    /// `NodeList.prototype` and `HTMLCollection.prototype` members (`WebIDL` §3.9).
+    CollectionItem,
+    CollectionNamedItem,
+    CollectionLength,
+    /// `CharacterData` methods (DOM §4.10).
+    CharacterDataSubstringData,
+    CharacterDataAppendData,
+    CharacterDataInsertData,
+    CharacterDataDeleteData,
+    CharacterDataReplaceData,
+    /// `DOMImplementation` methods (DOM §4.5).
+    ImplementationCreateDocumentType,
+    ImplementationHasFeature,
+    /// The namespace-aware attribute and element methods (DOM §4.9.1, §4.9.2).
+    CreateElementNs,
+    SetAttributeNs,
+    GetAttributeNs,
+    HasAttributeNs,
+    RemoveAttributeNs,
+    GetElementsByTagNameNs,
+    /// `Document.createCDATASection`, `createProcessingInstruction`, `importNode`
+    /// (DOM §4.5) and `Node.isSameNode` (DOM §4.4).
+    CreateCdataSection,
+    CreateProcessingInstruction,
+    ImportNode,
+    IsSameNode,
+    /// `DocumentFragment` gets the non-element parent query (DOM §4.2.6).
+    NonElementGetElementById,
     LocationToString,
     LocationAssign,
     LocationReplace,
@@ -2116,6 +2145,27 @@ fn namespace_export_descriptor(export: &NamespaceExport) -> PropertyDescriptor {
     }
 }
 
+/// Which nodes a live collection holds, by the DOM operation that made it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionFilter {
+    /// Every child node, as `Node.childNodes` (DOM §4.4).
+    ChildNodes,
+    /// Every child element, as `ParentNode.children` (DOM §4.2.6).
+    ChildElements,
+    /// Descendant elements whose qualified name matches; `*` matches all, as
+    /// `getElementsByTagName` (DOM §4.2.6.2, §4.2.6.1).
+    TagName(String),
+    /// Descendant elements matching a namespace and local name, where `None`
+    /// is the `*` wildcard, as `getElementsByTagNameNS` (DOM §4.2.6.2).
+    TagNameNs {
+        namespace: Option<String>,
+        local: Option<String>,
+    },
+    /// Descendant elements carrying every listed class token, as
+    /// `getElementsByClassName` (DOM §4.2.6.2).
+    ClassNames(Vec<String>),
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) enum ObjectHost {
     #[default]
@@ -2160,6 +2210,17 @@ pub(crate) enum ObjectHost {
     BooleanPrimitive(bool),
     DateInstance(f64),
     NamedNodeMap(NodeId),
+    /// A live `NodeList` or `HTMLCollection`: its members are read from the
+    /// tree of `root` on access (DOM §4.2.10), never copied at creation.
+    LiveCollection {
+        root: NodeId,
+        filter: CollectionFilter,
+        /// The members computed at DOM revision `.0`, reused while the tree
+        /// stays at that revision, so indexed loops do not rewalk the tree.
+        memo: Option<(u64, Vec<NodeId>)>,
+    },
+    /// A static `NodeList` (DOM §4.2.6.1), such as `querySelectorAll`'s result.
+    StaticNodeList(Vec<NodeId>),
     Attr {
         owner: NodeId,
         name: String,
@@ -2817,6 +2878,10 @@ pub struct RealmRecord {
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
     dataset_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `childNodes` `NodeList` of each node: one object per node (DOM §4.4).
+    child_node_list_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `children` `HTMLCollection` of each node: one object per node (DOM §4.2.6).
+    child_collection_wrappers: BTreeMap<NodeId, ObjectId>,
 }
 
 /// The objects that the browser host's globals contribute to a realm's record.
@@ -3230,6 +3295,8 @@ impl Realm {
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
             dataset_wrappers: BTreeMap::new(),
+            child_node_list_wrappers: BTreeMap::new(),
+            child_collection_wrappers: BTreeMap::new(),
             temporal_prototypes: BTreeMap::new(),
         }
     }
@@ -3306,6 +3373,25 @@ impl Realm {
             PropertyDescriptor::builtin(JsValue::Object(document_constructor)),
         );
         objects[document.0].prototype = Some(document_prototype);
+        // `document.implementation` (DOM §4.5): one DOMImplementation for the
+        // document. The specification makes it a readonly accessor; a
+        // non-writable data property reads the same and keeps identity.
+        let implementation = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: dom_prototypes.get("DOMImplementation").copied(),
+            ..JsObject::default()
+        });
+        objects[document_prototype.0].properties.insert(
+            "implementation".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(implementation),
+                writable: false,
+                enumerable: true,
+                configurable: true,
+            },
+        );
         for name in ["Document", "HTMLDocument"] {
             objects[global.0].properties.insert(
                 name.to_owned(),
@@ -3940,37 +4026,36 @@ impl Realm {
             prototype: Some(event_target),
             ..JsObject::default()
         });
-        for (name, function) in [
-            ("setAttribute", NativeFunction::SetAttribute),
-            ("getAttribute", NativeFunction::GetAttribute),
-            ("hasAttribute", NativeFunction::HasAttribute),
-            ("removeAttribute", NativeFunction::RemoveAttribute),
-            ("appendChild", NativeFunction::AppendChild),
-            ("removeChild", NativeFunction::RemoveChild),
-            ("insertBefore", NativeFunction::InsertBefore),
-            ("contains", NativeFunction::Contains),
-            ("matches", NativeFunction::Matches),
-            ("querySelector", NativeFunction::QuerySelector),
-            ("querySelectorAll", NativeFunction::QuerySelectorAll),
-            ("addEventListener", NativeFunction::AddEventListener),
-            ("removeEventListener", NativeFunction::RemoveEventListener),
-            ("dispatchEvent", NativeFunction::DispatchEvent),
-            (
-                "getBoundingClientRect",
-                NativeFunction::GetBoundingClientRect,
-            ),
-        ] {
-            let method = ObjectId(objects.len());
-            objects.push(JsObject {
-                prototype: Some(function_prototype),
-                host: ObjectHost::NativeFunction(function),
-                ..JsObject::default()
-            });
-            objects[prototype.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor::builtin(JsValue::Object(method)),
-            );
-        }
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            prototype,
+            &[
+                ("setAttribute", NativeFunction::SetAttribute),
+                ("getAttribute", NativeFunction::GetAttribute),
+                ("hasAttribute", NativeFunction::HasAttribute),
+                ("removeAttribute", NativeFunction::RemoveAttribute),
+                ("appendChild", NativeFunction::AppendChild),
+                ("removeChild", NativeFunction::RemoveChild),
+                ("insertBefore", NativeFunction::InsertBefore),
+                ("contains", NativeFunction::Contains),
+                ("matches", NativeFunction::Matches),
+                ("querySelector", NativeFunction::QuerySelector),
+                ("querySelectorAll", NativeFunction::QuerySelectorAll),
+                ("addEventListener", NativeFunction::AddEventListener),
+                ("removeEventListener", NativeFunction::RemoveEventListener),
+                ("dispatchEvent", NativeFunction::DispatchEvent),
+                (
+                    "getBoundingClientRect",
+                    NativeFunction::GetBoundingClientRect,
+                ),
+                ("setAttributeNS", NativeFunction::SetAttributeNs),
+                ("getAttributeNS", NativeFunction::GetAttributeNs),
+                ("hasAttributeNS", NativeFunction::HasAttributeNs),
+                ("removeAttributeNS", NativeFunction::RemoveAttributeNs),
+                ("isSameNode", NativeFunction::IsSameNode),
+            ],
+        );
         for name in ["scrollLeft", "scrollTop"] {
             objects[prototype.0].properties.insert(
                 name.to_owned(),
@@ -4052,7 +4137,19 @@ impl Realm {
             prototypes.insert(name, proto);
             proto
         };
-        derive("CharacterData", "Node", ObjectHost::DomConstructor, objects);
+        let character_data = derive("CharacterData", "Node", ObjectHost::DomConstructor, objects);
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            character_data,
+            &[
+                ("substringData", NativeFunction::CharacterDataSubstringData),
+                ("appendData", NativeFunction::CharacterDataAppendData),
+                ("insertData", NativeFunction::CharacterDataInsertData),
+                ("deleteData", NativeFunction::CharacterDataDeleteData),
+                ("replaceData", NativeFunction::CharacterDataReplaceData),
+            ],
+        );
         derive(
             "Text",
             "CharacterData",
@@ -4065,10 +4162,23 @@ impl Realm {
             ObjectHost::DomNodeConstructor(DomNodeKind::Comment),
             objects,
         );
-        derive(
+        let fragment = derive(
             "DocumentFragment",
             "Node",
             ObjectHost::DomNodeConstructor(DomNodeKind::Fragment),
+            objects,
+        );
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            fragment,
+            &[("getElementById", NativeFunction::NonElementGetElementById)],
+        );
+        derive("DocumentType", "Node", ObjectHost::DomConstructor, objects);
+        derive(
+            "ProcessingInstruction",
+            "CharacterData",
+            ObjectHost::DomConstructor,
             objects,
         );
         derive("Element", "Node", ObjectHost::DomConstructor, objects);
@@ -4102,7 +4212,102 @@ impl Realm {
             };
             derive(interface, parent, ObjectHost::DomConstructor, objects);
         }
+        // Collections and token lists are not Node subclasses. Each is an
+        // interface whose prototype inherits from %Object.prototype%.
+        for (name, methods) in [
+            ("NodeList", &[("item", NativeFunction::CollectionItem)][..]),
+            (
+                "HTMLCollection",
+                &[
+                    ("item", NativeFunction::CollectionItem),
+                    ("namedItem", NativeFunction::CollectionNamedItem),
+                ][..],
+            ),
+            (
+                "DOMTokenList",
+                &[
+                    ("add", NativeFunction::ClassListAdd),
+                    ("remove", NativeFunction::ClassListRemove),
+                    ("toggle", NativeFunction::ClassListToggle),
+                    ("contains", NativeFunction::ClassListContains),
+                    ("item", NativeFunction::ClassListItem),
+                    ("replace", NativeFunction::ClassListReplace),
+                    ("toString", NativeFunction::ClassListToString),
+                ][..],
+            ),
+            (
+                "DOMImplementation",
+                &[
+                    (
+                        "createDocumentType",
+                        NativeFunction::ImplementationCreateDocumentType,
+                    ),
+                    ("hasFeature", NativeFunction::ImplementationHasFeature),
+                ][..],
+            ),
+        ] {
+            let proto = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(object_prototype),
+                ..JsObject::default()
+            });
+            Self::install_builtin_methods(objects, function_prototype, proto, methods);
+            Self::dom_interface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                proto,
+                None,
+                ObjectHost::DomConstructor,
+            );
+            prototypes.insert(name, proto);
+        }
+        // `length` is an accessor on each list prototype (WebIDL §3.10.4), so
+        // `"length" in list` holds through the prototype chain.
+        for name in ["NodeList", "HTMLCollection", "DOMTokenList"] {
+            let proto = prototypes[name];
+            let getter = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(NativeFunction::CollectionLength),
+                ..JsObject::default()
+            });
+            objects[proto.0].properties.insert(
+                "length".to_owned(),
+                PropertyDescriptor {
+                    getter: Some(getter),
+                    setter: None,
+                    value: JsValue::Undefined,
+                    writable: false,
+                    enumerable: true,
+                    configurable: true,
+                },
+            );
+        }
         (prototype, prototypes)
+    }
+
+    /// Install `methods` on `prototype` as writable, non-enumerable builtins
+    /// (`WebIDL` §3.7), each a native function that receives its `this` value.
+    fn install_builtin_methods(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        prototype: ObjectId,
+        methods: &[(&str, NativeFunction)],
+    ) {
+        for (name, function) in methods {
+            let method = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(*function),
+                ..JsObject::default()
+            });
+            objects[prototype.0].properties.insert(
+                (*name).to_owned(),
+                PropertyDescriptor::builtin(JsValue::Object(method)),
+            );
+        }
     }
 
     /// Create the interface object (constructor) for `prototype` and register
@@ -9617,7 +9822,9 @@ impl RealmRecord {
             4 + self.node_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
-                + self.dataset_wrappers.len(),
+                + self.dataset_wrappers.len()
+                + self.child_node_list_wrappers.len()
+                + self.child_collection_wrappers.len(),
         );
         roots.push(self.global);
         roots.push(self.document);
@@ -9646,6 +9853,8 @@ impl RealmRecord {
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
         roots.extend(self.dataset_wrappers.values().copied());
+        roots.extend(self.child_node_list_wrappers.values().copied());
+        roots.extend(self.child_collection_wrappers.values().copied());
         roots
     }
 }
@@ -10467,13 +10676,84 @@ impl Realm {
         if let Some(wrapper) = self.class_list_wrappers.get(&node) {
             return *wrapper;
         }
+        let prototype = self.dom_prototype("DOMTokenList");
         let wrapper = self.allocate(JsObject {
-            prototype: Some(self.object_prototype),
+            prototype: Some(prototype),
             host: ObjectHost::ClassList(node),
             ..JsObject::default()
         });
         self.class_list_wrappers.insert(node, wrapper);
         wrapper
+    }
+
+    /// The prototype of the DOM interface `interface`, which the install step
+    /// registered for every interface this realm exposes.
+    fn dom_prototype(&self, interface: &str) -> ObjectId {
+        self.dom_prototypes
+            .get(interface)
+            .copied()
+            .unwrap_or(self.object_prototype)
+    }
+
+    /// The `childNodes` (`elements_only == false`) or `children` collection of
+    /// `node`. Each is one object per node, and it is live over the tree
+    /// (DOM §4.4, §4.2.6).
+    pub(crate) fn child_collection_wrapper(
+        &mut self,
+        node: NodeId,
+        elements_only: bool,
+    ) -> ObjectId {
+        let cache = if elements_only {
+            &self.child_collection_wrappers
+        } else {
+            &self.child_node_list_wrappers
+        };
+        if let Some(wrapper) = cache.get(&node) {
+            return *wrapper;
+        }
+        let (interface, filter) = if elements_only {
+            ("HTMLCollection", CollectionFilter::ChildElements)
+        } else {
+            ("NodeList", CollectionFilter::ChildNodes)
+        };
+        let wrapper = self.live_collection_wrapper(node, filter, interface);
+        if elements_only {
+            self.child_collection_wrappers.insert(node, wrapper);
+        } else {
+            self.child_node_list_wrappers.insert(node, wrapper);
+        }
+        wrapper
+    }
+
+    /// A new live collection over `root`'s tree, with the prototype of
+    /// `interface` (`"NodeList"` or `"HTMLCollection"`).
+    pub(crate) fn live_collection_wrapper(
+        &mut self,
+        root: NodeId,
+        filter: CollectionFilter,
+        interface: &str,
+    ) -> ObjectId {
+        let prototype = self.dom_prototype(interface);
+        self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::LiveCollection {
+                root,
+                filter,
+                memo: None,
+            },
+            ..JsObject::default()
+        })
+    }
+
+    /// A static `NodeList` holding `members`, such as a `querySelectorAll`
+    /// result (DOM §4.2.6.1).
+    pub(crate) fn static_node_list_wrapper(&mut self, members: Vec<NodeId>) -> ObjectId {
+        let prototype = self.dom_prototype("NodeList");
+        self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::StaticNodeList(members),
+            ..JsObject::default()
+        })
     }
 
     pub(crate) fn style_declaration_wrapper(&mut self, node: NodeId) -> ObjectId {

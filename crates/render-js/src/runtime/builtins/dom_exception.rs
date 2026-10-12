@@ -75,6 +75,19 @@ pub(in crate::runtime) enum DomExceptionName {
     /// The Encoding Standard's unknown-label throw, for the same reason as
     /// [`Self::EcmascriptTypeError`].
     EcmascriptRangeError,
+    /// A tree mutation the DOM forbids (DOM §4.2.3 "ensure pre-insertion
+    /// validity"), reported by `render-dom` as `HierarchyRequest`.
+    HierarchyRequest,
+    /// A child or reference node that is not where the operation needs it
+    /// (DOM §4.2.4 "pre-insert"), reported by `render-dom` as `NotFound`.
+    NotFound,
+    /// A node of the wrong type for the operation, reported by `render-dom` as
+    /// `InvalidNodeType`.
+    InvalidNodeType,
+    /// A `CharacterData` offset or count past the end of the data (DOM §4.10).
+    IndexSize,
+    /// A qualified name whose prefix, namespace and local name disagree (DOM §4.9.1).
+    Namespace,
 }
 
 impl DomExceptionName {
@@ -88,6 +101,20 @@ impl DomExceptionName {
             Self::Abort => "AbortError",
             Self::EcmascriptTypeError => "TypeError",
             Self::EcmascriptRangeError => "RangeError",
+            Self::HierarchyRequest => "HierarchyRequestError",
+            Self::NotFound => "NotFoundError",
+            Self::InvalidNodeType => "InvalidNodeTypeError",
+            Self::IndexSize => "IndexSizeError",
+            Self::Namespace => "NamespaceError",
+        }
+    }
+
+    /// The `DOMException` name for a failure `render-dom` reported.
+    pub(in crate::runtime) const fn from_dom(kind: render_dom::DomErrorKind) -> Self {
+        match kind {
+            render_dom::DomErrorKind::HierarchyRequest => Self::HierarchyRequest,
+            render_dom::DomErrorKind::NotFound => Self::NotFound,
+            render_dom::DomErrorKind::InvalidNodeType => Self::InvalidNodeType,
         }
     }
 }
@@ -466,6 +493,11 @@ mod tests {
             (DomExceptionName::Abort, 20),
             (DomExceptionName::EcmascriptTypeError, 0),
             (DomExceptionName::EcmascriptRangeError, 0),
+            (DomExceptionName::HierarchyRequest, 3),
+            (DomExceptionName::NotFound, 8),
+            (DomExceptionName::InvalidNodeType, 24),
+            (DomExceptionName::IndexSize, 1),
+            (DomExceptionName::Namespace, 14),
         ] {
             assert_eq!(
                 dom_exception_code(name.as_str()),
@@ -491,10 +523,13 @@ mod tests {
                 [thrown(function () { return document.querySelector('::'); }),
                  thrown(function () { return document.querySelectorAll('a b c d e ! !'); }),
                  thrown(function () { return document.body.matches('&&'); }),
+                 // DOM §4.2.6.2: `getElementsByClassName` splits its argument on
+                 // ASCII whitespace into class tokens and never parses a selector,
+                 // so `a!` is a token that matches nothing, not a SyntaxError.
                  thrown(function () { return document.getElementsByClassName('a!'); }),
                  thrown(function () { return document.body.closest('&&'); })].join(',')
             "),
-            "SyntaxError,SyntaxError,SyntaxError,SyntaxError,SyntaxError"
+            "SyntaxError,SyntaxError,SyntaxError,no throw,SyntaxError"
         );
         // The `SyntaxError` DOMException is not JavaScript's `SyntaxError`
         // (WebIDL §2.8.1: "this name is used to report parsing errors in web

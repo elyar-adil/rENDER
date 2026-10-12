@@ -227,7 +227,7 @@ pub struct JsRuntime {
 
 impl From<DomError> for JsError {
     fn from(error: DomError) -> Self {
-        Self::new(JsErrorKind::Dom, error.to_string(), None)
+        Self::from_dom(&error)
     }
 }
 

@@ -232,6 +232,8 @@ pub(super) fn mark_host(
         | ObjectHost::BooleanPrimitive(_)
         | ObjectHost::DateInstance(_)
         | ObjectHost::NamedNodeMap(_)
+        | ObjectHost::LiveCollection { .. }
+        | ObjectHost::StaticNodeList(_)
         | ObjectHost::Attr { .. }
         | ObjectHost::RegExp(_)
         | ObjectHost::RegExpConstructor

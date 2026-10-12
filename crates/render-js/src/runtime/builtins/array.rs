@@ -467,6 +467,20 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_has(dom, object, &index_key(index));
         }
+        // A NodeList, HTMLCollection or DOMTokenList has an index for each member
+        // it currently holds (WebIDL §3.10.4 indexed property getter).
+        if matches!(
+            self.realm.host_ref(object),
+            Some(ObjectHost::LiveCollection { .. } | ObjectHost::StaticNodeList(_))
+        ) {
+            let length = self
+                .collection_members_of(dom, object)
+                .map_or(0, <[render_dom::NodeId]>::len);
+            return Ok(index < length as f64);
+        }
+        if let Some(ObjectHost::ClassList(node)) = self.realm.host(object) {
+            return Ok(index < Self::class_list_tokens(dom, node)?.len() as f64);
+        }
         Ok(match self.realm.host(object) {
             Some(ObjectHost::TypedArray {
                 buffer,

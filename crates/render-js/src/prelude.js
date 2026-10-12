@@ -109,6 +109,26 @@
     clearTimeout(handle);
   });
 
+  // ---------------------------------------------------------- Indexed lists
+  // WebIDL §3.7.6: an interface with an indexed getter and a `length` gets
+  // %Array.prototype.values% as its @@iterator, and an `iterable<>` declaration
+  // also gets keys, values, entries and forEach. These are the Array functions
+  // themselves, and they read the list through `length` and indexed access, so
+  // the iteration stays live.
+  function iterableList(prototype, arrayMethods) {
+    defineProperty(prototype, Symbol.iterator, {
+      value: Array.prototype.values, writable: true, configurable: true, enumerable: false
+    });
+    if (arrayMethods) {
+      for (var name of ['keys', 'values', 'entries', 'forEach']) {
+        define(prototype, name, Array.prototype[name]);
+      }
+    }
+  }
+  iterableList(NodeList.prototype, true);
+  iterableList(HTMLCollection.prototype, false);
+  iterableList(DOMTokenList.prototype, true);
+
   // ------------------------------------------------------------ EventTarget
   var nodePrototype = Node.prototype;
   var eventTargetPrototype = Object.getPrototypeOf(nodePrototype);

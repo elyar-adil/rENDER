@@ -813,6 +813,30 @@ impl JsRuntime {
                 receiver,
                 arguments,
             ),
+            NativeFunction::ClassListReplace
+            | NativeFunction::CollectionItem
+            | NativeFunction::CollectionNamedItem
+            | NativeFunction::CollectionLength
+            | NativeFunction::CharacterDataSubstringData
+            | NativeFunction::CharacterDataAppendData
+            | NativeFunction::CharacterDataInsertData
+            | NativeFunction::CharacterDataDeleteData
+            | NativeFunction::CharacterDataReplaceData
+            | NativeFunction::ImplementationCreateDocumentType
+            | NativeFunction::ImplementationHasFeature
+            | NativeFunction::NonElementGetElementById
+            | NativeFunction::CreateElementNs
+            | NativeFunction::SetAttributeNs
+            | NativeFunction::GetAttributeNs
+            | NativeFunction::HasAttributeNs
+            | NativeFunction::RemoveAttributeNs
+            | NativeFunction::GetElementsByTagNameNs
+            | NativeFunction::CreateCdataSection
+            | NativeFunction::CreateProcessingInstruction
+            | NativeFunction::ImportNode
+            | NativeFunction::IsSameNode => {
+                self.dispatch_dom_native(dom, function, receiver, arguments)
+            }
             NativeFunction::ClassListToggle => {
                 self.dispatch_dom_native(dom, NativeFunction::ClassListToggle, receiver, arguments)
             }

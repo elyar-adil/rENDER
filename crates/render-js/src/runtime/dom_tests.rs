@@ -369,3 +369,173 @@ fn element_type_returns_the_spec_default_and_canonical_keyword() {
         "submit,reset,submit,text,checkbox,textarea,output,fieldset"
     );
 }
+
+#[test]
+fn collections_are_live_and_keep_identity_across_reads() {
+    // DOM 4.2.10: `childNodes` and `children` are one live object per node, and
+    // `getElementsByTagName` is a live HTMLCollection that sees later inserts.
+    assert_eq!(
+        eval(
+            "var list = $('list'); var tags = document.getElementsByTagName('li'); \
+             var before = tags.length; list.appendChild(document.createElement('li')); \
+             [list.childNodes === list.childNodes, list.children === list.children, \
+              before, tags.length, tags[tags.length - 1].nodeName, \
+              Object.prototype.toString.call(tags), tags.item(99) === null].join()"
+        ),
+        "true,true,3,4,LI,[object HTMLCollection],true"
+    );
+}
+
+#[test]
+fn node_list_and_html_collection_iterate_and_index_like_arrays() {
+    assert_eq!(
+        eval(
+            "var list = $('list'); var seen = []; list.childNodes.forEach(function (n) { seen.push(n.nodeName); }); \
+             var kids = [...list.children].map(function (e) { return e.id; }); \
+             [seen.length, kids.join('|'), list.children.namedItem('two').id, \
+              String(list.children.namedItem('')), list.children.item(0).id, \
+              list.childNodes.item(-1) === null, Array.isArray(list.childNodes)].join()"
+        ),
+        "3,one|two|three,two,null,one,true,false"
+    );
+}
+
+#[test]
+fn query_selector_all_returns_a_static_node_list() {
+    assert_eq!(
+        eval(
+            "var all = document.querySelectorAll('li'); var list = $('list'); \
+             list.appendChild(document.createElement('li')); \
+             [all.length, all.item(0).id, Object.prototype.toString.call(all)].join()"
+        ),
+        "3,one,[object NodeList]"
+    );
+}
+
+#[test]
+fn get_element_by_id_ignores_the_empty_string_and_fragments_scope_their_search() {
+    assert_eq!(
+        eval(
+            "var empty = document.createElement('div'); empty.id = ''; document.body.appendChild(empty); \
+             var frag = document.createDocumentFragment(); var inner = document.createElement('span'); \
+             inner.id = 'inner'; frag.appendChild(inner); \
+             [String(document.getElementById('')), frag.getElementById('inner').id, \
+              String(frag.getElementById('missing'))].join()"
+        ),
+        "null,inner,null"
+    );
+}
+
+#[test]
+fn dom_token_list_is_an_ordered_set_with_literal_value_and_update_steps() {
+    assert_eq!(
+        eval(
+            "var span = document.createElement('span'); span.setAttribute('class', '   a  a b '); \
+             var list = span.classList; var out = [list.length, String(list), list.value]; \
+             list.add('a'); out.push(JSON.stringify(span.getAttribute('class'))); \
+             out.push(list.toggle('c', undefined), list.toggle('c', true), list.toggle('a', false)); \
+             out.push(list.replace('b', 'z'), list.replace('missing', 'q')); \
+             out.push(span.getAttribute('class'), [...list].join('+'), list[0], list[9] === undefined); \
+             out.join('|')"
+        ),
+        "2|   a  a b |   a  a b |\"a b\"|true|true|false|true|false|z c|z+c|z|true"
+    );
+}
+
+#[test]
+fn dom_token_list_iteration_is_live_and_stringifies_to_value() {
+    assert_eq!(
+        eval(
+            "var span = document.createElement('span'); span.className = 'x y'; \
+             var list = span.classList; var keys = [...list.keys()]; var entries = [...list.entries()].join(';'); \
+             var seen = []; list.forEach(function (t, i) { seen.push(i + t); }); \
+             [keys.join(), entries, seen.join(), list.toString(), \
+              Object.prototype.toString.call(list)].join('#')"
+        ),
+        "0,1#0,x;1,y#0x,1y#x y#[object DOMTokenList]"
+    );
+}
+
+#[test]
+fn character_data_offsets_are_utf16_and_out_of_range_throws_index_size() {
+    assert_eq!(
+        eval(
+            "var text = document.createTextNode('a\u{1F600}b'); \
+             var out = [text.length, text.substringData(1, 2).length]; \
+             text.appendData('!'); text.insertData(0, '>'); text.deleteData(1, 1); \
+             text.replaceData(0, 1, 'X'); out.push(text.data, text.nodeValue); \
+             try { text.substringData(99, 1); } catch (e) { out.push(e.name, e instanceof DOMException); } \
+             out.join('|')"
+        ),
+        "4|2|X\u{1F600}b!|X\u{1F600}b!|IndexSizeError|true"
+    );
+}
+
+#[test]
+fn text_nodes_reject_children_with_a_hierarchy_request_dom_exception() {
+    assert_eq!(
+        eval(
+            "var text = document.createTextNode('t'); var out = []; \
+             try { text.appendChild(document.createElement('i')); } catch (e) { out.push(e.name, e instanceof DOMException); } \
+             try { document.body.removeChild(document.createElement('i')); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "HierarchyRequestError,true,NotFoundError"
+    );
+}
+
+#[test]
+fn create_element_ns_keeps_prefix_namespace_and_case_and_validates_names() {
+    assert_eq!(
+        eval(
+            "var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg:linearGradient'); \
+             var plain = document.createElementNS(null, 'Foo'); \
+             var out = [svg.prefix, svg.localName, svg.tagName, svg.namespaceURI, String(plain.namespaceURI), plain.tagName]; \
+             try { document.createElementNS('', ''); } catch (e) { out.push(e.name); } \
+             try { document.createElementNS('http://example.com/', 'foo:'); } catch (e) { out.push(e.name); } \
+             try { document.createElementNS(null, 'p:x'); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "svg,linearGradient,svg:linearGradient,http://www.w3.org/2000/svg,null,Foo,InvalidCharacterError,InvalidCharacterError,NamespaceError"
+    );
+}
+
+#[test]
+fn namespaced_attributes_are_found_by_qualified_name_regardless_of_namespace() {
+    assert_eq!(
+        eval(
+            "var el = document.createElement('div'); el.setAttributeNS('urn:example', 'foo', 'v'); \
+             var out = [el.getAttributeNS('urn:example', 'foo'), el.hasAttribute('foo'), el.getAttribute('foo')]; \
+             el.removeAttributeNS('urn:example', 'foo'); out.push(el.hasAttribute('foo'), String(el.getAttributeNS('', 'foo'))); \
+             out.join()"
+        ),
+        "v,true,v,false,null"
+    );
+}
+
+#[test]
+fn document_implementation_creates_doctypes_and_rejects_bad_names() {
+    assert_eq!(
+        eval(
+            "var doctype = document.implementation.createDocumentType('html', 'pub', 'sys'); \
+             var out = [doctype.name, doctype.publicId, doctype.systemId, doctype.nodeType, \
+                        document.implementation.hasFeature(), document.implementation === document.implementation]; \
+             try { document.implementation.createDocumentType('bad name', '', ''); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "html,pub,sys,10,true,true,InvalidCharacterError"
+    );
+}
+
+#[test]
+fn create_cdata_section_throws_in_html_and_processing_instructions_carry_their_target() {
+    assert_eq!(
+        eval(
+            "var out = []; try { document.createCDATASection('x'); } catch (e) { out.push(e.name); } \
+             var pi = document.createProcessingInstruction('xml-stylesheet', 'href=a'); \
+             out.push(pi.target, pi.data, pi.nodeValue, pi.nodeType); \
+             out.join()"
+        ),
+        "NotSupportedError,xml-stylesheet,href=a,href=a,7"
+    );
+}
