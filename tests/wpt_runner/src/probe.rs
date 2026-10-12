@@ -260,7 +260,7 @@ pub fn run(suite_root: &Path, revision: &str) -> Probe {
         let expression = format!("typeof {}", capability.expression);
         let observed = runtime
             .execute(&mut parsed.dom, &expression)
-            .map(|outcome| outcome.value.to_js_string())
+            .map(|outcome| outcome.value.to_js_string().to_lossy())
             .unwrap_or_else(|error| format!("<threw: {error}>"));
         probe.record(
             &format!("document.{} is callable", capability.method),

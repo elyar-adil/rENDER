@@ -635,7 +635,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
     let json = runtime
         .execute(dom, "String(globalThis.__wpt_read())")
         .ok()
-        .map(|outcome| outcome.value.to_js_string());
+        .map(|outcome| outcome.value.to_js_string().to_lossy());
 
     let harvest = json.as_deref().and_then(Harvest::parse);
 
