@@ -756,7 +756,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         category: Category::HarnessLimitation,
     };
     let registered = harvest.completion.as_ref().map_or(0, |c| c.tests);
-    let reported = harvest.results.len() as u32;
+    let reported = u32::try_from(harvest.results.len()).unwrap_or(u32::MAX);
     for test in harvest.results {
         let status = HarnessStatus::from_number(test.status);
         // `asserts_run` is cumulative across the whole file, so it is taken from
