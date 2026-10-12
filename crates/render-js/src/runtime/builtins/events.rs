@@ -600,6 +600,42 @@ impl JsRuntime {
             };
             self.call_listener(dom, &listener, event, current, event_type)?;
         }
+        // The `on…` IDL attributes of the Window and the Document are event
+        // handlers too. Each runs with the non-capturing listeners, after the ones
+        // registered with addEventListener, as a node's handler does above. Those
+        // two objects keep the attribute as an ordinary `on<type>` property that a
+        // script assigns directly, so `window.onload = f` and `onload = f` both
+        // reach here, as does `document.onreadystatechange = f`.
+        //
+        // `window.onerror` is excluded. It takes the message, source, position and
+        // error arguments and cancels when it returns true; that form is not
+        // implemented, so it is left unrun rather than run with the event object
+        // in place of those arguments.
+        // The owner is the object `stop_wrapper` names for this stop, which is
+        // already the right realm's window or document.
+        let owner = match stop {
+            Stop::Window(_) if event_type != "error" => Some(current),
+            Stop::Node(node) if node == dom.document() => Some(current),
+            _ => None,
+        };
+        if !capture_pass
+            && let Some(owner) = owner
+            && let Some(JsValue::Object(callback)) =
+                self.realm.get_property(owner, &format!("on{event_type}"))
+            && Self::is_callable_object(callback, &self.realm)
+            && !self
+                .event_flags
+                .get(&event)
+                .is_some_and(|flags| flags.stop_immediate)
+        {
+            let listener = Listener {
+                callback,
+                capture: false,
+                once: false,
+                passive: false,
+            };
+            self.call_listener(dom, &listener, event, current, event_type)?;
+        }
         Ok(())
     }
 
