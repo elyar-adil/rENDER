@@ -753,7 +753,10 @@ impl Solver<'_> {
         let mut auto = Vec::with_capacity(columns);
         for column in 0..columns {
             match fixed[column] {
-                Some(width) => widths[column] = width,
+                // §17.5.2.2: a column's minimum is the larger of its specified
+                // width and the min-content width of the cells in it, so a fixed
+                // column is never narrower than the content it has to hold.
+                Some(width) => widths[column] = width.max(minimum[column]),
                 None => auto.push(column),
             }
         }

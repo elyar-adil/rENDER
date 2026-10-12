@@ -65,10 +65,14 @@ pub struct StickyConstraint {
     pub containing_block: PhysicalRect,
     /// The insets that form the sticky view rectangle out of the scrollport.
     pub insets: StickyInsets,
-    /// The size of the scrollport that constrains the box. The page scrollport
-    /// starts at the document origin, so its document rectangle is the scroll
-    /// offset plus this size.
+    /// The size of the scrollport that constrains the box: the padding box of
+    /// its nearest ancestor scroll container, or the viewport when it has none.
     pub scrollport: PhysicalSize,
+    /// The document-space origin of that scrollport's padding box at scroll
+    /// offset zero. The viewport's is the document origin. A scroll offset moves
+    /// the content of the scrollport by its negation, so the part of the
+    /// document the scrollport shows starts at `scrollport_origin + offset`.
+    pub scrollport_origin: PhysicalPoint,
 }
 
 /// §4.1: the sticky view rectangle is the scrollport inset by the box's own
@@ -83,16 +87,18 @@ pub fn sticky_view_rect(
     let top = constraint.insets.amount(false, true);
     let bottom = constraint.insets.amount(false, false);
     PhysicalRect::new(
-        scroll_offset.x + left,
-        scroll_offset.y + top,
+        constraint.scrollport_origin.x + scroll_offset.x + left,
+        constraint.scrollport_origin.y + scroll_offset.y + top,
         (constraint.scrollport.width - left - right).max(0.0),
         (constraint.scrollport.height - top - bottom).max(0.0),
     )
 }
 
 /// §4.1: how far the box is displaced from [`StickyConstraint::margin_rect`]
-/// when the page is scrolled to `scroll_offset`, in document space. Add it to
-/// the box's fragment rectangle to get the position to paint it at.
+/// when its scrollport is scrolled to `scroll_offset`, in document space. The
+/// offset is that of the scrollport that constrains the box, which for a box in
+/// a nested scroll container is that container's, not the page's. Add it to the
+/// box's fragment rectangle to get the position to paint it at.
 #[must_use]
 pub fn sticky_offset(constraint: &StickyConstraint, scroll_offset: PhysicalPoint) -> PhysicalPoint {
     let view = sticky_view_rect(constraint, scroll_offset);

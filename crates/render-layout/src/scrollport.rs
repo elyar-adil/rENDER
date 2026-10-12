@@ -7,6 +7,12 @@
 //! scrollbar is always present. A clip has no scroll range at all, so the two
 //! are kept apart in the type rather than in a flag nobody checks.
 //!
+//! This is a deliberate simplification of CSS Overflow 3, which makes `hidden`
+//! a scroll container too (programmatically scrollable, with no user scrolling).
+//! Here `hidden` is a [`ClipMode::Clip`]. Code that needs the specification's
+//! scroll-container definition, such as sticky positioning, decides it from the
+//! computed `overflow` values itself rather than from this mode.
+//!
 //! The scroll offset is deliberately absent. It belongs to whoever owns input
 //! and paint scheduling (the shell), the same split sticky positioning makes:
 //! layout produces the rectangle and the range, and the consumer supplies the

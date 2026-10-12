@@ -577,12 +577,13 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         notes: "Block, inline, inline-block, list-item and flex formatting, floats, \
                 absolute and relative positioning, margin collapsing, the intrinsic \
                 and min/max sizing passes and text shaping through a measurer seam are \
-                implemented. Not implemented: multi-column layout, `position: sticky` \
-                (the keyword is defined in the property registry and nothing reads it), \
-                `direction` and RTL mirroring, and scroll containers - a fragment tree \
-                exposes one document-wide scrollable size and nothing represents a \
-                scrollable box, so `overflow: auto` on a `div` clips with no way to \
-                reach the content.",
+                implemented. Not implemented: multi-column layout, `position: sticky`'s \
+                displacement (layout resolves a constraint against the nearest scroll \
+                container, but no paint consumer applies it, so a sticky box still scrolls \
+                with the page), `direction` and RTL mirroring, and scrolling a nested scroll \
+                container. Each one has a scrollport geometry in the fragment tree, but only \
+                the page viewport owns a scroll offset, so `overflow: auto` on a `div` clips \
+                its content with no way to reach it.",
         dependencies: &[DOM_TREE, CSS_USED_VALUES, CSS_FLEXBOX, CSS_GRID],
         tests: LAYOUT_TESTS,
     },

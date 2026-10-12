@@ -38,6 +38,16 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
     })
 }
 
+/// The computed `overflow-x` and `overflow-y` of a box. An absent value is
+/// `visible`, which is also the initial value.
+pub(super) fn overflow_axes(style: Option<&ComputedStyle>) -> (Overflow, Overflow) {
+    let axis = |property: &str| match style.and_then(|style| style.typed(property)) {
+        Some(TypedPropertyValue::Overflow(value)) => *value,
+        _ => Overflow::Visible,
+    };
+    (axis("overflow-x"), axis("overflow-y"))
+}
+
 /// CSS Overflow 3 §3.1: what a box does with content that exceeds its padding
 /// box. `None` is `overflow: visible`, which neither clips nor scrolls.
 ///
@@ -45,11 +55,7 @@ pub(super) fn establishes_block_formatting_context(style: Option<&ComputedStyle>
 /// only a scrollable axis produces a scrollport. `hidden` on one axis with
 /// `auto` on the other scrolls, because the axes are independent.
 pub(super) fn overflow_clip_mode(style: Option<&ComputedStyle>) -> Option<ClipMode> {
-    let axis = |property: &str| match style.and_then(|style| style.typed(property)) {
-        Some(TypedPropertyValue::Overflow(value)) => *value,
-        _ => Overflow::Visible,
-    };
-    let (x, y) = (axis("overflow-x"), axis("overflow-y"));
+    let (x, y) = overflow_axes(style);
     if matches!(x, Overflow::Visible) && matches!(y, Overflow::Visible) {
         return None;
     }

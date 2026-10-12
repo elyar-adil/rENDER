@@ -15,6 +15,7 @@ use crate::geometry::PhysicalPoint;
 use crate::solver::LayoutOutput;
 use crate::sticky::StickyConstraint;
 use crate::sticky::sticky_offset;
+use crate::sticky::sticky_view_rect;
 
 use super::tests::{find, fragment, pipeline};
 
@@ -560,4 +561,109 @@ fn a_sticky_box_in_a_table_cell_is_constrained_by_the_cell() {
         sticky_offset(&bar, scrolled(0.0, 100.0)),
         PhysicalPoint::default()
     );
+}
+
+#[test]
+fn a_sticky_box_in_a_nested_scroll_container_is_constrained_by_its_padding_box() {
+    // CSS Positioned Layout 4 §4.1: the box is constrained by its nearest
+    // scrollport, the padding box of its nearest scroll container. Here that is
+    // the 400x300 scroller placed at (30, 20), not the 600px-high page viewport.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='scroller'>\
+           <div id='bar'>header</div><div id='rest'>body</div></div></body>",
+        &format!(
+            "{RESET} #scroller {{ overflow: auto; width: 400px; height: 300px; \
+               margin-top: 20px; margin-left: 30px }}\
+             #bar {{ position: sticky; top: 0; height: 50px }} #rest {{ height: 900px }}"
+        ),
+        800.0,
+    );
+    let dom = &output.dom;
+    let bar = constraint(&layout, find(dom, "#bar"));
+    assert!(near(bar.scrollport.width, 400.0), "{bar:?}");
+    assert!(near(bar.scrollport.height, 300.0), "{bar:?}");
+    assert!(near(bar.scrollport_origin.x, 30.0), "{bar:?}");
+    assert!(near(bar.scrollport_origin.y, 20.0), "{bar:?}");
+    // The box's containing block is the scroller's content box, so the box is
+    // pinned to the top of what the scroller shows.
+    assert!(near(bar.containing_block.origin.y, 20.0), "{bar:?}");
+    // With the scroller scrolled to 100 it shows the document from y=120 down,
+    // and the box is pinned there. The scroll offset is the scroller's own.
+    let view = sticky_view_rect(&bar, scrolled(0.0, 100.0));
+    assert!(near(view.origin.y, 120.0), "{view:?}");
+    assert!(
+        near(painted(&bar, scrolled(0.0, 100.0)).origin.y, 120.0),
+        "{bar:?}"
+    );
+    // Once the scroller has moved past the box's containing block, the box
+    // scrolls away with it rather than staying pinned.
+    assert!(
+        near(painted(&bar, scrolled(0.0, 1000.0)).origin.y, 20.0),
+        "{bar:?}"
+    );
+}
+
+#[test]
+fn the_nearest_scroll_container_constrains_a_sticky_box_not_an_outer_one() {
+    // `overflow: hidden` is a scroll container (CSS Overflow 3) even though it is
+    // not user-scrollable, so it is the nearest scrollport of the box inside it.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='outer'><div id='inner'>\
+           <div id='bar'>header</div><div id='rest'>body</div></div></div></body>",
+        &format!(
+            "{RESET} #outer {{ overflow: auto; width: 700px; height: 500px }}\
+             #inner {{ overflow: hidden; width: 400px; height: 300px }}\
+             #bar {{ position: sticky; top: 0; height: 50px }} #rest {{ height: 900px }}"
+        ),
+        800.0,
+    );
+    let dom = &output.dom;
+    let bar = constraint(&layout, find(dom, "#bar"));
+    assert!(near(bar.scrollport.width, 400.0), "{bar:?}");
+    assert!(near(bar.scrollport.height, 300.0), "{bar:?}");
+}
+
+#[test]
+fn an_overflow_clip_ancestor_is_not_a_scroll_container() {
+    // `overflow: clip` clips without making its box a scroll container, so the
+    // sticky box is still constrained by the viewport.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='clip'>\
+           <div id='bar'>header</div><div id='rest'>body</div></div></body>",
+        &format!(
+            "{RESET} #clip {{ overflow: clip; width: 400px; height: 300px }}\
+             #bar {{ position: sticky; top: 0; height: 50px }} #rest {{ height: 900px }}"
+        ),
+        800.0,
+    );
+    let dom = &output.dom;
+    let bar = constraint(&layout, find(dom, "#bar"));
+    assert!(near(bar.scrollport.width, 800.0), "{bar:?}");
+    assert!(near(bar.scrollport.height, 600.0), "{bar:?}");
+    assert!(near(bar.scrollport_origin.x, 0.0), "{bar:?}");
+    assert!(near(bar.scrollport_origin.y, 0.0), "{bar:?}");
+}
+
+#[test]
+fn the_body_or_root_overflow_is_the_viewports_not_a_scroll_container() {
+    // CSS Overflow 3 propagates the root element's `overflow` to the viewport, and
+    // the body's when the root's is `visible`. `body { overflow-x: hidden }` is
+    // common on real pages and must not make every sticky box below it scroll
+    // against the body's own padding box.
+    for css in ["body { overflow-x: hidden }", "html { overflow: hidden }"] {
+        let (output, _, layout) = pipeline(
+            "<!doctype html><html><body><div id='page'>\
+               <div id='bar'>header</div><div id='rest'>body</div></div></body></html>",
+            &format!(
+                "{RESET} #page {{ height: 2000px }}\
+                 #bar {{ position: sticky; top: 0; height: 50px }} {css}"
+            ),
+            400.0,
+        );
+        let dom = &output.dom;
+        let bar = constraint(&layout, find(dom, "#bar"));
+        assert!(near(bar.scrollport.width, 400.0), "{css}: {bar:?}");
+        assert!(near(bar.scrollport.height, 600.0), "{css}: {bar:?}");
+        assert!(near(bar.scrollport_origin.y, 0.0), "{css}: {bar:?}");
+    }
 }
