@@ -494,7 +494,8 @@ impl JsRuntime {
         }
         for handler in self
             .window_event_handlers
-            .values()
+            .iter()
+            .flat_map(BTreeMap::values)
             .flatten()
             .map(|listener| &listener.callback)
         {
@@ -505,6 +506,21 @@ impl JsRuntime {
                 &mut marked_environments,
                 *handler,
             );
+        }
+        for task in self.internal_tasks.values() {
+            if let super::nested::InternalTask::PostMessage {
+                data: JsValue::Object(object),
+                ..
+            } = task
+            {
+                mark_object(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    *object,
+                );
+            }
         }
         for timer in self.timers.values() {
             mark_object(

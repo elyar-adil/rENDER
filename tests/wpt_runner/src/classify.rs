@@ -450,10 +450,12 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         // Timers, event dispatch and external resources have engine support and
         // the adapter can express them.
         Capability::Timers | Capability::EventDispatch | Capability::ExternalResource => true,
-        // render-core's own registry records that nested browsing contexts are
-        // not implemented: "an `iframe` renders as nothing". Every `testcss.js`
-        // entry point needs one, so the entire CSS area is blocked here.
-        Capability::NestedBrowsingContext | Capability::WindowProxy => false,
+        // Nested browsing contexts are driven by the engine's own adapter: an
+        // iframe gets its own realm and document, `contentWindow` and
+        // `contentDocument` reach it, and `parent`, `top` and `postMessage` work
+        // between windows. A nested document is not painted, so a test that
+        // depends on how an iframe looks on screen is still a fail, not a pass.
+        Capability::NestedBrowsingContext | Capability::WindowProxy => true,
         Capability::NetworkFetch
         | Capability::WebSocket
         | Capability::DedicatedWorker

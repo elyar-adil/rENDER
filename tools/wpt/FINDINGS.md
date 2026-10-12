@@ -5,6 +5,29 @@ run against WPT revision **`c7fdee80f3f17b4e9813964916afdfd57ace863f`**.
 
 Everything below was measured, not estimated, unless a line says otherwise.
 
+## Update: nested browsing contexts are driven
+
+The engine now gives an `<iframe>` its own document and realm, and `contentWindow`,
+`parent`, `top` and `postMessage` work between windows (`docs/visual_fidelity_gaps.md`,
+S11). The runner marks `NestedBrowsingContext` and `WindowProxy` available, so the
+`lacks-nested-browsing-context` and `lacks-window-proxy` mechanisms are gone from
+`dom/` and `html/`: 643 and 106 tests respectively. Those tests now execute.
+
+Measured on `dom/` and `html/`, before and after, with the counts and the one lost
+pass explained in S11. The rows below this section are the earlier measurement, and
+they still describe the engine as it was at `c479c8d`. Where they disagree with
+this section, this section is current.
+
+| | before | after |
+| --- | ---: | ---: |
+| pass | 242 | 267 |
+| fail | 2,257 | 2,638 |
+| skipped | 8,378 | 7,972 |
+
+The pass rate falls from 9.7% to 9.2%, because the 380 newly executing tests fail on
+APIs the engine still lacks. The runner's self-check now uses `canvas`, not
+`NestedBrowsingContext`, as its example of a missing capability.
+
 ## The headline, and what changed
 
 **Last round reported no number at all.** It established that none of the 20,986

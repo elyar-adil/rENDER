@@ -475,6 +475,31 @@ impl Dom {
         self.document
     }
 
+    /// Moves every node of `other` into this arena as a new, detached document
+    /// tree, and returns the id of that tree's document node.
+    ///
+    /// A nested browsing context needs its own `Document` in the same arena as
+    /// its owner, because one JavaScript heap holds every realm and a node id
+    /// must name exactly one node. Node ids of `other` are shifted by the
+    /// current arena length, so existing ids are unchanged.
+    ///
+    /// The tree is not attached to any parent, so no structural mutation is
+    /// recorded and the revision is left alone: nothing in the primary tree
+    /// changed, and the tree is not rendered by the owning document.
+    pub fn graft_document(&mut self, other: Self) -> NodeId {
+        let offset = self.nodes.len();
+        let shift = |id: NodeId| NodeId::from_index(id.0 as usize + offset);
+        for node in other.nodes {
+            self.nodes.push(Node {
+                id: shift(node.id),
+                parent: node.parent.map(shift),
+                children: node.children.into_iter().map(shift).collect(),
+                kind: node.kind,
+            });
+        }
+        shift(other.document)
+    }
+
     #[must_use]
     pub const fn mutation_revision(&self) -> u64 {
         self.mutation_revision
@@ -1575,6 +1600,42 @@ mod tests {
     use super::{
         Dom, DomErrorKind, MutationHistoryError, MutationKind, Namespace, NodeId, NodeKind,
     };
+
+    #[test]
+    fn grafted_document_keeps_its_own_tree_and_leaves_existing_ids_alone() {
+        let mut owner = Dom::new();
+        let html = owner.create_element("html");
+        owner.append_child(owner.document(), html).unwrap();
+        let revision = owner.revision();
+
+        let mut nested = Dom::new();
+        let body = nested.create_element("body");
+        let text = nested.create_text("inside");
+        nested.append_child(nested.document(), body).unwrap();
+        nested.append_child(body, text).unwrap();
+
+        let nested_document = owner.graft_document(nested);
+
+        assert_ne!(nested_document, owner.document());
+        assert_eq!(
+            owner.revision(),
+            revision,
+            "a detached graft is not a mutation"
+        );
+        assert_eq!(owner.parent(html), Some(owner.document()));
+        assert!(matches!(
+            owner.node(nested_document).unwrap().kind(),
+            NodeKind::Document
+        ));
+        assert!(!owner.is_connected(nested_document));
+        let grafted_body = owner.children(nested_document).unwrap()[0];
+        assert_eq!(owner.parent(grafted_body), Some(nested_document));
+        let grafted_text = owner.children(grafted_body).unwrap()[0];
+        assert_eq!(
+            owner.node(grafted_text).unwrap().kind(),
+            &NodeKind::Text("inside".into())
+        );
+    }
 
     #[test]
     fn node_ids_are_stable_and_never_reused_when_detached() {

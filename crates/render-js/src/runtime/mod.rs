@@ -43,6 +43,8 @@ use std::collections::BTreeMap;
 pub(crate) use types::{BindingRead, Environment};
 use url::Url;
 
+use self::nested::{BrowsingContextRecord, FrameState, InternalTask};
+
 mod async_iteration;
 #[cfg(test)]
 mod bigint_tests;
@@ -69,8 +71,12 @@ mod gc;
 mod language_tests;
 mod module;
 pub use module::ModuleLoader;
+mod nested;
+pub use nested::DocumentLoader;
 #[cfg(test)]
 mod module_tests;
+#[cfg(test)]
+mod nested_tests;
 #[cfg(test)]
 mod prelude_tests;
 #[cfg(test)]
@@ -198,7 +204,24 @@ pub struct JsRuntime {
     /// again (in a loop, or a function called repeatedly) is not compiled again.
     regex_cache: std::collections::HashMap<(String, String), std::rc::Rc<crate::regex::Compiled>>,
     console_messages: Vec<ConsoleMessage>,
-    window_event_handlers: BTreeMap<String, Vec<types::Listener>>,
+    /// Window listeners by event type, one map per realm, indexed by
+    /// [`RealmId`]: a browsing context's `window` is not the page's.
+    window_event_handlers: Vec<BTreeMap<String, Vec<types::Listener>>>,
+    /// The browsing context each realm is, indexed by [`RealmId`].
+    contexts: Vec<BrowsingContextRecord>,
+    /// The state of each connected iframe. See [`FrameState`].
+    frames: BTreeMap<NodeId, FrameState>,
+    /// The realm each active call was made from, innermost last.
+    caller_realms: Vec<RealmId>,
+    /// Work the runtime has scheduled for itself, keyed by the timer id that
+    /// the embedding drains through [`Self::take_pending_timer_requests`].
+    internal_tasks: BTreeMap<u64, InternalTask>,
+    /// The revision of the DOM the last nested-context scan saw, so a scan runs
+    /// only when the tree changed.
+    nested_scan_revision: Option<DomRevision>,
+    /// Supplies the text of documents and scripts that nested browsing contexts
+    /// load by URL.
+    document_loader: Option<Box<dyn DocumentLoader>>,
     next_symbol_id: u64,
     /// `Symbol.for` registry: registry key -> symbol id.
     global_symbol_registry: BTreeMap<String, u64>,
@@ -276,8 +299,12 @@ impl JsRuntime {
 
     #[must_use]
     pub fn with_limits_and_url(dom: &Dom, limits: RuntimeLimits, document_url: &Url) -> Self {
+        let mut realm = Realm::bootstrap(dom.document(), document_url);
+        // The page is a top-level window: its own parent and top, and no frame element.
+        let global = realm.global_object();
+        realm.set_frame_relations(RealmId::default(), global, global, JsValue::Null);
         Self {
-            realm: Realm::bootstrap(dom.document(), document_url),
+            realm,
             host_functions: Vec::new(),
             steps_remaining: limits.max_execution_steps,
             calls_active: 0,
@@ -324,7 +351,17 @@ impl JsRuntime {
             regexes: Vec::new(),
             regex_cache: std::collections::HashMap::new(),
             console_messages: Vec::new(),
-            window_event_handlers: BTreeMap::new(),
+            window_event_handlers: vec![BTreeMap::new()],
+            contexts: vec![BrowsingContextRecord {
+                document: Some(dom.document()),
+                url: document_url.clone(),
+                frame: None,
+            }],
+            frames: BTreeMap::new(),
+            caller_realms: Vec::new(),
+            internal_tasks: BTreeMap::new(),
+            nested_scan_revision: None,
+            document_loader: None,
             next_symbol_id: crate::value::FIRST_DYNAMIC_SYMBOL_ID,
             global_symbol_registry: BTreeMap::new(),
             call_stack: Vec::new(),
@@ -371,13 +408,29 @@ impl JsRuntime {
     /// realm, so a failure there is a bug in the runtime.
     pub fn create_realm(&mut self, dom: &mut Dom) -> RealmId {
         let realm = self.realm.create_realm();
-        self.global_bindings.push(BTreeMap::new());
-        self.modules.push(BTreeMap::new());
+        self.push_realm_state(None, None, None);
         self.with_realm(realm, |runtime| {
             runtime.run_self_hosted(dom, INTRINSICS_PRELUDE_SOURCE)
         })
         .expect("the ECMAScript built-ins install in a fresh realm");
         realm
+    }
+
+    /// Adds the per-realm tables for a realm that was just created.
+    fn push_realm_state(
+        &mut self,
+        document: Option<NodeId>,
+        url: Option<Url>,
+        frame: Option<NodeId>,
+    ) {
+        self.global_bindings.push(BTreeMap::new());
+        self.modules.push(BTreeMap::new());
+        self.window_event_handlers.push(BTreeMap::new());
+        self.contexts.push(BrowsingContextRecord {
+            document,
+            url: url.unwrap_or_else(|| Url::parse("about:blank").expect("constant URL")),
+            frame,
+        });
     }
 
     /// Runs `body` with `realm` as the current realm, the realm of the running
@@ -786,6 +839,13 @@ impl JsRuntime {
         dom: &mut Dom,
         id: u64,
     ) -> (Option<f64>, Result<(), JsError>) {
+        if let Some(task) = self.internal_tasks.remove(&id) {
+            self.steps_remaining = self.limits.max_execution_steps;
+            self.calls_active = 0;
+            self.dom_nodes_created = 0;
+            self.environment.clear();
+            return (None, self.run_internal_task(dom, task));
+        }
         let Some(entry) = self.timers.get(&id).cloned() else {
             return (None, Ok(()));
         };
@@ -798,6 +858,7 @@ impl JsRuntime {
         self.environment.clear();
         let outcome = self.call(dom, entry.callback, &entry.arguments).map(|_| ());
         self.queue_mutation_deliveries(dom);
+        self.sync_nested_contexts(dom);
         let repeats = entry.kind == TimerKind::Interval && self.timers.contains_key(&id);
         (repeats.then_some(entry.delay_ms), outcome)
     }
@@ -956,7 +1017,10 @@ impl JsRuntime {
         // Window-level dispatch: the document is the propagation target and
         // `window_event_handlers` listeners run last, matching every other
         // window event this runtime fires. Listener throws are ignored.
-        let _ = self.dispatch_prepared_event(dom, dom.document(), event, "error", false);
+        let document = self.contexts[self.realm.current_realm().0]
+            .document
+            .unwrap_or_else(|| dom.document());
+        let _ = self.dispatch_prepared_event(dom, document, event, "error", false);
     }
 
     /// The committed document URL, used as the `filename` field of window
@@ -1115,6 +1179,7 @@ impl JsRuntime {
         if let Err(error) = &outcome {
             self.report_uncaught_error(dom, error);
         }
+        self.sync_nested_contexts(dom);
         outcome
     }
 

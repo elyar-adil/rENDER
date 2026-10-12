@@ -224,11 +224,16 @@ fn first_unsupported_capability(ctx: &TestContext<'_>) -> Option<Capability> {
         .filter_map(|s| s.inline.as_deref())
         .collect();
     let classification = crate::classify::classify(&scan, &inline, None, None);
+    // This adapter hosts one document and no nested ones, so it declines nested
+    // tests even where the engine's own adapter can drive them.
     classification
         .capabilities
         .iter()
         .copied()
-        .find(|c| !crate::classify::capability_is_available(*c))
+        .find(|c| {
+            !crate::classify::capability_is_available(*c)
+                || *c == Capability::NestedBrowsingContext
+        })
 }
 
 /// Walk one area, yielding suite-relative test paths in a stable order.

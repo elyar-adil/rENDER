@@ -144,6 +144,41 @@ pub struct WptHarnessEngine {
     /// Number of `PASS` results seen, so a run that suddenly passes everything
     /// is visible in the output rather than only in the numerator.
     passed: u32,
+    /// The pinned checkout. Nested browsing contexts load their documents and
+    /// scripts from it, through [`SuiteLoader`].
+    suite_root: std::path::PathBuf,
+}
+
+/// The host that WPT's own test server serves the suite from. The suite is
+/// read from disk instead, so a test's URLs resolve against this host and map
+/// onto the checkout.
+const WPT_HOST: &str = "web-platform.test";
+
+/// The URL a suite test runs at: its path under the suite's own host.
+fn test_url(path: &str) -> url::Url {
+    url::Url::parse(&format!("http://{WPT_HOST}/{path}"))
+        .unwrap_or_else(|_| url::Url::parse("about:blank").expect("constant URL"))
+}
+
+/// Serves the pinned checkout to nested browsing contexts: a URL under the
+/// suite's host names a file under the checkout, and every other URL is
+/// unavailable.
+#[derive(Debug)]
+struct SuiteLoader {
+    root: std::path::PathBuf,
+}
+
+impl render_core::js::DocumentLoader for SuiteLoader {
+    fn load_text(&mut self, url: &url::Url) -> Option<String> {
+        if url.host_str() != Some(WPT_HOST) {
+            return None;
+        }
+        let relative = url.path().trim_start_matches('/');
+        if relative.split('/').any(|part| part == "..") {
+            return None;
+        }
+        std::fs::read_to_string(self.root.join(relative)).ok()
+    }
 }
 
 impl WptHarnessEngine {
@@ -167,6 +202,7 @@ impl WptHarnessEngine {
             harness,
             limits,
             passed: 0,
+            suite_root: suite_root.to_path_buf(),
         })
     }
 
@@ -220,7 +256,10 @@ impl WptHarnessEngine {
         // document between tests would let state leak and turn an engine
         // ordering bug into a hundred apparent failures.
         let mut parsed = parse_document(ctx.source);
-        let mut runtime = JsRuntime::with_limits(&parsed.dom, self.limits);
+        let mut runtime = JsRuntime::with_limits_and_url(&parsed.dom, self.limits, &test_url(ctx.path));
+        runtime.set_document_loader(Box::new(SuiteLoader {
+            root: self.suite_root.clone(),
+        }));
 
         // 1. Load WPT's harness, unmodified, from the pinned checkout.
         runtime

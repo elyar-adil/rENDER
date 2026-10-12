@@ -5081,7 +5081,15 @@ impl JsRuntime {
                         None => Ok(JsValue::Null),
                     };
                 }
-                "ownerDocument" => return Ok(JsValue::Object(self.realm.document_object())),
+                "contentWindow" | "contentDocument"
+                    if super::nested::is_html_element(dom, node, "iframe") =>
+                {
+                    return Ok(self.frame_content(dom, node, property == "contentDocument"));
+                }
+                "ownerDocument" => {
+                    let owner = self.realm_of_node(dom, node);
+                    return Ok(JsValue::Object(self.realm.document_of(owner)));
+                }
                 "children" | "childNodes" => {
                     self.ensure_heap_capacity(1)?;
                     let elements_only = property == "children";
@@ -6233,13 +6241,21 @@ impl JsRuntime {
         receiver: JsValue,
     ) -> Result<JsValue, JsError> {
         let target_realm = self.realm.object_realm(callee);
-        if target_realm == self.realm.current_realm() {
-            return self.call_in_current_realm(dom, callee, arguments, receiver);
-        }
-        let previous_realm = self.realm.enter_realm(target_realm);
-        let result = self.call_in_current_realm(dom, callee, arguments, receiver);
-        let result = self.thrown_in_current_realm(result);
-        self.realm.enter_realm(previous_realm);
+        // The realm the call is made from. A native that acts for its caller, such
+        // as `postMessage`, reads it from `caller_realms`, because the callee's
+        // realm is current while it runs.
+        let caller_realm = self.realm.current_realm();
+        self.caller_realms.push(caller_realm);
+        let result = if target_realm == caller_realm {
+            self.call_in_current_realm(dom, callee, arguments, receiver)
+        } else {
+            let previous_realm = self.realm.enter_realm(target_realm);
+            let result = self.call_in_current_realm(dom, callee, arguments, receiver);
+            let result = self.thrown_in_current_realm(result);
+            self.realm.enter_realm(previous_realm);
+            result
+        };
+        self.caller_realms.pop();
         result
     }
 

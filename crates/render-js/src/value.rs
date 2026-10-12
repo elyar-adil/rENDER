@@ -952,6 +952,8 @@ pub(crate) enum NativeFunction {
     StyleRemoveProperty,
     StyleItem,
     QueueMicrotask,
+    /// `Window.prototype.postMessage`, bound to the window it is installed on.
+    WindowPostMessage,
     PromiseResolve,
     PromiseReject,
     PromiseThen,
@@ -3036,9 +3038,72 @@ impl Realm {
         id
     }
 
+    /// The realm of a browsing context: `CreateRealm()` plus the host globals
+    /// (`window`, `document`, `location`, ...) bound to `document_node` and
+    /// `document_url`. It shares this heap, so its objects and the page's
+    /// objects can name each other directly.
+    pub(crate) fn create_document_realm(
+        &mut self,
+        document_node: NodeId,
+        document_url: &Url,
+    ) -> RealmId {
+        let id = RealmId(self.realms.len());
+        let base = self.objects.len();
+        let record =
+            Self::install_intrinsics(&mut self.objects, Some((document_node, document_url)));
+        for object in &mut self.objects[base..] {
+            object.realm = id;
+        }
+        self.realms.push(record);
+        let previous = self.enter_realm(id);
+        self.install_temporal();
+        self.enter_realm(previous);
+        id
+    }
+
+    /// The global object of `realm`, whichever realm is current.
+    pub(crate) fn global_of(&self, realm: RealmId) -> ObjectId {
+        self.realms[realm.0].global
+    }
+
+    /// The document object of `realm`, whichever realm is current.
+    pub(crate) fn document_of(&self, realm: RealmId) -> ObjectId {
+        self.realms[realm.0].document
+    }
+
+    /// Points the `parent`, `top` and `frameElement` globals of a browsing
+    /// context at its embedding. `install_host_globals` gives every new realm
+    /// itself for all three, which is right only for a top-level window.
+    pub(crate) fn set_frame_relations(
+        &mut self,
+        realm: RealmId,
+        parent: ObjectId,
+        top: ObjectId,
+        frame_element: JsValue,
+    ) {
+        let global = self.realms[realm.0].global;
+        for (name, value) in [
+            ("parent", JsValue::Object(parent)),
+            ("top", JsValue::Object(top)),
+            ("frameElement", frame_element),
+        ] {
+            self.objects[global.0].properties.insert(
+                name.to_owned(),
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value,
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                },
+            );
+        }
+    }
+
     /// Installs the intrinsics and global object of one realm into `objects`.
-    /// `host` is the page's document and URL; only the page's realm gets the
-    /// host globals (`install_host_globals`).
+    /// `host` is the document and URL a realm's host globals are bound to: the
+    /// page's, or a browsing context's, and `None` for a plain `CreateRealm`.
     #[allow(
         clippy::too_many_lines,
         reason = "bootstrap installs every builtin in one explicit sequence"
@@ -3351,6 +3416,25 @@ impl Realm {
                 getter: None,
                 setter: None,
                 value: JsValue::Object(queue_microtask),
+                writable: true,
+                enumerable: false,
+                configurable: true,
+            },
+        );
+        let post_message = ObjectId(objects.len());
+        objects.push(JsObject {
+            host: ObjectHost::BoundFunction {
+                function: NativeFunction::WindowPostMessage,
+                receiver: global,
+            },
+            ..JsObject::default()
+        });
+        objects[global.0].properties.insert(
+            "postMessage".to_owned(),
+            PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: JsValue::Object(post_message),
                 writable: true,
                 enumerable: false,
                 configurable: true,
