@@ -407,19 +407,19 @@ pub(in crate::runtime) fn dataset_attribute_from_member(property: &str) -> Optio
     Some(mapped)
 }
 
+/// The content attribute behind an element property that is not reflected by
+/// the interface tables in `reflect.rs` (HTML "Reflecting content attributes in IDL attributes"). What remains here is the
+/// `Element`-level `id`, the SVG and `MathML` names that have no interface table
+/// yet, and the form-control and focus names, whose reflection belongs to those
+/// areas. Anything an interface table reflects is looked up there first.
 pub(in crate::runtime) fn node_attribute_property(property: &str) -> Option<&str> {
     match property {
         "id" => Some("id"),
         "className" => Some("class"),
         "value" => Some("value"),
         "name" => Some("name"),
-        "title" => Some("title"),
         "href" => Some("href"),
         "src" => Some("src"),
-        "srcset" | "srcSet" => Some("srcset"),
-        "sizes" => Some("sizes"),
-        "poster" => Some("poster"),
-        "loading" => Some("loading"),
         "width" => Some("width"),
         "height" => Some("height"),
         "alt" => Some("alt"),
@@ -429,12 +429,10 @@ pub(in crate::runtime) fn node_attribute_property(property: &str) -> Option<&str
         "action" => Some("action"),
         "method" => Some("method"),
         "target" => Some("target"),
-        "rel" => Some("rel"),
         "tabIndex" => Some("tabindex"),
         "disabled" => Some("disabled"),
         "checked" => Some("checked"),
         "selected" => Some("selected"),
-        "hidden" => Some("hidden"),
         "readOnly" => Some("readonly"),
         "required" => Some("required"),
         "multiple" => Some("multiple"),
@@ -449,7 +447,6 @@ pub(in crate::runtime) fn node_boolean_property(property: &str) -> bool {
         "disabled"
             | "checked"
             | "selected"
-            | "hidden"
             | "readOnly"
             | "required"
             | "multiple"
@@ -863,6 +860,46 @@ impl JsRuntime {
             pending.extend(dom.children(node).unwrap_or_default().iter().rev());
         }
         Ok(None)
+    }
+
+    /// `document.title` (HTML "The title element"): the text of the first `title` element in
+    /// tree order, with ASCII whitespace stripped and collapsed; "" when there is
+    /// no title element.
+    pub(in crate::runtime) fn document_title(
+        &mut self,
+        dom: &Dom,
+        document: NodeId,
+    ) -> Result<String, JsError> {
+        Ok(match self.find_element_by_tag(dom, document, "title")? {
+            Some(title) => self
+                .text_content(dom, title)?
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => String::new(),
+        })
+    }
+
+    /// Assign `document.title`: the first `title` element's text is replaced. With
+    /// no title element, a new one is appended to `head`, and a document without a
+    /// head is left unchanged.
+    pub(in crate::runtime) fn set_document_title(
+        &mut self,
+        dom: &mut Dom,
+        document: NodeId,
+        text: String,
+    ) -> Result<(), JsError> {
+        let title = if let Some(title) = self.find_element_by_tag(dom, document, "title")? {
+            title
+        } else {
+            let Some(head) = self.find_element_by_tag(dom, document, "head")? else {
+                return Ok(());
+            };
+            let title = dom.create_element("title");
+            dom.append_child(head, title)?;
+            title
+        };
+        self.set_text_content(dom, title, text)
     }
 
     pub(in crate::runtime) fn class_list_tokens(

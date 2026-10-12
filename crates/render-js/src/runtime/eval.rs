@@ -47,7 +47,9 @@ use crate::runtime::builtins::dom::html_element_type;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
+use crate::runtime::builtins::hyperlink::is_hyperlink_component;
 use crate::runtime::builtins::object::PropertyName;
+use crate::runtime::builtins::reflect::is_document_colour;
 use crate::runtime::builtins::string::string_method_native;
 use crate::runtime::builtins::style::STYLE_METHOD_PROPERTIES;
 use crate::runtime::convert::abstract_equal;
@@ -4821,6 +4823,17 @@ impl JsRuntime {
                 _ => {}
             }
         }
+        // Reflected IDL attributes (reflect.rs) and the URL components of `a` and
+        // `area` (hyperlink.rs) are read before any host-specific property, none
+        // of which names one.
+        if let Some(ObjectHost::Node(node)) = self.realm.host(object) {
+            if let Some(rule) = Self::reflected_attribute(dom, node, property) {
+                return self.read_reflected(dom, node, rule);
+            }
+            if is_hyperlink_component(dom, node, property) {
+                return self.read_hyperlink_component(dom, node, property);
+            }
+        }
         match self.realm.host(object) {
             Some(ObjectHost::Document(document)) => match property {
                 "documentElement" | "body" | "head" => {
@@ -4867,6 +4880,13 @@ impl JsRuntime {
                         .map(|child| self.wrap_node(dom, child))
                         .collect::<Result<Vec<_>, _>>()?;
                     return Ok(JsValue::Object(self.create_array_from_values(&values)?));
+                }
+                "title" => {
+                    let title = self.document_title(dom, document)?;
+                    return Ok(JsValue::String(title.into()));
+                }
+                property if is_document_colour(property) => {
+                    return self.read_document_colour(dom, document, property);
                 }
                 "readyState" => {
                     return Ok(JsValue::String(
@@ -5362,9 +5382,15 @@ impl JsRuntime {
         property: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
-        let reacts = matches!(self.realm.host(object), Some(ObjectHost::Node(_)))
-            && (matches!(property, "innerHTML" | "outerHTML" | "textContent")
-                || node_attribute_property(property).is_some());
+        let reacts = match self.realm.host(object) {
+            Some(ObjectHost::Node(node)) => {
+                matches!(property, "innerHTML" | "outerHTML" | "textContent")
+                    || Self::reflected_attribute(dom, node, property).is_some()
+                    || is_hyperlink_component(dom, node, property)
+                    || node_attribute_property(property).is_some()
+            }
+            _ => false,
+        };
         if !reacts {
             return self.set_member_native(dom, object, property, value);
         }
@@ -5411,6 +5437,16 @@ impl JsRuntime {
         {
             self.js_cookie_store(&(value.to_js_string()).to_lossy());
             return Ok(());
+        }
+        if let (Some(ObjectHost::Document(document)), "title") = (self.realm.host(object), property)
+        {
+            let text = (value.to_js_string()).to_lossy();
+            return self.set_document_title(dom, document, text);
+        }
+        if let (Some(ObjectHost::Document(document)), true) =
+            (self.realm.host(object), is_document_colour(property))
+        {
+            return self.write_document_colour(dom, document, property, &value);
         }
         if let Some(base) = location_base {
             if property == "href" {
@@ -5546,6 +5582,13 @@ impl JsRuntime {
                         }
                     }
                     return Ok(());
+                }
+                if let Some(rule) = Self::reflected_attribute(dom, node, property) {
+                    return self.write_reflected(dom, node, rule, &value);
+                }
+                if is_hyperlink_component(dom, node, property) {
+                    let text = self.to_string_value(dom, &value)?.to_lossy();
+                    return self.write_hyperlink_component(dom, node, property, &text);
                 }
                 if let Some(attribute) = node_attribute_property(property) {
                     if node_boolean_property(property) && !value.is_truthy() {

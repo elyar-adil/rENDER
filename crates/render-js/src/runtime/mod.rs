@@ -168,6 +168,9 @@ pub struct JsRuntime {
     /// Per-event dispatch state, present only while the event is dispatched.
     event_flags: BTreeMap<ObjectId, types::EventFlags>,
     event_handlers: BTreeMap<NodeId, BTreeMap<String, ObjectId>>,
+    /// The document base URL that reflected URL attributes resolve against,
+    /// keyed by the DOM revision it was computed at (see `reflect.rs`).
+    reflection_base_cache: Option<(DomRevision, Option<url::Url>)>,
     /// Global lexical declarations of each realm, indexed by [`RealmId`].
     global_bindings: Vec<BTreeMap<String, GlobalBinding>>,
     timers: BTreeMap<u64, TimerEntry>,
@@ -304,6 +307,7 @@ impl JsRuntime {
             event_listeners: BTreeMap::new(),
             event_flags: BTreeMap::new(),
             event_handlers: BTreeMap::new(),
+            reflection_base_cache: None,
             global_bindings: vec![BTreeMap::new()],
             timers: BTreeMap::new(),
             next_timer_id: 1,

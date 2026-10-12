@@ -369,3 +369,221 @@ fn element_type_returns_the_spec_default_and_canonical_keyword() {
         "submit,reset,submit,text,checkbox,textarea,output,fieldset"
     );
 }
+
+/// Evaluate `source` in a document at `url` whose markup is `page`.
+fn eval_at(page: &str, url: &str, source: &str) -> String {
+    let mut dom = parse_document(page).dom;
+    let document_url = url::Url::parse(url).expect("document url");
+    let mut runtime = JsRuntime::with_url(&dom, &document_url);
+    let value = runtime
+        .execute(&mut dom, source)
+        .unwrap_or_else(|error| panic!("{source}\n=> {error}"))
+        .value
+        .to_js_string()
+        .to_lossy();
+    assert!(runtime.prelude_error().is_none());
+    value
+}
+
+#[test]
+fn boolean_reflection_adds_and_removes_the_attribute() {
+    // HTML "Reflecting content attributes": the getter reports presence; the setter adds "" or removes.
+    assert_eq!(
+        eval(
+            "var p = document.getElementById('para'); var out = [p.hidden]; \
+             p.hidden = true; out.push(p.hidden, p.getAttribute('hidden') === ''); \
+             p.hidden = false; out.push(p.hidden, p.hasAttribute('hidden')); out.join()"
+        ),
+        "false,true,true,false,false"
+    );
+}
+
+#[test]
+fn enumerated_reflection_reads_canonical_keywords_and_no_state() {
+    // HTML "Enumerated attributes": keywords match ASCII case-insensitively and read in their
+    // canonical case. `dir` has no missing or invalid default, so both read "".
+    assert_eq!(
+        eval(
+            "var p = document.getElementById('para'); var out = [p.dir === '']; \
+             p.setAttribute('dir', 'RTL'); out.push(p.dir); \
+             p.dir = 'auto'; out.push(p.getAttribute('dir')); \
+             p.dir = 'sideways'; out.push(p.getAttribute('dir'), p.dir === ''); out.join()"
+        ),
+        "true,rtl,auto,sideways,true"
+    );
+}
+
+#[test]
+fn enumerated_reflection_nullable_default_and_invalid_value() {
+    // The script crossOrigin attribute is nullable: missing reads null, an
+    // invalid value reads its invalid default, and writing null removes it.
+    assert_eq!(
+        eval(
+            "var s = document.createElement('script'); var out = [s.crossOrigin === null]; \
+             s.setAttribute('crossorigin', ''); out.push(s.crossOrigin); \
+             s.crossOrigin = 'use-credentials'; out.push(s.getAttribute('crossorigin')); \
+             s.crossOrigin = null; out.push(s.hasAttribute('crossorigin')); out.join()"
+        ),
+        "true,anonymous,use-credentials,false"
+    );
+}
+
+#[test]
+fn enumerated_reflection_with_missing_and_invalid_defaults() {
+    // Media preload reads metadata when absent. Track kind reads subtitles when
+    // absent and metadata when invalid (HTML "The track element").
+    assert_eq!(
+        eval(
+            "var v = document.createElement('video'); var t = document.createElement('track'); \
+             var out = [v.preload, t.kind]; v.setAttribute('preload', 'AUTO'); out.push(v.preload); \
+             t.setAttribute('kind', 'bogus'); out.push(t.kind); out.join()"
+        ),
+        "metadata,subtitles,auto,metadata"
+    );
+}
+
+#[test]
+fn integer_reflection_parses_with_its_default() {
+    // `long` (HTML "Reflecting content attributes"): the rules for parsing integers, defaulting when the
+    // value is absent, not an integer, or outside the signed 32-bit range.
+    assert_eq!(
+        eval(
+            "var li = document.getElementById('one'); var out = [li.value]; \
+             li.value = '7'; out.push(li.value, li.getAttribute('value')); \
+             li.setAttribute('value', ' +12x'); out.push(li.value); \
+             li.setAttribute('value', '2147483648'); out.push(li.value); \
+             li.value = 2147483648; out.push(li.getAttribute('value')); \
+             var ol = document.createElement('ol'); out.push(ol.start); \
+             ol.start = -5; out.push(ol.start); out.join()"
+        ),
+        "0,7,7,12,0,-2147483648,1,-5"
+    );
+}
+
+#[test]
+fn unsigned_integer_reflection_clamps_and_defaults() {
+    // Table cells (HTML "The td element" and "The th element"): colSpan clamps to [1, 1000] and rowSpan to
+    // [0, 65534]; both default to 1. Canvas defaults to 300 by 150.
+    assert_eq!(
+        eval(
+            "var td = document.createElement('td'); var out = [td.colSpan, td.rowSpan]; \
+             td.colSpan = 0; out.push(td.getAttribute('colspan'), td.colSpan); \
+             td.colSpan = 5000; out.push(td.colSpan); \
+             td.setAttribute('colspan', '-3'); out.push(td.colSpan); \
+             td.rowSpan = 0; out.push(td.rowSpan); \
+             var c = document.createElement('canvas'); out.push(c.width, c.height); out.join()"
+        ),
+        "1,1,0,1,1000,1,0,300,150"
+    );
+}
+
+#[test]
+fn url_reflection_resolves_against_the_base_element_and_tracks_it() {
+    // HTML "Reflecting content attributes" (URL reflection) and "document base URL": the first
+    // base element with an href sets the base, and a later change to it is seen.
+    let page = "<!doctype html><html><head><base href='/base/'></head>\
+                <body><a id=a href='page.html'>x</a><a id=b>y</a></body></html>";
+    assert_eq!(
+        eval_at(
+            page,
+            "https://example.test/dir/index.html",
+            "var a = document.getElementById('a'); var b = document.getElementById('b'); \
+             var out = [a.href, b.href]; b.href = 'other'; out.push(b.href, b.getAttribute('href')); \
+             document.querySelector('base').setAttribute('href', '/moved/'); out.push(a.href); out.join()"
+        ),
+        "https://example.test/base/page.html,,https://example.test/base/other,other,https://example.test/moved/page.html"
+    );
+}
+
+#[test]
+fn reflection_is_limited_to_the_interfaces_that_declare_it() {
+    // `download` belongs to HTMLAnchorElement and HTMLAreaElement only, while
+    // the ARIA reflection (on Element) reads its missing default on any element.
+    assert_eq!(
+        eval(
+            "var p = document.createElement('p'); var div = document.createElement('div'); \
+             var out = [p.download === undefined, document.createElement('a').download === '']; \
+             out.push(div.ariaLive); div.ariaLive = 'POLITE'; out.push(div.getAttribute('aria-live'), div.ariaLive); \
+             out.join()"
+        ),
+        "true,true,off,POLITE,polite"
+    );
+}
+
+#[test]
+fn form_control_properties_keep_their_existing_behaviour() {
+    // Form controls keep the legacy value and type behaviour until the form
+    // reflection tables replace it.
+    assert_eq!(
+        eval(
+            "var i = document.createElement('input'); i.value = 'abc'; \
+             [i.value, i.type, i.getAttribute('value')].join()"
+        ),
+        "abc,text,abc"
+    );
+}
+
+#[test]
+fn translate_is_inherited_from_the_nearest_attribute() {
+    // HTML "The translate attribute": an element is translate-enabled unless the nearest `translate`
+    // attribute (on it or an ancestor) says `no`; the setter stores `yes` or `no`.
+    assert_eq!(
+        eval(
+            "var d = document.createElement('div'); var c = document.createElement('span'); \
+             d.appendChild(c); var out = [c.translate]; d.translate = false; \
+             out.push(c.translate, d.getAttribute('translate')); c.translate = true; \
+             out.push(c.getAttribute('translate'), c.translate); out.join()"
+        ),
+        "true,false,no,yes,true"
+    );
+}
+
+#[test]
+fn document_title_strips_and_collapses_and_creates_a_title() {
+    // HTML "The title element": the getter strips and collapses ASCII whitespace; the setter
+    // replaces the first title, or appends one to head when there is none.
+    assert_eq!(
+        eval(
+            "var out = [document.title]; document.title = '  A   b\\n c  '; out.push(document.title); out.join('|')"
+        ),
+        "t|A b c"
+    );
+    assert_eq!(
+        eval_at(
+            "<!doctype html><html><head></head><body></body></html>",
+            "https://example.test/",
+            "var out = [document.title === '']; document.title = 'New'; \
+             out.push(document.title, document.getElementsByTagName('title').length); out.join()"
+        ),
+        "true,New,1"
+    );
+}
+
+#[test]
+fn anchor_text_is_its_text_content() {
+    // HTML "The a element": `text` reads and writes the element's textContent.
+    assert_eq!(
+        eval(
+            "var a = document.createElement('a'); a.textContent = 'x y'; var out = [a.text]; \
+             a.text = 'z'; out.push(a.textContent); out.join()"
+        ),
+        "x y,z"
+    );
+}
+
+#[test]
+fn legacy_document_colours_reflect_the_body_attributes() {
+    // The obsolete document.fgColor (and bgColor, linkColor, vlinkColor,
+    // alinkColor) read and write the body's text, bgcolor, link, vlink and alink
+    // attributes, and a null write stores the empty string.
+    assert_eq!(
+        eval_at(
+            "<!doctype html><html><body text=red></body></html>",
+            "https://example.test/",
+            "var out = [document.fgColor]; document.bgColor = 'green'; \
+             out.push(document.body.getAttribute('bgcolor'), document.bgColor); \
+             document.fgColor = null; out.push(document.body.hasAttribute('text'), document.fgColor === ''); out.join()"
+        ),
+        "red,green,green,true,true"
+    );
+}
