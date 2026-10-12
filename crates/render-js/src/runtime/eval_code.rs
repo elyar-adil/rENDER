@@ -14,17 +14,17 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::RealmId;
+use crate::annex_b::function_declaration;
+use crate::annex_b::lexical_declarations;
+use crate::annex_b::mark_block_functions;
 use crate::lexer;
-use crate::parser::BindingTarget;
 use crate::parser::EvalContext;
-use crate::parser::FunctionKind;
 use crate::parser::Statement;
 use crate::parser::VariableKind;
 use crate::parser::collect_var_names;
 use crate::parser::parse_eval;
 use crate::runtime::JsRuntime;
 use crate::runtime::eval::Completion;
-use crate::runtime::eval::labelled_function;
 use crate::runtime::types::Binding;
 use crate::runtime::types::ClassFrame;
 use crate::runtime::types::EnvironmentRecord;
@@ -45,191 +45,6 @@ fn syntax_error(message: impl Into<String>) -> JsError {
 /// Strips a parse error's offset, which indexes the eval source, not the caller's.
 fn without_offset(error: &JsError) -> JsError {
     JsError::new(error.kind(), error.message(), None)
-}
-
-/// The function declaration a statement of a statement list is: a plain
-/// declaration, or one a label names (Annex B.3.2).
-fn function_declaration(statement: &Statement) -> Option<&Statement> {
-    match statement {
-        Statement::Function { .. } => Some(statement),
-        _ => labelled_function(statement),
-    }
-}
-
-/// The lexical declarations a statement makes directly in its statement list.
-fn lexical_declarations(statement: &Statement, out: &mut Vec<(String, VariableKind)>) {
-    match statement {
-        Statement::Variable { kind, name, .. } if *kind != VariableKind::Var => {
-            out.push((name.clone(), *kind));
-        }
-        Statement::VariableList {
-            kind, declarations, ..
-        } if *kind != VariableKind::Var => {
-            for (target, _) in declarations {
-                out.extend(target.names().into_iter().map(|name| (name, *kind)));
-            }
-        }
-        Statement::Class { name, .. } => out.push((name.clone(), VariableKind::Let)),
-        _ => {}
-    }
-}
-
-/// The names a statement list declares lexically. Function declarations in a
-/// block are lexical too; at the top of a script they are not.
-fn lexical_names(statements: &[Statement], functions: bool) -> Vec<String> {
-    let mut names = Vec::new();
-    for statement in statements {
-        if functions && let Some(Statement::Function { name, .. }) = function_declaration(statement)
-        {
-            names.push(name.clone());
-            continue;
-        }
-        let mut declared = Vec::new();
-        lexical_declarations(statement, &mut declared);
-        names.extend(declared.into_iter().map(|(name, _)| name));
-    }
-    names
-}
-
-/// The state of one Annex B.3.2.3 walk over the eval code: `accept` says whether
-/// a name gets a var binding in this eval, and `hoisted` collects the accepted names.
-struct AnnexB<'a> {
-    accept: &'a mut dyn FnMut(&str) -> bool,
-    hoisted: Vec<String>,
-}
-
-/// Marks the block-level function declarations of one statement list (ECMA-262
-/// B.3.2.3 step 1). `scope` holds the names the list's scope declares, and
-/// `enclosing` those of the scopes around it. A declaration is marked when a
-/// `var` of its name would be no early error, which needs the name to be
-/// declared once in its scope and not in any enclosing one, and `accept` agrees.
-fn mark_annex_b_list(
-    statements: &mut [Statement],
-    scope: &[String],
-    enclosing: &mut Vec<String>,
-    block: bool,
-    annex_b: &mut AnnexB<'_>,
-) {
-    if block {
-        for statement in statements.iter_mut() {
-            let Statement::Function {
-                name,
-                kind: FunctionKind::Normal,
-                annex_b_var,
-                ..
-            } = statement
-            else {
-                continue;
-            };
-            let declared_once = scope
-                .iter()
-                .filter(|other| other.as_str() == name.as_str())
-                .count()
-                == 1;
-            if declared_once && !enclosing.contains(name) && (annex_b.accept)(name.as_str()) {
-                *annex_b_var = true;
-                if !annex_b.hoisted.contains(name) {
-                    annex_b.hoisted.push(name.clone());
-                }
-            }
-        }
-    }
-    let depth = enclosing.len();
-    enclosing.extend(scope.iter().cloned());
-    for statement in statements.iter_mut() {
-        mark_annex_b_nested(statement, enclosing, annex_b);
-    }
-    enclosing.truncate(depth);
-}
-
-/// Descends from a statement into the statement lists it contains, each of which
-/// is a scope of its own, or shares one with the lists around it.
-fn mark_annex_b_nested(
-    statement: &mut Statement,
-    enclosing: &mut Vec<String>,
-    annex_b: &mut AnnexB<'_>,
-) {
-    match statement {
-        Statement::Block(statements) => {
-            let scope = lexical_names(statements, true);
-            mark_annex_b_list(statements, &scope, enclosing, true, annex_b);
-        }
-        Statement::If {
-            consequent,
-            alternate,
-            ..
-        } => {
-            mark_annex_b_nested(consequent, enclosing, annex_b);
-            if let Some(alternate) = alternate {
-                mark_annex_b_nested(alternate, enclosing, annex_b);
-            }
-        }
-        Statement::While { body, .. }
-        | Statement::DoWhile { body, .. }
-        | Statement::With { body, .. }
-        | Statement::Labeled { body, .. }
-        | Statement::ForInExpr { body, .. } => mark_annex_b_nested(body, enclosing, annex_b),
-        Statement::For {
-            initializer, body, ..
-        } => {
-            let depth = enclosing.len();
-            if let Some(initializer) = initializer {
-                enclosing.extend(lexical_names(std::slice::from_ref(&**initializer), false));
-            }
-            mark_annex_b_nested(body, enclosing, annex_b);
-            enclosing.truncate(depth);
-        }
-        Statement::ForIn {
-            kind, name, body, ..
-        }
-        | Statement::ForOf {
-            kind, name, body, ..
-        } => {
-            let depth = enclosing.len();
-            if *kind != VariableKind::Var {
-                enclosing.push(name.clone());
-            }
-            mark_annex_b_nested(body, enclosing, annex_b);
-            enclosing.truncate(depth);
-        }
-        Statement::Try {
-            body,
-            catch,
-            finally,
-            ..
-        } => {
-            let scope = lexical_names(body, true);
-            mark_annex_b_list(body, &scope, enclosing, true, annex_b);
-            if let Some(catch) = catch {
-                // A simple catch parameter may be `var`-declared (Annex B.3.4), so
-                // only a destructuring one shadows a block function here.
-                let depth = enclosing.len();
-                if let Some(parameter) = &catch.parameter
-                    && !matches!(parameter, BindingTarget::Name(_))
-                {
-                    enclosing.extend(parameter.names());
-                }
-                let scope = lexical_names(&catch.body, true);
-                mark_annex_b_list(&mut catch.body, &scope, enclosing, true, annex_b);
-                enclosing.truncate(depth);
-            }
-            if let Some(finally) = finally {
-                let scope = lexical_names(finally, true);
-                mark_annex_b_list(finally, &scope, enclosing, true, annex_b);
-            }
-        }
-        Statement::Switch { cases, .. } => {
-            // Every clause of a switch shares one block scope.
-            let mut scope = Vec::new();
-            for (_, statements) in cases.iter() {
-                scope.extend(lexical_names(statements, true));
-            }
-            for (_, statements) in cases.iter_mut() {
-                mark_annex_b_list(statements, &scope, enclosing, true, annex_b);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Creates a deletable var binding `name` in a function-scope record, holding
@@ -434,7 +249,7 @@ impl JsRuntime {
         self.environment.truncate(depth);
         match outcome? {
             Completion::Normal(value) => Ok(value),
-            Completion::Return(_) | Completion::Break(_) | Completion::Continue(_) => {
+            Completion::Return(_) | Completion::Break(..) | Completion::Continue(..) => {
                 Err(syntax_error("abrupt completion escaped eval code"))
             }
         }
@@ -525,15 +340,9 @@ impl JsRuntime {
         // also gets a var binding when no scope between the eval code and the
         // variable environment already binds its name.
         if !strict {
-            let scope = lexical_names(statements, false);
             let accept_var_scope = var_scope;
             let mut accept = |name: &str| self.annex_b_hoistable(name, accept_var_scope);
-            let mut annex_b = AnnexB {
-                accept: &mut accept,
-                hoisted: Vec::new(),
-            };
-            mark_annex_b_list(statements, &scope, &mut Vec::new(), false, &mut annex_b);
-            for name in annex_b.hoisted {
+            for name in mark_block_functions(statements, &mut accept) {
                 if !declared_functions.contains(&name) && !declared_vars.contains(&name) {
                     declared_vars.push(name);
                 }
@@ -627,10 +436,20 @@ impl JsRuntime {
 
     /// Whether the global environment binds `name` lexically
     /// (`HasLexicalDeclaration`).
-    fn global_lexical(&self, name: &str) -> bool {
+    pub(super) fn global_lexical(&self, name: &str) -> bool {
         self.global_bindings()
             .get(name)
             .is_some_and(|binding| binding.kind != VariableKind::Var)
+    }
+
+    /// Whether evaluating a block-level function declaration named `name` copies
+    /// its value to the var binding of that name (Annex B.3.2.1 and B.3.2.2 step 3).
+    /// Function code always has the binding. Global code has it only when
+    /// instantiation found the name not lexically bound and declarable
+    /// (`fnDefinable`), so the same test runs again here.
+    pub(super) fn annex_b_copies(&self, name: &str) -> bool {
+        self.variable_scope_depth().is_some()
+            || (!self.global_lexical(name) && self.can_declare_global_var(name))
     }
 
     /// Whether a var declaration of `name` conflicts with a binding between the

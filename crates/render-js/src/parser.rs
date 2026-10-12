@@ -9,6 +9,7 @@
 use super::lexer::{TemplatePart, Token, TokenKind, tokenize};
 use super::{JsError, JsErrorKind, RuntimeLimits};
 use crate::JsValue;
+use crate::annex_b;
 use crate::module::{
     DEFAULT_BINDING, IMPORT_META_BINDING, ImportEntry, ImportName, ImportPhase, IndirectExport,
     ModuleInfo,
@@ -304,10 +305,11 @@ pub(super) enum Statement {
         offset: usize,
         kind: FunctionKind,
         strict: bool,
-        /// Set by the eval instantiation of a sloppy direct or indirect eval on a
-        /// block-level declaration whose name that instantiation gave a `var`
-        /// binding (ECMA-262 B.3.2.3). Evaluating the declaration then copies its
-        /// block binding's value to the variable environment.
+        /// Set on a sloppy block-level plain function whose name Annex B.3.2 gives a
+        /// `var` binding: marked when its script or function body is parsed, or by
+        /// the eval instantiation of a sloppy eval (B.3.2.3). Evaluating the
+        /// declaration then copies its block binding's value to the variable
+        /// environment.
         annex_b_var: bool,
         source: SourceSpan,
     },
@@ -1291,10 +1293,15 @@ impl Parser {
     fn program(mut self) -> Result<(Vec<Statement>, bool), JsError> {
         self.strict = self.prologue_is_strict(self.cursor)?;
         let strict = self.strict;
-        let statements = self.statement_list(false)?;
+        let mut statements = self.statement_list(false)?;
         validate_declaration_conflicts(&statements, true, strict)?;
         if has_use_strict_directive(&statements) {
             validate_strict_statements(&statements)?;
+        }
+        // Annex B.3.2.2: whether each hoisted name gets its var binding is decided
+        // at instantiation, once the global environment is known.
+        if !strict {
+            annex_b::mark_block_functions(&mut statements, &mut |_| true);
         }
         Ok((statements, strict))
     }
@@ -4746,7 +4753,7 @@ impl Parser {
         self.switch_depth = previous_switch_depth;
         self.static_block = previous_static_block;
         self.static_block_await = previous_static_await;
-        let (parameters, body, strict) = result?;
+        let (parameters, mut body, strict) = result?;
         // ECMA-262 15.2.1.1 and 15.4.1.1: a duplicate parameter name is an early
         // error unless the function is sloppy, not a method, and has a simple
         // parameter list. Sloppy duplicates bind left to right, so the last wins.
@@ -4767,6 +4774,11 @@ impl Parser {
         if has_use_strict_directive(&body) {
             validate_strict_statements(&body)?;
         }
+        // Annex B.3.2.1: a sloppy body's block-level functions are marked here, since
+        // function code has no runtime condition beyond its parameter names.
+        if !strict {
+            annex_b::mark_function_body(&mut body, &parameters);
+        }
         Ok((parameters, body, strict))
     }
 
@@ -4786,6 +4798,15 @@ impl Parser {
         if !self.at(&TokenKind::RightParen) {
             loop {
                 if self.take(&TokenKind::Ellipsis) {
+                    // A rest element may destructure: the rest array is bound to an
+                    // anonymous slot, which the pattern is lowered from (ECMA-262 15.1.1).
+                    if self.at(&TokenKind::LeftBrace) || self.at(&TokenKind::LeftBracket) {
+                        let pattern = self.binding_pattern()?;
+                        let temporary = format!("\0param_{}", parameters.len());
+                        patterns.push((parameters.len(), temporary.clone(), pattern));
+                        parameters.push(format!("{PARAMETER_REST_MARKER}{temporary}"));
+                        break;
+                    }
                     let TokenKind::Identifier(parameter) = self.advance().kind else {
                         return Err(self.error("expected a rest parameter name"));
                     };
@@ -5842,7 +5863,7 @@ fn validate_strict_parameters(parameters: &[String]) -> Result<(), JsError> {
 }
 
 /// Strip a parameter's default/rest marker to recover its binding name.
-fn parameter_binding_name(parameter: &str) -> &str {
+pub(crate) fn parameter_binding_name(parameter: &str) -> &str {
     parameter
         .strip_prefix(PARAMETER_DEFAULT_MARKER)
         .or_else(|| parameter.strip_prefix(PARAMETER_REST_MARKER))

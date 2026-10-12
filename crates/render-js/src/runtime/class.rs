@@ -801,6 +801,14 @@ impl JsRuntime {
         dom: &mut Dom,
         property: &str,
     ) -> Result<JsValue, JsError> {
+        let receiver = self.current_this()?;
+        let base = self.super_prototype()?;
+        self.read_from_base(dom, base, property, receiver)
+    }
+
+    /// The base of a super reference: the home object's prototype, taken when the
+    /// reference is made (ECMA-262 `GetSuperBase`). `None` when that prototype is null.
+    pub(super) fn super_prototype(&self) -> Result<Option<ObjectId>, JsError> {
         let class = self.class_frame().ok_or_else(|| {
             JsError::new(JsErrorKind::Syntax, "'super' keyword unexpected here", None)
         })?;
@@ -811,15 +819,27 @@ impl JsRuntime {
                 None,
             ));
         };
-        let receiver = self.current_this()?;
-        let base = self.realm.get_prototype(home);
-        if self.realm.has_deferred_namespace() {
-            self.ensure_deferred_read(dom, base, property)?;
-        }
-        self.read_from_base(dom, base, property, receiver)
+        Ok(self.realm.get_prototype(home))
     }
 
-    fn read_from_base(
+    /// The parts of `super[key]` in the order ECMA-262 13.3.7.1 evaluates them:
+    /// `this` is checked, then the key expression runs, then the base is taken.
+    /// The key is returned unconverted, so the caller converts it at the point the
+    /// reference is used.
+    pub(super) fn super_computed_parts(
+        &mut self,
+        dom: &mut Dom,
+        property: &Expr,
+    ) -> Result<(Option<ObjectId>, JsValue, JsValue), JsError> {
+        let receiver = self.current_this()?;
+        let key = self.evaluate(dom, property)?;
+        let base = self.super_prototype()?;
+        Ok((base, receiver, key))
+    }
+
+    /// `[[Get]]` of `property` from a super base, with `receiver` as `this`. A null
+    /// base throws, since `GetValue` applies `ToObject` to it (ECMA-262 6.2.5.5).
+    pub(super) fn read_from_base(
         &mut self,
         dom: &mut Dom,
         base: Option<ObjectId>,
@@ -827,8 +847,13 @@ impl JsRuntime {
         receiver: JsValue,
     ) -> Result<JsValue, JsError> {
         let Some(base) = base else {
-            return Ok(JsValue::Undefined);
+            return Err(JsError::type_error(format!(
+                "Cannot read properties of null (reading '{property}')"
+            )));
         };
+        if self.realm.has_deferred_namespace() {
+            self.ensure_deferred_read(dom, Some(base), property)?;
+        }
         if self.realm.get_descriptor(base, property).is_none() {
             return Ok(JsValue::Undefined);
         }
@@ -859,21 +884,14 @@ impl JsRuntime {
     pub(super) fn read_super_symbol(
         &mut self,
         dom: &mut Dom,
+        base: Option<ObjectId>,
+        receiver: JsValue,
         symbol: &crate::JsSymbol,
     ) -> Result<JsValue, JsError> {
-        let class = self.class_frame().ok_or_else(|| {
-            JsError::new(JsErrorKind::Syntax, "'super' keyword unexpected here", None)
-        })?;
-        let Some(home) = class.home_object else {
-            return Err(JsError::new(
-                JsErrorKind::Syntax,
-                "'super' keyword unexpected here",
-                None,
+        let Some(mut owner) = base else {
+            return Err(JsError::type_error(
+                "Cannot read properties of null (reading a symbol)",
             ));
-        };
-        let receiver = self.current_this()?;
-        let Some(mut owner) = self.realm.get_prototype(home) else {
-            return Ok(JsValue::Undefined);
         };
         loop {
             match self.realm.own_symbol_property(owner, symbol) {
@@ -898,28 +916,22 @@ impl JsRuntime {
     pub(super) fn write_super_property(
         &mut self,
         dom: &mut Dom,
+        base: Option<ObjectId>,
+        receiver: JsValue,
         property: &str,
         value: JsValue,
     ) -> Result<(), JsError> {
-        let class = self.class_frame().ok_or_else(|| {
-            JsError::new(JsErrorKind::Syntax, "'super' keyword unexpected here", None)
-        })?;
-        let Some(home) = class.home_object else {
-            return Err(JsError::new(
-                JsErrorKind::Syntax,
-                "'super' keyword unexpected here",
-                None,
-            ));
+        // PutValue applies ToObject to the base, so a null base throws (ECMA-262 6.2.5.6).
+        let Some(base) = base else {
+            return Err(JsError::type_error(format!(
+                "Cannot set properties of null (setting '{property}')"
+            )));
         };
-        let receiver = self.current_this()?;
         // OrdinarySet reads the receiver's own descriptor, which a deferred namespace answers by evaluating its module.
         if let JsValue::Object(target) = receiver {
             self.ensure_deferred_namespace(dom, target, Some(property))?;
         }
-        let base = self.realm.get_prototype(home);
-        if let Some(base) = base
-            && let Some(descriptor) = self.realm.get_descriptor(base, property)
-        {
+        if let Some(descriptor) = self.realm.get_descriptor(base, property) {
             if descriptor.is_accessor() {
                 let Some(setter) = descriptor.setter else {
                     return Err(JsError::type_error("property has no setter"));

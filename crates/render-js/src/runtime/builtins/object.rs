@@ -35,7 +35,7 @@ use render_dom::Dom;
 
 /// A property key after `ToPropertyKey` (ECMA-262 7.1.19): a string name, or a
 /// symbol that addresses the object's symbol slots and never its string form.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(in crate::runtime) enum PropertyName {
     String(String),
     Symbol(JsSymbol),
@@ -957,7 +957,7 @@ impl JsRuntime {
     }
 
     /// `[[Get]]` of a field of a descriptor object, for a string or symbol key.
-    fn get_named_or_symbol(
+    pub(in crate::runtime) fn get_named_or_symbol(
         &mut self,
         dom: &mut Dom,
         object: ObjectId,

@@ -21,6 +21,8 @@ use crate::JsValue;
 use crate::ObjectId;
 use crate::PropertyDescriptor;
 use crate::Realm;
+use crate::annex_b::collect_hoisted_names;
+use crate::annex_b::labelled_function;
 use crate::parser::BinaryOp;
 use crate::parser::BindingPattern;
 use crate::parser::BindingTarget;
@@ -110,8 +112,11 @@ impl PrimitiveHint {
 pub(super) enum Completion {
     Normal(JsValue),
     Return(JsValue),
-    Break(Option<String>),
-    Continue(Option<String>),
+    /// A `break` and the value it carries. `None` is an empty completion value,
+    /// which the statements around the break fill in (ECMA-262 6.2.4 `UpdateEmpty`).
+    Break(Option<String>, Option<JsValue>),
+    /// A `continue` and the value it carries, with the same meaning as for `Break`.
+    Continue(Option<String>, Option<JsValue>),
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +128,15 @@ pub(super) enum AssignmentReference {
     Binding {
         name: String,
         scope: Option<usize>,
+    },
+    /// A property reference whose base and key are evaluated but not converted.
+    /// `ToObject(base)` and `ToPropertyKey(key)` run when the reference is read or
+    /// written (ECMA-262 6.2.5.5 `GetValue` and 6.2.5.6 `PutValue`), so a right-hand side
+    /// or an earlier destructuring step runs before either conversion.
+    /// [`Self::settle_reference`] performs the conversions once.
+    Pending {
+        base: JsValue,
+        key: JsValue,
     },
     Property {
         object: ObjectId,
@@ -136,7 +150,11 @@ pub(super) enum AssignmentReference {
         object: ObjectId,
         name: String,
     },
+    /// A `super` property. The base is the home object's prototype as it was when the
+    /// reference was made, and `receiver` is the `this` it was made with.
     SuperProperty {
+        base: Option<ObjectId>,
+        receiver: JsValue,
         property: String,
     },
 }
@@ -301,19 +319,6 @@ impl ArrayDestructuring {
     }
 }
 
-/// The plain function a chain of labels names, when a labelled function
-/// declaration (Annex B.3.2) is what the statement is. It is declared like an
-/// unlabelled function, so hoisting looks through the labels.
-pub(super) fn labelled_function(statement: &Statement) -> Option<&Statement> {
-    let mut inner = statement;
-    let mut labelled = false;
-    while let Statement::Labeled { body, .. } = inner {
-        inner = body.as_ref();
-        labelled = true;
-    }
-    (labelled && matches!(inner, Statement::Function { .. })).then_some(inner)
-}
-
 /// Whether `statement` completes empty, so it leaves the value of the statements
 /// before it as the completion value (ECMA-262 14.3.1.2, 14.3.3.2, 14.2.2 and
 /// 14.4.2): every variable and class declaration, every function declaration
@@ -376,6 +381,8 @@ impl JsRuntime {
         statements: &[Statement],
     ) -> Result<Completion, JsError> {
         let mut value = JsValue::Undefined;
+        // Whether `value` is a real value yet, or still the empty completion.
+        let mut has_value = false;
         for statement in statements {
             // Wrappers `ToObject` boxed for a previous statement are unreachable
             // from this one, so drop their GC pins; inside a native dispatch a
@@ -387,11 +394,20 @@ impl JsRuntime {
                 Completion::Normal(next) => {
                     if !completes_empty(statement) {
                         value = next;
+                        has_value = true;
                     }
                 }
+                // StatementList: UpdateEmpty(s, sl). A break or continue with an
+                // empty value takes the value the list has reached.
+                Completion::Break(label, None) if has_value => {
+                    return Ok(Completion::Break(label, Some(value)));
+                }
+                Completion::Continue(label, None) if has_value => {
+                    return Ok(Completion::Continue(label, Some(value)));
+                }
                 abrupt @ (Completion::Return(_)
-                | Completion::Break(_)
-                | Completion::Continue(_)) => {
+                | Completion::Break(..)
+                | Completion::Continue(..)) => {
                     return Ok(abrupt);
                 }
             }
@@ -555,6 +571,19 @@ impl JsRuntime {
                 )));
             }
         }
+        // Annex B.3.2.1 and B.3.2.2: a block-level function the parser marked also
+        // gets a var binding. Function code always creates it. Global code creates it
+        // only when the name is not lexically bound and can be declared
+        // (`fnDefinable`), and a name that cannot be declared is skipped rather than
+        // thrown on.
+        let mut hoisted = BTreeSet::new();
+        for statement in statements {
+            collect_hoisted_names(statement, &mut hoisted);
+        }
+        if self.environment.is_empty() {
+            hoisted.retain(|name| !self.global_lexical(name) && self.can_declare_global_var(name));
+        }
+        var_names.extend(hoisted);
         for (name, kind) in lexical_declarations {
             self.create_binding(&name, kind, false, JsValue::Undefined)?;
         }
@@ -628,9 +657,11 @@ impl JsRuntime {
                 } => {
                     // Sloppy code may repeat a block-level function declaration
                     // (Annex B.3.3.4); the last one wins, and the binding is shared.
+                    // The binding is mutable: BlockDeclarationInstantiation creates it
+                    // with CreateMutableBinding (ECMA-262 14.2.3).
                     if !function_names.contains(name)
                         && declarations
-                            .insert(name.clone(), VariableKind::Const)
+                            .insert(name.clone(), VariableKind::Let)
                             .is_some()
                     {
                         return Err(JsError::syntax(
@@ -1017,9 +1048,9 @@ impl JsRuntime {
                 name, annex_b_var, ..
             } => {
                 // A function declaration evaluates to an empty completion
-                // (ECMA-262 15.2.6). Annex B.3.2.3: a block-level declaration that
-                // eval instantiation gave a var binding copies its value there.
-                if *annex_b_var {
+                // (ECMA-262 15.2.6). Annex B.3.2: a block-level declaration that
+                // instantiation gave a var binding copies its value there.
+                if *annex_b_var && self.annex_b_copies(name) {
                     let function = self.lookup_binding(dom, name)?;
                     let scope = self.variable_scope_depth();
                     self.write_resolved_binding(dom, scope, name, function)?;
@@ -1104,13 +1135,24 @@ impl JsRuntime {
                 alternate,
                 ..
             } => {
-                if self.evaluate(dom, condition)?.is_truthy() {
-                    self.evaluate_statement(dom, consequent)
+                // An `if` is UpdateEmpty(stmtCompletion, undefined) (ECMA-262 14.6.2):
+                // a break or continue that leaves its clause empty carries undefined.
+                let completion = if self.evaluate(dom, condition)?.is_truthy() {
+                    self.evaluate_statement(dom, consequent)?
                 } else if let Some(alternate) = alternate {
-                    self.evaluate_statement(dom, alternate)
+                    self.evaluate_statement(dom, alternate)?
                 } else {
-                    Ok(Completion::Normal(JsValue::Undefined))
-                }
+                    return Ok(Completion::Normal(JsValue::Undefined));
+                };
+                Ok(match completion {
+                    Completion::Break(label, None) => {
+                        Completion::Break(label, Some(JsValue::Undefined))
+                    }
+                    Completion::Continue(label, None) => {
+                        Completion::Continue(label, Some(JsValue::Undefined))
+                    }
+                    other => other,
+                })
             }
             Statement::Switch {
                 expression, cases, ..
@@ -1127,11 +1169,15 @@ impl JsRuntime {
                     }
                     match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
-                        Completion::Continue(None) => {}
-                        Completion::Break(None) => break,
+                        Completion::Continue(None, carried) => take_carried(&mut value, carried),
+                        Completion::Break(None, carried) => {
+                            take_carried(&mut value, carried);
+                            break;
+                        }
                         returned @ Completion::Return(_) => return Ok(returned),
-                        labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                            return Ok(labeled);
+                        labeled @ (Completion::Break(Some(_), _)
+                        | Completion::Continue(Some(_), _)) => {
+                            return Ok(update_empty(labeled, &value));
                         }
                     }
                 }
@@ -1146,11 +1192,15 @@ impl JsRuntime {
                     self.consume_step()?;
                     match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                         Completion::Normal(next) => value = next,
-                        Completion::Continue(None) => {}
-                        Completion::Break(None) => break,
+                        Completion::Continue(None, carried) => take_carried(&mut value, carried),
+                        Completion::Break(None, carried) => {
+                            take_carried(&mut value, carried);
+                            break;
+                        }
                         returned @ Completion::Return(_) => return Ok(returned),
-                        labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                            return Ok(labeled);
+                        labeled @ (Completion::Break(Some(_), _)
+                        | Completion::Continue(Some(_), _)) => {
+                            return Ok(update_empty(labeled, &value));
                         }
                     }
                     if !self.evaluate(dom, condition)?.is_truthy() {
@@ -1222,16 +1272,18 @@ impl JsRuntime {
                     self.pending_loop_labels.clear();
                 }
                 match self.evaluate_statement(dom, body)? {
-                    Completion::Break(Some(target)) | Completion::Continue(Some(target))
-                        if *target == *label =>
-                    {
+                    // A labelled break ends the statement with the value it carries.
+                    Completion::Break(Some(target), carried) if *target == *label => {
+                        Ok(Completion::Normal(carried.unwrap_or(JsValue::Undefined)))
+                    }
+                    Completion::Continue(Some(target), _) if *target == *label => {
                         Ok(Completion::Normal(JsValue::Undefined))
                     }
                     other => Ok(other),
                 }
             }
-            Statement::Break(label) => Ok(Completion::Break(label.clone())),
-            Statement::Continue(label) => Ok(Completion::Continue(label.clone())),
+            Statement::Break(label) => Ok(Completion::Break(label.clone(), None)),
+            Statement::Continue(label) => Ok(Completion::Continue(label.clone(), None)),
             Statement::Block(statements) => self.evaluate_scoped_statements(dom, statements),
             Statement::With { object, body, .. } => self.evaluate_with_statement(dom, object, body),
             Statement::Expression(expression) => {
@@ -1286,12 +1338,24 @@ impl JsRuntime {
         let Some(start) = start else {
             return Ok(Completion::Normal(JsValue::Undefined));
         };
+        // CaseBlockEvaluation (ECMA-262 14.12.4): V starts undefined, and a clause
+        // that completes empty leaves it as it is. An abrupt completion takes V
+        // through UpdateEmpty, and a `break` ends the switch with that value.
         let mut value = JsValue::Undefined;
         for (_, statements) in &cases[start..] {
             match self.evaluate_statements(dom, statements)? {
-                Completion::Normal(next) => value = next,
-                Completion::Break(None) => break,
-                abrupt => return Ok(abrupt),
+                Completion::Normal(next) => {
+                    if !statements.iter().all(completes_empty) {
+                        value = next;
+                    }
+                }
+                Completion::Break(None, carried) => {
+                    return Ok(Completion::Normal(carried.unwrap_or(value)));
+                }
+                abrupt @ (Completion::Break(Some(_), _) | Completion::Continue(..)) => {
+                    return Ok(update_empty(abrupt, &value));
+                }
+                returned @ Completion::Return(_) => return Ok(returned),
             }
         }
         Ok(Completion::Normal(value))
@@ -1358,11 +1422,15 @@ impl JsRuntime {
                 }
                 match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                     Completion::Normal(next) => value = next,
-                    Completion::Continue(None) => {}
-                    Completion::Break(None) => break,
+                    Completion::Continue(None, carried) => take_carried(&mut value, carried),
+                    Completion::Break(None, carried) => {
+                        take_carried(&mut value, carried);
+                        break;
+                    }
                     returned @ Completion::Return(_) => return Ok(returned),
-                    labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                        return Ok(labeled);
+                    labeled
+                    @ (Completion::Break(Some(_), _) | Completion::Continue(Some(_), _)) => {
+                        return Ok(update_empty(labeled, &value));
                     }
                 }
                 if per_iteration_bindings && let Some(top) = self.environment.last() {
@@ -1433,11 +1501,14 @@ impl JsRuntime {
             }
             match own_loop_completion(&own_labels, completion?) {
                 Completion::Normal(next) => value = next,
-                Completion::Continue(None) => {}
-                Completion::Break(None) => break,
+                Completion::Continue(None, carried) => take_carried(&mut value, carried),
+                Completion::Break(None, carried) => {
+                    take_carried(&mut value, carried);
+                    break;
+                }
                 returned @ Completion::Return(_) => return Ok(returned),
-                labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                    return Ok(labeled);
+                labeled @ (Completion::Break(Some(_), _) | Completion::Continue(Some(_), _)) => {
+                    return Ok(update_empty(labeled, &value));
                 }
             }
         }
@@ -1473,11 +1544,14 @@ impl JsRuntime {
             )?;
             match own_loop_completion(&own_labels, self.evaluate_statement(dom, body)?) {
                 Completion::Normal(next) => value = next,
-                Completion::Continue(None) => {}
-                Completion::Break(None) => break,
+                Completion::Continue(None, carried) => take_carried(&mut value, carried),
+                Completion::Break(None, carried) => {
+                    take_carried(&mut value, carried);
+                    break;
+                }
                 returned @ Completion::Return(_) => return Ok(returned),
-                labeled @ (Completion::Break(Some(_)) | Completion::Continue(Some(_))) => {
-                    return Ok(labeled);
+                labeled @ (Completion::Break(Some(_), _) | Completion::Continue(Some(_), _)) => {
+                    return Ok(update_empty(labeled, &value));
                 }
             }
         }
@@ -1493,11 +1567,33 @@ impl JsRuntime {
         body: &Statement,
     ) -> Result<Completion, JsError> {
         let own_labels = std::mem::take(&mut self.pending_loop_labels);
-        let iterable = self.evaluate(dom, iterable)?;
+        // ForIn/OfHeadEvaluation (ECMA-262 14.7.5.6 step 3): a lexical loop variable
+        // exists, uninitialized, while the iterable expression runs, so a reference
+        // to it there is a ReferenceError.
+        let tdz = kind != VariableKind::Var;
+        if tdz {
+            let environment = Rc::new(RefCell::new(EnvironmentRecord::default()));
+            environment.borrow_mut().bindings.insert(
+                name.to_owned(),
+                Binding {
+                    value: JsValue::Undefined,
+                    mutable: !kind.is_immutable(),
+                    initialized: false,
+                    kind,
+                },
+            );
+            self.environment.push(environment);
+        }
+        let iterable = self.evaluate(dom, iterable);
+        if tdz {
+            self.environment.pop();
+        }
+        let iterable = iterable?;
         // Arrays and strings are walked directly. Any other iterable goes
         // through the iterator protocol one step at a time, so an infinite
         // generator works and leaving the loop early closes the iterator
-        // (ECMA-262 §7.4.12 `IteratorClose`).
+        // (ECMA-262 §7.4.12 `IteratorClose`). A value without `@@iterator` is not
+        // iterable, which GetIterator reports as a TypeError.
         let mut eager = None;
         let mut lazy = None;
         match &iterable {
@@ -1506,10 +1602,28 @@ impl JsRuntime {
             {
                 match self.get_iterator(dom, &iterable)? {
                     Some(pair) => lazy = Some(pair),
-                    None => eager = Some(self.iterate_values(dom, &iterable)?.into_iter()),
+                    None => {
+                        return Err(JsError::type_error(
+                            "the value is not iterable (no @@iterator method)",
+                        ));
+                    }
                 }
             }
-            _ => eager = Some(self.iterate_values(dom, &iterable)?.into_iter()),
+            JsValue::String(_) | JsValue::Object(_) => {
+                eager = Some(self.iterate_values(dom, &iterable)?.into_iter());
+            }
+            _ => {
+                // A primitive iterates through its wrapper's @@iterator, if any.
+                let boxed = self.to_object(&iterable)?;
+                match self.get_iterator(dom, &JsValue::Object(boxed))? {
+                    Some(pair) => lazy = Some(pair),
+                    None => {
+                        return Err(JsError::type_error(
+                            "the value is not iterable (no @@iterator method)",
+                        ));
+                    }
+                }
+            }
         }
         if kind == VariableKind::Var {
             self.create_binding(name, kind, true, JsValue::Undefined)?;
@@ -1575,14 +1689,17 @@ impl JsRuntime {
                     return Err(error);
                 }
                 Ok(Completion::Normal(next)) => value = next,
-                Ok(Completion::Continue(None)) => {}
+                Ok(Completion::Continue(None, carried)) => take_carried(&mut value, carried),
                 Ok(abrupt) => {
                     if let Some((iterator, _)) = lazy {
                         self.close_iterator_object(dom, iterator)?;
                     }
                     match abrupt {
-                        Completion::Break(None) => break,
-                        other => return Ok(other),
+                        Completion::Break(None, carried) => {
+                            take_carried(&mut value, carried);
+                            break;
+                        }
+                        other => return Ok(update_empty(other, &value)),
                     }
                 }
             }
@@ -1788,11 +1905,13 @@ impl JsRuntime {
             }
             Expr::SuperMember { property, .. } => self.read_super_property(dom, property),
             Expr::SuperComputedMember { property, .. } => {
-                // `this` is checked before the key expression runs (§13.3.7.1).
-                self.current_this()?;
-                let key = self.evaluate(dom, property)?;
-                let key = self.to_property_key_value(dom, key)?.to_js_string();
-                self.read_super_property(dom, &(key).to_key())
+                let (base, receiver, key) = self.super_computed_parts(dom, property)?;
+                match self.property_name_of(dom, key)? {
+                    PropertyName::Symbol(symbol) => {
+                        self.read_super_symbol(dom, base, receiver, &symbol)
+                    }
+                    PropertyName::String(name) => self.read_from_base(dom, base, &name, receiver),
+                }
             }
             Expr::SuperCall { arguments, .. } => {
                 let class = self.class_frame().ok_or_else(|| {
@@ -1926,6 +2045,7 @@ impl JsRuntime {
                 ..
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
+                let reference = self.settle_reference(dom, reference)?;
                 let previous = self.read_assignment_reference(dom, &reference)?;
                 // ECMA-262 13.4.2: the operand is converted with ToNumeric, and
                 // the step is 1 of that same numeric type (`1n` for a BigInt).
@@ -2030,6 +2150,7 @@ impl JsRuntime {
                 ..
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
+                let reference = self.settle_reference(dom, reference)?;
                 let current = self.read_assignment_reference(dom, &reference)?;
                 let right = self.evaluate(dom, value)?;
                 // Match the plain binary path: object operands go through
@@ -2048,29 +2169,14 @@ impl JsRuntime {
                     self.assign_destructuring_target(dom, target, value.clone())?;
                     return Ok(value);
                 }
-                // ECMA-262 13.15.2: a computed key converts (ToPropertyKey) in
-                // PutValue, which runs after the value expression.
-                match target.as_ref() {
-                    Expr::ComputedMember {
-                        object, property, ..
-                    } => {
-                        let (object, key) = self.computed_member_parts(dom, object, property)?;
-                        let value = self.evaluate(dom, value)?;
-                        let reference = self.property_key_reference(dom, object, key)?;
-                        self.write_assignment_reference(dom, &reference, value.clone())?;
-                        return Ok(value);
-                    }
-                    Expr::SuperComputedMember { property, .. } => {
-                        let key = self.evaluate(dom, property)?;
-                        let value = self.evaluate(dom, value)?;
-                        let key = self.to_property_key_value(dom, key)?.to_js_string();
-                        let reference = AssignmentReference::SuperProperty {
-                            property: (key).to_key(),
-                        };
-                        self.write_assignment_reference(dom, &reference, value.clone())?;
-                        return Ok(value);
-                    }
-                    _ => {}
+                if let Expr::SuperComputedMember { property, .. } = target.as_ref() {
+                    // `this`, the key expression and the base run first; the value
+                    // runs next, and the key converts in PutValue (ECMA-262 13.15.2).
+                    let (base, receiver, key) = self.super_computed_parts(dom, property)?;
+                    let value = self.evaluate(dom, value)?;
+                    let key = self.to_property_key_value(dom, key)?.to_js_string();
+                    self.write_super_property(dom, base, receiver, &(key).to_key(), value.clone())?;
+                    return Ok(value);
                 }
                 let reference = self.resolve_assignment_reference(dom, target)?;
                 let value = match target.as_ref() {
@@ -2089,6 +2195,7 @@ impl JsRuntime {
                 ..
             } => {
                 let reference = self.resolve_assignment_reference(dom, target)?;
+                let reference = self.settle_reference(dom, reference)?;
                 let current = self.read_assignment_reference(dom, &reference)?;
                 let short_circuits = match operator {
                     BinaryOp::LogicalAnd => !current.is_truthy(),
@@ -2113,33 +2220,35 @@ impl JsRuntime {
     /// is checked for `null` and `undefined` here, before any key conversion
     /// (ECMA-262 `GetValue` and `PutValue` both coerce the base first), so the
     /// key stays a value and the caller decides when `ToPropertyKey` runs.
-    fn computed_member_parts(
+    /// Converts a [`AssignmentReference::Pending`] reference: `ToObject` on its
+    /// base, then `ToPropertyKey` on its key, each once (ECMA-262 6.2.5.5). Any
+    /// other reference is already settled.
+    pub(super) fn settle_reference(
         &mut self,
         dom: &mut Dom,
-        object: &Expr,
-        property: &Expr,
-    ) -> Result<(ObjectId, JsValue), JsError> {
-        let evaluated = self.evaluate(dom, object)?;
-        let key_value = self.evaluate(dom, property)?;
-        let object = self.coerce_member_base(&evaluated, &(key_value.to_js_string()).to_key())?;
-        Ok((object, key_value))
+        reference: AssignmentReference,
+    ) -> Result<AssignmentReference, JsError> {
+        let AssignmentReference::Pending { base, key } = reference else {
+            return Ok(reference);
+        };
+        let object = self.coerce_member_base(&base, &(key.to_js_string()).to_key())?;
+        Ok(match self.property_name_of(dom, key)? {
+            PropertyName::Symbol(symbol) => AssignmentReference::SymbolProperty { object, symbol },
+            PropertyName::String(property) => AssignmentReference::Property { object, property },
+        })
     }
 
-    /// The reference for `object[key]` once `key` has been converted with
-    /// `ToPropertyKey`: a symbol names a symbol slot, anything else a string.
-    fn property_key_reference(
+    /// `ToPropertyKey` of a computed key, as the [`PropertyName`] it addresses: a
+    /// symbol keeps its identity, and anything else becomes its string.
+    pub(super) fn property_name_of(
         &mut self,
         dom: &mut Dom,
-        object: ObjectId,
         key: JsValue,
-    ) -> Result<AssignmentReference, JsError> {
-        match self.to_property_key_value(dom, key)? {
-            JsValue::Symbol(symbol) => Ok(AssignmentReference::SymbolProperty { object, symbol }),
-            key => Ok(AssignmentReference::Property {
-                object,
-                property: (key.to_js_string()).to_key(),
-            }),
-        }
+    ) -> Result<PropertyName, JsError> {
+        Ok(match self.to_property_key_value(dom, key)? {
+            JsValue::Symbol(symbol) => PropertyName::Symbol(symbol),
+            key => PropertyName::String(key.to_js_string().to_key()),
+        })
     }
 
     pub(super) fn resolve_assignment_reference(
@@ -2155,18 +2264,18 @@ impl JsRuntime {
             Expr::Member {
                 object, property, ..
             } => {
-                let evaluated = self.evaluate(dom, object)?;
-                let object = self.coerce_member_base(&evaluated, property)?;
-                Ok(AssignmentReference::Property {
-                    object,
-                    property: property.clone(),
+                let base = self.evaluate(dom, object)?;
+                Ok(AssignmentReference::Pending {
+                    base,
+                    key: JsValue::String(property.clone().into()),
                 })
             }
             Expr::ComputedMember {
                 object, property, ..
             } => {
-                let (object, key) = self.computed_member_parts(dom, object, property)?;
-                self.property_key_reference(dom, object, key)
+                let base = self.evaluate(dom, object)?;
+                let key = self.evaluate(dom, property)?;
+                Ok(AssignmentReference::Pending { base, key })
             }
             Expr::PrivateMember { object, name, .. } => {
                 let evaluated = self.evaluate(dom, object)?;
@@ -2176,13 +2285,21 @@ impl JsRuntime {
                     name: name.clone(),
                 })
             }
-            Expr::SuperMember { property, .. } => Ok(AssignmentReference::SuperProperty {
-                property: property.clone(),
-            }),
+            Expr::SuperMember { property, .. } => {
+                let receiver = self.current_this()?;
+                let base = self.super_prototype()?;
+                Ok(AssignmentReference::SuperProperty {
+                    base,
+                    receiver,
+                    property: property.clone(),
+                })
+            }
             Expr::SuperComputedMember { property, .. } => {
-                let key = self.evaluate(dom, property)?;
+                let (base, receiver, key) = self.super_computed_parts(dom, property)?;
                 let key = self.to_property_key_value(dom, key)?.to_js_string();
                 Ok(AssignmentReference::SuperProperty {
+                    base,
+                    receiver,
                     property: (key).to_key(),
                 })
             }
@@ -2240,13 +2357,13 @@ impl JsRuntime {
                     )));
                 }
                 let object = self.to_object(&value)?;
-                let mut excluded: Vec<String> = Vec::new();
+                let mut excluded: Vec<PropertyName> = Vec::new();
                 for (key, pattern) in properties {
                     let name = match key {
-                        PropertyKey::Static(name) => name.clone(),
+                        PropertyKey::Static(name) => PropertyName::String(name.clone()),
                         PropertyKey::Computed(expression) => {
                             let computed = self.evaluate(dom, expression)?;
-                            (self.to_property_key_value(dom, computed)?.to_js_string()).to_key()
+                            self.property_name_of(dom, computed)?
                         }
                         PropertyKey::Spread => {
                             unreachable!("the rest element is parsed separately")
@@ -2257,7 +2374,7 @@ impl JsRuntime {
                     };
                     // Read before pushing the exclusion so the getter runs even
                     // when a later property repeats the key.
-                    let property_value = self.get_member(dom, object, &name)?;
+                    let property_value = self.get_named_or_symbol(dom, object, &name)?;
                     excluded.push(name);
                     self.initialize_binding_pattern(dom, pattern, property_value, kind)?;
                 }
@@ -2312,6 +2429,59 @@ impl JsRuntime {
         }
     }
 
+    /// The reference of a simple `DestructuringAssignmentTarget`, evaluated before
+    /// the iterator steps for its element (ECMA-262 13.15.5.5 `AssignmentElement` step
+    /// 1 and `AssignmentRestElement` step 1). A target under a default counts by its
+    /// own target. A pattern has no reference, so `None`.
+    fn pre_resolve_target(
+        &mut self,
+        dom: &mut Dom,
+        target: &Expr,
+    ) -> Result<Option<AssignmentReference>, JsError> {
+        let simple = match target {
+            Expr::Assignment { target, .. } => target.as_ref(),
+            other => other,
+        };
+        match simple {
+            Expr::Identifier(_)
+            | Expr::Member { .. }
+            | Expr::ComputedMember { .. }
+            | Expr::PrivateMember { .. }
+            | Expr::SuperMember { .. }
+            | Expr::SuperComputedMember { .. } => {
+                self.resolve_assignment_reference(dom, simple).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Writes `value` to an element target. A reference resolved beforehand is
+    /// written after the target's default applies; without one the target is a
+    /// pattern, which assigns itself (13.15.5.5 `AssignmentElement` steps 3 and 4).
+    fn assign_element(
+        &mut self,
+        dom: &mut Dom,
+        target: &Expr,
+        reference: Option<AssignmentReference>,
+        value: JsValue,
+    ) -> Result<(), JsError> {
+        let Some(reference) = reference else {
+            return self.assign_destructuring_target(dom, target, value);
+        };
+        let value = match target {
+            Expr::Assignment {
+                target: inner,
+                value: default,
+                ..
+            } if matches!(value, JsValue::Undefined) => match inner.as_ref() {
+                Expr::Identifier(name) => self.evaluate_named(dom, default, name)?,
+                _ => self.evaluate(dom, default)?,
+            },
+            _ => value,
+        };
+        self.write_assignment_reference(dom, &reference, value)
+    }
+
     pub(super) fn assign_destructuring_target(
         &mut self,
         dom: &mut Dom,
@@ -2357,16 +2527,19 @@ impl JsRuntime {
                             }
                             // A rest target is the last element and takes what is left.
                             Expr::Spread(target) => {
+                                let reference = self.pre_resolve_target(dom, target)?;
                                 let remaining = iterator.rest(self, dom)?;
-                                return self.assign_destructuring_target(
+                                return self.assign_element(
                                     dom,
                                     target,
+                                    reference,
                                     JsValue::Object(remaining),
                                 );
                             }
                             target => {
+                                let reference = self.pre_resolve_target(dom, target)?;
                                 let element = iterator.next(self, dom)?;
-                                self.assign_destructuring_target(dom, target, element)?;
+                                self.assign_element(dom, target, reference, element)?;
                             }
                         }
                     }
@@ -2394,7 +2567,7 @@ impl JsRuntime {
                     )));
                 }
                 let object = self.to_object(&value)?;
-                let mut excluded = Vec::new();
+                let mut excluded: Vec<PropertyName> = Vec::new();
                 for property in properties {
                     if matches!(&property.key, PropertyKey::Spread) {
                         let rest = self.create_object_rest(dom, &value, &excluded)?;
@@ -2406,10 +2579,10 @@ impl JsRuntime {
                         continue;
                     }
                     let key = match &property.key {
-                        PropertyKey::Static(key) => key.clone(),
+                        PropertyKey::Static(key) => PropertyName::String(key.clone()),
                         PropertyKey::Computed(expression) => {
                             let computed = self.evaluate(dom, expression)?;
-                            (self.to_property_key_value(dom, computed)?.to_js_string()).to_key()
+                            self.property_name_of(dom, computed)?
                         }
                         PropertyKey::Spread => unreachable!("spread handled above"),
                         PropertyKey::Private(_) => {
@@ -2430,12 +2603,12 @@ impl JsRuntime {
                     );
                     if simple_target {
                         let reference = self.resolve_assignment_reference(dom, &property.value)?;
-                        let property_value = self.get_member(dom, object, &key)?;
+                        let property_value = self.get_named_or_symbol(dom, object, &key)?;
                         excluded.push(key);
                         self.write_assignment_reference(dom, &reference, property_value)?;
                         continue;
                     }
-                    let property_value = self.get_member(dom, object, &key)?;
+                    let property_value = self.get_named_or_symbol(dom, object, &key)?;
                     excluded.push(key);
                     self.assign_destructuring_target(dom, &property.value, property_value)?;
                 }
@@ -2457,6 +2630,10 @@ impl JsRuntime {
             AssignmentReference::Binding { name, scope } => {
                 self.read_resolved_binding(dom, *scope, name)
             }
+            AssignmentReference::Pending { .. } => {
+                let settled = self.settle_reference(dom, reference.clone())?;
+                self.read_assignment_reference(dom, &settled)
+            }
             AssignmentReference::Property { object, property } => {
                 self.get_member(dom, *object, property)
             }
@@ -2466,9 +2643,11 @@ impl JsRuntime {
             AssignmentReference::Private { object, name } => {
                 self.read_private(dom, &JsValue::Object(*object), name)
             }
-            AssignmentReference::SuperProperty { property } => {
-                self.read_super_property(dom, property)
-            }
+            AssignmentReference::SuperProperty {
+                base,
+                receiver,
+                property,
+            } => self.read_from_base(dom, *base, property, receiver.clone()),
         }
     }
 
@@ -2482,6 +2661,10 @@ impl JsRuntime {
             AssignmentReference::Binding { name, scope } => {
                 self.write_resolved_binding(dom, *scope, name, value)
             }
+            AssignmentReference::Pending { .. } => {
+                let settled = self.settle_reference(dom, reference.clone())?;
+                self.write_assignment_reference(dom, &settled, value)
+            }
             AssignmentReference::Property { object, property } => {
                 self.set_member(dom, *object, property, value)
             }
@@ -2491,9 +2674,11 @@ impl JsRuntime {
             AssignmentReference::Private { object, name } => {
                 self.write_private(dom, &JsValue::Object(*object), name, value)
             }
-            AssignmentReference::SuperProperty { property } => {
-                self.write_super_property(dom, property, value)
-            }
+            AssignmentReference::SuperProperty {
+                base,
+                receiver,
+                property,
+            } => self.write_super_property(dom, *base, receiver.clone(), property, value),
         }
     }
 
@@ -2527,7 +2712,11 @@ impl JsRuntime {
                     self.current_this()?;
                 }
                 let reference = self.resolve_assignment_reference(dom, operand)?;
+                let reference = self.settle_reference(dom, reference)?;
                 match reference {
+                    AssignmentReference::Pending { .. } => {
+                        unreachable!("a reference is settled before it is deleted");
+                    }
                     AssignmentReference::Property { object, property } => {
                         if let Some(ObjectHost::DataSet(node)) = self.realm.host(object) {
                             return Ok(JsValue::Boolean(JsRuntime::delete_dataset_member(
@@ -3266,12 +3455,15 @@ impl JsRuntime {
                 (value, receiver)
             }
             Expr::SuperComputedMember { property, .. } => {
-                let key = self.evaluate(dom, property)?;
-                let value = match self.to_property_key_value(dom, key)? {
-                    JsValue::Symbol(symbol) => self.read_super_symbol(dom, &symbol)?,
-                    key => self.read_super_property(dom, &(key.to_js_string()).to_key())?,
+                let (base, receiver, key) = self.super_computed_parts(dom, property)?;
+                let value = match self.property_name_of(dom, key)? {
+                    PropertyName::Symbol(symbol) => {
+                        self.read_super_symbol(dom, base, receiver.clone(), &symbol)?
+                    }
+                    PropertyName::String(name) => {
+                        self.read_from_base(dom, base, &name, receiver.clone())?
+                    }
                 };
-                let receiver = self.current_this()?;
                 (value, receiver)
             }
             Expr::PrivateMember { object, name, .. } => {
@@ -3482,40 +3674,12 @@ impl JsRuntime {
         let object = self.realm.create_ordinary_object();
         for property in properties {
             if matches!(property.key, PropertyKey::Spread) {
-                match self.evaluate(dom, &property.value)? {
-                    JsValue::Null | JsValue::Undefined => {}
-                    JsValue::Object(source) => {
-                        // `CopyDataProperties` reads each key with `Get`, so a
-                        // getter on the spread source contributes its result
-                        // rather than the descriptor's empty value slot.
-                        let keys = self.realm.enumerable_own_keys(source).unwrap_or_default();
-                        for key in keys {
-                            let value = self.get_member(dom, source, &key)?;
-                            if !self.realm.set_property(object, key, value) {
-                                return Err(JsError::type_error(
-                                    "could not define spread object property",
-                                ));
-                            }
-                        }
-                    }
-                    JsValue::String(text) => {
-                        for (index, character) in text.code_point_strings().into_iter().enumerate()
-                        {
-                            if !self.realm.set_property(
-                                object,
-                                index.to_string(),
-                                JsValue::String(character),
-                            ) {
-                                return Err(JsError::type_error(
-                                    "could not define spread string property",
-                                ));
-                            }
-                        }
-                    }
-                    JsValue::Boolean(_)
-                    | JsValue::Number(_)
-                    | JsValue::BigInt(_)
-                    | JsValue::Symbol(_) => {}
+                // CopyDataProperties(object, fromValue, « ») (ECMA-262 13.2.5.5): a
+                // nullish source copies nothing, and any other value boxes first.
+                let source = self.evaluate(dom, &property.value)?;
+                if !matches!(source, JsValue::Null | JsValue::Undefined) {
+                    let source = self.to_object(&source)?;
+                    self.copy_data_properties(dom, object, source, &[])?;
                 }
                 continue;
             }
@@ -3582,8 +3746,13 @@ impl JsRuntime {
                     };
                     format!("{prefix}{}", property_key_function_name(&key_value))
                 });
-                let name = accessor_name.as_deref().or(name.as_deref());
-                let value = self.create_method(name, parameters, body, *kind, *strict)?;
+                // A computed method key is not known to the parser, so the method
+                // is named by its property key (ECMA-262 15.4.4 SetFunctionName).
+                let name = accessor_name
+                    .or_else(|| name.clone())
+                    .unwrap_or_else(|| property_key_function_name(&key_value));
+                let value =
+                    self.create_method(Some(name.as_str()), parameters, body, *kind, *strict)?;
                 self.attach_function_source(&value, source);
                 value
             } else {
@@ -3654,7 +3823,13 @@ impl JsRuntime {
                 }
                 continue;
             }
-            if !self.realm.set_property(object, (key).to_key(), value) {
+            // CreateDataPropertyOrThrow (ECMA-262 7.3.7): a data property replaces an
+            // accessor of the same name that the literal defined earlier, since those
+            // are configurable.
+            if !self
+                .realm
+                .define_property(object, key.to_key(), PropertyDescriptor::data(value))
+            {
                 return Err(JsError::type_error("could not define object property"));
             }
         }
@@ -3665,7 +3840,7 @@ impl JsRuntime {
         &mut self,
         dom: &mut Dom,
         value: &JsValue,
-        excluded: &[String],
+        excluded: &[PropertyName],
     ) -> Result<ObjectId, JsError> {
         if matches!(value, JsValue::Null | JsValue::Undefined) {
             return Ok(self.realm.create_ordinary_object());
@@ -3673,24 +3848,50 @@ impl JsRuntime {
         // Object rest starts with `CopyDataProperties`, whose first step is
         // `ToObject`, so a primitive rest source boxes into its wrapper.
         let source = self.to_object(value)?;
-        let keys = self.realm.enumerable_own_keys(source).unwrap_or_default();
         // Reserve the result before reading the wrapper's keys so no collection
         // can tombstone the wrapper between the two steps.
         self.ensure_heap_capacity(1)?;
         let result = self.realm.create_ordinary_object();
-        for key in keys {
+        self.copy_data_properties(dom, result, source, excluded)?;
+        Ok(result)
+    }
+
+    /// `CopyDataProperties(target, source, excludedItems)` (ECMA-262 7.3.25). Each
+    /// own key of `source` that `excluded` does not name is taken in
+    /// `[[OwnPropertyKeys]]` order, and one that is enumerable under
+    /// `[[GetOwnProperty]]` has its `Get` value defined on `target`. A proxy source
+    /// answers through its traps, and a getter contributes its result.
+    pub(super) fn copy_data_properties(
+        &mut self,
+        dom: &mut Dom,
+        target: ObjectId,
+        source: ObjectId,
+        excluded: &[PropertyName],
+    ) -> Result<(), JsError> {
+        for key in self.own_property_keys(dom, source)? {
             if excluded.contains(&key) {
                 continue;
             }
-            // `CopyDataProperties` reads each key with `Get`, so a getter on
-            // the source runs and contributes its result. Copying the
-            // descriptor's value slot instead silently dropped every accessor.
-            let property_value = self.get_member(dom, source, &key)?;
-            if !self.realm.set_property(result, key, property_value) {
+            let enumerable = self
+                .own_descriptor(dom, source, &key)?
+                .is_some_and(|descriptor| descriptor.enumerable);
+            if !enumerable {
+                continue;
+            }
+            let value = self.get_named_or_symbol(dom, source, &key)?;
+            let defined = match key {
+                PropertyName::String(name) => self.realm.set_property(target, name, value),
+                PropertyName::Symbol(symbol) => self.realm.define_symbol_property(
+                    target,
+                    &symbol,
+                    PropertyDescriptor::data(value),
+                ),
+            };
+            if !defined {
                 return Err(JsError::type_error("could not define object rest property"));
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     pub(super) fn evaluate_array_literal(
@@ -6655,7 +6856,7 @@ impl JsRuntime {
                 Ok(final_this.unwrap_or(JsValue::Undefined))
             }
             Completion::Return(value) => Ok(value),
-            Completion::Break(_) | Completion::Continue(_) => Err(JsError::new(
+            Completion::Break(..) | Completion::Continue(..) => Err(JsError::new(
                 JsErrorKind::Syntax,
                 "loop control escaped a function body",
                 None,
@@ -7009,8 +7210,31 @@ pub(super) fn statement_offset(statement: &Statement) -> Option<usize> {
 /// itself, so it is read as the unlabeled form.
 fn own_loop_completion(labels: &[String], completion: Completion) -> Completion {
     match completion {
-        Completion::Continue(Some(label)) if labels.contains(&label) => Completion::Continue(None),
-        Completion::Break(Some(label)) if labels.contains(&label) => Completion::Break(None),
+        Completion::Continue(Some(label), carried) if labels.contains(&label) => {
+            Completion::Continue(None, carried)
+        }
+        Completion::Break(Some(label), carried) if labels.contains(&label) => {
+            Completion::Break(None, carried)
+        }
+        other => other,
+    }
+}
+
+/// The value a loop takes from a `break` or `continue` that ends an iteration: a
+/// carried value replaces the loop's value, and an empty one leaves it as it is
+/// (ECMA-262 14.7.1.2 `LoopEvaluation`, through `UpdateEmpty`).
+fn take_carried(value: &mut JsValue, carried: Option<JsValue>) {
+    if let Some(carried) = carried {
+        *value = carried;
+    }
+}
+
+/// `UpdateEmpty(completion, value)` for a `break` or `continue` (ECMA-262 6.2.4): an
+/// empty value takes `value`. Any other completion is unchanged.
+fn update_empty(completion: Completion, value: &JsValue) -> Completion {
+    match completion {
+        Completion::Break(label, None) => Completion::Break(label, Some(value.clone())),
+        Completion::Continue(label, None) => Completion::Continue(label, Some(value.clone())),
         other => other,
     }
 }

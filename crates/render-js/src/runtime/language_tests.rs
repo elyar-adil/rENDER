@@ -1176,6 +1176,44 @@ fn super_property_reads_check_this_before_the_key_expression() {
 }
 
 #[test]
+fn super_references_take_their_base_before_the_key_converts() {
+    // ECMA-262 13.3.7.1: the base is the home object's prototype as the reference is
+    // made, so a key whose conversion changes the prototype does not move the base.
+    assert_eq!(
+        ok(
+            "var result; var proto = { set p(v) { result = 'ok'; } }; var proto2 = { set p(v) { result = 'bad'; } }; var obj = { __proto__: proto, m() { super[key] = 10; } }; var key = { toString() { Object.setPrototypeOf(obj, proto2); return 'p'; } }; obj.m(); result"
+        ),
+        "ok"
+    );
+    assert_eq!(
+        ok(
+            "var proto3 = { p: 'readok' }; var proto4 = { p: 'readbad' }; var obj = { __proto__: proto3, m() { return super[key]; } }; var key = { toString() { Object.setPrototypeOf(obj, proto4); return 'p'; } }; obj.m()"
+        ),
+        "readok"
+    );
+    // A null base throws when the reference is read or written.
+    assert_eq!(
+        ok(
+            "var o = { m() { return super.x; } }; Object.setPrototypeOf(o, null); var r; try { o.m(); } catch (e) { r = e.constructor.name; } r"
+        ),
+        "TypeError"
+    );
+    assert_eq!(
+        ok(
+            "var o = { m() { super.zz = 1; } }; Object.setPrototypeOf(o, null); var r; try { o.m(); } catch (e) { r = e.constructor.name; } r"
+        ),
+        "TypeError"
+    );
+    // An uninitialized `this` throws before the key or the value runs.
+    assert_eq!(
+        ok(
+            "var ran = 0; var r; class A {} class B extends A { constructor() { try { super[{ toString() { ran++; return 'x'; } }] = (ran++, 1); } catch (e) { r = e.name + ran; } super(); } } new B(); r"
+        ),
+        "ReferenceError0"
+    );
+}
+
+#[test]
 fn super_binds_this_once_after_the_parent_constructs() {
     // §13.3.7.1 steps 3-6: the arguments and the parent construction happen
     // before BindThisValue, which throws when `this` is already bound.
@@ -2207,6 +2245,96 @@ fn switch_case_block_is_one_lexical_scope_with_hoisted_functions() {
 }
 
 #[test]
+fn completion_values_flow_through_switch_clauses_and_break_or_continue() {
+    // ECMA-262 14.12.4 CaseBlockEvaluation with UpdateEmpty: an empty clause keeps the
+    // value, and a break or continue carries the value its statement list reached.
+    assert_eq!(
+        ok("1; switch ('a') { case 'a': break; default: }"),
+        "undefined"
+    );
+    assert_eq!(
+        ok("2; switch ('a') { case 'a': { 3; break; } default: }"),
+        "3"
+    );
+    assert_eq!(ok("6; switch ('a') { case 'a': 7; default: }"), "7");
+    assert_eq!(
+        ok("9; switch ('a') { default: case 'b': 10; case 'c': 11; }"),
+        "11"
+    );
+    assert_eq!(
+        ok("4; do { switch ('a') { case 'a': continue; default: } } while (false)"),
+        "undefined"
+    );
+    assert_eq!(
+        ok("5; do { switch ('a') { case 'a': { 6; continue; } default: } } while (false)"),
+        "6"
+    );
+    // Loops and labels take the value of a break the same way.
+    assert_eq!(ok("1; while (true) { 3; break; }"), "3");
+    assert_eq!(ok("1; l: { 7; break l; }"), "7");
+    assert_eq!(ok("1; while (true) { if (true) break; }"), "undefined");
+}
+
+#[test]
+fn block_function_in_sloppy_script_gets_a_global_var_copied_on_evaluation() {
+    // Annex B.3.2.2: the global var exists from instantiation, holding undefined,
+    // and evaluating the declaration copies the block binding to it.
+    assert_eq!(
+        ok("var a = typeof f; { function f() { return 1; } } a + ',' + typeof f"),
+        "undefined,function"
+    );
+    // CreateGlobalVarBinding(F, false): a non-configurable, enumerable global.
+    assert_eq!(
+        ok(
+            "{ function g() {} } var d = Object.getOwnPropertyDescriptor(globalThis, 'g'); \
+            [d.configurable, d.writable, d.enumerable].join()"
+        ),
+        "false,true,true"
+    );
+    // The block binding is a mutable binding of its own (BlockDeclarationInstantiation).
+    assert_eq!(
+        ok("var r; { function h() { h = 2; return 1; } r = h(); } r + ',' + typeof h"),
+        "1,function"
+    );
+}
+
+#[test]
+fn block_function_in_sloppy_function_gets_a_var_binding_of_the_function() {
+    assert_eq!(
+        ok("function h() { var a = typeof f; { function f() {} } return a + ',' + typeof f; } h()"),
+        "undefined,function"
+    );
+    // A block-level function named like a parameter keeps the parameter (B.3.2.1 step 1.b).
+    assert_eq!(
+        ok("function p(f) { { function f() {} } return typeof f; } p(3)"),
+        "number"
+    );
+    // A `let` of the same name in the body makes the var an early error, so the
+    // block function stays in its block.
+    assert_eq!(
+        ok("function q() { let f = 2; { function f() {} } return f; } q()"),
+        "2"
+    );
+    // The arguments object is not replaced by a block-level function named `arguments`.
+    assert_eq!(
+        ok(
+            "function ar() { { function arguments() {} } return Object.prototype.toString.call(arguments); } ar()"
+        ),
+        "[object Arguments]"
+    );
+    // Strict code declares block functions lexically only.
+    assert_eq!(
+        ok("function st() { 'use strict'; { function s() {} } return typeof s; } st()"),
+        "undefined"
+    );
+    // A destructuring parameter's name counts as a parameter name.
+    assert_eq!(
+        ok("function dp([f]) { { function f() {} } return typeof f; } dp([4])"),
+        "number"
+    );
+}
+
+#[test]
 fn object_literal_values_name_anonymous_functions_after_their_key() {
     // §13.2.5.5 step 7: `key: AssignmentExpression` names an anonymous function,
     // arrow or class after the key; a symbol key gives `[description]`.
@@ -2396,6 +2524,90 @@ fn computed_keys_convert_after_the_base_check_and_the_value() {
             "var log = []; var base = {}; var k = { toString() { log.push('key'); return 'k'; } }; base[k] = (log.push('rhs'), 1); log.join()"
         ),
         "rhs,key"
+    );
+}
+
+#[test]
+fn destructuring_targets_resolve_their_reference_before_the_iterator_steps() {
+    // §13.15.5.5 AssignmentElement and AssignmentRestElement: a simple target's
+    // reference (base and key) is evaluated before the iterator steps, and its key
+    // converts only when the value is written, after the step.
+    assert_eq!(
+        ok(
+            "var log = []; var it = { next() { log.push('step'); return { done: true }; } }; var src = {}; src[Symbol.iterator] = () => it; var t = { set q(v) { log.push('set'); } }; ([t[{ toString() { log.push('key'); return 'q'; } }]] = src); log.join()"
+        ),
+        "step,key,set"
+    );
+    assert_eq!(
+        ok(
+            "var log = []; var it = { next() { log.push('step'); return { done: true }; } }; var src = {}; src[Symbol.iterator] = () => it; var t = { set q(v) { log.push('set'); } }; ([...t[{ toString() { log.push('key'); return 'q'; } }]] = src); log.join()"
+        ),
+        "step,key,set"
+    );
+    // A throwing target reference closes the iterator without stepping it.
+    assert_eq!(
+        ok(
+            "var closed = 0; var stepped = 0; var it = { [Symbol.iterator]() { return { next() { stepped++; return { done: false, value: 1 }; }, return() { closed++; return {}; } }; } }; var r; try { [{}[(() => { throw new RangeError('t'); })()]] = it; } catch (e) { r = e.name + closed + stepped; } r"
+        ),
+        "RangeError10"
+    );
+    // A null base throws in PutValue, after the value expression has run.
+    assert_eq!(
+        ok(
+            "var n = 0; var base = null; var r; try { base.prop = n += 1; } catch (e) { r = e.name + n; } r"
+        ),
+        "TypeError1"
+    );
+    // A compound assignment converts its key once, in GetValue.
+    assert_eq!(
+        ok("var c = 0; var a = [1]; a[{ toString() { c++; return '0'; } }] += 1; a[0] + ',' + c"),
+        "2,1"
+    );
+}
+
+#[test]
+fn for_of_heads_bind_their_loop_name_in_tdz_and_need_an_iterator() {
+    // ECMA-262 14.7.5.6 ForIn/OfHeadEvaluation: a lexical loop name is uninitialized
+    // while the iterable expression runs.
+    assert_eq!(
+        thrown_name("{ let x = 1; for (let x of [x]) {} }"),
+        "ReferenceError"
+    );
+    // GetIterator on a value with no @@iterator method is a TypeError.
+    assert_eq!(thrown_name("for (var y of {}) {}"), "TypeError");
+    assert_eq!(thrown_name("for (var n of 0) {}"), "TypeError");
+    // IteratorClose on break: a `return` result that is not an object is a TypeError.
+    assert_eq!(
+        thrown_name(
+            "var it = { next() { return { done: false, value: 1 }; }, return() { return 0; } }; var o = {}; o[Symbol.iterator] = () => it; for (var q of o) break;"
+        ),
+        "TypeError"
+    );
+}
+
+#[test]
+fn object_literal_members_name_computed_methods_and_replace_accessors() {
+    // SetFunctionName (ECMA-262 15.4.4): a computed method takes its key's name.
+    assert_eq!(
+        ok("var s = Symbol('test262'); var o = { [s]() {} }; o[s].name"),
+        "[test262]"
+    );
+    // CreateDataPropertyOrThrow replaces the accessor the literal defined earlier.
+    assert_eq!(
+        ok("var o = { get foo() { return 1; }, foo: 2 }; o.foo"),
+        "2"
+    );
+}
+
+#[test]
+fn a_yield_in_a_computed_object_key_suspends_the_generator() {
+    // The key is computed in source order, so the suspended key is the one the
+    // generator resumes with.
+    assert_eq!(
+        ok(
+            "function* g() { var o = { [yield 'k']: 1 }; return Object.keys(o)[0]; } var it = g(); it.next(); it.next('kk').value"
+        ),
+        "kk"
     );
 }
 

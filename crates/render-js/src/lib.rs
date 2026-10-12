@@ -5,6 +5,7 @@
 //! host objects mutate the existing arena so downstream rendering can consume
 //! its [`render_dom::MutationBatch`] without reparsing HTML.
 
+mod annex_b;
 mod bigint;
 mod lexer;
 mod module;

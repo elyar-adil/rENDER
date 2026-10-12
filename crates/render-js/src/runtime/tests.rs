@@ -3389,6 +3389,51 @@ fn an_object_pattern_reads_properties_in_order_and_excludes_them_from_the_rest()
 }
 
 #[test]
+fn copy_data_properties_takes_symbol_keys_and_proxy_traps_in_own_key_order() {
+    // ECMA-262 7.3.25 CopyDataProperties: the source's [[OwnPropertyKeys]] (symbols
+    // included) are read in order, excluded names are skipped before any
+    // [[GetOwnProperty]], and only enumerable keys are copied with [[Get]].
+    assert_eq!(
+        eval_read(
+            r"
+                var s = Symbol('foo');
+                var source = { 1: 'one', z: 'zed', a: 'ay' };
+                source[s] = 'sym';
+                Object.defineProperty(source, 'hidden', { value: 'h', enumerable: false });
+                var copied = { ...source };
+                var { 1: one, ...restA } = source;
+                var { [s]: symValue, ...restB } = source;
+            ",
+            "[copied[s], symValue, Reflect.ownKeys(restA).map(String).join(','), Reflect.ownKeys(restB).length].join('|')"
+        ),
+        "sym|sym|z,a,Symbol(foo)|3"
+    );
+    assert_eq!(
+        eval_read(
+            r"
+                var log = [];
+                var proxy = new Proxy({ a: 1, b: 2 }, {
+                    ownKeys(t) { log.push('ownKeys'); return Reflect.ownKeys(t); },
+                    getOwnPropertyDescriptor(t, k) { log.push('gopd:' + String(k)); return Reflect.getOwnPropertyDescriptor(t, k); },
+                    get(t, k) { log.push('get:' + String(k)); return t[k]; }
+                });
+                var { a, ...rest } = proxy;
+            ",
+            "log.join(',') + '/' + JSON.stringify(rest)"
+        ),
+        "get:a,ownKeys,gopd:b,get:b/{\"b\":2}"
+    );
+    // A string spreads by code unit, and a nullish spread copies nothing.
+    assert_eq!(
+        eval_read(
+            "",
+            "[JSON.stringify({ ...'ab' }), Object.keys({ ...'\u{1F600}' }).length, JSON.stringify({ ...null, ...5 })].join(' ')"
+        ),
+        "{\"0\":\"a\",\"1\":\"b\"} 2 {}"
+    );
+}
+
+#[test]
 fn destructuring_sources_that_cannot_iterate_throw_instead_of_binding_undefined() {
     // Every one of these has no `@@iterator`. Reading indexed properties off
     // them would quietly produce `undefined`, which is the failure this rules

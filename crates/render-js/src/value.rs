@@ -10131,25 +10131,6 @@ impl Realm {
         Some(properties)
     }
 
-    /// The enumerable own string keys of an object, in property order.
-    ///
-    /// `CopyDataProperties` reads each of these with `Get`, which can run an
-    /// accessor, so the key list is handed back separately rather than paired
-    /// with the descriptor's `value` slot — that slot is `undefined` for an
-    /// accessor, which is how `{ ...source }` used to lose every getter.
-    pub(crate) fn enumerable_own_keys(&self, object: ObjectId) -> Option<Vec<String>> {
-        self.objects.get(object.0)?;
-        let keys = self.own_property_names(object)?;
-        Some(
-            keys.into_iter()
-                .filter(|key| {
-                    self.own_property(object, key)
-                        .is_some_and(|descriptor| descriptor.enumerable)
-                })
-                .collect(),
-        )
-    }
-
     pub(crate) fn own_property_names(&self, object: ObjectId) -> Option<Vec<String>> {
         if let Some(index) = self.namespace_index(object) {
             // ECMA-262 10.4.6.11: a namespace's string keys are its exports, sorted.

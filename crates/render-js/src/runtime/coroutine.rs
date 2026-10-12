@@ -1403,21 +1403,36 @@ impl Compiler {
             }
             Expr::Object(properties) => {
                 let mut exploded = Vec::with_capacity(properties.len());
-                let last_suspending = properties
-                    .iter()
-                    .rposition(|property| expr_has_suspend(&property.value))
-                    .unwrap_or(0);
+                // A property suspends through its computed key or its value. Every
+                // key and value before the last suspending one is computed first, in
+                // source order, into a hidden temporary.
+                let suspends = |property: &ObjectProperty| {
+                    expr_has_suspend(&property.value)
+                        || matches!(&property.key, PropertyKey::Computed(key) if expr_has_suspend(key))
+                };
+                let last_suspending = properties.iter().rposition(suspends).unwrap_or(0);
                 for (index, property) in properties.iter().enumerate() {
-                    if matches!(&property.key, PropertyKey::Computed(key) if expr_has_suspend(key))
-                    {
-                        return Err(unsupported("a computed property key", 0));
-                    }
+                    let key = match &property.key {
+                        PropertyKey::Computed(key) => {
+                            let mut key = self.explode(key)?;
+                            // The key runs before anything the property or a later
+                            // one suspends on, so it is computed now unless nothing
+                            // after it suspends.
+                            if index < last_suspending
+                                || (index == last_suspending && expr_has_suspend(&property.value))
+                            {
+                                key = self.spill(key);
+                            }
+                            PropertyKey::Computed(key)
+                        }
+                        other => other.clone(),
+                    };
                     let mut value = self.explode(&property.value)?;
                     if index < last_suspending && property.accessor.is_none() && !property.method {
                         value = self.spill(value);
                     }
                     exploded.push(ObjectProperty {
-                        key: property.key.clone(),
+                        key,
                         value,
                         accessor: property.accessor,
                         shorthand: false,

@@ -727,8 +727,8 @@ impl JsRuntime {
                         Ok(Flow::Next)
                     }
                     Completion::Return(value) => self.do_return(dom, co, value),
-                    Completion::Break(label) => self.do_jump(dom, co, label.as_deref(), false),
-                    Completion::Continue(label) => self.do_jump(dom, co, label.as_deref(), true),
+                    Completion::Break(label, _) => self.do_jump(dom, co, label.as_deref(), false),
+                    Completion::Continue(label, _) => self.do_jump(dom, co, label.as_deref(), true),
                 }
             }
             Instr::Eval(expression) => {
@@ -1433,13 +1433,20 @@ impl JsRuntime {
         dom: &mut Dom,
         iterator: ObjectId,
     ) -> Result<(), JsError> {
-        let method = self.get_member(dom, iterator, "return")?;
-        if let JsValue::Object(method) = method
-            && Self::is_callable_object(method, &self.realm)
-        {
-            self.call_with_this(dom, method, &[], JsValue::Object(iterator))?;
+        // IteratorClose for a normal, break or return completion (ECMA-262 7.4.11):
+        // GetMethod(iterator, "return") throws for a non-callable method, and the
+        // result of a called `return` must be an object.
+        let Some(method) = self.get_method(dom, iterator, "return")? else {
+            return Ok(());
+        };
+        let result = self.call_with_this(dom, method, &[], JsValue::Object(iterator))?;
+        if matches!(result, JsValue::Object(_)) {
+            Ok(())
+        } else {
+            Err(JsError::type_error(
+                "iterator return() must produce an object",
+            ))
         }
-        Ok(())
     }
 
     // ------------------------------------------------------------------ yield*

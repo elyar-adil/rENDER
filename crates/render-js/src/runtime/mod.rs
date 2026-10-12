@@ -1144,7 +1144,7 @@ impl JsRuntime {
         self.queue_mutation_deliveries(dom);
         let value = match completion {
             Completion::Normal(value) => value,
-            Completion::Return(_) | Completion::Break(_) | Completion::Continue(_) => {
+            Completion::Return(_) | Completion::Break(..) | Completion::Continue(..) => {
                 return Err(JsError::new(
                     JsErrorKind::Syntax,
                     "abrupt completion escaped the script body",
