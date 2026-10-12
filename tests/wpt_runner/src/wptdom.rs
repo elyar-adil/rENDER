@@ -802,6 +802,15 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             .as_ref()
             .map_or(0, |c| c.tests)
             .saturating_sub(harvest.results.len() as u32);
+        // A timeout with no result is either a file that registered no test at
+        // all, which is not a testharness file, or a file whose tests started and
+        // waited for something that never happened. Those are different gaps.
+        let timed_out = status.map(HarnessStatus::from_number) == Some(HarnessStatus::Timeout);
+        let mechanism = match (timed_out, registered) {
+            (true, 0) => "no-testharness-test",
+            (true, _) => "tests-never-finished",
+            (false, _) => "no-verdict-from-harness",
+        };
         return Execution {
             status: match status {
                 Some(value) => HarnessStatus::from_number(value),
@@ -824,7 +833,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             }),
             assertions: 0,
             harness_asserts: 0,
-            mechanism: Some("no-verdict-from-harness".to_owned()),
+            mechanism: Some(mechanism.to_owned()),
             category: Category::HarnessLimitation,
         };
     }
@@ -965,26 +974,25 @@ impl Execution {
                 ),
             },
             // TIMEOUT is the harness's own timeout firing, not this runner's drain
-            // bound (that is `event-loop-never-settles`). It means a test was
-            // started and waited for something that never happened, or the file
-            // registered no test at all, which is the case without any results.
-            HarnessStatus::Timeout
-                if self.mechanism.as_deref() == Some("no-verdict-from-harness") =>
-            {
-                Verdict::Unsupported {
-                    capability: None,
-                    reason: "the file registered no testharness test before the harness \
-                             timeout, so it has no testharness verdict. It is a reftest, \
-                             crashtest, manual or support file, or its tests never started."
-                        .to_owned(),
-                }
-            }
+            // bound (that is `event-loop-never-settles`). The file either registered
+            // no test, or its tests started and waited for something that never
+            // happened; the mechanism says which, see `read_results`.
             HarnessStatus::Timeout => Verdict::Unsupported {
                 capability: None,
-                reason: format!(
-                    "the test did not finish before the harness timeout: {}",
-                    self.message.as_deref().unwrap_or("no message")
-                ),
+                reason: match self.mechanism.as_deref() {
+                    Some("no-testharness-test") => "the file registered no testharness test \
+                        before the harness timeout, so it has no testharness verdict. It is a \
+                        reftest, crashtest, manual or support file."
+                        .to_owned(),
+                    Some("tests-never-finished") => "the file's tests started, and none \
+                        finished before the harness timeout: each waited for an event, step or \
+                        driver that the engine did not provide."
+                        .to_owned(),
+                    _ => format!(
+                        "the test did not finish before the harness timeout: {}",
+                        self.message.as_deref().unwrap_or("no message")
+                    ),
+                },
             },
             // An unknown status is the case where guessing would be most
             // tempting and most dangerous. It becomes an explained skip, which
