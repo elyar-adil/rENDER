@@ -23,6 +23,7 @@ use std::fmt::Debug;
 use render_dom::{Dom, Namespace, NodeId, NodeKind};
 use url::Url;
 
+use super::builtins::dom_exception::DomExceptionName;
 use super::{INTRINSICS_PRELUDE_SOURCE, JsRuntime, PRELUDE_SOURCE};
 use crate::{JsError, JsValue, ObjectId, RealmId, TimerRequest};
 
@@ -484,8 +485,16 @@ impl JsRuntime {
         let delivered = match target_origin.as_str() {
             "*" => true,
             "/" => source_origin == self.origin_of(target),
-            other => Url::parse(other)
-                .is_ok_and(|url| url.origin().ascii_serialization() == self.origin_of(target)),
+            other => {
+                // Anything else must be a URL, or the call throws (HTML 9.4.3 step 4).
+                let url = Url::parse(other).map_err(|_| {
+                    self.dom_exception(
+                        DomExceptionName::Syntax,
+                        format!("postMessage: {other:?} is not a valid targetOrigin"),
+                    )
+                })?;
+                url.origin().ascii_serialization() == self.origin_of(target)
+            }
         };
         if !delivered {
             return Ok(JsValue::Undefined);

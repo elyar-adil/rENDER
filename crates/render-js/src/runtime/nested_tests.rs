@@ -381,3 +381,16 @@ fn a_srcdoc_script_resolves_its_src_against_the_embedding_document() {
         "yes"
     );
 }
+
+#[test]
+fn an_unparseable_target_origin_throws_a_syntax_error() {
+    let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "var name = 'none'; try { window.postMessage('x', 'http://[bad'); } catch (e) { name = e.name; } name"
+        ),
+        "SyntaxError"
+    );
+}
