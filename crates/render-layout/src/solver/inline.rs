@@ -1418,7 +1418,7 @@ impl<'a> Solver<'a> {
         // attributes. Without a raster it is not replaced, so its size stays the
         // presentation-hint size it had before.
         let is_svg = element.namespace == Namespace::Svg && element.local_name == "svg";
-        if !is_svg && !matches!(element.local_name.as_str(), "img" | "video") {
+        if !is_svg && !matches!(element.local_name.as_str(), "img" | "video" | "canvas") {
             return None;
         }
         let html_width = if is_svg {

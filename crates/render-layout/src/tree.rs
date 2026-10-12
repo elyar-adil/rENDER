@@ -673,7 +673,7 @@ impl Builder<'_> {
         if matches!(
             self.dom.node(node).map(render_dom::Node::kind),
             Some(NodeKind::Element(element))
-                if matches!(element.local_name.as_str(), "img" | "video")
+                if matches!(element.local_name.as_str(), "img" | "video" | "canvas")
         ) {
             let inline = matches!(
                 display,

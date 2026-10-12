@@ -302,9 +302,6 @@ pub struct ImagePaint {
     pub interpolate: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CanvasResourceId(pub u64);
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisplayCommand {
     SolidRect {
@@ -324,10 +321,6 @@ pub enum DisplayCommand {
     Image(ImagePaint),
     LinearGradient(LinearGradient),
     RadialGradient(RadialGradient),
-    Canvas {
-        resource: CanvasResourceId,
-        destination: PhysicalRect,
-    },
     PushStackingContext(StackingContext),
     PopStackingContext,
     /// Opens a CSS Positioned Layout §4.1 sticky scope. Everything up to the

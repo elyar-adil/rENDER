@@ -1,6 +1,7 @@
 //! Display-list construction, incremental diffing, and CPU reference painting.
 
 mod color;
+pub(crate) mod coverage;
 mod display_list;
 mod raster;
 mod scene;
@@ -8,14 +9,14 @@ pub(crate) mod sticky;
 
 pub use color::{Color, SystemPalette};
 pub use display_list::{
-    BlendMode, BorderPaint, BoxShadowPaint, CanvasResourceId, ClipShape, CompositingReason,
-    DisplayCommand, DisplayItem, DisplayItemId, DisplayList, DisplayListBuildOutput,
-    DisplayListBuilderLimits, DisplayListBuilderOptions, DisplayListDiagnostic,
-    DisplayListDiagnosticCode, DisplayListDiff, FontInstanceId, GlyphId, GlyphInstance, GlyphRun,
-    GradientStop, ImagePaint, ImageResourceId, LinearGradient, ListMarkerPaint, ListMarkerShape,
-    PaintCoordinateSpace, PaintPhase, RadialGradient, ReferenceTextShaper, StackingContext,
-    TextDecoration, TextDecorationLine, TextDecorationStyle, TextShadowPaint, TextShaper,
-    Transform2D, build_display_list, build_display_list_with_images,
+    BlendMode, BorderPaint, BoxShadowPaint, ClipShape, CompositingReason, DisplayCommand,
+    DisplayItem, DisplayItemId, DisplayList, DisplayListBuildOutput, DisplayListBuilderLimits,
+    DisplayListBuilderOptions, DisplayListDiagnostic, DisplayListDiagnosticCode, DisplayListDiff,
+    FontInstanceId, GlyphId, GlyphInstance, GlyphRun, GradientStop, ImagePaint, ImageResourceId,
+    LinearGradient, ListMarkerPaint, ListMarkerShape, PaintCoordinateSpace, PaintPhase,
+    RadialGradient, ReferenceTextShaper, StackingContext, TextDecoration, TextDecorationLine,
+    TextDecorationStyle, TextShadowPaint, TextShaper, Transform2D, build_display_list,
+    build_display_list_with_images,
 };
 pub use raster::{
     CpuRasterOutput, CpuRasterizer, GlyphMask, GlyphMaskProvider, NoGlyphMasks,

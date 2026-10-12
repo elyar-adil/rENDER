@@ -671,8 +671,7 @@ impl<'a> RasterState<'a> {
             }
             DisplayCommand::PushTransform(_)
             | DisplayCommand::PopTransform
-            | DisplayCommand::RadialGradient(_)
-            | DisplayCommand::Canvas { .. } => self.diagnostics.push(RasterDiagnostic {
+            | DisplayCommand::RadialGradient(_) => self.diagnostics.push(RasterDiagnostic {
                 item: item.id,
                 code: RasterDiagnosticCode::UnsupportedCommand,
                 message: "display command is represented but not rasterized yet".to_owned(),

@@ -362,6 +362,9 @@ pub struct Page {
     /// The frame store changed since the last completed raster, so a turn
     /// with no DOM invalidation must still repaint.
     video_frames_dirty: bool,
+    /// The 2D canvas engine the script runtime draws into. Its element bitmaps
+    /// are published into the image store the paint path reads.
+    canvas: crate::canvas::CanvasHandle,
     /// Last `document.title` value this page applied to the document, so a
     /// repeated own-property read is not mistaken for a fresh assignment.
     script_title_override: Option<String>,
@@ -433,13 +436,16 @@ impl Page {
         document_url: &Url,
     ) -> Self {
         let document = Document::parse(html);
-        let runtime =
+        let mut runtime =
             JsRuntime::with_limits_and_url(document.dom(), options.runtime_limits, document_url);
+        let canvas = crate::canvas::CanvasHandle::default();
+        runtime.install_canvas_host(Box::new(canvas.clone()));
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
         Self {
             document,
             runtime,
+            canvas,
             event_loop,
             invalidation,
             snapshot: None,
@@ -482,12 +488,15 @@ impl Page {
     ) -> Self {
         let document = Document::parse(html);
         let snapshot = document.render(options.render, backends);
-        let runtime =
+        let mut runtime =
             JsRuntime::with_limits_and_url(document.dom(), options.runtime_limits, document_url);
+        let canvas = crate::canvas::CanvasHandle::default();
+        runtime.install_canvas_host(Box::new(canvas.clone()));
         let event_loop = EventLoop::with_limits(document.dom(), options.event_loop_limits);
         let invalidation = InvalidationCursor::at_current(document.dom());
         let mut page = Self {
             document,
+            canvas,
             runtime,
             event_loop,
             invalidation,
@@ -1346,7 +1355,8 @@ impl Page {
 
         self.sync_script_title();
         let invalidation = self.invalidation.take(self.document.dom())?;
-        let render = (!invalidation.is_empty() || self.video_frames_dirty)
+        let canvas_changed = self.canvas.engine().borrow().has_changes();
+        let render = (!invalidation.is_empty() || self.video_frames_dirty || canvas_changed)
             .then(|| backends.map(|backends| self.render_update(backends)))
             .flatten();
         Ok(Some(PageTurnOutcome {
@@ -1452,6 +1462,7 @@ impl Page {
     }
 
     fn render_update(&mut self, backends: DocumentBackends<'_>) -> PageRenderUpdate {
+        self.publish_canvas_bitmaps();
         let previous = self.snapshot.as_ref();
         let previous_revision = previous.map(|snapshot| snapshot.revision);
         let next =
@@ -1467,6 +1478,28 @@ impl Page {
             previous_revision,
             revision,
             display_list_diff,
+        }
+    }
+
+    /// Publish the bitmap of every canvas script drew into since the last
+    /// render, so that the paint path reads the pixels as they are now.
+    fn publish_canvas_bitmaps(&mut self) {
+        let changed = self
+            .canvas
+            .engine()
+            .borrow_mut()
+            .take_changed_elements(self.document.dom());
+        for (node, width, height, rgba) in changed {
+            let Ok(image) = DecodedImage::from_rgba8(width, height, &rgba) else {
+                continue;
+            };
+            if self
+                .video_frames
+                .set_canvas_bitmap(node, image, ImageLimits::default())
+                .is_ok()
+            {
+                self.video_frames_dirty = true;
+            }
         }
     }
 
