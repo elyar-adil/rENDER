@@ -763,7 +763,7 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         // the last result rather than summed - summing would multiply it by the
         // number of subtests.
         worst.harness_asserts = test.asserts;
-        worst.assertions = worst.assertions.saturating_add(test.asserts);
+        worst.assertions = test.asserts;
         if severity(status) > severity(worst.status) {
             worst.status = status;
             worst.name = test.name;
