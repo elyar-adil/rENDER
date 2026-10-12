@@ -628,6 +628,8 @@ impl NativeFunction {
                 // Object.prototype methods that begin with ToObject(this).
                 | Self::ObjectPrototypeHasOwnProperty
                 | Self::ObjectPrototypePropertyIsEnumerable
+                // §20.1.3.5 begins with `Invoke(this, "toString")`, which coerces `this`.
+                | Self::ObjectPrototypeToLocaleString
                 // Date.prototype.toJSON begins with ToObject(this) (ECMA-262 21.4.4.37).
                 | Self::DateToJSON
         )
@@ -8982,6 +8984,7 @@ impl Realm {
         objects.push(JsObject {
             prototype: Some(function_prototype),
             host: ObjectHost::NativeFunction(NativeFunction::ArraySpecies),
+            properties: Self::function_metadata("get [Symbol.species]", 0.0),
             ..JsObject::default()
         });
         let species = JsSymbol::well_known("@@species");

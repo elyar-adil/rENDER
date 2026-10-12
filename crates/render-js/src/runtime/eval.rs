@@ -6191,6 +6191,16 @@ impl JsRuntime {
                 | NativeFunction::UrlSearchParamsToString
                 | NativeFunction::UrlSearchParamsForEach),
             )) => Ok(self.url_search_params_method(&receiver, function, arguments, dom)),
+            // §20.1.3.3 `isPrototypeOf` returns false for a primitive V before
+            // ToObject(this), so only an object V reaches a nullish receiver's TypeError.
+            Some(ObjectHost::NativeFunction(NativeFunction::ObjectPrototypeIsPrototypeOf))
+                if matches!(receiver, JsValue::Null | JsValue::Undefined)
+                    && matches!(arguments.first(), Some(JsValue::Object(_))) =>
+            {
+                Err(JsError::type_error(
+                    "Object.prototype.isPrototypeOf called on null or undefined",
+                ))
+            }
             // A built-in whose receiver is `RequireObjectCoercible`d gets the
             // nullish `this` as a `TypeError`, not the global object.
             Some(ObjectHost::NativeFunction(function))

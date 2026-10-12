@@ -175,13 +175,15 @@ impl JsRuntime {
                     0,
                     "Object.getOwnPropertySymbols",
                 )?)?;
-                self.ensure_deferred_namespace(dom, object, None)?;
+                // GetOwnPropertyKeys(O, symbol) (ECMA-262 20.1.2.11): the symbol keys
+                // of [[OwnPropertyKeys]], which a proxy answers through its trap.
                 let symbols = self
-                    .realm
-                    .own_symbols(object)
-                    .unwrap_or_default()
+                    .own_property_keys(dom, object)?
                     .into_iter()
-                    .map(JsValue::Symbol)
+                    .filter_map(|key| match key {
+                        PropertyName::Symbol(symbol) => Some(JsValue::Symbol(symbol)),
+                        PropertyName::String(_) => None,
+                    })
                     .collect::<Vec<_>>();
                 Ok(JsValue::Object(self.create_array_from_values(&symbols)?))
             }

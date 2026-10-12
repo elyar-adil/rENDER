@@ -1946,6 +1946,45 @@ fn super_references_and_object_literal_methods_follow_the_spec() {
 }
 
 #[test]
+fn object_prototype_methods_coerce_a_nullish_this_before_their_argument_work() {
+    // 20.1.3.3 isPrototypeOf: an object V reaches ToObject(this), which throws for
+    // null or undefined, but a primitive V returns false first. 20.1.3.5
+    // toLocaleString invokes `toString` on `this`, which throws for a nullish `this`.
+    assert_eq!(
+        ok(r#"var log = [];
+            var proto = Object.prototype.isPrototypeOf;
+            try { proto.call(null, {}); log.push("no"); } catch (error) { log.push(error instanceof TypeError); }
+            try { proto.call(undefined, 1); log.push(String(proto.call(null, 1))); } catch (error) { log.push("bad"); }
+            try { Object.prototype.toLocaleString.call(null); log.push("no"); } catch (error) { log.push(error instanceof TypeError); }
+            log.join(",")"#),
+        "true,false,true"
+    );
+}
+
+#[test]
+fn built_in_species_getters_are_named_get_species() {
+    // 23.1.2.5 get Array [ @@species ]: the accessor's name is "get [Symbol.species]".
+    assert_eq!(
+        ok("Object.getOwnPropertyDescriptor(Array, Symbol.species).get.name"),
+        "get [Symbol.species]"
+    );
+}
+
+#[test]
+fn get_own_property_symbols_reads_a_proxy_through_its_own_keys() {
+    // 20.1.2.11 steps 1-2: GetOwnPropertyKeys(O, symbol) takes [[OwnPropertyKeys]],
+    // which a proxy without an ownKeys trap answers from its target.
+    assert_eq!(
+        ok(r#"var target = {}; var s = Symbol("t");
+            Object.defineProperty(target, s, { value: 1 });
+            Object.defineProperty(target, Symbol.iterator, { value: 2 });
+            var keys = Object.getOwnPropertySymbols(new Proxy(target, {}));
+            [keys.length, keys.includes(s), keys.includes(Symbol.iterator)].join(",")"#),
+        "2,true,true"
+    );
+}
+
+#[test]
 fn object_literal_accessors_are_named_with_their_get_or_set_prefix() {
     // ECMA-262 15.4.5 (SetFunctionName with a prefix): an accessor's function is
     // named `get ` or `set ` before its key, for identifier, numeric and symbol keys.
