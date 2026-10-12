@@ -394,3 +394,18 @@ fn an_unparseable_target_origin_throws_a_syntax_error() {
         "SyntaxError"
     );
 }
+
+#[test]
+fn the_page_load_event_reaches_the_window_once_when_the_embedder_dispatches_it() {
+    let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
+    run(
+        &mut dom,
+        &mut runtime,
+        "var loads = 0; window.addEventListener('load', function () { loads++; });",
+    );
+    assert_eq!(run(&mut dom, &mut runtime, "loads"), "0", "nothing fires it by itself");
+    runtime
+        .dispatch_page_load(&mut dom)
+        .expect("the page's load event dispatches");
+    assert_eq!(run(&mut dom, &mut runtime, "loads"), "1");
+}

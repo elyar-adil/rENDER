@@ -411,6 +411,14 @@ impl JsRuntime {
         Ok(())
     }
 
+    /// Fires the page's `load` event at its window (HTML 8.1.7, "the end"). An
+    /// embedding calls this once, after the page's own scripts have run; a `load`
+    /// listener that is not run here is never run. `testharness.js` completes only
+    /// after this event, so a page that never gets it never finishes.
+    pub fn dispatch_page_load(&mut self, dom: &mut Dom) -> Result<(), JsError> {
+        self.dispatch_window_load(dom, RealmId::default())
+    }
+
     /// Fires `load` at the window of `realm`, after its document's scripts ran.
     /// The event is aimed at the document, which is how every window event here
     /// reaches the window.
