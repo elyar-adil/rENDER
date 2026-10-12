@@ -6276,13 +6276,13 @@ svg@svg
                 })
                 .collect::<Vec<_>>()
         );
-        // A namespaced attribute is not reachable through the null-namespace
-        // accessors, which is what makes it namespaced rather than a colon in a
-        // name.
+        // getAttribute matches the qualified name (DOM "get an attribute by
+        // name"), so the namespaced attribute is found by "xlink:href" but not
+        // by its local name alone.
         assert_eq!(output.dom.attribute(use_element, "href").unwrap(), None);
         assert_eq!(
             output.dom.attribute(use_element, "xlink:href").unwrap(),
-            None
+            Some("v")
         );
         assert_eq!(
             output
