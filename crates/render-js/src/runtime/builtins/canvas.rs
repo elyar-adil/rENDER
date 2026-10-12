@@ -455,8 +455,15 @@ impl JsRuntime {
             return Err(JsError::type_error("Illegal invocation"));
         };
         let kind = self.canvas_string(dom, arguments, 0)?;
-        if kind != "2d" {
-            return Ok(JsValue::Null);
+        match kind.as_str() {
+            "2d" => {}
+            // Context kinds of the specification that this surface does not provide.
+            "bitmaprenderer" | "webgl" | "webgl2" | "webgpu" => return Ok(JsValue::Null),
+            _ => {
+                return Err(JsError::type_error(format!(
+                    "The provided value '{kind}' is not a valid enum value of type CanvasContextId."
+                )));
+            }
         }
         let Some(host) = self.canvas_host.as_mut() else {
             return Ok(JsValue::Null);
@@ -626,7 +633,7 @@ impl JsRuntime {
                     Some(host) => host.size(dom, id),
                     None => (0, 0),
                 };
-                let converted = unsigned_long(number);
+                let converted = enforce_unsigned_long(number)?;
                 let (width, height) = if property == CanvasProperty::OffscreenWidth {
                     (converted, current_height)
                 } else {
@@ -1024,6 +1031,18 @@ fn unsigned_long(number: f64) -> u32 {
     let truncated = number.trunc();
     let modulo = truncated.rem_euclid(4_294_967_296.0);
     modulo as u32
+}
+
+/// The `WebIDL` `[EnforceRange] unsigned long` conversion: a value that is not
+/// finite, or lies outside `0..=4294967295` after truncation, is a `TypeError`.
+fn enforce_unsigned_long(number: f64) -> Result<u32, JsError> {
+    let truncated = number.trunc();
+    if !number.is_finite() || !(0.0..=4_294_967_295.0).contains(&truncated) {
+        return Err(JsError::type_error(
+            "Value is outside the 'unsigned long' value range",
+        ));
+    }
+    Ok(truncated as u32)
 }
 
 /// The `WebIDL` `long` conversion of an already-converted number.
