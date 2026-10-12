@@ -18,8 +18,9 @@
 //! [`CanvasHost`]. The drawing state, the pixels and the rasterization live in
 //! the host, so that the paint path and the script read one bitmap.
 //!
-//! Each interface is installed only where its surface is complete. A method
-//! that is not listed here is absent from the prototype, not stubbed.
+//! Each member is installed only when its behaviour is implemented. A member
+//! that is not listed here, such as `drawImage` or the gradient constructors,
+//! is absent from its prototype rather than stubbed.
 
 use crate::canvas::{
     Attribute, CanvasError, CanvasErrorKind, CanvasHost, CanvasId, CanvasOp, CanvasStyle,
