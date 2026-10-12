@@ -783,7 +783,10 @@ mod tests {
                 c.capabilities.contains(&Capability::NestedBrowsingContext),
                 "{entry} must be classified as needing a nested browsing context"
             );
-            assert!(matches!(c.blocker, Some(Blocker::MissingEngine(_))));
+            assert!(
+                super::capability_is_available(Capability::NestedBrowsingContext),
+                "the engine drives nested browsing contexts, which {entry} needs"
+            );
         }
     }
 
