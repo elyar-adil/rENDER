@@ -16,6 +16,7 @@ pub(super) mod array;
 pub(super) mod atomics;
 pub(super) mod bigint;
 pub(super) mod blob;
+pub(crate) mod canvas;
 pub(super) mod collections;
 pub(super) mod data_view;
 pub(super) mod date;

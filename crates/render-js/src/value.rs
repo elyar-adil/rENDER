@@ -16,7 +16,7 @@ use crate::utf16::JsString;
 
 /// Stable identity for an object allocated in a [`Realm`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectId(usize);
+pub struct ObjectId(pub(crate) usize);
 
 impl ObjectId {
     /// Return the object's arena index. This is useful for diagnostics only.
@@ -1373,6 +1373,12 @@ pub(crate) enum NativeFunction {
     VideoPause,
     VideoLoad,
     VideoCanPlayType,
+    /// A method of the canvas 2D surface (`builtins/canvas.rs`).
+    Canvas(crate::runtime::builtins::canvas::CanvasMethod),
+    /// The getter of a canvas accessor.
+    CanvasGetter(crate::runtime::builtins::canvas::CanvasProperty),
+    /// The setter of a canvas accessor.
+    CanvasSetter(crate::runtime::builtins::canvas::CanvasProperty),
     /// `%TypedArray%.prototype.buffer`: the `ArrayBuffer` the view is over.
     TypedArrayBufferGetter,
     /// A function an embedder defined with `JsRuntime::define_host_function`: the
@@ -2535,6 +2541,9 @@ pub(crate) enum ObjectHost {
     /// visible fields (`src`, `duration`, ...) are plain properties updated
     /// in place, mirroring the `XMLHttpRequest` pattern.
     VideoElement(VideoElementState),
+    /// An object of the canvas 2D surface: a constructor, a context, an
+    /// offscreen canvas, or an `ImageData` (`builtins/canvas.rs`).
+    Canvas(crate::runtime::builtins::canvas::CanvasObject),
 }
 
 impl ObjectHost {
@@ -2568,6 +2577,9 @@ impl ObjectHost {
                 | Self::DomNodeConstructor(_)
                 | Self::ImageConstructor
                 | Self::VideoConstructor
+                | Self::Canvas(crate::runtime::builtins::canvas::CanvasObject::Constructor(
+                    _
+                ))
                 | Self::ObjectConstructor
                 | Self::PromiseConstructor
                 | Self::AggregateErrorConstructor
@@ -2706,11 +2718,23 @@ pub(crate) struct MutationWatch {
     pub character_data: bool,
 }
 
+/// Constructors used by bootstrap and by the surface modules that add objects.
+impl JsObject {
+    /// An ordinary object of `prototype` carrying `host`.
+    pub(crate) fn with_host(prototype: Option<ObjectId>, host: ObjectHost) -> Self {
+        Self {
+            prototype,
+            host,
+            ..Self::default()
+        }
+    }
+}
+
 /// An object stored in a realm. Host identity is intentionally private: DOM
 /// wrappers can only be created by the binding layer.
 #[derive(Clone, Debug)]
 pub struct JsObject {
-    properties: BTreeMap<String, PropertyDescriptor>,
+    pub(crate) properties: BTreeMap<String, PropertyDescriptor>,
     /// Symbol-keyed properties, keyed by symbol id with the owning symbol
     /// kept alongside so descriptions survive (`getOwnPropertySymbols`).
     symbols: BTreeMap<u64, (JsSymbol, PropertyDescriptor)>,
@@ -3519,6 +3543,12 @@ impl Realm {
         Self::install_encoding(objects, global, object_prototype, function_prototype);
         Self::install_fetch(objects, global, object_prototype, function_prototype);
         Self::install_video(objects, global, object_prototype, function_prototype);
+        crate::runtime::builtins::canvas::install_canvas(
+            objects,
+            global,
+            object_prototype,
+            function_prototype,
+        );
         Self::define_global_function(
             objects,
             global,
@@ -11421,7 +11451,7 @@ impl Realm {
     }
 
     /// Appends `object` to the heap, stamped with the current realm.
-    fn allocate(&mut self, mut object: JsObject) -> ObjectId {
+    pub(crate) fn allocate(&mut self, mut object: JsObject) -> ObjectId {
         let id = ObjectId(self.objects.len());
         object.realm = self.current;
         self.objects.push(object);

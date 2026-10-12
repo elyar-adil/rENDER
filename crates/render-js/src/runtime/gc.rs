@@ -282,6 +282,16 @@ pub(super) fn mark_host(
         | ObjectHost::ProxyConstructor
         | ObjectHost::ShadowRealmConstructor
         | ObjectHost::ShadowRealm(_) => {}
+        ObjectHost::Canvas(canvas) => match canvas {
+            crate::runtime::builtins::canvas::CanvasObject::Context { canvas, .. } => {
+                mark_object(runtime, marked, work, marked_environments, *canvas);
+            }
+            crate::runtime::builtins::canvas::CanvasObject::ImageData { data, .. } => {
+                mark_object(runtime, marked, work, marked_environments, *data);
+            }
+            crate::runtime::builtins::canvas::CanvasObject::Constructor(_)
+            | crate::runtime::builtins::canvas::CanvasObject::OffscreenCanvas(_) => {}
+        },
         ObjectHost::WrappedFunction(target) => {
             mark_object(runtime, marked, work, marked_environments, *target);
         }
@@ -481,6 +491,15 @@ impl JsRuntime {
                 &mut work,
                 &mut marked_environments,
                 *listeners,
+            );
+        }
+        for context in self.canvas_contexts.values() {
+            mark_object(
+                self,
+                &mut marked,
+                &mut work,
+                &mut marked_environments,
+                *context,
             );
         }
         for handler in self.event_handlers.values().flat_map(BTreeMap::values) {
