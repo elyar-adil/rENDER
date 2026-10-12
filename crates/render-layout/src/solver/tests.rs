@@ -12,7 +12,8 @@ use render_dom::NodeId;
 use render_html::parse_document;
 
 use crate::solver::{
-    LayoutDiagnosticCode, LayoutLimits, LayoutOptions, SimpleTextMeasurer, layout_formatting_tree,
+    ImageResourceProvider, LayoutDiagnosticCode, LayoutLimits, LayoutOptions, SimpleTextMeasurer,
+    layout_formatting_tree, layout_formatting_tree_with_images,
 };
 
 pub(super) fn pipeline(
@@ -1397,6 +1398,59 @@ fn absolute_left_50_percent_with_negative_margin_centers_the_logo() {
         .expect("logo fragment");
     assert_eq!(logo.rect.origin.x, 365.0);
     assert_eq!(logo.rect.origin.y, 400.0 - 10.0 - 129.0);
+}
+
+/// An image store that knows the intrinsic size of one element, which is all
+/// the replaced sizing of an inline `svg` reads from it.
+struct OneIntrinsicSize(NodeId, (u32, u32));
+
+impl ImageResourceProvider for OneIntrinsicSize {
+    fn intrinsic_size_for_node(&self, node: NodeId) -> Option<(u32, u32)> {
+        (node == self.0).then_some(self.1)
+    }
+}
+
+/// An author `width: auto` overrides the presentation hint that carries an
+/// `svg`'s `width`, and layout cannot measure the svg's contents. The svg is a
+/// replaced element, so it takes its intrinsic size from the raster instead.
+#[test]
+fn an_inline_svg_with_an_auto_width_takes_its_intrinsic_size() {
+    let output = parse_document(
+        "<!doctype html><body><svg id='logo' width='40' height='10'><rect width='40' height='10'/></svg></body>",
+    );
+    let logo = find(&output.dom, "#logo");
+    let sheet = parse_stylesheet(
+        "html, body { display:block; margin:0 } svg { display:inline-block; width:auto }",
+    );
+    let styles = compute_document_styles(
+        &output.dom,
+        &[CascadeInput {
+            sheet: &sheet,
+            origin: CascadeOrigin::Author,
+        }],
+        &PropertyRegistry::standard_baseline(),
+        &ComputationLimits::default(),
+        &MatchContext::default(),
+    );
+    let formatting = build_formatting_tree(&output.dom, &styles, &FormattingLimits::default());
+    let images = OneIntrinsicSize(logo, (40, 10));
+    let layout = layout_formatting_tree_with_images(
+        &output.dom,
+        &formatting,
+        &styles,
+        LayoutOptions {
+            viewport: crate::PhysicalSize {
+                width: 1000.0,
+                height: 600.0,
+            },
+            ..LayoutOptions::default()
+        },
+        &SimpleTextMeasurer,
+        Some(&images),
+    );
+    let logo_fragment = fragment(&layout, logo);
+    assert_eq!(logo_fragment.rect.size.width, 40.0);
+    assert_eq!(logo_fragment.rect.size.height, 10.0);
 }
 
 #[test]

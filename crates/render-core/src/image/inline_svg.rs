@@ -61,6 +61,7 @@ use super::{
     DecodedImage, ImageLimits, ImageResourceId, ImageResourceKey, ImageResources,
     ImageSelectionContext, ImageSource, svg,
 };
+use crate::paint::Color;
 
 /// The `xlink` namespace URI, for the one attribute this module reads by
 /// namespace.
@@ -130,8 +131,9 @@ pub struct InlineSvgRaster {
     pub owner: NodeId,
     /// The identity the image store records the raster under.
     pub key: ImageResourceKey,
-    /// The serialised subtree, which is also the raster's content identity:
-    /// the same markup rasterises to the same image.
+    /// The serialised subtree. The raster's content identity is this markup
+    /// together with the colour `currentColor` resolved to, since both decide
+    /// the pixels: the same markup in a different colour is a different raster.
     pub source: String,
     pub image: DecodedImage,
 }
@@ -189,7 +191,19 @@ impl InlineSvgDiscovery {
     }
 }
 
-/// Find and rasterise every inline `<svg>` element in the document.
+/// Find and rasterise every inline `<svg>` element in the document, resolving
+/// `currentColor` to the initial value of `color`, which is black.
+///
+/// Use [`discover_inline_svgs_with_colors`] when the page has a computed
+/// `color` for the element, as the document pipeline does.
+#[must_use]
+pub fn discover_inline_svgs(dom: &Dom, limits: ImageLimits) -> InlineSvgDiscovery {
+    discover_inline_svgs_with_colors(dom, limits, |_| Color::BLACK)
+}
+
+/// [`discover_inline_svgs`] with `currentColor` resolved per `svg` element:
+/// `current_color` is asked for the computed `color` of each `svg` element it
+/// rasterises.
 ///
 /// The walk stops at `limits.max_discovery_nodes`, the same node budget image
 /// discovery uses, so a pathological document cannot make this pass unbounded.
@@ -199,8 +213,16 @@ impl InlineSvgDiscovery {
 /// again would draw the same geometry twice. The exception is an `svg` reached
 /// through an SVG HTML integration point, where the content between the two is
 /// HTML and the inner icon is not in the outer raster at all.
+///
+/// `currentColor` inside a nested shape resolves to the outer `svg`'s colour.
+/// Descendants that set their own `color` are not consulted; the raster is
+/// built from the serialised markup, which carries no computed styles.
 #[must_use]
-pub fn discover_inline_svgs(dom: &Dom, limits: ImageLimits) -> InlineSvgDiscovery {
+pub fn discover_inline_svgs_with_colors(
+    dom: &Dom,
+    limits: ImageLimits,
+    current_color: impl Fn(NodeId) -> Color,
+) -> InlineSvgDiscovery {
     let selection_context = ImageSelectionContext::default();
     let mut resources = Vec::new();
     let mut diagnostics = Vec::new();
@@ -230,7 +252,8 @@ pub fn discover_inline_svgs(dom: &Dom, limits: ImageLimits) -> InlineSvgDiscover
         };
 
         if is_svg_root(element) {
-            match rasterise(dom, node_id, element, limits, selection_context) {
+            let color = current_color(node_id);
+            match rasterise(dom, node_id, element, color, limits, selection_context) {
                 Ok(raster) => resources.push(raster),
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -286,6 +309,7 @@ fn rasterise(
     dom: &Dom,
     owner: NodeId,
     element: &ElementData,
+    current_color: Color,
     limits: ImageLimits,
     selection_context: ImageSelectionContext,
 ) -> Result<InlineSvgRaster, InlineSvgDiagnostic> {
@@ -302,23 +326,23 @@ fn rasterise(
         });
     }
     let (width, height) = svg_geometry(element).raster_size();
-    let image =
-        svg::decode_svg_viewport(source.as_bytes(), width, height, limits).map_err(|error| {
-            InlineSvgDiagnostic {
-                node: Some(owner),
-                code: InlineSvgDiagnosticCode::DecodeFailed,
-                message: format!("inline SVG did not rasterise: {error}"),
-            }
-        })?;
+    let image = svg::decode_svg_viewport(source.as_bytes(), width, height, current_color, limits)
+        .map_err(|error| InlineSvgDiagnostic {
+        node: Some(owner),
+        code: InlineSvgDiagnosticCode::DecodeFailed,
+        message: format!("inline SVG did not rasterise: {error}"),
+    })?;
+    let identity = raster_identity(&source, current_color);
     Ok(InlineSvgRaster {
         owner,
         key: ImageResourceKey {
             owner,
-            requested_url: inline_svg_url(owner, &source),
-            // The serialised markup is the source snapshot, so editing the
-            // subtree produces a different key and a fresh resource id, which
-            // is what makes the display-list diff see the change.
-            source_snapshot: source.clone(),
+            requested_url: inline_svg_url(owner, &identity),
+            // The identity is the source snapshot, so editing the subtree, or
+            // changing the colour `currentColor` resolves to, produces a
+            // different key and a fresh resource id. That is what makes the
+            // display-list diff see the change.
+            source_snapshot: identity,
             source: ImageSource::Element,
             selection_context,
         },
@@ -327,19 +351,29 @@ fn rasterise(
     })
 }
 
+/// What decides an inline `svg`'s pixels: its serialised markup and the colour
+/// `currentColor` resolves to. The colour is part of the identity because a
+/// colour change under unchanged markup must install a new raster.
+fn raster_identity(source: &str, current_color: Color) -> String {
+    format!(
+        "{source}\u{0}{:02x}{:02x}{:02x}{:02x}",
+        current_color.red, current_color.green, current_color.blue, current_color.alpha
+    )
+}
+
 /// A stable, non-fetchable URL standing in for the markup an inline `svg`
 /// carries.
 ///
 /// [`ImageResourceKey`] is keyed by `(owner, requested_url)`, and an inline
 /// `svg` has no URL to fetch. The `inline-svg:` scheme is not one the loader
 /// supports, so such a key can never be mistaken for a network request, and
-/// the content digest keeps two different markups for one owner from sharing a
-/// slot.
-fn inline_svg_url(owner: NodeId, source: &str) -> Url {
+/// the content digest keeps two different identities for one owner from
+/// sharing a slot.
+fn inline_svg_url(owner: NodeId, identity: &str) -> Url {
     Url::parse(&format!(
         "inline-svg://element/{}/{:016x}",
         owner.as_u64(),
-        content_digest(source)
+        content_digest(identity)
     ))
     .expect("the inline SVG URL scheme and its digits are a well-formed URL")
 }
@@ -497,7 +531,7 @@ mod tests {
     )]
     use super::{
         NEVER_RENDERED_SVG_ELEMENTS, SVG_HTML_INTEGRATION_POINTS, SvgGeometry,
-        discover_inline_svgs, svg_geometry, xlink_href,
+        discover_inline_svgs, discover_inline_svgs_with_colors, svg_geometry, xlink_href,
     };
     use crate::css::selector::{MatchContext, parse_selector_list, select_all};
     use crate::dom::{Dom, NodeId, NodeKind};
@@ -644,6 +678,36 @@ mod tests {
             "changed markup needs a new resource id so the display-list diff sees it"
         );
         assert_eq!(images.len(), 1, "the owner still holds exactly one raster");
+    }
+
+    /// `currentColor` decides the pixels, so the same markup in another colour
+    /// is another raster: the owner's entry is replaced and the pixels follow
+    /// the colour, rather than the old colour being kept under the same key.
+    #[test]
+    fn the_resolved_current_color_is_part_of_the_raster_identity() {
+        // The value is quoted: unquoted, the tokenizer would read `currentColor/`.
+        let dom = parse(
+            "<!doctype html><body><svg width=4 height=4>\
+             <rect width=4 height=4 fill='currentColor'/></svg>",
+        );
+        let limits = ImageLimits::default();
+        let mut images = ImageResources::default();
+        let green = PaintColor::rgb(0, 128, 0);
+        let blue = PaintColor::rgb(0, 0, 255);
+
+        let (first, diagnostics) =
+            discover_inline_svgs_with_colors(&dom, limits, |_| green).install(&mut images, limits);
+        assert!(diagnostics.is_empty());
+        let (second, diagnostics) =
+            discover_inline_svgs_with_colors(&dom, limits, |_| blue).install(&mut images, limits);
+        assert!(diagnostics.is_empty());
+
+        assert_eq!(first.len(), 1);
+        assert_ne!(first[0], second[0], "a new colour needs a new resource id");
+        assert_eq!(images.len(), 1, "the owner still holds exactly one raster");
+        let owner = only_svg(&dom);
+        let loaded = images.get_for_node(owner).expect("the raster is installed");
+        assert_eq!(loaded.image.pixel(1, 1), Some(blue));
     }
 
     /// A `xlink:href` is in the `xlink` namespace and a null-namespace `href`

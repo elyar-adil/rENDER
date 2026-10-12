@@ -370,6 +370,14 @@ impl Session {
             let code = code_name(&format!("{:?}", reported.code));
             entries.push(diagnostics::raster_entry(code, &reported.message));
         }
+        for diagnostic in &self.output.diagnostics.inline_svg {
+            entries.push(coded_entry(
+                Stage::InlineSvg,
+                code_name(&format!("{:?}", diagnostic.code)),
+                diagnostic.node,
+                &format!("{:?}: {}", diagnostic.code, diagnostic.message),
+            ));
+        }
         for diagnostic in &self.image_discovery.diagnostics {
             entries.push(coded_entry(
                 Stage::Image,

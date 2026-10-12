@@ -38,6 +38,7 @@ use render_css::properties::Overflow;
 use render_css::properties::TextAlign;
 use render_css::properties::TypedPropertyValue;
 use render_css::properties::WordBreak as WordBreakProperty;
+use render_dom::Namespace;
 use render_dom::Node;
 use render_dom::NodeId;
 use render_dom::NodeKind;
@@ -1411,11 +1412,25 @@ impl<'a> Solver<'a> {
         let Some(NodeKind::Element(element)) = self.dom.node(source).map(Node::kind) else {
             return None;
         };
-        if !matches!(element.local_name.as_str(), "img" | "video") {
+        // An inline `svg` is a replaced element. Its intrinsic size is the raster
+        // the document pipeline installed for it, which is sized from the
+        // element's own `width`/`height`/`viewBox`, and it has no HTML dimension
+        // attributes. Without a raster it is not replaced, so its size stays the
+        // presentation-hint size it had before.
+        let is_svg = element.namespace == Namespace::Svg && element.local_name == "svg";
+        if !is_svg && !matches!(element.local_name.as_str(), "img" | "video") {
             return None;
         }
-        let html_width = self.html_image_dimension(source, "width");
-        let html_height = self.html_image_dimension(source, "height");
+        let html_width = if is_svg {
+            None
+        } else {
+            self.html_image_dimension(source, "width")
+        };
+        let html_height = if is_svg {
+            None
+        } else {
+            self.html_image_dimension(source, "height")
+        };
         let intrinsic = self
             .images
             .and_then(|images| images.intrinsic_size_for_node(source))
@@ -1425,6 +1440,9 @@ impl<'a> Solver<'a> {
                     image_dimension_to_f32(height),
                 )
             });
+        if is_svg && intrinsic.is_none() {
+            return None;
+        }
         let ratio = intrinsic
             .filter(|(_, height)| *height > 0.0)
             .map(|(width, height)| width / height)

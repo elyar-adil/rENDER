@@ -598,9 +598,9 @@ fn text_measurement_depends_on_the_requested_font_family() {
     );
 }
 
-/// The namespace half of `docs/visual_fidelity_gaps.md` S5 has landed: an inline
-/// `<svg>` and its children are parsed as foreign content. The geometry half
-/// has not; see the ignored test below.
+/// The namespace half of `docs/visual_fidelity_gaps.md` S5: an inline `<svg>`
+/// and its children are parsed as foreign content. The geometry half is checked
+/// by `an_inline_svg_is_laid_out_as_a_box_and_painted_into_it`.
 #[test]
 fn inline_svg_is_parsed_as_foreign_content() {
     use render_core::dom::Namespace;
@@ -659,48 +659,151 @@ fn attribute_of(
     inspect::attribute(dom, node, name).map(str::to_owned)
 }
 
-/// Gap: `docs/visual_fidelity_gaps.md` S5 - inline SVG is now parsed as foreign
-/// content and rasterised as an image resource, so the **shape** is drawn, but
-/// nothing in `render-core`'s document pipeline runs
-/// [`render_core::image::inline_svg::discover_inline_svgs`] or installs its
-/// rasters. The `svg` element itself still lays out no box, so the raster has
-/// nothing to paint into.
+/// The S5 rendering half, through the document pipeline.
 ///
-/// Measured this round: with discovery and install performed by the caller - the
-/// documented API - the raster is produced and the badge's box is laid out at
-/// 16x16 from its `width`/`height`. The gap is the missing *call*, not the
-/// missing capability, and that is why the two halves are separated below.
+/// `Session::load` renders the fixture with
+/// `render_with_external_style_sheets_and_images` and installs no inline-SVG
+/// raster itself. The document pipeline discovers the page's inline `svg`
+/// elements and layers their rasters over the caller's images, so the badge's
+/// box and its image command come from the same render a page load produces.
+///
+/// The assertions are about the `svg` element, not its `path`. An SVG shape is
+/// not a CSS box: the rasteriser draws the `path` into the `svg` element's
+/// box, so layout must produce that box and paint must put the raster in it.
+/// An earlier version of this test required a box for the `path` itself, which
+/// assumed SVG graphics are CSS boxes, and they are not.
 #[test]
-#[ignore = "docs/visual_fidelity_gaps.md S5: the document pipeline never runs inline-SVG discovery"]
-fn an_inline_svg_shape_is_laid_out_and_painted() {
+fn an_inline_svg_is_laid_out_as_a_box_and_painted_into_it() {
+    use render_core::paint::DisplayCommand;
+
     let session = Session::load(&NETEASE_163_HOME);
     let dom = session.document.dom();
-    let paths = inspect::select(dom, "path");
-    assert!(!paths.is_empty(), "the inline SVG has no path children");
-    for path in &paths {
+    let svg = inspect::select_one(dom, "svg").expect("the fixture has an inline SVG badge");
+
+    // The fixture declares `width="16" height="16"`, so the box is 16x16.
+    let badge = inspect::box_of(session.fragments(), svg)
+        .expect("the inline SVG laid out no box")
+        .content;
+    assert_eq!(
+        (badge.size.width, badge.size.height),
+        (16.0, 16.0),
+        "the badge's box did not come from its width/height attributes"
+    );
+
+    // Its image command paints the raster into exactly that box.
+    let painted: Vec<_> = session
+        .display_list()
+        .items()
+        .iter()
+        .filter(|item| item.source == Some(svg))
+        .filter_map(|item| match &item.command {
+            DisplayCommand::Image(paint) => Some(paint.destination),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        painted,
+        vec![badge],
+        "the inline SVG's raster is not painted into its laid-out box"
+    );
+    assert!(
+        session.output.diagnostics.inline_svg.is_empty(),
+        "inline SVG discovery reported {:?}",
+        session.output.diagnostics.inline_svg
+    );
+}
+
+/// The top-level inline `svg` elements each registered fixture declares,
+/// pinned per fixture. A fixture not named here must declare none.
+///
+/// Counted as the parser built them: an `svg` in the SVG namespace that has no
+/// `svg` ancestor. A nested `svg` is part of its ancestor's raster and is not
+/// counted, because the rasteriser draws it there.
+const INLINE_SVG_ROOTS: &[(&str, usize)] = &[("netease_163_home", 1), ("sticky_toolbar", 1)];
+
+/// Every top-level inline `svg` a fixture declares is either laid out as a box
+/// with exactly one image command at that box, or is not laid out at all (its
+/// box is removed by a `display: none` ancestor), in which case it paints nothing.
+/// A box with no image command, or an image command with no box, is a defect.
+#[test]
+fn every_fixture_paints_its_inline_svgs() {
+    use render_core::dom::Namespace;
+    use render_core::paint::DisplayCommand;
+
+    for fixture in FIXTURES {
+        let session = Session::load(fixture);
+        let dom = session.document.dom();
+        let svgs: Vec<_> = inspect::select(dom, "svg")
+            .into_iter()
+            .filter(|node| inspect::namespace(dom, *node) == Some(Namespace::Svg))
+            .collect();
+        let roots: Vec<_> = svgs
+            .iter()
+            .copied()
+            .filter(|node| {
+                !svgs
+                    .iter()
+                    .any(|other| other != node && inspect::is_descendant(dom, *node, *other))
+            })
+            .collect();
+
+        let expected = INLINE_SVG_ROOTS
+            .iter()
+            .find(|(label, _)| *label == fixture.label)
+            .map_or(0, |(_, count)| *count);
+        assert_eq!(
+            roots.len(),
+            expected,
+            "{}: declares {} top-level inline svg elements, expected {expected}",
+            fixture.label,
+            roots.len()
+        );
+
+        for root in roots {
+            let painted: Vec<_> = session
+                .display_list()
+                .items()
+                .iter()
+                .filter(|item| item.source == Some(root))
+                .filter_map(|item| match &item.command {
+                    DisplayCommand::Image(paint) => Some(paint.destination),
+                    _ => None,
+                })
+                .collect();
+            match inspect::box_of(session.fragments(), root) {
+                Some(laid_out) => assert_eq!(
+                    painted,
+                    vec![laid_out.content],
+                    "{}: an inline svg's box and its image command disagree",
+                    fixture.label
+                ),
+                None => assert!(
+                    painted.is_empty(),
+                    "{}: an inline svg with no box still paints an image",
+                    fixture.label
+                ),
+            }
+        }
         assert!(
-            inspect::box_of(session.fragments(), *path).is_some(),
-            "an inline SVG <path> laid out no box"
+            session.output.diagnostics.inline_svg.is_empty(),
+            "{}: inline SVG discovery reported {:?}",
+            fixture.label,
+            session.output.diagnostics.inline_svg
         );
     }
 }
 
-/// The half of S5 that *did* land, as a permanent assertion, and the
-/// measurement that pins down exactly what is missing.
-///
-/// `discover_inline_svgs` and `InlineSvgDiscovery::install` are the documented
-/// API for turning an inline `<svg>` into a paintable image resource. This calls
-/// them the way a caller must, and asserts:
+/// The discovery API, called directly, as a caller that wants the raster itself
+/// does. `discover_inline_svgs` and `InlineSvgDiscovery::install` are public, and
+/// this asserts:
 ///
 /// 1. the raster is produced, for the fixture's own inline `<svg>`;
 /// 2. its intrinsic size comes from the `width`/`height` attributes;
-/// 3. it installs under the `svg` element's own key, so the ordinary image
-///    command will find it - which is what makes the missing call the only thing
-///    standing between this and a painted shape.
+/// 3. it installs under the `svg` element's own key, so an image command can
+///    find it.
 ///
-/// A regression in any of the three fails here. The *absence of the call* is the
-/// gap, and the ignored test above is where it is recorded; this test is what
-/// makes the gap's size known rather than guessed.
+/// The document pipeline runs this same discovery itself, so a page does not
+/// need this call; see `an_inline_svg_is_laid_out_as_a_box_and_painted_into_it`.
 #[test]
 fn an_inline_svg_rasterises_when_the_caller_asks_for_one() {
     use render_core::image::{ImageLimits, inline_svg::discover_inline_svgs};
