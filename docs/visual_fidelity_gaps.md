@@ -1374,99 +1374,58 @@ candidate to check against real-site script corpora already in `.diag/`.
 
 ## S11 - Nested browsing contexts: the script side is implemented, painting is not
 
-**Status: partly closed.** An `<iframe>` now has its own document and realm, and the
-page's scripts can reach it and it can reach the page. Still open: a nested document is
-**not painted** (an iframe is still nothing on screen), `window.open` and
-`target=_blank` do nothing, and frames have no cross-origin restrictions and cannot be
-navigated to a new URL.
+**Status: partly closed.** An `<iframe>` is a browsing context with its own document and realm, and the page's scripts can reach it and it can reach the page. Still open: a nested document is **not painted**, `window.open` and `target=_blank` do nothing, frames have no cross-origin restrictions, and a frame cannot be navigated to a new URL.
 
-### What is implemented (verified)
+### What is implemented (verified by tests)
 
-- `render-dom` (`crates/render-dom/src/lib.rs`): `Dom::graft_document` moves a parsed
-  document into the page's arena as a detached tree. One node id names one node for the
-  whole page, and the owner's ids do not change. It records no mutation.
-- `render-js`: one heap, one realm per browsing context.
-  `Realm::create_document_realm` (`crates/render-js/src/value.rs`) builds a realm whose
-  host globals are bound to that document. Window listeners, the event path and node
-  wrappers are per realm (`runtime/builtins/events.rs`, `runtime/builtins/dom.rs::wrap_node`).
+- `render-dom` (`crates/render-dom/src/lib.rs`): `Dom::graft_document` moves a parsed document into the page's arena as a detached tree. The owner's node ids do not change, and no mutation is recorded.
+- `render-js`: one heap, one realm per browsing context (`Realm::create_document_realm`). Window listeners, the event path and node wrappers are per realm.
 - Nested contexts, `crates/render-js/src/runtime/nested.rs`:
-  - a connected `<iframe>` is scheduled to load. Its window (`about:blank`) is made the
-    first time something asks for `contentWindow`, so a frame nobody inspects costs one
-    realm, not two;
-  - the document is `srcdoc`, then `src` through the host's `DocumentLoader`, then an
-    empty document. Its classic scripts run in its own realm, inline or `src`, and it
-    fires its window `load`;
-  - the iframe's `load` event fires after its document's `load`;
-  - `window.parent`, `window.top`, `window.frameElement`, and `postMessage`. A message is
-    structured-cloned at the call (`runtime/builtins/structured_clone.rs`), delivered as a
-    task, checked against `targetOrigin` (`*`, `/`, or an exact origin), and its
-    `source` is the calling window (the caller realm is tracked in `eval.rs::call`);
-  - `contentWindow`, `contentDocument`, `getElementById` on a child document, and
-    `ownerDocument`. Removing an iframe ends its context.
-- Heap: a realm costs about 1,840 objects against a 131,072-object limit. A realm is built
-  only after the heap is checked for room. A frame that cannot get one is refused: it has
-  no window and its `load` still fires. The page keeps running.
-- `render-core`: a `Page` runs frame loads and messages through its existing timer drain.
-- Tests: `crates/render-dom/src/lib.rs` (graft); `crates/render-js/src/runtime/nested_tests.rs`
-  (12 tests, one per behaviour above, plus heap refusal); `crates/render-core/tests/nested_browsing_contexts.rs`
-  (the page pipeline, and the no-paint check).
-- WPT runner (`tests/wpt_runner`): the engine is given the test's own URL,
-  `http://web-platform.test/<path>`, and a `SuiteLoader` that serves the pinned checkout for that
-  host. `NestedBrowsingContext` and `WindowProxy` are now available. The `render_core`
-  adapter still declines nested tests, since it hosts one document.
+  - A connected `<iframe>` gets an `about:blank` window the first time something asks for `contentWindow`. Its document loads in a later task: `srcdoc`, then `src` through the host's `DocumentLoader`, then an empty document. Its classic scripts run in its own realm, and its window `load` fires.
+  - An `about:blank` or `about:srcdoc` document takes the origin and base URL of the document that created its iframe (HTML 7.4.2.3). An iframe with neither `src` nor `srcdoc` keeps the window it already has.
+  - The iframe's `load` event fires after its window's `load`, even when a window `load` listener reports a failure.
+  - `window.parent`, `window.top`, `window.frameElement` and `postMessage`. A message is structured-cloned at the call and delivered as a task. `targetOrigin` is `*`, `/`, or a URL whose origin is compared; an unparseable one throws `SyntaxError` (HTML 9.4.3). The `source` is the calling window.
+  - `contentWindow`, `contentDocument`, `getElementById` on a child document, and `ownerDocument`. Removing an iframe ends its context.
+- Heap: a realm costs about 1,840 objects. A frame that cannot get one is refused: it has no window, its `load` still fires, and the page keeps running.
+- WPT runner (`tests/wpt_runner`): the dom/html adapter runs each test at `http://web-platform.test/<path>`, and a `SuiteLoader` serves the pinned checkout for that host. `NestedBrowsingContext` and `WindowProxy` are reported available. The CSS computed-value adapter still declines nested tests, because it hosts one document.
+- Tests: `crates/render-dom/src/lib.rs` (graft); `crates/render-js/src/runtime/nested_tests.rs` (16 tests, one per behaviour above); `crates/render-core/tests/nested_browsing_contexts.rs` (the page pipeline, and the no-paint check).
 
 ### What is not implemented
 
-- **Painting.** A nested document is not laid out or painted. Its iframe still renders as
-  nothing, so no empty box appears. `nested_browsing_contexts.rs::a_nested_document_is_not_painted_into_the_page`
-  pins that. Needed: the iframe as a replaced element with its own viewport, its own
-  scroll offset and its own input routing (`render-browser`).
-- **The browser shell installs no `DocumentLoader`.** An `src` frame is an empty document
-  in the browser until the shell's resource scheduler is connected.
-- `window.open`, `target=_blank`, cross-origin restrictions on frames, navigating an
-  existing frame to a new URL, and the `onmessage` attribute handler.
-- Frame loads and messages run through the embedding's timer drain. An embedding that
-  never drains timer requests never loads a frame.
+- **Painting.** A nested document is not laid out or painted, and its iframe renders as nothing. `nested_browsing_contexts.rs::a_nested_document_is_not_painted_into_the_page` pins that. Needed: the iframe as a replaced element with its own viewport, scroll offset and input routing (`render-browser`).
+- **The browser shell installs no `DocumentLoader`**, so an iframe `src` is an empty document in the browser.
+- `window.open`, `target=_blank`, cross-origin restrictions on frames, navigating an existing frame to a new URL, CSP sandboxing, and the `onmessage` window event-handler attribute.
+- The WPT runner does not dispatch the top-level window `load`, so a test that waits for `window.onload` does not start. That is the page lifecycle, not nested contexts.
+- Frame loads and messages run through the embedding's timer drain. An embedding that never drains timer requests never loads a frame.
 - Frames of a replaced document are not discarded when the document is replaced.
+- An `about:blank` iframe's `load` fires in a later task. HTML fires it synchronously when the iframe is inserted without `src`.
 
-### Measured effect (WPT `dom/` and `html/`, pinned revision c7fdee80)
+### Measured effect (WPT `dom/` and `html/`, pinned revision c7fdee80, 10,908 tests)
 
-Base: `c479c8d`, the worktree this change started from. Command:
-`tests/wpt_runner/target/release/wpt-runner run --areas dom,html --out <dir>`.
-`executed` is pass + fail, as the runner counts it.
+Three runs on the same suite revision. **Master as shipped** is the baseline in `tools/wpt/results/wpt-results.jsonl`, produced by a runner whose scorer reads only the first subtest of each file (see Decisions). **Master + scorer fix** is master with only that fix. **Branch** is this branch.
 
-| | before | after |
-| --- | ---: | ---: |
-| pass | 242 | 267 |
-| fail | 2,257 | 2,638 |
-| error | 31 | 31 |
-| skipped | 8,378 | 7,972 |
-| pass rate (pass / executed) | 9.7% (242 of 2,499) | 9.2% (267 of 2,905) |
-| skipped: `lacks-nested-browsing-context` | 643 | 0 |
-| skipped: `lacks-window-proxy` | 106 | 0 |
-| skipped: `lacks-canvas` | 1,610 | 1,620 |
+| | master as shipped | master + scorer fix | branch |
+| --- | ---: | ---: | ---: |
+| pass | 332 | 232 | 250 |
+| fail | 2,157 | 2,248 | 2,635 |
+| skipped | 8,388 | 8,397 | 7,992 |
+| error | 31 | 31 | 31 |
+| skipped: `lacks-nested-browsing-context` | 643 | 643 | 0 |
+| skipped: `lacks-window-proxy` | 106 | 106 | 0 |
+| skipped: harness did not complete within the drain bound | not separated | 3,304 | 3,811 |
+| test files refused a pass for unreported subtests | 0 | 64 | 68 |
 
-- 26 tests gained a pass. One test that passed before now fails: see the decision
-  below.
-- The rate falls because 380 tests that were blocked now execute and fail on APIs the
-  engine lacks: `document.createElementNS`, `Event.initEvent`, `document.write`, and
-  `support/` helpers served from other hosts. Those failures were hidden by the
-  nested-context block, and they are now the honest measure of the next work.
-- The 31 errors are the same charset files that could not be read as UTF-8 before.
-- `css/` was not measured in this change.
+Pass rate (pass / (pass + fail)): master + scorer fix 232 / 2,480 = 9.4%; branch 250 / 2,885 = 8.7%. The rate falls because tests that the nested-context gate used to block now execute, and most of them fail.
+
+- **Branch against master + scorer fix: 0 lost passes, 18 gained.** Compared key by key on test path. The WPT result rows have no mode field, so mode does not apply. Of the 18, 4 have full assertion coverage; 14 carry a "not reached" note. That note compares the static assertion-site count with the runner's summed counter, which overstates a file's assertions. `location_host.html` has one `assert_equals`, and it passes.
+- Against master as shipped, 98 passes are not passes on the branch. The same engine under the corrected scorer loses 100 of them, so the loss belongs to the scorer.
+- Drain-bound stalls rose by 507. These are tests that were blocked and now run. A sample was mostly media-element, navigation and harness-less crashtests. Not characterised in full.
 
 ### Decisions
 
-- **One pass lost, not restored.**
-  `html/semantics/embedded-content/the-iframe-element/sandbox-inherit-to-blank-document-unsandboxed.html`
-  passed before only because the top-level document was `about:blank`, whose origin is
-  opaque (`"null"`). The test asserts that origin for a CSP-sandboxed document, and CSP
-  sandboxing is not implemented. With its own URL the document's origin is
-  `http://web-platform.test`, so the test fails for that reason. Keeping the pass would
-  mean keeping `about:blank` for every top-level test, which is the wrong document URL for
-  relative `src` resolution. It was not kept with a workaround.
-- **Frames are tasks, not synchronous.** An `iframe` gets its window at once, but its
-  document loads in a later task, matching the spec's asynchronous navigation.
+- **The scorer fix comes first.** `Harvest::parse` stepped over each subtest but not the comma between them, so a file's verdict was its first subtest's verdict alone. Master's `html/semantics/embedded-content/the-iframe-element/sandbox-inherit-to-blank-document-unsandboxed.html` passed on its first assertion (1 of 6 sites). That assertion holds only because the top-level document was `about:blank`, with an opaque origin, and CSP sandboxing is not implemented. Under the fixed scorer master does not pass that file, and the branch fails it with the honest value (`expected "null" but got "http://web-platform.test"`). Restoring it would mean keeping `about:blank` for every top-level test, which is the wrong URL for relative `src` resolution. It is not restored.
+- **Frames are tasks, not synchronous.** An iframe gets its window at once, but its document loads in a later task, matching the spec's asynchronous navigation.
+- **Top-level tests run at their own URL**, `http://web-platform.test/<path>`, so relative `src` resolves against the test. This changes the origin every top-level test sees, which is the cause of the single false pass above.
 
 ### How to check
 

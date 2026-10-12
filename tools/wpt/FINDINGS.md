@@ -5,28 +5,39 @@ run against WPT revision **`c7fdee80f3f17b4e9813964916afdfd57ace863f`**.
 
 Everything below was measured, not estimated, unless a line says otherwise.
 
-## Update: nested browsing contexts are driven
+## Update: a scorer bug, and nested browsing contexts
 
-The engine now gives an `<iframe>` its own document and realm, and `contentWindow`,
-`parent`, `top` and `postMessage` work between windows (`docs/visual_fidelity_gaps.md`,
-S11). The runner marks `NestedBrowsingContext` and `WindowProxy` available, so the
-`lacks-nested-browsing-context` and `lacks-window-proxy` mechanisms are gone from
-`dom/` and `html/`: 643 and 106 tests respectively. Those tests now execute.
+Two changes to the numbers below.
 
-Measured on `dom/` and `html/`, before and after, with the counts and the one lost
-pass explained in S11. The rows below this section are the earlier measurement, and
-they still describe the engine as it was at `c479c8d`. Where they disagree with
-this section, this section is current.
+1. **The scorer read one subtest per file.** `Harvest::parse` stepped over each
+   subtest but not the comma between them, so a file's verdict was the verdict of
+   its first subtest alone. Master carried the same bug. The tables in the older
+   sections were measured with it, so their pass and fail counts are not reliable
+   for files with more than one subtest. The fix is in `wptdom.rs`, with the unit
+   test `a_harvest_reads_every_subtest_not_only_the_first`, and a second rule: a
+   file cannot pass when the harness registered more subtests than reached the
+   runner.
 
-| | before | after |
-| --- | ---: | ---: |
-| pass | 242 | 267 |
-| fail | 2,257 | 2,638 |
-| skipped | 8,378 | 7,972 |
+2. **Nested browsing contexts are driven.** `NestedBrowsingContext` and
+   `WindowProxy` are reported available for the dom/html adapter, so the
+   `lacks-nested-browsing-context` and `lacks-window-proxy` mechanisms no longer
+   occur there. Measured on `dom/` and `html/` (10,908 tests, pinned revision
+   `c7fdee80`), with the same runner in every column except the first:
 
-The pass rate falls from 9.7% to 9.2%, because the 380 newly executing tests fail on
-APIs the engine still lacks. The runner's self-check now uses `canvas`, not
-`NestedBrowsingContext`, as its example of a missing capability.
+   | | master as shipped | master + scorer fix | branch |
+   | --- | ---: | ---: | ---: |
+   | pass | 332 | 232 | 250 |
+   | fail | 2,157 | 2,248 | 2,635 |
+   | skipped | 8,388 | 8,397 | 7,992 |
+   | error | 31 | 31 | 31 |
+   | skipped: `lacks-nested-browsing-context` | 643 | 643 | 0 |
+   | skipped: `lacks-window-proxy` | 106 | 106 | 0 |
+
+   Branch against master with the scorer fix: 0 lost passes, 18 gained, compared
+   key by key on path. Against master as shipped, 98 passes are not passes on the
+   branch; the scorer fix alone accounts for 100 of them. The one false pass that
+   master as shipped had, and the reason for each figure, are in
+   `docs/visual_fidelity_gaps.md`, S11.
 
 ## The headline, and what changed
 
