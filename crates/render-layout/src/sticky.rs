@@ -15,6 +15,7 @@
 //! its normal layout position, its paint order and its stacking behaviour
 //! (§4.1: sticky positioning does not create a stacking context).
 
+use crate::fragment::FragmentId;
 use crate::geometry::{PhysicalPoint, PhysicalRect, PhysicalSize};
 
 /// The `top`/`right`/`bottom`/`left` insets of a sticky box (§9.4.3).
@@ -73,6 +74,10 @@ pub struct StickyConstraint {
     /// the content of the scrollport by its negation, so the part of the
     /// document the scrollport shows starts at `scrollport_origin + offset`.
     pub scrollport_origin: PhysicalPoint,
+    /// The scroll container whose offset moves this scrollport, or `None` when
+    /// the scrollport is the viewport. The two offsets differ: the viewport's is
+    /// the page's scroll position, and a nested container's is its own.
+    pub scroll_container: Option<FragmentId>,
 }
 
 /// §4.1: the sticky view rectangle is the scrollport inset by the box's own

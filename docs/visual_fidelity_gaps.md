@@ -566,145 +566,91 @@ declarations inside surviving rules. A gap report that counts the wrong unit wil
 zero problems while hundreds of declarations are being discarded. It now diffs
 declaration-level acceptance too.
 
-## S6 - **NOT closed.** The geometry is correct and nothing applies it
+## S6 - Sticky positioning: paint and hit testing consume the constraint; z-order and multi-column are open
 
-> **Correction, and the most important one in this register.** I closed this row on the strength of
-> 21 unit tests. The acceptance harness then measured the pixels and found that
-> **`sticky_constraint`, `sticky_offset` and `sticky_fragments` have no consumer outside
-> `render-layout`'s own source and its own tests** - nothing in `render-core`'s paint, page or
-> interaction path, and nothing in `render-browser`. Verified independently: a page with a sticky
-> bar rasterised at viewport origin `y=500` **finds white where red should be.**
->
-> **So the layout half is right and the paint half does not exist.** This is precisely the failure
-> the project's own rule forbids - "implement features fully or not at all" - and I recorded a
-> closure for it while enforcing that rule on other agents. **A unit test on a pure function proves
-> the function is correct; it says nothing about whether anything calls it.**
+Was: `render-css/src/properties.rs:758` parsed the `sticky` keyword, and layout recorded a constraint
+that nothing read, so a pinned header scrolled away with the content. The earlier closure rested on
+unit tests of a pure function, which said nothing about whether anything called it. This round added
+the paint consumer and tested it through pixels and hit tests.
 
-### What is actually there
+### Verified state
 
-- `crates/render-layout/src/solver/mod.rs:661` records `scrollport: self.options.viewport` for
-  every sticky box, and `FragmentTree` stores the constraint.
-- The **architecture is right and worth keeping**: layout never sees the scroll offset, the
-  fragment tree is built once in document space, and the consumer adds `sticky_offset(...)` to the
-  fragment and translates the subtree. That is why the fragment is never moved, so layout position,
-  paint order and stacking are untouched - which is what the specification requires.
-- **There is no such consumer.** The paint side was never written.
+- **Layout.** `FragmentTree::sticky_constraint` holds one `StickyConstraint` per sticky box,
+  resolved after layout (`solver/mod.rs`, `sticky_constraints`). It records the margin box, the
+  containing block, the four insets (`None` for `auto`), the scrollport, and `scroll_container`:
+  `None` when the scrollport is the viewport, otherwise the nearest ancestor scroll container. The
+  box is never moved in the fragment tree, so layout position, paint order and stacking are unchanged.
+- **Paint.** The display list wraps each sticky box in `DisplayCommand::PushSticky` and
+  `PopSticky` (`paint/display_list.rs`, `paint_fragment`). The scope encloses the box's stacking
+  context. The rasterizer (`paint/raster.rs`, `push_sticky`) resolves `sticky_offset` at raster time:
+  the constraint is first moved by the displacement the box's ancestors already received, then
+  evaluated against the viewport origin (viewport constraints) or zero (nested containers). The
+  displacement moves document-space items, and every descendant of the box moves with it. The
+  display list itself stays independent of scrolling.
+- **Hit testing and selection.** `paint/sticky.rs::sticky_displacements` computes the same
+  displacement for each fragment, and `InteractionScene` uses it for `hit_test`, `caret_at` and the
+  text maps, so a pinned header is hit where it is painted.
+- **Paint order.** Layout sorts a block container's children by `z-index`, then by whether they are
+  positioned (`solver/block.rs`, `paint_layer`), which is the CSS 2.1 Appendix E order for a positioned
+  box against in-flow content. A sticky box is positioned, so it paints after the in-flow siblings it
+  can overlap. Painting and hit testing both walk the children in that order. Without it a section's
+  background painted after the header would cover the header.
+- **Evidence.** The gate test `a_sticky_header_stays_in_the_scrollport` is no longer ignored and
+  passes. `a_sticky_box_in_a_nested_scrollport_resolves_against_that_scrollport` checks that the
+  constraint names its container. Eight render-core unit tests in `paint/sticky.rs` assert pixels and
+  hits: pinned at scroll 300 and 500; pushed up at the end of its containing block; released once
+  the block has scrolled past; not moved by the page scroll inside a nested scroller; composed inside
+  another sticky box (inner at viewport 20..60 over an outer at 0..100); painted over sections that
+  follow it; hit where it is painted; scope commands balanced. Layout tests assert `scroll_container`
+  for a box in the page and for a box in a nested scroller, and the sibling order a sticky box gets
+  (`a_sticky_box_paints_after_the_in_flow_siblings_without_moving_them`).
 
-`StickyInsets` holds `Option<f32>` per side because **an `auto` inset is not a zero inset**, and
-`sticky_offset` is a pure function with 12 tests asserting real geometry. All of that is correct and
-all of it is unreachable.
+### Decisions
 
-### The paint-side contract, written down so the next implementer does not re-derive it
-
-- Resolve `sticky_offset(constraint, scroll_offset)` per box and add it to the fragment's position.
-- **Translate the subtree**, not the box, so descendants move with it.
-- Clip to the scrollport, and use `max_scroll_offset` / `clamp_scroll_offset` for the range.
-- **Input routes to the innermost scrollport whose `clip` contains the point** whose
-  `max_scroll_offset` is non-zero, then bubbles outwards to the page.
-- Not in `render-layout`, and not to be faked there: the offset store, scrollbar chrome, keyboard
-  scrolling, scroll anchoring.
-- **A sticky box inside a *nested* scrollport is constrained by that scrollport.** Layout records
-  the padding box of the box's nearest ancestor scroll container on the constraint (`scrollport`,
-  its size, and `scrollport_origin`, its document-space origin); the viewport only when there is
-  none. `sticky_offset` takes the offset of that same container, which the consumer looks up in the
-  offset store. Using the page's offset for such a box is the defect the consumer must not make.
-  `overflow: hidden` counts as a scroll container here, as CSS Overflow 3 defines it, while the
-  scrollport geometry below still models it as a clip with no user scroll range. The root element's
-  `overflow`, and the body's when the root's is `visible`, are the viewport's and do not count.
-
-### The two general defects found while building it, both fixed at the helper
-
-1. **Under-constrained boxes got a phantom right margin.** CSS 2.1 §10.3.7 only adjusts a margin
-   when the values are *over*-constrained, but the fall-through arm ran for the under-constrained
-   case too, so `BoxGeometry::margin_rect()` stretched a 300px box to its containing block's 800px.
-   That is a wrong used value on a **public geometry helper**, and `scrollable_content_size` reads it
-   too.
-2. **A table cell's `vertical-align` ignored a cell with a height of its own** - the offset came
-   from the border box, which for a cell with a specified height equals its outer height, so
-   `<td style="height:200px; vertical-align:bottom">` left its content at the top. `BlockResult` now
-   carries `flow_height`.
-
-### And the same bug is still live somewhere else (see the harness findings)
-
-A nested scrollport's overflowing content **inflates the page's scrollable width**:
-`scrollable_content_size` measures 1320 against a 1280 viewport, because a 1300px strip inside a
-1240px scroller extends the document. **A real navbar that is its own scroller produces a spurious
-horizontal page scrollbar.** That is defect 1 above, in a place its fix did not reach.
-
-## S7 - Quirks mode, see "S7 - Quirks mode: parse side done, behaviour not started" below
-
-Was: `render-css/src/properties.rs:758` defines the `Sticky` keyword and **no consumer
-existed anywhere**, so a pinned header scrolled away with the content.
-
-### The architectural decision, which is the point
-
-**Layout never sees the scroll offset.** The fragment tree is built once in document space and
-`render-core` translates it by `-viewport_origin` at raster time. So a scroll-dependent
-displacement *cannot* be baked into a fragment without re-laying out the whole document on
-every scroll tick.
-
-- `crates/render-layout/src/sticky.rs` - `StickyConstraint { margin_rect, containing_block,
-  insets, scrollport }` plus the pure `sticky_view_rect` and
-  `sticky_offset(constraint, scroll_offset)`.
-- `solver/block.rs` - one branch: a box whose computed `position` is `Sticky` is registered.
-  **The fragment is never moved**, so layout position, paint order and stacking are untouched,
-  which is what the spec requires - sticky creates no stacking context and does not affect the
-  element's own layout position.
-- `solver/mod.rs` - constraints resolve **after** layout, not during. This is not a stylistic
-  choice: a relatively positioned ancestor, an out-of-flow ancestor, a table row, or a cell's
-  `vertical-align` offset all move a subtree *after* the box inside it is finished, so a
-  constraint recorded earlier would be stale.
-
-`StickyInsets` holds `Option<f32>` per side because **an `auto` inset is not a zero inset**.
-
-The clamp is per axis to `[block.start - box.start, block.end - box.end]`, plus one rule the
-geometry alone does not give you: a box is displaced only while its containing block is at least
-partly inside the sticky view rectangle, so a sticky element in a parent that has scrolled past
-is not dragged back into view. At both ends of that range the box is off-screen, so the
-transition is never visible.
-
-12 tests in `solver/sticky_tests.rs`, each asserting concrete geometry, including that a
-vertical scrollbar does not shift a `top`-constrained box horizontally and that a `bottom`-
-constrained element further down the page than the scrollport reaches is not pulled in.
-
-### Scrollports are now represented
-
-`FragmentTree` exposes, per box whose `overflow` is not `visible`,
-`ScrollportGeometry { mode, clip, scrollable }` with `max_scroll_offset()` and
-`clamp_scroll_offset()`. `clip` is the padding box in document space; `scrollable` is the content
-extent reachable past it.
-
-**`overflow: hidden` and `overflow: auto` are structurally distinct, not a flag.**
-`overflow_clip_mode` returns `None` for `visible`, `Clip` when no axis scrolls, and `Scrollport`
-when either axis does. `a_clip_is_not_a_scrollport` asserts the two modes produce the **same
-`clip` and the same `scrollable`** and differ only in **range** - so conflating them is not
-possible to do by accident.
+- The sticky scope wraps the stacking context, not the other way round. A transformed layer anchors
+  on the offset in effect when it opens, so a sticky displacement applied inside it would pivot the
+  transform around the layout position.
+- `StickyConstraint` is boxed inside `DisplayCommand::PushSticky`. Inline, the 88-byte payload made
+  `DisplayCommand` the largest command and grew `DisplayItem` to 160 bytes, and the `render-perf`
+  generated-fixture `first_visible` median rose by about 8% over several alternating runs. Boxed, the
+  command keeps its previous size and the median is within about 2% of base; only sticky boxes
+  allocate.
+- Sticky commands are stateful, so a scene containing one is a full repaint, as are stacking contexts
+  and clips. No retained-damage path replays them yet.
 
 ### Still open on this row
 
-`z-index` (read as raw text at `render-layout/src/solver/mod.rs:399`; flex and grid children are
-not sorted and the paint layer has no z-index awareness), multi-column layout, and the shell-side
-half of scrolling: the offset store, scrollbar chrome, keyboard scrolling, scroll anchoring, and the
-paint-side consumer of `sticky_offset`. The nested-scrollport constraint is no longer open: layout
-now resolves a sticky box against its nearest scroll container, and the consumer supplies that
-container's offset (see the paint-side contract above).
+- **Nested scroll offsets.** No per-container offset store exists, and the shell scrolls only the
+  page. The raster uses zero for nested containers, which is exact only while they sit at zero. The
+  constraint already carries the container identity needed once a real offset exists. Scroll input
+  routing, scrollbar chrome, keyboard scrolling and scroll anchoring belong to the shell and are
+  unchanged.
+- **Sticky inside `position: fixed`.** Paint does not displace it, because fixed-space items are
+  placed against the viewport and sticky displaces document-space items only. Hit testing does
+  displace it, because the hit tester does not track coordinate spaces. The two disagree, for a case
+  that is rare.
+- **Z-order is partial.** Block containers sort their children by `z-index` and positioned-ness, but
+  flex and grid children are not sorted, there is no stacking-context tree, and a `z-index` of a
+  descendant only lifts its ancestor's sort key (`fragment_z_index`). A sticky box in a flex or grid
+  container therefore paints in source order, under later siblings. Full Appendix E layering would
+  place sticky boxes in the same positioned layer as the other positioned boxes.
+- **Retained damage.** Any scene with a sticky box is a full repaint.
+- **Scrollable overflow of nested containers.** A nested scrollport's overflowing content still
+  extends the page's scrollable width: `scrollable_content_size` measures 1320 against a 1280 viewport
+  when a 1300px strip sits inside a 1240px scroller. A real navbar that is its own scroller therefore
+  produces a spurious horizontal page scrollbar. This round did not change it.
+- **Multi-column** is the other open item on this row, recorded in its own entry.
 
 ### Two general defects found in the helpers, both fixed at the source
 
-1. **Under-constrained boxes got a phantom right margin.** CSS 2.1 §10.3.7 only solves the
-   margin equation by adjusting a margin when the values are *over*-constrained, but the
-   fall-through arm ran for the under-constrained case too, so `BoxGeometry::margin_rect()`
-   stretched a 300px box to its containing block's 800px. That is a wrong used value on a
-   **public geometry helper**, and `scrollable_content_size` reads it too - so a 300px element
-   inflated the document's scrollable width and produced a spurious scrollbar.
-2. **A table cell's `vertical-align` ignored a cell with a height of its own.** The offset was
-   computed from the cell's *border box*, which for a cell with a specified height equals its
-   outer height, so `<td style="height:200px; vertical-align:bottom">` left its content at the
-   top. `BlockResult` now carries `flow_height` - what the in-flow children occupy, before a used
-   `height` stretches the box.
-
-A Hacker-News-shaped fixture is byte-identical before and after both fixes, so neither disturbed
-the common case.
+1. **Under-constrained boxes got a phantom right margin.** CSS 2.1 §10.3.7 adjusts a margin only when
+   the values are over-constrained, but the fall-through arm also ran for under-constrained boxes, so
+   `BoxGeometry::margin_rect()` stretched a 300px box to its containing block's 800px. That is a
+   wrong used value on a public geometry helper, and `scrollable_content_size` reads it too.
+2. **A table cell's `vertical-align` ignored a cell with a height of its own.** The offset came from
+   the border box, which for a cell with a specified height equals its outer height, so
+   `<td style="height:200px; vertical-align:bottom">` left its content at the top. `BlockResult` now
+   carries `flow_height`.
 
 ## S7 - Quirks mode, see "S7 - Quirks mode: parse side done, behaviour not started" below
 

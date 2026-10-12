@@ -477,6 +477,8 @@ const fn display_command_name(command: &DisplayCommand) -> &'static str {
         DisplayCommand::Canvas { .. } => "canvas",
         DisplayCommand::PushStackingContext(_) => "push-stack",
         DisplayCommand::PopStackingContext => "pop-stack",
+        DisplayCommand::PushSticky(_) => "push-sticky",
+        DisplayCommand::PopSticky => "pop-sticky",
     }
 }
 

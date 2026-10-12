@@ -12,7 +12,7 @@ use crate::dom::{DomRevision, NodeId};
 use crate::image::ImageResources;
 use crate::layout::{
     EdgeSizes, FontRequest, FormattingNodeId, FormattingTree, Fragment, FragmentId, FragmentKind,
-    FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, nominal_face,
+    FragmentTree, PhysicalPoint, PhysicalRect, PhysicalSize, StickyConstraint, nominal_face,
 };
 
 use super::color::{Color, SystemPalette};
@@ -330,6 +330,12 @@ pub enum DisplayCommand {
     },
     PushStackingContext(StackingContext),
     PopStackingContext,
+    /// Opens a CSS Positioned Layout §4.1 sticky scope. Everything up to the
+    /// matching [`DisplayCommand::PopSticky`] is displaced by the constraint's
+    /// sticky offset at the raster's scroll offset, so the list itself stays
+    /// independent of scrolling.
+    PushSticky(Box<StickyConstraint>),
+    PopSticky,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -712,6 +718,17 @@ impl<'a> Builder<'a> {
                 Visibility::Hidden | Visibility::Collapse
             ))
         );
+        // The sticky scope encloses the stacking context, so a transform on a
+        // sticky box pivots around the box where it is painted. Scroll never
+        // reaches the builder, so the displacement is resolved at raster time.
+        let sticky = fragments.sticky_constraint(id).copied();
+        if let Some(constraint) = sticky {
+            self.push_scope(
+                fragment,
+                coordinate_space,
+                DisplayCommand::PushSticky(Box::new(constraint)),
+            );
+        }
         // A transform groups the whole fragment �?background, shadow, text,
         // image, overflow clip and children �?behind one affine matrix the
         // same way opacity groups it behind an alpha. When both apply, a
@@ -719,10 +736,8 @@ impl<'a> Builder<'a> {
         // for one offscreen group.
         let stacking_context = fragment_stacking_context(opacity, transform);
         if let Some(context) = stacking_context {
-            self.push(
+            self.push_scope(
                 fragment,
-                PaintPhase::StackingContext,
-                fragment.rect,
                 coordinate_space,
                 DisplayCommand::PushStackingContext(context),
             );
@@ -760,6 +775,9 @@ impl<'a> Builder<'a> {
             }
             _ => None,
         };
+        // Children are already in paint order: layout sorts them by z-index and
+        // then by positioned-ness, so a sticky box follows the siblings it can
+        // overlap.
         for child in &fragment.children {
             self.paint_fragment(*child, coordinate_space);
         }
@@ -773,14 +791,31 @@ impl<'a> Builder<'a> {
             );
         }
         if stacking_context.is_some() {
-            self.push(
+            self.push_scope(
                 fragment,
-                PaintPhase::StackingContext,
-                fragment.rect,
                 coordinate_space,
                 DisplayCommand::PopStackingContext,
             );
         }
+        if sticky.is_some() {
+            self.push_scope(fragment, coordinate_space, DisplayCommand::PopSticky);
+        }
+    }
+
+    /// Emits a scope command (stacking context or sticky) for `fragment`.
+    fn push_scope(
+        &mut self,
+        fragment: &Fragment,
+        coordinate_space: PaintCoordinateSpace,
+        command: DisplayCommand,
+    ) {
+        self.push(
+            fragment,
+            PaintPhase::StackingContext,
+            fragment.rect,
+            coordinate_space,
+            command,
+        );
     }
 
     /// Resolves the fragment's `transform` property into the affine matrix

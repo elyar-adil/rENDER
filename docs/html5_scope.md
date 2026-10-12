@@ -294,7 +294,7 @@ Microdata、`is=""`、`<dialog>` 完整模态语义、Drag & Drop API、可访�
 | `padding / border` | ✅ 含 shorthand 展开（`crates/render-css/src/cascade.rs:399-404`） |
 | `border-radius` 含两值椭圆 | 🟡 斜杠语法已解析（`crates/render-core/src/paint/display_list.rs:1817`），但 `parse_corner_radii` 内用 `f32::midpoint` 把水平/垂直半径平均为单一标量（`parse_radius_list` 在 `:1834`）⇒ **椭圆退化为圆**。这是对 CSS Backgrounds 3 §5.5 的已记录偏差 |
 | `position: static / relative / absolute / fixed` | ✅ `solver/block.rs:765-782`（relative 平移子树、absolute/fixed 二次遍历定位） |
-| `position: sticky` | 🔴 关键字在 `crates/render-css/src/properties.rs:758`，零消费者（`docs/visual_fidelity_gaps.md` S6） |
+| `position: sticky` | 🟡 关键字在 `crates/render-css/src/properties.rs:758`；布局解析约束，绘制与命中测试按滚动偏移位移。嵌套滚动容器的偏移与 z-order 仍未完成（`docs/visual_fidelity_gaps.md` S6） |
 | `float` + 浮动清除 | ✅ `solver/block.rs`；`overflow:hidden` 自动包含浮动有回归测试 `crates/render-core/tests/layout_positioning.rs:119` |
 | `overflow: hidden` 绘制裁剪 | ✅ `display_list.rs:709`（构造）+ `overflow_clip_shape` `:1702`；回归测试同文件 |
 | 元素级滚动容器（可滚动溢出 + 滚动条） | 🔴 文档级视口滚动 ✅（`crates/render-layout/src/fragment.rs:128-175`、`crates/render-browser/src/chrome.rs:1812`），**元素级滚动条** 🔵 |

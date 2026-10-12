@@ -781,10 +781,12 @@ impl Solver<'_> {
             }
         }
         // Positioned descendants are laid out separately, but their paint
-        // order still follows z-index. Sorting the completed fragments keeps
-        // low-index overlays (such as a decorative border) behind higher
-        // positioned content while preserving source order within a layer.
-        children.sort_by_key(|child| self.fragment_z_index(*child));
+        // order still follows z-index, then positioned-ness (Appendix E). Sorting
+        // the completed fragments keeps low-index overlays (such as a decorative
+        // border) behind higher positioned content, and a sticky box behind the
+        // in-flow siblings it can overlap, while preserving source order within
+        // a layer.
+        children.sort_by_key(|child| self.paint_layer(*child));
         self.set_children(fragment, children);
         if position == Position::Relative {
             self.translate_fragment_subtree(fragment, relative_offset.0, relative_offset.1);

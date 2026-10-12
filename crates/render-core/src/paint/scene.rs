@@ -392,7 +392,9 @@ fn classify_item(item: &DisplayItem) -> PaintChunkClassification {
         | DisplayCommand::PushTransform(_)
         | DisplayCommand::PopTransform
         | DisplayCommand::PushStackingContext(_)
-        | DisplayCommand::PopStackingContext => {
+        | DisplayCommand::PopStackingContext
+        | DisplayCommand::PushSticky(_)
+        | DisplayCommand::PopSticky => {
             PaintChunkClassification::FullRepaintRequired(PaintFallbackReason::StatefulCommand)
         }
         DisplayCommand::SolidRect { .. }

@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 
@@ -17,6 +17,7 @@ use crate::layout::{
     FragmentId, FragmentKind, FragmentTree, PhysicalPoint, PhysicalRect, StoredFontRequest,
     TextMeasurer, TextStyle,
 };
+use crate::paint::sticky::sticky_displacements;
 
 use super::{BoundaryPoint, DomRange, InteractionError, Selection, compare_boundary_points};
 
@@ -251,12 +252,14 @@ impl<'a> InteractionScene<'a> {
             .fragments
             .viewport_to_document_point(viewport_point, self.scroll_offset);
         let paint_order = self.paint_order()?;
+        let displacements = sticky_displacements(self.fragments, self.scroll_offset);
         let mut hit = None;
         for fragment_id in paint_order.iter().rev() {
             let Some(fragment) = self.fragments.get(*fragment_id) else {
                 continue;
             };
-            if contains_point(fragment.rect, document_point)
+            let painted = painted_rect(&displacements, *fragment_id, fragment.rect);
+            if contains_point(painted, document_point)
                 && let Some(node) = fragment.source
             {
                 hit = Some((node, *fragment_id));
@@ -521,6 +524,7 @@ impl<'a> InteractionScene<'a> {
     }
 
     fn text_maps(&self, paint_order: &[FragmentId]) -> Result<Vec<TextMap>, HitTestError> {
+        let displacements = sticky_displacements(self.fragments, self.scroll_offset);
         let mut source_characters: HashMap<NodeId, Vec<SourceCharacter>> = HashMap::new();
         let mut source_cursors = HashMap::<NodeId, usize>::new();
         let mut total_dom_utf16 = 0_usize;
@@ -584,7 +588,7 @@ impl<'a> InteractionScene<'a> {
                 maps.push(TextMap {
                     fragment: *fragment_id,
                     node,
-                    rect: fragment.rect,
+                    rect: painted_rect(&displacements, *fragment_id, fragment.rect),
                     characters,
                 });
             }
@@ -978,6 +982,24 @@ fn validate_point(point: PhysicalPoint) -> Result<(), HitTestError> {
         Ok(())
     } else {
         Err(HitTestError::InvalidCoordinate)
+    }
+}
+
+/// The rectangle a fragment is painted at: its layout rectangle moved by the
+/// sticky displacement it has at the scroll offset the map was built for.
+fn painted_rect(
+    displacements: &BTreeMap<FragmentId, PhysicalPoint>,
+    fragment: FragmentId,
+    rect: PhysicalRect,
+) -> PhysicalRect {
+    match displacements.get(&fragment) {
+        Some(offset) => PhysicalRect::new(
+            rect.origin.x + offset.x,
+            rect.origin.y + offset.y,
+            rect.size.width,
+            rect.size.height,
+        ),
+        None => rect,
     }
 }
 

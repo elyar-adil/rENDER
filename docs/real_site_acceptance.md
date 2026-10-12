@@ -335,13 +335,12 @@ so these are to-do markers, not workarounds.
 | Ignored test | Gap |
 | --- | --- |
 | `text_measurement_depends_on_the_requested_font_family` | S1 - `TextStyle` carries no family, weight, or style |
-| `a_sticky_header_stays_in_the_scrollport` | S6 - `position: sticky` has no layout consumer |
 | `the_capability_registry_declares_web_font_and_animation_support` | S4 / S9 - `@font-face` is discarded and untracked |
 | `no_fixture_reports_any_parse_error` | not yet listed - see below |
 
 ### Markers that have already been retired
 
-Two of these started life as markers and are now part of the gate, because the
+Several of these started life as markers and are now part of the gate, because the
 capability landed while the fixtures were being built:
 
 - `link_underlines_reach_the_display_list` was the S3 marker. `text-decoration`
@@ -357,6 +356,9 @@ capability landed while the fixtures were being built:
   `an_inline_svg_is_laid_out_as_a_box_and_painted_into_it`. It passes, and it is
   a permanent test. `every_fixture_paints_its_inline_svgs` pins the per-fixture
   inline `<svg>` counts.
+- `a_sticky_header_stays_in_the_scrollport` was the S6 marker. The raster now applies
+  the sticky displacement, so a header at document y 500 is painted at viewport
+  y 0, and the assertion is permanent.
 
 ### An engine defect this harness found
 

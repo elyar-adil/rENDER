@@ -19,6 +19,7 @@ use crate::tree::FormattingTree;
 use render_css::computed::ComputedStyle;
 use render_css::properties::Float;
 use render_css::properties::Overflow;
+use render_css::properties::Position;
 use render_dom::Dom;
 use render_dom::Node;
 use render_dom::NodeId;
@@ -613,6 +614,28 @@ impl Solver<'_> {
             .and_then(|index| self.fragments.get_mut(index))
     }
 
+    /// The computed style of a fragment's box, or `None` for an anonymous box.
+    fn fragment_style(&self, id: FragmentId) -> Option<&ComputedStyle> {
+        let fragment = usize::try_from(id.as_u32())
+            .ok()
+            .and_then(|index| self.fragments.get(index))?;
+        self.formatting
+            .get(fragment.formatting_node)
+            .and_then(|node| node.style_source)
+            .and_then(|source| self.styles.get(&source))
+    }
+
+    /// The layer a child of a block container paints in: its `z-index`, then
+    /// whether it is positioned. CSS 2.1 Appendix E paints a positioned box above
+    /// the in-flow content of the same `z-index`, so a sticky box, which is in
+    /// flow for layout, sorts after the in-flow siblings it can overlap.
+    fn paint_layer(&self, id: FragmentId) -> (i32, bool) {
+        let positioned = self
+            .fragment_style(id)
+            .is_some_and(|style| resolve::position(Some(style)) != Position::Static);
+        (self.fragment_z_index(id), positioned)
+    }
+
     fn fragment_z_index(&self, id: FragmentId) -> i32 {
         let Some(fragment) = usize::try_from(id.as_u32())
             .ok()
@@ -621,10 +644,7 @@ impl Solver<'_> {
             return 0;
         };
         let own = self
-            .formatting
-            .get(fragment.formatting_node)
-            .and_then(|node| node.style_source)
-            .and_then(|source| self.styles.get(&source))
+            .fragment_style(id)
             .and_then(|style| style.get("z-index"))
             .and_then(|value| value.css_text().trim().parse::<i32>().ok())
             .unwrap_or(0);
@@ -683,7 +703,8 @@ impl Solver<'_> {
                 continue;
             };
             let insets = self.sticky_insets(fragment.formatting_node, block.size.width);
-            let (scrollport_origin, scrollport) = self.sticky_scrollport(id, &parents);
+            let (scroll_container, scrollport_origin, scrollport) =
+                self.sticky_scrollport(id, &parents);
             constraints.insert(
                 id,
                 StickyConstraint {
@@ -692,6 +713,7 @@ impl Solver<'_> {
                     insets,
                     scrollport,
                     scrollport_origin,
+                    scroll_container,
                 },
             );
         }
@@ -705,7 +727,11 @@ impl Solver<'_> {
     ///
     /// The walk starts at the box's parent, so a sticky box that is itself a
     /// scroll container is not its own scrollport.
-    fn sticky_scrollport(&self, id: FragmentId, parents: &[u32]) -> (PhysicalPoint, PhysicalSize) {
+    fn sticky_scrollport(
+        &self,
+        id: FragmentId,
+        parents: &[u32],
+    ) -> (Option<FragmentId>, PhysicalPoint, PhysicalSize) {
         let mut current = id.as_u32();
         while let Some(&parent) = parents.get(current as usize) {
             if parent == u32::MAX {
@@ -718,11 +744,11 @@ impl Solver<'_> {
                 && self.is_scroll_container(fragment)
             {
                 let padding = geometry.padding_rect();
-                return (padding.origin, padding.size);
+                return (Some(fragment.id), padding.origin, padding.size);
             }
             current = parent;
         }
-        (PhysicalPoint::default(), self.options.viewport)
+        (None, PhysicalPoint::default(), self.options.viewport)
     }
 
     /// CSS Overflow 3: a scroll container is a box whose `overflow` is other

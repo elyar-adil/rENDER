@@ -47,6 +47,8 @@ pub(super) fn log_completed_frame_debug(frame: &PageRenderFrame, tab_id: u64) {
             render_core::paint::DisplayCommand::Canvas { .. } => "canvas",
             render_core::paint::DisplayCommand::PushStackingContext(_) => "push-stack",
             render_core::paint::DisplayCommand::PopStackingContext => "pop-stack",
+            render_core::paint::DisplayCommand::PushSticky(_) => "push-sticky",
+            render_core::paint::DisplayCommand::PopSticky => "pop-sticky",
         };
         eprintln!(
             "render-browser display command={} source={:?} bounds={:?}",

@@ -449,9 +449,11 @@ fn a_box_whose_computed_position_is_not_sticky_is_never_moved() {
 }
 
 #[test]
-fn sticky_does_not_change_the_paint_order_of_a_box() {
-    // §4.1: sticky does not create a stacking context, so it neither escapes its
-    // parent in the fragment tree nor is re-ordered against its siblings.
+fn a_sticky_box_paints_after_the_in_flow_siblings_without_moving_them() {
+    // §4.1: sticky does not create a stacking context, so it does not escape its
+    // parent in the fragment tree, and it keeps its layout position. It is a
+    // positioned box, though, so CSS 2.1 Appendix E paints it after the in-flow,
+    // non-positioned siblings of the same z-index, as the sort in layout does.
     let (output, _, layout) = pipeline(
         "<!doctype html><body><div id='page'><div id='first'>a</div>\
            <div id='sticky'>b</div><div id='last'>c</div></div></body>",
@@ -476,8 +478,8 @@ fn sticky_does_not_change_the_paint_order_of_a_box() {
         order,
         vec![
             find(dom, "#first"),
-            find(dom, "#sticky"),
-            find(dom, "#last")
+            find(dom, "#last"),
+            find(dom, "#sticky")
         ]
     );
 }
@@ -584,6 +586,10 @@ fn a_sticky_box_in_a_nested_scroll_container_is_constrained_by_its_padding_box()
     assert!(near(bar.scrollport.height, 300.0), "{bar:?}");
     assert!(near(bar.scrollport_origin.x, 30.0), "{bar:?}");
     assert!(near(bar.scrollport_origin.y, 20.0), "{bar:?}");
+    // The scrollport belongs to the scroller, so its offset - not the page's -
+    // is the one that moves the box.
+    let scroller = fragment(&layout, find(dom, "#scroller")).id;
+    assert_eq!(bar.scroll_container, Some(scroller), "{bar:?}");
     // The box's containing block is the scroller's content box, so the box is
     // pinned to the top of what the scroller shows.
     assert!(near(bar.containing_block.origin.y, 20.0), "{bar:?}");
@@ -601,6 +607,22 @@ fn a_sticky_box_in_a_nested_scroll_container_is_constrained_by_its_padding_box()
         near(painted(&bar, scrolled(0.0, 1000.0)).origin.y, 20.0),
         "{bar:?}"
     );
+}
+
+#[test]
+fn a_sticky_box_in_the_page_records_the_viewport_as_its_scrollport() {
+    // Without a scroll container the scrollport is the viewport, and the offset
+    // that moves the box is the page's. `None` is how the consumer tells the two
+    // apart: a nested container's offset is its own.
+    let (output, _, layout) = pipeline(
+        "<!doctype html><body><div id='bar'>header</div><div id='rest'>body</div></body>",
+        &format!(
+            "{RESET} #bar {{ position: sticky; top: 0; height: 50px }} #rest {{ height: 900px }}"
+        ),
+        800.0,
+    );
+    let bar = constraint(&layout, find(&output.dom, "#bar"));
+    assert_eq!(bar.scroll_container, None, "{bar:?}");
 }
 
 #[test]

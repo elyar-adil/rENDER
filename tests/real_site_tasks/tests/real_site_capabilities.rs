@@ -499,11 +499,11 @@ fn the_diagnostic_counts_are_reported() {
 // `docs/visual_fidelity_gaps.md` that makes it impossible today. When the gap is
 // closed, delete the `#[ignore]` and the test joins the gate.
 //
-// Two of the five markers inherited from the previous round were **retired**:
+// Markers inherited from the previous round were **retired**:
 // `no_fixture_reports_any_parse_error`, because the tokenizer defect it named was
 // fixed, and it is now a permanent assertion above; and
-// `a_sticky_header_stays_in_the_scrollport` is *narrowed* below, because the
-// capability landed but the raster path does not consume the constraint.
+// `a_sticky_header_stays_in_the_scrollport`, because the raster now applies the
+// sticky displacement (S6), so the marker joined the gate.
 // ---------------------------------------------------------------------------
 
 /// `text-decoration` now reaches paint, so the underline the UA sheet asks for
@@ -932,20 +932,16 @@ fn a_sticky_box_keeps_its_normal_flow_layout_position() {
     );
 }
 
-/// The half of S6 that is missing: **no consumer applies the displacement**.
+/// S6's paint half: a sticky box is painted at its resolved position.
 ///
-/// This is the marker that stayed `#[ignore]`d, narrowed. It rasterises the same
-/// page at a scrolled viewport origin and requires the bar still to be there.
-/// Run explicitly this round it fails - the bar is gone from the raster - which
-/// is the finding, and it is why the marker names the missing call rather than
-/// the missing capability.
+/// It rasterises the same page at a scrolled viewport origin and requires the
+/// bar to be painted at the top of the viewport, where the sticky constraint
+/// pins it. The raster applies the displacement from `sticky_offset`, so the
+/// bar is at document y 500 and lands at viewport y 0.
 ///
-/// It asserts a *pixel*, which is unusual here, and the rule about never
-/// asserting a defect is respected: this is a post-gap assertion. Once a
-/// consumer exists it will be true, and it is not a baseline - it is a single
-/// known colour on a known background, not a comparison against a stored image.
+/// It asserts a *pixel*, and it is a post-gap assertion: it is a single known
+/// colour on a known background, not a comparison against a stored image.
 #[test]
-#[ignore = "docs/visual_fidelity_gaps.md S6: nothing reads FragmentTree::sticky_constraint"]
 fn a_sticky_header_stays_in_the_scrollport() {
     use render_core::document::DocumentRenderOptions;
     use render_core::layout::PhysicalPoint;
@@ -988,8 +984,9 @@ fn a_sticky_header_stays_in_the_scrollport() {
 ///
 /// Asserted against the fixture, because the fixture is the only thing that
 /// contains the shape: a real navbar that is its own horizontal scroller, with
-/// its first chip sticky against it. The paint-side consumer that applies the
-/// displacement is still missing; see `docs/visual_fidelity_gaps.md` S6.
+/// its first chip sticky against it. The paint side resolves the displacement
+/// against this same container, which is why the constraint records it; see
+/// `docs/visual_fidelity_gaps.md` S6.
 #[test]
 fn a_sticky_box_in_a_nested_scrollport_resolves_against_that_scrollport() {
     use render_core::layout::PhysicalSize;

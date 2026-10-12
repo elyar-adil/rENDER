@@ -46,7 +46,7 @@
 | `text-shadow` 与 `box-shadow` 同批修复 | **已发生。** `text-shadow` 已生产绘制命令（`display_list.rs:1194-1207`，多层解析 `:2435`，光栅化 `crates/render-core/src/paint/raster.rs`）。`text-decoration-*`（`:1164-1232`）与 `list-style*` marker（`:1298-1420`）也已接线 —— 这三项在旧版文档里从未被记录。 |
 | `::before` / `::after` 约 80 行（cascade 生成虚拟节点 + layout 参与） | **仍未发生。** 选择器能解析（`crates/render-css/src/selector.rs:539-584`），但布局与绘制两侧都没有伪元素盒生成，见第 5 节。 |
 | CSS Grid 需要"新建 `layout/grid.py` 约 300 行" | **已过时。** Grid 已实现：`crates/render-layout/src/grid.rs`（轨道/`auto-fit`/`auto-fill`/`minmax`/`repeat`）+ `crates/render-layout/src/solver/grid.rs`（放置），能力登记在 `crates/render-core/src/spec/registry.rs:14`（`css.grid-explicit-tracks`）。 |
-| `position: sticky` 约 50 行、绘制时偏移即可 | **未发生。** 关键字在 `crates/render-css/src/properties.rs:758`，无任何消费者（`docs/visual_fidelity_gaps.md` S6）。 |
+| `position: sticky` 约 50 行、绘制时偏移即可 | **已部分发生。** 关键字在 `crates/render-css/src/properties.rs:758`；绘制与命中测试已消费约束，嵌套滚动容器的偏移与 z-order 仍未完成（`docs/visual_fidelity_gaps.md` S6）。 |
 | `transform` 基础只需在 display list 填矩阵 | **已过时但方向正确，且已做。** `transform` / `transform-origin` 已端到端接通（`crates/render-core/src/paint/display_list.rs:764-800`，`:2179` opacity，`:2189` `fragment_stacking_context`）。 |
 | `@font-face` 用 `QFontDatabase.addApplicationFont()` 注册，约 40 行 | **未发生。** `@font-face` 解析后直接丢弃：`crates/render-css/src/stylesheet.rs:558-559`；`crates/render-core` 内检索 `@font-face` 无任何命中。 |
 | SVG `<img>` 靠 PyQt6 内置 `QSvgRenderer` | **已过时但能力已具备。** 现在是自研栅格化器 `crates/render-core/src/image/svg.rs`（该文件 1-18 行自述其子集：基本图形 / `path` 的 `M m L l H h V v C c S s Q q T t Z z`（`A` 弧退化为直线）/ `<g>` 变换 / `fill`+`stroke` 继承 / 尺寸按 `viewBox` 回退），入口在 `crates/render-core/src/image.rs:585-586`。 |

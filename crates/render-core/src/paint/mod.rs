@@ -4,6 +4,7 @@ mod color;
 mod display_list;
 mod raster;
 mod scene;
+pub(crate) mod sticky;
 
 pub use color::{Color, SystemPalette};
 pub use display_list::{

@@ -70,6 +70,8 @@ pub(crate) fn is_content_hit_command(command: &DisplayCommand) -> bool {
             | DisplayCommand::PopTransform
             | DisplayCommand::PushStackingContext(_)
             | DisplayCommand::PopStackingContext
+            | DisplayCommand::PushSticky(_)
+            | DisplayCommand::PopSticky
     )
 }
 

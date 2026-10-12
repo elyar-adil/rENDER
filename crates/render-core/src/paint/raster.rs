@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::css::properties::BorderStyle;
 use crate::image::ImageResources;
-use crate::layout::{PhysicalPoint, PhysicalRect};
+use crate::layout::{PhysicalPoint, PhysicalRect, StickyConstraint};
 
 use super::color::{Color, clamped_rounded_u8};
 use super::display_list::{
@@ -16,6 +16,7 @@ use super::display_list::{
     TextShadowPaint, Transform2D,
 };
 use super::scene::{PaintDamage, PaintScene, RetainedFrame};
+use super::sticky::sticky_displacement;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Surface {
@@ -492,6 +493,13 @@ struct RasterState<'a> {
     /// Translation accumulated by open pure-translation stacking contexts,
     /// applied on top of every item offset.
     translation: PhysicalPoint,
+    /// Displacement of the open sticky boxes. It moves document-space items
+    /// only: a fixed-position item is placed against the viewport, which no
+    /// sticky ancestor moves.
+    sticky: PhysicalPoint,
+    /// The `sticky` displacement each open sticky scope replaced, restored when
+    /// that scope closes.
+    sticky_frames: Vec<PhysicalPoint>,
     /// `text-shadow` layers seen since the last glyph run. A shadow item
     /// describes the glyph run that follows it, so the rasterizer holds the
     /// parameters until the run supplies the glyph geometry.
@@ -526,6 +534,8 @@ impl<'a> RasterState<'a> {
             ))],
             frames: Vec::new(),
             translation: PhysicalPoint::default(),
+            sticky: PhysicalPoint::default(),
+            sticky_frames: Vec::new(),
             pending_shadows: Vec::new(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
@@ -552,6 +562,8 @@ impl<'a> RasterState<'a> {
             clips: vec![ClipRegion::rect(clip)],
             frames: Vec::new(),
             translation: PhysicalPoint::default(),
+            sticky: PhysicalPoint::default(),
+            sticky_frames: Vec::new(),
             pending_shadows: Vec::new(),
             diagnostics: Vec::new(),
             viewport_origin: PhysicalPoint {
@@ -593,6 +605,8 @@ impl<'a> RasterState<'a> {
             DisplayCommand::PopClip => self.pop_clip(item.id),
             DisplayCommand::PushStackingContext(context) => self.push_stacking_context(*context),
             DisplayCommand::PopStackingContext => self.pop_stacking_context(item.id),
+            DisplayCommand::PushSticky(constraint) => self.push_sticky(constraint),
+            DisplayCommand::PopSticky => self.pop_sticky(item.id),
             DisplayCommand::GlyphRun(run) => {
                 self.paint_glyph_run(item, run, glyphs, offset);
             }
@@ -667,19 +681,45 @@ impl<'a> RasterState<'a> {
     }
 
     fn item_offset(&self, coordinate_space: PaintCoordinateSpace) -> PhysicalPoint {
-        let base = match coordinate_space {
+        match coordinate_space {
+            // Sticky displacement belongs to document content only, and the
+            // document is what the viewport origin scrolls.
             PaintCoordinateSpace::Document => PhysicalPoint {
-                x: -self.viewport_origin.x,
-                y: -self.viewport_origin.y,
+                x: self.translation.x + self.sticky.x - self.viewport_origin.x,
+                y: self.translation.y + self.sticky.y - self.viewport_origin.y,
             },
-            PaintCoordinateSpace::Viewport => PhysicalPoint::default(),
+            // Fast-path stacking-context translations shift both coordinate
+            // spaces: a transformed element is also the containing block for
+            // its fixed descendants.
+            PaintCoordinateSpace::Viewport => self.translation,
+        }
+    }
+
+    /// CSS Positioned Layout 4 §4.1: the box and its containing block are
+    /// constrained where the ancestors have already placed them, so the
+    /// constraint is moved by the displacement in effect here before it is
+    /// resolved against the scroll offset.
+    fn push_sticky(&mut self, constraint: &StickyConstraint) {
+        let placed_by = PhysicalPoint {
+            x: self.translation.x + self.sticky.x,
+            y: self.translation.y + self.sticky.y,
         };
-        // Fast-path stacking-context translations shift both coordinate
-        // spaces: a transformed element is also the containing block for its
-        // fixed descendants.
-        PhysicalPoint {
-            x: base.x + self.translation.x,
-            y: base.y + self.translation.y,
+        let displacement = sticky_displacement(constraint, placed_by, self.viewport_origin);
+        self.sticky_frames.push(self.sticky);
+        self.sticky = PhysicalPoint {
+            x: self.sticky.x + displacement.x,
+            y: self.sticky.y + displacement.y,
+        };
+    }
+
+    fn pop_sticky(&mut self, item: DisplayItemId) {
+        match self.sticky_frames.pop() {
+            Some(previous) => self.sticky = previous,
+            None => self.diagnostics.push(RasterDiagnostic {
+                item,
+                code: RasterDiagnosticCode::UnbalancedState,
+                message: "unbalanced sticky-position pop".to_owned(),
+            }),
         }
     }
 
