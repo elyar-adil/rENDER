@@ -678,9 +678,14 @@ struct Builder<'a> {
     limit_reported: bool,
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
     fn paint_fragment(&mut self, id: FragmentId, parent_space: PaintCoordinateSpace) {
-        let Some(fragment) = self.fragments.get(id).cloned() else {
+        // The fragment tree and the computed styles outlive the builder, so the
+        // fragment and its style are borrowed for `'a` rather than cloned: a
+        // computed style is a few hundred heap values, and every fragment used to
+        // pay for a copy of its own.
+        let fragments = self.fragments;
+        let Some(fragment) = fragments.get(id) else {
             self.diagnostics.push(DisplayListDiagnostic {
                 node: None,
                 code: DisplayListDiagnosticCode::MissingFragment,
@@ -688,10 +693,10 @@ impl Builder<'_> {
             });
             return;
         };
-        let style = self.style_for(&fragment).cloned();
-        let coordinate_space = fragment_coordinate_space(style.as_ref(), parent_space);
-        let current_color = self.current_color(style.as_ref());
-        let opacity = fragment_opacity(style.as_ref());
+        let style = self.style_for(fragment);
+        let coordinate_space = fragment_coordinate_space(style, parent_space);
+        let current_color = self.current_color(style);
+        let opacity = fragment_opacity(style);
         // Transforms are anchored to the border box: percentages in the
         // transform list and the default transform-origin resolve against
         // it (CSS Transforms Level 1 §4). Text fragments have no border
@@ -700,9 +705,9 @@ impl Builder<'_> {
             FragmentKind::Box(geometry) => geometry.border_rect(),
             FragmentKind::Text(_) => fragment.rect,
         };
-        let transform = self.fragment_transform(style.as_ref(), border_rect);
+        let transform = self.fragment_transform(style, border_rect);
         let hidden = matches!(
-            style.as_ref().and_then(|style| style.typed("visibility")),
+            style.and_then(|style| style.typed("visibility")),
             Some(TypedPropertyValue::Visibility(
                 Visibility::Hidden | Visibility::Collapse
             ))
@@ -715,7 +720,7 @@ impl Builder<'_> {
         let stacking_context = fragment_stacking_context(opacity, transform);
         if let Some(context) = stacking_context {
             self.push(
-                &fragment,
+                fragment,
                 PaintPhase::StackingContext,
                 fragment.rect,
                 coordinate_space,
@@ -726,35 +731,23 @@ impl Builder<'_> {
         if !hidden {
             match &fragment.kind {
                 FragmentKind::Box(geometry) => {
-                    self.paint_box(
-                        &fragment,
-                        geometry,
-                        style.as_ref(),
-                        current_color,
-                        coordinate_space,
-                    );
-                    self.paint_image(&fragment, geometry, style.as_ref(), coordinate_space);
+                    self.paint_box(fragment, geometry, style, current_color, coordinate_space);
+                    self.paint_image(fragment, geometry, style, coordinate_space);
                 }
                 FragmentKind::Text(text) => {
-                    self.paint_text(
-                        &fragment,
-                        text,
-                        style.as_ref(),
-                        current_color,
-                        coordinate_space,
-                    );
+                    self.paint_text(fragment, text, style, current_color, coordinate_space);
                 }
             }
         }
-        let overflow_clip = match (&fragment.kind, style.as_ref()) {
+        let overflow_clip = match (&fragment.kind, style) {
             (FragmentKind::Box(geometry), Some(style)) => {
                 let mut clip_geometry = (*geometry).clone();
                 clip_geometry.content_rect =
-                    self.recovered_content_rect(&fragment, geometry, Some(style));
+                    self.recovered_content_rect(fragment, geometry, Some(style));
                 if let Some(shape) = overflow_clip_shape(&clip_geometry, style) {
                     let rect = clip_shape_rect(shape);
                     self.push(
-                        &fragment,
+                        fragment,
                         PaintPhase::Content,
                         rect,
                         coordinate_space,
@@ -772,7 +765,7 @@ impl Builder<'_> {
         }
         if overflow_clip.is_some() {
             self.push(
-                &fragment,
+                fragment,
                 PaintPhase::Content,
                 fragment.rect,
                 coordinate_space,
@@ -781,7 +774,7 @@ impl Builder<'_> {
         }
         if stacking_context.is_some() {
             self.push(
-                &fragment,
+                fragment,
                 PaintPhase::StackingContext,
                 fragment.rect,
                 coordinate_space,
@@ -1727,12 +1720,13 @@ impl Builder<'_> {
         )
     }
 
-    fn style_for(&mut self, fragment: &Fragment) -> Option<&ComputedStyle> {
-        let source = self
-            .formatting
+    fn style_for(&mut self, fragment: &Fragment) -> Option<&'a ComputedStyle> {
+        let formatting = self.formatting;
+        let styles = self.styles;
+        let source = formatting
             .get(fragment.formatting_node)
             .and_then(|node| node.style_source);
-        let style = source.and_then(|source| self.styles.get(&source));
+        let style = source.and_then(|source| styles.get(&source));
         if source.is_some() && style.is_none() {
             self.diagnostics.push(DisplayListDiagnostic {
                 node: source,

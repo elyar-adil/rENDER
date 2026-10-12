@@ -1352,37 +1352,95 @@ fn clip_shape_contains(shape: ClipShape, point: PhysicalPoint) -> bool {
     }
 }
 
-fn clip_coverage(clip: Option<&ClipRegion>, x: f32, y: f32) -> f32 {
-    let Some(clip) = clip else { return 1.0 };
-    // Fast path: a clip built purely from axis-aligned rects. All sixteen
-    // samples of one pixel cell share the same floor, so every sample agrees
-    // with every other and coverage is exactly 0.0 or 1.0. Intersecting the
-    // half-open rects once turns the sixteen sampled containment tests into
-    // four comparisons with bit-identical results.
-    let shapes = &clip.shapes[..clip.shape_count];
-    if shapes
-        .iter()
-        .all(|shape| matches!(shape, ClipShape::Rect(_)))
-    {
-        let mut left = f32::MIN;
-        let mut right = f32::MAX;
-        let mut top = f32::MIN;
-        let mut bottom = f32::MAX;
+/// A clip built purely from axis-aligned rects, reduced to the bounds that
+/// decide a pixel cell's coverage.
+///
+/// Intersecting the half-open rects once turns the sixteen sampled containment
+/// tests of [`clip_coverage`] into four comparisons. Paint loops reduce the
+/// clip once per call and answer every pixel from these bounds, so the
+/// reduction is not repeated for each of a surface's pixels.
+#[derive(Clone, Copy)]
+struct RectCellClip {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl RectCellClip {
+    /// The reduction of `clip`, or `None` when a rounded shape needs sampling.
+    fn of(clip: &ClipRegion) -> Option<Self> {
+        let shapes = &clip.shapes[..clip.shape_count];
+        if !shapes
+            .iter()
+            .all(|shape| matches!(shape, ClipShape::Rect(_)))
+        {
+            return None;
+        }
+        let mut bounds = Self {
+            left: f32::MIN,
+            top: f32::MIN,
+            right: f32::MAX,
+            bottom: f32::MAX,
+        };
         for shape in shapes {
             let ClipShape::Rect(rect) = *shape else {
                 unreachable!("the all-rect guard was just checked");
             };
-            left = left.max(rect.origin.x);
-            right = right.min(rect.right());
-            top = top.max(rect.origin.y);
-            bottom = bottom.min(rect.bottom());
+            bounds.left = bounds.left.max(rect.origin.x);
+            bounds.right = bounds.right.min(rect.right());
+            bounds.top = bounds.top.max(rect.origin.y);
+            bounds.bottom = bounds.bottom.min(rect.bottom());
         }
-        if left >= right || top >= bottom {
-            return 0.0;
-        }
+        Some(bounds)
+    }
+
+    /// The coverage [`clip_coverage`] gives the centre of pixel `(x, y)`.
+    fn coverage(self, x: u32, y: u32) -> f32 {
+        let cell_x = pixel_cell(x);
+        let cell_y = pixel_cell(y);
+        let inside = cell_x >= self.left
+            && cell_x < self.right
+            && cell_y >= self.top
+            && cell_y < self.bottom;
+        if inside { 1.0 } else { 0.0 }
+    }
+}
+
+/// The pixel cell the centre sample `index + 0.5` floors into, as a float.
+fn pixel_cell(index: u32) -> f32 {
+    // Below 2^23 the centre is exact in f32 and floors back to `index`, so the
+    // software floor is skipped on the paint path.
+    if index < 1 << 23 {
+        u32_to_f32(index)
+    } else {
+        (u32_to_f32(index) + 0.5).floor()
+    }
+}
+
+/// The coverage of pixel `(x, y)` under `clip`, with a rect-only clip answered
+/// from its reduction made once by the caller. Equal to `clip_coverage` at the
+/// pixel centre.
+fn pixel_coverage(clip: Option<&ClipRegion>, rect: Option<RectCellClip>, x: u32, y: u32) -> f32 {
+    match (clip, rect) {
+        (None, _) => 1.0,
+        (Some(_), Some(rect)) => rect.coverage(x, y),
+        (Some(clip), None) => clip_coverage(Some(clip), u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5),
+    }
+}
+
+fn clip_coverage(clip: Option<&ClipRegion>, x: f32, y: f32) -> f32 {
+    let Some(clip) = clip else { return 1.0 };
+    // Fast path: a clip built purely from axis-aligned rects. All sixteen
+    // samples of one pixel cell share the same floor, so every sample agrees
+    // with every other and coverage is exactly 0.0 or 1.0.
+    if let Some(rect) = RectCellClip::of(clip) {
         let cell_x = x.floor();
         let cell_y = y.floor();
-        let inside = cell_x >= left && cell_x < right && cell_y >= top && cell_y < bottom;
+        let inside = cell_x >= rect.left
+            && cell_x < rect.right
+            && cell_y >= rect.top
+            && cell_y < rect.bottom;
         return if inside { 1.0 } else { 0.0 };
     }
     let samples = [0.125_f32, 0.375, 0.625, 0.875];
@@ -1761,12 +1819,13 @@ fn fill_rect(
     let top = floor_to_u32(rect.origin.y);
     let right = ceil_to_u32(rect.right().min(u32_to_f32(surface.width)));
     let bottom = ceil_to_u32(rect.bottom().min(u32_to_f32(surface.height)));
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in top..bottom {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
         }
         for x in left..right {
-            let coverage = clip_coverage(clip, u32_to_f32(x) + 0.5, u32_to_f32(y) + 0.5);
+            let coverage = pixel_coverage(clip, rect_clip, x, y);
             if coverage <= 0.0 {
                 continue;
             }
@@ -2001,6 +2060,7 @@ fn paint_glyph(
     };
     let mask_width = usize::try_from(mask.width).unwrap_or(usize::MAX / 2);
     let mask_height = usize::try_from(mask.height).unwrap_or(0);
+    let rect_clip = clip.and_then(RectCellClip::of);
     for y in 0..mask_height {
         if control.is_some_and(RasterControl::is_cancelled) {
             return false;
@@ -2026,20 +2086,10 @@ fn paint_glyph(
             else {
                 continue;
             };
-            let clip_alpha = match clip {
-                None => 1.0,
-                Some(clip) => {
-                    let alpha = clip_coverage(
-                        Some(clip),
-                        u32_to_f32(target_x) + 0.5,
-                        u32_to_f32(target_y) + 0.5,
-                    );
-                    if alpha <= 0.0 {
-                        continue;
-                    }
-                    alpha
-                }
-            };
+            let clip_alpha = pixel_coverage(clip, rect_clip, target_x, target_y);
+            if clip_alpha <= 0.0 {
+                continue;
+            }
             if let Some(surface_index) = surface.index(target_x, target_y) {
                 surface.pixels[surface_index] = blend(
                     surface.pixels[surface_index],
@@ -2283,6 +2333,13 @@ impl PremultipliedColor {
 }
 
 fn blend(destination: Color, source: Color, opacity: f32) -> Color {
+    // An opaque source at full opacity covers the destination completely. The
+    // formula below reduces to `source` for that input (alpha 1, every channel
+    // multiplied by 1 and the destination term by 0), so the shortcut returns
+    // the same pixel without the per-channel float work.
+    if source.alpha == u8::MAX && opacity >= 1.0 {
+        return source;
+    }
     let source_alpha = f32::from(source.alpha) / 255.0 * opacity.clamp(0.0, 1.0);
     let destination_alpha = f32::from(destination.alpha) / 255.0;
     let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);

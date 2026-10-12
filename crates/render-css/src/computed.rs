@@ -964,14 +964,80 @@ impl CustomResolver<'_> {
 /// uses the same default in `LengthResolutionContext`.
 const DEFAULT_ROOT_FONT_SIZE: f32 = 16.0;
 
+/// The computed and typed forms of every non-inherited registered property's
+/// initial value.
+///
+/// An element that declares nothing for such a property computes exactly this
+/// value, whatever its parent or ancestors are, so the work of producing it
+/// (tokenising the initial text and parsing its grammar) is done once per
+/// document rather than once per element.
+struct InitialValues {
+    values: BTreeMap<String, InitialValue>,
+}
+
+struct InitialValue {
+    value: Option<ComputedValue>,
+    typed: Option<TypedPropertyValue>,
+    /// The grammar rejects the initial value. Such a property keeps the full
+    /// per-element path, whose fallback and diagnostic depend on the element.
+    rejected: bool,
+}
+
+impl InitialValues {
+    fn new(registry: &PropertyRegistry, limits: &ComputationLimits) -> Self {
+        let values = registry
+            .iter()
+            .filter(|(_, definition)| !definition.inherited)
+            .map(|(name, definition)| {
+                let value = tokenize(&definition.initial_value, limits)
+                    .ok()
+                    .and_then(|tokens| ComputedValue::within_limits(tokens, limits));
+                let parsed = value
+                    .as_ref()
+                    .and_then(|value| parse_typed_property(name, &value.parseable_css()));
+                let (typed, rejected) = match parsed {
+                    Some(Ok(typed)) => (Some(typed), false),
+                    Some(Err(_)) => (None, true),
+                    None => (None, false),
+                };
+                (
+                    name.clone(),
+                    InitialValue {
+                        value,
+                        typed,
+                        rejected,
+                    },
+                )
+            })
+            .collect();
+        Self { values }
+    }
+}
+
 /// Resolve token-level computed values for one element.
 #[must_use]
-#[allow(clippy::too_many_lines)] // Kept linear to mirror the ordered CSS computed-value stages.
 pub fn compute_style(
     cascaded: &CascadedStyle,
     parent: Option<&ComputedStyle>,
     registry: &PropertyRegistry,
     limits: &ComputationLimits,
+) -> ComputedStyle {
+    compute_style_with_initials(
+        cascaded,
+        parent,
+        registry,
+        limits,
+        &InitialValues::new(registry, limits),
+    )
+}
+
+#[allow(clippy::too_many_lines)] // Kept linear to mirror the ordered CSS computed-value stages.
+fn compute_style_with_initials(
+    cascaded: &CascadedStyle,
+    parent: Option<&ComputedStyle>,
+    registry: &PropertyRegistry,
+    limits: &ComputationLimits,
+    initials: &InitialValues,
 ) -> ComputedStyle {
     let mut diagnostics = Vec::new();
     let mut invalid = parent
@@ -1112,6 +1178,22 @@ pub fn compute_style(
     let mut typed_properties = BTreeMap::new();
     let mut specified = BTreeSet::new();
     for (name, definition) in registry.iter() {
+        // An unspecified, non-inherited property is its initial value, and the
+        // table already holds that value and its typed parse. The inherited and
+        // specified cases need the element's own parent or declarations.
+        if cascaded.get(name).is_none()
+            && !definition.inherited
+            && let Some(initial) = initials.values.get(name)
+            && !initial.rejected
+        {
+            if let Some(value) = &initial.value {
+                properties.insert(name.clone(), value.clone());
+            }
+            if let Some(typed) = &initial.typed {
+                typed_properties.insert(name.clone(), typed.clone());
+            }
+            continue;
+        }
         let mut computed =
             compute_registered_property(name, definition, cascaded, parent, &mut resolver, limits);
         // Whether the document supplied this property at all, decided before
@@ -1308,6 +1390,7 @@ pub fn compute_document_styles_with_hints(
     hints: &dyn Fn(NodeId) -> Vec<Declaration>,
 ) -> BTreeMap<NodeId, ComputedStyle> {
     let mut styles = BTreeMap::new();
+    let initials = InitialValues::new(registry, limits);
     let mut stack = vec![(dom.document(), None)];
     while let Some((node, parent_element)) = stack.pop() {
         let current_parent = if matches!(dom.node(node).map(Node::kind), Some(NodeKind::Element(_)))
@@ -1320,11 +1403,12 @@ pub fn compute_document_styles_with_hints(
             let ua_hints = hints(node);
             let cascaded =
                 cascade_element_with_origins(dom, node, sources, context, &ua_hints, &inline);
-            let style = compute_style(
+            let style = compute_style_with_initials(
                 &cascaded,
                 parent_element.and_then(|parent| styles.get(&parent)),
                 registry,
                 limits,
+                &initials,
             );
             styles.insert(node, style);
             Some(node)
