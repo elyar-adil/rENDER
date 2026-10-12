@@ -352,11 +352,11 @@ impl JsRuntime {
             regex_cache: std::collections::HashMap::new(),
             console_messages: Vec::new(),
             window_event_handlers: vec![BTreeMap::new()],
-            contexts: vec![BrowsingContextRecord {
-                document: Some(dom.document()),
-                url: document_url.clone(),
-                frame: None,
-            }],
+            contexts: vec![BrowsingContextRecord::own(
+                Some(dom.document()),
+                document_url.clone(),
+                None,
+            )],
             frames: BTreeMap::new(),
             caller_realms: Vec::new(),
             internal_tasks: BTreeMap::new(),
@@ -408,7 +408,11 @@ impl JsRuntime {
     /// realm, so a failure there is a bug in the runtime.
     pub fn create_realm(&mut self, dom: &mut Dom) -> RealmId {
         let realm = self.realm.create_realm();
-        self.push_realm_state(None, None, None);
+        self.push_realm_state(BrowsingContextRecord::own(
+            None,
+            Url::parse("about:blank").expect("constant URL"),
+            None,
+        ));
         self.with_realm(realm, |runtime| {
             runtime.run_self_hosted(dom, INTRINSICS_PRELUDE_SOURCE)
         })
@@ -417,20 +421,11 @@ impl JsRuntime {
     }
 
     /// Adds the per-realm tables for a realm that was just created.
-    fn push_realm_state(
-        &mut self,
-        document: Option<NodeId>,
-        url: Option<Url>,
-        frame: Option<NodeId>,
-    ) {
+    fn push_realm_state(&mut self, context: BrowsingContextRecord) {
         self.global_bindings.push(BTreeMap::new());
         self.modules.push(BTreeMap::new());
         self.window_event_handlers.push(BTreeMap::new());
-        self.contexts.push(BrowsingContextRecord {
-            document,
-            url: url.unwrap_or_else(|| Url::parse("about:blank").expect("constant URL")),
-            frame,
-        });
+        self.contexts.push(context);
     }
 
     /// Runs `body` with `realm` as the current realm, the realm of the running

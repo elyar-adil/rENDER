@@ -330,3 +330,35 @@ fn a_frame_that_cannot_get_a_realm_is_refused_and_the_page_keeps_running() {
     );
     assert_eq!(run(&mut dom, &mut runtime, "1 + 1"), "2");
 }
+
+#[test]
+fn an_about_blank_frame_takes_its_creators_origin_so_same_origin_messages_reach_it() {
+    let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
+    run(
+        &mut dom,
+        &mut runtime,
+        "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow; var got = 'none'; w.addEventListener('message', function (e) { got = e.origin; }); w.postMessage('x', '/');",
+    );
+    settle(&mut dom, &mut runtime);
+    assert_eq!(run(&mut dom, &mut runtime, "got"), "http://example.test");
+}
+
+#[test]
+fn a_srcdoc_script_resolves_its_src_against_the_embedding_document() {
+    let mut documents = BTreeMap::new();
+    documents.insert(
+        "http://example.test/lib/helper.js".to_owned(),
+        "var helped = 'yes';".to_owned(),
+    );
+    let html = "<body><iframe srcdoc=\"<script src='lib/helper.js'></script>\"></iframe></body>";
+    let (mut dom, mut runtime) = page(html, documents);
+    settle(&mut dom, &mut runtime);
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "document.querySelector('iframe').contentWindow.helped"
+        ),
+        "yes"
+    );
+}

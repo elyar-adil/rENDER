@@ -39,10 +39,30 @@ pub(super) struct BrowsingContextRecord {
     /// The displayed document. `None` for a realm made by `CreateRealm`, which
     /// displays no document.
     pub(super) document: Option<NodeId>,
-    /// The URL the document came from; the base of its relative URLs.
-    pub(super) url: Url,
+    /// The base URL that relative URLs in the document resolve against. It is
+    /// the document's own URL, except for an `about:blank` or `about:srcdoc`
+    /// document, which takes the base URL of the document that created its
+    /// iframe (HTML 7.4.2.3). `location` reports the document's own URL, which
+    /// the realm's host globals hold.
+    pub(super) base: Url,
+    /// The serialised origin of the document. An `about:blank` or `about:srcdoc`
+    /// document takes its creator's origin, so it is not opaque (HTML 7.4.2.3).
+    pub(super) origin: String,
     /// The iframe element that embeds the context, `None` for the page.
     pub(super) frame: Option<NodeId>,
+}
+
+impl BrowsingContextRecord {
+    /// A context whose base URL and origin are its own URL's.
+    pub(super) fn own(document: Option<NodeId>, url: Url, frame: Option<NodeId>) -> Self {
+        let origin = url.origin().ascii_serialization();
+        Self {
+            document,
+            base: url,
+            origin,
+            frame,
+        }
+    }
 }
 
 /// Work the runtime scheduled for itself. See the module comment.
@@ -188,13 +208,36 @@ impl JsRuntime {
         frame: Option<NodeId>,
     ) -> Result<RealmId, JsError> {
         self.ensure_heap_capacity(REALM_HEAP_OBJECTS)?;
+        let context = self.new_context(dom, Some(document), url, frame);
         let realm = self.realm.create_document_realm(document, url);
-        self.push_realm_state(Some(document), Some(url.clone()), frame);
+        self.push_realm_state(context);
         self.with_realm(realm, |runtime| {
             runtime.run_self_hosted(dom, INTRINSICS_PRELUDE_SOURCE)?;
             runtime.run_self_hosted(dom, PRELUDE_SOURCE)
         })?;
         Ok(realm)
+    }
+
+    /// The record of a context that displays `url`. An `about:blank` or
+    /// `about:srcdoc` document in an iframe takes the base URL and origin of the
+    /// iframe's own document, so a window it posts to sees a same-origin sender.
+    fn new_context(
+        &self,
+        dom: &Dom,
+        document: Option<NodeId>,
+        url: &Url,
+        frame: Option<NodeId>,
+    ) -> BrowsingContextRecord {
+        let creator = frame.map(|frame| self.realm_of_node(dom, frame));
+        match creator {
+            Some(creator) if inherits_creator_origin(url) => BrowsingContextRecord {
+                document,
+                base: self.contexts[creator.0].base.clone(),
+                origin: self.contexts[creator.0].origin.clone(),
+                frame,
+            },
+            _ => BrowsingContextRecord::own(document, url.clone(), frame),
+        }
     }
 
     /// Points the `parent`, `top` and `frameElement` of a context at its
@@ -270,7 +313,7 @@ impl JsRuntime {
             return Ok(());
         }
         let owner = self.realm_of_node(dom, frame);
-        let base = self.contexts[owner.0].url.clone();
+        let base = self.contexts[owner.0].base.clone();
         let (url, source) = self.frame_document_source(dom, frame, &base);
         let document = dom.graft_document(render_html::parse_document(&source).dom);
         let Ok(realm) = self.create_browsing_context(dom, document, &url, Some(frame)) else {
@@ -287,8 +330,9 @@ impl JsRuntime {
         // The new document may hold iframes of its own, which the next scan must see
         // even though grafting does not record a mutation.
         self.nested_scan_revision = None;
+        let document_base = self.contexts[realm.0].base.clone();
         self.with_realm(realm, |runtime| {
-            runtime.run_document_scripts(dom, document, &url);
+            runtime.run_document_scripts(dom, document, &document_base);
         });
         self.dispatch_window_load(dom, realm)?;
         self.schedule(InternalTask::FrameLoad { frame });
@@ -447,12 +491,18 @@ impl JsRuntime {
 
     /// The serialised origin of the document of `realm`.
     fn origin_of(&self, realm: RealmId) -> String {
-        self.contexts[realm.0].url.origin().ascii_serialization()
+        self.contexts[realm.0].origin.clone()
     }
 }
 
 fn blank_url() -> Url {
     Url::parse(ABOUT_BLANK).expect("constant URL")
+}
+
+/// Whether a document at `url` takes its origin and base URL from the document
+/// that created it, rather than from `url`.
+fn inherits_creator_origin(url: &Url) -> bool {
+    matches!(url.as_str(), ABOUT_BLANK | ABOUT_SRCDOC)
 }
 
 /// The root of the tree that `node` is in.
