@@ -231,7 +231,7 @@ impl Engine for WptHarnessEngine {
             return Ok(Verdict::Unsupported {
                 capability: Some(capability),
                 reason: format!(
-                    "render-core implements no nested browsing context, so {} cannot be driven",
+                    "the engine lacks {}, so the test cannot be driven",
                     capability.label()
                 ),
             });
