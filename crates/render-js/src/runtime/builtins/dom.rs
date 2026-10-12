@@ -602,6 +602,53 @@ pub(in crate::runtime) fn dataset_attribute_from_member(property: &str) -> Optio
     Some(mapped)
 }
 
+/// The event handler names a `body` element forwards to its Window (HTML, the
+/// window-reflecting body element event handler set), without the `on` prefix.
+const WINDOW_REFLECTING_BODY_HANDLERS: &[&str] = &[
+    "afterprint",
+    "beforeprint",
+    "beforeunload",
+    "blur",
+    "error",
+    "focus",
+    "hashchange",
+    "languagechange",
+    "load",
+    "message",
+    "messageerror",
+    "offline",
+    "online",
+    "pagehide",
+    "pageshow",
+    "popstate",
+    "rejectionhandled",
+    "resize",
+    "storage",
+    "unhandledrejection",
+    "unload",
+];
+
+/// Whether `property` on `node` is one of a `body` element's handlers that
+/// forward to the Window. Reading or writing `body.onload` then reads or writes
+/// the Window's own `onload`, whether or not the body is connected.
+pub(in crate::runtime) fn window_reflecting_body_handler(
+    dom: &Dom,
+    node: NodeId,
+    property: &str,
+) -> bool {
+    let Some(event_type) = property.strip_prefix("on") else {
+        return false;
+    };
+    if !WINDOW_REFLECTING_BODY_HANDLERS.contains(&event_type) {
+        return false;
+    }
+    matches!(
+        dom.node(node).map(render_dom::Node::kind),
+        Some(render_dom::NodeKind::Element(element))
+            if element.namespace == render_dom::Namespace::Html && element.local_name == "body"
+    )
+}
+
 /// The content attribute behind an element property that is not reflected by
 /// the interface tables in `reflect.rs` (HTML "Reflecting content attributes in IDL attributes"). What remains here is the
 /// `Element`-level `id`, the SVG and `MathML` names that have no interface table
