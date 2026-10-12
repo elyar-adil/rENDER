@@ -33,11 +33,11 @@ mod stroke;
 mod style;
 
 #[cfg(test)]
-mod page_tests;
+mod argument_tests;
 #[cfg(test)]
 mod limit_tests;
 #[cfg(test)]
-mod argument_tests;
+mod page_tests;
 #[cfg(test)]
 mod tests;
 

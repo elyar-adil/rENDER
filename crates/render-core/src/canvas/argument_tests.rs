@@ -13,8 +13,10 @@ fn an_unknown_context_kind_is_a_type_error() {
         assert_eq!(run(&script), "TypeError", "kind {kind:?}");
     }
     assert_eq!(
-        run("var name = 'none'; try { document.getElementById('c').getContext(); } \
-             catch (e) { name = e.name; } name"),
+        run(
+            "var name = 'none'; try { document.getElementById('c').getContext(); } \
+             catch (e) { name = e.name; } name"
+        ),
         "TypeError"
     );
 }
@@ -37,8 +39,10 @@ fn offscreen_size_setters_enforce_the_unsigned_long_range() {
         assert_eq!(run(&script), "TypeError", "value {value}");
     }
     assert_eq!(
-        run("var o = new OffscreenCanvas(4, 4); o.width = '12'; o.height = 7.9; \
-             [o.width, o.height].join(',')"),
+        run(
+            "var o = new OffscreenCanvas(4, 4); o.width = '12'; o.height = 7.9; \
+             [o.width, o.height].join(',')"
+        ),
         "12,7"
     );
 }
