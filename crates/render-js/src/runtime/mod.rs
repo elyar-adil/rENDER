@@ -73,10 +73,13 @@ mod module;
 #[cfg(test)]
 mod range_tests;
 pub use module::ModuleLoader;
+mod named_access;
 mod nested;
 pub use nested::DocumentLoader;
 #[cfg(test)]
 mod module_tests;
+#[cfg(test)]
+mod named_access_tests;
 #[cfg(test)]
 mod nested_tests;
 #[cfg(test)]
