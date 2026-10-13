@@ -70,6 +70,8 @@ mod gc;
 #[cfg(test)]
 mod language_tests;
 mod module;
+#[cfg(test)]
+mod range_tests;
 pub use module::ModuleLoader;
 mod nested;
 pub use nested::DocumentLoader;

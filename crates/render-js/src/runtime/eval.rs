@@ -5367,6 +5367,9 @@ impl JsRuntime {
             (Some(ObjectHost::Document(_)), "createTextNode") => {
                 Some(NativeFunction::CreateTextNode)
             }
+            (Some(ObjectHost::Document(_)), "createRange") => {
+                Some(NativeFunction::Range(crate::value::RangeOp::CreateRange))
+            }
             (Some(ObjectHost::Document(_)), "createComment") => Some(NativeFunction::CreateComment),
             (Some(ObjectHost::Document(_)), "createDocumentFragment") => {
                 Some(NativeFunction::CreateDocumentFragment)
@@ -6035,6 +6038,10 @@ impl JsRuntime {
             Some(ObjectHost::DomNodeConstructor(kind)) => {
                 self.construct_dom_node(dom, kind, arguments)
             }
+            Some(ObjectHost::RangeConstructor) => self.range_constructor(dom),
+            Some(ObjectHost::StaticRangeConstructor) => {
+                self.static_range_constructor(dom, arguments)
+            }
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             Some(ObjectHost::VideoConstructor) => {
@@ -6368,6 +6375,9 @@ impl JsRuntime {
             Some(ObjectHost::DomNodeConstructor(_)) => Err(JsError::type_error(
                 "Failed to construct a DOM node: please use the 'new' operator",
             )),
+            Some(ObjectHost::RangeConstructor | ObjectHost::StaticRangeConstructor) => Err(
+                JsError::type_error("Failed to construct a Range: please use the 'new' operator"),
+            ),
             Some(ObjectHost::ImageConstructor) => self.image_constructor(dom, arguments),
             // Legacy web compatibility: `Video()` without `new` constructs,
             // exactly like `Image()`.

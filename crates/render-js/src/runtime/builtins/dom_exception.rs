@@ -84,8 +84,15 @@ pub(in crate::runtime) enum DomExceptionName {
     /// A node of the wrong type for the operation, reported by `render-dom` as
     /// `InvalidNodeType`.
     InvalidNodeType,
-    /// A `CharacterData` offset or count past the end of the data (DOM §4.10).
+    /// A `CharacterData` offset or count past the end of the data (DOM §4.10),
+    /// and a range boundary offset past the end of its node (DOM §5.2).
     IndexSize,
+    /// A range compared with a range in another document (DOM §5.2), reported
+    /// by `render-dom` as `WrongDocument`.
+    WrongDocument,
+    /// A range operation the range's state does not allow, such as
+    /// `surroundContents` over a partially selected element (DOM §5.2).
+    InvalidState,
     /// A qualified name whose prefix, namespace and local name disagree (DOM §4.9.1).
     Namespace,
 }
@@ -105,6 +112,8 @@ impl DomExceptionName {
             Self::NotFound => "NotFoundError",
             Self::InvalidNodeType => "InvalidNodeTypeError",
             Self::IndexSize => "IndexSizeError",
+            Self::WrongDocument => "WrongDocumentError",
+            Self::InvalidState => "InvalidStateError",
             Self::Namespace => "NamespaceError",
         }
     }
@@ -115,6 +124,10 @@ impl DomExceptionName {
             render_dom::DomErrorKind::HierarchyRequest => Self::HierarchyRequest,
             render_dom::DomErrorKind::NotFound => Self::NotFound,
             render_dom::DomErrorKind::InvalidNodeType => Self::InvalidNodeType,
+            render_dom::DomErrorKind::IndexSize => Self::IndexSize,
+            render_dom::DomErrorKind::WrongDocument => Self::WrongDocument,
+            render_dom::DomErrorKind::NotSupported => Self::NotSupported,
+            render_dom::DomErrorKind::InvalidState => Self::InvalidState,
         }
     }
 }
@@ -497,6 +510,8 @@ mod tests {
             (DomExceptionName::NotFound, 8),
             (DomExceptionName::InvalidNodeType, 24),
             (DomExceptionName::IndexSize, 1),
+            (DomExceptionName::WrongDocument, 4),
+            (DomExceptionName::InvalidState, 11),
             (DomExceptionName::Namespace, 14),
         ] {
             assert_eq!(

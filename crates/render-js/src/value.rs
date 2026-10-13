@@ -5,7 +5,7 @@ use std::fmt;
 use std::num::FpCategory;
 
 use crate::JsError;
-use render_dom::NodeId;
+use render_dom::{NodeId, RangeId};
 use url::Url;
 
 use crate::bigint::JsBigInt;
@@ -408,6 +408,41 @@ pub(crate) enum DomNodeKind {
     Text,
     Comment,
     Fragment,
+}
+
+/// The operations of `AbstractRange`, `Range` and `StaticRange` (DOM §5): the
+/// getters that read a range's boundary points, and the methods of `Range`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RangeOp {
+    StartContainer,
+    StartOffset,
+    EndContainer,
+    EndOffset,
+    Collapsed,
+    CommonAncestorContainer,
+    SetStart,
+    SetEnd,
+    SetStartBefore,
+    SetStartAfter,
+    SetEndBefore,
+    SetEndAfter,
+    Collapse,
+    SelectNode,
+    SelectNodeContents,
+    CompareBoundaryPoints,
+    ComparePoint,
+    IsPointInRange,
+    IntersectsNode,
+    CloneRange,
+    Detach,
+    DeleteContents,
+    ExtractContents,
+    CloneContents,
+    InsertNode,
+    SurroundContents,
+    ToString,
+    /// `Document.prototype.createRange()`.
+    CreateRange,
 }
 
 /// HTML element interfaces and the tag names they cover (HTML Standard §3.2.8,
@@ -847,6 +882,12 @@ pub(crate) enum NativeFunction {
     CharacterDataInsertData,
     CharacterDataDeleteData,
     CharacterDataReplaceData,
+    /// `Text.prototype.splitText` (DOM §4.11.1).
+    TextSplitText,
+    /// `Node.prototype.normalize` (DOM §4.4).
+    NodeNormalize,
+    /// The `AbstractRange`, `Range` and `StaticRange` operations (DOM §5).
+    Range(RangeOp),
     /// `DOMImplementation` methods (DOM §4.5).
     ImplementationCreateDocumentType,
     ImplementationHasFeature,
@@ -2361,6 +2402,12 @@ pub(crate) enum ObjectHost {
     /// `Text`, `Comment` and `DocumentFragment`: the DOM interfaces a script can
     /// construct with `new`.
     DomNodeConstructor(DomNodeKind),
+    /// `new Range()` (DOM §5.2).
+    RangeConstructor,
+    /// `new StaticRange(init)` (DOM §5.5).
+    StaticRangeConstructor,
+    /// A `Range` or `StaticRange` object: the range `RangeId` names in its document.
+    Range(RangeId),
     /// A generator object; the index names its coroutine.
     Generator(usize),
     /// The callback an `await` registers on a promise to continue its
@@ -2575,6 +2622,8 @@ impl ObjectHost {
                 | Self::EventConstructor
                 | Self::DomConstructor
                 | Self::DomNodeConstructor(_)
+                | Self::RangeConstructor
+                | Self::StaticRangeConstructor
                 | Self::ImageConstructor
                 | Self::VideoConstructor
                 | Self::Canvas(crate::runtime::builtins::canvas::CanvasObject::Constructor(
@@ -3328,6 +3377,8 @@ impl Realm {
                     | ObjectHost::EventConstructor
                     | ObjectHost::DomConstructor
                     | ObjectHost::DomNodeConstructor(_)
+                    | ObjectHost::RangeConstructor
+                    | ObjectHost::StaticRangeConstructor
                     | ObjectHost::ImageConstructor
                     | ObjectHost::VideoConstructor
                     | ObjectHost::IntersectionObserverConstructor
@@ -4177,6 +4228,7 @@ impl Realm {
                 ("hasAttributeNS", NativeFunction::HasAttributeNs),
                 ("removeAttributeNS", NativeFunction::RemoveAttributeNs),
                 ("isSameNode", NativeFunction::IsSameNode),
+                ("normalize", NativeFunction::NodeNormalize),
             ],
         );
         for name in ["scrollLeft", "scrollTop"] {
@@ -4408,6 +4460,169 @@ impl Realm {
                 },
             );
         }
+        // DOM §5: `AbstractRange` is the common interface of `Range` and
+        // `StaticRange`, and `Range` and `StaticRange` are not constructed from
+        // each other.
+        let abstract_range = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(object_prototype),
+            ..JsObject::default()
+        });
+        let abstract_range_constructor = Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "AbstractRange",
+            abstract_range,
+            None,
+            ObjectHost::DomConstructor,
+        );
+        prototypes.insert("AbstractRange", abstract_range);
+        Self::install_getters(
+            objects,
+            function_prototype,
+            abstract_range,
+            &[
+                (
+                    "startContainer",
+                    NativeFunction::Range(RangeOp::StartContainer),
+                ),
+                ("startOffset", NativeFunction::Range(RangeOp::StartOffset)),
+                ("endContainer", NativeFunction::Range(RangeOp::EndContainer)),
+                ("endOffset", NativeFunction::Range(RangeOp::EndOffset)),
+                ("collapsed", NativeFunction::Range(RangeOp::Collapsed)),
+            ],
+        );
+
+        let range = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(abstract_range),
+            ..JsObject::default()
+        });
+        let range_constructor = Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "Range",
+            range,
+            Some(abstract_range_constructor),
+            ObjectHost::RangeConstructor,
+        );
+        prototypes.insert("Range", range);
+        Self::install_getters(
+            objects,
+            function_prototype,
+            range,
+            &[(
+                "commonAncestorContainer",
+                NativeFunction::Range(RangeOp::CommonAncestorContainer),
+            )],
+        );
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            range,
+            &[
+                ("setStart", NativeFunction::Range(RangeOp::SetStart)),
+                ("setEnd", NativeFunction::Range(RangeOp::SetEnd)),
+                (
+                    "setStartBefore",
+                    NativeFunction::Range(RangeOp::SetStartBefore),
+                ),
+                (
+                    "setStartAfter",
+                    NativeFunction::Range(RangeOp::SetStartAfter),
+                ),
+                ("setEndBefore", NativeFunction::Range(RangeOp::SetEndBefore)),
+                ("setEndAfter", NativeFunction::Range(RangeOp::SetEndAfter)),
+                ("collapse", NativeFunction::Range(RangeOp::Collapse)),
+                ("selectNode", NativeFunction::Range(RangeOp::SelectNode)),
+                (
+                    "selectNodeContents",
+                    NativeFunction::Range(RangeOp::SelectNodeContents),
+                ),
+                (
+                    "compareBoundaryPoints",
+                    NativeFunction::Range(RangeOp::CompareBoundaryPoints),
+                ),
+                ("comparePoint", NativeFunction::Range(RangeOp::ComparePoint)),
+                (
+                    "isPointInRange",
+                    NativeFunction::Range(RangeOp::IsPointInRange),
+                ),
+                (
+                    "intersectsNode",
+                    NativeFunction::Range(RangeOp::IntersectsNode),
+                ),
+                ("cloneRange", NativeFunction::Range(RangeOp::CloneRange)),
+                ("detach", NativeFunction::Range(RangeOp::Detach)),
+                (
+                    "deleteContents",
+                    NativeFunction::Range(RangeOp::DeleteContents),
+                ),
+                (
+                    "extractContents",
+                    NativeFunction::Range(RangeOp::ExtractContents),
+                ),
+                (
+                    "cloneContents",
+                    NativeFunction::Range(RangeOp::CloneContents),
+                ),
+                ("insertNode", NativeFunction::Range(RangeOp::InsertNode)),
+                (
+                    "surroundContents",
+                    NativeFunction::Range(RangeOp::SurroundContents),
+                ),
+                ("toString", NativeFunction::Range(RangeOp::ToString)),
+            ],
+        );
+
+        let static_range = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(abstract_range),
+            ..JsObject::default()
+        });
+        Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "StaticRange",
+            static_range,
+            Some(abstract_range_constructor),
+            ObjectHost::StaticRangeConstructor,
+        );
+        prototypes.insert("StaticRange", static_range);
+
+        // The four comparison types of `compareBoundaryPoints` (DOM §5.2), on the
+        // interface object and on its prototype.
+        for (name, value) in [
+            ("START_TO_START", 0.0),
+            ("START_TO_END", 1.0),
+            ("END_TO_END", 2.0),
+            ("END_TO_START", 3.0),
+        ] {
+            for target in [range_constructor, range] {
+                objects[target.0].properties.insert(
+                    name.to_owned(),
+                    PropertyDescriptor {
+                        getter: None,
+                        setter: None,
+                        value: JsValue::Number(value),
+                        writable: false,
+                        enumerable: true,
+                        configurable: false,
+                    },
+                );
+            }
+        }
+
+        // `Text.prototype.splitText` (DOM §4.11.1).
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            prototypes["Text"],
+            &[("splitText", NativeFunction::TextSplitText)],
+        );
         (prototype, prototypes)
     }
 
@@ -10793,6 +11008,17 @@ impl Realm {
         });
         self.node_wrappers.insert(node, wrapper);
         wrapper
+    }
+
+    /// A new `Range` or `StaticRange` object for `range`, with the prototype of
+    /// `interface`. Each range has its own wrapper, so there is no cache.
+    pub(crate) fn range_wrapper(&mut self, range: RangeId, interface: &str) -> ObjectId {
+        let prototype = self.dom_prototype(interface);
+        self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::Range(range),
+            ..JsObject::default()
+        })
     }
 
     pub(crate) fn class_list_wrapper(&mut self, node: NodeId) -> ObjectId {
