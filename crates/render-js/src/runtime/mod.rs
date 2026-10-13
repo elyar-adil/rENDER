@@ -671,7 +671,15 @@ impl JsRuntime {
         }
         self.realm.set_location_url(url.clone());
         let document = dom.document();
-        self.dispatch_dom_event(dom, document, "popstate", false, false, &[("state", state)])
+        self.dispatch_dom_event(
+            dom,
+            document,
+            "popstate",
+            false,
+            false,
+            false,
+            &[("state", state)],
+        )
     }
 
     /// Sets `history.length` to the embedding's session-history length. The
@@ -886,6 +894,10 @@ impl JsRuntime {
     /// # Errors
     ///
     /// Propagates errors thrown inside listeners.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the event's init flags are separate booleans, as the Event constructor's dictionary lists them"
+    )]
     pub fn dispatch_dom_event(
         &mut self,
         dom: &mut Dom,
@@ -893,9 +905,10 @@ impl JsRuntime {
         event_type: &str,
         bubbles: bool,
         cancelable: bool,
+        composed: bool,
         extra_properties: &[(&str, JsValue)],
     ) -> Result<bool, JsError> {
-        let event = self.create_event_object(event_type, bubbles, cancelable, false, true)?;
+        let event = self.create_event_object(event_type, bubbles, cancelable, composed, true)?;
         for (name, value) in extra_properties {
             self.realm
                 .set_property(event, (*name).to_owned(), value.clone());

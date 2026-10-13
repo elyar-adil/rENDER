@@ -193,3 +193,51 @@ fn slots_assign_light_children_by_name_and_report_them() {
         "1,true,true,true,1,1"
     );
 }
+
+#[test]
+fn a_user_agent_click_is_composed_and_a_submit_is_not() {
+    use render_dom::{ShadowRootMode, SlotAssignmentMode};
+
+    let mut dom =
+        parse_document("<!doctype html><html><body><div id=host></div></body></html>").dom;
+    let mut pending = vec![dom.document()];
+    let mut host = None;
+    while let Some(node) = pending.pop() {
+        if dom.attribute(node, "id").ok().flatten() == Some("host") {
+            host = Some(node);
+            break;
+        }
+        pending.extend(dom.children(node).unwrap_or_default().iter().rev());
+    }
+    let host = host.expect("the page has a host");
+    let root = dom
+        .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+        .expect("a div can host a shadow root");
+    let button = dom.create_element("button");
+    dom.append_child(root, button).expect("append button");
+
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(
+            &mut dom,
+            "var seen = []; \
+             document.addEventListener('click', function (e) { seen.push('click:' + e.target.id); }); \
+             document.addEventListener('submit', function () { seen.push('submit'); });",
+        )
+        .expect("setup");
+    // A UA click is composed (UI Events), so the document hears it with the host
+    // as its target. A submit is not composed, so it stays inside the shadow tree.
+    runtime
+        .dispatch_dom_event(&mut dom, button, "click", true, true, true, &[])
+        .expect("click");
+    runtime
+        .dispatch_dom_event(&mut dom, button, "submit", true, true, false, &[])
+        .expect("submit");
+    let log = runtime
+        .execute(&mut dom, "seen.join(',')")
+        .expect("log")
+        .value
+        .to_js_string()
+        .to_lossy();
+    assert_eq!(log, "click:host");
+}

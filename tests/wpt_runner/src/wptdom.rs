@@ -723,10 +723,22 @@ fn run_page_lifecycle(
         _ => Ok(()),
     };
     runtime.set_document_ready_state(DocumentReadyState::Interactive);
-    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
-    step(runtime.dispatch_dom_event(dom, document, "DOMContentLoaded", true, false, &[]).map(drop))?;
+    step(
+        runtime
+            .dispatch_dom_event(dom, document, "readystatechange", false, false, false, &[])
+            .map(drop),
+    )?;
+    step(
+        runtime
+            .dispatch_dom_event(dom, document, "DOMContentLoaded", true, false, false, &[])
+            .map(drop),
+    )?;
     runtime.set_document_ready_state(DocumentReadyState::Complete);
-    step(runtime.dispatch_dom_event(dom, document, "readystatechange", false, false, &[]).map(drop))?;
+    step(
+        runtime
+            .dispatch_dom_event(dom, document, "readystatechange", false, false, false, &[])
+            .map(drop),
+    )?;
     step(runtime.dispatch_page_load(dom))
 }
 
