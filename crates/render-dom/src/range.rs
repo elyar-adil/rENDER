@@ -421,13 +421,18 @@ impl Dom {
     /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
     /// unknown range.
     pub fn range_to_string(&self, range: RangeId) -> Result<String, DomError> {
+        // DOM §5.2 `toString()` reads Text nodes only, so a Comment or
+        // ProcessingInstruction at a boundary contributes nothing.
         let record = *self.range_record(range)?;
         let (start, end) = (record.start, record.end);
-        if start.node == end.node && self.is_character_data(start.node) {
+        let is_text = |dom: &Self, node: NodeId| {
+            matches!(dom.node(node).map(Node::kind), Some(NodeKind::Text(_)))
+        };
+        if start.node == end.node && is_text(self, start.node) {
             return self.utf16_substring(start.node, start.offset, end.offset);
         }
         let mut text = String::new();
-        if self.is_character_data(start.node) {
+        if is_text(self, start.node) {
             text.push_str(&self.utf16_substring(start.node, start.offset, usize::MAX)?);
         }
         for node in self.contained_nodes(start, end) {
@@ -435,7 +440,7 @@ impl Dom {
                 text.push_str(data);
             }
         }
-        if self.is_character_data(end.node) {
+        if is_text(self, end.node) {
             text.push_str(&self.utf16_substring(end.node, 0, end.offset)?);
         }
         Ok(text)
