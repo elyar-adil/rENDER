@@ -37,7 +37,7 @@ fn a_new_range_is_collapsed_at_the_start_of_the_document() {
 }
 
 #[test]
-fn create_range_and_boundary_setters_describe_the_selection() {
+fn create_range_and_boundary_setters_set_the_boundary_points() {
     assert_eq!(
         eval(
             "var list = $('list'); var r = document.createRange(); \
@@ -172,5 +172,20 @@ fn a_range_constructor_without_new_is_refused() {
     assert_eq!(
         eval("try { Range(); 'no error'; } catch (e) { e.name; }"),
         "TypeError"
+    );
+}
+
+// There is no Selection state. `getSelection()` is the prelude stub: one empty
+// object whose `addRange` does nothing, so a range added to it is not visible.
+// A Selection implementation must change this test on purpose.
+#[test]
+fn the_selection_stub_stays_empty_after_add_range() {
+    assert_eq!(
+        eval(
+            "var list = $('list'); var r = document.createRange(); r.selectNodeContents(list); \
+             var s = getSelection(); s.addRange(r); \
+             [s.rangeCount, s.type, s.isCollapsed, s === document.getSelection(), s.toString() === ''].join()"
+        ),
+        "0,None,true,true,true"
     );
 }
