@@ -99,6 +99,9 @@ pub enum Exclusion {
     Reference,
     /// Under a `support/` directory: a fixture, not a test.
     Support,
+    /// Under a `resources/` directory: a helper that tests load with
+    /// `<script src>`, not a test in its own right.
+    Resources,
     /// Under a `manual/` directory: not an automated test by WPT's own rule.
     Manual,
     /// Under a `tools/` directory: suite tooling, not a test.
@@ -117,6 +120,7 @@ impl Exclusion {
         match self {
             Self::Reference => "reference",
             Self::Support => "support-fixture",
+            Self::Resources => "resources-fixture",
             Self::Manual => "manual",
             Self::Tooling => "tooling",
             Self::Unreadable => "unreadable",
@@ -524,6 +528,9 @@ fn classify_exclusion(rel: &str, referenced: &BTreeSet<String>) -> Option<Exclus
     if segments.iter().any(|s| *s == "support") {
         return Some(Exclusion::Support);
     }
+    if segments.iter().any(|s| *s == "resources") {
+        return Some(Exclusion::Resources);
+    }
     if segments.iter().any(|s| *s == "manual") {
         return Some(Exclusion::Manual);
     }
@@ -751,4 +758,30 @@ mod tests {
         );
         assert_eq!(classify_exclusion("html/tools/foo.html", &empty), Some(Exclusion::Tooling));
     }
+
+    #[test]
+    fn helper_directories_are_excluded_and_the_walk_uses_the_same_rule() {
+        let empty = BTreeSet::new();
+        assert_eq!(
+            classify_exclusion("dom/nodes/resources/helper.html", &empty),
+            Some(Exclusion::Resources)
+        );
+        assert!(super::is_helper_path("dom/nodes/resources/helper.html"));
+        assert!(super::is_helper_path("html/a/support/x.html"));
+        // A directory whose name merely contains the word is not a helper directory.
+        assert!(!super::is_helper_path("dom/nodes/resources-extra/x.html"));
+        assert!(!super::is_helper_path("dom/nodes/resources.html"));
+    }
+}
+
+/// Whether a suite-relative path names a helper file rather than a test: a file
+/// under a `resources/` or `support/` directory. Tests load these with
+/// `<script src>`, and WPT does not run them as tests. The test walk and the
+/// census share this rule, so their denominators cannot disagree.
+#[must_use]
+pub fn is_helper_path(rel: &str) -> bool {
+    let directories = rel.rsplit_once('/').map_or("", |(directories, _)| directories);
+    directories
+        .split('/')
+        .any(|segment| segment == "resources" || segment == "support")
 }

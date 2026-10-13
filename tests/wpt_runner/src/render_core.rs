@@ -253,7 +253,10 @@ pub fn walk_area(root: &Path, area: &str) -> Vec<String> {
                 stack.push(path);
             } else if kind.is_file() && path.extension().is_some_and(|e| e == "html") {
                 if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    if !crate::census::is_helper_path(&rel) {
+                        out.push(rel);
+                    }
                 }
             }
         }
@@ -375,6 +378,9 @@ mod tests {
             }
             crate::engine::Verdict::Unsupported { reason, .. } => {
                 assert!(reason.contains("no verdict"), "{reason}");
+            }
+            crate::engine::Verdict::MissingFixture { .. } => {
+                panic!("a document with no declared script fixtures has none to be missing")
             }
         }
     }

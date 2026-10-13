@@ -237,6 +237,21 @@ fn describe_mechanism(key: &str, file: &FileResult) -> (String, crate::mechanism
                 .to_owned(),
             Category::HarnessLimitation,
         ),
+        "script-from-elsewhere" => (
+            "the test loads a script from an origin or scheme this runner does not serve (a \
+             data: URL, an unknown scheme, or a host outside the suite). The file is not in the \
+             checkout, so the test cannot run as written."
+                .to_owned(),
+            Category::HarnessLimitation,
+        ),
+        "server-generated-fixture" => (
+            "the test loads a script the WPT server generates: a .sub template with \
+             {{host}}/{{ports}} substitution, or a .py handler. This runner serves files from \
+             disk and performs no substitution, so the script it would read is not the script \
+             the test is written against. The test is declined, not run with wrong values."
+                .to_owned(),
+            Category::HarnessLimitation,
+        ),
         "no-assertion-site" => (
             "the test declares no assertion and no reftest reference, so it has no way to fail \
              in any browser. Counted, never scored."

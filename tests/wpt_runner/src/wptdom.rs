@@ -45,7 +45,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use render_core::html::parse_document;
+use render_core::document::Document;
+use render_core::script::{
+    ScriptDiscoveryLimits, ScriptScheduling, ScriptSource, discover_scripts,
+};
 use render_core::js::{
     CompiledScript, DocumentReadyState, JsRuntime, RuntimeLimits, TimerRequest,
 };
@@ -175,8 +178,15 @@ impl render_core::js::DocumentLoader for SuiteLoader {
         if url.host_str() != Some(WPT_HOST) {
             return None;
         }
-        let relative = url.path().trim_start_matches('/');
+        let decoded = percent_decode(url.path());
+        let relative = decoded.trim_start_matches('/');
         if relative.split('/').any(|part| part == "..") {
+            return None;
+        }
+        // A `.sub` template or a `.py` handler is a response the WPT server generates.
+        // Its file is source text, not the document a browser would load, so it is refused
+        // rather than parsed as a page.
+        if relative.contains("{{") || is_server_generated(relative) {
             return None;
         }
         std::fs::read_to_string(self.root.join(relative)).ok()
@@ -239,26 +249,32 @@ impl Engine for WptHarnessEngine {
             });
         }
 
-        let execution = self.execute_test(ctx)?;
-        Ok(execution.into_verdict(ctx))
+        // The test's own document, and the classic scripts it declares, resolved
+        // before anything runs. A declared script this runner cannot serve is decided
+        // here, so no test runs half way and then fails on a helper it never had.
+        let mut document = Document::parse(ctx.source);
+        let plan = match plan_scripts(&document, &test_url(ctx.path), &self.suite_root) {
+            Ok(plan) => plan,
+            Err(refusal) => return Ok(refusal.into_verdict()),
+        };
+        let execution = self.execute_test(ctx, &mut document, &plan)?;
+        Ok(with_notes(execution.into_verdict(ctx), plan.notes()))
     }
 }
 
 impl WptHarnessEngine {
     /// Run one test and report what the harness said.
-    fn execute_test(&mut self, ctx: &TestContext<'_>) -> Result<Execution, HarnessError> {
-        let scan = crate::source::scan(ctx.source);
-        let inline: Vec<String> = scan
-            .scripts
-            .iter()
-            .filter_map(|s| s.inline.clone())
-            .collect();
-
+    fn execute_test(
+        &mut self,
+        ctx: &TestContext<'_>,
+        document: &mut Document,
+        plan: &ScriptPlan,
+    ) -> Result<Execution, HarnessError> {
         // A fresh document per test, from the test's own HTML. Sharing one
         // document between tests would let state leak and turn an engine
         // ordering bug into a hundred apparent failures.
-        let mut parsed = parse_document(ctx.source);
-        let mut runtime = JsRuntime::with_limits_and_url(&parsed.dom, self.limits, &test_url(ctx.path));
+        let mut runtime =
+            JsRuntime::with_limits_and_url(document.dom(), self.limits, &test_url(ctx.path));
         runtime.set_document_loader(Box::new(SuiteLoader {
             root: self.suite_root.clone(),
         }));
@@ -269,7 +285,7 @@ impl WptHarnessEngine {
 
         // 1. Load WPT's harness, unmodified, from the pinned checkout.
         runtime
-            .execute_compiled(&mut parsed.dom, &self.harness)
+            .execute_compiled(document.dom_mut(), &self.harness)
             .map_err(|error| HarnessError {
                 message: format!("testharness.js did not execute: {error}"),
             })?;
@@ -280,16 +296,22 @@ impl WptHarnessEngine {
         //    from a synchronously-run test.
         runtime
             .execute(
-                &mut parsed.dom,
+                document.dom_mut(),
                 RESULT_SINK,
             )
             .map_err(|error| HarnessError {
                 message: format!("could not register the result callback: {error}"),
             })?;
 
-        // 3. Run the test's own scripts, in document order.
-        for script in &inline {
-            if let Err(error) = runtime.execute(&mut parsed.dom, script) {
+        // 3. Run the classic scripts the test declares, in the order `plan_scripts`
+        //    resolved them. A script that throws reports its error to the window and
+        //    the rest still run, as HTML's "report the exception" requires.
+        for script in &plan.scripts {
+            let outcome = match &script.url {
+                Some(url) => runtime.execute_with_filename(document.dom_mut(), &script.source, url),
+                None => runtime.execute(document.dom_mut(), &script.source),
+            };
+            if let Err(error) = outcome {
                 // A script that throws is what the harness's window `error`
                 // handler is for, and the harness will have recorded it. Only a
                 // *resource limit* aborts the run, because a step budget that
@@ -315,7 +337,7 @@ impl WptHarnessEngine {
         //     are the readiness changes and their events. testharness.js completes a
         //     file only after `load`, and a test waiting for any of these events
         //     never starts without them.
-        if let Err(error) = run_page_lifecycle(&mut runtime, &mut parsed.dom)
+        if let Err(error) = run_page_lifecycle(&mut runtime, document.dom_mut())
             && error.kind() == render_core::js::JsErrorKind::ResourceLimit
         {
             return Ok(Execution {
@@ -333,7 +355,7 @@ impl WptHarnessEngine {
         //    microtasks and timers, and stopping before they run would report
         //    NOTRUN for every async test - a systematic under-count that looks
         //    like an engine that cannot do async at all.
-        let drained = self.drain(&mut runtime, &mut parsed.dom);
+        let drained = self.drain(&mut runtime, document.dom_mut());
         if !drained.settled {
             return Ok(Execution {
                 status: HarnessStatus::NotRun,
@@ -348,7 +370,7 @@ impl WptHarnessEngine {
             });
         }
 
-        Ok(read_results(&mut runtime, &mut parsed.dom, ctx.path))
+        Ok(read_results(&mut runtime, document.dom_mut(), ctx.path))
     }
 
     /// Drain microtasks and timers to a fixed bound, in HTML timer order.
@@ -423,6 +445,266 @@ impl WptHarnessEngine {
             }
         }
         DrainOutcome { settled: false }
+    }
+}
+
+/// The suite-relative path of the harness. The adapter loads it before the test
+/// runs, so a test's own `<script src>` of it is not run a second time.
+const HARNESS_PATH: &str = "resources/testharness.js";
+
+/// The classic scripts a test declares, in the order they run, with every
+/// fixture resolved. See [`plan_scripts`].
+#[derive(Debug, Default)]
+struct ScriptPlan {
+    /// Parser-blocking scripts in document order, then `async`, then `defer`.
+    /// That is the order `render-core`'s page queue uses, so the runner and the
+    /// page agree on it.
+    scripts: Vec<RunScript>,
+    /// Module scripts the test declares and this runner does not execute.
+    modules_not_run: u32,
+}
+
+impl ScriptPlan {
+    /// What the plan left out, for the result's notes, so a pass that did not run
+    /// a declared module is labelled as such.
+    fn notes(&self) -> Vec<String> {
+        if self.modules_not_run == 0 {
+            return Vec::new();
+        }
+        vec![format!(
+            "{} module script(s) declared and not executed: this runner does not run ES \
+             module scripts",
+            self.modules_not_run
+        )]
+    }
+}
+
+/// One classic script, ready to run.
+#[derive(Debug)]
+struct RunScript {
+    /// The URL a file-backed script was read from. Its uncaught errors report this
+    /// as their `filename`. `None` for an inline script, whose errors report the
+    /// document.
+    url: Option<String>,
+    source: String,
+}
+
+/// A declared script the runner cannot run, and why.
+#[derive(Debug)]
+struct Declined {
+    url: String,
+    mechanism: &'static str,
+    reason: String,
+}
+
+impl Declined {
+    fn into_verdict(self) -> Verdict {
+        Verdict::MissingFixture {
+            url: self.url,
+            mechanism: self.mechanism.to_owned(),
+            reason: self.reason,
+        }
+    }
+}
+
+fn fixture_declined(url: &url::Url, mechanism: &'static str, reason: String) -> Declined {
+    Declined {
+        url: url.as_str().to_owned(),
+        mechanism,
+        reason,
+    }
+}
+
+/// Resolve the classic scripts a test declares, in the order a browser runs them.
+///
+/// The declaration order and the scheduling come from `render-core`'s
+/// [`discover_scripts`], which is the page's own script discovery, so this file
+/// does not restate HTML's `<script>` rules. What this adds is the fixture half:
+/// each `src` is resolved against the test's URL and read from the checkout.
+///
+/// * A parser-blocking script runs where it appears, so an external one runs before
+///   the inline scripts that follow it (HTML 4.12.1).
+/// * An `async` script runs after the parser-blocking ones, then each `defer` script,
+///   both in document order.
+/// * A module script is not executed, and the count is reported in the result's notes.
+/// * `testharness.js` is not run again. The adapter loaded it first, and loading it
+///   again would reset the harness.
+///
+/// # Errors
+///
+/// A script the runner cannot serve is declined before anything runs. Deciding
+/// here, rather than at the point of execution, is what keeps a test from running
+/// part way and failing on a helper it never had.
+fn plan_scripts(
+    document: &Document,
+    base: &url::Url,
+    suite_root: &Path,
+) -> Result<ScriptPlan, Declined> {
+    let discovery = discover_scripts(document, base, ScriptDiscoveryLimits::default());
+    let mut plan = ScriptPlan::default();
+    let mut parser_blocking = Vec::new();
+    let mut asynchronous = Vec::new();
+    let mut deferred = Vec::new();
+    for script in discovery.scripts {
+        if script.module {
+            plan.modules_not_run += 1;
+            continue;
+        }
+        let Some(run) = resolve_script(script.source, suite_root)? else {
+            continue;
+        };
+        match script.scheduling {
+            ScriptScheduling::ParserBlocking => parser_blocking.push(run),
+            ScriptScheduling::Async => asynchronous.push(run),
+            ScriptScheduling::Defer => deferred.push(run),
+        }
+    }
+    plan.scripts = parser_blocking
+        .into_iter()
+        .chain(asynchronous)
+        .chain(deferred)
+        .collect();
+    Ok(plan)
+}
+
+/// Read one declared script from the checkout, or decline it.
+///
+/// `Ok(None)` is the harness, which is already loaded.
+fn resolve_script(source: ScriptSource, suite_root: &Path) -> Result<Option<RunScript>, Declined> {
+    let resolved_url = match source {
+        ScriptSource::Inline { source } => return Ok(Some(RunScript { url: None, source })),
+        ScriptSource::External { resolved_url, .. } => resolved_url,
+    };
+    let relative = suite_relative(&resolved_url)?;
+    if relative == HARNESS_PATH {
+        return Ok(None);
+    }
+    let file = suite_root.join(&relative);
+    if !file.is_file() {
+        return Err(fixture_declined(
+            &resolved_url,
+            "missing-fixture",
+            format!("the script is not in the checkout at {relative}"),
+        ));
+    }
+    if is_server_generated(&relative) {
+        return Err(fixture_declined(
+            &resolved_url,
+            "server-generated-fixture",
+            format!("the script at {relative} is a template or handler the WPT server generates"),
+        ));
+    }
+    let text = std::fs::read_to_string(&file).map_err(|error| {
+        fixture_declined(
+            &resolved_url,
+            "missing-fixture",
+            format!("the script at {relative} could not be read as UTF-8 text: {error}"),
+        )
+    })?;
+    Ok(Some(RunScript {
+        url: Some(resolved_url.as_str().to_owned()),
+        source: text,
+    }))
+}
+
+/// The suite-relative path a script URL names.
+///
+/// A host the suite serves (the test's own host, or one of its subdomains) serves
+/// the checkout by path, so `http://www1.web-platform.test/x.js` and `/x.js` name the
+/// same file. A script from any other origin or scheme is not in the checkout.
+fn suite_relative(url: &url::Url) -> Result<String, Declined> {
+    let host = url.host_str().unwrap_or_default();
+    let suite_host = host == WPT_HOST || host.ends_with(&format!(".{WPT_HOST}"));
+    if !matches!(url.scheme(), "http" | "https") || !suite_host {
+        return Err(fixture_declined(
+            url,
+            "script-from-elsewhere",
+            format!("the script is served from {url}, which is not a host this runner serves"),
+        ));
+    }
+    let relative = percent_decode(url.path()).trim_start_matches('/').to_owned();
+    if relative.contains("{{") {
+        return Err(fixture_declined(
+            url,
+            "server-generated-fixture",
+            format!("the script path {relative} is a template the WPT server fills in"),
+        ));
+    }
+    if relative.is_empty() || relative.split('/').any(|part| part == "..") {
+        return Err(fixture_declined(
+            url,
+            "missing-fixture",
+            format!("the script path {relative:?} does not name a file in the checkout"),
+        ));
+    }
+    Ok(relative)
+}
+
+/// Whether the WPT server, rather than the checkout, produces a file's response: a
+/// `.sub` file with `{{host}}` and `{{ports}}` substitution, or a `.py` handler.
+fn is_server_generated(relative: &str) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    name.contains(".sub.") || name.ends_with(".py")
+}
+
+/// Decode the `%XX` escapes of a URL path, so a file name with a space or a non-ASCII
+/// character maps onto the file it names. A malformed escape is kept as written.
+fn percent_decode(path: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Add notes to a pass or a fail. Every other verdict is returned unchanged.
+fn with_notes(verdict: Verdict, extra: Vec<String>) -> Verdict {
+    if extra.is_empty() {
+        return verdict;
+    }
+    match verdict {
+        Verdict::Passed {
+            assertions_evaluated,
+            mut notes,
+        } => {
+            notes.extend(extra);
+            Verdict::Passed {
+                assertions_evaluated,
+                notes,
+            }
+        }
+        Verdict::Failed {
+            assertion,
+            engine_location,
+            mut notes,
+        } => {
+            notes.extend(extra);
+            Verdict::Failed {
+                assertion,
+                engine_location,
+                notes,
+            }
+        }
+        other => other,
     }
 }
 
@@ -867,6 +1149,30 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             worst.name = test.name;
             worst.message = test.message;
         }
+    }
+    // A harness-level ERROR is an uncaught exception that ended the file. The subtests that
+    // passed are the ones that ran before the exception, so they cannot make the file pass.
+    // A test that declares `allow_uncaught_exception` never sets this status, so a file that
+    // expects the exception is judged on its own subtests and not here.
+    if worst.status == HarnessStatus::Pass
+        && harvest
+            .completion
+            .as_ref()
+            .is_some_and(|c| c.status == 1.0)
+    {
+        worst.status = HarnessStatus::Fail;
+        worst.message = Some(format!(
+            "the file ended with an uncaught exception ({}), so its passing subtests ran before it \
+             stopped and do not cover the file",
+            harvest
+                .completion
+                .as_ref()
+                .and_then(|c| c.message.clone())
+                .unwrap_or_else(|| "no message".to_owned())
+        ));
+        worst.mechanism = None;
+        worst.category = Category::EngineDefect;
+        return worst;
     }
     // A pass needs every subtest the harness registered to have reported. A registered
     // subtest with no result is a verdict this runner cannot see, and a pass computed from
@@ -1377,6 +1683,11 @@ fn mechanism_for(
     result: &FileResult,
     classification: &crate::classify::Classification,
 ) -> Option<String> {
+    // A mechanism the adapter already attributed (a declined fixture) is the
+    // strongest evidence there is, because the test never ran to produce a failure.
+    if let Some(mechanism) = &result.mechanism {
+        return Some(mechanism.clone());
+    }
     if let Some(assertion) = &result.failing_assertion {
         return Some(failure_mechanism(assertion));
     }
@@ -1430,6 +1741,13 @@ fn failure_mechanism(assertion: &str) -> String {
     let message = assertion
         .split_once(": ")
         .map_or(assertion, |(_, rest)| rest);
+
+    // `testdriver-vendor.js` is the in-page half of WPT's automation protocol. Its
+    // stubs throw this message because the browser automation behind them is not
+    // provided to this runner, so the test cannot pass for any engine reason.
+    if message.contains("is not implemented by testdriver-vendor.js") {
+        return "needs-testdriver".to_owned();
+    }
 
     // "X is not defined" - the commonest real failure, and the clearest.
     if let Some(head) = message.split(" is not defined").next() {
@@ -1640,7 +1958,12 @@ pub fn walk_area(root: &Path, area: &str) -> Vec<String> {
                 stack.push(path);
             } else if kind.is_file() && path.extension().is_some_and(|e| e == "html") {
                 if let Ok(rel) = path.strip_prefix(root) {
-                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                    let rel = rel.to_string_lossy().replace('\\', "/");
+                    // Helpers under resources/ and support/ are loaded by tests with
+                    // <script src>. WPT does not run them as tests, so they are not rows.
+                    if !crate::census::is_helper_path(&rel) {
+                        out.push(rel);
+                    }
                 }
             }
         }
@@ -1657,6 +1980,7 @@ mod tests {
     use super::{HarnessStatus, Harvest, severity, slug};
     use crate::mechanism::Category;
     use crate::outcome::Outcome;
+    use render_core::document::Document;
 
     #[test]
     fn harness_statuses_map_from_the_harness_own_numbers() {
@@ -1966,5 +2290,75 @@ mod tests {
         assert_eq!(harvest.results[1].name, "b");
         assert_eq!(harvest.results[2].name, "c");
         assert_eq!(harvest.completion.as_ref().map(|c| c.tests), Some(3));
+    }
+
+    fn base() -> url::Url {
+        url::Url::parse("http://web-platform.test/a/test.html").expect("test URL")
+    }
+
+    #[test]
+    fn a_script_url_on_a_suite_host_maps_onto_the_checkout() {
+        // The query and fragment are not part of the file, and a subdomain of the
+        // suite host serves the checkout by the same path.
+        let own = url::Url::parse("http://web-platform.test/resources/x.js?q=1#f").expect("url");
+        assert_eq!(super::suite_relative(&own).expect("maps"), "resources/x.js");
+        let sub = url::Url::parse("http://www1.web-platform.test:8000/a%20b.js").expect("url");
+        assert_eq!(super::suite_relative(&sub).expect("maps"), "a b.js");
+    }
+
+    #[test]
+    fn a_script_from_another_origin_is_declined_under_its_own_mechanism() {
+        let foreign = url::Url::parse("http://example.com/x.js").expect("url");
+        let declined = super::suite_relative(&foreign).err().expect("declined");
+        assert_eq!(declined.mechanism, "script-from-elsewhere");
+    }
+
+    #[test]
+    fn server_generated_scripts_are_recognised_and_static_ones_are_not() {
+        assert!(super::is_server_generated("common/get-host-info.sub.js"));
+        assert!(super::is_server_generated("common/slow.py"));
+        assert!(!super::is_server_generated("resources/testharnessreport.js"));
+    }
+
+    #[test]
+    fn percent_escapes_decode_and_malformed_ones_are_kept() {
+        assert_eq!(super::percent_decode("/a%20b%zz%"), "/a b%zz%");
+        assert_eq!(super::percent_decode("/%E2%9C%93.js"), "/\u{2713}.js");
+    }
+
+    #[test]
+    fn a_declared_script_missing_from_the_checkout_is_declined_before_anything_runs() {
+        let document = Document::parse(
+            "<script src=\"/resources/absent-helper.js\"></script><script>x()</script>",
+        );
+        let declined = super::plan_scripts(
+            &document,
+            &base(),
+            std::path::Path::new("/nonexistent-suite-root"),
+        )
+        .err()
+        .expect("declined");
+        assert_eq!(declined.mechanism, "missing-fixture");
+        assert!(declined.reason.contains("absent-helper.js"), "{}", declined.reason);
+    }
+
+    #[test]
+    fn inline_scripts_keep_document_order_and_module_scripts_are_not_run() {
+        let document = Document::parse(
+            "<script>first()</script><script type=module>module()</script><script>second()</script>",
+        );
+        let plan = super::plan_scripts(&document, &base(), std::path::Path::new("/nonexistent"))
+            .expect("plans");
+        let sources: Vec<&str> = plan.scripts.iter().map(|s| s.source.as_str()).collect();
+        assert_eq!(sources, ["first()", "second()"]);
+        assert_eq!(plan.modules_not_run, 1);
+        assert_eq!(plan.notes().len(), 1);
+    }
+
+    #[test]
+    fn a_templated_script_path_is_declined_as_server_generated() {
+        let templated = url::Url::parse("http://web-platform.test/a/{{host}}.js").expect("url");
+        let declined = super::suite_relative(&templated).err().expect("declined");
+        assert_eq!(declined.mechanism, "server-generated-fixture");
     }
 }
