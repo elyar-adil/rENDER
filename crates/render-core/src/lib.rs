@@ -4,6 +4,7 @@
 //! behavior is defined by web standards and conformance tests; the Python code
 //! is a migration reference, not a behavioral authority.
 
+pub mod canvas;
 pub mod css {
     pub use render_css::length::{CssValueError, LengthContext, resolve_length_expr};
     pub use render_css::*;

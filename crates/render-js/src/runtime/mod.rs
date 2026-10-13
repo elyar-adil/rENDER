@@ -249,6 +249,11 @@ pub struct JsRuntime {
     media_query_lists: Vec<ObjectId>,
     /// Highest DOM revision already copied into observer queues.
     mutation_seen_revision: DomRevision,
+    /// The embedder's 2D canvas host; `None` leaves `getContext` answering `null`.
+    canvas_host: Option<Box<dyn crate::canvas::CanvasHost>>,
+    /// The `CanvasRenderingContext2D` object of each canvas, so that repeated
+    /// `getContext` calls return the same object. Rooted for the collector.
+    canvas_contexts: BTreeMap<crate::canvas::CanvasId, ObjectId>,
 }
 
 impl From<DomError> for JsError {
@@ -388,6 +393,8 @@ impl JsRuntime {
             mutation_observers: Vec::new(),
             media_query_lists: Vec::new(),
             mutation_seen_revision: dom.revision(),
+            canvas_host: None,
+            canvas_contexts: BTreeMap::new(),
             limits,
         }
     }

@@ -406,8 +406,7 @@ fn classify_item(item: &DisplayItem) -> PaintChunkClassification {
         | DisplayCommand::GlyphRun(_)
         | DisplayCommand::Image(_)
         | DisplayCommand::LinearGradient(_)
-        | DisplayCommand::RadialGradient(_)
-        | DisplayCommand::Canvas { .. } => {
+        | DisplayCommand::RadialGradient(_) => {
             PaintChunkClassification::FullRepaintRequired(PaintFallbackReason::UnsupportedCommand)
         }
     }

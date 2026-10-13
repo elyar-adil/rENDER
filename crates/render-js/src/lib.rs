@@ -20,6 +20,9 @@ mod value;
 /// on `std` and `mp4parse`, and is consumed by `runtime::builtins::video`.
 pub mod video;
 
+/// The embedder seam for `<canvas>` and `OffscreenCanvas` 2D contexts.
+pub mod canvas;
+
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;

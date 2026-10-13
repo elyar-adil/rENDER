@@ -268,11 +268,11 @@ pub fn run() -> SelfTest {
     }
 
     // 8. A test blocked by a missing engine capability is never executable. The
-    //    capability is one the engine still lacks: nested browsing contexts are
-    //    implemented, so a testcss.js test no longer blocks on them.
+    //    capability is one the engine still lacks: the 2D canvas context and
+    //    nested browsing contexts are implemented, so neither blocks any longer.
     {
         let scan = crate::source::scan(
-            "<script>assert_equals(document.createElement('canvas').getContext('2d') !== null, true);</script>",
+            "<script>assert_equals(new AudioContext().state !== undefined, true);</script>",
         );
         let inline: Vec<&str> = scan
             .scripts
@@ -283,12 +283,12 @@ pub fn run() -> SelfTest {
         let held = !classification.is_executable()
             && matches!(
                 classification.blocker,
-                Some(Blocker::MissingEngine(Capability::Canvas))
+                Some(Blocker::MissingEngine(Capability::WebAudio))
             );
         record(
             &mut out,
             "a test needing a missing capability is blocked, never executable",
-            "is_executable=false, blocker=MissingEngine(canvas)",
+            "is_executable=false, blocker=MissingEngine(webaudio)",
             format!("is_executable={}, blocker={:?}", classification.is_executable(), classification.blocker.as_ref().map(Blocker::describe)),
             held,
             "counting a test as runnable when it is known not to run is how a denominator \

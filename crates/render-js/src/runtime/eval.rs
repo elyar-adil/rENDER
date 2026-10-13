@@ -5803,6 +5803,7 @@ impl JsRuntime {
                 | ObjectHost::DomConstructor
                 | ObjectHost::ImageConstructor
                 | ObjectHost::VideoConstructor
+                | ObjectHost::Canvas(crate::runtime::builtins::canvas::CanvasObject::Constructor(_))
                 | ObjectHost::XmlHttpRequestConstructor
                 | ObjectHost::AbortControllerConstructor
                 | ObjectHost::FormDataConstructor
@@ -6027,6 +6028,9 @@ impl JsRuntime {
                 self.temporal_construct(dom, kind, &new_target, arguments)
             }
             Some(ObjectHost::PromiseConstructor) => self.construct_promise(dom, arguments),
+            Some(ObjectHost::Canvas(
+                crate::runtime::builtins::canvas::CanvasObject::Constructor(kind),
+            )) => self.canvas_construct(dom, kind, arguments),
             Some(ObjectHost::EventConstructor) => self.event_constructor(arguments),
             Some(ObjectHost::DomNodeConstructor(kind)) => {
                 self.construct_dom_node(dom, kind, arguments)
@@ -6357,6 +6361,9 @@ impl JsRuntime {
             Some(ObjectHost::EventConstructor) => {
                 Err(JsError::type_error("Event constructor requires 'new'"))
             }
+            Some(ObjectHost::Canvas(
+                crate::runtime::builtins::canvas::CanvasObject::Constructor(_),
+            )) => Err(JsError::type_error("Constructor requires 'new'")),
             Some(ObjectHost::DomConstructor) => Err(JsError::type_error("Illegal constructor")),
             Some(ObjectHost::DomNodeConstructor(_)) => Err(JsError::type_error(
                 "Failed to construct a DOM node: please use the 'new' operator",

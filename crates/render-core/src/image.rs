@@ -92,6 +92,10 @@ pub enum ImageSource {
     /// not by URL-keyed image loads.
     VideoFrame,
     CssBackground,
+    /// The bitmap of a `<canvas>` element, published by the canvas engine
+    /// (installed through [`ImageResources::set_canvas_bitmap`]), not by a
+    /// URL-keyed load.
+    Canvas,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -329,7 +333,7 @@ pub fn image_key_is_current(dom: &Dom, document_url: &Url, key: &ImageResourceKe
     }
     // Presented video frames are owned by the video pipeline's lifecycle,
     // not by URL revalidation.
-    if key.source == ImageSource::VideoFrame {
+    if matches!(key.source, ImageSource::VideoFrame | ImageSource::Canvas) {
         return false;
     }
     let Some(element) = html_element(dom, key.owner) else {
@@ -659,6 +663,12 @@ pub struct LoadedImage {
     pub image: Arc<DecodedImage>,
 }
 
+/// The requested-URL component of a canvas bitmap's key. A canvas has no URL,
+/// so every bitmap carries this fixed one; the owner node tells them apart.
+fn canvas_bitmap_url() -> Url {
+    Url::parse("about:canvas").expect("about:canvas is a valid URL")
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ImageResources {
     by_node_url: BTreeMap<(NodeId, String), LoadedImage>,
@@ -691,6 +701,11 @@ impl ImageResources {
             .values()
             .find(|loaded| {
                 loaded.key.owner == node && matches!(loaded.key.source, ImageSource::VideoFrame)
+            })
+            .or_else(|| {
+                self.by_node_url.values().find(|loaded| {
+                    loaded.key.owner == node && matches!(loaded.key.source, ImageSource::Canvas)
+                })
             })
             .or_else(|| {
                 self.by_node_url.values().find(|loaded| {
@@ -819,6 +834,44 @@ impl ImageResources {
             selection_context: ImageSelectionContext::default(),
         };
         self.insert(key, frame, limits)
+    }
+
+    /// Publish the bitmap of the `<canvas>` element at `node`, replacing the
+    /// one it had.
+    ///
+    /// # Errors
+    ///
+    /// Returns a store-limit error without changing the existing bitmap.
+    pub fn set_canvas_bitmap(
+        &mut self,
+        node: NodeId,
+        bitmap: DecodedImage,
+        limits: ImageLimits,
+    ) -> Result<ImageResourceId, ImageStoreError> {
+        self.remove_canvas_bitmap(node);
+        let key = ImageResourceKey {
+            owner: node,
+            requested_url: canvas_bitmap_url(),
+            source_snapshot: String::new(),
+            source: ImageSource::Canvas,
+            selection_context: ImageSelectionContext::default(),
+        };
+        self.insert(key, bitmap, limits)
+    }
+
+    /// Drop the bitmap of the `<canvas>` element at `node`.
+    pub fn remove_canvas_bitmap(&mut self, node: NodeId) -> Option<LoadedImage> {
+        let map_key = self
+            .by_node_url
+            .iter()
+            .find(|((owner, _), loaded)| *owner == node && loaded.key.source == ImageSource::Canvas)
+            .map(|((owner, url), _)| (*owner, url.clone()))?;
+        let loaded = self.by_node_url.remove(&map_key)?;
+        self.by_id.remove(&loaded.id);
+        self.decoded_bytes = self
+            .decoded_bytes
+            .saturating_sub(loaded.image.decoded_bytes());
+        Some(loaded)
     }
 
     /// Drop the presented frame of the `<video>` element at `node` (element

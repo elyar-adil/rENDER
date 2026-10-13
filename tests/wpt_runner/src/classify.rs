@@ -456,11 +456,14 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         // between windows. A nested document is not painted, so a test that
         // depends on how an iframe looks on screen is still a fail, not a pass.
         Capability::NestedBrowsingContext | Capability::WindowProxy => true,
+        // The 2D canvas context (`getContext("2d")`, `CanvasRenderingContext2D`,
+        // `OffscreenCanvas`, `ImageData`) is implemented in render-js and
+        // rasterized by render-core. Other context kinds answer `null`.
+        Capability::Canvas => true,
         Capability::NetworkFetch
         | Capability::WebSocket
         | Capability::DedicatedWorker
         | Capability::ClientStorage
-        | Capability::Canvas
         | Capability::WebAudio
         | Capability::WebGpu
         | Capability::WebRtc
