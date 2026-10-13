@@ -5,6 +5,128 @@ run against WPT revision **`c7fdee80f3f17b4e9813964916afdfd57ace863f`**.
 
 Everything below was measured, not estimated, unless a line says otherwise.
 
+## Update: classic external scripts, the walk, and the false passes they exposed
+
+The baseline for this update is `3210679`, whose tree is identical to master
+`ed4d7cb`. The walk is the same dom/ and html/ walk, measured again on this branch.
+
+**What changed**
+
+1. **The walk no longer counts helper files.** Files under `resources/` and
+   `support/` are loaded by tests and are not tests. The walk and the census share
+   `census::is_helper_path`. The walk drops 574 rows (dom 7, html 567). The census gains
+   a `resources-fixture` exclusion (dom 5, html 456).
+2. **Classic `<script src>` runs.** Order and scheduling come from render-core's own
+   `discover_scripts`. Parser-blocking scripts run where they appear, so an external one
+   runs before the inline scripts after it. Then `async`, then `defer`, all before
+   `DOMContentLoaded`. Each `src` resolves against the test URL and is read from the
+   checkout. `testharness.js` is not run twice. Module scripts are not run, and the count
+   is a note on the result.
+3. **A declared script the runner cannot serve is a skip, not a failure.** An absent or
+   unreadable file is `missing-fixture`. A script the WPT server generates (`.sub.`
+   templates, `.py` handlers) is `server-generated-fixture`. Another origin or scheme is
+   `script-from-elsewhere`. The decision is made before the test runs, so no test runs
+   part way. The document loader refuses the same files when a nested browsing context
+   asks for them.
+4. **`window.onerror` takes the five-argument form** (HTML 8.1.8.1). An uncaught error
+   reaches it as an ErrorEvent: `(message, filename, lineno, colno, error)`. A `true`
+   return cancels the event, and `filename` is the classic script's URL for top-level
+   code. `addEventListener('error')` is unchanged. Four render-js tests cover this.
+5. **A file that ends in a harness ERROR cannot pass.** testharness reports an uncaught
+   exception as status ERROR. The subtests that passed before it stopped do not cover the
+   file. The adapter previously ignored that status when subtests existed.
+
+**Numbers, dom/ and html/ walk (10,334 tests)**
+
+| | baseline | this branch |
+| --- | ---: | ---: |
+| pass | 301 | **338** |
+| fail | 3,383 | 3,715 |
+| skip | 6,622 | 6,253 |
+| error | 28 | 28 |
+| pass / (pass + fail) | 8.17% (301 / 3,684) | 8.34% (338 / 4,053) |
+
+Denominators. Rows: 10,908 → 10,334, with 574 helper rows removed. Census scored
+population: about 6,095 → 5,634 (dom 554, html 5,080). The old figure is an estimate: the
+461 files now under `resources-fixture` were scored before this change. Executed
+(pass + fail): 3,684 → 4,053.
+
+The raw pass count rises by 37: 52 gained and 15 lost, each listed below. The rate rises
+less than the count because many FAIL rows became skips, which raises the executed
+denominator by 369. Seven of the gains are the window.onerror tests, which failed only
+because `window.onerror` never ran.
+
+**The 1,623 baseline FAIL rows that say "X is not defined"**
+
+- 39 now PASS.
+- 456 now fail on a real assertion or a real gap: assertion-unclassified 283,
+  wrong-value 82, value-shape 68, host-property-missing 16, host-not-iterable 7.
+- 84 now fail as `needs-testdriver`. The helper loads, and its automation stubs throw
+  "not implemented by testdriver-vendor.js". That is not an engine result.
+- 528 still say "X is not defined". The names are not helper globals: named access to
+  `id`ed elements (`item1`, `button`, `target`), DOMParser, Range, and similar. They are
+  unchanged engine gaps.
+- 516 became skips: 184 server-generated fixtures, 12 missing fixtures, 150 with no
+  verdict or capability, 142 with no assertion site, and 28 stalls (below).
+
+**Stalls, measured from the result notes (dom/ and html/ walk)**
+
+| | baseline | this branch |
+| --- | ---: | ---: |
+| tests started, none finished | 287 | 507 |
+| subtests registered but unreported | 59 | 141 |
+| no testharness test registered | 2,150 | 2,184 |
+| status NOT-RUN | 1,028 | 68 |
+
+Of the baseline FAIL rows that became skips, 217 became "started, none finished". The
+causes are capability gaps, not drain or timer faults. About 119 are testdriver tests
+that wait for automation the runner does not provide. About 92 are `svg-in-img` tests
+that wait for an image `load` event. The runner fetches no images, so that event never
+fires. About 70 unreported-subtest rows are nested documents served by WPT handlers
+(`moving-between-documents`, `coop-coep-sandbox`). The drain bound of 512 turns is
+unchanged, and no stall was hidden.
+
+**Canvas, and a decision I reversed.** 942 canvas tests were NOT-RUN in the baseline and
+now FAIL with `value of callee.getContext is undefined`. The census classes them
+`lacks-canvas`, but the canvas call sits in `canvas-tests.js`, which the runner did not
+load before. I tried declining on the text of loaded helpers. That over-declined three
+tests that passed, because a helper defines a canvas function that the test never calls
+(`common.js`), and testharness's testdriver files mention network APIs. I reverted it.
+These rows are honest runtime failures on a missing API.
+
+**The 15 lost passes, each explained**
+
+- *Subset passes.* The old adapter counted only the subtests that ran before an error or
+  a missing helper stopped the file. `EventTarget-dispatchEvent` (the `aliases` helper
+  was not loaded, so 20 subtests were never created; the BeforeUnloadEvent alias is a
+  real gap). `location-prototype-setting-same-origin` and
+  `windowproxy-prototype-setting-same-origin` (a ReferenceError from a missing helper;
+  the immutable-prototype check is a real gap). `window-composed-path`, `interface-objects`,
+  `microtask_after_script` and `nested-options` (uncaught exceptions after some subtests).
+- *The old scanner ran code the spec makes inert.* `template-for-script-eval` ran a
+  script inside `<template>`. It is now discovered as inert, and `template for` is not
+  implemented.
+- *Module bodies ran as classic scripts.* `inline-async-onload`, `inline-defer-onload`,
+  `inline-no-async-onload`, `invalid-import-errors-order`, `error-and-slow-dependency`
+  and `script-for-event`. These passed because module code ran with classic semantics.
+  Module scripts are not executed now, so they fail or have no verdict.
+- *A real gap that the onerror change exposed.* `compile-error-in-body-onerror` passed
+  because `window.onerror` never ran. The test needs `<body onerror>` to forward to the
+  window and clear it on a compile error, which is not implemented.
+
+Every lost pass is a false pass or a real gap, with no unexplained loss.
+
+**What is left, in order of rows affected**
+
+1. Testdriver automation and image loading (about 211 stalled rows).
+2. Named access to `id`ed elements on the window (about 528 rows).
+3. Module scripts: import/export and deferred module execution (about 413 tests).
+4. Nested documents from WPT handlers, which need a served mode rather than files.
+5. `<body>` and `<frameset>` window event-handler attributes, and `template for`.
+6. Source positions for inline scripts. `lineno` is relative to the script text, not to
+   the document, so `runtime-error-in-window-onerror` cannot see the line it expects.
+7. Capability detection by text over-declines (`common.js`), and needs a runtime check.
+
 ## Update: a scorer bug, and nested browsing contexts
 
 Two changes to the numbers below.
