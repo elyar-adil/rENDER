@@ -161,8 +161,16 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
                 (define/get/getName/whenDefined/upgrade, upgrade on define and on \
                 insertion, connected/disconnected/attributeChanged callbacks for \
                 the attribute and subtree APIs); customized built-ins, \
-                `classList`/`style`/`dataset` attribute reactions, shadow trees \
-                and `attachShadow` are absent, so there is no shadow DOM.",
+                `classList`/`style`/`dataset` attribute reactions and declarative \
+                shadow roots (`shadowrootmode`) are absent. Shadow trees are \
+                implemented: `attachShadow` with `mode`, `delegatesFocus` and \
+                `slotAssignment`, `shadowRoot`, the shadow-including root and \
+                `isConnected`, `getRootNode`, named and manual slot assignment, \
+                retargeted event targets and `relatedTarget`, `composedPath`, the \
+                flat tree that style and layout walk, and image and video discovery \
+                through the shadow-including tree. `slotchange` is not dispatched, \
+                and shadow-tree stylesheets are not collected, so `:host` and \
+                `::slotted` match nothing.",
         dependencies: &[],
         tests: DOM_TESTS,
     },

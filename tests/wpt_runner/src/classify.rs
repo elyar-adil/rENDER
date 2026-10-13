@@ -450,6 +450,10 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         // Timers, event dispatch and external resources have engine support and
         // the adapter can express them.
         Capability::Timers | Capability::EventDispatch | Capability::ExternalResource => true,
+        // `attachShadow`, `ShadowRoot`, retargeted events and the flat tree are
+        // implemented (DOM 4.2.2, 2.9). Shadow-tree stylesheets are not yet, and
+        // the runner does not score reftests, so those rows stay unscored.
+        Capability::ShadowDom => true,
         // Nested browsing contexts are driven by the engine's own adapter: an
         // iframe gets its own realm and document, `contentWindow` and
         // `contentDocument` reach it, and `parent`, `top` and `postMessage` work
@@ -474,7 +478,6 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         | Capability::WebGpu
         | Capability::WebRtc
         | Capability::WebAssembly
-        | Capability::ShadowDom
         | Capability::Animation
         | Capability::MediaPlayback
         | Capability::Navigation
