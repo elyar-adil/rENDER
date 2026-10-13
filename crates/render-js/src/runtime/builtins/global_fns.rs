@@ -830,7 +830,11 @@ impl JsRuntime {
             | NativeFunction::CharacterDataDeleteData
             | NativeFunction::CharacterDataReplaceData
             | NativeFunction::ImplementationCreateDocumentType
+            | NativeFunction::ImplementationCreateDocument
+            | NativeFunction::ImplementationCreateHtmlDocument
             | NativeFunction::ImplementationHasFeature
+            | NativeFunction::DocumentImplementation
+            | NativeFunction::AdoptNode
             | NativeFunction::NonElementGetElementById
             | NativeFunction::CreateElementNs
             | NativeFunction::SetAttributeNs

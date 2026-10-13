@@ -120,8 +120,18 @@ impl JsRuntime {
     /// the tree `node` is in. A node in no context's tree, such as one that was
     /// created and not yet inserted, belongs to the running realm.
     pub(super) fn realm_of_node(&self, dom: &Dom, node: NodeId) -> RealmId {
-        self.realm_of_document(root_of(dom, node))
-            .unwrap_or_else(|| self.realm.current_realm())
+        let root = root_of(dom, node);
+        if let Some(realm) = self.realm_of_document(root) {
+            return realm;
+        }
+        // Otherwise the node belongs to the realm of its node document, which is
+        // a browsing context's document or a document a script made (DOM §4.4).
+        let owner = dom.node_document(node).unwrap_or(root);
+        if let Some(realm) = self.realm_of_document(owner) {
+            return realm;
+        }
+        self.created_document(owner)
+            .map_or_else(|| self.realm.current_realm(), |created| created.realm)
     }
 
     /// The realm whose global object is `global`, if it is a window.

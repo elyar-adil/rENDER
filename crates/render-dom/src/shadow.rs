@@ -209,6 +209,9 @@ impl Dom {
             delegates_focus,
             slot_assignment,
         }));
+        // A shadow root is in its host's node document (DOM §4.2.2.1).
+        let owner = self.owner_of(host);
+        self.set_node_document(root, owner);
         if let Some(data) = self.element_data_mut(host) {
             data.shadow_root = Some(root);
         }

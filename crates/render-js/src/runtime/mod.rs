@@ -218,6 +218,9 @@ pub struct JsRuntime {
     contexts: Vec<BrowsingContextRecord>,
     /// The state of each connected iframe. See [`FrameState`].
     frames: BTreeMap<NodeId, FrameState>,
+    /// The documents a script made, and the realm each belongs to. See
+    /// `builtins::dom_document`.
+    created_documents: BTreeMap<NodeId, builtins::dom_document::CreatedDocument>,
     /// The realm each active call was made from, innermost last.
     caller_realms: Vec<RealmId>,
     /// Work the runtime has scheduled for itself, keyed by the timer id that
@@ -380,6 +383,7 @@ impl JsRuntime {
                 None,
             )],
             frames: BTreeMap::new(),
+            created_documents: BTreeMap::new(),
             caller_realms: Vec::new(),
             internal_tasks: BTreeMap::new(),
             nested_scan_revision: None,

@@ -408,6 +408,8 @@ pub(crate) enum DomNodeKind {
     Text,
     Comment,
     Fragment,
+    /// `new Document()` (DOM): an empty XML document with no browsing context.
+    Document,
 }
 
 /// The operations of `AbstractRange`, `Range` and `StaticRange` (DOM §5): the
@@ -900,7 +902,13 @@ pub(crate) enum NativeFunction {
     Range(RangeOp),
     /// `DOMImplementation` methods (DOM §4.5).
     ImplementationCreateDocumentType,
+    ImplementationCreateDocument,
+    ImplementationCreateHtmlDocument,
     ImplementationHasFeature,
+    /// The `implementation` getter of a document (DOM §4.5).
+    DocumentImplementation,
+    /// `Document.prototype.adoptNode` (DOM).
+    AdoptNode,
     /// The namespace-aware attribute and element methods (DOM §4.9.1, §4.9.2).
     CreateElementNs,
     SetAttributeNs,
@@ -2244,6 +2252,9 @@ pub(crate) enum ObjectHost {
     Ordinary,
     Array,
     Document(NodeId),
+    /// The `DOMImplementation` of the document `NodeId` (DOM §4.5), which
+    /// `createDocumentType`, `createDocument` and `createHTMLDocument` use.
+    DomImplementation(NodeId),
     Node(NodeId),
     ClassList(NodeId),
     /// `element.dataset` `DOMStringMap`. Reads and writes map camelCase
@@ -2973,6 +2984,9 @@ pub struct RealmRecord {
     /// `%WrapForValidIteratorPrototype%`: the prototype of `Iterator.from` wrappers.
     iterator_wrap_prototype: ObjectId,
     node_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `DOMImplementation` of each document, made when the document's
+    /// `implementation` is first read, so each document has one.
+    implementation_wrappers: BTreeMap<NodeId, ObjectId>,
     class_list_wrappers: BTreeMap<NodeId, ObjectId>,
     style_declaration_wrappers: BTreeMap<NodeId, ObjectId>,
     dataset_wrappers: BTreeMap<NodeId, ObjectId>,
@@ -3455,6 +3469,7 @@ impl Realm {
             shadow_realm_prototype,
             media_query_list_prototype,
             node_wrappers: BTreeMap::new(),
+            implementation_wrappers: BTreeMap::new(),
             class_list_wrappers: BTreeMap::new(),
             style_declaration_wrappers: BTreeMap::new(),
             dataset_wrappers: BTreeMap::new(),
@@ -3529,64 +3544,79 @@ impl Realm {
                 configurable: true,
             },
         );
-        let (element_prototype, dom_prototypes) =
+        let (element_prototype, mut dom_prototypes) =
             Self::install_dom_interfaces(objects, global, object_prototype, function_prototype);
         // DOM libraries feature-detect and use `instanceof Document` during
-        // startup. Keep a dedicated prototype for the live document wrapper
-        // so the check has the same result as a browser while the constructor
-        // remains intentionally non-constructible.
+        // startup. `Document` is constructible (`new Document()` makes an XML
+        // document), and its prototype is the one every document inherits from.
         let document_prototype = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(element_prototype),
             ..JsObject::default()
         });
-        let document_constructor = ObjectId(objects.len());
+        Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "Document",
+            document_prototype,
+            None,
+            ObjectHost::DomNodeConstructor(DomNodeKind::Document),
+        );
+        // `HTMLDocument` and `XMLDocument` (DOM §4.5 and HTML) have no
+        // constructors. A page's document is an HTMLDocument, and `createDocument`
+        // makes XMLDocuments. `instanceof` tells the three apart.
+        let mut document_interface = |name: &'static str| {
+            let prototype = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(document_prototype),
+                ..JsObject::default()
+            });
+            Self::dom_interface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                prototype,
+                None,
+                ObjectHost::DomConstructor,
+            );
+            prototype
+        };
+        let html_document_prototype = document_interface("HTMLDocument");
+        let xml_document_prototype = document_interface("XMLDocument");
+        dom_prototypes.insert("Document", document_prototype);
+        dom_prototypes.insert("HTMLDocument", html_document_prototype);
+        dom_prototypes.insert("XMLDocument", xml_document_prototype);
+        objects[document.0].prototype = Some(html_document_prototype);
+        // `document.implementation` (DOM §4.5): a readonly attribute, and each
+        // document has its own DOMImplementation, so it is an accessor.
+        let implementation_getter = ObjectId(objects.len());
         objects.push(JsObject {
             prototype: Some(function_prototype),
-            host: ObjectHost::DomConstructor,
-            ..JsObject::default()
-        });
-        objects[document_constructor.0].properties.insert(
-            "prototype".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(document_prototype)),
-        );
-        objects[document_prototype.0].properties.insert(
-            "constructor".to_owned(),
-            PropertyDescriptor::builtin(JsValue::Object(document_constructor)),
-        );
-        objects[document.0].prototype = Some(document_prototype);
-        // `document.implementation` (DOM §4.5): one DOMImplementation for the
-        // document. The specification makes it a readonly accessor; a
-        // non-writable data property reads the same and keeps identity.
-        let implementation = ObjectId(objects.len());
-        objects.push(JsObject {
-            prototype: dom_prototypes.get("DOMImplementation").copied(),
+            host: ObjectHost::NativeFunction(NativeFunction::DocumentImplementation),
             ..JsObject::default()
         });
         objects[document_prototype.0].properties.insert(
             "implementation".to_owned(),
             PropertyDescriptor {
-                getter: None,
+                getter: Some(implementation_getter),
                 setter: None,
-                value: JsValue::Object(implementation),
+                value: JsValue::Undefined,
                 writable: false,
                 enumerable: true,
                 configurable: true,
             },
         );
-        for name in ["Document", "HTMLDocument"] {
-            objects[global.0].properties.insert(
-                name.to_owned(),
-                PropertyDescriptor {
-                    getter: None,
-                    setter: None,
-                    value: JsValue::Object(document_constructor),
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                },
-            );
-        }
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            document_prototype,
+            &[
+                ("adoptNode", NativeFunction::AdoptNode),
+                ("importNode", NativeFunction::ImportNode),
+            ],
+        );
         Self::install_location(
             objects,
             global,
@@ -4455,6 +4485,14 @@ impl Realm {
                     (
                         "createDocumentType",
                         NativeFunction::ImplementationCreateDocumentType,
+                    ),
+                    (
+                        "createDocument",
+                        NativeFunction::ImplementationCreateDocument,
+                    ),
+                    (
+                        "createHTMLDocument",
+                        NativeFunction::ImplementationCreateHtmlDocument,
                     ),
                     ("hasFeature", NativeFunction::ImplementationHasFeature),
                 ][..],
@@ -10197,6 +10235,7 @@ impl RealmRecord {
     fn identity_roots(&self) -> Vec<ObjectId> {
         let mut roots = Vec::with_capacity(
             4 + self.node_wrappers.len()
+                + self.implementation_wrappers.len()
                 + self.class_list_wrappers.len()
                 + self.style_declaration_wrappers.len()
                 + self.dataset_wrappers.len()
@@ -10227,6 +10266,7 @@ impl RealmRecord {
         roots.push(self.media_query_list_prototype);
         roots.extend(self.temporal_prototypes.values().copied());
         roots.extend(self.node_wrappers.values().copied());
+        roots.extend(self.implementation_wrappers.values().copied());
         roots.extend(self.class_list_wrappers.values().copied());
         roots.extend(self.style_declaration_wrappers.values().copied());
         roots.extend(self.dataset_wrappers.values().copied());
@@ -11046,6 +11086,47 @@ impl Realm {
             ..JsObject::default()
         });
         self.node_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// The wrapper of the document `node`, when it is not this realm's own
+    /// document. A document made by script is an object of its own, with the
+    /// prototype of the `interface` it was made as (`Document`, `HTMLDocument`
+    /// or `XMLDocument`).
+    pub(crate) fn document_wrapper(&mut self, node: NodeId, interface: &str) -> ObjectId {
+        if let Some(wrapper) = self.node_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let prototype = self
+            .dom_prototypes
+            .get(interface)
+            .copied()
+            .unwrap_or(self.element_prototype);
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::Document(node),
+            ..JsObject::default()
+        });
+        self.node_wrappers.insert(node, wrapper);
+        wrapper
+    }
+
+    /// The `DOMImplementation` object of the document `node` (DOM §4.5).
+    pub(crate) fn implementation_wrapper(&mut self, node: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.implementation_wrappers.get(&node) {
+            return *wrapper;
+        }
+        let prototype = self
+            .dom_prototypes
+            .get("DOMImplementation")
+            .copied()
+            .unwrap_or(self.element_prototype);
+        let wrapper = self.allocate(JsObject {
+            prototype: Some(prototype),
+            host: ObjectHost::DomImplementation(node),
+            ..JsObject::default()
+        });
+        self.implementation_wrappers.insert(node, wrapper);
         wrapper
     }
 

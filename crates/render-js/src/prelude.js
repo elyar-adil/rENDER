@@ -328,7 +328,7 @@
   var elementPrototype = Element.prototype;
   var characterDataPrototype = CharacterData.prototype;
   var fragmentPrototype = DocumentFragment.prototype;
-  var documentPrototype = Object.getPrototypeOf(document);
+  var documentPrototype = Document.prototype;
 
   function toNode(value) {
     return value !== null && typeof value === 'object' && typeof value.nodeType === 'number'
@@ -557,13 +557,6 @@
   });
   define(documentPrototype, 'getElementsByName', function getElementsByName(name) {
     return slice.call(this.querySelectorAll('[name="' + String(name).replace(/"/g, '\\"') + '"]'));
-  });
-  define(documentPrototype, 'importNode', function importNode(node, deep) {
-    return node.cloneNode(!!deep);
-  });
-  define(documentPrototype, 'adoptNode', function adoptNode(node) {
-    if (node.parentNode) node.parentNode.removeChild(node);
-    return node;
   });
   define(documentPrototype, 'hasFocus', function hasFocus() { return true; });
   define(documentPrototype, 'execCommand', function execCommand() { return false; });
