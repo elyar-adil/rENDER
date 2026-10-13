@@ -16,10 +16,9 @@
 use crate::JsError;
 use crate::JsValue;
 use crate::ObjectId;
-use crate::RealmId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
-use crate::runtime::types::{EventFlags, Listener};
+use crate::runtime::types::{EventFlags, Listener, PathEntry, Stop};
 use crate::value::NativeFunction;
 use crate::value::ObjectHost;
 use render_dom::Dom;
@@ -38,14 +37,6 @@ fn default_passive_event_type(event_type: &str) -> bool {
 const AT_TARGET: f64 = 2.0;
 const CAPTURING_PHASE: f64 = 1.0;
 const BUBBLING_PHASE: f64 = 3.0;
-
-/// One stop on an event's path.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Stop {
-    Node(NodeId),
-    /// The window of a realm.
-    Window(RealmId),
-}
 
 impl JsRuntime {
     pub(in crate::runtime) fn dispatch_events_native(
@@ -102,16 +93,10 @@ impl JsRuntime {
             }
             NativeFunction::EventComposedPath => {
                 let path: Vec<JsValue> = self
-                    .event_flags
-                    .get(&receiver)
-                    .map(|flags| {
-                        flags
-                            .path
-                            .iter()
-                            .map(|object| JsValue::Object(*object))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                    .composed_path(receiver)
+                    .into_iter()
+                    .map(JsValue::Object)
+                    .collect();
                 Ok(JsValue::Object(self.create_array_from_values(&path)?))
             }
             NativeFunction::WindowAddEventListener => self.add_window_listener(receiver, arguments),
@@ -204,6 +189,39 @@ impl JsRuntime {
                 stop_propagation: false,
             };
         }
+    }
+
+    /// The node an event's `relatedTarget` names, or `None` when it names none,
+    /// or names something that is not a node.
+    fn event_related_node(&self, event: ObjectId) -> Option<NodeId> {
+        match self.realm.get_property(event, "relatedTarget")? {
+            JsValue::Object(object) => match self.realm.host(object) {
+                Some(ObjectHost::Node(node) | ObjectHost::Document(node)) => Some(node),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `composedPath()` (DOM §2.9): the objects the current listener's event
+    /// visits, in path order. A step is hidden from the current listener when a
+    /// closed shadow root lies from that step up to, but not including, the
+    /// current step: the listener is outside that root, so it cannot see in.
+    /// Steps that are the current one, or past it, are never hidden by this.
+    pub(in crate::runtime) fn composed_path(&self, event: ObjectId) -> Vec<ObjectId> {
+        let Some(flags) = self.event_flags.get(&event) else {
+            return Vec::new();
+        };
+        let path = &flags.path;
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let current = flags.current.min(path.len() - 1);
+        path.iter()
+            .enumerate()
+            .filter(|(index, _)| !(*index..current).any(|inner| path[inner].root_of_closed_tree))
+            .map(|(_, entry)| entry.object)
+            .collect()
     }
 
     /// Run `update` on the canceled and stop-propagation flags of `event`.
@@ -550,17 +568,39 @@ impl JsRuntime {
     fn invoke_stop(
         &mut self,
         dom: &mut Dom,
-        stop: Stop,
+        index: usize,
         event: ObjectId,
         event_type: &str,
         phase: f64,
         capture_pass: bool,
     ) -> Result<(), JsError> {
-        let current = self.stop_wrapper(dom, stop)?;
+        // DOM §2.9 invoke: the event's target, relatedTarget and currentTarget
+        // are those of this step of the path, whatever the step's listeners do.
+        let Some(entry) = self
+            .event_flags
+            .get(&event)
+            .and_then(|flags| flags.path.get(index).copied())
+        else {
+            return Ok(());
+        };
+        let stop = entry.stop;
+        let current = entry.object;
+        self.event_flags.entry(event).or_default().current = index;
         self.realm
             .set_property(event, "currentTarget".to_owned(), JsValue::Object(current));
         self.realm
             .set_property(event, "eventPhase".to_owned(), JsValue::Number(phase));
+        self.realm
+            .set_property(event, "target".to_owned(), JsValue::Object(entry.target));
+        self.realm.set_property(
+            event,
+            "srcElement".to_owned(),
+            JsValue::Object(entry.target),
+        );
+        if let Some(related) = entry.related {
+            self.realm
+                .set_property(event, "relatedTarget".to_owned(), JsValue::Object(related));
+        }
         for listener in self.stop_listeners(stop, event_type) {
             if listener.capture != capture_pass {
                 continue;
@@ -759,33 +799,62 @@ impl JsRuntime {
             JsValue::Object(target_wrapper),
         );
 
-        // The path: the target, its ancestors up to the document, and then the
-        // window. An event aimed at the document itself without bubbling (the
-        // embedder's `load`) still reaches the window, as it always has here.
-        let mut path = vec![Stop::Node(target)];
-        let mut ancestor = dom.parent(target);
-        while let Some(node) = ancestor {
-            path.push(Stop::Node(node));
-            ancestor = dom.parent(node);
+        // DOM §2.9: the path. Each step is the target, an ancestor, or the host a
+        // shadow tree's contents are seen from; the event's target and
+        // relatedTarget are retargeted at every step. A `relatedTarget` that is
+        // not a node is left as the script set it.
+        let composed = self
+            .realm
+            .get_property(event, "composed")
+            .is_some_and(|value| value.is_truthy());
+        let related = self.event_related_node(event);
+        let steps = dom.event_path(target, related, composed);
+        let mut path: Vec<PathEntry> = Vec::with_capacity(steps.len() + 1);
+        for step in &steps {
+            let object = self.stop_wrapper(dom, Stop::Node(step.invocation_target))?;
+            let target_object = self.stop_wrapper(dom, Stop::Node(step.target))?;
+            let related_object = match step.related_target {
+                Some(node) => Some(self.stop_wrapper(dom, Stop::Node(node))?),
+                None => None,
+            };
+            path.push(PathEntry {
+                stop: Stop::Node(step.invocation_target),
+                object,
+                target: target_object,
+                related: related_object,
+                at_target: step.at_target,
+                root_of_closed_tree: step.root_of_closed_tree,
+            });
         }
-        // A tree that ends at a browsing context's document reaches that
-        // context's window, which is the page's window for the page's tree.
-        let window = path.last().and_then(|stop| match stop {
-            Stop::Node(root) => self.realm_of_document(*root),
-            Stop::Window(_) => None,
-        });
-        if let Some(realm) = window {
-            path.push(Stop::Window(realm));
+        // A path that ends at a browsing context's document reaches that
+        // context's window. The window is outside every shadow tree, so it reads
+        // the target and relatedTarget as the outermost ones.
+        let window = steps
+            .last()
+            .and_then(|step| self.realm_of_document(step.invocation_target));
+        if let (Some(realm), Some(last)) = (window, path.last().copied()) {
+            let object = self.stop_wrapper(dom, Stop::Window(realm))?;
+            let related_object = match related {
+                Some(node) => {
+                    let outermost = dom.retarget(node, None);
+                    Some(self.stop_wrapper(dom, Stop::Node(outermost))?)
+                }
+                None => None,
+            };
+            path.push(PathEntry {
+                stop: Stop::Window(realm),
+                object,
+                target: last.target,
+                related: related_object,
+                at_target: false,
+                root_of_closed_tree: false,
+            });
         }
         let bubbles_to_window = bubbles || self.realm_of_document(target).is_some();
-        let mut wrappers = Vec::with_capacity(path.len());
-        for stop in &path {
-            wrappers.push(self.stop_wrapper(dom, *stop)?);
-        }
         self.event_flags.insert(
             event,
             EventFlags {
-                path: wrappers,
+                path: path.clone(),
                 error_event,
                 ..EventFlags::default()
             },
@@ -794,31 +863,36 @@ impl JsRuntime {
         let stopped = |runtime: &Self| runtime.event_stop_propagation(event);
 
         let result = (|| -> Result<(), JsError> {
-            // Capture: from the outermost stop down to the target's parent.
-            for stop in path.iter().skip(1).rev() {
+            // Capture: from the outermost step down to the target. A step whose
+            // target is adjusted to it is at the target phase (DOM §2.9 invoke).
+            for (index, entry) in path.iter().copied().enumerate().rev() {
                 if stopped(self) {
                     return Ok(());
                 }
-                self.invoke_stop(dom, *stop, event, event_type, CAPTURING_PHASE, true)?;
+                let phase = if entry.at_target {
+                    AT_TARGET
+                } else {
+                    CAPTURING_PHASE
+                };
+                self.invoke_stop(dom, index, event, event_type, phase, true)?;
             }
-            // At the target: capturing listeners, then the others.
-            if stopped(self) {
-                return Ok(());
-            }
-            self.invoke_stop(dom, path[0], event, event_type, AT_TARGET, true)?;
-            if stopped(self) {
-                return Ok(());
-            }
-            self.invoke_stop(dom, path[0], event, event_type, AT_TARGET, false)?;
-            // Bubble: outward, only for events that bubble.
-            for stop in path.iter().skip(1) {
+            // Bubble: from the target outward. The target's own step runs its
+            // non-capturing listeners, and a step at an adjusted target runs even
+            // when the event does not bubble; the rest bubble only if the event does.
+            for (index, entry) in path.iter().copied().enumerate() {
                 if stopped(self) {
                     return Ok(());
                 }
-                if !(bubbles || bubbles_to_window && matches!(stop, Stop::Window(_))) {
+                let is_window = matches!(entry.stop, Stop::Window(_));
+                if !(entry.at_target || bubbles || bubbles_to_window && is_window) {
                     continue;
                 }
-                self.invoke_stop(dom, *stop, event, event_type, BUBBLING_PHASE, false)?;
+                let phase = if entry.at_target {
+                    AT_TARGET
+                } else {
+                    BUBBLING_PHASE
+                };
+                self.invoke_stop(dom, index, event, event_type, phase, false)?;
             }
             Ok(())
         })();

@@ -44,6 +44,8 @@ use crate::runtime::JsRuntime;
 use crate::runtime::builtins::array::array_index;
 use crate::runtime::builtins::dom::css_prop_from_member;
 use crate::runtime::builtins::dom::html_element_type;
+use crate::runtime::builtins::dom::is_element_node;
+use crate::runtime::builtins::dom::is_text_node;
 use crate::runtime::builtins::dom::is_valid_property_name;
 use crate::runtime::builtins::dom::node_attribute_property;
 use crate::runtime::builtins::dom::node_boolean_property;
@@ -4818,7 +4820,7 @@ impl JsRuntime {
                             Some(NodeKind::Comment(_)) => 8.0,
                             Some(NodeKind::Document) => 9.0,
                             Some(NodeKind::DocumentType(_)) => 10.0,
-                            Some(NodeKind::DocumentFragment) => 11.0,
+                            Some(NodeKind::DocumentFragment | NodeKind::ShadowRoot(_)) => 11.0,
                             Some(NodeKind::ProcessingInstruction { .. }) => 7.0,
                             _ => 0.0,
                         },
@@ -4982,7 +4984,11 @@ impl JsRuntime {
                 // HTML §6.6.2: the focused area's element, or `body` when the
                 // viewport is the focused area.
                 "activeElement" => {
+                    // DOM §4.2.2 DocumentOrShadowRoot: the focused element as seen
+                    // from the document, so a focused element in a shadow tree
+                    // reads as its outermost host.
                     if let Some(node) = dom.focused_element() {
+                        let node = dom.retarget(node, Some(document));
                         return self.wrap_node(dom, node);
                     }
                     return match self.find_element_by_tag(dom, document, "body")? {
@@ -4990,6 +4996,8 @@ impl JsRuntime {
                         None => Ok(JsValue::Null),
                     };
                 }
+                // A document is its own shadow-including root (DOM §4.4).
+                "isConnected" => return Ok(JsValue::Boolean(true)),
                 _ => {}
             },
             Some(ObjectHost::Blob {
@@ -5037,6 +5045,63 @@ impl JsRuntime {
                 "style" => {
                     self.ensure_heap_capacity(1)?;
                     return Ok(JsValue::Object(self.realm.style_declaration_wrapper(node)));
+                }
+                "isConnected" => {
+                    return Ok(JsValue::Boolean(dom.is_connected(node)));
+                }
+                // `shadowRoot` exists on elements only, and is null unless the
+                // root is open (DOM §4.2.2).
+                "shadowRoot" if is_element_node(dom, node) => {
+                    let open = dom.shadow_root(node).filter(|root| {
+                        dom.shadow_root_data(*root)
+                            .is_some_and(|data| data.mode == render_dom::ShadowRootMode::Open)
+                    });
+                    return match open {
+                        Some(root) => self.wrap_node(dom, root),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                // `assignedSlot` is a Slottable member, so elements and text (DOM §4.2.2.2).
+                "assignedSlot" if is_element_node(dom, node) || is_text_node(dom, node) => {
+                    return match dom.assigned_slot(node) {
+                        Some(slot) => self.wrap_node(dom, slot),
+                        None => Ok(JsValue::Null),
+                    };
+                }
+                "host" if dom.shadow_root_data(node).is_some() => {
+                    let host = dom.shadow_host(node).expect("checked by the guard");
+                    return self.wrap_node(dom, host);
+                }
+                "mode" if dom.shadow_root_data(node).is_some() => {
+                    let mode = dom
+                        .shadow_root_data(node)
+                        .map_or("", |data| data.mode.as_str());
+                    return Ok(JsValue::String(mode.into()));
+                }
+                "delegatesFocus" if dom.shadow_root_data(node).is_some() => {
+                    let delegates = dom
+                        .shadow_root_data(node)
+                        .is_some_and(|data| data.delegates_focus);
+                    return Ok(JsValue::Boolean(delegates));
+                }
+                "slotAssignment" if dom.shadow_root_data(node).is_some() => {
+                    let mode = dom
+                        .shadow_root_data(node)
+                        .map_or("", |data| data.slot_assignment.as_str());
+                    return Ok(JsValue::String(mode.into()));
+                }
+                // DOM §4.2.2 DocumentOrShadowRoot: the focused element as seen from
+                // this root, or null when it is outside the root's tree.
+                "activeElement" if dom.shadow_root_data(node).is_some() => {
+                    let focused = dom
+                        .focused_element()
+                        .map(|focused| dom.retarget(focused, Some(node)));
+                    return match focused {
+                        Some(candidate) if dom.root_node(candidate, false) == node => {
+                            self.wrap_node(dom, candidate)
+                        }
+                        _ => Ok(JsValue::Null),
+                    };
                 }
                 "innerHTML" | "outerHTML" => {
                     let html = if property == "innerHTML" {

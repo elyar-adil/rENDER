@@ -394,9 +394,10 @@ fn boundary_length(dom: &Dom, node: NodeId) -> Result<usize, InteractionError> {
         )
     })?;
     match node.kind() {
-        NodeKind::Document | NodeKind::DocumentFragment | NodeKind::Element(_) => {
-            Ok(node.children().len())
-        }
+        NodeKind::Document
+        | NodeKind::DocumentFragment
+        | NodeKind::ShadowRoot(_)
+        | NodeKind::Element(_) => Ok(node.children().len()),
         NodeKind::Text(data)
         | NodeKind::Comment(data)
         | NodeKind::ProcessingInstruction { data, .. } => Ok(data.encode_utf16().count()),

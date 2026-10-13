@@ -22,6 +22,9 @@ impl JsRuntime {
         dom: &mut Dom,
         target: NodeId,
     ) -> Result<(), JsError> {
+        // HTML §6.6.3 focusing steps: a shadow host whose root delegates focus
+        // hands focus to its focus delegate, when it has one.
+        let target = dom.focus_delegate(target).unwrap_or(target);
         if dom.focused_element() == Some(target) || !dom.is_focusable_area(target) {
             return Ok(());
         }

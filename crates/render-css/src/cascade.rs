@@ -141,7 +141,15 @@ pub fn cascade_element_with_origins(
     let mut candidates: BTreeMap<String, Vec<Candidate>> = BTreeMap::new();
     let mut source_order = 0_u64;
 
+    // An author stylesheet is scoped to the tree it belongs to, so the
+    // document's sheets never reach an element inside a shadow tree. The
+    // user-agent and user origins still apply there. Shadow-tree sheets are not
+    // collected yet, so no author rule applies inside a shadow tree.
+    let in_shadow_tree = dom.shadow_host(dom.root_node(element, false)).is_some();
     for (source_index, source) in sources.iter().enumerate() {
+        if in_shadow_tree && source.origin == CascadeOrigin::Author {
+            continue;
+        }
         for rule in &source.sheet.rules {
             if !rule
                 .media

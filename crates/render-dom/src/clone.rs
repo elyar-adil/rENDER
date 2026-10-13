@@ -15,13 +15,19 @@ impl Dom {
     ///
     /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
     /// unknown node, and [`DomErrorKind::NotSupported`](crate::DomErrorKind::NotSupported)
-    /// for a Document, which this arena cannot clone as a separate document.
+    /// for a Document, which this arena cannot clone as a separate document, and
+    /// for a shadow root, which `cloneNode()` refuses (DOM §4.5).
     pub fn clone_node(&mut self, node: NodeId, deep: bool) -> Result<NodeId, DomError> {
         let source = self.kind(node)?.clone();
         let copy = match source {
             NodeKind::Document => {
                 return Err(DomError::not_supported(
                     "cloning a Document is not supported by this arena",
+                ));
+            }
+            NodeKind::ShadowRoot(_) => {
+                return Err(DomError::not_supported(
+                    "a shadow root cannot be cloned (DOM NotSupportedError)",
                 ));
             }
             NodeKind::DocumentType(data) => {

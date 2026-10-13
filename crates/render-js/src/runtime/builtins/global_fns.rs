@@ -898,6 +898,13 @@ impl JsRuntime {
             NativeFunction::Contains => {
                 self.dispatch_dom_native(dom, NativeFunction::Contains, receiver, arguments)
             }
+            NativeFunction::AttachShadow
+            | NativeFunction::GetRootNode
+            | NativeFunction::SlotAssign
+            | NativeFunction::SlotAssignedNodes
+            | NativeFunction::SlotAssignedElements => {
+                self.dispatch_dom_native(dom, function, receiver, arguments)
+            }
             NativeFunction::CreateDocumentFragment => self.dispatch_dom_native(
                 dom,
                 NativeFunction::CreateDocumentFragment,

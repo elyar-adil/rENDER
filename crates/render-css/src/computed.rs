@@ -1419,10 +1419,10 @@ pub fn compute_document_styles_with_hints(
         } else {
             parent_element
         };
-        if let Some(children) = dom.children(node) {
-            for child in children.iter().rev() {
-                stack.push((*child, current_parent));
-            }
+        // The flat tree: a host's children are its shadow tree, and a slot's are
+        // the nodes assigned to it. Inheritance follows the same tree.
+        for child in dom.flat_children(node).into_iter().rev() {
+            stack.push((child, current_parent));
         }
     }
     styles

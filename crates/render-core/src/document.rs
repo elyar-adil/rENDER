@@ -86,6 +86,9 @@ input[type="hidden" i] { display: none; }
 
 /* §15.3.2 The page. */
 html, body { display: block; }
+/* DOM §4.2.2.2 and HTML §15.3.1: a slot generates no box of its own; its flat
+   tree children are the nodes assigned to it. */
+slot { display: contents; }
 body { margin-top: 8px; margin-right: 8px; margin-bottom: 8px; margin-left: 8px; }
 
 /* §15.3.3 Flow content. The block margins of the elements with default

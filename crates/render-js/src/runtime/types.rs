@@ -198,6 +198,32 @@ pub(super) struct Listener {
     pub(super) passive: bool,
 }
 
+/// One stop on an event's path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Stop {
+    Node(render_dom::NodeId),
+    /// The window of a realm.
+    Window(crate::RealmId),
+}
+
+/// One step of an event's path (DOM §2.9), with what a script reads at it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PathEntry {
+    /// Where the step's listeners are registered.
+    pub(super) stop: Stop,
+    /// The object `currentTarget` is at this step.
+    pub(super) object: ObjectId,
+    /// The object `target` is at this step: retargeted through shadow roots.
+    pub(super) target: ObjectId,
+    /// The object `relatedTarget` is at this step, when the event has one.
+    pub(super) related: Option<ObjectId>,
+    /// Whether the step's listeners run in the `AT_TARGET` phase.
+    pub(super) at_target: bool,
+    /// Whether the step is a closed shadow root, which `composedPath()` hides
+    /// from listeners outside it.
+    pub(super) root_of_closed_tree: bool,
+}
+
 /// Dispatch state that belongs to an `Event` while it is being dispatched.
 /// The canceled and stop-propagation flags persist on the event object
 /// itself (`ObjectHost::Event`), because the spec lets them be set outside a
@@ -207,8 +233,10 @@ pub(super) struct EventFlags {
     pub(super) stop_immediate: bool,
     /// Set while a passive listener runs, where `preventDefault` is ignored.
     pub(super) in_passive_listener: bool,
-    /// What `composedPath()` returns: the objects the event travels through.
-    pub(super) path: Vec<ObjectId>,
+    /// The event's path, which `composedPath()` reads from.
+    pub(super) path: Vec<PathEntry>,
+    /// The index in `path` of the step whose listeners are running.
+    pub(super) current: usize,
     /// The event is an `ErrorEvent` raised by an uncaught error, so the window's
     /// `onerror` handler is called with the five error arguments.
     pub(super) error_event: bool,

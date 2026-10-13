@@ -408,19 +408,8 @@
   define(nodePrototype, 'hasChildNodes', function hasChildNodes() {
     return this.firstChild !== null;
   });
-  define(nodePrototype, 'getRootNode', function getRootNode() {
-    var node = this;
-    while (node.parentNode) node = node.parentNode;
-    return node;
-  });
-  defineGetter(nodePrototype, 'isConnected', function () {
-    var node = this;
-    while (node) {
-      if (node.nodeType === 9) return true;
-      node = node.parentNode;
-    }
-    return false;
-  });
+  // `getRootNode` and `isConnected` are native: a walk over `parentNode` cannot
+  // cross a shadow root's host, and DOM §4.4 requires it to.
   define(nodePrototype, 'isSameNode', function isSameNode(other) {
     return this === other;
   });

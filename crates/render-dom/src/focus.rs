@@ -76,6 +76,38 @@ impl Dom {
             && (self.parsed_tab_index(node).is_some() || self.is_natively_focusable(node))
     }
 
+    /// The focus delegate of a shadow host (HTML §6.6.3): when the host's shadow
+    /// root delegates focus, the first focusable area in that root's tree, in tree
+    /// order. `None` when the host does not delegate, or its root has no focusable
+    /// area.
+    #[must_use]
+    pub fn focus_delegate(&self, host: NodeId) -> Option<NodeId> {
+        let root = self.shadow_root(host)?;
+        if !self.shadow_root_data(root)?.delegates_focus {
+            return None;
+        }
+        let mut stack: Vec<NodeId> = self
+            .children(root)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .copied()
+            .collect();
+        while let Some(node) = stack.pop() {
+            if self.is_focusable_area(node) {
+                return Some(node);
+            }
+            stack.extend(
+                self.children(node)
+                    .unwrap_or_default()
+                    .iter()
+                    .rev()
+                    .copied(),
+            );
+        }
+        None
+    }
+
     /// The `tabindex` content attribute parsed as an integer, when it is present
     /// and parses (HTML §6.6.4).
     #[must_use]

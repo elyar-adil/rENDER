@@ -307,7 +307,9 @@ impl Builder<'_> {
             });
             return;
         }
-        let children = self.dom.children(dom_parent).unwrap_or_default().to_vec();
+        // The flat tree is what is laid out: a host's shadow tree, and each slot
+        // in place of the nodes assigned to it.
+        let children = self.dom.flat_children(dom_parent);
         if let Some(table_parent @ (TableLevel::Rows | TableLevel::Row | TableLevel::Column)) =
             self.table_parent.take()
         {
@@ -531,7 +533,7 @@ impl Builder<'_> {
                     return;
                 }
                 if display == Display::Box(DisplayBox::Contents) {
-                    let children = self.dom.children(dom_node).unwrap_or_default().to_vec();
+                    let children = self.dom.flat_children(dom_node);
                     for child in children {
                         self.append_dom_node(
                             child,
@@ -655,7 +657,7 @@ impl Builder<'_> {
                     self.append_child(id, text_id);
                 }
             }
-            NodeKind::Document | NodeKind::DocumentFragment => {
+            NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
                 self.append_dom_children(
                     dom_node,
                     format_parent,

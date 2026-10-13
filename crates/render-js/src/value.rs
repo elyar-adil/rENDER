@@ -834,6 +834,16 @@ pub(crate) enum NativeFunction {
     WindowAddEventListener,
     WindowRemoveEventListener,
     CompareDocumentPosition,
+    /// `Element.prototype.attachShadow` (DOM §4.2.2).
+    AttachShadow,
+    /// `Node.prototype.getRootNode` (DOM §4.4).
+    GetRootNode,
+    /// `HTMLSlotElement.prototype.assign` (DOM §4.2.2.2).
+    SlotAssign,
+    /// `HTMLSlotElement.prototype.assignedNodes` (DOM §4.2.2.2).
+    SlotAssignedNodes,
+    /// `HTMLSlotElement.prototype.assignedElements` (DOM §4.2.2.2).
+    SlotAssignedElements,
     CreateElement,
     SetAttribute,
     GetAttribute,
@@ -4229,6 +4239,7 @@ impl Realm {
                 ("removeAttributeNS", NativeFunction::RemoveAttributeNs),
                 ("isSameNode", NativeFunction::IsSameNode),
                 ("normalize", NativeFunction::NodeNormalize),
+                ("getRootNode", NativeFunction::GetRootNode),
             ],
         );
         for name in ["scrollLeft", "scrollTop"] {
@@ -4356,7 +4367,20 @@ impl Realm {
             ObjectHost::DomConstructor,
             objects,
         );
-        derive("Element", "Node", ObjectHost::DomConstructor, objects);
+        // A shadow root is a document fragment with a host and a mode (DOM §4.2.2.1).
+        derive(
+            "ShadowRoot",
+            "DocumentFragment",
+            ObjectHost::DomConstructor,
+            objects,
+        );
+        let element = derive("Element", "Node", ObjectHost::DomConstructor, objects);
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            element,
+            &[("attachShadow", NativeFunction::AttachShadow)],
+        );
         derive(
             "HTMLElement",
             "Element",
@@ -4387,6 +4411,17 @@ impl Realm {
             };
             derive(interface, parent, ObjectHost::DomConstructor, objects);
         }
+        // `HTMLSlotElement` (HTML §4.2.2.2 and DOM §4.2.2.2): slot assignment.
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            prototypes["HTMLSlotElement"],
+            &[
+                ("assign", NativeFunction::SlotAssign),
+                ("assignedNodes", NativeFunction::SlotAssignedNodes),
+                ("assignedElements", NativeFunction::SlotAssignedElements),
+            ],
+        );
         // Collections and token lists are not Node subclasses. Each is an
         // interface whose prototype inherits from %Object.prototype%.
         for (name, methods) in [

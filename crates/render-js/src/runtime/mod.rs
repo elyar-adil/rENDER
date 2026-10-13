@@ -83,6 +83,8 @@ mod nested_tests;
 mod prelude_tests;
 #[cfg(test)]
 mod realm_tests;
+#[cfg(test)]
+mod shadow_tests;
 pub(crate) mod types;
 
 #[cfg(test)]
