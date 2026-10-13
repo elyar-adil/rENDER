@@ -949,6 +949,12 @@ fn collect_elements(dom: &Dom, limit: usize) -> (Vec<NodeId>, Vec<ImageDiscovery
             elements.push(node);
         }
         pending.extend(current.children().iter().rev());
+        // The shadow-including walk: a host's shadow root is visited before its
+        // light children, so it is pushed last and popped first. An image in a
+        // shadow tree loads whether or not a slot renders it.
+        if let Some(root) = dom.shadow_root(node) {
+            pending.push(root);
+        }
     }
     (elements, diagnostics)
 }
@@ -1279,6 +1285,7 @@ mod tests {
         ImageSelectionContext, decode_image, discover_images, discover_images_with_context,
         image_key_is_current,
     };
+    use crate::dom::{ShadowRootMode, SlotAssignmentMode};
     use crate::paint::Color;
 
     fn png_bytes() -> Vec<u8> {
@@ -1321,6 +1328,40 @@ mod tests {
             "https://cdn.example/assets/a@2x.png"
         );
         assert!(discovery.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn discovers_images_in_a_shadow_tree_before_the_light_children() {
+        let mut parsed = parse_document("<div id=host><img src='light.png'></div>");
+        let host = by_id(&parsed.dom, "host");
+        let root = parsed
+            .dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let shadow_image = parsed.dom.create_element("img");
+        parsed
+            .dom
+            .set_attribute(shadow_image, "src", "shadow.png")
+            .expect("set the shadow image's src");
+        parsed
+            .dom
+            .append_child(root, shadow_image)
+            .expect("append the image to the shadow root");
+        let document_url = Url::parse("https://example.test/page/index.html").unwrap();
+        let discovery = discover_images(&parsed.dom, &document_url, ImageLimits::default());
+
+        let urls: Vec<&str> = discovery
+            .resources
+            .iter()
+            .map(|image| image.key.requested_url.as_str())
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "https://example.test/page/shadow.png",
+                "https://example.test/page/light.png",
+            ]
+        );
     }
 
     #[test]
