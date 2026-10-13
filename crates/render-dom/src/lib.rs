@@ -9,9 +9,13 @@ use std::collections::{BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
+mod clone;
 mod focus;
+mod range;
+mod text;
 
 pub use focus::parse_html_integer;
+pub use range::{BoundaryPoint, RangeId, RangeKind};
 
 const DEFAULT_MUTATION_JOURNAL_CAPACITY: usize = 4_096;
 
@@ -383,6 +387,14 @@ pub enum DomErrorKind {
     HierarchyRequest,
     NotFound,
     InvalidNodeType,
+    /// An offset or count past the end of the data or the node (DOM §4.10, §5.2).
+    IndexSize,
+    /// A node or range from another tree or document (DOM §5.2).
+    WrongDocument,
+    /// An operation the specification names with an unknown argument (DOM §5.2).
+    NotSupported,
+    /// A range whose state does not allow the operation (DOM §5.2).
+    InvalidState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,6 +432,22 @@ impl DomError {
     fn invalid_node_type(message: impl Into<String>) -> Self {
         Self::new(DomErrorKind::InvalidNodeType, message)
     }
+
+    fn index_size(message: impl Into<String>) -> Self {
+        Self::new(DomErrorKind::IndexSize, message)
+    }
+
+    fn wrong_document(message: impl Into<String>) -> Self {
+        Self::new(DomErrorKind::WrongDocument, message)
+    }
+
+    fn not_supported(message: impl Into<String>) -> Self {
+        Self::new(DomErrorKind::NotSupported, message)
+    }
+
+    fn invalid_state(message: impl Into<String>) -> Self {
+        Self::new(DomErrorKind::InvalidState, message)
+    }
 }
 
 impl fmt::Display for DomError {
@@ -442,6 +470,9 @@ pub struct Dom {
     oldest_available_revision: DomRevision,
     /// The document's focused area (HTML §6.6.2). See [`Dom::focused_element`].
     focused_area: Option<NodeId>,
+    /// Every range this document has created, live and static (DOM §5). A
+    /// [`RangeId`] indexes this table. See the `range` module.
+    ranges: Vec<range::RangeRecord>,
 }
 
 impl Default for Dom {
@@ -467,6 +498,7 @@ impl Dom {
             mutation_journal_capacity: DEFAULT_MUTATION_JOURNAL_CAPACITY,
             oldest_available_revision: DomRevision::default(),
             focused_area: None,
+            ranges: Vec::new(),
         }
     }
 
@@ -947,43 +979,11 @@ impl Dom {
         node: NodeId,
         reference: Option<NodeId>,
     ) -> Result<NodeId, DomError> {
-        self.require_node(parent)?;
-        self.require_node(node)?;
-        if let Some(reference) = reference {
-            self.require_node(reference)?;
-            if self.parent(reference) != Some(parent) {
-                return Err(DomError::not_found(
-                    "reference node is not a child of the insertion parent",
-                ));
-            }
-        }
-
-        self.validate_parent_kind(parent)?;
-        if node == parent || self.is_inclusive_ancestor(node, parent) {
-            return Err(DomError::hierarchy(
-                "inserting the node would create a cycle",
-            ));
-        }
-
-        let effective_reference = if reference == Some(node) {
-            self.next_sibling(node)
-        } else {
-            reference
-        };
+        let effective_reference = self.pre_insert_checks(parent, node, reference)?;
         let insertion_nodes = match self.kind(node)? {
             NodeKind::DocumentFragment => self.children(node).unwrap_or_default().to_vec(),
             _ => vec![node],
         };
-
-        for insertion_node in &insertion_nodes {
-            if self.is_inclusive_ancestor(*insertion_node, parent) {
-                return Err(DomError::hierarchy(
-                    "inserting a fragment child would create a cycle",
-                ));
-            }
-            self.validate_child_kind(parent, *insertion_node)?;
-        }
-        self.validate_document_children(parent, &insertion_nodes, effective_reference)?;
 
         if insertion_nodes.is_empty() {
             return Ok(node);
@@ -1000,6 +1000,21 @@ impl Dom {
         let parent_index = parent
             .index()
             .ok_or_else(|| DomError::not_found("insertion parent is outside arena capacity"))?;
+        // DOM §4.2.3 "insert", step 4: a fragment gives up its children first.
+        if matches!(self.kind(node)?, NodeKind::DocumentFragment) {
+            for insertion_node in &insertion_nodes {
+                self.detach_without_revision(*insertion_node);
+            }
+        }
+        // Step 5: boundary points past the reference move by the number of nodes.
+        // With no ranges there is nothing to move, and the index is not worth reading.
+        if !self.ranges.is_empty()
+            && let Some(reference) = effective_reference
+        {
+            let index = self.index_in_parent(reference).unwrap_or(0);
+            self.update_ranges_for_insert(parent, index, insertion_nodes.len());
+        }
+        // Step 7: each node leaves its old parent (the adopt step) and is inserted.
         for insertion_node in &insertion_nodes {
             self.detach_without_revision(*insertion_node);
         }
@@ -1304,19 +1319,10 @@ impl Dom {
         node: NodeId,
         value: impl Into<String>,
     ) -> Result<(), DomError> {
+        // DOM §4.10 "set data" is "replace data" over the whole of the node.
         let value = value.into();
-        match &mut self.node_mut(node)?.kind {
-            NodeKind::Text(data)
-            | NodeKind::Comment(data)
-            | NodeKind::ProcessingInstruction { data, .. } => *data = value,
-            _ => {
-                return Err(DomError::invalid_node_type(
-                    "node does not implement CharacterData",
-                ));
-            }
-        }
-        self.record_mutations([MutationKind::CharacterData { target: node }]);
-        Ok(())
+        let length = self.character_data_text(node)?.encode_utf16().count();
+        self.replace_data(node, 0, length, &value)
     }
 
     fn allocate(&mut self, kind: NodeKind) -> NodeId {
@@ -1455,10 +1461,64 @@ impl Dom {
         false
     }
 
+    /// DOM §4.2.3 "ensure pre-insertion validity" and the reference adjustment
+    /// of §4.2.4 "pre-insert". Returns the reference node the insertion uses:
+    /// the next sibling when `reference` is `node` itself.
+    fn pre_insert_checks(
+        &self,
+        parent: NodeId,
+        node: NodeId,
+        reference: Option<NodeId>,
+    ) -> Result<Option<NodeId>, DomError> {
+        self.require_node(parent)?;
+        self.require_node(node)?;
+        if let Some(reference) = reference {
+            self.require_node(reference)?;
+            if self.parent(reference) != Some(parent) {
+                return Err(DomError::not_found(
+                    "reference node is not a child of the insertion parent",
+                ));
+            }
+        }
+
+        self.validate_parent_kind(parent)?;
+        if node == parent || self.is_inclusive_ancestor(node, parent) {
+            return Err(DomError::hierarchy(
+                "inserting the node would create a cycle",
+            ));
+        }
+
+        let effective_reference = if reference == Some(node) {
+            self.next_sibling(node)
+        } else {
+            reference
+        };
+        let insertion_nodes = match self.kind(node)? {
+            NodeKind::DocumentFragment => self.children(node).unwrap_or_default().to_vec(),
+            _ => vec![node],
+        };
+        for insertion_node in &insertion_nodes {
+            if self.is_inclusive_ancestor(*insertion_node, parent) {
+                return Err(DomError::hierarchy(
+                    "inserting a fragment child would create a cycle",
+                ));
+            }
+            self.validate_child_kind(parent, *insertion_node)?;
+        }
+        self.validate_document_children(parent, &insertion_nodes, effective_reference)?;
+        Ok(effective_reference)
+    }
+
     fn detach_without_revision(&mut self, node: NodeId) {
         let Some(parent) = self.parent(node) else {
             return;
         };
+        // DOM §4.2.3 "remove", steps 3 to 6: live ranges leave the removed node.
+        if !self.ranges.is_empty()
+            && let Some(index) = self.index_in_parent(node)
+        {
+            self.update_ranges_for_remove(node, parent, index);
+        }
         if let Some(parent_node) = parent.index().and_then(|index| self.nodes.get_mut(index)) {
             parent_node.children.retain(|candidate| *candidate != node);
         }

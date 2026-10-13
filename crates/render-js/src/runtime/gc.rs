@@ -241,6 +241,9 @@ pub(super) fn mark_host(
         | ObjectHost::Event { .. }
         | ObjectHost::DomConstructor
         | ObjectHost::DomNodeConstructor(_)
+        | ObjectHost::RangeConstructor
+        | ObjectHost::StaticRangeConstructor
+        | ObjectHost::Range(_)
         | ObjectHost::ImageConstructor
         | ObjectHost::IntersectionObserverConstructor
         | ObjectHost::MutationObserverConstructor

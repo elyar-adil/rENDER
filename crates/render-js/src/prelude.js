@@ -432,27 +432,6 @@
     if (existing.parentNode === this) this.removeChild(existing);
     return existing;
   });
-  define(nodePrototype, 'normalize', function normalize() {
-    var node = this.firstChild;
-    while (node) {
-      var next = node.nextSibling;
-      if (node.nodeType === 3) {
-        if (node.data === '') {
-          this.removeChild(node);
-        } else {
-          while (next && next.nodeType === 3) {
-            node.data += next.data;
-            var merged = next;
-            next = next.nextSibling;
-            this.removeChild(merged);
-          }
-        }
-      } else if (node.nodeType === 1) {
-        node.normalize();
-      }
-      node = next;
-    }
-  });
   define(nodePrototype, 'compareDocumentPosition', function compareDocumentPosition(other) {
     if (this === other) return 0;
     function pathTo(node) {

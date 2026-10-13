@@ -460,6 +460,12 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         // `OffscreenCanvas`, `ImageData`) is implemented in render-js and
         // rasterized by render-core. Other context kinds answer `null`.
         Capability::Canvas => true,
+        // `Range` is DOM §5: `createRange` and `new Range()`, live boundary points
+        // that every tree mutation updates, static ranges, and the comparison and
+        // content algorithms. There is no Selection, so a test that drives one
+        // through `getSelection()` sees an empty selection and is not evidence
+        // about ranges.
+        Capability::Range => true,
         Capability::NetworkFetch
         | Capability::WebSocket
         | Capability::DedicatedWorker
@@ -468,7 +474,6 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         | Capability::WebGpu
         | Capability::WebRtc
         | Capability::WebAssembly
-        | Capability::Range
         | Capability::ShadowDom
         | Capability::Animation
         | Capability::MediaPlayback

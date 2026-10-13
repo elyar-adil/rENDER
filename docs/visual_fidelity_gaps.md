@@ -2534,11 +2534,18 @@ report it had been given wrong in its mechanism while right about its consequenc
 
 ## S13 - Interaction and document-level features
 
-- **No Selection or Range API.** `getSelection`, `createRange`,
+- **No Selection state; Range is implemented.** `Range`, `StaticRange` and `createRange`
+  exist (DOM section 5, live boundary points updated on every tree mutation:
+  `crates/render-dom/src/range.rs`, `crates/render-js/src/runtime/builtins/dom_range.rs`).
+  The DOM Selection is a stub: `crates/render-js/src/prelude.js` defines `getSelection()`
+  and `document.getSelection()` to return one empty object, with `rangeCount` 0,
+  `type` 'None', `addRange` a no-op and `getRangeAt` throwing `IndexSizeError`. The
+  test `the_selection_stub_stays_empty_after_add_range` pins that behaviour.
   `caretRangeFromPoint` and `caretPositionFromPoint` appear nowhere. The
-  `ContentSelection` type in `crates/render-browser/src/app.rs:3210` is the shell's own
+  `ContentSelection` type in `crates/render-browser/src/app.rs:3642` is the shell's own
   hit-test result for hover and click, not the DOM Selection model. Consequence: a user
-  cannot select text, cannot copy, and page scripts that call `getSelection()` throw.
+  cannot select text or copy it, and page scripts that read `getSelection()` get an empty
+  selection, not a live one.
 - **No scroll containers - scrolling is page-level only.** `FragmentTree` exposes a
   single document-wide `scrollable_content_size` with `max_scroll_offset` and
   `clamp_scroll_offset` (`crates/render-layout/src/fragment.rs:104-141`). Nothing

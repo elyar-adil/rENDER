@@ -136,6 +136,8 @@ impl JsRuntime {
                 self.character_data_native(dom, function, receiver, arguments)
             }
             NativeFunction::ImplementationHasFeature => Ok(JsValue::Boolean(true)),
+            NativeFunction::NodeNormalize => self.node_normalize(dom, receiver),
+            NativeFunction::TextSplitText => self.text_split_text(dom, receiver, arguments),
             NativeFunction::CreateElementNs => {
                 self.require_document(receiver)?;
                 let namespace = nullable_string_argument(arguments, 0);

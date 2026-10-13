@@ -841,9 +841,12 @@ impl JsRuntime {
             | NativeFunction::CreateCdataSection
             | NativeFunction::CreateProcessingInstruction
             | NativeFunction::ImportNode
-            | NativeFunction::IsSameNode => {
+            | NativeFunction::IsSameNode
+            | NativeFunction::NodeNormalize
+            | NativeFunction::TextSplitText => {
                 self.dispatch_dom_native(dom, function, receiver, arguments)
             }
+            NativeFunction::Range(op) => self.range_native(dom, op, receiver, arguments),
             NativeFunction::ClassListToggle => {
                 self.dispatch_dom_native(dom, NativeFunction::ClassListToggle, receiver, arguments)
             }

@@ -1715,7 +1715,7 @@ const MISSING_HOST_APIS: &[&str] = &[
     "AbortSignal", "AbortController", "DOMException", "CustomEvent", "EventSource",
     "MessageChannel", "MessagePort", "MutationObserver", "IntersectionObserver",
     "ResizeObserver", "PerformanceObserver", "TextEncoder", "TextDecoder",
-    "Notification", "Selection", "Range", "ShadowRoot", "TouchEvent",
+    "Notification", "Selection", "ShadowRoot", "TouchEvent",
     "PointerEvent", "ClipboardEvent", "StorageEvent", "HashChangeEvent",
     "PopStateEvent", "Storage", "Worker", "WorkerGlobalScope", "XMLHttpRequest",
     "XMLHttpRequestUpload", "FileReader", "File", "FileList", "Blob",

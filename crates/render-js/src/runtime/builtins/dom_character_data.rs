@@ -139,6 +139,37 @@ impl JsRuntime {
             format!("{method}: offset is greater than the length of the data"),
         )
     }
+
+    /// `Node.prototype.normalize()` (DOM §4.4).
+    pub(in crate::runtime) fn node_normalize(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_node(receiver)?;
+        dom.normalize(node)?;
+        Ok(JsValue::Undefined)
+    }
+
+    /// `Text.prototype.splitText(offset)` (DOM §4.11.1). The receiver must be a
+    /// Text node, and the new node holding the rest of the data is returned.
+    pub(in crate::runtime) fn text_split_text(
+        &mut self,
+        dom: &mut Dom,
+        receiver: ObjectId,
+        arguments: &[JsValue],
+    ) -> Result<JsValue, JsError> {
+        let node = self.require_node(receiver)?;
+        if !matches!(
+            dom.node(node).map(render_dom::Node::kind),
+            Some(NodeKind::Text(_))
+        ) {
+            return Err(JsError::type_error("incompatible Text method receiver"));
+        }
+        let offset = self.offset_argument(dom, arguments, 0, "splitText")?;
+        let rest = dom.split_text(node, offset)?;
+        self.wrap_node(dom, rest)
+    }
 }
 
 /// The data of `node` as UTF-16 code units.

@@ -528,7 +528,7 @@ task queue 与 `queue_task`（`:344`）、microtask 队列与 `queue_microtask`�
 | `document.createElement / createTextNode / createComment` | ✅ `runtime/builtins/dom.rs:116,178` + `CreateComment`（`HANDOFF.md` 2026-09-27 记录，为修 jQuery 1.6.4 特征检测而补） |
 | `document.createDocumentFragment` | ✅ `runtime/eval.rs:3223-3225` + `runtime/builtins/dom.rs:126`；底层 `NodeKind::DocumentFragment`（`crates/render-dom/src/lib.rs:224,476`）与插入时展开（`:960-976`） |
 | `document.createEvent` / `compareDocumentPosition` / `attributes` 的 `NamedNodeMap` | 🟡 入口存在（`runtime/eval.rs:3226-3231`），❓ 行为保真度未核实 |
-| Range / Selection | 🟡 选择模型在引擎侧完整（`crates/render-core/src/interaction.rs:126-283`、`interaction/hit_test.rs`），**JS 侧 `Range`/`Selection` API 🔴** |
+| Range / Selection | 🟡 选择模型在引擎侧完整（`crates/render-core/src/interaction.rs:126-283`、`interaction/hit_test.rs`）；**JS 侧 `Range` API 已实现**（DOM §5，边界点随每次变更实时更新，`runtime/builtins/dom_range.rs`）；**JS 侧 `Selection` API 🔴**（`getSelection()` 是 prelude 空桩：`rangeCount` 恒为 0，`addRange` 无效） |
 | `MutationObserver` | ✅ `runtime/builtins/observers.rs:183-350`（基于 DOM mutation journal，`runtime/builtins/dom.rs:1069`） |
 | `IntersectionObserver` | 🟡 已实现（`observers.rs:60-171`），但它服务的布局信息是合成的，❓ 语义保真度未核实 |
 | `ResizeObserver` | 🔴 反证：`crates/render-js/examples/qq_bundle_probe.rs:191-192` 自己 polyfill 了它 |
