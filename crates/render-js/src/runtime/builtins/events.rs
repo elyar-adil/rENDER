@@ -607,10 +607,22 @@ impl JsRuntime {
         // script assigns directly, so `window.onload = f` and `onload = f` both
         // reach here, as does `document.onreadystatechange = f`.
         //
-        // `window.onerror` is excluded. It takes the message, source, position and
-        // error arguments and cancels when it returns true; that form is not
-        // implemented, so it is left unrun rather than run with the event object
-        // in place of those arguments.
+        // `window.onerror` for an uncaught error. An `ErrorEvent` reaches it in the
+        // five-argument form and a true return value cancels the event (HTML
+        // 8.1.8.1, OnErrorEventHandler). The generic handler below does not run it
+        // for `error` at the window, so it runs once.
+        if !capture_pass
+            && event_type == "error"
+            && matches!(stop, Stop::Window(_))
+            && self
+                .event_flags
+                .get(&event)
+                .is_some_and(|flags| flags.error_event && !flags.stop_immediate)
+            && let Some(JsValue::Object(callback)) = self.realm.get_property(current, "onerror")
+            && Self::is_callable_object(callback, &self.realm)
+        {
+            self.call_window_onerror(dom, callback, current, event)?;
+        }
         // The owner is the object `stop_wrapper` names for this stop, which is
         // already the right realm's window or document.
         let owner = match stop {
@@ -637,6 +649,36 @@ impl JsRuntime {
             self.call_listener(dom, &listener, event, current, event_type)?;
         }
         Ok(())
+    }
+
+    /// Call `window.onerror` with the five arguments an `ErrorEvent` carries. A
+    /// return value of `true` cancels the event, as the attribute's type says. A
+    /// handler that throws is not reported again: `call_listener` avoids the same
+    /// recursion for `error` listeners.
+    fn call_window_onerror(
+        &mut self,
+        dom: &mut Dom,
+        callback: ObjectId,
+        window: ObjectId,
+        event: ObjectId,
+    ) -> Result<(), JsError> {
+        let arguments: Vec<JsValue> = ["message", "filename", "lineno", "colno", "error"]
+            .into_iter()
+            .map(|name| {
+                self.realm
+                    .get_property(event, name)
+                    .unwrap_or(JsValue::Undefined)
+            })
+            .collect();
+        match self.call_with_this(dom, callback, &arguments, JsValue::Object(window)) {
+            Ok(JsValue::Boolean(true)) => {
+                self.with_event_flags(event, |canceled, _| *canceled = true);
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == crate::JsErrorKind::ResourceLimit => Err(error),
+            Err(_) => Ok(()),
+        }
     }
 
     /// Call one listener. A listener that throws is reported and the dispatch
@@ -702,6 +744,12 @@ impl JsRuntime {
         event_type: &str,
         bubbles: bool,
     ) -> Result<bool, JsError> {
+        // An uncaught error's event is an `ErrorEvent`. The flag is taken here, so
+        // a later dispatch of the same object is not mistaken for it.
+        let error_event = self
+            .pending_error_event
+            .take_if(|pending| *pending == event)
+            .is_some();
         let target_wrapper = self.stop_wrapper(dom, Stop::Node(target))?;
         self.realm
             .set_property(event, "target".to_owned(), JsValue::Object(target_wrapper));
@@ -738,6 +786,7 @@ impl JsRuntime {
             event,
             EventFlags {
                 path: wrappers,
+                error_event,
                 ..EventFlags::default()
             },
         );

@@ -410,3 +410,101 @@ fn time_stamp_is_coarsened_to_a_hundred_microseconds() {
         "true"
     );
 }
+
+/// Run `source` as a classic script that throws, then read the log the page's
+/// `seen` array collected. The script's name is given as its `filename`.
+fn uncaught_error_log(setup: &str, source: &str, filename: &str) -> String {
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(&mut dom, &format!("var seen = []; {setup}"))
+        .expect("setup");
+    assert!(
+        runtime
+            .execute_with_filename(&mut dom, source, filename)
+            .is_err(),
+        "the script was meant to throw"
+    );
+    runtime
+        .execute(&mut dom, "seen.join(';')")
+        .expect("read the log")
+        .value
+        .to_js_string()
+        .to_lossy()
+}
+
+#[test]
+fn window_onerror_is_called_with_the_five_error_event_arguments() {
+    // HTML 8.1.8.1: an ErrorEvent reaches `window.onerror` as (message, filename,
+    // lineno, colno, error), and the filename is the script's own URL.
+    assert_eq!(
+        uncaught_error_log(
+            "window.onerror = function (message, filename, lineno, colno, error) { \
+             seen.push([arguments.length, typeof message, filename, \
+             error instanceof Error, error.message].join('|')); };",
+            "throw new Error('boom')",
+            "http://web-platform.test/resources/helper.js",
+        ),
+        "5|string|http://web-platform.test/resources/helper.js|true|boom"
+    );
+}
+
+#[test]
+fn an_error_listener_gets_the_event_and_not_the_onerror_arguments() {
+    // `addEventListener('error')` is an ordinary listener: one argument, the event.
+    assert_eq!(
+        uncaught_error_log(
+            "window.addEventListener('error', function (event) { \
+             seen.push([arguments.length, event.type, event.message].join('|')); });",
+            "throw new Error('boom')",
+            "http://web-platform.test/a.js",
+        ),
+        "1|error|boom"
+    );
+}
+
+#[test]
+fn window_onerror_runs_once_for_an_uncaught_error_and_not_as_a_plain_listener() {
+    // The generic `on<type>` path must not also call `window.onerror` with the
+    // event object: if it did, the log would hold a second entry.
+    assert_eq!(
+        uncaught_error_log(
+            "window.onerror = function () { seen.push('onerror:' + arguments.length); };",
+            "throw new Error('boom')",
+            "http://web-platform.test/a.js",
+        ),
+        "onerror:5"
+    );
+}
+
+#[test]
+fn an_inline_script_reports_the_document_as_filename_and_the_name_does_not_linger() {
+    // A script read from a URL names that URL only while it runs. The next script
+    // that is not read from a URL reports the document, as an inline script does.
+    let mut dom = parse_document("<!doctype html><html><body></body></html>").dom;
+    let mut runtime = JsRuntime::new(&dom);
+    runtime
+        .execute(
+            &mut dom,
+            "var seen = []; window.onerror = function (message, filename) { seen.push(filename); };",
+        )
+        .expect("setup");
+    assert!(
+        runtime
+            .execute_with_filename(&mut dom, "throw new Error('named')", "http://x.test/n.js")
+            .is_err()
+    );
+    assert!(
+        runtime
+            .execute(&mut dom, "throw new Error('inline')")
+            .is_err()
+    );
+    let log = runtime
+        .execute(&mut dom, "seen.join(';') + '#' + location.href")
+        .expect("read the log")
+        .value
+        .to_js_string()
+        .to_lossy();
+    let (names, href) = log.split_once('#').expect("log separator");
+    assert_eq!(names, format!("http://x.test/n.js;{href}"));
+}

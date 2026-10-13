@@ -209,6 +209,9 @@ pub(super) struct EventFlags {
     pub(super) in_passive_listener: bool,
     /// What `composedPath()` returns: the objects the event travels through.
     pub(super) path: Vec<ObjectId>,
+    /// The event is an `ErrorEvent` raised by an uncaught error, so the window's
+    /// `onerror` handler is called with the five error arguments.
+    pub(super) error_event: bool,
 }
 
 /// How a user function is created, beyond its name, parameters and body.

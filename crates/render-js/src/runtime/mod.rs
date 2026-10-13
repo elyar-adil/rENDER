@@ -234,6 +234,14 @@ pub struct JsRuntime {
     transient_roots: Vec<ObjectId>,
     /// Byte offsets where each source line starts, for error positioning.
     source_line_starts: Vec<usize>,
+    /// The URL of the classic script that [`Self::execute_with_filename`] is
+    /// running. An uncaught error reports it as the error event's `filename`;
+    /// `None` reports the document's URL, as for an inline script.
+    script_filename: Option<String>,
+    /// The `error` event that [`Self::report_uncaught_error`] is dispatching. Its
+    /// listeners see an `ErrorEvent`, which is what selects the five-argument
+    /// `window.onerror` form.
+    pending_error_event: Option<ObjectId>,
     /// JS-visible cookies (`document.cookie`), keyed by name.
     js_cookie_jar: BTreeMap<String, String>,
     random_state: u64,
@@ -325,6 +333,8 @@ impl JsRuntime {
             coroutine_code: BTreeMap::new(),
             async_generators: BTreeMap::new(),
             prelude_error: None,
+            script_filename: None,
+            pending_error_event: None,
             functions: Vec::new(),
             class_frames: Vec::new(),
             root_strict: false,
@@ -1002,7 +1012,13 @@ impl JsRuntime {
             ("message", JsValue::String(message)),
             (
                 "filename",
-                JsValue::String((self.document_url_string()).into()),
+                JsValue::String(
+                    (self
+                        .script_filename
+                        .clone()
+                        .unwrap_or_else(|| self.document_url_string()))
+                    .into(),
+                ),
             ),
             (
                 "lineno",
@@ -1022,6 +1038,7 @@ impl JsRuntime {
         let document = self.contexts[self.realm.current_realm().0]
             .document
             .unwrap_or_else(|| dom.document());
+        self.pending_error_event = Some(event);
         let _ = self.dispatch_prepared_event(dom, document, event, "error", false);
     }
 
@@ -1056,6 +1073,30 @@ impl JsRuntime {
             }
         };
         self.execute_compiled(dom, &script)
+    }
+
+    /// Parse and run one classic script that was read from `filename`.
+    ///
+    /// An uncaught error in the script reports `filename` as the error event's
+    /// `filename`, which is the script's URL rather than the document's. That is the
+    /// HTML "report the exception" rule for a script with a URL. The name applies to
+    /// the script's own top-level code: a function it defines and that runs later
+    /// reports the document, because the runtime does not record where a function
+    /// was defined.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::execute`].
+    pub fn execute_with_filename(
+        &mut self,
+        dom: &mut Dom,
+        source: &str,
+        filename: &str,
+    ) -> Result<ScriptOutcome, JsError> {
+        self.script_filename = Some(filename.to_owned());
+        let outcome = self.execute(dom, source);
+        self.script_filename = None;
+        outcome
     }
 
     /// Defines `name` on `target` as a function that runs `host` when called. An
