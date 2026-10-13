@@ -997,7 +997,15 @@ fn dispatch_dom_event_walks_ancestors_and_reports_prevention() {
         parsed.dom.children(div).unwrap_or_default()[0]
     };
     let allowed = runtime
-        .dispatch_dom_event(&mut parsed.dom, child, "custompress", true, true, &[])
+        .dispatch_dom_event(
+            &mut parsed.dom,
+            child,
+            "custompress",
+            true,
+            true,
+            false,
+            &[],
+        )
         .expect("trusted dispatch should run listeners");
     assert!(!allowed, "preventDefault must cancel the default action");
 }

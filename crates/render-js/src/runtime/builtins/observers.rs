@@ -333,6 +333,9 @@ impl JsRuntime {
                         MutationKind::ChildList { .. } => watch.child_list,
                         MutationKind::Attribute { .. } => watch.attributes,
                         MutationKind::CharacterData { .. } => watch.character_data,
+                        // A shadow root queues no record (DOM §4.2.2): it is
+                        // only a rendering invalidation.
+                        MutationKind::ShadowRootAttached { .. } => false,
                     };
                     if relevant && matches {
                         delivered.push(record.clone());
@@ -396,6 +399,11 @@ impl JsRuntime {
         let object = self.realm.create_object(None);
         let kind = &record.kind;
         let (type_name, target, attribute_name, added, removed) = match kind {
+            // Never queued for script: `queue_mutation_deliveries` filters it out,
+            // so this record never reaches a converted value.
+            MutationKind::ShadowRootAttached { .. } => {
+                return Ok(JsValue::Null);
+            }
             MutationKind::ChildList {
                 target,
                 added,

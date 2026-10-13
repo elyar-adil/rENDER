@@ -193,6 +193,13 @@ pub(super) const INTERFACES: &[(&str, &[Reflected])] = &[
     (
         "Element",
         &[
+            // DOM §4.2.2.2: the `slot` IDL attribute reflects the `slot` content
+            // attribute, which names the slot a child is assigned to.
+            Reflected {
+                idl: "slot",
+                attribute: "slot",
+                reflection: Reflection::String,
+            },
             Reflected {
                 idl: "ariaAtomic",
                 attribute: "aria-atomic",

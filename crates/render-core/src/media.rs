@@ -506,6 +506,12 @@ fn collect_elements(dom: &Dom, limit: usize) -> (Vec<NodeId>, Vec<MediaDiscovery
             elements.push(node);
         }
         pending.extend(current.children().iter().rev());
+        // The shadow-including walk: a host's shadow root is visited before its
+        // light children, so it is pushed last and popped first. A video in a
+        // shadow tree is discovered whether or not a slot renders it.
+        if let Some(root) = dom.shadow_root(node) {
+            pending.push(root);
+        }
     }
     (elements, diagnostics)
 }
@@ -573,12 +579,58 @@ fn attribute<'a>(element: &'a ElementData, name: &str) -> Option<&'a str> {
 mod tests {
     use url::Url;
 
+    use crate::dom::{Dom, NodeId, ShadowRootMode, SlotAssignmentMode};
     use crate::html::parse_document;
 
     use super::{
         MediaDiscoveryDiagnosticCode, MediaKind, MediaLimits, MediaPreload, discover_media,
         media_poster_key_is_current, media_source_key_is_current,
     };
+
+    fn by_id(dom: &Dom, id: &str) -> NodeId {
+        let mut pending = vec![dom.document()];
+        while let Some(node) = pending.pop() {
+            if dom.attribute(node, "id").ok().flatten() == Some(id) {
+                return node;
+            }
+            pending.extend(dom.children(node).unwrap_or_default().iter().rev());
+        }
+        panic!("missing test element #{id}");
+    }
+
+    #[test]
+    fn discovers_a_video_in_a_shadow_tree() {
+        let mut parsed = parse_document("<div id=host></div>");
+        let host = by_id(&parsed.dom, "host");
+        let root = parsed
+            .dom
+            .attach_shadow(host, ShadowRootMode::Open, false, SlotAssignmentMode::Named)
+            .expect("a div can host a shadow root");
+        let video = parsed.dom.create_element("video");
+        let source = parsed.dom.create_element("source");
+        parsed
+            .dom
+            .set_attribute(source, "src", "/media/shadow.mp4")
+            .expect("set the source's src");
+        parsed
+            .dom
+            .set_attribute(source, "type", "video/mp4")
+            .expect("set the source's type");
+        parsed
+            .dom
+            .append_child(video, source)
+            .expect("append the source");
+        parsed
+            .dom
+            .append_child(root, video)
+            .expect("append the video to the shadow root");
+        let document_url = Url::parse("https://example.test/page/index.html").unwrap();
+        let discovery = discover_media(&parsed.dom, &document_url, MediaLimits::default());
+
+        assert_eq!(discovery.media.len(), 1);
+        assert_eq!(discovery.media[0].owner, video);
+        assert_eq!(discovery.media[0].candidates.len(), 1);
+    }
 
     #[test]
     fn discovers_video_metadata_from_multiple_typed_sources() {

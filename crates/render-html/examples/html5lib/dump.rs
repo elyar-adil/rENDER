@@ -128,7 +128,7 @@ fn dump_node(dom: &Dom, node: NodeId, depth: usize, out: &mut Vec<String>) {
         NodeKind::ProcessingInstruction { target, data } => {
             out.push(format!("|{}<?{target} {data}>", pad(depth)));
         }
-        NodeKind::Document | NodeKind::DocumentFragment => {
+        NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
             for child in dom.children(node).unwrap_or_default() {
                 dump_node(dom, *child, depth, out);
             }

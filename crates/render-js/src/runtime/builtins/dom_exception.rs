@@ -91,7 +91,10 @@ pub(in crate::runtime) enum DomExceptionName {
     /// by `render-dom` as `WrongDocument`.
     WrongDocument,
     /// A range operation the range's state does not allow, such as
-    /// `surroundContents` over a partially selected element (DOM §5.2).
+    /// `surroundContents` over a partially selected element (DOM §5.2), and an
+    /// operation on a node already in a state forbidding it, such as a second
+    /// `attachShadow` on one host (DOM §2.8.1, reported by `render-dom` as
+    /// `InvalidState`).
     InvalidState,
     /// A qualified name whose prefix, namespace and local name disagree (DOM §4.9.1).
     Namespace,
@@ -111,9 +114,9 @@ impl DomExceptionName {
             Self::HierarchyRequest => "HierarchyRequestError",
             Self::NotFound => "NotFoundError",
             Self::InvalidNodeType => "InvalidNodeTypeError",
+            Self::InvalidState => "InvalidStateError",
             Self::IndexSize => "IndexSizeError",
             Self::WrongDocument => "WrongDocumentError",
-            Self::InvalidState => "InvalidStateError",
             Self::Namespace => "NamespaceError",
         }
     }

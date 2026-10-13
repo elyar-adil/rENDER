@@ -46,7 +46,7 @@ fn serialize(dom: &render_core::dom::Dom, node: render_core::dom::NodeId, out: &
         NodeKind::Comment(_)
         | NodeKind::DocumentType(_)
         | NodeKind::ProcessingInstruction { .. } => {}
-        NodeKind::Document | NodeKind::DocumentFragment => {
+        NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
             for child in dom.children(node).unwrap_or_default() {
                 serialize(dom, *child, out);
             }

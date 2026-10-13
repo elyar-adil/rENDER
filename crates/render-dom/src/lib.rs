@@ -12,10 +12,15 @@ use std::fmt;
 mod clone;
 mod focus;
 mod range;
+mod shadow;
 mod text;
 
 pub use focus::parse_html_integer;
 pub use range::{BoundaryPoint, RangeId, RangeKind};
+pub use shadow::{
+    EventPathStep, ShadowRootData, ShadowRootMode, SlotAssignmentMode,
+    is_valid_custom_element_name, is_valid_shadow_host_name,
+};
 
 const DEFAULT_MUTATION_JOURNAL_CAPACITY: usize = 4_096;
 
@@ -66,6 +71,12 @@ pub enum MutationKind {
     CharacterData {
         target: NodeId,
     },
+    /// A shadow root was attached to `host` (DOM §4.2.2 `attachShadow`). It
+    /// changes what the host renders, but queues no mutation record for script,
+    /// so mutation observers never see it.
+    ShadowRootAttached {
+        host: NodeId,
+    },
 }
 
 impl MutationKind {
@@ -75,13 +86,16 @@ impl MutationKind {
             Self::ChildList { target, .. }
             | Self::Attribute { target, .. }
             | Self::CharacterData { target } => *target,
+            Self::ShadowRootAttached { host } => *host,
         }
     }
 
     #[must_use]
     pub const fn impact(&self) -> MutationImpact {
         match self {
-            Self::ChildList { .. } | Self::Attribute { .. } => MutationImpact::ALL_RENDERING,
+            Self::ChildList { .. } | Self::Attribute { .. } | Self::ShadowRootAttached { .. } => {
+                MutationImpact::ALL_RENDERING
+            }
             Self::CharacterData { .. } => MutationImpact::LAYOUT_PAINT_ACCESSIBILITY,
         }
     }
@@ -287,6 +301,14 @@ pub struct ElementData {
     /// to child traversal, `getElementById`, and selector matching over the
     /// document. See [`Dom::template_contents`].
     pub template_contents: Option<NodeId>,
+    /// The shadow root attached to this element by `attachShadow`, whatever its
+    /// mode. Like [`Self::template_contents`] it is not a child of the element;
+    /// see [`Dom::shadow_root`].
+    pub shadow_root: Option<NodeId>,
+    /// The nodes this element has been given as a slot in a manual-assignment
+    /// shadow tree, by `slot.assign(...)`, in the order given. Only a slot uses
+    /// it. See [`Dom::assign_slot_nodes`].
+    pub manually_assigned_nodes: Vec<NodeId>,
     /// The form owner the HTML parser associated with this element through the
     /// form element pointer, and the parent it was created for. `None` for every
     /// element the parser did not associate that way, which is every element
@@ -317,6 +339,32 @@ pub struct DocumentTypeData {
 /// only state the form owner needs, and it is invalidated by reading it: it
 /// applies only while the element is still the child it was created for, which
 /// is exactly when the parser's association is still the current one.
+/// Shift every node id a kind stores, for a tree moved into a larger arena by
+/// [`Dom::graft_document`].
+fn shift_kind(kind: NodeKind, shift: impl Fn(NodeId) -> NodeId + Copy) -> NodeKind {
+    match kind {
+        NodeKind::Element(mut data) => {
+            data.template_contents = data.template_contents.map(shift);
+            data.shadow_root = data.shadow_root.map(shift);
+            for node in &mut data.manually_assigned_nodes {
+                *node = shift(*node);
+            }
+            data.parser_inserted_form_owner =
+                data.parser_inserted_form_owner
+                    .map(|owner| ParserInsertedFormOwner {
+                        form: shift(owner.form),
+                        intended_parent: shift(owner.intended_parent),
+                    });
+            NodeKind::Element(data)
+        }
+        NodeKind::ShadowRoot(mut data) => {
+            data.host = shift(data.host);
+            NodeKind::ShadowRoot(data)
+        }
+        other => other,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParserInsertedFormOwner {
     /// The element the parser's form element pointer was set to.
@@ -330,11 +378,17 @@ pub struct ParserInsertedFormOwner {
 pub enum NodeKind {
     Document,
     DocumentFragment,
+    /// A shadow root (DOM §4.2.2.1). It behaves as a document fragment, and it is
+    /// the root of a shadow tree, not a child of its host.
+    ShadowRoot(ShadowRootData),
     DocumentType(DocumentTypeData),
     Element(ElementData),
     Text(String),
     Comment(String),
-    ProcessingInstruction { target: String, data: String },
+    ProcessingInstruction {
+        target: String,
+        data: String,
+    },
 }
 
 impl NodeKind {
@@ -342,7 +396,7 @@ impl NodeKind {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Document => "#document",
-            Self::DocumentFragment => "#document-fragment",
+            Self::DocumentFragment | Self::ShadowRoot(_) => "#document-fragment",
             Self::DocumentType(_) => "#doctype",
             Self::Element(_) => "element",
             Self::Text(_) => "#text",
@@ -391,9 +445,13 @@ pub enum DomErrorKind {
     IndexSize,
     /// A node or range from another tree or document (DOM §5.2).
     WrongDocument,
-    /// An operation the specification names with an unknown argument (DOM §5.2).
+    /// The node cannot have the requested capability at all, for example a shadow
+    /// root on an element that cannot host one, or an operation the specification
+    /// names with an unknown argument (DOM `NotSupportedError`).
     NotSupported,
-    /// A range whose state does not allow the operation (DOM §5.2).
+    /// A range whose state does not allow the operation (DOM §5.2), or a node in a
+    /// state that forbids it, for example a second shadow root on one host (DOM
+    /// `InvalidStateError`).
     InvalidState,
 }
 
@@ -526,7 +584,7 @@ impl Dom {
                 id: shift(node.id),
                 parent: node.parent.map(shift),
                 children: node.children.into_iter().map(shift).collect(),
-                kind: node.kind,
+                kind: shift_kind(node.kind, shift),
             });
         }
         shift(other.document)
@@ -624,16 +682,12 @@ impl Dom {
             .copied()
     }
 
+    /// Whether `node` is connected: its shadow-including root is the document
+    /// (DOM §4.4 `isConnected`). A node in a shadow tree is connected when its
+    /// host is.
     #[must_use]
     pub fn is_connected(&self, node: NodeId) -> bool {
-        let mut current = Some(node);
-        while let Some(candidate) = current {
-            if candidate == self.document {
-                return true;
-            }
-            current = self.parent(candidate);
-        }
-        false
+        self.shadow_including_root(node) == self.document
     }
 
     pub fn create_document_fragment(&mut self) -> NodeId {
@@ -981,7 +1035,9 @@ impl Dom {
     ) -> Result<NodeId, DomError> {
         let effective_reference = self.pre_insert_checks(parent, node, reference)?;
         let insertion_nodes = match self.kind(node)? {
-            NodeKind::DocumentFragment => self.children(node).unwrap_or_default().to_vec(),
+            NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
+                self.children(node).unwrap_or_default().to_vec()
+            }
             _ => vec![node],
         };
 
@@ -1357,7 +1413,10 @@ impl Dom {
 
     fn validate_parent_kind(&self, parent: NodeId) -> Result<(), DomError> {
         match self.kind(parent)? {
-            NodeKind::Document | NodeKind::DocumentFragment | NodeKind::Element(_) => Ok(()),
+            NodeKind::Document
+            | NodeKind::DocumentFragment
+            | NodeKind::ShadowRoot(_)
+            | NodeKind::Element(_) => Ok(()),
             _ => Err(DomError::hierarchy(
                 "only Document, DocumentFragment, and Element can be insertion parents",
             )),
@@ -1367,7 +1426,10 @@ impl Dom {
     fn validate_child_kind(&self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         let parent_kind = self.kind(parent)?;
         let child_kind = self.kind(child)?;
-        if matches!(child_kind, NodeKind::Document | NodeKind::DocumentFragment) {
+        if matches!(
+            child_kind,
+            NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_)
+        ) {
             return Err(DomError::hierarchy(
                 "Document cannot be inserted and DocumentFragment must be expanded",
             ));
@@ -1381,9 +1443,11 @@ impl Dom {
                 NodeKind::Text(_) => Err(DomError::hierarchy(
                     "Text nodes cannot be children of Document",
                 )),
-                NodeKind::Document | NodeKind::DocumentFragment => unreachable!(),
+                NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
+                    unreachable!()
+                }
             },
-            NodeKind::DocumentFragment | NodeKind::Element(_) => {
+            NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) | NodeKind::Element(_) => {
                 if matches!(child_kind, NodeKind::DocumentType(_)) {
                     Err(DomError::hierarchy(
                         "DocumentType can only be inserted into Document",
@@ -1435,7 +1499,10 @@ impl Dom {
                     }
                 }
                 NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. } => {}
-                NodeKind::Text(_) | NodeKind::Document | NodeKind::DocumentFragment => {
+                NodeKind::Text(_)
+                | NodeKind::Document
+                | NodeKind::DocumentFragment
+                | NodeKind::ShadowRoot(_) => {
                     return Err(DomError::hierarchy("invalid child type in Document"));
                 }
             }
@@ -1568,6 +1635,8 @@ impl Dom {
             local_name,
             attributes: Vec::new(),
             template_contents,
+            shadow_root: None,
+            manually_assigned_nodes: Vec::new(),
             parser_inserted_form_owner: None,
         }
     }

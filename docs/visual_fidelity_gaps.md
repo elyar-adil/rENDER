@@ -2639,3 +2639,38 @@ The rules that follow, for briefs and for me:
 - **A test must never encode a defect as expected behaviour.** Several agents caught
   themselves doing this and corrected the test rather than the code; that is the signal
   the standard is working.
+
+## Shadow trees: the core is in, and shadow-scoped styling is open
+
+Shadow trees exist now (DOM §4.2.2, §2.9): `attachShadow`, named and manual slot
+assignment, the flat tree that style and layout walk, retargeted events, and image and
+video discovery through the shadow-including tree, so a shadow tree's images load. Three
+items are not closed, and they are recorded here rather than papered over.
+
+- **Shadow-tree stylesheets are not collected.** The author-sheet walk in
+  `crates/render-core/src/document.rs` (`collect_author_style_sheets`) follows the DOM
+  child lists from the document, and a shadow root is never one of them, so a `<style>`
+  or `<link rel=stylesheet>` inside a shadow root applies nowhere. The cascade
+  (`crates/render-css/src/cascade.rs`, `cascade_element_with_origins`) also drops every
+  author-origin sheet for an element inside a shadow tree, so a document rule cannot leak
+  into shadow content. User-agent and user rules, and inline styles, still apply there.
+  The consequence is that shadow content is styled by the user-agent sheet and by
+  inheritance only.
+- **`:host` and `::slotted` match nothing.** The selector grammar parses them, and
+  `crates/render-css/src/selector.rs` (`shadow_dom_pseudo_classes_parse_and_match_nothing`)
+  pins that. Closing the first item is what makes `:host` meaningful, because a
+  shadow sheet has to be scoped to its own root and matched with `:host` against the
+  host.
+- **`slotchange` is not dispatched.** The slot-change signal of DOM §4.2.2.5 is absent,
+  so a script that waits for `slotchange` never runs. Assignment itself is current:
+  `assignedNodes`, `assignedElements` and `assignedSlot` read the live assignment.
+
+What closing the styling items needs: collect `<style>` and stylesheet `<link>` elements
+under each shadow root with the root as their owner; pass the owner to the cascade so a
+sheet applies only to elements whose root is that owner; give `MatchContext` the host of
+the element's shadow tree so `:host` can match it; and match `::slotted()` against the
+nodes assigned to a slot in that tree. The style-invalidation roots also need the host
+added when a mutation lands inside a shadow tree, because the invalidation keys on the
+mutation target and a shadow root is not in the flat tree. Closing `slotchange` needs a
+slot-change signal queued from assignment changes and delivered at the microtask
+checkpoint, as DOM §4.2.2.5 describes.

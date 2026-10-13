@@ -85,6 +85,10 @@ pub struct PageDomEvent {
     pub event_type: String,
     pub bubbles: bool,
     pub cancelable: bool,
+    /// Whether the event crosses a shadow root (DOM §2.9 `composed`). The UI
+    /// events a user agent generates from input are composed by their own
+    /// specifications, and everything else is not.
+    pub composed: bool,
     /// Extra event properties beyond the standard Event fields, such as
     /// `key` on keyboard events.
     pub properties: Vec<(String, JsValue)>,
@@ -98,6 +102,7 @@ impl PageDomEvent {
             event_type: event_type.to_owned(),
             bubbles: false,
             cancelable: false,
+            composed: false,
             properties: Vec::new(),
         }
     }
@@ -111,6 +116,12 @@ impl PageDomEvent {
     #[must_use]
     pub const fn cancelable(mut self, cancelable: bool) -> Self {
         self.cancelable = cancelable;
+        self
+    }
+
+    #[must_use]
+    pub const fn composed(mut self, composed: bool) -> Self {
+        self.composed = composed;
         self
     }
 }
@@ -926,7 +937,8 @@ impl Page {
         self.queue_dom_event(
             PageDomEvent::new(target, "click")
                 .bubbles(true)
-                .cancelable(true),
+                .cancelable(true)
+                .composed(true),
         )
     }
 
@@ -937,7 +949,11 @@ impl Page {
     ///
     /// Returns a typed scheduler resource-limit error.
     pub fn queue_input_event(&mut self, target: NodeId) -> Result<TaskId, PageQueueError> {
-        self.queue_dom_event(PageDomEvent::new(target, "input").bubbles(true))
+        self.queue_dom_event(
+            PageDomEvent::new(target, "input")
+                .bubbles(true)
+                .composed(true),
+        )
     }
 
     /// Queue a trusted cancelable `keydown` event at the document.
@@ -968,7 +984,9 @@ impl Page {
         target: NodeId,
         key: &str,
     ) -> Result<TaskId, PageQueueError> {
-        let mut event = PageDomEvent::new(target, "keydown").cancelable(true);
+        let mut event = PageDomEvent::new(target, "keydown")
+            .cancelable(true)
+            .composed(true);
         event
             .properties
             .push(("key".to_owned(), JsValue::String(key.into())));
@@ -1642,6 +1660,7 @@ fn execute_task(
                 &event.event_type,
                 event.bubbles,
                 event.cancelable,
+                event.composed,
                 &properties,
             )?;
             Ok(ScriptOutcome {

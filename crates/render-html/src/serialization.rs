@@ -204,7 +204,7 @@ fn serialize_node(dom: &Dom, node: NodeId, output: &mut String, scripting_enable
             output.push_str(data);
             output.push_str("?>");
         }
-        NodeKind::Document | NodeKind::DocumentFragment => {
+        NodeKind::Document | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_) => {
             for child in node_ref.children() {
                 serialize_node(dom, *child, output, scripting_enabled);
             }

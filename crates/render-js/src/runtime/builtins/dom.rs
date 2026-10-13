@@ -431,6 +431,53 @@ impl JsRuntime {
                 let candidate = self.value_as_node(required_argument(arguments, 0, "contains")?)?;
                 Ok(JsValue::Boolean(dom_contains(dom, root, candidate)))
             }
+            NativeFunction::AttachShadow => {
+                let host = self.require_node(receiver)?;
+                let init = required_argument(arguments, 0, "attachShadow")?.clone();
+                let (mode, delegates_focus, slot_assignment) = self.shadow_root_init(dom, &init)?;
+                let root = dom.attach_shadow(host, mode, delegates_focus, slot_assignment)?;
+                self.wrap_node(dom, root)
+            }
+            NativeFunction::GetRootNode => {
+                let node = self.require_node(receiver)?;
+                let composed =
+                    self.option_flag(dom, arguments.first(), "composed", "getRootNode")?;
+                let root = dom.root_node(node, composed);
+                self.wrap_node(dom, root)
+            }
+            NativeFunction::SlotAssign => {
+                let slot = self.require_node(receiver)?;
+                let mut nodes = Vec::with_capacity(arguments.len());
+                for value in arguments {
+                    let node = self.value_as_node(value)?;
+                    // A slottable is an element or a text node (DOM §4.2.2.2).
+                    if !is_element_node(dom, node) && !is_text_node(dom, node) {
+                        return Err(JsError::type_error(
+                            "assign arguments must be elements or text nodes",
+                        ));
+                    }
+                    nodes.push(node);
+                }
+                dom.assign_slot_nodes(slot, &nodes)?;
+                Ok(JsValue::Undefined)
+            }
+            NativeFunction::SlotAssignedNodes | NativeFunction::SlotAssignedElements => {
+                let slot = self.require_node(receiver)?;
+                let method = if function == NativeFunction::SlotAssignedElements {
+                    "assignedElements"
+                } else {
+                    "assignedNodes"
+                };
+                let flatten = self.option_flag(dom, arguments.first(), "flatten", method)?;
+                let elements_only = function == NativeFunction::SlotAssignedElements;
+                let values = dom
+                    .assigned_nodes(slot, flatten)
+                    .into_iter()
+                    .filter(|node| !elements_only || is_element_node(dom, *node))
+                    .map(|node| self.wrap_node(dom, node))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(JsValue::Object(self.create_array_from_values(&values)?))
+            }
             NativeFunction::Matches => {
                 let node = self.require_node(receiver)?;
                 let selector = required_argument(arguments, 0, "matches")?.to_js_string();
@@ -1549,7 +1596,10 @@ impl JsRuntime {
             dom.set_character_data(node, value)?;
             return Ok(());
         }
-        if !matches!(kind, NodeKind::Element(_) | NodeKind::DocumentFragment) {
+        if !matches!(
+            kind,
+            NodeKind::Element(_) | NodeKind::DocumentFragment | NodeKind::ShadowRoot(_)
+        ) {
             return Ok(());
         }
         let children = dom.children(node).unwrap_or_default().to_vec();
@@ -1566,6 +1616,84 @@ impl JsRuntime {
             dom.append_child(node, text)?;
         }
         Ok(())
+    }
+
+    /// One boolean member of an options dictionary (`WebIDL` §3.10.23): `undefined`
+    /// and `null` leave the dictionary empty, so the member is `false`; any other
+    /// non-object is a conversion failure.
+    pub(in crate::runtime) fn option_flag(
+        &mut self,
+        dom: &mut Dom,
+        options: Option<&JsValue>,
+        member: &str,
+        method: &str,
+    ) -> Result<bool, JsError> {
+        match options {
+            None | Some(JsValue::Null | JsValue::Undefined) => Ok(false),
+            Some(JsValue::Object(object)) => {
+                let object = *object;
+                Ok(self.get_member(dom, object, member)?.is_truthy())
+            }
+            Some(_) => Err(JsError::type_error(format!(
+                "{method} options must be an object"
+            ))),
+        }
+    }
+
+    /// The `ShadowRootInit` dictionary of `attachShadow` (DOM §4.2.2): the
+    /// required `mode`, and the `delegatesFocus` and `slotAssignment` members.
+    /// `clonable`, `serializable` and `customElementRegistry` are not
+    /// implemented, so they are not read.
+    pub(in crate::runtime) fn shadow_root_init(
+        &mut self,
+        dom: &mut Dom,
+        init: &JsValue,
+    ) -> Result<
+        (
+            render_dom::ShadowRootMode,
+            bool,
+            render_dom::SlotAssignmentMode,
+        ),
+        JsError,
+    > {
+        let object = match init {
+            JsValue::Object(object) => *object,
+            JsValue::Undefined | JsValue::Null => {
+                return Err(JsError::type_error(
+                    "attachShadow requires a ShadowRootInit with a mode",
+                ));
+            }
+            _ => {
+                return Err(JsError::type_error(
+                    "attachShadow init must be a ShadowRootInit object",
+                ));
+            }
+        };
+        let mode_value = self.get_member(dom, object, "mode")?;
+        let mode = match mode_value.to_js_string().to_lossy().as_str() {
+            "open" => render_dom::ShadowRootMode::Open,
+            "closed" => render_dom::ShadowRootMode::Closed,
+            _ => {
+                return Err(JsError::type_error(
+                    "ShadowRootMode must be \"open\" or \"closed\"",
+                ));
+            }
+        };
+        let delegates_focus = self.get_member(dom, object, "delegatesFocus")?.is_truthy();
+        let slot_value = self.get_member(dom, object, "slotAssignment")?;
+        let slot_assignment = match slot_value {
+            JsValue::Undefined => render_dom::SlotAssignmentMode::Named,
+            value => match value.to_js_string().to_lossy().as_str() {
+                "manual" => render_dom::SlotAssignmentMode::Manual,
+                "named" => render_dom::SlotAssignmentMode::Named,
+                _ => {
+                    return Err(JsError::type_error(
+                        "SlotAssignmentMode must be \"manual\" or \"named\"",
+                    ));
+                }
+            },
+        };
+        Ok((mode, delegates_focus, slot_assignment))
     }
 
     pub(in crate::runtime) fn require_document(&self, object: ObjectId) -> Result<NodeId, JsError> {
@@ -1656,6 +1784,22 @@ impl JsRuntime {
     }
 }
 
+/// Whether `node` is an element, whatever its namespace.
+pub(in crate::runtime) fn is_element_node(dom: &Dom, node: NodeId) -> bool {
+    matches!(
+        dom.node(node).map(render_dom::Node::kind),
+        Some(NodeKind::Element(_))
+    )
+}
+
+/// Whether `node` is a text node.
+pub(in crate::runtime) fn is_text_node(dom: &Dom, node: NodeId) -> bool {
+    matches!(
+        dom.node(node).map(render_dom::Node::kind),
+        Some(NodeKind::Text(_))
+    )
+}
+
 /// The DOM interface a node's wrapper should inherit from.
 pub(in crate::runtime) fn dom_interface_name(dom: &Dom, node: NodeId) -> &'static str {
     match dom.node(node).map(render_dom::Node::kind) {
@@ -1671,6 +1815,7 @@ pub(in crate::runtime) fn dom_interface_name(dom: &Dom, node: NodeId) -> &'stati
         Some(NodeKind::Text(_)) => "Text",
         Some(NodeKind::Comment(_)) => "Comment",
         Some(NodeKind::DocumentFragment) => "DocumentFragment",
+        Some(NodeKind::ShadowRoot(_)) => "ShadowRoot",
         Some(NodeKind::DocumentType(_)) => "DocumentType",
         Some(NodeKind::ProcessingInstruction { .. }) => "ProcessingInstruction",
         _ => "Node",
