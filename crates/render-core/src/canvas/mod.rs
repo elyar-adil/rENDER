@@ -39,6 +39,8 @@ mod limit_tests;
 #[cfg(test)]
 mod page_tests;
 #[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
 mod tests;
 
 use std::cell::RefCell;

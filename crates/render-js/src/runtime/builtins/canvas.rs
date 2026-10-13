@@ -436,7 +436,15 @@ impl JsRuntime {
         }
     }
 
-    /// `HTMLCanvasElement.prototype.getContext`. Only `"2d"` is supported;
+    /// `HTMLCanvasElement.prototype.getContext`. The options argument is
+    /// converted as `WebIDL` requires. These values are converted but not applied:
+    /// `alpha: false`, which requires an opaque bitmap (every alpha byte 255,
+    /// `clearRect` leaving opaque black); `colorSpace: "display-p3"`, which
+    /// requires the bitmap to be display-p3; `colorType: "float16"`, which
+    /// requires 16-bit float components; `desynchronized`, which the
+    /// specification says the context "might be" desynchronized; and
+    /// `willReadFrequently`, which only marks the context for readback
+    /// optimization. Only `"2d"` is supported;
     /// every other kind answers `null`, as the specification allows for a
     /// context the user agent does not implement.
     fn canvas_get_context(
@@ -466,6 +474,7 @@ impl JsRuntime {
                 )));
             }
         }
+        self.convert_context_settings(dom, arguments)?;
         let Some(host) = self.canvas_host.as_mut() else {
             return Ok(JsValue::Null);
         };
@@ -474,6 +483,46 @@ impl JsRuntime {
             Err(id) => id,
         };
         self.context_object(id, receiver)
+    }
+
+    /// The `CanvasRenderingContext2DSettings` dictionary of `getContext`, converted
+    /// as `WebIDL` requires: members are read in alphabetical order, so each getter
+    /// runs once, and an enumerated value outside its set is a `TypeError`, even
+    /// when the context already exists. The converted values are not applied to
+    /// the context; the members this surface ignores are listed on
+    /// `canvas_get_context`.
+    fn convert_context_settings(
+        &mut self,
+        dom: &mut Dom,
+        arguments: &[JsValue],
+    ) -> Result<(), JsError> {
+        let object = match arguments.get(1) {
+            None | Some(JsValue::Undefined | JsValue::Null) => return Ok(()),
+            Some(JsValue::Object(object)) => *object,
+            Some(_) => return Err(JsError::type_error("The options argument is not an object")),
+        };
+        self.get_value(dom, object, "alpha")?;
+        let color_space = self.get_value(dom, object, "colorSpace")?;
+        if !matches!(color_space, JsValue::Undefined) {
+            let text = self.canvas_to_string(dom, &color_space)?;
+            if !matches!(text.as_str(), "srgb" | "display-p3") {
+                return Err(JsError::type_error(format!(
+                    "The provided value '{text}' is not a valid enum value of type PredefinedColorSpace."
+                )));
+            }
+        }
+        let color_type = self.get_value(dom, object, "colorType")?;
+        if !matches!(color_type, JsValue::Undefined) {
+            let text = self.canvas_to_string(dom, &color_type)?;
+            if !matches!(text.as_str(), "unorm8" | "float16") {
+                return Err(JsError::type_error(format!(
+                    "The provided value '{text}' is not a valid enum value of type CanvasColorType."
+                )));
+            }
+        }
+        self.get_value(dom, object, "desynchronized")?;
+        self.get_value(dom, object, "willReadFrequently")?;
+        Ok(())
     }
 
     /// The context object of `id`, created on first request. Later requests
