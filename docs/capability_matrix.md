@@ -108,7 +108,7 @@ Verified by grep, not inferred. Full discussion in the register's S30.
 | **History API** | `pushState`/`replaceState` change the URL and `history.state` without a load. Back/forward/go within the document fire `popstate` without a load; entries of another document reload. `history.length` reflects the list at each turn's start |
 | **Iframes** | no second document, so any page embedding one loses that content entirely |
 | **Animations and transitions** | `@keyframes` is parsed, diagnosed and discarded - 249 blocks in the corpus. No clock, so nothing can be time-driven |
-| **Selection / Range** | no `getSelection`, `createRange`, or caret position APIs |
+| **Selection / Range** | Range is implemented (DOM §5): `Range`, `StaticRange`, `createRange`, the boundary-point and content algorithms, and live updates on every tree mutation. There is no `getSelection` selection state, so `getSelection()` reports an empty selection, and no caret position APIs |
 | **Shadow DOM** | no `customElements` or `attachShadow` |
 | **Compositing** | there is no compositor. Every frame is one raster of the whole document, which is why scrolling cannot be cheap and why `position: fixed` cannot be a layer |
 | **Bidi** | UAX #9 has zero occurrences, so right-to-left scripts lay out left-to-right. Correctly lower priority given the corpus, but recorded rather than left to be rediscovered |
