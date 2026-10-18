@@ -99,7 +99,8 @@ mod using_tests;
 
 pub use types::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
-    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerHandler, TimerKind,
+    TimerRequest,
 };
 
 /// Whether a history change may point `new` at the document URL `current`.
@@ -865,6 +866,10 @@ impl JsRuntime {
     /// (HTML 8.6), so the embedding must reschedule from the first value and
     /// report the second. A callback that cancelled its own interval gets no
     /// next run.
+    ///
+    /// An exception that escapes the handler is reported as an uncaught
+    /// exception (HTML 8.1.8.2, "report the exception") before this returns, so
+    /// the window `error` event runs for both the function and the string form.
     pub fn fire_timer_reporting(
         &mut self,
         dom: &mut Dom,
@@ -887,7 +892,18 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
-        let outcome = self.call(dom, entry.callback, &entry.arguments).map(|_| ());
+        let outcome = match &entry.handler {
+            TimerHandler::Callback(callback) => {
+                let outcome = self.call(dom, *callback, &entry.arguments).map(|_| ());
+                if let Err(error) = &outcome {
+                    self.report_uncaught_error(dom, error);
+                }
+                outcome
+            }
+            // `execute` reports its own compile and runtime failures, exactly as
+            // it does for any classic script, so nothing is reported twice.
+            TimerHandler::Script(source) => self.execute(dom, source).map(|_| ()),
+        };
         self.queue_mutation_deliveries(dom);
         self.sync_nested_contexts(dom);
         let repeats = entry.kind == TimerKind::Interval && self.timers.contains_key(&id);

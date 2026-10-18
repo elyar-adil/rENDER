@@ -22,6 +22,7 @@ use crate::runtime::coroutine_run::Resume;
 use crate::runtime::types::EnvironmentRecord;
 use crate::runtime::types::JsMicrotask;
 use crate::runtime::types::PromiseCapability;
+use crate::runtime::types::TimerHandler;
 use crate::value::ObjectHost;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -546,13 +547,15 @@ impl JsRuntime {
             }
         }
         for timer in self.timers.values() {
-            mark_object(
-                self,
-                &mut marked,
-                &mut work,
-                &mut marked_environments,
-                timer.callback,
-            );
+            if let TimerHandler::Callback(callback) = timer.handler {
+                mark_object(
+                    self,
+                    &mut marked,
+                    &mut work,
+                    &mut marked_environments,
+                    callback,
+                );
+            }
         }
         // An `Atomics.waitAsync` promise stays reachable until its waiter is
         // notified or times out, whether or not the script still holds it.

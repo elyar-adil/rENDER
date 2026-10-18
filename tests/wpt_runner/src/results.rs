@@ -22,6 +22,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::census::{AreaCensus, BlockerKey, Census, Exclusion};
+use crate::engine::SubtestEvidence;
 use crate::outcome::{Outcome, SkipReason, Tally};
 
 /// A JSON value this crate emits. Deliberately small: the alternative is a
@@ -587,10 +588,53 @@ pub struct FileResult {
     /// is what a reader acts on. A skip table grouped by bucket is a list of
     /// categories; a table grouped by mechanism is a work queue.
     pub mechanism: Option<String>,
+    /// What the harness reported about this file's subtests: the registered count,
+    /// the reported results, and how many reported subtests recorded no assertion
+    /// while they ran. `None` when no harness ran (census declines, fixtures, adapter
+    /// errors).
+    pub subtests: Option<SubtestEvidence>,
     pub notes: Vec<String>,
 }
 
+/// How much of a pass the run's own record supports. See
+/// [`SubtestEvidence::is_full`] for the full case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassEvidence {
+    /// Every registered subtest reported, and each recorded an assertion while it ran.
+    Full,
+    /// The harness reported, but not every subtest is covered: a subtest recorded
+    /// nothing, the registered count is unknown, or the counts disagree.
+    Partial,
+    /// The pass did not come from a harness record at all.
+    NoHarnessRecord,
+}
+
+impl PassEvidence {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+            Self::NoHarnessRecord => "no-harness-record",
+        }
+    }
+}
+
 impl FileResult {
+    /// For a pass, the evidence class; `None` for every other outcome.
+    #[must_use]
+    pub fn pass_evidence(&self) -> Option<PassEvidence> {
+        if self.outcome != Outcome::Pass {
+            return None;
+        }
+        Some(match self.subtests {
+            None => PassEvidence::NoHarnessRecord,
+            Some(evidence) if evidence.is_full() && self.assertions_evaluated > 0 => {
+                PassEvidence::Full
+            }
+            Some(_) => PassEvidence::Partial,
+        })
+    }
+
     fn to_json(&self) -> Json {
         Json::Object(vec![
             ("path".into(), Json::Str(self.path.clone())),
@@ -624,6 +668,27 @@ impl FileResult {
             (
                 "assertion_sites".into(),
                 Json::UInt(u64::from(self.assertion_sites)),
+            ),
+            (
+                "subtests_registered".into(),
+                self.subtests
+                    .and_then(|s| s.registered)
+                    .map_or(Json::Null, |n| Json::UInt(u64::from(n))),
+            ),
+            (
+                "subtests_reported".into(),
+                self.subtests
+                    .map_or(Json::Null, |s| Json::UInt(u64::from(s.reported))),
+            ),
+            (
+                "subtests_without_assertions".into(),
+                self.subtests
+                    .map_or(Json::Null, |s| Json::UInt(u64::from(s.without_assertions))),
+            ),
+            (
+                "pass_evidence".into(),
+                self.pass_evidence()
+                    .map_or(Json::Null, |e| Json::Str(e.label().into())),
             ),
             (
                 "mechanism".into(),
@@ -794,13 +859,16 @@ impl Report {
                     (
                         "note".into(),
                         Json::Str(
-                            "these are reported, not scored: a test with no assertion that can \
-                             fail would otherwise inflate the pass count"
+                            "static_no_assertion_site is a census fact about file text, and the \
+                             census veto uses it to decline passes. executed_with_zero_assertions_\
+                             evaluated is the run's own count: passes whose counter recorded no \
+                             assertion. Neither is inflated into a pass."
                                 .into(),
                         ),
                     ),
                 ]),
             ),
+            ("pass_evidence".into(), self.pass_evidence_json()),
             (
                 "executed_by_area".into(),
                 Json::Object(
@@ -814,8 +882,8 @@ impl Report {
         ])
     }
 
-    /// Passes where no assertion was evaluated. The observable form of a test
-    /// that cannot fail.
+    /// Passes whose run recorded no assertion. The observable form of a test that
+    /// cannot fail, counted from the run, not from the source.
     pub fn vacuous_passes(&self) -> u32 {
         self.executed
             .iter()
@@ -823,6 +891,41 @@ impl Report {
             .count()
             .try_into()
             .unwrap_or(u32::MAX)
+    }
+
+    /// Executed passes by evidence class: `(full, partial, no harness record)`.
+    /// The three counts sum to the number of passes.
+    #[must_use]
+    pub fn pass_evidence_counts(&self) -> (u32, u32, u32) {
+        let (mut full, mut partial, mut none) = (0_u32, 0_u32, 0_u32);
+        for file in &self.executed {
+            match file.pass_evidence() {
+                Some(PassEvidence::Full) => full += 1,
+                Some(PassEvidence::Partial) => partial += 1,
+                Some(PassEvidence::NoHarnessRecord) => none += 1,
+                None => {}
+            }
+        }
+        (full, partial, none)
+    }
+
+    /// The pass-evidence summary object, with the counts above.
+    fn pass_evidence_json(&self) -> Json {
+        let (full, partial, none) = self.pass_evidence_counts();
+        Json::Object(vec![
+            ("full".into(), Json::UInt(u64::from(full))),
+            ("partial".into(), Json::UInt(u64::from(partial))),
+            ("no_harness_record".into(), Json::UInt(u64::from(none))),
+            (
+                "note".into(),
+                Json::Str(
+                    "full: every registered subtest reported and each recorded an assertion while it ran. \
+                     partial: a subtest recorded none while it ran, the registered count is unknown, or the \
+                     counts disagree. no_harness_record: no harness result for the pass."
+                        .into(),
+                ),
+            ),
+        ])
     }
 
     /// Write the summary and the per-file detail.

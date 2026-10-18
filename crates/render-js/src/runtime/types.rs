@@ -511,13 +511,25 @@ impl DocumentReadyState {
     }
 }
 
-/// A callback registered through the global timer functions. The runtime
-/// retains only callable identities; actual scheduling belongs to the
+/// What a timer runs when it fires.
+#[derive(Clone, Debug)]
+pub enum TimerHandler {
+    /// A callable: the `Function` form of `setTimeout` or `setInterval`, a
+    /// `requestAnimationFrame` callback, or an engine-internal native callback.
+    Callback(ObjectId),
+    /// The string form. HTML 8.6 (timer initialization steps) runs the string as
+    /// a classic script in the global scope when the timer fires. A compile or
+    /// runtime failure is reported as an uncaught exception, like any script's.
+    Script(String),
+}
+
+/// A handler registered through the global timer functions. The runtime retains
+/// only callable identities and script text; actual scheduling belongs to the
 /// embedding page, which drains [`JsRuntime::take_pending_timer_requests`].
 #[derive(Clone, Debug)]
 pub struct TimerEntry {
     pub kind: TimerKind,
-    pub callback: ObjectId,
+    pub handler: TimerHandler,
     pub delay_ms: f64,
     /// Extra arguments given to `setTimeout` or `setInterval` after the delay,
     /// passed to the callback on every run.

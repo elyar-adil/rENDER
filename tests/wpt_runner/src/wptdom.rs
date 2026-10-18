@@ -54,7 +54,7 @@ use render_core::js::{
 };
 
 use crate::classify::Capability;
-use crate::engine::{Engine, HarnessError, TestContext, Verdict};
+use crate::engine::{Engine, HarnessError, SubtestEvidence, TestContext, Verdict};
 use crate::mechanism::{self, Category};
 use crate::results::FileResult;
 
@@ -123,17 +123,14 @@ pub struct Execution {
     pub status: HarnessStatus,
     /// The test's name, as the harness recorded it.
     pub name: String,
-    /// Assertions the harness recorded evaluating, from `Tests.asserts_run`.
-    ///
-    /// Read from the harness's own record rather than counted here. It is the
-    /// only field that says whether a pass is real, and getting the *name* wrong
-    /// made every pass in one run vacuous while looking completely healthy -
-    /// see [`RESULT_SINK`].
-    pub harness_asserts: u32,
     /// The harness's failure message, when it gave one.
     pub message: Option<String>,
-    /// How many assertions the harness reported evaluating.
+    /// Assertions the runner's counter recorded across the file. It is the total
+    /// of the per-subtest counts in [`Execution::subtests`]. See [`RESULT_SINK`].
     pub assertions: u32,
+    /// What the harness reported about the file's subtests. `None` when the
+    /// execution never reached the harness's results.
+    pub subtests: Option<SubtestEvidence>,
     /// The mechanism key, for the ranked table. See [`classify_error`].
     pub mechanism: Option<String>,
     /// The category this result falls into.
@@ -246,6 +243,7 @@ impl Engine for WptHarnessEngine {
                     "the engine lacks {}, so the test cannot be driven",
                     capability.label()
                 ),
+                subtests: None,
             });
         }
 
@@ -323,7 +321,7 @@ impl WptHarnessEngine {
                         name: ctx.path.to_owned(),
                         message: Some(format!("engine step budget exhausted: {error}")),
                         assertions: 0,
-                        harness_asserts: 0,
+                        subtests: None,
                         mechanism: Some("engine-step-budget".to_owned()),
                         category: Category::HarnessLimitation,
                     });
@@ -345,7 +343,7 @@ impl WptHarnessEngine {
                 name: ctx.path.to_owned(),
                 message: Some(format!("engine step budget exhausted: {error}")),
                 assertions: 0,
-                harness_asserts: 0,
+                subtests: None,
                 mechanism: Some("engine-step-budget".to_owned()),
                 category: Category::HarnessLimitation,
             });
@@ -364,7 +362,7 @@ impl WptHarnessEngine {
                     "the event loop did not settle within {MAX_DRAIN_TURNS} turns"
                 )),
                 assertions: 0,
-                harness_asserts: 0,
+                subtests: None,
                 mechanism: Some("event-loop-never-settles".to_owned()),
                 category: Category::HarnessLimitation,
             });
@@ -685,23 +683,27 @@ fn with_notes(verdict: Verdict, extra: Vec<String>) -> Verdict {
         Verdict::Passed {
             assertions_evaluated,
             mut notes,
+            subtests,
         } => {
             notes.extend(extra);
             Verdict::Passed {
                 assertions_evaluated,
                 notes,
+                subtests,
             }
         }
         Verdict::Failed {
             assertion,
             engine_location,
             mut notes,
+            subtests,
         } => {
             notes.extend(extra);
             Verdict::Failed {
                 assertion,
                 engine_location,
                 notes,
+                subtests,
             }
         }
         other => other,
@@ -815,13 +817,37 @@ const RESULT_SINK: &str = r#"
     // *evaluated*, which is the quantity a pass rate depends on. Wrapping rather
     // than replacing leaves WPT's own logic underneath, so a wrapped assertion
     // still throws and the harness still catches it and sets the status.
+    //
+    // Attribution to a subtest, without a per-assertion lookup. Each wrapped call
+    // adds one to the counter and nothing else, so the runner costs an assertion no
+    // more than it did before subtests were counted. A subtest's own count is the
+    // increase between its first step (the test-state callback fires with STARTED
+    // when a step begins, after the harness sets `tests.current_test`) and its
+    // result. An assertion made by a subtest always falls inside that window, so a
+    // zero is exact: nothing ran during the subtest's life that the counter saw.
+    // When subtests interleave, another subtest's assertions can land in the window
+    // too, which only ever over-counts; it never hides an assertion.
     var counted = 0;
-    ["assert_equals", "assert_not_equals", "assert_true", "assert_false",
-     "assert_array_equals", "assert_object_equals", "assert_approx_equals",
-     "assert_unreached", "assert_regexp_match", "assert_in_array",
-     "assert_class_string", "assert_own_property", "assert_less_than",
-     "assert_greater_than", "assert_throws_js", "assert_throws_dom",
-     "assert_raises_js", "promise_rejects_js"]
+    var STARTED = 1; // Test.prototype.phases.STARTED in testharness.js
+    var started_at = new Map();
+    add_test_state_callback(function (test) {
+        if (test.phase === STARTED && !started_at.has(test)) {
+            started_at.set(test, counted);
+        }
+    });
+    // Every assertion function testharness.js exposes (`expose_assert` and the
+    // `expose` helpers of the same family), so no assertion goes uncounted.
+    ["assert_any", "assert_approx_equals", "assert_array_approx_equals",
+     "assert_array_equals", "assert_between_exclusive", "assert_between_inclusive",
+     "assert_class_string", "assert_equals", "assert_false", "assert_greater_than",
+     "assert_greater_than_equal", "assert_idl_attribute", "assert_implements",
+     "assert_implements_optional", "assert_in_array", "assert_inherits",
+     "assert_less_than", "assert_less_than_equal", "assert_not_equals",
+     "assert_not_own_property", "assert_object_equals", "assert_own_property",
+     "assert_readonly", "assert_regexp_match", "assert_throws_dom",
+     "assert_throws_exactly", "assert_throws_js", "assert_throws_quotaexceedederror",
+     "assert_true", "assert_unreached", "promise_rejects_dom", "promise_rejects_exactly",
+     "promise_rejects_js", "promise_rejects_quotaexceedederror"]
         .forEach(function (name) {
             var original = globalThis[name];
             if (typeof original !== "function") { return; }
@@ -835,12 +861,17 @@ const RESULT_SINK: &str = r#"
 
     function harvest(entry) {
         var test = entry.test || entry;
+        // A subtest that never started has no window, so it recorded nothing.
+        var start = started_at.has(test) ? started_at.get(test) : counted;
         collected.push({
             name: String(test.name),
             status: Number(test.status),
             message: test.message === undefined || test.message === null
                 ? null : String(test.message),
-            asserts: counted
+            // `asserts` is the file-wide running total when this subtest reported.
+            // `own_asserts` is the increase since this subtest's first step.
+            asserts: counted,
+            own_asserts: counted - start
         });
     }
     add_result_callback(harvest);
@@ -882,7 +913,11 @@ struct HarvestedTest {
     name: String,
     status: f64,
     message: Option<String>,
+    /// The file-wide running total when this subtest reported.
     asserts: u32,
+    /// Assertions the counter recorded between this subtest's first step and its
+    /// result. Zero means none ran while it was running. See [`RESULT_SINK`].
+    own_asserts: u32,
 }
 
 #[derive(Debug)]
@@ -1052,6 +1087,7 @@ fn parse_test(object: &str) -> HarvestedTest {
         status: number_field(object, "status").unwrap_or(-1.0),
         message: string_field(object, "message"),
         asserts: number_field(object, "asserts").unwrap_or(0.0).max(0.0) as u32,
+        own_asserts: number_field(object, "own_asserts").unwrap_or(0.0).max(0.0) as u32,
     }
 }
 
@@ -1077,10 +1113,33 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
                 json.as_deref().unwrap_or("<the reader threw>")
             )),
             assertions: 0,
-            harness_asserts: 0,
+            subtests: None,
             mechanism: Some("result-channel-unreadable".to_owned()),
             category: Category::HarnessLimitation,
         };
+    };
+
+    judge(harvest, path)
+}
+
+/// Judge one file from the harness's own record of its subtests. Pure, so the scoring
+/// rules are tested directly, without a running harness.
+fn judge(harvest: Harvest, path: &str) -> Execution {
+    // The harness's own account of this file's subtests, recorded for every row that
+    // came from the harness. `registered` is the harness's count of tests it ran
+    // (`completion.tests`); `reported` is what reached this runner; a reported subtest
+    // with `own_asserts == 0` recorded no assertion while it ran.
+    let registered = harvest.completion.as_ref().map(|c| c.tests);
+    let reported = u32::try_from(harvest.results.len()).unwrap_or(u32::MAX);
+    let evidence = SubtestEvidence {
+        registered,
+        reported,
+        without_assertions: u32::try_from(
+            harvest.results.iter().filter(|test| test.own_asserts == 0).count(),
+        )
+        .unwrap_or(u32::MAX),
+        // The counter is cumulative across the file, so its largest value is its total.
+        assertions: harvest.results.iter().map(|test| test.asserts).max().unwrap_or(0),
     };
 
     if harvest.results.is_empty() {
@@ -1095,16 +1154,12 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         // signal that a result went missing. It is reported rather than
         // consumed, so the disagreement stays visible instead of being resolved
         // by whichever number happened to be read first.
-        let registered = harvest
-            .completion
-            .as_ref()
-            .map_or(0, |c| c.tests)
-            .saturating_sub(harvest.results.len() as u32);
+        let unreported = registered.unwrap_or(0);
         // A timeout with no result is either a file that registered no test at
         // all, which is not a testharness file, or a file whose tests started and
         // waited for something that never happened. Those are different gaps.
         let timed_out = status.map(HarnessStatus::from_number) == Some(HarnessStatus::Timeout);
-        let mechanism = match (timed_out, registered) {
+        let mechanism = match (timed_out, unreported) {
             (true, 0) => "no-testharness-test",
             (true, _) => "tests-never-finished",
             (false, _) => "no-verdict-from-harness",
@@ -1120,17 +1175,17 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
             name: path.to_owned(),
             message: Some(match message {
                 Some(given) => format!(
-                    "{given} (the harness reported {registered} test(s) and {} result(s) \
+                    "{given} (the harness reported {unreported} test(s) and {} result(s) \
                      reached this runner)",
                     harvest.results.len()
                 ),
                 None => format!(
-                    "the harness reported no result and no status for this test ({registered} \
+                    "the harness reported no result and no status for this test ({unreported} \
                      registered, 0 collected)"
                 ),
             }),
             assertions: 0,
-            harness_asserts: 0,
+            subtests: Some(evidence),
             mechanism: Some(mechanism.to_owned()),
             category: Category::HarnessLimitation,
         };
@@ -1142,20 +1197,13 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
         status: HarnessStatus::Pass,
         name: path.to_owned(),
         message: None,
-        assertions: 0,
-        harness_asserts: 0,
+        assertions: evidence.assertions,
+        subtests: Some(evidence),
         mechanism: None,
         category: Category::HarnessLimitation,
     };
-    let registered = harvest.completion.as_ref().map_or(0, |c| c.tests);
-    let reported = u32::try_from(harvest.results.len()).unwrap_or(u32::MAX);
     for test in harvest.results {
         let status = HarnessStatus::from_number(test.status);
-        // `asserts_run` is cumulative across the whole file, so it is taken from
-        // the last result rather than summed - summing would multiply it by the
-        // number of subtests.
-        worst.harness_asserts = test.asserts;
-        worst.assertions = test.asserts;
         if severity(status) > severity(worst.status) {
             worst.status = status;
             worst.name = test.name;
@@ -1189,12 +1237,15 @@ fn read_results(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom, path: 
     // A pass needs every subtest the harness registered to have reported. A registered
     // subtest with no result is a verdict this runner cannot see, and a pass computed from
     // the others would claim more than was checked. A failure among the reported ones
-    // still stands, because it is a real result whatever else went unreported.
-    if worst.status == HarnessStatus::Pass && registered > reported {
+    // still stands, because it is a real result whatever else went unreported. A file with
+    // no completion record has no registered count to check against; its pass is recorded
+    // with that gap in its evidence rather than refused here.
+    let unreported = registered.unwrap_or(0).saturating_sub(reported);
+    if worst.status == HarnessStatus::Pass && unreported > 0 {
         worst.status = HarnessStatus::Unknown;
         worst.message = Some(format!(
-            "{} of {registered} registered subtest(s) reported no result",
-            registered - reported
+            "{unreported} of {} registered subtest(s) reported no result",
+            registered.unwrap_or(0)
         ));
         worst.mechanism = Some("subtest-unreported".to_owned());
         worst.category = Category::HarnessLimitation;
@@ -1241,33 +1292,35 @@ impl Execution {
     /// expectation, which is exactly what an engine defect is. Nothing else in
     /// this file is allowed to produce a `Fail`.
     fn into_verdict(self, ctx: &TestContext<'_>) -> Verdict {
+        let subtests = self.subtests;
         match self.status {
-            // A pass is a pass only if the harness actually evaluated something.
+            // A pass is a pass only if the run recorded an assertion.
             //
             // The measured run this replaces reported 210 passes, and **all 210
             // evaluated zero assertions**: the sink was reading `test.asserts`,
             // a field `testharness.js` does not define, so every count came back
             // `undefined` and became 0. The number looked entirely healthy - a
             // 7.4% conformance rate - and every single one of those passes was
-            // vacuous. `Report::vacuous_passes` flagged them in a footnote, which
-            // is nowhere near loud enough for a 100% vacuous pass rate.
+            // vacuous.
             //
-            // So a pass with zero evaluated assertions is **not** a pass here. It
-            // becomes an explained skip. That is the conservative direction: it
-            // can only lower the reported rate, never raise it, and a lower rate
-            // that is real is worth more than a higher one that is not.
+            // So a file whose subtests recorded no assertion at all is **not** a pass
+            // here. It becomes an explained skip. That is the conservative direction: it
+            // can only lower the reported rate, never raise it. The reason is written from
+            // the run's own counter, not from the source text.
             HarnessStatus::Pass if self.assertions == 0 => Verdict::Unsupported {
                 capability: None,
                 reason: format!(
-                    "the harness reported PASS but evaluated 0 assertions, while this file \
-                     declares {} assertion site(s) statically. A pass that checked nothing is \
-                     not evidence about the engine, so it is not counted as one.",
-                    ctx.assertion_sites
+                    "the harness reported PASS for {} subtest(s), but this runner's assertion \
+                     counter recorded no assertion across the file. A pass that checked nothing \
+                     is not evidence about the engine, so it is not counted as one.",
+                    self.subtests.map_or(0, |s| s.reported)
                 ),
+                subtests,
             },
             HarnessStatus::Pass => Verdict::Passed {
                 assertions_evaluated: self.assertions,
                 notes: self.notes(),
+                subtests,
             },
             HarnessStatus::Fail => Verdict::Failed {
                 assertion: format!(
@@ -1280,6 +1333,7 @@ impl Execution {
                 // confident pointer at the wrong code. See FINDINGS.md.
                 engine_location: None,
                 notes: self.notes(),
+                subtests,
             },
             HarnessStatus::PreconditionFailed => Verdict::Unsupported {
                 capability: None,
@@ -1287,6 +1341,7 @@ impl Execution {
                     "the test declared a precondition this engine does not meet: {}",
                     self.message.as_deref().unwrap_or("<no message>")
                 ),
+                subtests,
             },
             HarnessStatus::NotRun => Verdict::Unsupported {
                 capability: None,
@@ -1294,6 +1349,7 @@ impl Execution {
                     "the test did not run to a verdict: {}",
                     self.message.as_deref().unwrap_or("<no message>")
                 ),
+                subtests,
             },
             // TIMEOUT is the harness's own timeout firing, not this runner's drain
             // bound (that is `event-loop-never-settles`). The file either registered
@@ -1315,6 +1371,7 @@ impl Execution {
                         self.message.as_deref().unwrap_or("no message")
                     ),
                 },
+                subtests,
             },
             // An unknown status is the case where guessing would be most
             // tempting and most dangerous. It becomes an explained skip, which
@@ -1326,19 +1383,40 @@ impl Execution {
                     "the harness reported no verdict this runner can interpret: {}",
                     self.message.as_deref().unwrap_or("<no message>")
                 ),
+                subtests,
             },
         }
         .with_ctx(ctx)
     }
 
+    /// Notes for a row, written from the harness's own subtest record.
+    ///
+    /// Each note states a fact the run recorded. None of them compares the run
+    /// with a count of assertion call sites in the source.
     fn notes(&self) -> Vec<String> {
         let mut notes = Vec::new();
-        if self.status == HarnessStatus::Pass && self.assertions == 0 {
-            notes.push(
-                "the harness reported PASS having evaluated zero assertions; counted as a vacuous \
-                 pass"
+        let Some(evidence) = self.subtests else {
+            return notes;
+        };
+        match evidence.registered {
+            None => notes.push(
+                "the harness gave no completion record, so the number of subtests it \
+                 registered is unknown"
                     .to_owned(),
-            );
+            ),
+            Some(registered) if registered != evidence.reported => notes.push(format!(
+                "the harness registered {registered} subtest(s) and {} reported a result to \
+                 this runner",
+                evidence.reported
+            )),
+            Some(_) => {}
+        }
+        if evidence.without_assertions > 0 {
+            notes.push(format!(
+                "{} of {} reported subtest(s) recorded no assertion while they ran, so their \
+                 own counts are zero",
+                evidence.without_assertions, evidence.reported
+            ));
         }
         notes
     }
@@ -1456,6 +1534,8 @@ impl Engine for AlwaysPasses {
         Ok(Verdict::Passed {
             assertions_evaluated: 0,
             notes: vec!["negative control: this pass asserts nothing".to_owned()],
+            // The control drives no harness, so there is no subtest record to report.
+            subtests: None,
         })
     }
 }
@@ -1629,6 +1709,7 @@ fn harness_error(path: &str, area: &str, error: String, mechanism: &str) -> File
         assertions_evaluated: 0,
         assertion_sites: 0,
         mechanism: Some(mechanism.to_owned()),
+        subtests: None,
         notes: vec!["a harness error, not a test failure".to_owned()],
     }
 }
@@ -1938,6 +2019,15 @@ fn declined(
     };
     let mut notes = previous.notes;
     notes.push(format!("census verdict supersedes the adapter's pass: {note}"));
+    // The census finding is a static reading of the file. When the run's own counter
+    // saw assertions, the row says so, so the two readings are visible side by side.
+    if previous.assertions_evaluated > 0 {
+        notes.push(format!(
+            "the run's assertion counter recorded {} assertion(s) for this file; the census \
+             finding above is static and does not reflect them",
+            previous.assertions_evaluated
+        ));
+    }
     FileResult {
         path,
         area,
@@ -1948,6 +2038,7 @@ fn declined(
         skip_reason: Some(skip_reason),
         assertions_evaluated: previous.assertions_evaluated,
         assertion_sites: previous.assertion_sites,
+        subtests: previous.subtests,
         notes,
         mechanism: previous.mechanism,
     }
@@ -1989,7 +2080,8 @@ pub fn walk_area(root: &Path, area: &str) -> Vec<String> {
 
 #[cfg(all(test, feature = "engine"))]
 mod tests {
-    use super::{HarnessStatus, Harvest, severity, slug};
+    use super::{Execution, HarnessStatus, Harvest, judge, severity, slug};
+    use crate::engine::{TestContext, Verdict};
     use crate::mechanism::Category;
     use crate::outcome::Outcome;
     use render_core::document::Document;
@@ -2118,12 +2210,18 @@ mod tests {
         // naming `AbortSignal` are one missing interface, not 228 defects. A key
         // carrying the path produced 62 keys for one directory and a "ranked"
         // table of files, which is what this table exists to stop being.
-        for name in ["AbortSignal", "MutationObserver", "ResizeObserver", "Range"] {
+        for name in ["AbortSignal", "MutationObserver", "ResizeObserver"] {
             let key = super::failure_mechanism(&format!(
                 "dom/x/y-crash.html: {name} is not defined (the harness reported 0 test(s))"
             ));
             assert_eq!(key, format!("lacks-{name}"));
         }
+        // `Range` was removed from the list once the engine implemented it, so a message
+        // naming it as undefined is an undefined global, not a missing interface.
+        let key = super::failure_mechanism(
+            "dom/x/y-crash.html: Range is not defined (the harness reported 0 test(s))",
+        );
+        assert_eq!(key, "undefined-global-range");
     }
 
     #[test]
@@ -2302,6 +2400,128 @@ mod tests {
         assert_eq!(harvest.results[1].name, "b");
         assert_eq!(harvest.results[2].name, "c");
         assert_eq!(harvest.completion.as_ref().map(|c| c.tests), Some(3));
+    }
+
+    fn context(path: &str) -> TestContext<'_> {
+        TestContext {
+            path,
+            area: "dom",
+            file: std::path::Path::new(path),
+            suite_root: std::path::Path::new("."),
+            source: "",
+            assertion_sites: 2,
+        }
+    }
+
+    fn judged(json: &str) -> (Execution, Verdict) {
+        let harvest = Harvest::parse(json).expect("the fixture is the sink's shape");
+        let execution = judge(harvest, "dom/a.html");
+        let verdict = execution.clone().into_verdict(&context("dom/a.html"));
+        (execution, verdict)
+    }
+
+    #[test]
+    fn a_harvest_carries_each_subtests_own_assertion_count() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":2,"own_asserts":2},{"name":"b","status":0,"message":null,"asserts":2,"own_asserts":0}],"completion":{"status":0,"message":null,"num_tests":2}}"#;
+        let harvest = Harvest::parse(json).expect("the sink's shape parses");
+        assert_eq!(harvest.results[0].own_asserts, 2);
+        assert_eq!(harvest.results[1].own_asserts, 0);
+        assert_eq!(harvest.results[1].asserts, 2, "the file-wide total is kept too");
+    }
+
+    #[test]
+    fn a_pass_whose_every_subtest_evaluated_an_assertion_has_full_evidence() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1,"own_asserts":1},{"name":"b","status":0,"message":null,"asserts":2,"own_asserts":1}],"completion":{"status":0,"message":null,"num_tests":2}}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Pass);
+        let Verdict::Passed { assertions_evaluated, notes, subtests } = verdict else {
+            panic!("a fully evidenced pass stays a pass");
+        };
+        assert_eq!(assertions_evaluated, 2);
+        assert!(notes.is_empty(), "nothing weakens this pass: {notes:?}");
+        let evidence = subtests.expect("the harness record travels with the verdict");
+        assert!(evidence.is_full());
+        assert_eq!(evidence.registered, Some(2));
+        assert_eq!(evidence.reported, 2);
+    }
+
+    #[test]
+    fn a_pass_with_a_subtest_that_evaluated_nothing_stays_a_pass_but_says_so() {
+        // A no-throw subtest is a legitimate WPT check, so the pass is not refused here.
+        // What the run recorded is written on the row instead of being hidden.
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":2,"own_asserts":2},{"name":"b","status":0,"message":null,"asserts":2,"own_asserts":0}],"completion":{"status":0,"message":null,"num_tests":2}}"#;
+        let (_, verdict) = judged(json);
+        let Verdict::Passed { notes, subtests, .. } = verdict else {
+            panic!("the file-level pass is unchanged by a zero-count subtest");
+        };
+        let evidence = subtests.expect("evidence present");
+        assert_eq!(evidence.without_assertions, 1);
+        assert!(!evidence.is_full());
+        assert!(
+            notes.iter().any(|n| n.contains("1 of 2 reported subtest(s)")),
+            "the zero-count subtest is named in the notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_pass_that_registered_more_subtests_than_reported_is_refused() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1,"own_asserts":1},{"name":"b","status":0,"message":null,"asserts":2,"own_asserts":1}],"completion":{"status":0,"message":null,"num_tests":3}}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Unknown);
+        assert_eq!(execution.mechanism.as_deref(), Some("subtest-unreported"));
+        let Verdict::Unsupported { subtests, reason, .. } = verdict else {
+            panic!("an unreported subtest is an explained skip, never a pass");
+        };
+        assert!(reason.contains("1 of 3 registered subtest(s)"), "{reason}");
+        let evidence = subtests.expect("evidence present");
+        assert_eq!((evidence.registered, evidence.reported), (Some(3), 2));
+    }
+
+    #[test]
+    fn a_pass_without_a_completion_record_is_kept_and_marked_as_partly_evidenced() {
+        // Without a completion record the registered count is unknown. The scorer has
+        // nothing to check against, so the pass stands, and the row says what is missing.
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1,"own_asserts":1}],"completion":null}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Pass);
+        let Verdict::Passed { notes, subtests, .. } = verdict else {
+            panic!("the pass stands");
+        };
+        let evidence = subtests.expect("evidence present");
+        assert_eq!(evidence.registered, None);
+        assert!(!evidence.is_full());
+        assert!(notes.iter().any(|n| n.contains("no completion record")), "{notes:?}");
+    }
+
+    #[test]
+    fn a_file_whose_subtests_recorded_no_assertion_is_not_a_pass() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":0,"own_asserts":0}],"completion":{"status":0,"message":null,"num_tests":1}}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Pass);
+        let Verdict::Unsupported { reason, subtests, .. } = verdict else {
+            panic!("a pass with no recorded assertion is an explained skip");
+        };
+        assert!(reason.contains("recorded no assertion across the file"), "{reason}");
+        assert_eq!(subtests.map(|s| s.reported), Some(1));
+    }
+
+    #[test]
+    fn an_uncaught_exception_fails_the_file_whatever_its_subtests_recorded() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1,"own_asserts":1}],"completion":{"status":1,"message":"boom","num_tests":1}}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Fail);
+        assert!(matches!(verdict, Verdict::Failed { .. }));
+    }
+
+    #[test]
+    fn a_subtest_failure_keeps_its_evidence_on_the_fail_row() {
+        let json = r#"{"results":[{"name":"a","status":0,"message":null,"asserts":1,"own_asserts":1},{"name":"b","status":1,"message":"expected 1 but got 2","asserts":2,"own_asserts":1}],"completion":{"status":0,"message":null,"num_tests":2}}"#;
+        let (execution, verdict) = judged(json);
+        assert_eq!(execution.status, HarnessStatus::Fail);
+        let Verdict::Failed { subtests, .. } = verdict else {
+            panic!("a real failure stays a failure");
+        };
+        assert_eq!(subtests.map(|s| (s.registered, s.reported)), Some((Some(2), 2)));
     }
 
     fn base() -> url::Url {

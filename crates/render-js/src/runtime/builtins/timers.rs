@@ -19,6 +19,7 @@ use crate::ObjectId;
 use crate::runtime::JsRuntime;
 use crate::runtime::convert::required_argument;
 use crate::runtime::types::TimerEntry;
+use crate::runtime::types::TimerHandler;
 use crate::runtime::types::TimerKind;
 use crate::runtime::types::TimerRequest;
 use crate::value::NativeFunction;
@@ -70,13 +71,23 @@ impl JsRuntime {
         kind: TimerKind,
         arguments: Vec<JsValue>,
     ) -> f64 {
+        self.register_timer_handler(TimerHandler::Callback(callback), delay_ms, kind, arguments)
+    }
+
+    pub(in crate::runtime) fn register_timer_handler(
+        &mut self,
+        handler: TimerHandler,
+        delay_ms: f64,
+        kind: TimerKind,
+        arguments: Vec<JsValue>,
+    ) -> f64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
         self.timers.insert(
             id,
             TimerEntry {
                 kind,
-                callback,
+                handler,
                 delay_ms,
                 arguments,
             },
@@ -107,15 +118,26 @@ impl JsRuntime {
         } else {
             "setInterval"
         };
-        let callback =
-            Self::require_callable_object(required_argument(arguments, 0, name)?, &self.realm)?;
+        // WebIDL `TimerHandler` is `(Function or DOMString)`: a callable object is
+        // the function form, and any other value is converted with ToString and
+        // run as a script when the timer fires (HTML 8.6, timer initialization).
+        let handler = match required_argument(arguments, 0, name)? {
+            JsValue::Object(object) if Self::is_callable_object(*object, &self.realm) => {
+                TimerHandler::Callback(*object)
+            }
+            value => TimerHandler::Script(self.to_string_value(dom, value)?.to_lossy()),
+        };
         let delay = match arguments.get(1) {
             None | Some(JsValue::Undefined) => 0.0,
             Some(value) => self.to_number_value(dom, value)?,
         };
-        let extra = arguments.get(2..).unwrap_or_default().to_vec();
-        Ok(JsValue::Number(self.register_timer_entry(
-            callback,
+        // The string form takes no extra arguments: a script has no parameters.
+        let extra = match handler {
+            TimerHandler::Callback(_) => arguments.get(2..).unwrap_or_default().to_vec(),
+            TimerHandler::Script(_) => Vec::new(),
+        };
+        Ok(JsValue::Number(self.register_timer_handler(
+            handler,
             timer_delay_ms(delay),
             kind,
             extra,
