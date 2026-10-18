@@ -2252,6 +2252,11 @@ pub(crate) enum ObjectHost {
     Ordinary,
     Array,
     Document(NodeId),
+    /// The named properties object of a window (`WebIDL` §3.9, HTML §7.2): the
+    /// object between `Window.prototype` and `EventTarget.prototype` on a
+    /// window's prototype chain. Its named properties are the elements of the
+    /// document `NodeId`, and a realm with no document has none.
+    WindowProperties(Option<NodeId>),
     /// The `DOMImplementation` of the document `NodeId` (DOM §4.5), which
     /// `createDocumentType`, `createDocument` and `createHTMLDocument` use.
     DomImplementation(NodeId),
@@ -3546,6 +3551,17 @@ impl Realm {
         );
         let (element_prototype, mut dom_prototypes) =
             Self::install_dom_interfaces(objects, global, object_prototype, function_prototype);
+        let window_document = match &objects[document.0].host {
+            ObjectHost::Document(node) => Some(*node),
+            _ => None,
+        };
+        Self::install_window_interface(
+            objects,
+            global,
+            dom_prototypes["EventTarget"],
+            function_prototype,
+            window_document,
+        );
         // DOM libraries feature-detect and use `instanceof Document` during
         // startup. `Document` is constructible (`new Document()` makes an XML
         // document), and its prototype is the one every document inherits from.
@@ -4326,6 +4342,7 @@ impl Realm {
             }
         }
         prototypes.insert("Node", prototype);
+        prototypes.insert("EventTarget", event_target);
 
         let mut derive = |name: &'static str,
                           parent: &'static str,
@@ -4723,6 +4740,66 @@ impl Realm {
                 PropertyDescriptor::builtin(JsValue::Object(method)),
             );
         }
+    }
+
+    /// Builds the `Window` interface and the named properties object of a
+    /// window (`WebIDL` §3.9, HTML §7.2). The global object's prototype is
+    /// `Window.prototype`, whose prototype is the `WindowProperties` object, whose
+    /// prototype is `EventTarget.prototype`:
+    ///
+    /// ```text
+    /// global -> Window.prototype -> WindowProperties -> EventTarget.prototype
+    /// ```
+    ///
+    /// The named properties of the window live on `WindowProperties`, so a name
+    /// is looked up below `Window.prototype` and above `EventTarget.prototype`.
+    /// `Window` is `[Global]`: its own members stay on the global object itself.
+    fn install_window_interface(
+        objects: &mut Vec<JsObject>,
+        global: ObjectId,
+        event_target_prototype: ObjectId,
+        function_prototype: ObjectId,
+        document: Option<NodeId>,
+    ) {
+        let named_properties = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(event_target_prototype),
+            host: ObjectHost::WindowProperties(document),
+            ..JsObject::default()
+        });
+        // WebIDL §2.7.2: the interface prototype's @@toStringTag names the object.
+        let tag = JsSymbol::well_known("@@toStringTag");
+        objects[named_properties.0].symbols.insert(
+            tag.id(),
+            (
+                tag,
+                PropertyDescriptor {
+                    getter: None,
+                    setter: None,
+                    value: JsValue::String(("WindowProperties".to_owned()).into()),
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                },
+            ),
+        );
+        let window_prototype = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(named_properties),
+            ..JsObject::default()
+        });
+        // `Window` has no constructor operation, so the interface object throws
+        // "Illegal constructor" when called, as a `DomConstructor` does.
+        Self::dom_interface(
+            objects,
+            global,
+            function_prototype,
+            "Window",
+            window_prototype,
+            None,
+            ObjectHost::DomConstructor,
+        );
+        objects[global.0].prototype = Some(window_prototype);
     }
 
     /// Create the interface object (constructor) for `prototype` and register

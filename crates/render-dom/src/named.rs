@@ -130,6 +130,19 @@ impl Dom {
         found.into_iter().map(|(_, node)| node).collect()
     }
 
+    /// Every name under which `document` names at least one element, in key
+    /// order. This is the set [`Dom::named_elements`] answers non-empty for, so a
+    /// caller that lists the named properties of a window sees each name once.
+    #[must_use]
+    pub fn named_keys(&self, document: NodeId) -> Vec<String> {
+        self.named
+            .keys
+            .keys()
+            .filter(|key| !self.named_elements(document, key).is_empty())
+            .cloned()
+            .collect()
+    }
+
     /// The root of `node` reached through parents, and the child index of each
     /// step from that root down to `node`. Comparing two positions in order
     /// gives document order: an ancestor's position is a prefix, so it sorts
