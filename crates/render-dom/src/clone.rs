@@ -9,21 +9,23 @@ impl Dom {
     ///
     /// The copy keeps the element's namespace, prefix and attributes exactly, as
     /// the specification requires, and a `template` element's content is copied
-    /// into the copy's own template contents. The copy is detached.
+    /// into the copy's own template contents. The copy is detached. A Document
+    /// copy is a new document with the same content type, and its children are
+    /// copied with it when `deep` is true. Every other copy has the node document
+    /// of the node it copies.
     ///
     /// # Errors
     ///
     /// Returns [`DomErrorKind::NotFound`](crate::DomErrorKind::NotFound) for an
     /// unknown node, and [`DomErrorKind::NotSupported`](crate::DomErrorKind::NotSupported)
-    /// for a Document, which this arena cannot clone as a separate document, and
     /// for a shadow root, which `cloneNode()` refuses (DOM §4.5).
     pub fn clone_node(&mut self, node: NodeId, deep: bool) -> Result<NodeId, DomError> {
         let source = self.kind(node)?.clone();
+        let is_document = matches!(source, NodeKind::Document);
         let copy = match source {
             NodeKind::Document => {
-                return Err(DomError::not_supported(
-                    "cloning a Document is not supported by this arena",
-                ));
+                let content_type = self.content_type(node).to_owned();
+                self.create_document(content_type)
             }
             NodeKind::ShadowRoot(_) => {
                 return Err(DomError::not_supported(
@@ -52,6 +54,10 @@ impl Dom {
                 copy
             }
         };
+        if !is_document {
+            let owner = self.owner_of(node);
+            self.set_node_document(copy, owner);
+        }
         if deep {
             if let (Some(source_contents), Some(copy_contents)) =
                 (self.template_contents(node), self.template_contents(copy))

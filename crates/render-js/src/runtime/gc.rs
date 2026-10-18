@@ -201,6 +201,7 @@ pub(super) fn mark_host(
         | ObjectHost::Array
         | ObjectHost::Arguments(None)
         | ObjectHost::Document(_)
+        | ObjectHost::DomImplementation(_)
         | ObjectHost::Node(_)
         | ObjectHost::ClassList(_)
         | ObjectHost::DataSet(_)

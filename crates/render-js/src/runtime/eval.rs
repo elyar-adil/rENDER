@@ -4948,14 +4948,29 @@ impl JsRuntime {
                 return self.read_hyperlink_component(dom, node, property);
             }
         }
+        // A document made by script answers its own URL, state and window.
+        if let Some(ObjectHost::Document(document)) = self.realm.host(object)
+            && let Some(value) = self.created_document_property(dom, document, property)
+        {
+            return Ok(value);
+        }
         match self.realm.host(object) {
             Some(ObjectHost::Document(document)) => match property {
-                "documentElement" | "body" | "head" => {
-                    let tag = match property {
-                        "documentElement" => "html",
-                        "body" => "body",
-                        _ => "head",
+                // DOM §4.4: the document element is the first element child.
+                "documentElement" => {
+                    let element = dom
+                        .children(document)
+                        .unwrap_or_default()
+                        .iter()
+                        .copied()
+                        .find(|child| is_element_node(dom, *child));
+                    return match element {
+                        Some(node) => self.wrap_node(dom, node),
+                        None => Ok(JsValue::Null),
                     };
+                }
+                "body" | "head" => {
+                    let tag = if property == "body" { "body" } else { "head" };
                     return match self.find_element_by_tag(dom, document, tag)? {
                         Some(node) => self.wrap_node(dom, node),
                         None => Ok(JsValue::Null),
@@ -5175,8 +5190,12 @@ impl JsRuntime {
                     return Ok(self.frame_content(dom, node, property == "contentDocument"));
                 }
                 "ownerDocument" => {
-                    let owner = self.realm_of_node(dom, node);
-                    return Ok(JsValue::Object(self.realm.document_of(owner)));
+                    // DOM §4.4: the node document, which is the document the node
+                    // was created in or adopted into.
+                    return match dom.node_document(node) {
+                        Some(document) => self.wrap_node(dom, document),
+                        None => Ok(JsValue::Null),
+                    };
                 }
                 "children" | "childNodes" => {
                     self.ensure_heap_capacity(1)?;
@@ -5482,6 +5501,7 @@ impl JsRuntime {
                 Some(NativeFunction::CreateProcessingInstruction)
             }
             (Some(ObjectHost::Document(_)), "importNode") => Some(NativeFunction::ImportNode),
+            (Some(ObjectHost::Document(_)), "adoptNode") => Some(NativeFunction::AdoptNode),
             (Some(ObjectHost::Document(_) | ObjectHost::Node(_)), "getElementsByTagNameNS") => {
                 Some(NativeFunction::GetElementsByTagNameNs)
             }

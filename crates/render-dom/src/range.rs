@@ -1099,6 +1099,9 @@ impl Dom {
             (None, NodeKind::Comment(_)) => self.create_comment(data),
             (None, _) => self.create_text(data),
         };
+        // A copy is in the node document of the node it copies (DOM §4.4 "clone").
+        let owner = self.owner_of(node);
+        self.set_node_document(copy, owner);
         Ok(copy)
     }
 
@@ -1155,6 +1158,9 @@ impl Dom {
         end: BoundaryPoint,
     ) -> Result<(NodeId, BoundaryPoint), DomError> {
         let fragment = self.create_document_fragment();
+        // DOM §5.5 "extract": the fragment is in the start node's node document.
+        let owner = self.owner_of(start.node);
+        self.set_node_document(fragment, owner);
         if start == end {
             return Ok((fragment, start));
         }
@@ -1223,6 +1229,9 @@ impl Dom {
         end: BoundaryPoint,
     ) -> Result<NodeId, DomError> {
         let fragment = self.create_document_fragment();
+        // DOM §5.5 "clone the contents": the fragment is in the start node's node document.
+        let owner = self.owner_of(start.node);
+        self.set_node_document(fragment, owner);
         if start == end {
             return Ok(fragment);
         }

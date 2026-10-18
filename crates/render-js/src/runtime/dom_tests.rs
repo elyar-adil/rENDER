@@ -568,6 +568,23 @@ fn document_implementation_creates_doctypes_and_rejects_bad_names() {
 }
 
 #[test]
+fn create_document_type_takes_any_name_without_space_gt_or_null() {
+    assert_eq!(
+        eval(
+            "var out = []; \
+             ['', '1foo', '@foo', 'edi:{', 'a-b:c.j'].forEach(function (name) { \
+               try { document.implementation.createDocumentType(name, '', ''); out.push('ok'); } \
+               catch (e) { out.push(e.name); } }); \
+             ['edi:>', 'edi:a ', 'a\\tb', 'a\\u0000b'].forEach(function (name) { \
+               try { document.implementation.createDocumentType(name, '', ''); out.push('ok'); } \
+               catch (e) { out.push(e.name); } }); \
+             out.join()"
+        ),
+        "ok,ok,ok,ok,ok,InvalidCharacterError,InvalidCharacterError,InvalidCharacterError,InvalidCharacterError"
+    );
+}
+
+#[test]
 fn create_cdata_section_throws_in_html_and_processing_instructions_carry_their_target() {
     assert_eq!(
         eval(
@@ -782,5 +799,183 @@ fn legacy_document_colours_reflect_the_body_attributes() {
              document.fgColor = null; out.push(document.body.hasAttribute('text'), document.fgColor === ''); out.join()"
         ),
         "red,green,green,true,true"
+    );
+}
+
+#[test]
+fn create_html_document_builds_the_standard_skeleton() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument('t'); \
+             [d.childNodes.length, d.doctype.name, d.documentElement.localName, \
+              d.documentElement.childNodes.length, d.head.firstChild.localName, \
+              d.head.firstChild.firstChild.data, d.body.localName, d.body.childNodes.length].join()"
+        ),
+        "2,html,html,2,title,t,body,0"
+    );
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); \
+             [d.head.childNodes.length, d.documentElement.childNodes.length].join()"
+        ),
+        "0,2"
+    );
+}
+
+#[test]
+fn created_html_document_has_its_own_metadata() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); \
+             [d.URL, d.documentURI, d.contentType, d.compatMode, d.characterSet, d.readyState, \
+              d.location, d.defaultView, d instanceof HTMLDocument, d instanceof Document, \
+              d.createElement('DIV').localName].join()"
+        ),
+        "about:blank,about:blank,text/html,CSS1Compat,UTF-8,complete,,,true,true,div"
+    );
+}
+
+#[test]
+fn each_document_has_one_implementation() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); \
+             [document.implementation === document.implementation, \
+              d.implementation === d.implementation, d.implementation === document.implementation, \
+              d.implementation instanceof DOMImplementation].join()"
+        ),
+        "true,true,false,true"
+    );
+}
+
+#[test]
+fn create_document_makes_a_typed_xml_document_with_a_root() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createDocument('http://www.w3.org/2000/svg', 'svg', null); \
+             [Object.getPrototypeOf(d) === XMLDocument.prototype, d instanceof XMLDocument, \
+              d.contentType, d.documentElement.localName, d.documentElement.namespaceURI, \
+              d.documentElement.ownerDocument === d, d.doctype, d.childNodes.length, d.readyState].join()"
+        ),
+        "true,true,image/svg+xml,svg,http://www.w3.org/2000/svg,true,,1,complete"
+    );
+    assert_eq!(
+        eval(
+            "var t = document.implementation.createDocumentType('html', '', ''); \
+             var d = document.implementation.createDocument(null, '', t); \
+             [d.contentType, d.documentElement, d.doctype.name, d.doctype.ownerDocument === d].join()"
+        ),
+        "application/xml,,html,true"
+    );
+}
+
+#[test]
+fn create_document_rejects_a_bad_name_and_a_non_doctype() {
+    assert_eq!(
+        eval(
+            "var out = []; \
+             try { document.implementation.createDocument(null, 'a:b'); } catch (e) { out.push(e.name); } \
+             try { document.implementation.createDocument(); } catch (e) { out.push(e.name); } \
+             try { document.implementation.createDocument(null, 'x', {}); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "NamespaceError,TypeError,TypeError"
+    );
+}
+
+#[test]
+fn new_document_is_an_empty_xml_document_that_is_not_an_xml_document() {
+    assert_eq!(
+        eval(
+            "var d = new Document(); \
+             [Object.getPrototypeOf(d) === Document.prototype, d instanceof XMLDocument, \
+              d.contentType, d.URL, d.location, d.doctype, d.documentElement, \
+              d.createElement('DIV').localName, d.createElement('a').constructor === Element].join()"
+        ),
+        "true,false,application/xml,about:blank,,,,DIV,true"
+    );
+}
+
+#[test]
+fn html_and_xml_document_interfaces_have_no_constructor() {
+    assert_eq!(
+        eval(
+            "var out = []; \
+             [HTMLDocument, XMLDocument].forEach(function (C) { \
+               try { new C(); out.push('constructed'); } catch (e) { out.push(e.name); } }); \
+             out.join()"
+        ),
+        "TypeError,TypeError"
+    );
+}
+
+#[test]
+fn nodes_belong_to_the_document_that_created_or_adopted_them() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument('x'); \
+             var p = d.createElement('p'); var page = document.createElement('i'); \
+             [p.ownerDocument === d, d.body.appendChild(page).ownerDocument === d, \
+              page.ownerDocument === document, document.body.ownerDocument === document, \
+              d.doctype.ownerDocument === d, d.ownerDocument, \
+              document.implementation.createDocumentType('x', '', '').ownerDocument === document].join()"
+        ),
+        "true,true,false,true,true,,true"
+    );
+}
+
+#[test]
+fn adopt_node_moves_a_node_into_the_document() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); var el = $('one'); \
+             var moved = d.adoptNode(el); \
+             var before = [moved === el, el.parentNode === null, el.ownerDocument === d, \
+               document.getElementById('one') === null].join(); \
+             d.body.appendChild(el); \
+             var out = []; \
+             try { d.adoptNode(document); } catch (e) { out.push(e.name); } \
+             before + ';' + [el.parentNode === d.body, el.ownerDocument === d].join() + ';' + out.join()"
+        ),
+        "true,true,true,true;true,true;NotSupportedError"
+    );
+}
+
+#[test]
+fn import_node_copies_into_the_document() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); \
+             var copy = d.importNode($('two'), true); \
+             [copy.ownerDocument === d, copy.textContent, $('two').ownerDocument === document, \
+              copy.parentNode === null].join()"
+        ),
+        "true,2,true,true"
+    );
+}
+
+#[test]
+fn import_node_refuses_a_document() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); var out = []; \
+             try { document.importNode(d, true); } catch (e) { out.push(e.name); } \
+             try { document.importNode(document, false); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "NotSupportedError,NotSupportedError"
+    );
+}
+
+#[test]
+fn clone_node_copies_a_document_with_its_doctype_and_children() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument('t'); var c = d.cloneNode(true); \
+             var shallow = d.cloneNode(false); \
+             [c === d, c instanceof HTMLDocument, c.contentType, c.childNodes.length, c.doctype.name, \
+              c.title, c.ownerDocument === null, c.body.ownerDocument === c, shallow.childNodes.length].join()"
+        ),
+        "false,true,text/html,2,html,t,true,true,0"
     );
 }

@@ -136,10 +136,20 @@ impl JsRuntime {
                 self.character_data_native(dom, function, receiver, arguments)
             }
             NativeFunction::ImplementationHasFeature => Ok(JsValue::Boolean(true)),
+            NativeFunction::ImplementationCreateDocument => {
+                self.implementation_document(receiver)?;
+                self.create_document_method(dom, arguments)
+            }
+            NativeFunction::ImplementationCreateHtmlDocument => {
+                self.implementation_document(receiver)?;
+                self.create_html_document(dom, arguments)
+            }
+            NativeFunction::DocumentImplementation => self.document_implementation(dom, receiver),
+            NativeFunction::AdoptNode => self.adopt_node_method(dom, receiver, arguments),
             NativeFunction::NodeNormalize => self.node_normalize(dom, receiver),
             NativeFunction::TextSplitText => self.text_split_text(dom, receiver, arguments),
             NativeFunction::CreateElementNs => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let namespace = nullable_string_argument(arguments, 0);
                 let qualified = required_argument(arguments, 1, "createElementNS")?
                     .to_js_string()
@@ -156,6 +166,7 @@ impl JsRuntime {
                     prefix,
                     local,
                 );
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::SetAttributeNs => {
@@ -233,7 +244,7 @@ impl JsRuntime {
                 ))
             }
             NativeFunction::CreateProcessingInstruction => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let target = required_argument(arguments, 0, "createProcessingInstruction")?
                     .to_js_string()
                     .to_lossy();
@@ -248,19 +259,28 @@ impl JsRuntime {
                 }
                 self.ensure_heap_capacity(1)?;
                 let node = dom.create_processing_instruction(target, data);
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::ImportNode => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let node = self.value_as_node(required_argument(arguments, 0, "importNode")?)?;
-                if node == dom.document() {
+                // DOM §4.5 `importNode`: a Document or a shadow root cannot be imported.
+                // This is checked before the copy, so a refused node allocates nothing.
+                if matches!(
+                    dom.node(node).map(render_dom::Node::kind),
+                    Some(NodeKind::Document | NodeKind::ShadowRoot(_))
+                ) {
                     return Err(self.dom_exception(
                         DomExceptionName::NotSupported,
-                        "a Document node cannot be imported",
+                        "a Document or shadow root node cannot be imported",
                     ));
                 }
                 let deep = arguments.get(1).is_some_and(JsValue::is_truthy);
-                self.clone_node_value(dom, node, deep)
+                // DOM §4.5 `importNode`: a clone that is adopted into this document.
+                let copy = self.clone_node_recursive(dom, node, deep)?;
+                dom.adopt_node(document, copy)?;
+                self.wrap_node(dom, copy)
             }
             NativeFunction::IsSameNode => {
                 let node = self.require_node(receiver)?;
@@ -271,6 +291,7 @@ impl JsRuntime {
                 Ok(JsValue::Boolean(same))
             }
             NativeFunction::ImplementationCreateDocumentType => {
+                let document = self.implementation_document(receiver)?;
                 let name = required_argument(arguments, 0, "createDocumentType")?
                     .to_js_string()
                     .to_lossy();
@@ -280,9 +301,9 @@ impl JsRuntime {
                 let system_id = required_argument(arguments, 2, "createDocumentType")?
                     .to_js_string()
                     .to_lossy();
-                // DOM §4.5: a qualified name that is not a valid XML name is an
+                // DOM §4.5: a name that is not a valid doctype name is an
                 // `InvalidCharacterError`.
-                if !valid_xml_name(&name) {
+                if !valid_doctype_name(&name) {
                     return Err(self.dom_exception(
                         DomExceptionName::InvalidCharacter,
                         format!("{name:?} is not a valid doctype name"),
@@ -290,6 +311,7 @@ impl JsRuntime {
                 }
                 self.ensure_heap_capacity(1)?;
                 let node = dom.create_document_type(name, public_id, system_id);
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::CloneNode => {
@@ -298,24 +320,27 @@ impl JsRuntime {
                 self.clone_node_value(dom, node, deep)
             }
             NativeFunction::CreateTextNode => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let data = required_argument(arguments, 0, "createTextNode")?
                     .to_js_string()
                     .to_lossy();
                 let node = dom.create_text(data);
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::CreateComment => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let data = required_argument(arguments, 0, "createComment")?
                     .to_js_string()
                     .to_lossy();
                 let node = dom.create_comment(data);
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::CreateDocumentFragment => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let node = dom.create_document_fragment();
+                dom.set_node_document(node, document);
                 self.wrap_node(dom, node)
             }
             NativeFunction::CreateEvent => {
@@ -357,12 +382,23 @@ impl JsRuntime {
                 Ok(JsValue::Number(DOCUMENT_POSITION_DISCONNECTED))
             }
             NativeFunction::CreateElement => {
-                self.require_document(receiver)?;
+                let document = self.require_document(receiver)?;
                 let name = required_argument(arguments, 0, "createElement")?.to_js_string();
-                if !valid_html_local_name(&(name).to_lossy()) {
+                let local_name = name.to_lossy();
+                // DOM §4.5 `createElement`: an HTML document takes an HTML name and
+                // lowercases it; any other document takes an XML Name and keeps its
+                // case. The namespace is HTML for an HTML or XHTML document, and null
+                // for every other.
+                let html = dom.is_html_document(document);
+                let valid = if html {
+                    valid_html_local_name(&local_name)
+                } else {
+                    valid_xml_name(&local_name)
+                };
+                if !valid {
                     return Err(self.dom_exception(
                         DomExceptionName::InvalidCharacter,
-                        format!("{name:?} is not a supported HTML local name"),
+                        format!("{name:?} is not a supported local name"),
                     ));
                 }
                 if self.dom_nodes_created >= self.limits.max_dom_nodes_created {
@@ -370,10 +406,18 @@ impl JsRuntime {
                 }
                 self.ensure_heap_capacity(1)?;
                 self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
-                let node = dom.create_element(name.to_lossy());
-                Ok(JsValue::Object(
-                    self.realm.node_wrapper(node, dom_interface_name(dom, node)),
-                ))
+                let node = if html {
+                    dom.create_element(local_name)
+                } else {
+                    let namespace = if dom.content_type(document) == "application/xhtml+xml" {
+                        render_dom::Namespace::Html
+                    } else {
+                        render_dom::Namespace::from_uri(None)
+                    };
+                    dom.create_element_qualified(namespace, None, local_name)
+                };
+                dom.set_node_document(node, document);
+                self.wrap_node(dom, node)
             }
             NativeFunction::GetAttribute => {
                 let node = self.require_node(receiver)?;
@@ -821,11 +865,21 @@ pub(in crate::runtime) enum CloneSource {
     Text(String),
     Comment(String),
     Fragment,
+    /// A copy of a document has its content type and the interface it was made as.
+    Document {
+        content_type: String,
+        interface: &'static str,
+    },
+    DocumentType {
+        name: String,
+        public_id: String,
+        system_id: String,
+    },
 }
 
 /// A nullable `DOMString` argument (`WebIDL` §3.2.12): `null` and `undefined`
 /// are `None`, anything else is its string value.
-fn nullable_string_argument(arguments: &[JsValue], index: usize) -> Option<String> {
+pub(super) fn nullable_string_argument(arguments: &[JsValue], index: usize) -> Option<String> {
     match arguments.get(index) {
         None | Some(JsValue::Null | JsValue::Undefined) => None,
         Some(value) => Some(value.to_js_string().to_lossy()),
@@ -855,6 +909,15 @@ pub(in crate::runtime) fn valid_xml_name(name: &str) -> bool {
     })
 }
 
+/// Whether `name` is a valid doctype name (DOM §4.5 `createDocumentType`): it
+/// contains no ASCII whitespace, no `>` and no NULL. Any other string, the empty
+/// string included, is a valid doctype name, which is looser than an XML `Name`.
+pub(in crate::runtime) fn valid_doctype_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\u{c}' | '\r' | ' ' | '>' | '\0'))
+}
+
 pub(in crate::runtime) fn valid_html_local_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -877,6 +940,10 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
         let image = dom.create_element("img");
+        // An image made by script belongs to the document of the realm it is made in.
+        if let Some(document) = self.realm_document_node() {
+            dom.set_node_document(image, document);
+        }
         for (index, name) in [(0, "width"), (1, "height")] {
             if let Some(value) = arguments.get(index)
                 && !matches!(value, JsValue::Undefined)
@@ -1030,10 +1097,19 @@ impl JsRuntime {
             Some(NodeKind::Text(data)) => CloneSource::Text(data.clone()),
             Some(NodeKind::Comment(data)) => CloneSource::Comment(data.clone()),
             Some(NodeKind::DocumentFragment) => CloneSource::Fragment,
-            // The DOM Standard's `clone a node` step: a `Document` and a
-            // `DocumentType` both throw here ("if node is a document or
-            // document type, throw a `NotSupportedError` `DOMException`"), and
-            // every other node kind this engine models is cloneable.
+            Some(NodeKind::Document) => CloneSource::Document {
+                content_type: dom.content_type(node).to_owned(),
+                interface: self
+                    .created_document(node)
+                    .map_or("HTMLDocument", |created| created.interface),
+            },
+            Some(NodeKind::DocumentType(doctype)) => CloneSource::DocumentType {
+                name: doctype.name.clone(),
+                public_id: doctype.public_id.clone(),
+                system_id: doctype.system_id.clone(),
+            },
+            // Every other node kind this engine models is cloneable here, and a
+            // shadow root is refused (DOM §4.5 `cloneNode`).
             _ => {
                 return Err(self.dom_exception(
                     DomExceptionName::NotSupported,
@@ -1041,6 +1117,7 @@ impl JsRuntime {
                 ));
             }
         };
+        let is_document = matches!(source, CloneSource::Document { .. });
         let copy = match source {
             CloneSource::Element {
                 local_name,
@@ -1069,7 +1146,29 @@ impl JsRuntime {
                 self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
                 dom.create_document_fragment()
             }
+            CloneSource::Document {
+                content_type,
+                interface,
+            } => {
+                self.ensure_heap_capacity(1)?;
+                self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
+                self.make_document(dom, &content_type, interface)
+            }
+            CloneSource::DocumentType {
+                name,
+                public_id,
+                system_id,
+            } => {
+                self.ensure_heap_capacity(1)?;
+                self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
+                dom.create_document_type(name, public_id, system_id)
+            }
         };
+        // A copy is in the node document of the node it copies. A document copy
+        // is its own node document, which `make_document` set.
+        if let (false, Some(owner)) = (is_document, dom.node_document(node)) {
+            dom.set_node_document(copy, owner);
+        }
         let children = if deep {
             dom.children(node).unwrap_or_default().to_vec()
         } else {
@@ -1757,7 +1856,13 @@ impl JsRuntime {
             DomNodeKind::Text => dom.create_text(data.to_lossy()),
             DomNodeKind::Comment => dom.create_comment(data.to_lossy()),
             DomNodeKind::Fragment => dom.create_document_fragment(),
+            DomNodeKind::Document => return self.construct_document(dom),
         };
+        // DOM §4.4: a node made by a constructor belongs to the document of the
+        // global object it is made in, which is the running realm's document.
+        if let Some(document) = self.realm_document_node() {
+            dom.set_node_document(node, document);
+        }
         self.wrap_node(dom, node)
     }
 
@@ -1776,7 +1881,17 @@ impl JsRuntime {
             dom.node(node).map(render_dom::Node::kind),
             Some(NodeKind::Document)
         ) {
-            return Ok(JsValue::Object(self.realm.document_object()));
+            if self.realm_document_node() == Some(node) {
+                return Ok(JsValue::Object(self.realm.document_object()));
+            }
+            // Another document, made by script or a copy of one, has its own wrapper.
+            self.ensure_heap_capacity(1)?;
+            let interface = self
+                .created_document(node)
+                .map_or("HTMLDocument", |created| created.interface);
+            return Ok(JsValue::Object(
+                self.realm.document_wrapper(node, interface),
+            ));
         }
         self.ensure_heap_capacity(1)?;
         let interface = dom_interface_name(dom, node);

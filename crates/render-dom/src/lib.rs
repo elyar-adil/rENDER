@@ -5,11 +5,12 @@
 //! observations, and traces a shared identity without exposing Rust references
 //! across mutation boundaries.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
 mod clone;
+mod document;
 mod focus;
 mod named;
 mod range;
@@ -413,6 +414,9 @@ pub struct Node {
     parent: Option<NodeId>,
     children: Vec<NodeId>,
     kind: NodeKind,
+    /// The node document (DOM §4.4): the document that created this node or
+    /// adopted it. A document is its own owner. See [`Dom::node_document`].
+    owner: NodeId,
 }
 
 impl Node {
@@ -434,6 +438,11 @@ impl Node {
     #[must_use]
     pub const fn kind(&self) -> &NodeKind {
         &self.kind
+    }
+
+    /// The node document of this node. See [`Dom::node_document`].
+    pub(crate) const fn owner(&self) -> NodeId {
+        self.owner
     }
 }
 
@@ -529,6 +538,9 @@ pub struct Dom {
     oldest_available_revision: DomRevision,
     /// The document's focused area (HTML §6.6.2). See [`Dom::focused_element`].
     focused_area: Option<NodeId>,
+    /// The content type of each document made by [`Dom::create_document`]. A
+    /// document without an entry is an HTML page document (DOM §4.4).
+    document_content_types: BTreeMap<NodeId, String>,
     /// Every range this document has created, live and static (DOM §5). A
     /// [`RangeId`] indexes this table. See the `range` module.
     ranges: Vec<range::RangeRecord>,
@@ -553,6 +565,7 @@ impl Dom {
                 parent: None,
                 children: Vec::new(),
                 kind: NodeKind::Document,
+                owner: document,
             }],
             document,
             mutation_revision: 0,
@@ -560,6 +573,7 @@ impl Dom {
             mutation_journal_capacity: DEFAULT_MUTATION_JOURNAL_CAPACITY,
             oldest_available_revision: DomRevision::default(),
             focused_area: None,
+            document_content_types: BTreeMap::new(),
             ranges: Vec::new(),
             named: named::NamedIndex::default(),
         }
@@ -590,11 +604,18 @@ impl Dom {
                 parent: node.parent.map(shift),
                 children: node.children.into_iter().map(shift).collect(),
                 kind: shift_kind(node.kind, shift),
+                owner: shift(node.owner),
             });
         }
         for index in offset..self.nodes.len() {
             self.index_named(NodeId::from_index(index));
         }
+        self.document_content_types.extend(
+            other
+                .document_content_types
+                .into_iter()
+                .map(|(document, content_type)| (shift(document), content_type)),
+        );
         shift(other.document)
     }
 
@@ -1082,6 +1103,14 @@ impl Dom {
         for insertion_node in &insertion_nodes {
             self.detach_without_revision(*insertion_node);
         }
+        // The insert steps adopt each node into the parent's node document, so
+        // a node that came from another document is walked once, here.
+        let owner = self.owner_of(parent);
+        for insertion_node in &insertion_nodes {
+            if self.owner_of(*insertion_node) != owner {
+                self.adopt_subtree(*insertion_node, owner);
+            }
+        }
         let insertion_index = match effective_reference {
             Some(reference) => self
                 .node(parent)
@@ -1404,6 +1433,7 @@ impl Dom {
             parent: None,
             children: Vec::new(),
             kind,
+            owner: self.document,
         });
         id
     }
