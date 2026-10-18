@@ -48,6 +48,7 @@ impl Dom {
                 if let Some(element) = self.element_data_mut(copy) {
                     element.attributes = data.attributes.clone();
                 }
+                self.index_named(copy);
                 copy
             }
         };

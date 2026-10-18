@@ -2023,7 +2023,7 @@ impl JsRuntime {
                     unreachable!("matched by the guard")
                 };
                 let scope = self.resolve_name(dom, name)?;
-                if scope.is_none() && !self.global_name_exists(name) {
+                if scope.is_none() && !self.global_name_exists(dom, name)? {
                     return Ok(JsValue::String(("undefined".to_owned()).into()));
                 }
                 let value = self.read_resolved_binding(dom, scope, name)?;
@@ -4565,7 +4565,7 @@ impl JsRuntime {
         name: &str,
     ) -> Result<JsValue, JsError> {
         let Some(depth) = scope else {
-            return self.read_global_binding(name);
+            return self.read_global_binding(dom, name);
         };
         if let Some(object) = self.with_object_at(depth) {
             // GetBindingValue of an object environment record (ECMA-262
@@ -4596,7 +4596,7 @@ impl JsRuntime {
         }
     }
 
-    fn read_global_binding(&self, name: &str) -> Result<JsValue, JsError> {
+    fn read_global_binding(&mut self, dom: &mut Dom, name: &str) -> Result<JsValue, JsError> {
         if let Some(binding) = self.global_bindings().get(name)
             && !binding.initialized
         {
@@ -4611,8 +4611,11 @@ impl JsRuntime {
         } {
             return Ok(JsValue::Number(f64::from(value)));
         }
-        self.realm
-            .global(name)
+        if let Some(value) = self.realm.global(name) {
+            return Ok(value);
+        }
+        let global = self.realm.global_object();
+        self.named_access_value(dom, global, name)?
             .ok_or_else(|| JsError::reference(format!("{name} is not defined")))
     }
 
@@ -4639,7 +4642,7 @@ impl JsRuntime {
         value: JsValue,
     ) -> Result<(), JsError> {
         let Some(depth) = scope else {
-            return self.write_global_binding(name, value);
+            return self.write_global_binding(dom, name, value);
         };
         if let Some(object) = self.with_object_at(depth) {
             return self.set_with_binding(dom, object, name, value);
@@ -4671,7 +4674,12 @@ impl JsRuntime {
         )))
     }
 
-    fn write_global_binding(&mut self, name: &str, value: JsValue) -> Result<(), JsError> {
+    fn write_global_binding(
+        &mut self,
+        dom: &mut Dom,
+        name: &str,
+        value: JsValue,
+    ) -> Result<(), JsError> {
         if let Some(binding) = self.global_bindings().get(name) {
             if !binding.initialized {
                 return Err(JsError::reference(format!(
@@ -4685,8 +4693,12 @@ impl JsRuntime {
             }
         }
         // An unresolvable reference in strict code throws (PutValue, ECMA-262
-        // 6.2.5.6); sloppy code creates the global.
-        if self.code_is_strict() && self.realm.global(name).is_none() {
+        // 6.2.5.6); sloppy code creates the global. A named property of the
+        // window resolves the reference (HasProperty of the global object).
+        if self.code_is_strict()
+            && self.realm.global(name).is_none()
+            && !self.named_global_exists(dom, name)?
+        {
             return Err(JsError::reference(format!("{name} is not defined")));
         }
         // A failed [[Set]] throws only in strict code (PutValue, ECMA-262 6.2.5.6).
@@ -4711,8 +4723,18 @@ impl JsRuntime {
 
     /// Whether `name` is bound in the global environment (its global
     /// bindings or the global object).
-    fn global_name_exists(&self, name: &str) -> bool {
-        self.global_bindings().contains_key(name) || self.realm.global(name).is_some()
+    fn global_name_exists(&mut self, dom: &mut Dom, name: &str) -> Result<bool, JsError> {
+        if self.global_bindings().contains_key(name) || self.realm.global(name).is_some() {
+            return Ok(true);
+        }
+        self.named_global_exists(dom, name)
+    }
+
+    /// Whether the window of the current realm names `name` with a named
+    /// property (HTML §7.4.4): the global object's named properties object holds it.
+    fn named_global_exists(&mut self, dom: &mut Dom, name: &str) -> Result<bool, JsError> {
+        let global = self.realm.global_object();
+        Ok(self.named_access_value(dom, global, name)?.is_some())
     }
 
     /// `with (object) body` (ECMA-262 14.11.2): the body runs in an object
@@ -5537,6 +5559,13 @@ impl JsRuntime {
         if let Some(function) = function {
             self.ensure_heap_capacity(1)?;
             return Ok(JsValue::Object(self.realm.bound_function(function, object)));
+        }
+        // Named properties (HTML §7.4.4, §3.1.5) sit below every property of the
+        // chain, so they answer only when the chain holds no property of this name.
+        if inherited_origin.is_none()
+            && let Some(value) = self.named_access_value(dom, object, property)?
+        {
+            return Ok(value);
         }
         // Inherited prototype members come last so host interfaces keep
         // precedence over `Object.prototype` fallbacks. The pure chain walk

@@ -11,6 +11,7 @@ use std::fmt;
 
 mod clone;
 mod focus;
+mod named;
 mod range;
 mod shadow;
 mod text;
@@ -531,6 +532,9 @@ pub struct Dom {
     /// Every range this document has created, live and static (DOM §5). A
     /// [`RangeId`] indexes this table. See the `range` module.
     ranges: Vec<range::RangeRecord>,
+    /// The elements named by their `id` and `name` attributes. See
+    /// [`Dom::named_elements`].
+    named: named::NamedIndex,
 }
 
 impl Default for Dom {
@@ -557,6 +561,7 @@ impl Dom {
             oldest_available_revision: DomRevision::default(),
             focused_area: None,
             ranges: Vec::new(),
+            named: named::NamedIndex::default(),
         }
     }
 
@@ -586,6 +591,9 @@ impl Dom {
                 children: node.children.into_iter().map(shift).collect(),
                 kind: shift_kind(node.kind, shift),
             });
+        }
+        for index in offset..self.nodes.len() {
+            self.index_named(NodeId::from_index(index));
         }
         shift(other.document)
     }
@@ -1173,6 +1181,7 @@ impl Dom {
         };
         let value = value.into();
         let mutation_name = local_name.clone();
+        self.unindex_named(element);
         let node = self.node_mut(element)?;
         let NodeKind::Element(data) = &mut node.kind else {
             unreachable!("element kind was checked")
@@ -1195,6 +1204,7 @@ impl Dom {
             target: element,
             local_name: mutation_name,
         }]);
+        self.index_named(element);
         Ok(())
     }
 
@@ -1214,6 +1224,7 @@ impl Dom {
         } else {
             local_name.to_owned()
         };
+        self.unindex_named(element);
         let node = self.node_mut(element)?;
         let NodeKind::Element(data) = &mut node.kind else {
             unreachable!("element kind was checked")
@@ -1229,6 +1240,7 @@ impl Dom {
                 local_name: normalized,
             }]);
         }
+        self.index_named(element);
         Ok(())
     }
 
@@ -1283,6 +1295,7 @@ impl Dom {
         let mutation_name = local_name.clone();
         let namespace = namespace.map(str::to_owned);
         let prefix = prefix.map(str::to_owned);
+        self.unindex_named(element);
         let node = self.node_mut(element)?;
         let NodeKind::Element(data) = &mut node.kind else {
             unreachable!("element kind was checked")
@@ -1304,6 +1317,7 @@ impl Dom {
             target: element,
             local_name: mutation_name,
         }]);
+        self.index_named(element);
         Ok(())
     }
 
@@ -1347,6 +1361,7 @@ impl Dom {
         if !matches!(self.kind(element)?, NodeKind::Element(_)) {
             return Err(DomError::invalid_node_type("attributes require an element"));
         }
+        self.unindex_named(element);
         let node = self.node_mut(element)?;
         let NodeKind::Element(data) = &mut node.kind else {
             unreachable!("element kind was checked")
@@ -1361,6 +1376,7 @@ impl Dom {
                 local_name: local_name.to_owned(),
             }]);
         }
+        self.index_named(element);
         Ok(())
     }
 

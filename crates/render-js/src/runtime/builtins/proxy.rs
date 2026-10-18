@@ -670,6 +670,13 @@ impl JsRuntime {
             if self.own_descriptor(dom, current, key)?.is_some() {
                 return Ok(true);
             }
+            // A window or a document names its elements below its own properties
+            // (HTML §7.4.4, §3.1.5), so the name is present for `in` and `Reflect.has`.
+            if let PropertyName::String(name) = key
+                && self.named_access_value(dom, current, name)?.is_some()
+            {
+                return Ok(true);
+            }
             match self.prototype_of(dom, current)? {
                 Some(parent) => current = parent,
                 None => return Ok(false),

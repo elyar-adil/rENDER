@@ -2232,6 +2232,10 @@ pub(crate) enum CollectionFilter {
     /// Descendant elements carrying every listed class token, as
     /// `getElementsByClassName` (DOM §4.2.6.2).
     ClassNames(Vec<String>),
+    /// The elements of the document named by the key, as the named properties of
+    /// a window or a document give them (HTML §7.4.4, §3.1.5). The root is the
+    /// document itself.
+    NamedItem(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

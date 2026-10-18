@@ -35,6 +35,7 @@ pub(crate) fn collection_members(
             .copied()
             .filter(|child| is_element(dom, *child))
             .collect(),
+        CollectionFilter::NamedItem(key) => dom.named_elements(root, key),
         _ => descendants(dom, root)
             .into_iter()
             .filter(|node| is_element(dom, *node) && element_matches(dom, *node, filter))
@@ -111,6 +112,7 @@ fn element_matches(dom: &Dom, node: NodeId, filter: &CollectionFilter) -> bool {
                 .iter()
                 .all(|token| classes.split_ascii_whitespace().any(|class| class == token))
         }
+        CollectionFilter::NamedItem(key) => dom.names_element(node, key),
         CollectionFilter::ChildNodes | CollectionFilter::ChildElements => false,
     }
 }
