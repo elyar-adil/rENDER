@@ -4237,6 +4237,101 @@ fn uncaught_microtask_errors_dispatch_a_window_error_event() {
 }
 
 #[test]
+fn a_string_timer_handler_runs_as_a_global_script_when_it_fires() {
+    // The string form of setTimeout is compiled and run in the global scope when the
+    // timer fires; a declaration in it becomes a global, and extra arguments are
+    // not passed to a script.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    let id = runtime
+        .execute(
+            &mut parsed.dom,
+            "setTimeout('var fromString = 40 + 2;', 5, 'ignored')",
+        )
+        .expect("string timer registration should execute")
+        .value;
+    assert_eq!(id, JsValue::Number(1.0));
+    assert_eq!(
+        runtime
+            .execute(&mut parsed.dom, "typeof fromString")
+            .expect("probe should execute")
+            .value,
+        JsValue::String("undefined".into())
+    );
+    let _ = runtime.take_pending_timer_requests();
+    let (next, outcome) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert_eq!(next, None);
+    assert!(outcome.is_ok());
+    assert_eq!(
+        runtime
+            .execute(&mut parsed.dom, "fromString")
+            .expect("global probe should execute")
+            .value,
+        JsValue::Number(42.0)
+    );
+}
+
+#[test]
+fn string_timer_failures_are_reported_once_as_window_error_events() {
+    // A runtime failure and a compile failure in the string form both reach the window
+    // `error` event, each exactly once, with the document URL as the filename.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let url = Url::parse("https://example.test/page.html").expect("test URL");
+    let mut runtime = JsRuntime::with_url(&parsed.dom, &url);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r#"
+                window.failures = [];
+                window.addEventListener("error", function (event) {
+                    window.failures.push(
+                        event.message + "|" + event.filename + "|" +
+                        (event.error instanceof SyntaxError ? "syntax" :
+                         event.error instanceof ReferenceError ? "reference" : "other")
+                    );
+                });
+                setTimeout("undefinedVariable;", 0);
+                setTimeout("{", 0);
+            "#,
+        )
+        .expect("timer registration should execute");
+    let _ = runtime.take_pending_timer_requests();
+    let (_, first) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    let (_, second) = runtime.fire_timer_reporting(&mut parsed.dom, 2);
+    assert!(first.is_err() && second.is_err());
+    let outcome = runtime
+        .execute(&mut parsed.dom, "window.failures.join(' ; ')")
+        .expect("failure probe should execute");
+    let JsValue::String(text) = outcome.value else {
+        panic!("failure probe must produce a string");
+    };
+    let text = text.to_lossy();
+    assert!(
+        text.contains("undefinedVariable is not defined|https://example.test/page.html|reference"),
+        "runtime failure reported: {text}"
+    );
+    assert_eq!(text.matches(" ; ").count(), 1, "exactly two events: {text}");
+    assert!(
+        text.ends_with("|https://example.test/page.html|syntax"),
+        "compile failure reported: {text}"
+    );
+}
+
+#[test]
+fn a_non_callable_timer_handler_is_converted_to_a_script_string() {
+    // WebIDL TimerHandler is (Function or DOMString): a number is a string, so it is
+    // compiled as a script (an expression statement here, which does nothing).
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(&mut parsed.dom, "setTimeout(12345, 0);")
+        .expect("a number is a valid timer handler");
+    let _ = runtime.take_pending_timer_requests();
+    let (_, outcome) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert!(outcome.is_ok());
+}
+
+#[test]
 fn document_cookie_round_trips_and_deletes() {
     let mut parsed = parse_document("<!doctype html><p></p>");
     let mut runtime = JsRuntime::new(&parsed.dom);

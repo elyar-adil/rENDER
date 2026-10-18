@@ -99,7 +99,8 @@ mod using_tests;
 
 pub use types::{
     ConsoleLevel, ConsoleMessage, DocumentReadyState, ElementRect, FetchOutcome, HistoryRequest,
-    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerKind, TimerRequest,
+    JsMicrotask, NavigationRequest, PendingFetch, TimerEntry, TimerHandler, TimerKind,
+    TimerRequest,
 };
 
 /// Whether a history change may point `new` at the document URL `current`.
@@ -887,7 +888,14 @@ impl JsRuntime {
         self.calls_active = 0;
         self.dom_nodes_created = 0;
         self.environment.clear();
-        let outcome = self.call(dom, entry.callback, &entry.arguments).map(|_| ());
+        let outcome = match &entry.handler {
+            TimerHandler::Callback(callback) => {
+                self.call(dom, *callback, &entry.arguments).map(|_| ())
+            }
+            // `execute` reports its own compile and runtime failures, exactly as
+            // it does for any classic script, so nothing is reported twice.
+            TimerHandler::Script(source) => self.execute(dom, source).map(|_| ()),
+        };
         self.queue_mutation_deliveries(dom);
         self.sync_nested_contexts(dom);
         let repeats = entry.kind == TimerKind::Interval && self.timers.contains_key(&id);
