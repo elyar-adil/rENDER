@@ -144,6 +144,7 @@ impl Engine for RenderCoreEngine {
     fn run(&mut self, ctx: &TestContext<'_>) -> Result<Verdict, HarnessError> {
         if let Some(capability) = first_unsupported_capability(ctx) {
             return Ok(Verdict::Unsupported {
+                subtests: None,
                 capability: Some(capability),
                 reason: format!(
                     "render-core implements no nested browsing context, so {} cannot be driven; \
@@ -164,6 +165,7 @@ impl Engine for RenderCoreEngine {
         // which is what should happen when nothing about them was asserted.
         if output.styles.is_empty() {
             return Ok(Verdict::Unsupported {
+                subtests: None,
                 capability: None,
                 reason: "the style pipeline produced no computed values for this document, and \
                          this adapter asserts no WPT expectation, so there is no verdict"
@@ -190,6 +192,7 @@ impl Engine for RenderCoreEngine {
             // the value is not a CSS value. This is the one `fail` this adapter
             // is allowed to produce, and it says which property.
             return Ok(Verdict::Failed {
+                subtests: None,
                 assertion: format!(
                     "the computed value of `{property}` serialises to the empty string, which is \
                      not a CSS value"
@@ -203,6 +206,7 @@ impl Engine for RenderCoreEngine {
         }
 
         Ok(Verdict::Unsupported {
+            subtests: None,
             capability: None,
             reason: format!(
                 "the CSS style pipeline ran over {} node(s) and produced {evaluated} computed \
@@ -316,6 +320,7 @@ fn run_file(
                 assertions_evaluated: 0,
                 assertion_sites: 0,
                 mechanism: Some("test-file-unreadable".to_owned()),
+                subtests: None,
                 notes: vec!["a harness error, not a test failure".to_owned()],
             };
         }
@@ -394,7 +399,7 @@ mod tests {
             ))
             .expect("no harness error");
         match verdict {
-            crate::engine::Verdict::Unsupported { capability, reason } => {
+            crate::engine::Verdict::Unsupported { capability, reason, .. } => {
                 assert_eq!(
                     capability,
                     Some(crate::classify::Capability::NestedBrowsingContext)

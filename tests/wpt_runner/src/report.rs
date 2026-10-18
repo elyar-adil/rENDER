@@ -334,20 +334,31 @@ fn render_executed(
     writeln!(
         out,
         "\nTests that could not fail (reported, not scored):\n  \
-         {} declared no assertion site statically, {} passed with zero assertions evaluated",
+         {} declared no assertion site in their text (census), {} passes recorded no assertion \
+         in the run (dynamic)",
         report.census.total_cannot_fail, vacuous
     )
     .expect("write to String cannot fail");
     if vacuous > 0 {
         writeln!(
             out,
-            "  {} passes are vacuous: the adapter reported pass having evaluated nothing. These\n\
+            "  {} passes are vacuous: the run's assertion counter recorded nothing for them. These\n\
              \x20 are included in `pass` above and are listed here so the pass count is not read\n\
              \x20 as stronger evidence than it is.",
             vacuous
         )
         .expect("write to String cannot fail");
     }
+
+    let evidence = report.pass_evidence_counts();
+    writeln!(
+        out,
+        "\nPass evidence (from the harness's own subtest record):\n  \
+         {} full, {} partial (a subtest recorded no assertion while it ran, or the registered count is unknown), \
+         {} with no harness record",
+        evidence.0, evidence.1, evidence.2
+    )
+    .expect("write to String cannot fail");
 }
 
 /// Render the ranked mechanism table, which is the part of this report anyone

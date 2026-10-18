@@ -72,15 +72,21 @@ impl Engine for Stub {
     fn run(&mut self, ctx: &TestContext<'_>) -> Result<Verdict, HarnessError> {
         let _ = ctx;
         match self.0 {
-            "pass" => Ok(Verdict::Passed { assertions_evaluated: 3, notes: Vec::new() }),
+            "pass" => Ok(Verdict::Passed {
+                assertions_evaluated: 3,
+                notes: Vec::new(),
+                subtests: None,
+            }),
             "fail" => Ok(Verdict::Failed {
                 assertion: "assert_equals: expected \"10px\" but got \"20px\"".to_owned(),
                 engine_location: None,
                 notes: Vec::new(),
+                subtests: None,
             }),
             "unsupported" => Ok(Verdict::Unsupported {
                 capability: Some(Capability::NestedBrowsingContext),
                 reason: "the adapter cannot create a nested browsing context".to_owned(),
+                subtests: None,
             }),
             "error" => Err(HarnessError { message: "fixture read failed".to_owned() }),
             // A panic path, so the containment is exercised rather than assumed.
