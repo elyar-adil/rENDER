@@ -301,9 +301,9 @@ impl JsRuntime {
                 let system_id = required_argument(arguments, 2, "createDocumentType")?
                     .to_js_string()
                     .to_lossy();
-                // DOM §4.5: a qualified name that is not a valid XML name is an
+                // DOM §4.5: a name that is not a valid doctype name is an
                 // `InvalidCharacterError`.
-                if !valid_xml_name(&name) {
+                if !valid_doctype_name(&name) {
                     return Err(self.dom_exception(
                         DomExceptionName::InvalidCharacter,
                         format!("{name:?} is not a valid doctype name"),
@@ -907,6 +907,15 @@ pub(in crate::runtime) fn valid_xml_name(name: &str) -> bool {
             || matches!(character, '_' | ':' | '-' | '.' | '\u{b7}')
             || !character.is_ascii()
     })
+}
+
+/// Whether `name` is a valid doctype name (DOM §4.5 `createDocumentType`): it
+/// contains no ASCII whitespace, no `>` and no NULL. Any other string, the empty
+/// string included, is a valid doctype name, which is looser than an XML `Name`.
+pub(in crate::runtime) fn valid_doctype_name(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|character| matches!(character, '\t' | '\n' | '\u{c}' | '\r' | ' ' | '>' | '\0'))
 }
 
 pub(in crate::runtime) fn valid_html_local_name(name: &str) -> bool {

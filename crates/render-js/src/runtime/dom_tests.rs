@@ -568,6 +568,23 @@ fn document_implementation_creates_doctypes_and_rejects_bad_names() {
 }
 
 #[test]
+fn create_document_type_takes_any_name_without_space_gt_or_null() {
+    assert_eq!(
+        eval(
+            "var out = []; \
+             ['', '1foo', '@foo', 'edi:{', 'a-b:c.j'].forEach(function (name) { \
+               try { document.implementation.createDocumentType(name, '', ''); out.push('ok'); } \
+               catch (e) { out.push(e.name); } }); \
+             ['edi:>', 'edi:a ', 'a\\tb', 'a\\u0000b'].forEach(function (name) { \
+               try { document.implementation.createDocumentType(name, '', ''); out.push('ok'); } \
+               catch (e) { out.push(e.name); } }); \
+             out.join()"
+        ),
+        "ok,ok,ok,ok,ok,InvalidCharacterError,InvalidCharacterError,InvalidCharacterError,InvalidCharacterError"
+    );
+}
+
+#[test]
 fn create_cdata_section_throws_in_html_and_processing_instructions_carry_their_target() {
     assert_eq!(
         eval(
