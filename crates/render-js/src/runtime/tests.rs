@@ -4237,6 +4237,50 @@ fn uncaught_microtask_errors_dispatch_a_window_error_event() {
 }
 
 #[test]
+fn a_throwing_timer_callback_dispatches_a_window_error_event() {
+    // HTML 8.6 and 8.1.8.2: an exception that escapes a timer callback is reported,
+    // so the window `error` event runs with the five spec arguments and a real
+    // ReferenceError. The timer's own fire still returns the error to the embedder.
+    let mut parsed = parse_document("<!doctype html><p></p>");
+    let mut runtime = JsRuntime::new(&parsed.dom);
+    runtime
+        .execute(
+            &mut parsed.dom,
+            r"
+                window.reports = [];
+                window.onerror = function (message, filename, lineno, colno, error) {
+                    window.reports.push([
+                        arguments.length,
+                        typeof message,
+                        typeof filename,
+                        typeof lineno,
+                        typeof colno,
+                        error instanceof ReferenceError,
+                        message
+                    ].join('|'));
+                    return true;
+                };
+                setTimeout(function () { missingFunction(); }, 0);
+            ",
+        )
+        .expect("timer registration should execute");
+    let _ = runtime.take_pending_timer_requests();
+    let (next, outcome) = runtime.fire_timer_reporting(&mut parsed.dom, 1);
+    assert_eq!(next, None);
+    assert!(
+        outcome.is_err(),
+        "the callback's exception is still returned"
+    );
+    let outcome = runtime
+        .execute(&mut parsed.dom, "window.reports.join(';')")
+        .expect("report probe should execute");
+    assert_eq!(
+        outcome.value,
+        JsValue::String("5|string|string|number|number|true|missingFunction is not defined".into())
+    );
+}
+
+#[test]
 fn a_string_timer_handler_runs_as_a_global_script_when_it_fires() {
     // The string form of setTimeout is compiled and run in the global scope when the
     // timer fires; a declaration in it becomes a global, and extra arguments are

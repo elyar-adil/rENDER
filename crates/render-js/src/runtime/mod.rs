@@ -866,6 +866,10 @@ impl JsRuntime {
     /// (HTML 8.6), so the embedding must reschedule from the first value and
     /// report the second. A callback that cancelled its own interval gets no
     /// next run.
+    ///
+    /// An exception that escapes the handler is reported as an uncaught
+    /// exception (HTML 8.1.8.2, "report the exception") before this returns, so
+    /// the window `error` event runs for both the function and the string form.
     pub fn fire_timer_reporting(
         &mut self,
         dom: &mut Dom,
@@ -890,7 +894,11 @@ impl JsRuntime {
         self.environment.clear();
         let outcome = match &entry.handler {
             TimerHandler::Callback(callback) => {
-                self.call(dom, *callback, &entry.arguments).map(|_| ())
+                let outcome = self.call(dom, *callback, &entry.arguments).map(|_| ());
+                if let Err(error) = &outcome {
+                    self.report_uncaught_error(dom, error);
+                }
+                outcome
             }
             // `execute` reports its own compile and runtime failures, exactly as
             // it does for any classic script, so nothing is reported twice.
