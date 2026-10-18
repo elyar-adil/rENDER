@@ -413,3 +413,33 @@ fn the_page_load_event_reaches_the_window_once_when_the_embedder_dispatches_it()
         .expect("the page's load event dispatches");
     assert_eq!(run(&mut dom, &mut runtime, "loads"), "1");
 }
+
+#[test]
+fn a_node_made_by_a_frame_constructor_belongs_to_the_frame_document() {
+    let (mut dom, mut runtime) = page("<body></body>", BTreeMap::new());
+    run(
+        &mut dom,
+        &mut runtime,
+        "var f = document.createElement('iframe'); document.body.appendChild(f); var w = f.contentWindow;",
+    );
+    assert_eq!(
+        run(&mut dom, &mut runtime, "new w.Text('x') instanceof w.Text"),
+        "true"
+    );
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "new w.Text('x').ownerDocument === w.document"
+        ),
+        "true"
+    );
+    assert_eq!(
+        run(
+            &mut dom,
+            &mut runtime,
+            "new Text('x').ownerDocument === document"
+        ),
+        "true"
+    );
+}

@@ -9,13 +9,10 @@ impl Dom {
     ///
     /// The copy keeps the element's namespace, prefix and attributes exactly, as
     /// the specification requires, and a `template` element's content is copied
-    /// into the copy's own template contents. The copy is detached.
-    ///
-    /// # Errors
-    ///
-    /// A Document copy is a new document with the same content type, and its
-    /// children are copied with it when `deep` is true. Every other copy has the
-    /// node document of the node it copies.
+    /// into the copy's own template contents. The copy is detached. A Document
+    /// copy is a new document with the same content type, and its children are
+    /// copied with it when `deep` is true. Every other copy has the node document
+    /// of the node it copies.
     ///
     /// # Errors
     ///

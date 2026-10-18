@@ -938,6 +938,19 @@ fn import_node_copies_into_the_document() {
 }
 
 #[test]
+fn import_node_refuses_a_document() {
+    assert_eq!(
+        eval(
+            "var d = document.implementation.createHTMLDocument(); var out = []; \
+             try { document.importNode(d, true); } catch (e) { out.push(e.name); } \
+             try { document.importNode(document, false); } catch (e) { out.push(e.name); } \
+             out.join()"
+        ),
+        "NotSupportedError,NotSupportedError"
+    );
+}
+
+#[test]
 fn clone_node_copies_a_document_with_its_doctype_and_children() {
     assert_eq!(
         eval(

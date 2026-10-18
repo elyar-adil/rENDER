@@ -265,10 +265,15 @@ impl JsRuntime {
             NativeFunction::ImportNode => {
                 let document = self.require_document(receiver)?;
                 let node = self.value_as_node(required_argument(arguments, 0, "importNode")?)?;
-                if node == dom.document() {
+                // DOM §4.5 `importNode`: a Document or a shadow root cannot be imported.
+                // This is checked before the copy, so a refused node allocates nothing.
+                if matches!(
+                    dom.node(node).map(render_dom::Node::kind),
+                    Some(NodeKind::Document | NodeKind::ShadowRoot(_))
+                ) {
                     return Err(self.dom_exception(
                         DomExceptionName::NotSupported,
-                        "a Document node cannot be imported",
+                        "a Document or shadow root node cannot be imported",
                     ));
                 }
                 let deep = arguments.get(1).is_some_and(JsValue::is_truthy);
@@ -926,6 +931,10 @@ impl JsRuntime {
         self.ensure_heap_capacity(1)?;
         self.dom_nodes_created = self.dom_nodes_created.saturating_add(1);
         let image = dom.create_element("img");
+        // An image made by script belongs to the document of the realm it is made in.
+        if let Some(document) = self.realm_document_node() {
+            dom.set_node_document(image, document);
+        }
         for (index, name) in [(0, "width"), (1, "height")] {
             if let Some(value) = arguments.get(index)
                 && !matches!(value, JsValue::Undefined)
@@ -1840,6 +1849,11 @@ impl JsRuntime {
             DomNodeKind::Fragment => dom.create_document_fragment(),
             DomNodeKind::Document => return self.construct_document(dom),
         };
+        // DOM §4.4: a node made by a constructor belongs to the document of the
+        // global object it is made in, which is the running realm's document.
+        if let Some(document) = self.realm_document_node() {
+            dom.set_node_document(node, document);
+        }
         self.wrap_node(dom, node)
     }
 
