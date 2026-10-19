@@ -55,6 +55,7 @@ pub mod fixtures;
 pub mod mechanism;
 pub mod outcome;
 pub mod probe;
+pub mod reftest;
 pub mod report;
 pub mod results;
 pub mod selftest;
