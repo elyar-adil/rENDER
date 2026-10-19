@@ -36,6 +36,8 @@ pub(crate) fn collection_members(
             .filter(|child| is_element(dom, *child))
             .collect(),
         CollectionFilter::NamedItem(key) => dom.named_elements(root, key),
+        CollectionFilter::FormControls => dom.form_control_members(root),
+        CollectionFilter::FormControlName(key) => dom.form_control_named(root, key),
         _ => descendants(dom, root)
             .into_iter()
             .filter(|node| is_element(dom, *node) && element_matches(dom, *node, filter))
@@ -113,7 +115,11 @@ fn element_matches(dom: &Dom, node: NodeId, filter: &CollectionFilter) -> bool {
                 .all(|token| classes.split_ascii_whitespace().any(|class| class == token))
         }
         CollectionFilter::NamedItem(key) => dom.names_element(node, key),
-        CollectionFilter::ChildNodes | CollectionFilter::ChildElements => false,
+        CollectionFilter::Forms => dom.is_form_element(node),
+        CollectionFilter::ChildNodes
+        | CollectionFilter::ChildElements
+        | CollectionFilter::FormControls
+        | CollectionFilter::FormControlName(_) => false,
     }
 }
 
@@ -299,9 +305,9 @@ impl JsRuntime {
         }
     }
 
-    /// `HTMLCollection.prototype.namedItem`: the first member whose `id` is
-    /// `key`, else the first named element whose `name` is `key`. The empty
-    /// string names nothing (HTML §4.2.5).
+    /// `HTMLCollection.prototype.namedItem` and `HTMLFormControlsCollection`'s named
+    /// item: the named item of the receiver's rule, or `null` when there is none.
+    /// The empty string names nothing (HTML §4.2.5, §4.10.3).
     pub(crate) fn collection_named_item(
         &mut self,
         dom: &mut Dom,
@@ -311,34 +317,166 @@ impl JsRuntime {
         let key = required_argument(arguments, 0, "namedItem")?
             .to_js_string()
             .to_lossy();
-        if key.is_empty() {
-            return Ok(JsValue::Null);
-        }
-        let Some(members) = self.collection_members_of(dom, receiver) else {
+        let Some(rule) = self.collection_named_rule(dom, receiver) else {
             return Err(JsError::type_error(
                 "incompatible HTMLCollection method receiver",
             ));
         };
-        let members = members.to_vec();
-        let by_id = members
-            .iter()
-            .copied()
-            .find(|node| dom.attribute(*node, "id").ok().flatten() == Some(key.as_str()));
-        let found = by_id.or_else(|| {
-            members.iter().copied().find(|node| {
-                matches!(
-                    dom.node(*node).map(render_dom::Node::kind),
-                    Some(NodeKind::Element(element))
-                        if element.namespace == Namespace::Html
-                            && NAMED_ITEM_ELEMENTS.contains(&element.local_name.as_str())
-                ) && dom.attribute(*node, "name").ok().flatten() == Some(key.as_str())
-            })
-        });
-        match found {
-            Some(node) => self.wrap_node(dom, node),
-            None => Ok(JsValue::Null),
+        Ok(self
+            .collection_named_lookup(dom, receiver, rule, &key)?
+            .unwrap_or(JsValue::Null))
+    }
+
+    /// The named-property rule of the live collection `object`: which names it
+    /// supports, and what a name yields. `None` for a `NodeList`, a
+    /// `RadioNodeList`, and any object that is not a live collection, since those
+    /// have no named properties.
+    pub(crate) fn collection_named_rule(&self, dom: &Dom, object: ObjectId) -> Option<NamedRule> {
+        let Some(ObjectHost::LiveCollection { root, filter, .. }) = self.realm.host_ref(object)
+        else {
+            return None;
+        };
+        match filter {
+            CollectionFilter::ChildNodes | CollectionFilter::FormControlName(_) => None,
+            CollectionFilter::FormControls if dom.is_form_element(*root) => {
+                Some(NamedRule::FormControls)
+            }
+            _ => Some(NamedRule::HtmlCollection),
         }
     }
+
+    /// The value of the named property `key` of the live collection `object` under
+    /// `rule`, or `None` when no member is named `key`. An `HTMLCollection` yields
+    /// its first named member (HTML §4.2.10.2). A form's `elements` yields the one
+    /// element named `key`, or a live `RadioNodeList` when several are (HTML
+    /// §4.10.3).
+    pub(crate) fn collection_named_lookup(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        rule: NamedRule,
+        key: &str,
+    ) -> Result<Option<JsValue>, JsError> {
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let root = match self.realm.host_ref(object) {
+            Some(ObjectHost::LiveCollection { root, .. }) => *root,
+            _ => return Ok(None),
+        };
+        let Some(members) = self
+            .collection_members_of(dom, object)
+            .map(<[NodeId]>::to_vec)
+        else {
+            return Ok(None);
+        };
+        match rule {
+            NamedRule::HtmlCollection => match html_collection_named(dom, &members, key) {
+                Some(node) => self.wrap_node(dom, node).map(Some),
+                None => Ok(None),
+            },
+            NamedRule::FormControls => {
+                let named: Vec<NodeId> = members
+                    .into_iter()
+                    .filter(|node| dom.names_form_control(*node, key))
+                    .collect();
+                match named.as_slice() {
+                    [] => Ok(None),
+                    [single] => self.wrap_node(dom, *single).map(Some),
+                    _ => {
+                        self.ensure_heap_capacity(1)?;
+                        Ok(Some(JsValue::Object(self.realm.live_collection_wrapper(
+                            root,
+                            CollectionFilter::FormControlName(key.to_owned()),
+                            "RadioNodeList",
+                        ))))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The names the live collection `object` supports under `rule`, in the order
+    /// the named properties of the object are enumerated (`WebIDL` §3.9.4): the
+    /// names of an `HTMLCollection` are its members' ids, then the names of its
+    /// named elements, and a form's controls are their ids and names.
+    pub(crate) fn collection_named_names(
+        &mut self,
+        dom: &mut Dom,
+        object: ObjectId,
+        rule: NamedRule,
+    ) -> Vec<String> {
+        let root = match self.realm.host_ref(object) {
+            Some(ObjectHost::LiveCollection { root, .. }) => *root,
+            _ => return Vec::new(),
+        };
+        match rule {
+            NamedRule::FormControls => dom.form_control_names(root),
+            NamedRule::HtmlCollection => {
+                let members = self
+                    .collection_members_of(dom, object)
+                    .map(<[NodeId]>::to_vec)
+                    .unwrap_or_default();
+                html_collection_names(dom, &members)
+            }
+        }
+    }
+}
+
+/// The named-property rule of a live collection (see
+/// [`JsRuntime::collection_named_rule`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamedRule {
+    /// An `HTMLCollection`: the ids of its members, and the `name` of each member
+    /// that is a named element, yielding the first member with that name.
+    HtmlCollection,
+    /// `HTMLFormControlsCollection`: the `id` and `name` of each listed element.
+    FormControls,
+}
+
+/// The named item of an `HTMLCollection` named `key` (HTML §4.2.10.2): the first
+/// member whose `id` is `key`, else the first named element whose `name` is `key`.
+fn html_collection_named(dom: &Dom, members: &[NodeId], key: &str) -> Option<NodeId> {
+    members
+        .iter()
+        .copied()
+        .find(|node| dom.attribute(*node, "id").ok().flatten() == Some(key))
+        .or_else(|| {
+            members.iter().copied().find(|node| {
+                is_named_item_element(dom, *node)
+                    && dom.attribute(*node, "name").ok().flatten() == Some(key)
+            })
+        })
+}
+
+/// The names of an `HTMLCollection` (HTML §4.2.10.2): the non-empty `id` of each
+/// member in order, then the `name` of each named element, each name once.
+fn html_collection_names(dom: &Dom, members: &[NodeId]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let ids = members
+        .iter()
+        .filter_map(|node| dom.attribute(*node, "id").ok().flatten());
+    let names_of_named = members
+        .iter()
+        .filter(|node| is_named_item_element(dom, **node))
+        .filter_map(|node| dom.attribute(*node, "name").ok().flatten());
+    for key in ids.chain(names_of_named).filter(|key| !key.is_empty()) {
+        if !names.iter().any(|name| name.as_str() == key) {
+            names.push(key.to_owned());
+        }
+    }
+    names
+}
+
+/// Whether `node` is an HTML element that an `HTMLCollection` names by its `name`
+/// attribute (HTML §4.2.10.2).
+fn is_named_item_element(dom: &Dom, node: NodeId) -> bool {
+    matches!(
+        dom.node(node).map(render_dom::Node::kind),
+        Some(NodeKind::Element(element))
+            if element.namespace == Namespace::Html
+                && NAMED_ITEM_ELEMENTS.contains(&element.local_name.as_str())
+    )
 }
 
 #[cfg(test)]

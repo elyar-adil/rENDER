@@ -27,7 +27,11 @@
 //! properties are not own properties of the window, so they are not enumerated
 //! and `hasOwnProperty` reports them absent on the window. They are own
 //! properties of the named properties object, writable, not enumerable and
-//! configurable, as `WebIDL` §3.9 requires.
+//! configurable, as `WebIDL` §3.9 requires. A document's named properties are
+//! never own properties, so `hasOwnProperty` reports them absent too. The named
+//! items of a form and of a collection are own, read-only properties instead;
+//! see `builtins/dom_forms.rs`. A live collection's named items are answered
+//! here too, by its own rule (`collection_named_rule`).
 
 use render_dom::{Dom, NodeId, NodeKind};
 
@@ -75,6 +79,11 @@ impl JsRuntime {
     ) -> Result<Option<JsValue>, JsError> {
         if key.is_empty() {
             return Ok(None);
+        }
+        // A live collection names its items by their rule (HTML §4.2.10.2 and
+        // §4.10.3), which is not the window's or the document's.
+        if let Some(rule) = self.collection_named_rule(dom, object) {
+            return self.collection_named_lookup(dom, object, rule, key);
         }
         let Some((document, is_window)) = self.named_access_scope(object) else {
             return Ok(None);

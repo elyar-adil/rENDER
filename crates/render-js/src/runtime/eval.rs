@@ -4796,6 +4796,16 @@ impl JsRuntime {
             }
             return Ok(descriptor.value);
         }
+        // A form's controls, by index and by name, answer before its prototype
+        // chain: an `HTMLFormElement` is `[LegacyOverrideBuiltIns]` (HTML §4.10.3).
+        // An own property has already answered above.
+        if matches!(
+            self.realm.host_ref(object),
+            Some(ObjectHost::Node(node)) if dom.is_form_element(*node)
+        ) && let Some(member) = self.exotic_member(dom, object, property)?
+        {
+            return Ok(member.value);
+        }
         // A proxy on the prototype chain answers before any later holder.
         if let Some(value) = self.proxy_inherited_get(dom, object, property)? {
             return Ok(value);
@@ -5644,6 +5654,16 @@ impl JsRuntime {
         self.consume_step()?;
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_set(dom, object, property, value);
+        }
+        // An indexed or named member of a form or a collection is read-only
+        // (WebIDL §3.9): a write to it is refused, which throws in strict code.
+        if self.exotic_member(dom, object, property)?.is_some() {
+            if self.code_is_strict() {
+                return Err(JsError::type_error(format!(
+                    "cannot assign to read only property '{property}'"
+                )));
+            }
+            return Ok(());
         }
         // ECMA-262 10.4.5.5 [[Set]] with the typed array as its own receiver: a
         // canonical numeric key writes through TypedArraySetElement and never
