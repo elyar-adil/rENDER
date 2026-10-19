@@ -888,6 +888,18 @@ pub(crate) enum NativeFunction {
     CollectionItem,
     CollectionNamedItem,
     CollectionLength,
+    /// The `form` accessors of form-associated elements and the form collections
+    /// (HTML §3.1.5, §4.10.2, §4.10.3, §4.10.4): `HTMLFormElement.prototype.elements`
+    /// and `length`, `HTMLFieldSetElement.prototype.elements`, the `form` getter
+    /// of each listed element, and `Document.prototype.forms`.
+    FormElements,
+    FormLength,
+    FieldsetElements,
+    ControlForm,
+    DocumentForms,
+    /// `RadioNodeList.prototype.value` (HTML §4.10.3, common DOM interfaces).
+    RadioNodeListValue,
+    RadioNodeListSetValue,
     /// `CharacterData` methods (DOM §4.10).
     CharacterDataSubstringData,
     CharacterDataAppendData,
@@ -2244,6 +2256,17 @@ pub(crate) enum CollectionFilter {
     /// a window or a document give them (HTML §7.4.4, §3.1.5). The root is the
     /// document itself.
     NamedItem(String),
+    /// The `form` elements of a document, in tree order, as `document.forms`
+    /// gives them (HTML §3.1.5). The root is the document.
+    Forms,
+    /// The controls of a form, as `form.elements` gives them, or the listed
+    /// descendants of a fieldset, as `fieldset.elements` does (HTML §4.10.3,
+    /// §4.10.4). The root is the form or the fieldset; the members come from
+    /// `render_dom::Dom::form_control_members`.
+    FormControls,
+    /// The controls of a form named by the key, as the `RadioNodeList` of a named
+    /// item of `form.elements` is (HTML §4.10.3). The root is the form.
+    FormControlName(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -2999,6 +3022,11 @@ pub struct RealmRecord {
     child_node_list_wrappers: BTreeMap<NodeId, ObjectId>,
     /// The `children` `HTMLCollection` of each node: one object per node (DOM §4.2.6).
     child_collection_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `elements` collection of each form and fieldset: one object per owner
+    /// (HTML §4.10.3, §4.10.4), because the attribute returns the same object.
+    form_controls_wrappers: BTreeMap<NodeId, ObjectId>,
+    /// The `forms` collection of each document: one object per document (HTML §3.1.5).
+    document_forms_wrappers: BTreeMap<NodeId, ObjectId>,
 }
 
 /// The objects that the browser host's globals contribute to a realm's record.
@@ -3480,6 +3508,8 @@ impl Realm {
             dataset_wrappers: BTreeMap::new(),
             child_node_list_wrappers: BTreeMap::new(),
             child_collection_wrappers: BTreeMap::new(),
+            form_controls_wrappers: BTreeMap::new(),
+            document_forms_wrappers: BTreeMap::new(),
             temporal_prototypes: BTreeMap::new(),
         }
     }
@@ -3623,6 +3653,16 @@ impl Realm {
                 enumerable: true,
                 configurable: true,
             },
+        );
+        // `document.forms` (HTML §3.1.5): a live `HTMLCollection` of the document's
+        // form elements.
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            document_prototype,
+            "forms",
+            NativeFunction::DocumentForms,
+            None,
         );
         Self::install_builtin_methods(
             objects,
@@ -4552,6 +4592,82 @@ impl Realm {
                     enumerable: true,
                     configurable: true,
                 },
+            );
+        }
+        // `HTMLFormControlsCollection` (HTML §4.10.3) inherits `HTMLCollection`, and
+        // `RadioNodeList` (HTML §4.10.3) inherits `NodeList`. Neither has methods of
+        // its own: the named item and the `value` attribute are the additions.
+        for (name, parent) in [
+            ("HTMLFormControlsCollection", "HTMLCollection"),
+            ("RadioNodeList", "NodeList"),
+        ] {
+            let proto = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(prototypes[parent]),
+                ..JsObject::default()
+            });
+            Self::dom_interface(
+                objects,
+                global,
+                function_prototype,
+                name,
+                proto,
+                None,
+                ObjectHost::DomConstructor,
+            );
+            prototypes.insert(name, proto);
+        }
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            prototypes["RadioNodeList"],
+            "value",
+            NativeFunction::RadioNodeListValue,
+            Some(NativeFunction::RadioNodeListSetValue),
+        );
+        // HTML §4.10.3: a form's `elements` and `length`; a fieldset's `elements`
+        // (§4.10.4); and `form`, the form owner of each listed element (§4.10.2).
+        // `img` is form-associated but not listed, so it has no `form` attribute.
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            prototypes["HTMLFormElement"],
+            "elements",
+            NativeFunction::FormElements,
+            None,
+        );
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            prototypes["HTMLFormElement"],
+            "length",
+            NativeFunction::FormLength,
+            None,
+        );
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            prototypes["HTMLFieldSetElement"],
+            "elements",
+            NativeFunction::FieldsetElements,
+            None,
+        );
+        for interface in [
+            "HTMLFieldSetElement",
+            "HTMLButtonElement",
+            "HTMLInputElement",
+            "HTMLObjectElement",
+            "HTMLOutputElement",
+            "HTMLSelectElement",
+            "HTMLTextAreaElement",
+        ] {
+            Self::install_attribute(
+                objects,
+                function_prototype,
+                prototypes[interface],
+                "form",
+                NativeFunction::ControlForm,
+                None,
             );
         }
         // DOM §5: `AbstractRange` is the common interface of `Range` and
@@ -5485,6 +5601,47 @@ impl Realm {
             },
         );
         (prototype, constructor)
+    }
+
+    /// Install the `WebIDL` attribute `name` on `target` as an accessor (`WebIDL`
+    /// §3.7.6): enumerable and configurable, with the native `getter`, and the
+    /// native `setter` when one is given.
+    fn install_attribute(
+        objects: &mut Vec<JsObject>,
+        function_prototype: ObjectId,
+        target: ObjectId,
+        name: &str,
+        getter: NativeFunction,
+        setter: Option<NativeFunction>,
+    ) {
+        let getter_object = ObjectId(objects.len());
+        objects.push(JsObject {
+            prototype: Some(function_prototype),
+            host: ObjectHost::NativeFunction(getter),
+            properties: Self::function_metadata(&format!("get {name}"), 0.0),
+            ..JsObject::default()
+        });
+        let setter_object = setter.map(|setter| {
+            let object = ObjectId(objects.len());
+            objects.push(JsObject {
+                prototype: Some(function_prototype),
+                host: ObjectHost::NativeFunction(setter),
+                properties: Self::function_metadata(&format!("set {name}"), 1.0),
+                ..JsObject::default()
+            });
+            object
+        });
+        objects[target.0].properties.insert(
+            name.to_owned(),
+            PropertyDescriptor {
+                value: JsValue::Undefined,
+                writable: false,
+                getter: Some(getter_object),
+                setter: setter_object,
+                enumerable: true,
+                configurable: true,
+            },
+        );
     }
 
     /// Install accessor properties with getter-only functions on `target`.
@@ -10317,7 +10474,9 @@ impl RealmRecord {
                 + self.style_declaration_wrappers.len()
                 + self.dataset_wrappers.len()
                 + self.child_node_list_wrappers.len()
-                + self.child_collection_wrappers.len(),
+                + self.child_collection_wrappers.len()
+                + self.form_controls_wrappers.len()
+                + self.document_forms_wrappers.len(),
         );
         roots.push(self.global);
         roots.push(self.document);
@@ -10349,6 +10508,8 @@ impl RealmRecord {
         roots.extend(self.dataset_wrappers.values().copied());
         roots.extend(self.child_node_list_wrappers.values().copied());
         roots.extend(self.child_collection_wrappers.values().copied());
+        roots.extend(self.form_controls_wrappers.values().copied());
+        roots.extend(self.document_forms_wrappers.values().copied());
         roots
     }
 }
@@ -11268,6 +11429,30 @@ impl Realm {
         } else {
             self.child_node_list_wrappers.insert(node, wrapper);
         }
+        wrapper
+    }
+
+    /// The `elements` collection of a form or fieldset `owner`, one object per
+    /// owner (HTML §4.10.3, §4.10.4). `interface` is `"HTMLFormControlsCollection"`
+    /// for a form and `"HTMLCollection"` for a fieldset.
+    pub(crate) fn form_controls_wrapper(&mut self, owner: NodeId, interface: &str) -> ObjectId {
+        if let Some(wrapper) = self.form_controls_wrappers.get(&owner) {
+            return *wrapper;
+        }
+        let wrapper =
+            self.live_collection_wrapper(owner, CollectionFilter::FormControls, interface);
+        self.form_controls_wrappers.insert(owner, wrapper);
+        wrapper
+    }
+
+    /// The `forms` collection of `document`, one object per document (HTML §3.1.5).
+    pub(crate) fn document_forms_wrapper(&mut self, document: NodeId) -> ObjectId {
+        if let Some(wrapper) = self.document_forms_wrappers.get(&document) {
+            return *wrapper;
+        }
+        let wrapper =
+            self.live_collection_wrapper(document, CollectionFilter::Forms, "HTMLCollection");
+        self.document_forms_wrappers.insert(document, wrapper);
         wrapper
     }
 

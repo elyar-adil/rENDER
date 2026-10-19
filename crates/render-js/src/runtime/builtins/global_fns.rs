@@ -847,7 +847,14 @@ impl JsRuntime {
             | NativeFunction::ImportNode
             | NativeFunction::IsSameNode
             | NativeFunction::NodeNormalize
-            | NativeFunction::TextSplitText => {
+            | NativeFunction::TextSplitText
+            | NativeFunction::FormElements
+            | NativeFunction::FormLength
+            | NativeFunction::FieldsetElements
+            | NativeFunction::ControlForm
+            | NativeFunction::DocumentForms
+            | NativeFunction::RadioNodeListValue
+            | NativeFunction::RadioNodeListSetValue => {
                 self.dispatch_dom_native(dom, function, receiver, arguments)
             }
             NativeFunction::Range(op) => self.range_native(dom, op, receiver, arguments),

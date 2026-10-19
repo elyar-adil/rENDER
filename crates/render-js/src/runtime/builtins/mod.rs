@@ -25,6 +25,7 @@ pub(super) mod dom_character_data;
 pub(super) mod dom_collections;
 pub(super) mod dom_document;
 pub(super) mod dom_exception;
+pub(super) mod dom_forms;
 pub(super) mod dom_range;
 pub(super) mod encoding;
 pub(super) mod events;

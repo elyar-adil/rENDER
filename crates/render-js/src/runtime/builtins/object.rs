@@ -1163,6 +1163,12 @@ impl JsRuntime {
             if self.realm.is_module_namespace(object) {
                 return self.define_namespace_export(dom, object, name, &partial);
             }
+            // An indexed member of a form or collection takes only a restatement of
+            // its own data; a named member refuses every definition (WebIDL §3.9.3).
+            if let Some(member) = self.exotic_member(dom, object, name)? {
+                return Ok(member.enumerable
+                    && super::dom_forms::indexed_definition_is_compatible(&member, &partial));
+            }
         }
         match self.realm.host(object) {
             Some(ObjectHost::Proxy { .. }) => {
@@ -1431,6 +1437,20 @@ impl JsRuntime {
                 configurable: true,
             }));
         }
+        // A form's controls, and a collection's named items, are own read-only
+        // properties: enumerable only when indexed (HTML §4.10.3, WebIDL §3.9).
+        if let PropertyName::String(name) = key
+            && let Some(member) = self.exotic_member(dom, object, name)?
+        {
+            return Ok(Some(PropertyDescriptor {
+                getter: None,
+                setter: None,
+                value: member.value,
+                writable: false,
+                enumerable: member.enumerable,
+                configurable: true,
+            }));
+        }
         match key {
             PropertyName::String(name) => {
                 if let Some(descriptor) = self.realm.own_property(object, name) {
@@ -1471,15 +1491,22 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_own_property_keys(dom, object);
         }
+        // Indexed members first, then named members, then the ordinary own names
+        // (WebIDL §3.9.4).
         let mut keys = self
-            .realm
-            .own_property_names(object)
-            .unwrap_or_default()
+            .exotic_own_keys(dom, object)?
             .into_iter()
             .map(PropertyName::String)
             .collect::<Vec<_>>();
         keys.extend(
             self.window_named_keys(dom, object)?
+                .into_iter()
+                .map(PropertyName::String),
+        );
+        keys.extend(
+            self.realm
+                .own_property_names(object)
+                .unwrap_or_default()
                 .into_iter()
                 .map(PropertyName::String),
         );

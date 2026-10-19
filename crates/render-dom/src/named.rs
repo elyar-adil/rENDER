@@ -143,6 +143,77 @@ impl Dom {
             .collect()
     }
 
+    /// Whether element `node` is named `key` as a listed element of a form: its
+    /// `id` or its `name` attribute is `key` (HTML §4.10.3). Unlike
+    /// [`Self::names_element`], a `name` attribute names every listed element,
+    /// not only the ones that take one, and the empty key names nothing.
+    #[must_use]
+    pub fn names_form_control(&self, node: NodeId, key: &str) -> bool {
+        if key.is_empty() || !self.is_listed_element(node) {
+            return false;
+        }
+        matches!(
+            self.node(node).map(Node::kind),
+            Some(NodeKind::Element(data))
+                if attribute_value(data, "id") == Some(key)
+                    || attribute_value(data, "name") == Some(key)
+        )
+    }
+
+    /// The members of the form-control collection rooted at `root` (HTML
+    /// §4.10.3, §4.10.4), in tree order. For a `form` root these are the listed
+    /// elements whose form owner is that form, rooted at the form's own tree (see
+    /// [`Self::form_owner_elements`]). For any other root, a `fieldset`, they are
+    /// the listed descendants of the root, the root itself excluded.
+    #[must_use]
+    pub fn form_control_members(&self, root: NodeId) -> Vec<NodeId> {
+        if self.is_form_element(root) {
+            return self.form_owner_elements(root);
+        }
+        self.children(root)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|child| self.listed_elements_within(*child))
+            .collect()
+    }
+
+    /// The members of the form-control collection rooted at `root` that are
+    /// named `key`, in tree order (HTML §4.10.3, the named item of
+    /// `HTMLFormControlsCollection`).
+    #[must_use]
+    pub fn form_control_named(&self, root: NodeId, key: &str) -> Vec<NodeId> {
+        if key.is_empty() {
+            return Vec::new();
+        }
+        self.form_control_members(root)
+            .into_iter()
+            .filter(|node| self.names_form_control(*node, key))
+            .collect()
+    }
+
+    /// The names the form-control collection rooted at `root` supports: the
+    /// non-empty `id` and `name` of each member, in tree order, each name once.
+    /// These are the supported property names of a form (HTML §4.10.3).
+    #[must_use]
+    pub fn form_control_names(&self, root: NodeId) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for node in self.form_control_members(root) {
+            let Some(NodeKind::Element(data)) = self.node(node).map(Node::kind) else {
+                continue;
+            };
+            for key in [attribute_value(data, "id"), attribute_value(data, "name")]
+                .into_iter()
+                .flatten()
+                .filter(|key| !key.is_empty())
+            {
+                if !names.iter().any(|name| name.as_str() == key) {
+                    names.push(key.to_owned());
+                }
+            }
+        }
+        names
+    }
+
     /// The root of `node` reached through parents, and the child index of each
     /// step from that root down to `node`. Comparing two positions in order
     /// gives document order: an ancestor's position is a prefix, so it sorts
@@ -241,5 +312,92 @@ mod tests {
         let grafted_span = dom.children(grafted).unwrap()[0];
         assert_eq!(dom.named_elements(grafted, "g"), vec![grafted_span]);
         assert!(dom.named_elements(document, "g").is_empty());
+    }
+
+    /// A form holding two inputs named `b` (one with an id), a text input
+    /// named `t`, an `input type=image` named `img`, and an `img` named `m`
+    /// (not listed, so never a control). Returns the form and its controls.
+    fn form_sample() -> (Dom, NodeId, Vec<NodeId>) {
+        let mut dom = Dom::new();
+        let document = dom.document();
+        let form = dom.create_element("form");
+        dom.append_child(document, form).unwrap();
+        let mut controls = Vec::new();
+        for (tag, attributes) in [
+            ("input", vec![("name", "b"), ("id", "i1")]),
+            ("input", vec![("name", "b")]),
+            ("input", vec![("type", "text"), ("name", "t")]),
+            ("input", vec![("type", "image"), ("name", "img")]),
+            ("img", vec![("name", "m")]),
+        ] {
+            let node = dom.create_element(tag);
+            for (name, value) in attributes {
+                dom.set_attribute(node, name, value).unwrap();
+            }
+            dom.append_child(form, node).unwrap();
+            controls.push(node);
+        }
+        (dom, form, controls)
+    }
+
+    #[test]
+    fn a_form_control_is_named_by_its_id_or_its_name() {
+        let (dom, form, controls) = form_sample();
+        assert!(dom.names_form_control(controls[0], "i1"));
+        assert!(dom.names_form_control(controls[0], "b"));
+        assert!(dom.names_form_control(controls[1], "b"));
+        assert!(!dom.names_form_control(controls[0], ""));
+        assert!(
+            !dom.names_form_control(controls[4], "m"),
+            "an img is not listed"
+        );
+        assert_eq!(
+            dom.form_control_named(form, "b"),
+            vec![controls[0], controls[1]]
+        );
+        assert_eq!(dom.form_control_named(form, "t"), vec![controls[2]]);
+        assert!(dom.form_control_named(form, "img").is_empty());
+        assert!(dom.form_control_named(form, "m").is_empty());
+        assert!(dom.form_control_named(form, "").is_empty());
+    }
+
+    #[test]
+    fn form_control_members_exclude_image_inputs_and_images() {
+        let (dom, form, controls) = form_sample();
+        assert_eq!(
+            dom.form_control_members(form),
+            vec![controls[0], controls[1], controls[2]]
+        );
+    }
+
+    #[test]
+    fn form_control_names_are_ids_and_names_in_tree_order_each_once() {
+        let (dom, form, _) = form_sample();
+        assert_eq!(dom.form_control_names(form), vec!["i1", "b", "t"]);
+    }
+
+    #[test]
+    fn a_fieldset_collection_holds_its_listed_descendants_not_itself() {
+        let mut dom = Dom::new();
+        let document = dom.document();
+        let fieldset = dom.create_element("fieldset");
+        dom.set_attribute(fieldset, "name", "fs").unwrap();
+        dom.append_child(document, fieldset).unwrap();
+        let inner = dom.create_element("fieldset");
+        let input = dom.create_element("input");
+        let span = dom.create_element("span");
+        dom.append_child(fieldset, inner).unwrap();
+        dom.append_child(inner, input).unwrap();
+        dom.append_child(fieldset, span).unwrap();
+        assert_eq!(dom.form_control_members(fieldset), vec![inner, input]);
+        assert_eq!(dom.form_control_named(fieldset, "fs"), Vec::<NodeId>::new());
+    }
+
+    #[test]
+    fn a_removed_control_leaves_its_form_collection() {
+        let (mut dom, form, controls) = form_sample();
+        dom.remove_child(form, controls[1]).unwrap();
+        assert_eq!(dom.form_control_named(form, "b"), vec![controls[0]]);
+        assert_eq!(dom.form_owner(controls[1]), None);
     }
 }

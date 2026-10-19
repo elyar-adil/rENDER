@@ -998,6 +998,12 @@ impl JsRuntime {
         if matches!(self.realm.host(object), Some(ObjectHost::Proxy { .. })) {
             return self.proxy_delete_property(dom, object, key);
         }
+        // An indexed or named member is not deletable (WebIDL §3.9.3 [[Delete]]).
+        if let PropertyName::String(name) = key
+            && self.exotic_member(dom, object, name)?.is_some()
+        {
+            return Ok(false);
+        }
         Ok(match key {
             PropertyName::String(name) => self.realm.delete_property(object, name),
             PropertyName::Symbol(symbol) => self.realm.delete_symbol_property(object, symbol),

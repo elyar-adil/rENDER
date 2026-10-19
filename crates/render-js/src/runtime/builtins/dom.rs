@@ -128,6 +128,15 @@ impl JsRuntime {
             NativeFunction::CollectionNamedItem => {
                 self.collection_named_item(dom, receiver, arguments)
             }
+            NativeFunction::FormElements => self.form_elements_native(dom, receiver),
+            NativeFunction::FormLength => self.form_length_native(dom, receiver),
+            NativeFunction::FieldsetElements => self.fieldset_elements_native(dom, receiver),
+            NativeFunction::ControlForm => self.control_form_native(dom, receiver),
+            NativeFunction::DocumentForms => self.document_forms_native(dom, receiver),
+            NativeFunction::RadioNodeListValue => self.radio_node_list_value_native(dom, receiver),
+            NativeFunction::RadioNodeListSetValue => {
+                self.radio_node_list_set_value_native(dom, receiver, arguments)
+            }
             NativeFunction::CharacterDataSubstringData
             | NativeFunction::CharacterDataAppendData
             | NativeFunction::CharacterDataInsertData

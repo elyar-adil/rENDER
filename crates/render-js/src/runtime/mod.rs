@@ -77,6 +77,8 @@ mod named_access;
 mod nested;
 pub use nested::DocumentLoader;
 #[cfg(test)]
+mod form_tests;
+#[cfg(test)]
 mod module_tests;
 #[cfg(test)]
 mod named_access_tests;
