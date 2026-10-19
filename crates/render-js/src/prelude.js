@@ -552,7 +552,7 @@
     return null;
   });
   // Static snapshots, not the live `HTMLCollection`s of the specification.
-  [['forms', 'form'], ['images', 'img'], ['scripts', 'script'], ['embeds', 'embed'],
+  [['images', 'img'], ['scripts', 'script'], ['embeds', 'embed'],
    ['links', 'a[href], area[href]'], ['anchors', 'a[name]']].forEach(function (entry) {
     defineGetter(documentPrototype, entry[0], function () {
       return slice.call(this.querySelectorAll(entry[1]));

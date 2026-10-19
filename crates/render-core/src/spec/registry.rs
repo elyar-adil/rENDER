@@ -270,9 +270,12 @@ pub static CURRENT_FEATURES: &[FeatureDefinition] = &[
         status: SupportStatus::Partial,
         notes: "Form controls parse, are styled by the user-agent sheet, are laid out \
                 as atomic inlines and carry their `value` and placeholder synthesis. \
-                There is no form submission, no constraint validation, and none of \
-                the form-associated Web APIs: `FormData` is absent from the global \
-                object, so any bundle that reads it throws a ReferenceError.",
+                The form collections are implemented: `document.forms`, `form.elements`, \
+                `fieldset.elements`, `form.length`, the indexed and named members of a \
+                form, `control.form`, and `RadioNodeList`. Not implemented: form \
+                submission, constraint validation, `reset()`, the past names map, and \
+                radio-group checkedness. `FormData` is absent from the global object, \
+                so any bundle that reads it throws a ReferenceError.",
         dependencies: &[DOM_TREE, LAYOUT],
         tests: &[],
     },
