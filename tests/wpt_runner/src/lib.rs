@@ -47,6 +47,8 @@
 //! | [`results`] | JSON summary plus per-file JSONL, as data |
 //! | [`report`] | the human-readable reading, with denominators inline |
 //! | [`wptdom`] | executes `dom/` and `html/` through WPT's own testharness |
+//! | [`reftest`] | reference, crash and manual test rules: no engine, pure and tested |
+//! | [`wptreftest`] | renders reference and crash tests through render-core's public API |
 
 pub mod census;
 pub mod classify;
@@ -55,6 +57,7 @@ pub mod fixtures;
 pub mod mechanism;
 pub mod outcome;
 pub mod probe;
+pub mod reftest;
 pub mod report;
 pub mod results;
 pub mod selftest;
@@ -62,6 +65,9 @@ pub mod source;
 
 #[cfg(feature = "engine")]
 pub mod wptdom;
+
+#[cfg(feature = "engine")]
+pub mod wptreftest;
 
 #[cfg(feature = "engine")]
 pub mod render_core;

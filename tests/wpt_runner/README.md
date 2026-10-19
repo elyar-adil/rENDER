@@ -68,6 +68,8 @@ are engine defects versus missing capabilities versus harness limits.
 | `src/results.rs` | JSON summary plus per-file JSONL |
 | `src/report.rs` | the human-readable reading |
 | `src/render_core.rs` | the `render-core` adapter, behind the `engine` feature |
+| `src/reftest.rs` | reference, crash and manual test rules: fuzzy metadata, comparison, judgement |
+| `src/wptreftest.rs` | renders reference and crash tests through render-core, behind `engine` |
 
 ## Dependencies
 

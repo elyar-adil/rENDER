@@ -387,6 +387,9 @@ mod tests {
             crate::engine::Verdict::MissingFixture { .. } => {
                 panic!("a document with no declared script fixtures has none to be missing")
             }
+            crate::engine::Verdict::Declined { .. } => {
+                panic!("the computed-value adapter declines through Unsupported, never Declined")
+            }
         }
     }
 

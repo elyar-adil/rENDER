@@ -41,6 +41,10 @@ pub enum HarnessShape {
     TestCss,
     /// `link rel="match"` - compared by rendered reference, not by assertion.
     Reftest,
+    /// A file under a `crashtests/` directory with no testharness. It is scored by
+    /// completing without a panic or an uncaught error, so it has something to fail
+    /// on even though it declares no assertion.
+    Crashtest,
 }
 
 impl HarnessShape {
@@ -53,6 +57,7 @@ impl HarnessShape {
             Self::LegacySetup => "setup",
             Self::TestCss => "testcss.js",
             Self::Reftest => "reftest",
+            Self::Crashtest => "crashtest",
         }
     }
 
@@ -83,6 +88,7 @@ impl HarnessShape {
                 | Self::LegacySetup
                 | Self::TestCss
                 | Self::Reftest
+                | Self::Crashtest
         )
     }
 }
@@ -367,6 +373,17 @@ pub fn classify(
     if scan.reftest_reference.is_some() {
         shapes.push(HarnessShape::Reftest);
     }
+    // Only a crash test without testharness.js is scored by completing. A testharness file under
+    // a `crashtests/` directory is judged by its assertions, as every other testharness file is.
+    let testharness = scan
+        .external_scripts
+        .iter()
+        .any(|src| src.contains("testharness.js"));
+    if !testharness
+        && test_dir.is_some_and(|dir| dir.components().any(|c| c.as_os_str() == "crashtests"))
+    {
+        shapes.push(HarnessShape::Crashtest);
+    }
 
     shapes.sort_unstable();
     shapes.dedup();
@@ -419,7 +436,11 @@ fn pick_blocker(
     // A test with no assertion site and no reftest has nothing to fail. This is
     // checked first: it is a property of the test itself, and reporting it as
     // "blocked" would misattribute it to the engine.
-    if assertion_sites == 0 && !shapes.contains(&HarnessShape::Reftest) {
+    // A reftest is scored by pixels and a crash test by completing, so neither
+    // needs an assertion site to be able to fail.
+    let scored_without_assertions =
+        shapes.contains(&HarnessShape::Reftest) || shapes.contains(&HarnessShape::Crashtest);
+    if assertion_sites == 0 && !scored_without_assertions {
         return Some(Blocker::NoAssertions);
     }
     for shape in shapes {
@@ -451,8 +472,9 @@ pub const fn capability_is_available(capability: Capability) -> bool {
         // the adapter can express them.
         Capability::Timers | Capability::EventDispatch | Capability::ExternalResource => true,
         // `attachShadow`, `ShadowRoot`, retargeted events and the flat tree are
-        // implemented (DOM 4.2.2, 2.9). Shadow-tree stylesheets are not yet, and
-        // the runner does not score reftests, so those rows stay unscored.
+        // implemented (DOM 4.2.2, 2.9). Shadow-tree stylesheets are not yet, so a
+        // test that depends on them is scored on what the engine paints, not on
+        // what the shadow tree styles.
         Capability::ShadowDom => true,
         // Nested browsing contexts are driven by the engine's own adapter: an
         // iframe gets its own realm and document, `contentWindow` and
@@ -844,6 +866,33 @@ mod tests {
         let c = classify_text("<link rel=\"match\" href=\"ref.html\"><div>x</div>");
         assert!(!c.cannot_fail());
         assert!(c.shapes.contains(&HarnessShape::Reftest));
+    }
+
+    #[test]
+    fn a_crash_test_without_testharness_is_scored_but_a_testharness_file_in_crashtests_is_not() {
+        let dir = std::path::Path::new("dom/nodes/crashtests");
+        let crash = scan("<div>x</div><script>var a = 1;</script>");
+        let crash_scripts: Vec<&str> = crash
+            .scripts
+            .iter()
+            .filter_map(|s| s.inline.as_deref())
+            .collect();
+        let scored = classify(&crash, &crash_scripts, Some(dir), None);
+        assert!(scored.shapes.contains(&HarnessShape::Crashtest));
+        assert!(!scored.cannot_fail(), "a crash test can fail by throwing");
+
+        let harness = scan("<script src=\"/resources/testharness.js\"></script><div>x</div>");
+        let harness_scripts: Vec<&str> = harness
+            .scripts
+            .iter()
+            .filter_map(|s| s.inline.as_deref())
+            .collect();
+        let judged = classify(&harness, &harness_scripts, Some(dir), None);
+        assert!(!judged.shapes.contains(&HarnessShape::Crashtest));
+        assert!(
+            judged.cannot_fail(),
+            "a testharness file with no assertion has nothing to fail"
+        );
     }
 
     #[test]
