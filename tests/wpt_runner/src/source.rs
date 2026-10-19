@@ -132,7 +132,9 @@ pub fn scan(source: &str) -> Scan {
                 let rel = attr_map.get("rel").map_or(String::new(), |v| v.to_ascii_lowercase());
                 let href = attr_map.get("href").cloned();
                 if let Some(href) = href {
-                    if rel.split_ascii_whitespace().any(|r| r == "match") {
+                    // `mismatch` is a reftest too: a mismatch-only test has a reference, and
+                    // classing it as having none would veto its pass as "cannot fail".
+                    if rel.split_ascii_whitespace().any(|r| r == "match" || r == "mismatch") {
                         out.reftest_reference = Some(href.clone());
                     }
                     if rel.split_ascii_whitespace().any(|r| r == "stylesheet") {
@@ -298,6 +300,12 @@ mod tests {
     #[test]
     fn detects_reftest_match_reference() {
         let scan = scan("<link rel=\"match\" href=\"ref.html\">");
+        assert_eq!(scan.reftest_reference.as_deref(), Some("ref.html"));
+    }
+
+    #[test]
+    fn detects_reftest_mismatch_reference() {
+        let scan = scan("<link rel=\"mismatch\" href=\"ref.html\">");
         assert_eq!(scan.reftest_reference.as_deref(), Some("ref.html"));
     }
 

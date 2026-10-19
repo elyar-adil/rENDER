@@ -96,6 +96,13 @@ pub enum SkipReason {
     OutOfScopeArea,
     /// Nothing about the test was wrong; it was simply not selected.
     NotSelected,
+    /// The test needs a person to run it (a manual or interactive test), or a
+    /// non-screen environment such as print or paged media. Excluded by decision:
+    /// automation cannot run it, so it is not scored either way.
+    NotAutomatable,
+    /// A reference page: another test compares against it, and it declares no test
+    /// of its own. It is a support file, and not an unverified test.
+    ReferenceFile,
 }
 
 impl SkipReason {
@@ -107,6 +114,8 @@ impl SkipReason {
             Self::MissingFixture => "missing-fixture",
             Self::OutOfScopeArea => "out-of-scope-area",
             Self::NotSelected => "not-selected",
+            Self::NotAutomatable => "not-automatable",
+            Self::ReferenceFile => "reference-file",
         }
     }
 
@@ -126,6 +135,12 @@ impl SkipReason {
             Self::MissingFixture => "a declared support file is absent from the checkout",
             Self::OutOfScopeArea => "excluded by deliberate scope decision, not by failure",
             Self::NotSelected => "not selected for this run",
+            Self::NotAutomatable => {
+                "a person must run it, or it needs a non-screen environment; excluded by decision"
+            }
+            Self::ReferenceFile => {
+                "a reference page another test compares against, not a test in its own right"
+            }
         }
     }
 
