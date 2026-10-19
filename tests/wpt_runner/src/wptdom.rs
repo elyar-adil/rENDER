@@ -56,6 +56,7 @@ use render_core::js::{
 use crate::classify::Capability;
 use crate::engine::{Engine, HarnessError, SubtestEvidence, TestContext, Verdict};
 use crate::mechanism::{self, Category};
+use crate::reftest::percent_decode;
 use crate::results::FileResult;
 
 /// What this adapter is, stated in the results file.
@@ -154,10 +155,10 @@ pub struct WptHarnessEngine {
 /// The host that WPT's own test server serves the suite from. The suite is
 /// read from disk instead, so a test's URLs resolve against this host and map
 /// onto the checkout.
-const WPT_HOST: &str = "web-platform.test";
+pub(crate) const WPT_HOST: &str = crate::reftest::SUITE_HOST;
 
 /// The URL a suite test runs at: its path under the suite's own host.
-fn test_url(path: &str) -> url::Url {
+pub(crate) fn test_url(path: &str) -> url::Url {
     url::Url::parse(&format!("http://{WPT_HOST}/{path}"))
         .unwrap_or_else(|_| url::Url::parse("about:blank").expect("constant URL"))
 }
@@ -166,8 +167,8 @@ fn test_url(path: &str) -> url::Url {
 /// suite's host names a file under the checkout, and every other URL is
 /// unavailable.
 #[derive(Debug)]
-struct SuiteLoader {
-    root: std::path::PathBuf,
+pub(crate) struct SuiteLoader {
+    pub(crate) root: std::path::PathBuf,
 }
 
 impl render_core::js::DocumentLoader for SuiteLoader {
@@ -232,6 +233,13 @@ impl Engine for WptHarnessEngine {
     /// runtime could not be constructed. An engine limitation is
     /// [`Verdict::Unsupported`], a skip.
     fn run(&mut self, ctx: &TestContext<'_>) -> Result<Verdict, HarnessError> {
+        // Reference tests and crash tests are scored by pixels and by completing, not by
+        // testharness.js, so they never reach the harness below. A file that is neither
+        // returns `None` and takes the testharness path unchanged.
+        if let Some(verdict) = crate::wptreftest::score(ctx, &self.suite_root) {
+            return verdict;
+        }
+
         // Refuse before doing any work. A test that needs a nested browsing
         // context cannot be driven by anything this adapter does, and a test
         // that drives an iframe would otherwise half-run and report a verdict
@@ -353,7 +361,7 @@ impl WptHarnessEngine {
         //    microtasks and timers, and stopping before they run would report
         //    NOTRUN for every async test - a systematic under-count that looks
         //    like an engine that cannot do async at all.
-        let drained = self.drain(&mut runtime, document.dom_mut());
+        let drained = Self::drain(&mut runtime, document.dom_mut());
         if !drained.settled {
             return Ok(Execution {
                 status: HarnessStatus::NotRun,
@@ -388,8 +396,12 @@ impl WptHarnessEngine {
     /// Returns whether the loop settled. A loop that never settles is a harness
     /// limitation, never a fail: the test did not assert anything wrong, it
     /// simply never finished, and those are different claims.
-    fn drain(&mut self, runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom) -> DrainOutcome {
+    pub(crate) fn drain(runtime: &mut JsRuntime, dom: &mut render_core::dom::Dom) -> DrainOutcome {
         let mut clock = 0.0_f64;
+        // The first exception a timer callback threw. The runtime has already reported it to
+        // `window.onerror`; it is kept here for the reference and crash scorers, which must not
+        // treat a page whose timer threw as the page they would have compared.
+        let mut uncaught: Option<render_core::js::JsError> = None;
         let mut sequence = 0_u64;
         let mut pending: Vec<PendingTimer> = Vec::new();
         for _ in 0..MAX_DRAIN_TURNS {
@@ -428,11 +440,17 @@ impl WptHarnessEngine {
                 .min_by(|(_, a), (_, b)| a.due.total_cmp(&b.due).then(a.sequence.cmp(&b.sequence)))
                 .map(|(index, _)| index)
             else {
-                return DrainOutcome { settled: true };
+                return DrainOutcome {
+                    settled: true,
+                    uncaught,
+                };
             };
             let timer = pending.swap_remove(next);
             clock = clock.max(timer.due);
-            let (period, _outcome) = runtime.fire_timer_reporting(dom, timer.id);
+            let (period, outcome) = runtime.fire_timer_reporting(dom, timer.id);
+            if let Err(error) = outcome {
+                uncaught.get_or_insert(error);
+            }
             if let Some(period) = period {
                 pending.push(PendingTimer {
                     due: clock + period,
@@ -442,7 +460,10 @@ impl WptHarnessEngine {
                 sequence += 1;
             }
         }
-        DrainOutcome { settled: false }
+        DrainOutcome {
+            settled: false,
+            uncaught,
+        }
     }
 }
 
@@ -453,13 +474,13 @@ const HARNESS_PATH: &str = "resources/testharness.js";
 /// The classic scripts a test declares, in the order they run, with every
 /// fixture resolved. See [`plan_scripts`].
 #[derive(Debug, Default)]
-struct ScriptPlan {
+pub(crate) struct ScriptPlan {
     /// Parser-blocking scripts in document order, then `async`, then `defer`.
     /// That is the order `render-core`'s page queue uses, so the runner and the
     /// page agree on it.
-    scripts: Vec<RunScript>,
+    pub(crate) scripts: Vec<RunScript>,
     /// Module scripts the test declares and this runner does not execute.
-    modules_not_run: u32,
+    pub(crate) modules_not_run: u32,
 }
 
 impl ScriptPlan {
@@ -479,20 +500,20 @@ impl ScriptPlan {
 
 /// One classic script, ready to run.
 #[derive(Debug)]
-struct RunScript {
+pub(crate) struct RunScript {
     /// The URL a file-backed script was read from. Its uncaught errors report this
     /// as their `filename`. `None` for an inline script, whose errors report the
     /// document.
-    url: Option<String>,
-    source: String,
+    pub(crate) url: Option<String>,
+    pub(crate) source: String,
 }
 
 /// A declared script the runner cannot run, and why.
 #[derive(Debug)]
-struct Declined {
-    url: String,
-    mechanism: &'static str,
-    reason: String,
+pub(crate) struct Declined {
+    pub(crate) url: String,
+    pub(crate) mechanism: &'static str,
+    pub(crate) reason: String,
 }
 
 impl Declined {
@@ -533,7 +554,7 @@ fn fixture_declined(url: &url::Url, mechanism: &'static str, reason: String) -> 
 /// A script the runner cannot serve is declined before anything runs. Deciding
 /// here, rather than at the point of execution, is what keeps a test from running
 /// part way and failing on a helper it never had.
-fn plan_scripts(
+pub(crate) fn plan_scripts(
     document: &Document,
     base: &url::Url,
     suite_root: &Path,
@@ -645,35 +666,6 @@ fn is_server_generated(relative: &str) -> bool {
     name.contains(".sub.") || name.ends_with(".py")
 }
 
-/// Decode the `%XX` escapes of a URL path, so a file name with a space or a non-ASCII
-/// character maps onto the file it names. A malformed escape is kept as written.
-fn percent_decode(path: &str) -> String {
-    fn hex(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-    let bytes = path.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
-        {
-            out.push(high * 16 + low);
-            i += 3;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 /// Add notes to a pass or a fail. Every other verdict is returned unchanged.
 fn with_notes(verdict: Verdict, extra: Vec<String>) -> Verdict {
     if extra.is_empty() {
@@ -715,7 +707,7 @@ fn with_notes(verdict: Verdict, extra: Vec<String>) -> Verdict {
 /// document; the readiness becomes `complete`, and `readystatechange` fires
 /// before the page's `load` event. A step that fails for any reason other than
 /// the resource budget is ignored, as a listener's own throw is.
-fn run_page_lifecycle(
+pub(crate) fn run_page_lifecycle(
     runtime: &mut JsRuntime,
     dom: &mut render_core::dom::Dom,
 ) -> Result<(), render_core::js::JsError> {
@@ -753,8 +745,10 @@ struct PendingTimer {
     id: u64,
 }
 
-struct DrainOutcome {
-    settled: bool,
+pub(crate) struct DrainOutcome {
+    pub(crate) settled: bool,
+    /// The first exception a timer callback threw while the loop ran.
+    pub(crate) uncaught: Option<render_core::js::JsError>,
 }
 
 /// The script that installs the result channel.
@@ -1461,7 +1455,7 @@ fn slug(text: &str) -> String {
 }
 
 /// Which required capability, if any, makes this test undrivable.
-fn first_unsupported_capability(ctx: &TestContext<'_>) -> Option<Capability> {
+pub(crate) fn first_unsupported_capability(ctx: &TestContext<'_>) -> Option<Capability> {
     let scan = crate::source::scan(ctx.source);
     let inline: Vec<&str> = scan
         .scripts
@@ -1547,13 +1541,22 @@ pub fn execute_areas(
     adapter: Adapter,
     limit: Option<usize>,
 ) -> Vec<FileResult> {
+    // Every area is walked first, so a reference page that a test in one area names is known
+    // to be a reference when its own row is reached in another.
+    let walks: Vec<(&str, Vec<String>)> = areas
+        .iter()
+        .map(|area| (*area, walk_area(suite_root, area)))
+        .collect();
+    crate::wptreftest::register_reference_targets(
+        suite_root,
+        walks.iter().flat_map(|(_, paths)| paths.iter().map(String::as_str)),
+    );
     let mut out = Vec::new();
-    for area in areas {
+    for (area, paths) in walks {
         // Counted first so progress can be a fraction of a known total. A
         // "still running" message with no denominator is the same sin as a
         // percentage without one: a reader cannot tell a slow run from a stuck
         // one, and a run that looks stuck gets killed, losing the whole result.
-        let paths = walk_area(suite_root, area);
         let total = paths.len();
         let mut done = 0usize;
         for path in paths {
@@ -1828,6 +1831,16 @@ const MISSING_HOST_APIS: &[&str] = &[
 /// nobody checks. A mechanism table that confidently mislabels its own causes is
 /// worse than one that admits a gap.
 fn failure_mechanism(assertion: &str) -> String {
+    // Reference and crash test failures are named by the scorer that produced them,
+    // and their text is matched whole, before the harness-prefix stripping below.
+    if let Some(key) = crate::reftest::mechanism_for_assertion(assertion) {
+        return key.to_owned();
+    }
+    // An uncaught exception in a reference or crash test is classified by the exception it
+    // names, exactly as a testharness failure is, so a missing API keeps its name.
+    if let Some(message) = crate::reftest::uncaught_error_message(assertion) {
+        return failure_mechanism(message);
+    }
     // The harness prefixes the message with the test name and a colon; strip it
     // so the pattern search sees the actual failure. Only the *first* colon is
     // consumed, because a message may legitimately contain more.
