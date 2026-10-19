@@ -158,6 +158,9 @@
   defineProperty(global, 'EventTarget', {
     value: EventTarget, writable: true, configurable: true, enumerable: false
   });
+  // WebIDL §3.7.1: `Window` inherits from `EventTarget`, so the interface object
+  // of `Window` has the `EventTarget` interface object as its [[Prototype]].
+  Object.setPrototypeOf(global.Window, EventTarget);
 
   // These serve targets that are not DOM nodes (`new EventTarget()` and its
   // subclasses); nodes and the window keep their native implementations, which
@@ -752,9 +755,17 @@
   define(global, 'frames', global);
   define(global, 'origin', location.origin);
   define(global, 'isSecureContext', location.protocol === 'https:' || location.hostname === 'localhost');
-  define(global, 'dispatchEvent', function dispatchEvent(event) {
-    return document.dispatchEvent(event);
-  });
+  // `window.dispatchEvent` dispatches on the document. The window reaches
+  // `EventTarget.prototype` now, whose method serves only targets that are not
+  // windows or nodes, so the window's own member is defined whenever the window
+  // holds none of its own. A `define` here would find the inherited method and
+  // leave the window's listeners unreached.
+  if (!Object.prototype.hasOwnProperty.call(global, 'dispatchEvent')) {
+    defineProperty(global, 'dispatchEvent', {
+      value: function dispatchEvent(event) { return document.dispatchEvent(event); },
+      writable: true, configurable: true, enumerable: false
+    });
+  }
   // No dialog, popup or print UI exists, so each behaves as in a browser that
   // has suppressed them: nothing is shown and the cancelling answer is given.
   define(global, 'alert', function alert() {});

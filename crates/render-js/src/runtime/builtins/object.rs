@@ -1431,10 +1431,17 @@ impl JsRuntime {
                 configurable: true,
             }));
         }
-        Ok(match key {
-            PropertyName::String(name) => self.realm.own_property(object, name),
-            PropertyName::Symbol(symbol) => self.realm.own_symbol_property(object, symbol),
-        })
+        match key {
+            PropertyName::String(name) => {
+                if let Some(descriptor) = self.realm.own_property(object, name) {
+                    return Ok(Some(descriptor));
+                }
+                // A window's named properties are own properties of its named
+                // properties object (WebIDL §3.9), not of the window.
+                self.window_named_descriptor(dom, object, name)
+            }
+            PropertyName::Symbol(symbol) => Ok(self.realm.own_symbol_property(object, symbol)),
+        }
     }
 
     /// The string keys of `[[OwnPropertyKeys]]`, in order.
@@ -1471,6 +1478,11 @@ impl JsRuntime {
             .into_iter()
             .map(PropertyName::String)
             .collect::<Vec<_>>();
+        keys.extend(
+            self.window_named_keys(dom, object)?
+                .into_iter()
+                .map(PropertyName::String),
+        );
         keys.extend(
             self.realm
                 .own_symbols(object)

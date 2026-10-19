@@ -177,3 +177,124 @@ fn an_unnamed_identifier_is_still_not_defined() {
         "undefined,false,ReferenceError"
     );
 }
+
+#[test]
+fn the_window_prototype_chain_runs_through_the_named_properties_object() {
+    assert_eq!(
+        run(
+            PAGE,
+            "var npo = Object.getPrototypeOf(Window.prototype); \
+             log.push(Object.getPrototypeOf(window) === Window.prototype, \
+             Object.getPrototypeOf(npo) === EventTarget.prototype, \
+             Object.getPrototypeOf(EventTarget.prototype) === Object.prototype, \
+             Object.prototype.toString.call(window), \
+             Object.prototype.toString.call(Window.prototype), \
+             Object.prototype.toString.call(npo), \
+             window.constructor === Window, \
+             Window.prototype.constructor === Window, \
+             Object.getPrototypeOf(Window) === EventTarget);"
+        ),
+        "true,true,true,[object Window],[object Window],[object WindowProperties],true,true,true"
+    );
+}
+
+#[test]
+fn window_constructor_is_a_non_writable_prototype_with_a_writable_global() {
+    assert_eq!(
+        run(
+            PAGE,
+            "var prototype = Object.getOwnPropertyDescriptor(Window, 'prototype'); \
+             var global = Object.getOwnPropertyDescriptor(window, 'Window'); \
+             log.push(typeof Window, prototype.writable, prototype.configurable, \
+             global.writable, global.enumerable, global.configurable, \
+             window.hasOwnProperty('Window'));"
+        ),
+        "function,false,false,true,false,true,true"
+    );
+}
+
+#[test]
+fn window_interface_object_is_not_constructible() {
+    assert_eq!(
+        run(
+            PAGE,
+            "try { new Window(); } catch (error) { log.push(error.name); } \
+             try { Window(); } catch (error) { log.push(error.name); }"
+        ),
+        "TypeError,TypeError"
+    );
+}
+
+#[test]
+fn named_property_is_an_own_property_of_the_named_object_only() {
+    assert_eq!(
+        run(
+            PAGE,
+            "var npo = Object.getPrototypeOf(Window.prototype); \
+             var desc = Object.getOwnPropertyDescriptor(npo, 'host'); \
+             log.push(desc.value === host, desc.writable, desc.enumerable, desc.configurable, \
+             Object.getOwnPropertyDescriptor(window, 'host'), \
+             Object.getOwnPropertyDescriptor(Window.prototype, 'host'), \
+             npo.hasOwnProperty('host'), Window.prototype.hasOwnProperty('host'), \
+             'host' in Window.prototype, Window.prototype.host === host);"
+        ),
+        "true,true,false,true,,,true,false,true,true"
+    );
+}
+
+#[test]
+fn an_event_target_member_shadows_a_named_property_of_the_same_name() {
+    assert_eq!(
+        run(
+            PAGE,
+            "var npo = Object.getPrototypeOf(Window.prototype); \
+             EventTarget.prototype.host = 'shadowing'; \
+             log.push(window.host, Window.prototype.host, npo.host, \
+             Object.getOwnPropertyDescriptor(npo, 'host'), npo.hasOwnProperty('host'), \
+             'host' in npo);"
+        ),
+        "shadowing,shadowing,shadowing,,false,true"
+    );
+}
+
+#[test]
+fn a_window_member_shadows_the_named_property_below_it() {
+    assert_eq!(
+        run(
+            PAGE,
+            "Window.prototype.host = 'shadowing'; \
+             log.push(window.host, Object.getOwnPropertyDescriptor(window, 'host'), \
+             Object.getPrototypeOf(Window.prototype).host === document.getElementById('host'));"
+        ),
+        "shadowing,,true"
+    );
+}
+
+#[test]
+fn window_dispatch_event_reaches_the_window_handlers() {
+    assert_eq!(
+        run(
+            PAGE,
+            "window.onresize = function (e) { log.push(e.type, e.currentTarget === window); }; \
+             window.dispatchEvent(new Event('resize')); \
+             log.push(window.hasOwnProperty('dispatchEvent'));"
+        ),
+        "resize,true,true"
+    );
+}
+
+#[test]
+fn own_property_names_of_the_named_object_list_its_visible_names() {
+    assert_eq!(
+        run(
+            PAGE,
+            "var npo = Object.getPrototypeOf(Window.prototype); \
+             var names = Object.getOwnPropertyNames(npo); \
+             log.push(names.indexOf('host') >= 0, names.indexOf('pic-id') >= 0, \
+             names.indexOf('shadowed') >= 0, names.indexOf('toString') >= 0, \
+             Object.getOwnPropertyNames(window).indexOf('host') >= 0, \
+             Object.keys(npo).length);"
+        ),
+        "true,true,true,false,false,0"
+    );
+}
