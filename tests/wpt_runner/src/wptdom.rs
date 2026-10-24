@@ -46,6 +46,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use render_core::document::Document;
+use render_core::dom::NodeId;
 use render_core::script::{
     ScriptDiscoveryLimits, ScriptScheduling, ScriptSource, discover_scripts,
 };
@@ -313,10 +314,12 @@ impl WptHarnessEngine {
         //    resolved them. A script that throws reports its error to the window and
         //    the rest still run, as HTML's "report the exception" requires.
         for script in &plan.scripts {
-            let outcome = match &script.url {
-                Some(url) => runtime.execute_with_filename(document.dom_mut(), &script.source, url),
-                None => runtime.execute(document.dom_mut(), &script.source),
-            };
+            let outcome = runtime.execute_parser_script(
+                document.dom_mut(),
+                &script.source,
+                script.url.as_deref(),
+                script.owner,
+            );
             if let Err(error) = outcome {
                 // A script that throws is what the harness's window `error`
                 // handler is for, and the harness will have recorded it. Only a
@@ -506,6 +509,10 @@ pub(crate) struct RunScript {
     /// document.
     pub(crate) url: Option<String>,
     pub(crate) source: String,
+    /// The `<script>` element the code belongs to. `document.currentScript`
+    /// names it, and a `document.write` inside the script inserts right after
+    /// it (HTML §8.4.3), so the runtime has to know which element is running.
+    pub(crate) owner: NodeId,
 }
 
 /// A declared script the runner cannot run, and why.
@@ -569,7 +576,7 @@ pub(crate) fn plan_scripts(
             plan.modules_not_run += 1;
             continue;
         }
-        let Some(run) = resolve_script(script.source, suite_root)? else {
+        let Some(run) = resolve_script(script.source, script.owner, suite_root)? else {
             continue;
         };
         match script.scheduling {
@@ -589,9 +596,19 @@ pub(crate) fn plan_scripts(
 /// Read one declared script from the checkout, or decline it.
 ///
 /// `Ok(None)` is the harness, which is already loaded.
-fn resolve_script(source: ScriptSource, suite_root: &Path) -> Result<Option<RunScript>, Declined> {
+fn resolve_script(
+    source: ScriptSource,
+    owner: NodeId,
+    suite_root: &Path,
+) -> Result<Option<RunScript>, Declined> {
     let resolved_url = match source {
-        ScriptSource::Inline { source } => return Ok(Some(RunScript { url: None, source })),
+        ScriptSource::Inline { source } => {
+            return Ok(Some(RunScript {
+                url: None,
+                source,
+                owner,
+            }));
+        }
         ScriptSource::External { resolved_url, .. } => resolved_url,
     };
     let relative = suite_relative(&resolved_url)?;
@@ -623,6 +640,7 @@ fn resolve_script(source: ScriptSource, suite_root: &Path) -> Result<Option<RunS
     Ok(Some(RunScript {
         url: Some(resolved_url.as_str().to_owned()),
         source: text,
+        owner,
     }))
 }
 

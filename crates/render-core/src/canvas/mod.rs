@@ -250,25 +250,23 @@ impl Canvas {
                     self.state.stroke = paint;
                 }
             }
-            (Attribute::GlobalAlpha, CanvasValue::Number(value)) => {
-                if value.is_finite() && (0.0..=1.0).contains(&value) {
-                    self.state.global_alpha = value;
-                }
+            (Attribute::GlobalAlpha, CanvasValue::Number(value))
+                if value.is_finite() && (0.0..=1.0).contains(&value) =>
+            {
+                self.state.global_alpha = value;
             }
-            (Attribute::LineWidth, CanvasValue::Number(value)) => {
-                if value.is_finite() && value > 0.0 {
-                    self.state.line_width = value;
-                }
+            (Attribute::LineWidth, CanvasValue::Number(value))
+                if value.is_finite() && value > 0.0 =>
+            {
+                self.state.line_width = value;
             }
-            (Attribute::MiterLimit, CanvasValue::Number(value)) => {
-                if value.is_finite() && value > 0.0 {
-                    self.state.miter_limit = value;
-                }
+            (Attribute::MiterLimit, CanvasValue::Number(value))
+                if value.is_finite() && value > 0.0 =>
+            {
+                self.state.miter_limit = value;
             }
-            (Attribute::LineDashOffset, CanvasValue::Number(value)) => {
-                if value.is_finite() {
-                    self.state.dash_offset = value;
-                }
+            (Attribute::LineDashOffset, CanvasValue::Number(value)) if value.is_finite() => {
+                self.state.dash_offset = value;
             }
             (Attribute::LineCap, CanvasValue::Text(keyword)) => {
                 if let Some(cap) = LineCap::parse(&keyword) {

@@ -315,6 +315,7 @@ impl JsRuntime {
         self.steps_remaining = self.limits.max_execution_steps;
         self.calls_active = 0;
         self.dom_nodes_created = 0;
+        self.active_script_kinds.push(true);
         let suspended = self.suspend_scopes();
         let saved = std::mem::take(&mut self.environment);
         let result = self
@@ -326,6 +327,7 @@ impl JsRuntime {
                 }
                 _ => Ok(()),
             });
+        self.active_script_kinds.pop();
         self.environment = saved;
         self.resume_scopes(suspended);
         if let Err(error) = &result {

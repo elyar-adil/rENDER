@@ -154,6 +154,11 @@ impl JsRuntime {
                 self.create_html_document(dom, arguments)
             }
             NativeFunction::DocumentImplementation => self.document_implementation(dom, receiver),
+            NativeFunction::DocumentWrite => self.document_write(dom, receiver, arguments, false),
+            NativeFunction::DocumentWriteln => self.document_writeln(dom, receiver, arguments),
+            NativeFunction::DocumentOpen => self.document_open(dom, receiver, arguments),
+            NativeFunction::DocumentClose => self.document_close(dom, receiver),
+            NativeFunction::DocumentCurrentScript => self.document_current_script(dom),
             NativeFunction::AdoptNode => self.adopt_node_method(dom, receiver, arguments),
             NativeFunction::NodeNormalize => self.node_normalize(dom, receiver),
             NativeFunction::TextSplitText => self.text_split_text(dom, receiver, arguments),

@@ -834,6 +834,11 @@ impl JsRuntime {
             | NativeFunction::ImplementationCreateHtmlDocument
             | NativeFunction::ImplementationHasFeature
             | NativeFunction::DocumentImplementation
+            | NativeFunction::DocumentWrite
+            | NativeFunction::DocumentWriteln
+            | NativeFunction::DocumentOpen
+            | NativeFunction::DocumentClose
+            | NativeFunction::DocumentCurrentScript
             | NativeFunction::AdoptNode
             | NativeFunction::NonElementGetElementById
             | NativeFunction::CreateElementNs

@@ -66,6 +66,11 @@ pub struct PageOptions {
 pub enum PageTask {
     Script(String),
     CompiledScript(CompiledScript),
+    /// A parser-created classic script: its element is the write insertion
+    /// point and `document.currentScript` while it runs (HTML §8.4.3).
+    ParserScript(String, NodeId),
+    /// [`PageTask::ParserScript`] for a script the embedding already compiled.
+    CompiledParserScript(CompiledScript, NodeId),
     /// Declare and evaluate a module and the modules it imports.
     Module(ModuleEntry),
     JsMicrotask(JsMicrotask),
@@ -134,7 +139,7 @@ impl PageTask {
 
     fn source_bytes(&self) -> usize {
         match self {
-            Self::Script(source) => source.len(),
+            Self::Script(source) | Self::ParserScript(source, _) => source.len(),
             _ => 0,
         }
     }
@@ -727,17 +732,23 @@ impl Page {
     /// Queue an already tokenized and parsed classic script without repeating
     /// compilation in the event-loop task.
     ///
+    /// `owner` is the script's `<script>` element for a parser-created script:
+    /// it is the insertion point a `document.write` inside the script uses. An
+    /// ad-hoc script has none.
+    ///
     /// # Errors
     ///
     /// Returns a typed scheduler resource-limit error.
     pub fn queue_compiled_script(
         &mut self,
         script: CompiledScript,
+        owner: Option<NodeId>,
     ) -> Result<TaskId, PageQueueError> {
-        self.queue_task(
-            TaskSource::DomManipulation,
-            PageTask::CompiledScript(script),
-        )
+        let task = match owner {
+            Some(owner) => PageTask::CompiledParserScript(script, owner),
+            None => PageTask::CompiledScript(script),
+        };
+        self.queue_task(TaskSource::DomManipulation, task)
     }
 
     /// Queue a revision-bound batch prepared by an embedding resource loader.
@@ -788,7 +799,7 @@ impl Page {
                 Some(entry) => {
                     self.queue_task(TaskSource::DomManipulation, PageTask::Module(entry))
                 }
-                None => self.queue_compiled_script(script.compiled),
+                None => self.queue_compiled_script(script.compiled, Some(script.owner)),
             };
             match queued_task {
                 Ok(id) => queued.push(id),
@@ -1629,6 +1640,12 @@ fn execute_task(
     match task {
         PageTask::Script(source) => runtime.execute(dom, &source),
         PageTask::CompiledScript(script) => runtime.execute_compiled(dom, &script),
+        PageTask::ParserScript(source, owner) => {
+            runtime.execute_parser_script(dom, &source, None, owner)
+        }
+        PageTask::CompiledParserScript(script, owner) => {
+            runtime.execute_parser_compiled_script(dom, &script, owner)
+        }
         PageTask::Module(entry) => {
             for unit in &entry.units {
                 if !runtime.has_module(&unit.key) {
@@ -1971,7 +1988,7 @@ mod tests {
             &RuntimeLimits::default(),
         )
         .expect("script compiles before queuing");
-        page.queue_compiled_script(script)
+        page.queue_compiled_script(script, None)
             .expect("compiled task fits scheduler");
 
         let turn = page

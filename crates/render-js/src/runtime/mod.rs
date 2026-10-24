@@ -56,6 +56,9 @@ mod coroutine_run;
 #[cfg(test)]
 mod coroutine_tests;
 mod disposal;
+mod document_write;
+#[cfg(test)]
+mod document_write_tests;
 #[cfg(test)]
 mod dom_tests;
 mod eval;
@@ -122,6 +125,10 @@ fn same_history_origin(new: &Url, current: &Url) -> bool {
 
 /// A realm-owning interpreter instance. DOM wrappers retain stable `NodeId`
 /// identities, never Rust references, across calls to [`Self::execute`].
+// The bools are independent runtime states (strictness, prelude install,
+// write-stream open, error reporting), not a state machine; splitting them
+// into enums would rename facts, not remove them.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct JsRuntime {
     realm: Realm,
@@ -251,6 +258,20 @@ pub struct JsRuntime {
     /// running. An uncaught error reports it as the error event's `filename`;
     /// `None` reports the document's URL, as for an inline script.
     script_filename: Option<String>,
+    /// The script elements whose classic scripts are executing, innermost
+    /// last. `document.currentScript` reads the last one, and a
+    /// `document.write` inside a parser-created script inserts right after
+    /// it (see [`document_write`]).
+    parser_script_owners: Vec<NodeId>,
+    /// Whether each running script is a module, innermost last: `true` while
+    /// module code executes, `false` for a classic script.
+    /// `document.write` from a module is ignored (HTML §8.4.3).
+    active_script_kinds: Vec<bool>,
+    /// The open `document.write` streams. See [`document_write`].
+    write_sessions: Vec<document_write::WriteSession>,
+    /// Bumped by every `document.open()`, so a write session taken out while
+    /// a nested script runs can tell that its stream was reset under it.
+    write_stream_epoch: u64,
     /// The `error` event that [`Self::report_uncaught_error`] is dispatching. Its
     /// listeners see an `ErrorEvent`, which is what selects the five-argument
     /// `window.onerror` form.
@@ -396,6 +417,10 @@ impl JsRuntime {
             call_stack: Vec::new(),
             transient_roots: Vec::new(),
             source_line_starts: Vec::new(),
+            parser_script_owners: Vec::new(),
+            active_script_kinds: Vec::new(),
+            write_sessions: Vec::new(),
+            write_stream_epoch: 0,
             js_cookie_jar: BTreeMap::new(),
             random_state: {
                 let nanos = std::time::SystemTime::now()
@@ -1279,7 +1304,9 @@ impl JsRuntime {
         from_revision: DomRevision,
     ) -> Result<ScriptOutcome, JsError> {
         let previous_root_strict = std::mem::replace(&mut self.root_strict, strict);
+        self.active_script_kinds.push(false);
         let outcome = self.run_script_statements(dom, statements, from_revision);
+        self.active_script_kinds.pop();
         self.root_strict = previous_root_strict;
         outcome
     }

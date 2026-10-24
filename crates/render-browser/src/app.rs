@@ -3723,14 +3723,13 @@ impl ApplicationHandler<UserEvent> for BrowserApp {
                 self.relayout_and_render(true);
                 self.request_redraw();
             }
-            WindowEvent::Moved(_) => {
+            WindowEvent::Moved(_)
                 // A native window drag runs its own event loop and consumes the
                 // button release, so a move while a press is recorded means that
                 // press has ended.
-                if self.left_pointer_down {
+                if self.left_pointer_down => {
                     self.handle_pointer_release();
                 }
-            }
             WindowEvent::ThemeChanged(theme) => {
                 self.theme = theme_from_winit(theme);
                 self.repaint_chrome();

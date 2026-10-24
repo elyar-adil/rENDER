@@ -919,6 +919,13 @@ pub(crate) enum NativeFunction {
     ImplementationHasFeature,
     /// The `implementation` getter of a document (DOM §4.5).
     DocumentImplementation,
+    /// `document.write`, `writeln`, `open` and `close` (HTML §8.4) and the
+    /// `currentScript` getter (HTML §4.12.4.1).
+    DocumentWrite,
+    DocumentWriteln,
+    DocumentOpen,
+    DocumentClose,
+    DocumentCurrentScript,
     /// `Document.prototype.adoptNode` (DOM).
     AdoptNode,
     /// The namespace-aware attribute and element methods (DOM §4.9.1, §4.9.2).
@@ -3662,6 +3669,16 @@ impl Realm {
             document_prototype,
             "forms",
             NativeFunction::DocumentForms,
+            None,
+        );
+        // `document.currentScript` (HTML §4.12.4.1): the script element whose
+        // classic script is running, or null.
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            document_prototype,
+            "currentScript",
+            NativeFunction::DocumentCurrentScript,
             None,
         );
         Self::install_builtin_methods(

@@ -5383,14 +5383,12 @@ impl JsRuntime {
                     }
                 }
             }
-            Some(ObjectHost::TypedArray { kind, .. }) => {
-                if property == "BYTES_PER_ELEMENT" {
-                    #[allow(
-                        clippy::cast_precision_loss,
-                        reason = "element sizes are tiny integers"
-                    )]
-                    return Ok(JsValue::Number(kind.element_size() as f64));
-                }
+            Some(ObjectHost::TypedArray { kind, .. }) if property == "BYTES_PER_ELEMENT" => {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "element sizes are tiny integers"
+                )]
+                return Ok(JsValue::Number(kind.element_size() as f64));
             }
             Some(ObjectHost::StringPrimitive(text)) => {
                 // A String wrapper's indexed properties and `length` are code-unit
@@ -5491,6 +5489,10 @@ impl JsRuntime {
                 Some(NativeFunction::CreateDocumentFragment)
             }
             (Some(ObjectHost::Document(_)), "createEvent") => Some(NativeFunction::CreateEvent),
+            (Some(ObjectHost::Document(_)), "write") => Some(NativeFunction::DocumentWrite),
+            (Some(ObjectHost::Document(_)), "writeln") => Some(NativeFunction::DocumentWriteln),
+            (Some(ObjectHost::Document(_)), "open") => Some(NativeFunction::DocumentOpen),
+            (Some(ObjectHost::Document(_)), "close") => Some(NativeFunction::DocumentClose),
             (Some(ObjectHost::Node(_)), "compareDocumentPosition") => {
                 Some(NativeFunction::CompareDocumentPosition)
             }
