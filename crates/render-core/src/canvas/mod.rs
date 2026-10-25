@@ -1222,6 +1222,7 @@ fn keyword_is_valid(attribute: Attribute, keyword: &str) -> bool {
             "titling-caps",
         ],),
         Attribute::GlobalCompositeOperation => (&[
+            "clear",
             "source-over",
             "source-in",
             "source-out",
@@ -1267,8 +1268,10 @@ fn keyword_is_valid(attribute: Attribute, keyword: &str) -> bool {
         ],),
         _ => return false,
     };
-    list.iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(keyword))
+    // These are Web IDL enum values on context attributes, not HTML content
+    // attributes: their keywords are case-sensitive (WPT
+    // `2d.composite.operation.casesensitive`).
+    list.contains(&keyword)
 }
 
 fn index_size(message: &str) -> CanvasError {

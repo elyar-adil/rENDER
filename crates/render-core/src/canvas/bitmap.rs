@@ -323,9 +323,11 @@ fn composite_over(destination: [u8; 4], source: Source, alpha: f32) -> [u8; 4] {
 /// The Porter-Duff compositing of one source pixel onto one destination
 /// pixel (HTML §4.12.5.1.3 "compositing"): the source and destination
 /// weights the mode names, applied to premultiplied colours and an alpha
-/// that adds the same way.
+/// that adds the same way. A blend mode composes its blend function with
+/// source-over, as CSS Compositing and Blending §5.2 defines it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompositeMode {
+    Clear,
     Copy,
     Destination,
     DestinationAtop,
@@ -338,15 +340,41 @@ pub enum CompositeMode {
     SourceOut,
     SourceOver,
     Xor,
+    Blend(BlendMode),
+}
+
+/// A separable or nonseparable colour blend function (CSS Compositing and
+/// Blending Level 1 §5.3-5.4). Each takes straight, un-premultiplied
+/// colours and returns the blended colour, which is then composited with
+/// source-over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlendMode {
+    Multiply,
+    Screen,
+    Overlay,
+    Darken,
+    Lighten,
+    ColorDodge,
+    ColorBurn,
+    HardLight,
+    SoftLight,
+    Difference,
+    Exclusion,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
 
 impl CompositeMode {
-    /// The mode a `globalCompositeOperation` keyword names. The separable
-    /// blend modes are not here yet: they parse but paint as `source-over`,
-    /// which is a stated gap.
+    /// The mode a `globalCompositeOperation` keyword names. The keywords are
+    /// Web IDL enum values on the context's attribute and therefore
+    /// case-sensitive (WPT `2d.composite.operation.casesensitive`); the
+    /// selectors are the ones HTML §4.12.5.1.3 lists.
     #[must_use]
     pub fn parse(keyword: &str) -> Option<Self> {
         let mode = match keyword {
+            "clear" => Self::Clear,
             "copy" => Self::Copy,
             "destination" => Self::Destination,
             "destination-atop" => Self::DestinationAtop,
@@ -357,13 +385,23 @@ impl CompositeMode {
             "source-atop" => Self::SourceAtop,
             "source-in" => Self::SourceIn,
             "source-out" => Self::SourceOut,
-            // The separable and nonseparable blend modes: the state accepts
-            // them, the paint does not apply them yet, so they parse as the
-            // source-over painting they currently fall back to.
-            "source-over" | "multiply" | "screen" | "overlay" | "darken" | "lighten"
-            | "color-dodge" | "color-burn" | "hard-light" | "soft-light" | "difference"
-            | "exclusion" | "hue" | "saturation" | "color" | "luminosity" => Self::SourceOver,
+            "source-over" => Self::SourceOver,
             "xor" => Self::Xor,
+            "multiply" => Self::Blend(BlendMode::Multiply),
+            "screen" => Self::Blend(BlendMode::Screen),
+            "overlay" => Self::Blend(BlendMode::Overlay),
+            "darken" => Self::Blend(BlendMode::Darken),
+            "lighten" => Self::Blend(BlendMode::Lighten),
+            "color-dodge" => Self::Blend(BlendMode::ColorDodge),
+            "color-burn" => Self::Blend(BlendMode::ColorBurn),
+            "hard-light" => Self::Blend(BlendMode::HardLight),
+            "soft-light" => Self::Blend(BlendMode::SoftLight),
+            "difference" => Self::Blend(BlendMode::Difference),
+            "exclusion" => Self::Blend(BlendMode::Exclusion),
+            "hue" => Self::Blend(BlendMode::Hue),
+            "saturation" => Self::Blend(BlendMode::Saturation),
+            "color" => Self::Blend(BlendMode::Color),
+            "luminosity" => Self::Blend(BlendMode::Luminosity),
             _ => return None,
         };
         Some(mode)
@@ -371,6 +409,7 @@ impl CompositeMode {
 
     fn coefficients(self, source_alpha: f32, destination_alpha: f32) -> (f32, f32) {
         match self {
+            Self::Clear => (0.0, 0.0),
             Self::Copy => (1.0, 0.0),
             Self::Destination => (0.0, 1.0),
             Self::DestinationAtop => (1.0 - destination_alpha, source_alpha),
@@ -381,10 +420,203 @@ impl CompositeMode {
             Self::SourceAtop => (destination_alpha, 1.0 - source_alpha),
             Self::SourceIn => (destination_alpha, 0.0),
             Self::SourceOut => (1.0 - destination_alpha, 0.0),
-            Self::SourceOver => (1.0, 1.0 - source_alpha),
+            Self::SourceOver | Self::Blend(_) => (1.0, 1.0 - source_alpha),
             Self::Xor => (1.0 - destination_alpha, 1.0 - source_alpha),
         }
     }
+}
+
+impl BlendMode {
+    /// The blend function, on straight colours in `0.0..=1.0`.
+    ///
+    /// The nonseparable modes are the four CSS builds from `SetLum`,
+    /// `SetSat` and `ClipColor`, so they share those helpers rather than
+    /// repeating the formulas.
+    fn apply(self, backdrop: [f32; 3], source: [f32; 3]) -> [f32; 3] {
+        match self {
+            Self::Multiply => [
+                backdrop[0] * source[0],
+                backdrop[1] * source[1],
+                backdrop[2] * source[2],
+            ],
+            Self::Screen => [
+                screen(backdrop[0], source[0]),
+                screen(backdrop[1], source[1]),
+                screen(backdrop[2], source[2]),
+            ],
+            Self::Overlay => [
+                hard_light(source[0], backdrop[0]),
+                hard_light(source[1], backdrop[1]),
+                hard_light(source[2], backdrop[2]),
+            ],
+            Self::Darken => [
+                backdrop[0].min(source[0]),
+                backdrop[1].min(source[1]),
+                backdrop[2].min(source[2]),
+            ],
+            Self::Lighten => [
+                backdrop[0].max(source[0]),
+                backdrop[1].max(source[1]),
+                backdrop[2].max(source[2]),
+            ],
+            Self::ColorDodge => [
+                color_dodge(backdrop[0], source[0]),
+                color_dodge(backdrop[1], source[1]),
+                color_dodge(backdrop[2], source[2]),
+            ],
+            Self::ColorBurn => [
+                color_burn(backdrop[0], source[0]),
+                color_burn(backdrop[1], source[1]),
+                color_burn(backdrop[2], source[2]),
+            ],
+            Self::HardLight => [
+                hard_light(backdrop[0], source[0]),
+                hard_light(backdrop[1], source[1]),
+                hard_light(backdrop[2], source[2]),
+            ],
+            Self::SoftLight => [
+                soft_light(backdrop[0], source[0]),
+                soft_light(backdrop[1], source[1]),
+                soft_light(backdrop[2], source[2]),
+            ],
+            Self::Difference => [
+                (backdrop[0] - source[0]).abs(),
+                (backdrop[1] - source[1]).abs(),
+                (backdrop[2] - source[2]).abs(),
+            ],
+            Self::Exclusion => [
+                exclusion(backdrop[0], source[0]),
+                exclusion(backdrop[1], source[1]),
+                exclusion(backdrop[2], source[2]),
+            ],
+            Self::Hue => set_luminosity(
+                set_saturation(source, saturation(backdrop)),
+                luminosity(backdrop),
+            ),
+            Self::Saturation => set_luminosity(
+                set_saturation(backdrop, saturation(source)),
+                luminosity(backdrop),
+            ),
+            Self::Color => set_luminosity(source, luminosity(backdrop)),
+            Self::Luminosity => set_luminosity(backdrop, luminosity(source)),
+        }
+    }
+}
+
+/// `B(Cb, Cs) = Cb + Cs - Cb x Cs`.
+fn screen(backdrop: f32, source: f32) -> f32 {
+    backdrop + source - backdrop * source
+}
+
+/// The shared hard-light formula; `overlay` is hard-light with the two
+/// colours exchanged (CSS Compositing and Blending §5.3).
+fn hard_light(backdrop: f32, source: f32) -> f32 {
+    if source <= 0.5 {
+        2.0 * source * backdrop
+    } else {
+        1.0 - 2.0 * (1.0 - source) * (1.0 - backdrop)
+    }
+}
+
+/// `B(Cb, Cs) = Cb / (1 - Cs)`, with the two degenerate ends at 0 and 1.
+fn color_dodge(backdrop: f32, source: f32) -> f32 {
+    if backdrop <= 0.0 {
+        0.0
+    } else if source >= 1.0 {
+        1.0
+    } else {
+        (backdrop / (1.0 - source)).min(1.0)
+    }
+}
+
+/// `B(Cb, Cs) = 1 - min(1, (1 - Cb) / Cs)`, with the degenerate ends at 1
+/// and 0.
+fn color_burn(backdrop: f32, source: f32) -> f32 {
+    if backdrop >= 1.0 {
+        1.0
+    } else if source <= 0.0 {
+        0.0
+    } else {
+        1.0 - ((1.0 - backdrop) / source).min(1.0)
+    }
+}
+
+/// The piecewise soft-light curve of CSS Compositing and Blending §5.3.
+fn soft_light(backdrop: f32, source: f32) -> f32 {
+    if source <= 0.5 {
+        backdrop - (1.0 - 2.0 * source) * backdrop * (1.0 - backdrop)
+    } else {
+        let d = if backdrop <= 0.25 {
+            ((16.0 * backdrop - 12.0) * backdrop + 4.0) * backdrop
+        } else {
+            backdrop.sqrt()
+        };
+        backdrop + (2.0 * source - 1.0) * (d - backdrop)
+    }
+}
+
+/// `B(Cb, Cs) = Cb + Cs - 2 x Cb x Cs`.
+fn exclusion(backdrop: f32, source: f32) -> f32 {
+    backdrop + source - 2.0 * backdrop * source
+}
+
+/// The luminance coefficients of CSS Compositing and Blending §5.4.
+fn luminosity(colour: [f32; 3]) -> f32 {
+    0.3 * colour[0] + 0.59 * colour[1] + 0.11 * colour[2]
+}
+
+/// `ClipColor(C)`: pull a colour back inside the unit cube without changing
+/// its luminosity.
+fn clip_color(mut colour: [f32; 3]) -> [f32; 3] {
+    let lum = luminosity(colour);
+    let lowest = colour.iter().copied().fold(f32::INFINITY, f32::min);
+    let highest = colour.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if lowest < 0.0 && lum != lowest {
+        for channel in &mut colour {
+            *channel = lum + (*channel - lum) * lum / (lum - lowest);
+        }
+    }
+    if highest > 1.0 && highest != lum {
+        for channel in &mut colour {
+            *channel = lum + (*channel - lum) * (1.0 - lum) / (highest - lum);
+        }
+    }
+    colour
+}
+
+/// `SetLum(C, l)`: change a colour's luminosity.
+fn set_luminosity(colour: [f32; 3], target: f32) -> [f32; 3] {
+    let difference = target - luminosity(colour);
+    clip_color([
+        colour[0] + difference,
+        colour[1] + difference,
+        colour[2] + difference,
+    ])
+}
+
+/// `Sat(C)`: the saturation of a colour.
+fn saturation(colour: [f32; 3]) -> f32 {
+    let highest = colour.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lowest = colour.iter().copied().fold(f32::INFINITY, f32::min);
+    highest - lowest
+}
+
+/// `SetSat(C, s)`: change a colour's saturation.
+fn set_saturation(colour: [f32; 3], target: f32) -> [f32; 3] {
+    let highest = colour.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let lowest = colour.iter().copied().fold(f32::INFINITY, f32::min);
+    if highest <= lowest {
+        return [0.0; 3];
+    }
+    colour.map(|channel| {
+        if channel == lowest {
+            0.0
+        } else if channel == highest {
+            target
+        } else {
+            (channel - lowest) * target / (highest - lowest)
+        }
+    })
 }
 
 /// One Porter-Duff composite of `source` (its alpha already carries the
@@ -392,20 +624,69 @@ impl CompositeMode {
 fn composite_pixel(destination: [u8; 4], source: Source, mode: CompositeMode) -> [u8; 4] {
     let source_alpha = source.alpha.clamp(0.0, 1.0);
     let destination_alpha = f32::from(destination[3]) / 255.0;
+    if let CompositeMode::Blend(blend) = mode {
+        return composite_blend(destination, source, source_alpha, destination_alpha, blend);
+    }
     let (source_weight, destination_weight) = mode.coefficients(source_alpha, destination_alpha);
     let output_alpha =
         (source_alpha * source_weight + destination_alpha * destination_weight).min(1.0);
     if output_alpha <= 0.0 {
         return [0; 4];
     }
+    // The bitmap stores premultiplied colours, the same convention
+    // `composite_over` and `read_straight` follow.
     let mut out = [0_u8; 4];
     for channel in 0..3 {
         let source_colour = f32::from([source.red, source.green, source.blue][channel])
             * source_alpha
             * source_weight;
-        let destination_colour =
-            f32::from(destination[channel]) * destination_alpha * destination_weight;
-        out[channel] = round_byte((source_colour + destination_colour) / output_alpha);
+        // `destination` is already premultiplied, so its alpha is in the
+        // colour channel; only the mode's weight applies.
+        let destination_colour = f32::from(destination[channel]) * destination_weight;
+        out[channel] = round_byte(source_colour + destination_colour);
+    }
+    out[3] = round_byte(output_alpha * 255.0);
+    out
+}
+
+/// A blend mode's result: blend the two straight colours, mix the blend with
+/// the source by the backdrop's alpha (CSS Compositing and Blending §5.2),
+/// then composite that colour with source-over.
+fn composite_blend(
+    destination: [u8; 4],
+    source: Source,
+    source_alpha: f32,
+    destination_alpha: f32,
+    blend: BlendMode,
+) -> [u8; 4] {
+    let source_straight = [
+        f32::from(source.red) / 255.0,
+        f32::from(source.green) / 255.0,
+        f32::from(source.blue) / 255.0,
+    ];
+    // The destination is stored premultiplied. Its straight colour only
+    // enters the blend where the backdrop exists; where it does not, the
+    // source reaches the result unblended, which the alpha-weighted mix below
+    // gives for any backdrop colour.
+    let backdrop_straight = if destination_alpha > 0.0 {
+        let scale = 1.0 / (destination_alpha * 255.0);
+        [
+            f32::from(destination[0]) * scale,
+            f32::from(destination[1]) * scale,
+            f32::from(destination[2]) * scale,
+        ]
+    } else {
+        [0.0; 3]
+    };
+    let blended = blend.apply(backdrop_straight, source_straight);
+    let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
+    let mut out = [0_u8; 4];
+    for channel in 0..3 {
+        let mixed = (1.0 - destination_alpha) * source_straight[channel]
+            + destination_alpha * blended[channel];
+        let premultiplied =
+            source_alpha * mixed + f32::from(destination[channel]) / 255.0 * (1.0 - source_alpha);
+        out[channel] = round_byte(premultiplied * 255.0);
     }
     out[3] = round_byte(output_alpha * 255.0);
     out

@@ -544,17 +544,137 @@ fn lighter_adds_source_and_destination() {
 }
 
 #[test]
-fn tmp_gco_probe() {
-    println!(
-        "GCO: {}",
+fn composite_operation_accepts_clear() {
+    // WPT 2d.composite.operation.clear: 'clear' is a valid keyword.
+    assert_eq!(
         run(&format!(
-            "{SETUP} ctx.globalCompositeOperation = 'source-in'; ctx.globalCompositeOperation"
-        ))
+            "{SETUP} ctx.globalCompositeOperation = 'clear'; ctx.globalCompositeOperation"
+        )),
+        "clear"
     );
-    println!(
-        "GCO_VALID: {}",
-        run(&format!(
-            "{SETUP} ctx.globalCompositeOperation = 'destination-over'; ctx.globalCompositeOperation"
-        ))
+}
+
+#[test]
+fn clear_blanks_the_canvas_it_composites_onto() {
+    // WPT 2d.composite.solid.clear: 'clear' has zero source and destination
+    // coefficients, so it blanks every pixel the operation reaches - not just
+    // the pixels the source shape covers.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(0, 255, 255, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'clear'; \
+         ctx.fillStyle = 'rgba(255, 255, 0, 1)'; ctx.fillRect(10, 10, 20, 20); \
+         [{}, {}, {}].join('|')",
+        pixel(15, 15),
+        pixel(5, 5),
+        pixel(50, 25)
     );
+    assert_eq!(run(&script), "0,0,0,0|0,0,0,0|0,0,0,0");
+}
+
+#[test]
+fn clear_leaves_pixels_outside_the_clip_region_alone() {
+    // WPT 2d.composite.clip.clear: the clip bounds the compositing operation,
+    // so clearing inside it cannot reach the pixels outside.
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(0, 255, 0, 1)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'clear'; \
+         ctx.beginPath(); ctx.rect(10, 10, 20, 20); ctx.clip(); \
+         ctx.fillStyle = 'rgba(255, 0, 0, 1)'; ctx.fillRect(0, 0, 50, 50); \
+         [{}, {}].join('|')",
+        pixel(15, 15),
+        pixel(50, 25)
+    );
+    assert_eq!(run(&script), "0,0,0,0|0,255,0,255");
+}
+
+#[test]
+fn composite_operation_keywords_are_case_sensitive() {
+    // WPT 2d.composite.operation.casesensitive: the value is a Web IDL enum,
+    // so a differently-cased keyword leaves the attribute unchanged.
+    let script = format!(
+        "{SETUP} ctx.globalCompositeOperation = 'xor'; \
+         ctx.globalCompositeOperation = 'Source-over'; \
+         ctx.textAlign = 'center'; ctx.textAlign = 'Center'; \
+         [ctx.globalCompositeOperation, ctx.textAlign].join('|')"
+    );
+    assert_eq!(run(&script), "xor|center");
+}
+
+#[test]
+fn blend_modes_apply_their_colour_function_before_source_over() {
+    // CSS Compositing and Blending §5.2-5.4: the blend function runs first,
+    // then the result is composited with source-over. The destination is
+    // opaque green and the source opaque red throughout.
+    let cases = [
+        ("multiply", "0,0,0,255"),
+        ("screen", "255,255,0,255"),
+        ("overlay", "0,255,0,255"),
+        ("darken", "0,0,0,255"),
+        ("lighten", "255,255,0,255"),
+        ("color-dodge", "0,255,0,255"),
+        ("color-burn", "0,255,0,255"),
+        ("hard-light", "255,0,0,255"),
+        ("soft-light", "0,255,0,255"),
+        ("difference", "255,255,0,255"),
+        ("exclusion", "255,255,0,255"),
+        ("hue", "255,106,106,255"),
+        ("saturation", "0,255,0,255"),
+        ("color", "255,106,106,255"),
+        ("luminosity", "0,130,0,255"),
+    ];
+    for (mode, expected) in cases {
+        let script = format!(
+            "{SETUP} c.width = 10; c.height = 10; \
+             ctx.fillStyle = 'rgb(0, 255, 0)'; ctx.fillRect(0, 0, 10, 10); \
+             ctx.globalCompositeOperation = '{mode}'; \
+             ctx.fillStyle = 'rgb(255, 0, 0)'; ctx.fillRect(0, 0, 10, 10); \
+             var d = ctx.getImageData(5, 5, 1, 1).data; \
+             [d[0], d[1], d[2], d[3]].join(',')"
+        );
+        let actual = run(&script);
+        let channels: Vec<i32> = actual
+            .split(',')
+            .map(|channel| channel.parse().expect("a channel"))
+            .collect();
+        let expected: Vec<i32> = expected
+            .split(',')
+            .map(|channel| channel.parse().expect("a channel"))
+            .collect();
+        for (channel, target) in channels.iter().zip(&expected) {
+            assert!(
+                (channel - target).abs() <= 1,
+                "{mode}: channel {channel} is more than 1 away from {target} (whole pixel {actual})"
+            );
+        }
+    }
+}
+
+#[test]
+fn xor_blends_both_halves_with_their_own_weights() {
+    // WPT 2d.composite.transparent.xor: the pixel holds both the
+    // destination's green (weighted by the source's absence) and the
+    // source's blue (weighted by the destination's absence).
+    let script = format!(
+        "{SETUP} c.width = 100; c.height = 50; \
+         ctx.fillStyle = 'rgba(0, 255, 0, 0.5)'; ctx.fillRect(0, 0, 100, 50); \
+         ctx.globalCompositeOperation = 'xor'; \
+         ctx.fillStyle = 'rgba(0, 0, 255, 0.75)'; ctx.fillRect(0, 0, 100, 50); \
+         var d = ctx.getImageData(50, 25, 1, 1).data; \
+         [d[0], d[1], d[2], d[3]].join(',')"
+    );
+    // The WPT test asserts these channels within a tolerance of 5: the
+    // bitmap's 8-bit alpha quantises the exact half-alpha destination.
+    let actual: Vec<i32> = run(&script)
+        .split(',')
+        .map(|channel| channel.parse().expect("a channel"))
+        .collect();
+    let expected = [0, 64, 191, 128];
+    for (channel, target) in actual.iter().zip(expected) {
+        assert!(
+            (channel - target).abs() <= 5,
+            "channel {channel} is more than 5 away from {target}"
+        );
+    }
 }
