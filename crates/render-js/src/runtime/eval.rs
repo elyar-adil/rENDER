@@ -5496,6 +5496,9 @@ impl JsRuntime {
             (Some(ObjectHost::Node(_)), "compareDocumentPosition") => {
                 Some(NativeFunction::CompareDocumentPosition)
             }
+            (Some(ObjectHost::Node(_)), "show") => Some(NativeFunction::DialogShow),
+            (Some(ObjectHost::Node(_)), "showModal") => Some(NativeFunction::DialogShowModal),
+            (Some(ObjectHost::Node(_)), "requestClose") => Some(NativeFunction::DialogRequestClose),
             (Some(ObjectHost::NamedNodeMap(_)), "item") => Some(NativeFunction::NamedMapItem),
             (Some(ObjectHost::NamedNodeMap(_)), "getNamedItem") => {
                 Some(NativeFunction::NamedMapGetNamedItem)

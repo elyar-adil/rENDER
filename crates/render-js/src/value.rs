@@ -919,6 +919,14 @@ pub(crate) enum NativeFunction {
     ImplementationHasFeature,
     /// The `implementation` getter of a document (DOM §4.5).
     DocumentImplementation,
+    /// `HTMLDialogElement` (HTML §4.11.2): the open/close operations and the
+    /// `returnValue` IDL attribute.
+    DialogShow,
+    DialogShowModal,
+    DialogClose,
+    DialogRequestClose,
+    DialogReturnValueGet,
+    DialogReturnValueSet,
     /// `document.write`, `writeln`, `open` and `close` (HTML §8.4) and the
     /// `currentScript` getter (HTML §4.12.4.1).
     DocumentWrite,
@@ -4519,6 +4527,29 @@ impl Realm {
             };
             derive(interface, parent, ObjectHost::DomConstructor, objects);
         }
+        // HTML §4.11.2: the dialog operations, and `returnValue`, which is an
+        // IDL attribute backed by internal state rather than a reflection (its
+        // tests require close() to set it without invoking a script-defined
+        // setter).
+        Self::install_builtin_methods(
+            objects,
+            function_prototype,
+            prototypes["HTMLDialogElement"],
+            &[
+                ("show", NativeFunction::DialogShow),
+                ("showModal", NativeFunction::DialogShowModal),
+                ("close", NativeFunction::DialogClose),
+                ("requestClose", NativeFunction::DialogRequestClose),
+            ],
+        );
+        Self::install_attribute(
+            objects,
+            function_prototype,
+            prototypes["HTMLDialogElement"],
+            "returnValue",
+            NativeFunction::DialogReturnValueGet,
+            Some(NativeFunction::DialogReturnValueSet),
+        );
         // `HTMLSlotElement` (HTML §4.2.2.2 and DOM §4.2.2.2): slot assignment.
         Self::install_builtin_methods(
             objects,

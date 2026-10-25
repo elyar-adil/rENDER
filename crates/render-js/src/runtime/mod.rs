@@ -55,6 +55,8 @@ mod coroutine;
 mod coroutine_run;
 #[cfg(test)]
 mod coroutine_tests;
+#[cfg(test)]
+mod dialog_tests;
 mod disposal;
 mod document_write;
 #[cfg(test)]
@@ -278,6 +280,9 @@ pub struct JsRuntime {
     pending_error_event: Option<ObjectId>,
     /// JS-visible cookies (`document.cookie`), keyed by name.
     js_cookie_jar: BTreeMap<String, String>,
+    /// The `returnValue` of each dialog (HTML §4.11.2): internal state, not a
+    /// reflection, so a script-defined `returnValue` setter is not invoked.
+    dialog_return_values: BTreeMap<NodeId, String>,
     random_state: u64,
     element_geometry: BTreeMap<u64, ElementRect>,
     viewport: ElementRect,
@@ -422,6 +427,7 @@ impl JsRuntime {
             write_sessions: Vec::new(),
             write_stream_epoch: 0,
             js_cookie_jar: BTreeMap::new(),
+            dialog_return_values: BTreeMap::new(),
             random_state: {
                 let nanos = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -994,6 +1000,9 @@ impl JsRuntime {
                 self.notify_intersection_observer(dom, observer)
             }
             JsMicrotask::MutationObserver(observer) => self.notify_mutation_observer(dom, observer),
+            JsMicrotask::DialogClosed(dialog) => self
+                .dispatch_dom_event(dom, dialog, "close", false, false, false, &[])
+                .map(|_| JsValue::Undefined),
             JsMicrotask::MediaQueryListChange(list) => self.notify_media_query_list(dom, list),
             JsMicrotask::PromiseReaction {
                 handler,

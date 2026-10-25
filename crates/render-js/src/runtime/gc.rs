@@ -609,6 +609,9 @@ impl JsRuntime {
                         *callback,
                     );
                 }
+                // A queued close event names a node, which the DOM keeps
+                // alive; there is no object reference to mark.
+                JsMicrotask::DialogClosed(_) => {}
                 JsMicrotask::IntersectionObserver(observer)
                 | JsMicrotask::MutationObserver(observer)
                 | JsMicrotask::MediaQueryListChange(observer) => {

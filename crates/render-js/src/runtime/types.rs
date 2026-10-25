@@ -13,6 +13,8 @@
     clippy::wrong_self_convention
 )]
 
+use render_dom::NodeId;
+
 use crate::JsValue;
 use crate::ObjectId;
 use crate::parser::Expr;
@@ -444,6 +446,10 @@ pub(super) struct PromiseRecord {
 #[derive(Clone, Debug, PartialEq)]
 pub enum JsMicrotask {
     Callback(ObjectId),
+    /// Fire the `close` event at a dialog (HTML §4.11.2): `close()` and
+    /// `requestClose()` remove the `open` attribute synchronously but queue
+    /// the event, and this is the queue.
+    DialogClosed(NodeId),
     IntersectionObserver(ObjectId),
     MutationObserver(ObjectId),
     /// A `MediaQueryList` whose `matches` flipped, so its `change` listeners

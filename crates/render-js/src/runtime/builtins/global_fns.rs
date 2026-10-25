@@ -839,6 +839,12 @@ impl JsRuntime {
             | NativeFunction::DocumentOpen
             | NativeFunction::DocumentClose
             | NativeFunction::DocumentCurrentScript
+            | NativeFunction::DialogShow
+            | NativeFunction::DialogShowModal
+            | NativeFunction::DialogClose
+            | NativeFunction::DialogRequestClose
+            | NativeFunction::DialogReturnValueGet
+            | NativeFunction::DialogReturnValueSet
             | NativeFunction::AdoptNode
             | NativeFunction::NonElementGetElementById
             | NativeFunction::CreateElementNs

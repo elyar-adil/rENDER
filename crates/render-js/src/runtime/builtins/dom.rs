@@ -159,6 +159,15 @@ impl JsRuntime {
             NativeFunction::DocumentOpen => self.document_open(dom, receiver, arguments),
             NativeFunction::DocumentClose => self.document_close(dom, receiver),
             NativeFunction::DocumentCurrentScript => self.document_current_script(dom),
+            NativeFunction::DialogShow
+            | NativeFunction::DialogShowModal
+            | NativeFunction::DialogClose
+            | NativeFunction::DialogRequestClose
+            | NativeFunction::DialogReturnValueGet
+            | NativeFunction::DialogReturnValueSet => {
+                let node = self.require_node(receiver)?;
+                self.dialog_native(dom, function, node, arguments)
+            }
             NativeFunction::AdoptNode => self.adopt_node_method(dom, receiver, arguments),
             NativeFunction::NodeNormalize => self.node_normalize(dom, receiver),
             NativeFunction::TextSplitText => self.text_split_text(dom, receiver, arguments),
