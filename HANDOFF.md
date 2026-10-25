@@ -1,3 +1,34 @@
+# 交接文档 (2026-10-25, 续) — dialog + canvas roundRect
+
+接续同日 document.write 会话。主题:按最新失败聚类继续推进 WPT 通过率。
+
+## 本轮已完成(2 个提交)
+
+| 提交 | 内容 |
+|---|---|
+| `6be1fc7` | **HTMLDialogElement**:show/showModal/close/requestClose + returnValue IDL 属性。语义按 WPT dialog-close.html 钉死:close() 只作用于 open 的对话框、无参调用**保留** returnValue、close 设置 IDL 值**不触发**脚本定义的 setter(故 returnValue 是 runtime 内部状态而非反射);requestClose 同步派发 cancelable 的 cancel、被 preventDefault 则不动;**close 事件入微任务队列**(调用方能在 close() 返回时断言事件未运行)。showModal 对已打开/未连接抛 InvalidStateError。聚焦步骤与 top layer(::backdrop/:modal)是已声明缺口——75 个 showModal reftest 需要后者。render-js 1152 测试 |
+| `c6641fb` | **canvas roundRect**(HTML §4.12.5.1.4)。radii 按 `(unrestricted double or DOMPointInit)` 归一化:数字=圆形、对象(含数组)=DOMPointInit 缺省 x/y 为 0(badinput 形状因此可解析而非抛错)、BigInt=TypeError;序列长度 1..4 且非负,否则 RangeError。路径建立在既有原语上(moveTo + 四边 + 四椭圆弧 + close),fill/stroke/clip/isPointInPath 全部免费获得。**负宽高:命名角互换 + 边取 min/max 极值**——这是负尺寸测试像素对上的关键(直接用 x/y/w/h 公式会把圆角画到形状外);混合符号逆时针绕行(winding 测试需要);相邻半径超边长按标准单一因子缩放;零半径角不产生弧、零高度仍描边。注意:实现在 JS 侧展开为既有 CanvasOp 序列,render-core 零改动。render-core canvas 测试 28→35 |
+
+## 测量(每次一个特性,逐步)
+
+| 步 | pass | 符合率 |
+|---|---|---|
+| document.write 会话结束 | 1192 | 26.1% |
+| + dialog | 1204 | 26.6% |
+| + roundRect | **1261** | **28.0%** |
+
+roundrect 集群 57 pass(此前 0);dialog 集群 13 pass,其余转 skip(focus/top-layer 缺口)。dom 区 29.2%,html 27.8%。
+
+## 下一步候选(按聚类大小)
+
+1. canvas 梯度对象:createLinearGradient/createRadialGradient/createPattern 缺失("Missing arguments cause TypeError" + 大量 fill 类测试);fillText(10)需 canvas 侧字体管线。
+2. "Parsing of non-negative integers"(22):canvas/img 的 width/height 作为 replaced element 内在尺寸进 layout——canvas.width 反射已对,缺的是呈现尺寸。
+3. document.parseHTMLUnsafe(7,真实站点在用,但 WPT 里 5 个 iframe 门控)。
+4. ::backdrop + top layer(解锁 75+ showModal/showPopover reftest)。
+5. 嵌套浏览上下文仍是最大单缺口(630+)。
+
+---
+
 # 交接文档 (2026-10-25) — document.write 端到端 + WPT 重测
 
 本轮主题:git pull 后重测 WPT 基线,然后实现 HTML §8.4 动态标记插入(document.write/writeln/open/close + currentScript)——WPT 失败聚类的最大单因(~50 个直接测试 + 156 个测试引用它),也是真实遗留页面的硬依赖。
