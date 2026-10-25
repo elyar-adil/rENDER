@@ -1,3 +1,31 @@
+# 交接文档 (2026-10-25, 续三) — roundRect 展开 bug + DOMPoint/DOMRect
+
+接续同日渐变会话。主题:优先修对正常页面影响大的核心功能。
+
+## 本轮已完成(1 个提交,含一个引擎级 bug 修复)
+
+| 提交 | 内容 |
+|---|---|
+| `102d957` | ① **roundRect 2/3 半径展开 bug**:`while radii.len() < 4 { push(last) }` 的预填充跑在 match 展开之前,把 `[20,0]` 垫成 `[20,0,0,0]`,毁掉"两个半径=对角对、三个半径=第二个重复"的规则——凡用多半径的测试全灭。删掉预填充,match 直接展开。② **DOMPoint/DOMPointReadOnly/DOMRect/DOMRectReadOnly**(Geometry Spec §1-2),prelude 自宿主:值存每实例一个隐藏 own 槽(浏览器是内部槽,Object.keys 为空、访问器在原型上),DOMPoint 加 setter,rect 派生边用 min/max 形式(负宽高的含义),toJSON/fromPoint/fromRect/toStringTag 齐备。③ **getBoundingClientRect 返回真 DOMRectReadOnly**(instanceof/toString 与平台一致)。④ **引擎修复:ECMA-262 OrdinaryGet 的 setter-only 续链**——get_value 遇到"只有 setter 的访问器"直接返回 undefined,而规范要求沿原型链继续找基类 getter(派生类 setter 遮蔽基类 getter 的经典形态);getter_on_chain 按 OrdinaryGet 语义续走。render-js 1157 测试 |
+
+## 测量
+
+| 步 | pass | 符合率 |
+|---|---|---|
+| + gradients | 1303 | 29.0% |
+| + roundRect 修复 + geometry | **1343** | **29.9%** |
+
+roundrect 集群 57 → **97 pass**。dom 29.2%,html 30.0%。
+
+## 下一步候选
+
+1. canvas 文本(ctx.font/fillText/strokeText/measureText——state-reset 聚类 22 个 + fillText 10 个;需要嵌入方字形栅格服务,架构级)。
+2. createPattern;canvas/img 内在尺寸进 layout(22)。
+3. ::backdrop + top layer(75+ reftest)。
+4. 嵌套浏览上下文(630+,总闸)。
+
+---
+
 # 交接文档 (2026-10-25, 续二) — canvas 渐变
 
 接续同日 dialog/roundRect 会话。
