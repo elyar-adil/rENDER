@@ -1,3 +1,30 @@
+# 交接文档 (2026-10-26) — canvas toDataURL + 预乘合成/混合模式
+
+接续 2026-10-25 canvas 会话,补齐合成正确性并加上 `toDataURL`。
+
+## 本轮已完成(2 个提交)
+
+| 提交 | 内容 |
+|---|---|
+| `30752a9` | **预乘位图的 Porter-Duff 修复**:`composite_pixel` 不再对输出除以 alpha(位图存的就是预乘值),也不再让已经预乘的目标再乘一次目标 alpha;WPT `2d.composite.transparent.xor` 的 `0,64,191,127` 落到 ±5 容差内。新增 `clear` 模式(零系数)与关键字校验;canvas 枚举属性按 Web IDL 改为**大小写敏感**(`keyword_is_valid` 精确匹配);补齐全部 15 个混合模式(11 个可分离 + 4 个不可分离,后者用 `SetLum`/`SetSat`/`ClipColor`),按 CSS Compositing and Blending §5.2-5.4 先混合再 source-over。删掉会空转打印的临时探针。render-core lib 325 测试全过 |
+| `b6a40f9` | **`HTMLCanvasElement.prototype.toDataURL(type, quality)`**(HTML §4.12.5.3):缺省且 `undefined` 为 `image/png`;类型 ASCII 大小写不敏感;`image/jpg`、`image/webp` 及未知类型回退 PNG;JPEG 从**预乘 RGB**(即透明像素合成到黑)编码,质量只用 JavaScript 数字且须在 `0..=1`,默认 0.92;位图任一边为 0 返回 `data:,`;额外参数忽略;没有 `getContext` 也能工作;方法只装在元素原型上,不在 `CanvasRenderingContext2D`。PNG 从直通 alpha RGBA 编码,统一 base64。新增 8 个测试:解码后像素往返、零尺寸、大小写/回退、JPEG 透明合成、质量高低长度、非数字与越界质量、无上下文/额外参数、接收者校验 |
+
+## 验证
+
+- `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`python tools/check_site_neutrality.py` 均通过;render-core canvas 65 测试全过。
+- `cargo test --workspace` 在整包并行满载时仍有 3 个既有的本机回环测试超时(`a_same_origin_fetch_stores_the_cookies_its_response_sets`、`a_cross_origin_put_is_sent_only_after_its_preflight_allows_it`、`a_refused_preflight_keeps_the_request_from_being_sent`):`serve_until_idle` 在第一个请求到达前只等 10 秒,而并行负载下 `headless_app_with` 的构造可能超过该窗口,监听器先关闭。三个测试单独运行或三个一起运行均通过,与本轮改动无关;下次可把服务器线程挪到 app 构造之后或放宽首请求窗口。
+- 本轮**未重跑 WPT**。`toDataURL.default/arguments.*/bogustype/jpg/lowercase.*/nocontext/png/unrecognised/zero*` 只检查前缀或 `data:,`,预计直接增加 13-15 个 pass;`toDataURL.*.primarycolours`、`complexcolours`、`jpeg.alpha`、`jpeg.quality.*` 的像素部分还等 `drawImage`。上次基线仍为 1456/4492(32.4%)。
+
+## 下一步候选
+
+1. `drawImage`(图像/元素/画布作为源;解锁图像像素、pattern 和 `toDataURL` 解码测试)。
+2. canvas 文本(`fillText`/`strokeText`/`measureText`,需要嵌入方字形栅格服务,架构级)。
+3. `::backdrop` + top layer(75+ reftest)。
+4. 表单约束校验(`checkValidity`/`reportValidity`/`:invalid` 等,约 9 个 WPT)。
+5. 嵌套浏览上下文(630+,总闸)。
+
+---
+
 # 交接文档 (2026-10-25, 续四) — canvas 状态属性 + Porter-Duff 合成
 
 接续同日 geometry 会话,继续"对正常使用影响大的核心功能"。
